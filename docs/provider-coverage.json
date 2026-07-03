@@ -1,0 +1,802 @@
+{
+  "generatedFrom": {
+    "providerTypes": "/data/projects/cc-switch",
+    "presets": "/data/projects/cc-switch"
+  },
+  "providerTypes": [
+    {
+      "id": "claude",
+      "label": "Anthropic official / API key",
+      "apps": [
+        "claude"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "claude_auth",
+      "label": "Claude bearer-only relay",
+      "apps": [
+        "claude"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "claude_oauth",
+      "label": "Claude Official OAuth",
+      "apps": [
+        "claude"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "codex",
+      "label": "OpenAI/Codex compatible",
+      "apps": [
+        "codex"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "codex_oauth",
+      "label": "OpenAI ChatGPT OAuth",
+      "apps": [
+        "claude",
+        "codex"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "gemini",
+      "label": "Google Gemini API key",
+      "apps": [
+        "gemini"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "gemini_cli",
+      "label": "Google Gemini OAuth / CLI",
+      "apps": [
+        "gemini",
+        "claude"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "openrouter",
+      "label": "OpenRouter",
+      "apps": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "github_copilot",
+      "label": "GitHub Copilot",
+      "apps": [
+        "claude"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "deepseek_account",
+      "label": "DeepSeek account",
+      "apps": [
+        "claude"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "kiro_oauth",
+      "label": "Kiro OAuth",
+      "apps": [
+        "claude"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "cursor_oauth",
+      "label": "Cursor OAuth",
+      "apps": [
+        "claude",
+        "codex"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "cursor_apikey",
+      "label": "Cursor API key",
+      "apps": [
+        "claude",
+        "codex"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "antigravity_oauth",
+      "label": "Antigravity OAuth",
+      "apps": [
+        "claude",
+        "gemini"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "agy_oauth",
+      "label": "Antigravity CLI / agy",
+      "apps": [
+        "claude",
+        "gemini"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "ollama_cloud",
+      "label": "Ollama API key",
+      "apps": [
+        "claude",
+        "codex"
+      ],
+      "required": true,
+      "presentInSource": true
+    },
+    {
+      "id": "aws_bedrock",
+      "label": "AWS Bedrock compatibility schema",
+      "apps": [
+        "claude"
+      ],
+      "required": false,
+      "presentInSource": false
+    },
+    {
+      "id": "nvidia",
+      "label": "Nvidia OpenAI-compatible API",
+      "apps": [
+        "claude",
+        "codex"
+      ],
+      "required": false,
+      "presentInSource": false
+    },
+    {
+      "id": "deepseek_api",
+      "label": "DeepSeek API key",
+      "apps": [
+        "claude",
+        "codex"
+      ],
+      "required": false,
+      "presentInSource": false
+    }
+  ],
+  "presets": {
+    "claude": [
+      {
+        "name": "Claude Official",
+        "providerType": "claude_oauth",
+        "apiFormat": null,
+        "baseUrl": null
+      },
+      {
+        "name": "OpenAI OAuth",
+        "providerType": "codex_oauth",
+        "apiFormat": "openai_responses",
+        "baseUrl": "https://chatgpt.com/backend-api/codex"
+      },
+      {
+        "name": "Kiro OAuth",
+        "providerType": "kiro_oauth",
+        "apiFormat": null,
+        "baseUrl": "https://q.us-east-1.amazonaws.com"
+      },
+      {
+        "name": "Ollama API Key",
+        "providerType": "ollama_cloud",
+        "apiFormat": "openai_chat",
+        "baseUrl": "https://ollama.com"
+      },
+      {
+        "name": "Cursor OAuth",
+        "providerType": "cursor_oauth",
+        "apiFormat": null,
+        "baseUrl": "https://api2.cursor.sh"
+      },
+      {
+        "name": "Cursor API Key",
+        "providerType": "cursor_apikey",
+        "apiFormat": null,
+        "baseUrl": "https://api.cursor.com"
+      },
+      {
+        "name": "Antigravity OAuth",
+        "providerType": "antigravity_oauth",
+        "apiFormat": "gemini_native",
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com"
+      },
+      {
+        "name": "Antigravity CLI (agy)",
+        "providerType": "agy_oauth",
+        "apiFormat": "gemini_native",
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com"
+      },
+      {
+        "name": "GitHub Copilot",
+        "providerType": "github_copilot",
+        "apiFormat": "openai_chat",
+        "baseUrl": "https://api.githubcopilot.com"
+      },
+      {
+        "name": "DeepSeek Official",
+        "providerType": "deepseek_account",
+        "apiFormat": null,
+        "baseUrl": "https://chat.deepseek.com"
+      },
+      {
+        "name": "AWS Bedrock (AKSK)",
+        "providerType": null,
+        "apiFormat": null,
+        "baseUrl": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com"
+      },
+      {
+        "name": "AWS Bedrock (API Key)",
+        "providerType": null,
+        "apiFormat": null,
+        "baseUrl": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com"
+      },
+      {
+        "name": "OpenRouter",
+        "providerType": null,
+        "apiFormat": null,
+        "baseUrl": "https://openrouter.ai/api"
+      },
+      {
+        "name": "Nvidia",
+        "providerType": null,
+        "apiFormat": "openai_chat",
+        "baseUrl": "https://integrate.api.nvidia.com"
+      },
+      {
+        "name": "DeepSeek(API Key)",
+        "providerType": null,
+        "apiFormat": null,
+        "baseUrl": "https://api.deepseek.com/anthropic"
+      }
+    ],
+    "codex": [
+      {
+        "name": "OpenAI OAuth",
+        "providerType": "codex_oauth",
+        "apiFormat": null,
+        "baseUrl": null
+      },
+      {
+        "name": "Cursor API Key",
+        "providerType": "cursor_apikey",
+        "apiFormat": "openai_chat",
+        "baseUrl": "https://api.cursor.com"
+      },
+      {
+        "name": "Cursor OAuth",
+        "providerType": "cursor_oauth",
+        "apiFormat": "openai_chat",
+        "baseUrl": "https://api2.cursor.sh"
+      },
+      {
+        "name": "Ollama API Key",
+        "providerType": "ollama_cloud",
+        "apiFormat": "openai_chat",
+        "baseUrl": "https://ollama.com"
+      },
+      {
+        "name": "OpenRouter",
+        "providerType": null,
+        "apiFormat": null,
+        "baseUrl": "https://openrouter.ai/api/v1"
+      },
+      {
+        "name": "Nvidia",
+        "providerType": null,
+        "apiFormat": "openai_chat",
+        "baseUrl": "https://integrate.api.nvidia.com/v1"
+      },
+      {
+        "name": "DeepSeek(API Key)",
+        "providerType": null,
+        "apiFormat": "openai_chat",
+        "baseUrl": "https://api.deepseek.com"
+      }
+    ],
+    "gemini": [
+      {
+        "name": "Google Official",
+        "providerType": "google_gemini_oauth",
+        "apiFormat": null,
+        "baseUrl": null
+      },
+      {
+        "name": "Antigravity OAuth",
+        "providerType": "antigravity_oauth",
+        "apiFormat": null,
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com"
+      },
+      {
+        "name": "Antigravity CLI (agy)",
+        "providerType": "agy_oauth",
+        "apiFormat": null,
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com"
+      },
+      {
+        "name": "OpenRouter",
+        "providerType": null,
+        "apiFormat": null,
+        "baseUrl": "https://openrouter.ai/api"
+      }
+    ],
+    "universal": [
+      {
+        "name": "NewAPI",
+        "providerType": "newapi",
+        "apiFormat": null,
+        "baseUrl": null
+      },
+      {
+        "name": "自定义网关",
+        "providerType": "custom_gateway",
+        "apiFormat": null,
+        "baseUrl": null
+      }
+    ]
+  },
+  "fixtures": {
+    "claude": [
+      {
+        "app": "claude",
+        "name": "Claude Official",
+        "expectedProviderType": "claude_oauth",
+        "provider": {
+          "id": "claude:Claude Official",
+          "name": "Claude Official",
+          "settingsConfig": {},
+          "meta": {
+            "providerType": "claude_oauth"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "OpenAI OAuth",
+        "expectedProviderType": "codex_oauth",
+        "provider": {
+          "id": "claude:OpenAI OAuth",
+          "name": "OpenAI OAuth",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://chatgpt.com/backend-api/codex"
+            }
+          },
+          "meta": {
+            "providerType": "codex_oauth",
+            "apiFormat": "openai_responses"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "Kiro OAuth",
+        "expectedProviderType": "kiro_oauth",
+        "provider": {
+          "id": "claude:Kiro OAuth",
+          "name": "Kiro OAuth",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://q.us-east-1.amazonaws.com"
+            }
+          },
+          "meta": {
+            "providerType": "kiro_oauth"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "Ollama API Key",
+        "expectedProviderType": "ollama_cloud",
+        "provider": {
+          "id": "claude:Ollama API Key",
+          "name": "Ollama API Key",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://ollama.com"
+            }
+          },
+          "meta": {
+            "providerType": "ollama_cloud",
+            "apiFormat": "openai_chat"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "Cursor OAuth",
+        "expectedProviderType": "cursor_oauth",
+        "provider": {
+          "id": "claude:Cursor OAuth",
+          "name": "Cursor OAuth",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://api2.cursor.sh"
+            }
+          },
+          "meta": {
+            "providerType": "cursor_oauth"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "Cursor API Key",
+        "expectedProviderType": "cursor_apikey",
+        "provider": {
+          "id": "claude:Cursor API Key",
+          "name": "Cursor API Key",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://api.cursor.com"
+            }
+          },
+          "meta": {
+            "providerType": "cursor_apikey"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "Antigravity OAuth",
+        "expectedProviderType": "antigravity_oauth",
+        "provider": {
+          "id": "claude:Antigravity OAuth",
+          "name": "Antigravity OAuth",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://daily-cloudcode-pa.googleapis.com"
+            }
+          },
+          "meta": {
+            "providerType": "antigravity_oauth",
+            "apiFormat": "gemini_native"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "Antigravity CLI (agy)",
+        "expectedProviderType": "agy_oauth",
+        "provider": {
+          "id": "claude:Antigravity CLI (agy)",
+          "name": "Antigravity CLI (agy)",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://daily-cloudcode-pa.googleapis.com"
+            }
+          },
+          "meta": {
+            "providerType": "agy_oauth",
+            "apiFormat": "gemini_native"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "GitHub Copilot",
+        "expectedProviderType": "github_copilot",
+        "provider": {
+          "id": "claude:GitHub Copilot",
+          "name": "GitHub Copilot",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://api.githubcopilot.com"
+            }
+          },
+          "meta": {
+            "providerType": "github_copilot",
+            "apiFormat": "openai_chat"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "DeepSeek Official",
+        "expectedProviderType": "deepseek_account",
+        "provider": {
+          "id": "claude:DeepSeek Official",
+          "name": "DeepSeek Official",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://chat.deepseek.com"
+            }
+          },
+          "meta": {
+            "providerType": "deepseek_account"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "AWS Bedrock (AKSK)",
+        "expectedProviderType": "aws_bedrock",
+        "provider": {
+          "id": "claude:AWS Bedrock (AKSK)",
+          "name": "AWS Bedrock (AKSK)",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com"
+            }
+          },
+          "meta": null
+        }
+      },
+      {
+        "app": "claude",
+        "name": "AWS Bedrock (API Key)",
+        "expectedProviderType": "aws_bedrock",
+        "provider": {
+          "id": "claude:AWS Bedrock (API Key)",
+          "name": "AWS Bedrock (API Key)",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com"
+            }
+          },
+          "meta": null
+        }
+      },
+      {
+        "app": "claude",
+        "name": "OpenRouter",
+        "expectedProviderType": "openrouter",
+        "provider": {
+          "id": "claude:OpenRouter",
+          "name": "OpenRouter",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://openrouter.ai/api"
+            }
+          },
+          "meta": null
+        }
+      },
+      {
+        "app": "claude",
+        "name": "Nvidia",
+        "expectedProviderType": "nvidia",
+        "provider": {
+          "id": "claude:Nvidia",
+          "name": "Nvidia",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://integrate.api.nvidia.com"
+            }
+          },
+          "meta": {
+            "apiFormat": "openai_chat"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "DeepSeek(API Key)",
+        "expectedProviderType": "deepseek_api",
+        "provider": {
+          "id": "claude:DeepSeek(API Key)",
+          "name": "DeepSeek(API Key)",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"
+            }
+          },
+          "meta": null
+        }
+      }
+    ],
+    "codex": [
+      {
+        "app": "codex",
+        "name": "OpenAI OAuth",
+        "expectedProviderType": "codex_oauth",
+        "provider": {
+          "id": "codex:OpenAI OAuth",
+          "name": "OpenAI OAuth",
+          "settingsConfig": {},
+          "meta": {
+            "providerType": "codex_oauth"
+          }
+        }
+      },
+      {
+        "app": "codex",
+        "name": "Cursor API Key",
+        "expectedProviderType": "cursor_apikey",
+        "provider": {
+          "id": "codex:Cursor API Key",
+          "name": "Cursor API Key",
+          "settingsConfig": {
+            "env": {
+              "OPENAI_BASE_URL": "https://api.cursor.com"
+            }
+          },
+          "meta": {
+            "providerType": "cursor_apikey",
+            "apiFormat": "openai_chat"
+          }
+        }
+      },
+      {
+        "app": "codex",
+        "name": "Cursor OAuth",
+        "expectedProviderType": "cursor_oauth",
+        "provider": {
+          "id": "codex:Cursor OAuth",
+          "name": "Cursor OAuth",
+          "settingsConfig": {
+            "env": {
+              "OPENAI_BASE_URL": "https://api2.cursor.sh"
+            }
+          },
+          "meta": {
+            "providerType": "cursor_oauth",
+            "apiFormat": "openai_chat"
+          }
+        }
+      },
+      {
+        "app": "codex",
+        "name": "Ollama API Key",
+        "expectedProviderType": "ollama_cloud",
+        "provider": {
+          "id": "codex:Ollama API Key",
+          "name": "Ollama API Key",
+          "settingsConfig": {
+            "env": {
+              "OPENAI_BASE_URL": "https://ollama.com"
+            }
+          },
+          "meta": {
+            "providerType": "ollama_cloud",
+            "apiFormat": "openai_chat"
+          }
+        }
+      },
+      {
+        "app": "codex",
+        "name": "OpenRouter",
+        "expectedProviderType": "openrouter",
+        "provider": {
+          "id": "codex:OpenRouter",
+          "name": "OpenRouter",
+          "settingsConfig": {
+            "env": {
+              "OPENAI_BASE_URL": "https://openrouter.ai/api/v1"
+            }
+          },
+          "meta": null
+        }
+      },
+      {
+        "app": "codex",
+        "name": "Nvidia",
+        "expectedProviderType": "nvidia",
+        "provider": {
+          "id": "codex:Nvidia",
+          "name": "Nvidia",
+          "settingsConfig": {
+            "env": {
+              "OPENAI_BASE_URL": "https://integrate.api.nvidia.com/v1"
+            }
+          },
+          "meta": {
+            "apiFormat": "openai_chat"
+          }
+        }
+      },
+      {
+        "app": "codex",
+        "name": "DeepSeek(API Key)",
+        "expectedProviderType": "deepseek_api",
+        "provider": {
+          "id": "codex:DeepSeek(API Key)",
+          "name": "DeepSeek(API Key)",
+          "settingsConfig": {
+            "env": {
+              "OPENAI_BASE_URL": "https://api.deepseek.com"
+            }
+          },
+          "meta": {
+            "apiFormat": "openai_chat"
+          }
+        }
+      }
+    ],
+    "gemini": [
+      {
+        "app": "gemini",
+        "name": "Google Official",
+        "expectedProviderType": "gemini_cli",
+        "provider": {
+          "id": "gemini:Google Official",
+          "name": "Google Official",
+          "settingsConfig": {},
+          "meta": {
+            "providerType": "google_gemini_oauth"
+          }
+        }
+      },
+      {
+        "app": "gemini",
+        "name": "Antigravity OAuth",
+        "expectedProviderType": "antigravity_oauth",
+        "provider": {
+          "id": "gemini:Antigravity OAuth",
+          "name": "Antigravity OAuth",
+          "settingsConfig": {
+            "env": {
+              "GOOGLE_GEMINI_BASE_URL": "https://daily-cloudcode-pa.googleapis.com"
+            }
+          },
+          "meta": {
+            "providerType": "antigravity_oauth"
+          }
+        }
+      },
+      {
+        "app": "gemini",
+        "name": "Antigravity CLI (agy)",
+        "expectedProviderType": "agy_oauth",
+        "provider": {
+          "id": "gemini:Antigravity CLI (agy)",
+          "name": "Antigravity CLI (agy)",
+          "settingsConfig": {
+            "env": {
+              "GOOGLE_GEMINI_BASE_URL": "https://daily-cloudcode-pa.googleapis.com"
+            }
+          },
+          "meta": {
+            "providerType": "agy_oauth"
+          }
+        }
+      },
+      {
+        "app": "gemini",
+        "name": "OpenRouter",
+        "expectedProviderType": "openrouter",
+        "provider": {
+          "id": "gemini:OpenRouter",
+          "name": "OpenRouter",
+          "settingsConfig": {
+            "env": {
+              "GOOGLE_GEMINI_BASE_URL": "https://openrouter.ai/api"
+            }
+          },
+          "meta": null
+        }
+      }
+    ]
+  }
+}

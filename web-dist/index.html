@@ -1,0 +1,1839 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cc-switch-server</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d9dde3;
+      --text: #1f2328;
+      --muted: #667085;
+      --accent: #1769aa;
+      --bad: #b42318;
+      --good: #087443;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+    }
+    header {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+    main {
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      min-height: calc(100vh - 52px);
+    }
+    nav {
+      border-right: 1px solid var(--line);
+      background: #fbfbfc;
+      padding: 12px;
+    }
+	    nav button, button {
+	      border: 1px solid var(--line);
+	      background: #fff;
+	      color: var(--text);
+	      min-height: 34px;
+      border-radius: 6px;
+	      padding: 0 10px;
+	      cursor: pointer;
+	    }
+	    button:disabled {
+	      color: var(--muted);
+	      background: #f1f3f5;
+	      cursor: not-allowed;
+	    }
+    nav button {
+      display: block;
+      width: 100%;
+      text-align: left;
+      margin-bottom: 6px;
+    }
+    nav button.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: #eef6fd;
+    }
+    section { padding: 18px; }
+    h1 { font-size: 17px; margin: 0; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+    }
+    .wide { grid-column: 1 / -1; }
+    .compact-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px 10px;
+      align-items: end;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      min-width: 0;
+    }
+    label {
+      display: block;
+      color: var(--muted);
+      margin: 8px 0 4px;
+      font-size: 12px;
+    }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      min-height: 34px;
+      padding: 7px 9px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+    th { color: var(--muted); font-weight: 600; background: #fbfbfc; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .check-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+    .check-row label { display: inline-flex; align-items: center; gap: 6px; margin: 0; color: var(--text); }
+    .check-row input { width: auto; min-height: 0; }
+    .stack { display: grid; gap: 8px; }
+    .small { font-size: 12px; }
+    .muted { color: var(--muted); }
+    .ok { color: var(--good); }
+    .bad { color: var(--bad); }
+    .hidden { display: none; }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+    @media (max-width: 760px) {
+      main { grid-template-columns: 1fr; }
+      nav { border-right: 0; border-bottom: 1px solid var(--line); }
+      nav button { display: inline-block; width: auto; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>cc-switch-server</h1>
+    <div class="row">
+      <span id="sessionState" class="muted">未登录</span>
+      <button id="refreshBtn">刷新</button>
+    </div>
+  </header>
+  <main>
+    <nav id="tabs"></nav>
+    <section>
+      <div id="setupView" class="panel hidden">
+        <h2>首次设置</h2>
+        <label>Password</label><input id="setupPassword" type="password">
+        <label>Owner email</label><input id="setupEmail" type="email">
+        <label>Router URL</label><input id="setupRouter" value="https://router.example.com">
+        <label>Client tunnel subdomain</label><input id="setupSubdomain">
+        <div style="height:10px"></div><button id="setupBtn">保存</button>
+      </div>
+      <div id="loginView" class="panel hidden">
+        <h2>登录</h2>
+        <label>Method</label>
+        <select id="loginMethod"><option value="password">password</option><option value="api_token">api token</option><option value="email">email</option></select>
+        <label>Password / API token / Email</label><input id="loginSecret" type="password">
+        <div id="emailLoginFields" class="hidden">
+          <label>Email code</label><input id="loginCode" inputmode="numeric" autocomplete="one-time-code">
+          <div style="height:10px"></div><button id="requestEmailCodeBtn">发送验证码</button>
+        </div>
+        <div style="height:10px"></div><button id="loginBtn">登录</button>
+      </div>
+      <div id="appView" class="hidden">
+        <div id="content"></div>
+      </div>
+      <div style="height:12px"></div>
+      <div id="notice" class="muted"></div>
+    </section>
+  </main>
+  <script>
+    const tabs = ["Providers", "Universal", "Accounts", "Shares", "Usage", "Pricing", "Router", "Settings", "Failover", "Backup"];
+    let token = localStorage.getItem("ccsToken") || "";
+    let current = "Providers";
+    let accountEditBase = null;
+    let eventSource = null;
+    let eventReloadTimer = null;
+    const fallbackProviderTypesByApp = {
+      claude: ["claude","claude_auth","claude_oauth","codex_oauth","gemini_cli","openrouter","github_copilot","deepseek_account","kiro_oauth","cursor_oauth","cursor_apikey","antigravity_oauth","agy_oauth","ollama_cloud","aws_bedrock","nvidia","deepseek_api"],
+      codex: ["codex","codex_oauth","openrouter","cursor_oauth","cursor_apikey","ollama_cloud","nvidia","deepseek_api","claude","claude_auth","claude_oauth","gemini","gemini_cli"],
+      gemini: ["gemini","gemini_cli","openrouter","antigravity_oauth","agy_oauth","claude","claude_auth","claude_oauth","codex","codex_oauth","nvidia","deepseek_api"]
+    };
+    const fallbackProviderLabels = {
+      claude: "Claude API", claude_auth: "Claude bearer relay", claude_oauth: "Claude OAuth",
+      codex: "OpenAI/Codex", codex_oauth: "OpenAI OAuth", gemini: "Gemini API", gemini_cli: "Gemini OAuth/CLI",
+      openrouter: "OpenRouter", github_copilot: "GitHub Copilot", deepseek_account: "DeepSeek Account",
+      kiro_oauth: "Kiro OAuth", cursor_oauth: "Cursor OAuth", cursor_apikey: "Cursor API Key",
+      antigravity_oauth: "Antigravity OAuth", agy_oauth: "Antigravity CLI", ollama_cloud: "Ollama Cloud",
+      aws_bedrock: "AWS Bedrock", nvidia: "Nvidia", deepseek_api: "DeepSeek API Key"
+    };
+    const fallbackProviderDefaults = {
+      claude: {baseUrl:"https://api.anthropic.com", apiFormat:"anthropic", model:"claude-sonnet-4-6", key:"ANTHROPIC_API_KEY"},
+      claude_auth: {baseUrl:"https://api.anthropic.com", apiFormat:"anthropic", model:"claude-sonnet-4-6", key:"ANTHROPIC_AUTH_TOKEN"},
+      claude_oauth: {baseUrl:"https://api.anthropic.com", apiFormat:"anthropic", model:"claude-sonnet-4-6", key:"ANTHROPIC_AUTH_TOKEN"},
+      codex: {baseUrl:"https://api.openai.com/v1", apiFormat:"openai_responses", model:"gpt-5.5", key:"OPENAI_API_KEY"},
+      codex_oauth: {baseUrl:"https://chatgpt.com/backend-api/codex", apiFormat:"openai_responses", model:"gpt-5.5", key:"OPENAI_API_KEY"},
+      gemini: {baseUrl:"https://generativelanguage.googleapis.com", apiFormat:"gemini_native", model:"gemini-3.5-flash", key:"GEMINI_API_KEY"},
+      gemini_cli: {baseUrl:"https://generativelanguage.googleapis.com", apiFormat:"gemini_native", model:"gemini-3.5-flash", key:"GEMINI_API_KEY"},
+      openrouter: {baseUrl:"https://openrouter.ai/api", apiFormat:"openai_chat", model:"openrouter/auto", key:"API_KEY"},
+      github_copilot: {baseUrl:"https://api.githubcopilot.com", apiFormat:"openai_chat", model:"gpt-5.5", key:"ANTHROPIC_AUTH_TOKEN"},
+      deepseek_account: {baseUrl:"https://chat.deepseek.com", apiFormat:"anthropic", model:"deepseek-v4-pro", key:"ANTHROPIC_AUTH_TOKEN"},
+      kiro_oauth: {baseUrl:"https://q.us-east-1.amazonaws.com", apiFormat:"anthropic", model:"claude-sonnet-4-8", key:"ANTHROPIC_AUTH_TOKEN"},
+      cursor_oauth: {baseUrl:"https://api2.cursor.sh", apiFormat:"openai_chat", model:"composer-2.5", key:"ANTHROPIC_AUTH_TOKEN"},
+      cursor_apikey: {baseUrl:"https://api.cursor.com", apiFormat:"openai_chat", model:"composer-2.5", key:"ANTHROPIC_AUTH_TOKEN"},
+      antigravity_oauth: {baseUrl:"https://daily-cloudcode-pa.googleapis.com", apiFormat:"gemini_native", model:"gemini-3.5-flash-medium", key:"GEMINI_API_KEY"},
+      agy_oauth: {baseUrl:"https://daily-cloudcode-pa.googleapis.com", apiFormat:"gemini_native", model:"gemini-3.5-flash-medium", key:"GEMINI_API_KEY"},
+      ollama_cloud: {baseUrl:"https://ollama.com", apiFormat:"openai_chat", model:"gpt-oss:20b", key:"OPENAI_API_KEY"},
+      aws_bedrock: {baseUrl:"https://bedrock-runtime.${AWS_REGION}.amazonaws.com", apiFormat:"anthropic", model:"global.anthropic.claude-opus-4-8", key:"AWS_ACCESS_KEY_ID"},
+      nvidia: {baseUrl:"https://integrate.api.nvidia.com/v1", apiFormat:"openai_chat", model:"moonshotai/kimi-k2.5", key:"OPENAI_API_KEY"},
+      deepseek_api: {baseUrl:"https://api.deepseek.com", apiFormat:"openai_chat", model:"deepseek-v4-flash", key:"OPENAI_API_KEY"}
+    };
+    const fallbackProviderTemplateEnv = {
+      claude: ["ANTHROPIC_BASE_URL","ANTHROPIC_API_KEY","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_OPUS_MODEL"],
+      claude_auth: ["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_OPUS_MODEL"],
+      claude_oauth: ["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_OPUS_MODEL"],
+      codex: ["OPENAI_BASE_URL","OPENAI_API_KEY"],
+      codex_oauth: ["OPENAI_BASE_URL","OPENAI_API_KEY"],
+      gemini: ["GOOGLE_GEMINI_BASE_URL","GEMINI_API_KEY","GEMINI_MODEL"],
+      gemini_cli: ["GOOGLE_GEMINI_BASE_URL","GEMINI_API_KEY","GEMINI_MODEL"],
+      openrouter: ["OPENAI_BASE_URL","OPENAI_API_KEY"],
+      github_copilot: ["ANTHROPIC_AUTH_TOKEN"],
+      deepseek_account: ["ANTHROPIC_AUTH_TOKEN"],
+      kiro_oauth: ["ANTHROPIC_AUTH_TOKEN"],
+      cursor_oauth: ["OPENAI_BASE_URL","ANTHROPIC_AUTH_TOKEN"],
+      cursor_apikey: ["OPENAI_BASE_URL","ANTHROPIC_AUTH_TOKEN"],
+      antigravity_oauth: ["GOOGLE_GEMINI_BASE_URL","GEMINI_API_KEY","GEMINI_MODEL"],
+      agy_oauth: ["GOOGLE_GEMINI_BASE_URL","GEMINI_API_KEY","GEMINI_MODEL"],
+      ollama_cloud: ["OPENAI_BASE_URL","OPENAI_API_KEY"],
+      aws_bedrock: ["AWS_REGION","AWS_ACCESS_KEY_ID","AWS_SECRET_ACCESS_KEY","AWS_SESSION_TOKEN","CLAUDE_CODE_USE_BEDROCK"],
+      nvidia: ["OPENAI_BASE_URL","OPENAI_API_KEY"],
+      deepseek_api: ["OPENAI_BASE_URL","OPENAI_API_KEY"]
+    };
+    let providerTypesByApp = cloneConfig(fallbackProviderTypesByApp);
+    let providerLabels = cloneConfig(fallbackProviderLabels);
+    let providerDefaults = cloneConfig(fallbackProviderDefaults);
+    let providerTemplateEnv = cloneConfig(fallbackProviderTemplateEnv);
+    let providerMatrixCache = null;
+    let providerMatrixEntriesByKey = {};
+
+    const api = async (path, options = {}) => {
+      const headers = Object.assign({"content-type": "application/json"}, options.headers || {});
+      if (token) headers.authorization = "Bearer " + token;
+      const res = await fetch(path, Object.assign({}, options, {headers}));
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok) throw new Error(data.error || data.message || text || res.statusText);
+      return data;
+    };
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const notice = (msg, bad=false) => {
+      const el = document.getElementById("notice");
+      el.className = bad ? "bad" : "muted";
+      el.textContent = msg;
+    };
+    async function copyText(text) {
+      if (navigator.clipboard?.writeText) {
+        try { await navigator.clipboard.writeText(text); } catch (_) {}
+      }
+    }
+    function cloneConfig(value) {
+      return JSON.parse(JSON.stringify(value));
+    }
+    async function loadProviderMatrix() {
+      if (providerMatrixCache) return providerMatrixCache;
+      try {
+        const matrix = await api("/api/provider-matrix");
+        applyProviderMatrix(matrix);
+        return providerMatrixCache;
+      } catch (e) {
+        providerMatrixCache = {ok: false, entries: [], providerTypes: [], summary: null, error: e.message};
+        return providerMatrixCache;
+      }
+    }
+    function applyProviderMatrix(matrix) {
+      if (!matrix || !Array.isArray(matrix.entries) || !matrix.entries.length) return;
+      providerMatrixCache = matrix;
+      providerTypesByApp = {};
+      providerLabels = {};
+      providerDefaults = {};
+      providerTemplateEnv = {};
+      providerMatrixEntriesByKey = {};
+      for (const entry of matrix.entries) {
+        providerMatrixEntriesByKey[capabilityKey(entry.app, entry.providerType)] = entry;
+        if (entry.uiVisible) {
+          (providerTypesByApp[entry.app] ||= []).push(entry.providerType);
+        }
+      }
+      for (const item of matrix.providerTypes || []) {
+        const type = item.providerType;
+        providerLabels[type] = item.label || type;
+        providerDefaults[type] = item.defaults || {};
+        providerTemplateEnv[type] = item.templateEnv || [];
+      }
+      for (const [app, types] of Object.entries(providerTypesByApp)) {
+        providerTypesByApp[app] = [...new Set(types)];
+      }
+    }
+    function providerMatrixEntry(app, providerType) {
+      return providerMatrixEntriesByKey[capabilityKey(app, providerType)] || null;
+    }
+
+    async function init() {
+      renderTabs();
+      document.getElementById("refreshBtn").onclick = load;
+      document.getElementById("setupBtn").onclick = setup;
+      document.getElementById("loginBtn").onclick = login;
+      document.getElementById("requestEmailCodeBtn").onclick = requestEmailCode;
+      document.getElementById("loginMethod").onchange = updateLoginControls;
+      updateLoginControls();
+      await load();
+    }
+    function renderTabs() {
+      document.getElementById("tabs").innerHTML = tabs.map(tab => `<button data-tab="${tab}" class="${tab===current?'active':''}">${tab}</button>`).join("");
+      document.querySelectorAll("[data-tab]").forEach(btn => btn.onclick = () => { current = btn.dataset.tab; renderTabs(); loadApp(); });
+    }
+    async function load() {
+      try {
+        const status = await api("/api/setup/status", {headers: {}});
+        document.getElementById("setupView").classList.toggle("hidden", !status.needsSetup);
+        document.getElementById("loginView").classList.toggle("hidden", status.needsSetup || !!token);
+        document.getElementById("appView").classList.toggle("hidden", status.needsSetup || !token);
+        document.getElementById("sessionState").textContent = token ? "已登录" : "未登录";
+        if (!status.needsSetup && token) {
+          connectEvents();
+          await loadApp();
+        } else {
+          disconnectEvents();
+        }
+      } catch (e) { notice(e.message, true); }
+    }
+    async function setup() {
+      try {
+        await api("/api/setup", {method:"POST", body: JSON.stringify({
+          password: setupPassword.value,
+          ownerEmail: setupEmail.value,
+          routerUrl: setupRouter.value,
+          clientTunnelSubdomain: setupSubdomain.value
+        })});
+        notice("setup complete");
+        await load();
+      } catch (e) { notice(e.message, true); }
+    }
+    async function login() {
+      try {
+        const method = loginMethod.value;
+        if (method === "email") {
+          const res = await api("/api/auth/email/verify-code", {method:"POST", body: JSON.stringify({email: loginSecret.value, code: loginCode.value})});
+          token = res.token;
+          localStorage.setItem("ccsToken", token);
+          await load();
+          return;
+        }
+        const body = {method};
+        if (method === "password") body.password = loginSecret.value;
+        if (method === "api_token") body.apiToken = loginSecret.value;
+        const res = await api("/api/auth/login", {method:"POST", body: JSON.stringify(body)});
+        token = res.token;
+        localStorage.setItem("ccsToken", token);
+        await load();
+      } catch (e) { notice(e.message, true); }
+    }
+    async function requestEmailCode() {
+      try {
+        const res = await api("/api/auth/email/request-code", {method:"POST", body: JSON.stringify({email: loginSecret.value})});
+        notice(`code sent to ${res.maskedDestination || "email"}`);
+      } catch (e) { notice(e.message, true); }
+    }
+    function updateLoginControls() {
+      const isEmail = loginMethod.value === "email";
+      emailLoginFields.classList.toggle("hidden", !isEmail);
+      loginSecret.type = isEmail ? "email" : "password";
+    }
+    function connectEvents() {
+      if (!token || eventSource) return;
+      eventSource = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
+      eventSource.onmessage = event => handleServerEvent(event);
+      ["usage.created","usage.updated","share.changed","share.deleted","share.imported","tunnel.changed","backup.created","backup.restored"].forEach(type => {
+        eventSource.addEventListener(type, event => handleServerEvent(event));
+      });
+      eventSource.onerror = () => {
+        if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+          disconnectEvents();
+        }
+      };
+    }
+    function disconnectEvents() {
+      if (eventSource) eventSource.close();
+      eventSource = null;
+      if (eventReloadTimer) clearTimeout(eventReloadTimer);
+      eventReloadTimer = null;
+    }
+    function handleServerEvent(event) {
+      let payload = {};
+      try { payload = JSON.parse(event.data || "{}"); } catch (_) {}
+      const type = payload.eventType || event.type || "";
+      if (!type || type === "message") return;
+      const shouldRefresh =
+        (type.startsWith("usage.") && current === "Usage") ||
+        (type.startsWith("share.") && current === "Shares") ||
+        (type.startsWith("tunnel.") && (current === "Router" || current === "Shares" || current === "Settings")) ||
+        (type.startsWith("backup.") && current === "Backup");
+      if (!shouldRefresh) return;
+      if (eventReloadTimer) clearTimeout(eventReloadTimer);
+      eventReloadTimer = setTimeout(() => {
+        eventReloadTimer = null;
+        loadApp().catch(e => notice(e.message, true));
+      }, 300);
+    }
+    async function loadApp() {
+      const loaders = {Providers: loadProviders, Universal: loadUniversalProviders, Accounts: loadAccounts, Shares: loadShares, Usage: loadUsage, Pricing: loadPricing, Router: loadRouter, Settings: loadSettings, Failover: loadFailover, Backup: loadBackups};
+      await loaders[current]();
+    }
+    async function loadProviders() {
+      const app = document.getElementById("providerFilter")?.value || "claude";
+      const [matrix, providers, health, presets, proxyCaps, accountCaps] = await Promise.all([loadProviderMatrix(), api(`/api/providers?app=${app}`), api(`/api/providers/health?app=${app}`), api(`/api/provider-presets?app=${app}`), api("/api/proxy/capabilities"), api("/api/accounts/capabilities")]);
+      const healthById = Object.fromEntries(health.providers.map(item => [item.providerId, item]));
+      const proxyCapByKey = Object.fromEntries((proxyCaps.capabilities || []).map(item => [capabilityKey(item.app, item.providerType), item]));
+      const accountCapByType = Object.fromEntries((accountCaps.capabilities || []).map(item => [item.providerType, item]));
+      const matrixWarning = matrix?.ok === false ? `<div class="bad">provider matrix API unavailable; using static fallback</div>` : "";
+      content.innerHTML = `<div class="grid"><div class="panel wide"><h2>Provider</h2>
+        ${matrixWarning}
+        <div class="compact-grid">
+          <div><label>App</label><select id="providerApp"><option ${app==="claude"?"selected":""}>claude</option><option ${app==="codex"?"selected":""}>codex</option><option ${app==="gemini"?"selected":""}>gemini</option></select></div>
+          <div><label>Provider type</label><select id="providerType">${providerTypeOptions(app)}</select></div>
+          <div><label>ID</label><input id="providerId"></div>
+          <div><label>Name</label><input id="providerName"></div>
+          <div><label>Category</label><input id="providerCategory" placeholder="official / aggregator"></div>
+          <div><label>API format</label><select id="providerApiFormat"><option value="">auto</option><option value="anthropic">anthropic</option><option value="openai_chat">openai_chat</option><option value="openai_responses">openai_responses</option><option value="gemini_native">gemini_native</option></select></div>
+          <div><label>Base URL</label><input id="providerBaseUrl"></div>
+          <div><label>API key</label><input id="providerApiKey" type="password"></div>
+          <div><label>API key field</label><select id="providerApiKeyField"><option>auto</option><option>ANTHROPIC_AUTH_TOKEN</option><option>ANTHROPIC_API_KEY</option><option>OPENAI_API_KEY</option><option>GEMINI_API_KEY</option><option>GOOGLE_API_KEY</option><option>AWS_ACCESS_KEY_ID</option></select></div>
+          <div><label>AWS region</label><input id="providerAwsRegion"></div>
+          <div><label>AWS secret key</label><input id="providerAwsSecret" type="password"></div>
+          <div><label>AWS session token</label><input id="providerAwsSession" type="password"></div>
+          <div><label>Model</label><input id="providerModel"></div>
+          <div><label>Upstream model</label><input id="providerUpstreamModel"></div>
+          <div><label>Test model</label><input id="providerTestModel"></div>
+          <div><label>Network test</label><select id="providerNetworkTest"><option value="false">config only</option><option value="true">network</option></select></div>
+          <div><label>Stream test</label><input id="providerStreamTest" type="checkbox"></div>
+          <div><label>Codex effort</label><select id="providerCodexEffort"><option value="">auto</option><option>minimal</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option></select></div>
+          <div><label>Auth provider</label><input id="providerAuthProvider"></div>
+          <div><label>Account ID</label><input id="providerAccountId"></div>
+          <div><label>Cost multiplier</label><input id="providerCostMultiplier"></div>
+          <div><label>Quota dispatch %</label><input id="providerQuotaPercent" type="number" min="0" max="100"></div>
+          <div><label>Custom User-Agent</label><input id="providerUserAgent"></div>
+          <div><label>Prompt cache key</label><input id="providerPromptCacheKey"></div>
+        </div>
+        <div class="check-row">
+          <label><input id="providerCodexFast" type="checkbox">Codex fast</label>
+          <label><input id="providerCodexImage" type="checkbox">Codex image</label>
+          <label><input id="providerIsFullUrl" type="checkbox">Full URL</label>
+        </div>
+        <label>Template variables</label><pre id="providerTemplateVars" class="muted"></pre>
+        <div class="compact-grid">
+          <div><label>Models</label><textarea id="providerModels" placeholder="one model per line"></textarea></div>
+          <div><label>Model catalog JSON</label><textarea id="providerModelCatalog">{}</textarea></div>
+          <div><label>Model mapping JSON</label><textarea id="providerModelMapping">{}</textarea></div>
+          <div><label>Cache injection JSON</label><textarea id="providerCacheInjection">{}</textarea></div>
+          <div><label>Thinking pipeline JSON</label><textarea id="providerThinkingPipeline">{}</textarea></div>
+          <div><label>Request governance JSON</label><textarea id="providerRequestGovernance">{}</textarea></div>
+          <div><label>Copilot optimizer JSON</label><textarea id="providerCopilotOptimizer">{}</textarea></div>
+          <div><label>Codex chat reasoning JSON</label><textarea id="providerCodexReasoning">{}</textarea></div>
+          <div><label>Extra env JSON</label><textarea id="providerExtraEnv">{}</textarea></div>
+        </div>
+        <label>Advanced provider JSON</label><textarea id="providerJson">{}</textarea>
+        <div class="row"><button id="applyProviderTemplate">应用类型模板</button><button id="saveProvider">保存</button><button id="clearProviderForm">清空</button></div>
+        <label>Preset</label><select id="presetName">${presets.presets.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("")}</select>
+        <button id="createPreset">从 Preset 创建</button>
+        <label>Import / export JSON</label><textarea id="providerImportJson">{ "providers": [] }</textarea>
+        <div class="row"><button id="exportProviders">导出当前 App</button><button id="exportAllProviders">导出全部</button><button id="importProviders">导入 Providers</button><button id="batchTestProviders">批量测试当前 App</button></div></div>
+        <div class="panel wide"><h2>列表</h2><label>App filter</label><select id="providerFilter"><option ${app==="claude"?"selected":""}>claude</option><option ${app==="codex"?"selected":""}>codex</option><option ${app==="gemini"?"selected":""}>gemini</option></select>
+		        ${table(["id","name","type","adapter","support","readiness","visibility","next","format","transform","stream","modelList","models","health","account","baseUrl"], providers.providers.map(p => {
+		          const cap = proxyCapByKey[capabilityKey(p.app, p.providerType)] || {};
+		          const matrixEntry = providerMatrixEntry(p.app, p.providerType) || {};
+		          return [p.provider.id,p.provider.name,p.providerType,cap.adapter || "",adapterSupportText(cap),providerReadinessText(cap, accountCapByType[p.providerType], matrixEntry),matrixEntry.visibility || "",providerNextStepText(cap, accountCapByType[p.providerType], matrixEntry, p.provider),p.provider.meta?.apiFormat || "",yesNo(cap.requiresTransform),capabilityYesNo(cap.supportsStreamUsage, cap.support),capabilityYesNo(cap.supportsModelList, cap.support),modelListText(p.provider),providerHealthText(healthById[p.provider.id]),accountBindingText(p.provider),providerBaseUrlText(p.provider)];
+		        }))}
+	        <div class="row">${providerActionButtons(providers.providers, proxyCapByKey)}</div></div></div>`;
+      providerFilter.onchange = loadProviders;
+      providerApp.onchange = () => { document.getElementById("providerFilter").value = providerApp.value; loadProviders(); };
+      providerType.onchange = () => fillProviderDefaults(providerApp.value, providerType.value);
+      applyProviderTemplate.onclick = () => fillProviderDefaults(providerApp.value, providerType.value);
+      clearProviderForm.onclick = () => resetProviderForm(app);
+      saveProvider.onclick = async () => {
+        const base = parseJson(providerJson.value, {});
+        const provider = buildProviderFromForm(base);
+        await api("/api/providers", {method:"POST", body: JSON.stringify({app: providerApp.value, provider})});
+        await loadProviders();
+      };
+      createPreset.onclick = async () => {
+        await api("/api/providers/from-preset", {method:"POST", body: JSON.stringify({app: providerApp.value, name: presetName.value})});
+        await loadProviders();
+      };
+      exportProviders.onclick = async () => {
+        const res = await api(`/api/providers/export?app=${providerApp.value}`);
+        providerImportJson.value = JSON.stringify({providers: res.providers}, null, 2);
+      };
+      exportAllProviders.onclick = async () => {
+        const res = await api("/api/providers/export");
+        providerImportJson.value = JSON.stringify({providers: res.providers}, null, 2);
+      };
+      importProviders.onclick = async () => {
+        const payload = parseJson(providerImportJson.value, {providers: []});
+        const providersToImport = normalizeProviderImport(payload);
+        const res = await api("/api/providers/import", {method:"POST", body: JSON.stringify({providers: providersToImport})});
+        notice(`imported ${res.imported}`);
+        await loadProviders();
+      };
+      batchTestProviders.onclick = async () => {
+        const res = await api("/api/providers/test", {method:"POST", body: JSON.stringify(providerTestPayload({app: providerFilter.value}))});
+        notice(`tested ${res.results.length} providers`);
+      };
+      document.querySelectorAll("[data-test-provider]").forEach(btn => btn.onclick = async () => {
+        const params = providerTestParams();
+        const suffix = params.toString() ? `?${params.toString()}` : "";
+        const res = await api(`/api/providers/${btn.dataset.testProvider}/test${suffix}`, {method:"POST"});
+        notice(`${res.adapter} ${res.model}${res.stream ? " stream" : ""} ${res.networkError || res.endpoint}`);
+      });
+      document.querySelectorAll("[data-fetch-models]").forEach(btn => btn.onclick = async () => {
+        const res = await api(`/api/providers/${btn.dataset.fetchModels}/fetch-models`, {method:"POST", body: JSON.stringify({app: providerFilter.value, merge: true})});
+        notice(`fetched ${res.models.length} models, merged ${res.mergedCount}`);
+        await loadProviders();
+      });
+      document.querySelectorAll("[data-edit-provider]").forEach(btn => btn.onclick = () => {
+        const stored = providers.providers.find(item => item.provider.id === btn.dataset.editProvider);
+        if (stored) fillProviderForm(stored.app, stored.providerType, stored.provider);
+      });
+      resetProviderForm(app);
+    }
+    async function loadUniversalProviders() {
+      const data = await api("/api/universal-providers");
+      const providers = Object.values(data.providers || {});
+      const defaultProvider = {
+        id: "",
+        name: "NewAPI",
+        providerType: "newapi",
+        apps: {claude: true, codex: true, gemini: true},
+        baseUrl: "",
+        apiKey: "",
+        models: {
+          claude: {model: "claude-sonnet-4-6", haikuModel: "claude-haiku-4-5-20251001", sonnetModel: "claude-sonnet-4-6", opusModel: "claude-opus-4-8"},
+          codex: {model: "gpt-5.5", reasoningEffort: "high"},
+          gemini: {model: "gemini-3.5-flash"}
+        }
+      };
+      content.innerHTML = `<div class="grid"><div class="panel wide"><h2>Universal Provider</h2>
+        <div class="compact-grid">
+          <div><label>ID</label><input id="universalId"></div>
+          <div><label>Name</label><input id="universalName" value="NewAPI"></div>
+          <div><label>Provider type</label><input id="universalType" value="newapi"></div>
+          <div><label>Base URL</label><input id="universalBaseUrl"></div>
+          <div><label>API key</label><input id="universalApiKey" type="password"></div>
+          <div><label>Website</label><input id="universalWebsite"></div>
+          <div><label>Claude model</label><input id="universalClaudeModel" value="claude-sonnet-4-6"></div>
+          <div><label>Claude Haiku</label><input id="universalClaudeHaiku" value="claude-haiku-4-5-20251001"></div>
+          <div><label>Claude Sonnet</label><input id="universalClaudeSonnet" value="claude-sonnet-4-6"></div>
+          <div><label>Claude Opus</label><input id="universalClaudeOpus" value="claude-opus-4-8"></div>
+          <div><label>Codex model</label><input id="universalCodexModel" value="gpt-5.5"></div>
+          <div><label>Codex effort</label><select id="universalCodexEffort"><option>high</option><option>medium</option><option>low</option><option>xhigh</option><option>minimal</option></select></div>
+          <div><label>Gemini model</label><input id="universalGeminiModel" value="gemini-3.5-flash"></div>
+        </div>
+        <div class="compact-grid">
+          <div><label>Claude model catalog JSON</label><textarea id="universalClaudeCatalog">{}</textarea></div>
+          <div><label>Claude model mapping JSON</label><textarea id="universalClaudeMapping">{}</textarea></div>
+          <div><label>Codex model catalog JSON</label><textarea id="universalCodexCatalog">{}</textarea></div>
+          <div><label>Codex model mapping JSON</label><textarea id="universalCodexMapping">{}</textarea></div>
+          <div><label>Codex chat reasoning JSON</label><textarea id="universalCodexReasoning">{}</textarea></div>
+          <div><label>Gemini model catalog JSON</label><textarea id="universalGeminiCatalog">{}</textarea></div>
+          <div><label>Gemini model mapping JSON</label><textarea id="universalGeminiMapping">{}</textarea></div>
+        </div>
+        <div class="check-row">
+          <label><input id="universalClaudeEnabled" type="checkbox" checked>Claude</label>
+          <label><input id="universalCodexEnabled" type="checkbox" checked>Codex</label>
+          <label><input id="universalGeminiEnabled" type="checkbox" checked>Gemini</label>
+        </div>
+        <label>Notes</label><textarea id="universalNotes"></textarea>
+        <label>Advanced JSON</label><textarea id="universalJson">${esc(JSON.stringify(defaultProvider, null, 2))}</textarea>
+        <div class="row"><button id="syncUniversalJson">JSON 同步到表单</button><button id="saveUniversal">保存</button><button id="saveSyncUniversal">保存并同步</button></div>
+        <label>Import / export JSON</label><textarea id="universalImportJson">{ "providers": [] }</textarea>
+        <div class="row"><button id="exportUniversal">导出</button><button id="importUniversal">导入</button></div></div>
+        <div class="panel wide"><h2>列表</h2>${table(["id","name","type","apps","baseUrl","models"], providers.map(p => [p.id,p.name,p.providerType,Object.entries(p.apps || {}).filter(([,v])=>v).map(([k])=>k).join(", "),p.baseUrl,universalModelsText(p)]))}
+        <div class="row">${providers.map(p => `<button data-edit-universal="${esc(p.id)}">编辑 ${esc(p.name)}</button><button data-sync-universal="${esc(p.id)}">同步 ${esc(p.name)}</button><button data-delete-universal="${esc(p.id)}">删除 ${esc(p.name)}</button>`).join("")}</div></div></div>`;
+      fillUniversalForm(defaultProvider);
+      syncUniversalJson.onclick = () => fillUniversalForm(parseJson(universalJson.value, defaultProvider));
+      saveUniversal.onclick = async () => {
+        const provider = buildUniversalFromForm(parseJson(universalJson.value, {}));
+        await api("/api/universal-providers", {method:"POST", body: JSON.stringify({provider})});
+        await loadUniversalProviders();
+      };
+      saveSyncUniversal.onclick = async () => {
+        const provider = buildUniversalFromForm(parseJson(universalJson.value, {}));
+        const saved = await api("/api/universal-providers", {method:"POST", body: JSON.stringify({provider})});
+        const res = await api(`/api/universal-providers/${saved.provider.id}/sync`, {method:"POST"});
+        const synced = (res.result.synced || []).join(", ") || "none";
+        const removed = (res.result.removed || []).join(", ");
+        notice(`synced ${synced}${removed ? `; removed ${removed}` : ""}`);
+        await loadUniversalProviders();
+      };
+      exportUniversal.onclick = async () => {
+        const res = await api("/api/universal-providers/export");
+        universalImportJson.value = JSON.stringify({providers: res.providers}, null, 2);
+      };
+      importUniversal.onclick = async () => {
+        const payload = parseJson(universalImportJson.value, {providers: []});
+        const providersToImport = normalizeUniversalImport(payload);
+        const res = await api("/api/universal-providers/import", {method:"POST", body: JSON.stringify({providers: providersToImport})});
+        notice(`imported ${res.imported}`);
+        await loadUniversalProviders();
+      };
+      document.querySelectorAll("[data-edit-universal]").forEach(btn => btn.onclick = () => {
+        const provider = providers.find(item => item.id === btn.dataset.editUniversal);
+        if (provider) fillUniversalForm(provider);
+      });
+      document.querySelectorAll("[data-sync-universal]").forEach(btn => btn.onclick = async () => {
+        const res = await api(`/api/universal-providers/${btn.dataset.syncUniversal}/sync`, {method:"POST"});
+        const synced = (res.result.synced || []).join(", ") || "none";
+        const removed = (res.result.removed || []).join(", ");
+        notice(`synced ${synced}${removed ? `; removed ${removed}` : ""}`);
+        await loadUniversalProviders();
+      });
+      document.querySelectorAll("[data-delete-universal]").forEach(btn => btn.onclick = async () => {
+        await api(`/api/universal-providers/${btn.dataset.deleteUniversal}`, {method:"DELETE"});
+        await loadUniversalProviders();
+      });
+    }
+    async function loadAccounts() {
+      const [, data, caps, templates] = await Promise.all([loadProviderMatrix(), api("/api/accounts"), api("/api/accounts/capabilities"), api("/api/accounts/import-templates")]);
+      const capabilityByType = Object.fromEntries((caps.capabilities || []).map(item => [item.providerType, item]));
+      const importTemplates = templates.templates || [];
+      content.innerHTML = `<div class="grid"><div class="panel wide"><h2>Account</h2>
+        <div class="compact-grid">
+          <div><label>ID</label><input id="accountId"></div>
+          <div><label>Provider type</label><select id="accountType">${accountTypeOptions(caps.capabilities || [])}</select></div>
+          <div><label>Import template</label><select id="accountTemplate">${accountTemplateOptions(importTemplates)}</select></div>
+          <div><label>Email</label><input id="accountEmail"></div>
+          <div><label>Subscription</label><input id="accountSubscription"></div>
+          <div><label>Quota %</label><input id="accountQuotaPercent" type="number" min="0"></div>
+          <div><label>Expires at ms</label><input id="accountExpiresAt" type="number"></div>
+          <div><label>Access token</label><input id="accountToken" type="password"></div>
+          <div><label>Refresh token</label><input id="accountRefreshToken" type="password"></div>
+          <div><label>ID token</label><input id="accountIdToken" type="password"></div>
+          <div><label>API key</label><input id="accountApiKey" type="password"></div>
+        </div>
+        <label>Scopes</label><textarea id="accountScopes" placeholder="one scope per line"></textarea>
+        <div class="compact-grid">
+          <div><label>Profile JSON</label><textarea id="accountProfileJson">{}</textarea></div>
+          <div><label>Raw JSON</label><textarea id="accountRawJson">{}</textarea></div>
+          <div><label>Quota JSON</label><textarea id="accountQuotaJson">{}</textarea></div>
+        </div>
+        <div class="row"><button id="applyAccountTemplate">应用导入模板</button><button id="fillAccountTemplateSample">填入示例 JSON</button><button id="saveAccount">保存</button><button id="clearAccountForm">清空</button></div>
+        <div class="compact-grid">
+          <div><label>Login session</label><input id="accountLoginSession"></div>
+          <div><label>OAuth state</label><input id="accountLoginState"></div>
+          <div><label>OAuth code</label><input id="accountLoginCode" type="password"></div>
+        </div>
+        <div class="row"><button id="startAccountLogin">Start login preview</button><button id="finishAccountLogin">Finish login preview</button><button id="exchangeAccountLogin">Exchange/import account</button></div>
+        <div class="compact-grid">
+          <div><label>Copilot GitHub domain</label><input id="copilotGithubDomain" value="github.com"></div>
+          <div><label>Copilot device code</label><input id="copilotDeviceCode" type="password"></div>
+          <div><label>Copilot user code</label><input id="copilotUserCode" readonly></div>
+          <div><label>Copilot verify URL</label><input id="copilotVerifyUrl" readonly></div>
+        </div>
+        <div class="row"><button id="startCopilotDevice">Start Copilot device</button><button id="pollCopilotDevice">Poll/import Copilot</button></div>
+        <div class="compact-grid">
+          <div><label>Kiro region</label><input id="kiroRegion" value="us-east-1"></div>
+          <div><label>Kiro start URL</label><input id="kiroStartUrl" value="https://view.awsapps.com/start"></div>
+          <div><label>Kiro device code</label><input id="kiroDeviceCode" type="password"></div>
+          <div><label>Kiro user code</label><input id="kiroUserCode" readonly></div>
+          <div><label>Kiro verify URL</label><input id="kiroVerifyUrl" readonly></div>
+        </div>
+        <div class="row"><button id="startKiroDevice">Start Kiro device</button><button id="pollKiroDevice">Poll/import Kiro</button></div></div>
+		        <div class="panel wide"><h2>列表</h2>${table(["id","type","status","email","credential","refresh","subscription","quota","expires","error","profile"], data.accounts.map(a => { const cap = capabilityByType[a.providerType]; return [a.id,a.providerType,accountCapabilityText(cap),a.email,accountCredentialText(a),accountRefreshStateText(a, cap),a.subscriptionLevel,accountQuotaText(a),formatTs(a.expiresAt),a.lastRefreshError || "",jsonPreview(a.profile)]; }))}
+		        <div class="row">${accountActionButtons(data.accounts, capabilityByType)}</div></div>
+		        <div class="panel wide"><h2>能力</h2>${table(["type","manager","support","status","login","refresh","plan","quota","import","stage","profile","quota strategy","blocked"], (caps.capabilities || []).map(c => [c.providerType,c.manager,c.support,c.status,capabilityYesNo(c.supportsStartLogin, c.support),capabilityYesNo(c.supportsRefresh, c.support),capabilityYesNo(c.supportsRefreshPlan, c.support),capabilityYesNo(c.supportsQuota, c.support),yesNo(c.supportsImport),c.serverNativeStage || "",c.profileStrategy || "",c.quotaStrategy || "",c.blockingReason || ""]))}</div>
+		        <div class="panel wide"><h2>导入模板</h2>${table(["type","credential","required","optional","profile","raw","notes"], importTemplates.map(t => [t.providerType,t.credentialKind,listText(t.requiredFields),listText(t.optionalFields),listText(t.profileHints),listText(t.rawHints),t.notes]))}</div></div>`;
+      resetAccountForm(caps.capabilities || [], importTemplates);
+      accountType.onchange = () => { accountTemplate.value = accountType.value; applyAccountImportTemplate(importTemplates, accountType.value); };
+      accountTemplate.onchange = () => { accountType.value = accountTemplate.value; applyAccountImportTemplate(importTemplates, accountTemplate.value); };
+      applyAccountTemplate.onclick = () => applyAccountImportTemplate(importTemplates, accountType.value);
+      fillAccountTemplateSample.onclick = () => fillAccountImportSample(importTemplates, accountType.value);
+      saveAccount.onclick = async () => {
+        await api("/api/accounts", {method:"POST", body: JSON.stringify(buildAccountFromForm())});
+        await loadAccounts();
+      };
+      clearAccountForm.onclick = () => resetAccountForm(caps.capabilities || [], importTemplates);
+      startAccountLogin.onclick = async () => {
+        const res = await api("/api/accounts/login/start", {method:"POST", body: JSON.stringify({providerType: accountType.value})});
+        accountLoginSession.value = res.login?.sessionId || "";
+        accountLoginState.value = res.login?.state || "";
+        notice(JSON.stringify(res.login));
+        if (res.login?.authorizeUrl) window.open(res.login.authorizeUrl, "_blank", "noopener");
+      };
+      finishAccountLogin.onclick = async () => {
+        const body = {
+          sessionId: accountLoginSession.value,
+          state: accountLoginState.value,
+          code: accountLoginCode.value
+        };
+        const res = await api("/api/accounts/login/finish", {method:"POST", body: JSON.stringify(body)});
+        notice(JSON.stringify(res.login));
+      };
+      exchangeAccountLogin.onclick = async () => {
+        const body = {
+          sessionId: accountLoginSession.value,
+          state: accountLoginState.value,
+          code: accountLoginCode.value,
+          executeTokenExchange: true
+        };
+        try {
+          const res = await api("/api/accounts/login/finish", {method:"POST", body: JSON.stringify(body)});
+          notice(JSON.stringify({login: res.login, account: res.account}));
+          await loadAccounts();
+        } catch (e) {
+          const pending = String(e.message || "").toLowerCase().includes("pending");
+          notice(e.message, !pending);
+        }
+      };
+      startCopilotDevice.onclick = async () => {
+        try {
+          const res = await api("/api/accounts/copilot/device/start", {method:"POST", body: JSON.stringify({githubDomain: copilotGithubDomain.value})});
+          copilotDeviceCode.value = res.device?.deviceCode || "";
+          copilotUserCode.value = res.device?.userCode || "";
+          copilotVerifyUrl.value = res.device?.verificationUriComplete || res.device?.verificationUri || "";
+          notice(`Copilot code ${copilotUserCode.value}`);
+          if (copilotVerifyUrl.value) window.open(copilotVerifyUrl.value, "_blank", "noopener");
+        } catch (e) { notice(e.message, true); }
+      };
+      pollCopilotDevice.onclick = async () => {
+        try {
+          const res = await api("/api/accounts/copilot/device/poll", {method:"POST", body: JSON.stringify({deviceCode: copilotDeviceCode.value, githubDomain: copilotGithubDomain.value})});
+          notice(res.pending ? `${res.message}; retry in ${res.retryAfterSecs || 5}s` : `Imported ${res.account?.id || "copilot account"}`);
+          if (!res.pending) await loadAccounts();
+        } catch (e) { notice(e.message, true); }
+      };
+      startKiroDevice.onclick = async () => {
+        try {
+          const res = await api("/api/accounts/kiro/device/start", {method:"POST", body: JSON.stringify({region: kiroRegion.value, startUrl: kiroStartUrl.value})});
+          kiroDeviceCode.value = res.device?.deviceCode || "";
+          kiroUserCode.value = res.device?.userCode || "";
+          kiroVerifyUrl.value = res.device?.verificationUriComplete || res.device?.verificationUri || "";
+          notice(`Kiro code ${kiroUserCode.value}`);
+          if (kiroVerifyUrl.value) window.open(kiroVerifyUrl.value, "_blank", "noopener");
+        } catch (e) { notice(e.message, true); }
+      };
+      pollKiroDevice.onclick = async () => {
+        try {
+          const res = await api("/api/accounts/kiro/device/poll", {method:"POST", body: JSON.stringify({deviceCode: kiroDeviceCode.value})});
+          notice(res.pending ? `${res.message}; retry in ${res.retryAfterSecs || 5}s` : `Imported ${res.account?.id || "kiro account"}`);
+          if (!res.pending) await loadAccounts();
+        } catch (e) { notice(e.message, true); }
+      };
+      document.querySelectorAll("[data-edit-account]").forEach(btn => btn.onclick = () => {
+        const account = data.accounts.find(item => item.id === btn.dataset.editAccount);
+        if (account) fillAccountForm(account);
+      });
+      document.querySelectorAll("[data-refresh-account]").forEach(btn => btn.onclick = async () => { await api(`/api/accounts/${btn.dataset.refreshAccount}/refresh`, {method:"POST"}); await loadAccounts(); });
+      document.querySelectorAll("[data-refresh-plan-account]").forEach(btn => btn.onclick = async () => { const res = await api(`/api/accounts/${btn.dataset.refreshPlanAccount}/refresh-plan`); notice(JSON.stringify(res)); });
+      document.querySelectorAll("[data-delete-account]").forEach(btn => btn.onclick = async () => { await api(`/api/accounts/${btn.dataset.deleteAccount}`, {method:"DELETE"}); await loadAccounts(); });
+      document.querySelectorAll("[data-quota-account]").forEach(btn => btn.onclick = async () => { const res = await api(`/api/accounts/${btn.dataset.quotaAccount}/quota?refresh=true`); notice(JSON.stringify(res.quota)); await loadAccounts(); });
+    }
+    async function loadShares() {
+      const data = await api("/api/shares");
+      content.innerHTML = `<div class="grid"><div class="panel"><h2>新增 Share</h2>
+        <label>App</label><select id="shareApp"><option>claude</option><option>codex</option><option>gemini</option></select>
+        <label>Provider ID</label><input id="shareProvider">
+        <label>Provider type</label><input id="shareType" value="codex">
+        <button id="saveShare">保存</button> <button id="snapshotShares">刷新快照</button> <button id="pullShareEdits">拉取 pending edits</button> <button id="listShareMarkets">列出 share markets</button> <button id="exportShares">导出</button>
+        <div id="shareActionResult" class="muted"></div>
+        <label>导入 JSON</label><textarea id="importJson">{ "shares": [] }</textarea><button id="importShares">导入</button></div>
+        <div class="panel wide"><h2>列表</h2>${table(["id","app","provider","status","owner","subdomain","for sale","market","grant","account","bindings","model health","router sync","router url"], data.shares.map(s => [s.id,s.app,s.providerId,s.status,s.ownerEmail || "",s.tunnelSubdomain || "",yesNo(s.forSale),s.saleMarketKind || "",marketGrantText(s.marketGrant),s.accountEmail,bindingText(s),shareModelHealthText(s),s.routerLastSyncedAtMs ? "synced" : (s.routerLastSyncError || ""),s.routerUrl || ""]))}
+        <div class="row">${data.shares.map(s => `<button data-connect-share="${esc(s.id)}">Connect info ${esc(s.id)}</button><button data-subdomain-share="${esc(s.id)}">Subdomain</button><button data-owner-share="${esc(s.id)}">Owner</button><button data-authorize-market="${esc(s.id)}">Authorize market</button><button data-pause-share="${esc(s.id)}">暂停</button><button data-resume-share="${esc(s.id)}">恢复</button><button data-binding-share="${esc(s.id)}">Binding</button><button data-start-tunnel="${esc(s.id)}">启动 tunnel</button><button data-stop-tunnel="${esc(s.id)}">停止 tunnel</button><button data-acl-share="${esc(s.id)}">ACL</button><button data-delete-share="${esc(s.id)}">删除</button>`).join("")}</div>
+        <pre id="shareConnectInfo" class="muted"></pre></div></div>`;
+      saveShare.onclick = async () => {
+        await api("/api/shares", {method:"POST", body: JSON.stringify({app: shareApp.value, providerId: shareProvider.value, providerType: shareType.value})});
+        await loadShares();
+      };
+      snapshotShares.onclick = async () => { await api("/api/shares/runtime-snapshot", {method:"POST"}); await loadShares(); };
+      pullShareEdits.onclick = async () => {
+        const res = await api("/api/router/share-edits/pull", {method:"POST"});
+        shareActionResult.textContent = JSON.stringify(res.summary || res, null, 2);
+        await loadShares();
+      };
+      listShareMarkets.onclick = async () => {
+        const res = await api("/api/share-markets");
+        shareActionResult.textContent = JSON.stringify(res.markets || [], null, 2);
+      };
+      exportShares.onclick = async () => { const res = await api("/api/shares/export"); importJson.value = JSON.stringify({shares: res.shares}, null, 2); };
+      importShares.onclick = async () => { await api("/api/shares/import", {method:"POST", body: importJson.value}); await loadShares(); };
+      document.querySelectorAll("[data-connect-share]").forEach(btn => btn.onclick = async () => {
+        const res = await api(`/api/shares/${btn.dataset.connectShare}/connect-info`);
+        const text = JSON.stringify(res, null, 2);
+        shareConnectInfo.textContent = text;
+        await copyText(text);
+        notice(`connect info copied for ${res.shareId}`);
+      });
+      document.querySelectorAll("[data-subdomain-share]").forEach(btn => btn.onclick = async () => {
+        const subdomain = prompt("share subdomain");
+        if (!subdomain) return;
+        await api(`/api/shares/${btn.dataset.subdomainShare}/subdomain`, {method:"POST", body: JSON.stringify({subdomain})});
+        await loadShares();
+      });
+      document.querySelectorAll("[data-owner-share]").forEach(btn => btn.onclick = async () => {
+        const newOwnerEmail = prompt("new owner email");
+        if (!newOwnerEmail) return;
+        await api(`/api/shares/${btn.dataset.ownerShare}/owner/request-code`, {method:"POST", body: JSON.stringify({newOwnerEmail})});
+        const code = prompt("verification code sent to new owner");
+        if (!code) return;
+        await api(`/api/shares/${btn.dataset.ownerShare}/owner/verify-code`, {method:"POST", body: JSON.stringify({newOwnerEmail, code})});
+        await loadShares();
+      });
+      document.querySelectorAll("[data-authorize-market]").forEach(btn => btn.onclick = async () => {
+        const marketEmail = prompt("share market email");
+        if (!marketEmail) return;
+        await api(`/api/shares/${btn.dataset.authorizeMarket}/authorize-market`, {method:"POST", body: JSON.stringify({marketEmail})});
+        await loadShares();
+      });
+      document.querySelectorAll("[data-pause-share]").forEach(btn => btn.onclick = async () => { await api(`/api/shares/${btn.dataset.pauseShare}/pause`, {method:"POST"}); await loadShares(); });
+      document.querySelectorAll("[data-resume-share]").forEach(btn => btn.onclick = async () => { await api(`/api/shares/${btn.dataset.resumeShare}/resume`, {method:"POST"}); await loadShares(); });
+      document.querySelectorAll("[data-start-tunnel]").forEach(btn => btn.onclick = async () => { await api(`/api/shares/${btn.dataset.startTunnel}/tunnel/start`, {method:"POST"}); await loadShares(); });
+      document.querySelectorAll("[data-stop-tunnel]").forEach(btn => btn.onclick = async () => { await api(`/api/shares/${btn.dataset.stopTunnel}/tunnel/stop`, {method:"POST"}); await loadShares(); });
+      document.querySelectorAll("[data-delete-share]").forEach(btn => btn.onclick = async () => { await api(`/api/shares/${btn.dataset.deleteShare}`, {method:"DELETE"}); await loadShares(); });
+      document.querySelectorAll("[data-binding-share]").forEach(btn => btn.onclick = async () => {
+        const app = prompt("app: claude/codex/gemini", "codex");
+        const providerId = prompt("provider id");
+        const providerType = prompt("provider type", "codex");
+        if (!app || !providerId || !providerType) return;
+        await api(`/api/shares/${btn.dataset.bindingShare}/binding`, {method:"POST", body: JSON.stringify({binding:{app, providerId, providerType}})});
+        await loadShares();
+      });
+      document.querySelectorAll("[data-acl-share]").forEach(btn => btn.onclick = async () => {
+        const email = prompt("shared email");
+        await api(`/api/shares/${btn.dataset.aclShare}/acl`, {method:"POST", body: JSON.stringify({acl:{sharedWithEmails: email ? [email] : [], publicMarketEmail: null}})});
+        await loadShares();
+      });
+    }
+    async function loadUsage() {
+      const prevLimit = document.getElementById("usageLimit")?.value || "50";
+      const prevApp = document.getElementById("usageApp")?.value || "";
+      const prevProvider = document.getElementById("usageProvider")?.value || "";
+      const prevShare = document.getElementById("usageShare")?.value || "";
+      const prevUser = document.getElementById("usageUser")?.value || "";
+      const prevSource = document.getElementById("usageSource")?.value || "";
+      const prevFrom = document.getElementById("usageFrom")?.value || "";
+      const prevTo = document.getElementById("usageTo")?.value || "";
+      const prevWindow = document.getElementById("usageWindow")?.value || "3600000";
+      const qs = new URLSearchParams({limit: prevLimit});
+      if (prevApp) qs.set("app", prevApp);
+      if (prevProvider) qs.set("providerId", prevProvider);
+      if (prevShare) qs.set("shareId", prevShare);
+      if (prevUser) qs.set("userEmail", prevUser);
+      if (prevSource) qs.set("dataSource", prevSource);
+      if (prevFrom) qs.set("fromMs", prevFrom);
+      if (prevTo) qs.set("toMs", prevTo);
+      if (prevWindow) qs.set("windowMs", prevWindow);
+      const [summary, trends, providerStats, modelStats, logs] = await Promise.all([
+        api(`/api/usage/summary?${qs}`),
+        api(`/api/usage/trends?${qs}`),
+        api(`/api/usage/provider-stats?${qs}`),
+        api(`/api/usage/model-stats?${qs}`),
+        api(`/api/usage/logs?${qs}`)
+      ]);
+      content.innerHTML = `<div class="grid"><div class="panel"><h2>Summary</h2><pre>${esc(JSON.stringify(summary.summary, null, 2))}</pre><button id="backfill">回填成本</button> <button id="retryRouterUsage">重试 Router Sync</button>
+        <label>Limit</label><input id="usageLimit" value="${esc(qs.get("limit"))}"><label>From ms</label><input id="usageFrom" value="${esc(qs.get("fromMs") || "")}"><label>To ms</label><input id="usageTo" value="${esc(qs.get("toMs") || "")}"><label>Window ms</label><input id="usageWindow" value="${esc(qs.get("windowMs") || "")}"><label>App</label><input id="usageApp" value="${esc(qs.get("app") || "")}"><label>Provider ID</label><input id="usageProvider" value="${esc(qs.get("providerId") || "")}"><label>Share ID</label><input id="usageShare" value="${esc(qs.get("shareId") || "")}"><label>User email</label><input id="usageUser" value="${esc(qs.get("userEmail") || "")}"><label>Source</label><input id="usageSource" value="${esc(qs.get("dataSource") || "")}"><button id="usageFilter">过滤</button></div>
+        <div class="panel"><h2>Trends</h2>${table(["start","requests","success","fail","tokens","cost","avg ms"], trends.trends.map(t => [formatTs(t.startMs),t.rollup.requests,t.rollup.successes,t.rollup.failures,t.rollup.totalTokens,usdText(t.rollup.totalCostUsd),numberText(t.avgDurationMs)]))}</div>
+        <div class="panel"><h2>Providers</h2>${table(["app","provider","type","requests","tokens","cost","avg ms"], providerStats.providers.map(p => [p.app,p.providerName || p.providerId,p.providerType,p.rollup.requests,p.rollup.totalTokens,usdText(p.rollup.totalCostUsd),numberText(p.avgDurationMs)]))}</div>
+        <div class="panel"><h2>Models</h2>${table(["app","model","pricing","source","requests","tokens","cost"], modelStats.models.map(m => [m.app,m.model,m.pricingModel || "",m.actualModelSource || "",m.rollup.requests,m.rollup.totalTokens,usdText(m.rollup.totalCostUsd)]))}</div>
+        <div class="panel wide"><h2>Logs</h2>${table(["request","app","provider","model","status","tokens","source","router sync"], logs.logs.map(l => [l.requestId,l.app,l.providerName,l.actualModel || l.model || "",l.statusCode,l.totalTokens ?? "",l.dataSource || "",l.routerLastSyncedAtMs ? "synced" : (l.routerLastSyncError || "")]))}<div class="row">${logs.logs.map(l => `<button data-usage-detail="${esc(l.requestId)}">Detail ${esc(l.requestId)}</button>`).join("")}</div></div></div>`;
+      backfill.onclick = async () => { await api("/api/usage/backfill-costs", {method:"POST"}); await loadUsage(); };
+      retryRouterUsage.onclick = async () => { const res = await api("/api/usage/router-sync/retry", {method:"POST"}); notice(`attempted ${res.attempted}, synced ${res.synced}, failed ${res.failed}`); await loadUsage(); };
+      usageFilter.onclick = loadUsage;
+      document.querySelectorAll("[data-usage-detail]").forEach(btn => btn.onclick = async () => {
+        const res = await api(`/api/usage/logs/${encodeURIComponent(btn.dataset.usageDetail)}`);
+        notice(JSON.stringify(res.log));
+      });
+    }
+    async function loadPricing() {
+      const app = document.getElementById("pricingLimitApp")?.value || "codex";
+      const [pricing, limits] = await Promise.all([
+        api("/api/pricing/models"),
+        api(`/api/provider-limits?app=${encodeURIComponent(app)}`)
+      ]);
+      content.innerHTML = `<div class="grid"><div class="panel"><h2>Model Pricing</h2>
+        <label>Model ID</label><input id="pricingModelId">
+        <label>Display name</label><input id="pricingDisplayName">
+        <div class="compact-grid">
+          <div><label>Input / 1M</label><input id="pricingInput" type="number" min="0" step="0.000001"></div>
+          <div><label>Output / 1M</label><input id="pricingOutput" type="number" min="0" step="0.000001"></div>
+          <div><label>Cache read / 1M</label><input id="pricingCacheRead" type="number" min="0" step="0.000001"></div>
+          <div><label>Cache create / 1M</label><input id="pricingCacheCreate" type="number" min="0" step="0.000001"></div>
+        </div>
+        <div class="row"><button id="savePricing">保存</button><button id="clearPricing">清空</button><button id="backfillPricing">回填缺失成本</button></div></div>
+        <div class="panel wide"><h2>Pricing Table</h2>${table(["model","name","input","output","cache read","cache create"], pricing.models.map(m => [m.modelId,m.displayName,m.inputCostPerMillion,m.outputCostPerMillion,m.cacheReadCostPerMillion,m.cacheCreationCostPerMillion]))}
+        <div class="row">${pricing.models.map(m => `<button data-edit-pricing="${esc(m.modelId)}">编辑 ${esc(m.modelId)}</button><button data-delete-pricing="${esc(m.modelId)}">删除 ${esc(m.modelId)}</button>`).join("")}</div></div>
+        <div class="panel wide"><h2>Provider Limits</h2>
+        <label>App</label><select id="pricingLimitApp"><option ${app==="claude"?"selected":""}>claude</option><option ${app==="codex"?"selected":""}>codex</option><option ${app==="gemini"?"selected":""}>gemini</option></select>
+        ${table(["provider","account","daily","monthly","quota","shares","warnings"], (limits.limits || []).map(limit => [
+          `${limit.providerName} (${limit.providerId})`,
+          [limit.accountEmail, limit.accountId].filter(Boolean).join(" / "),
+          limitCostText(limit.dailyUsageUsd, limit.dailyLimitUsd, limit.dailyExceeded),
+          limitCostText(limit.monthlyUsageUsd, limit.monthlyLimitUsd, limit.monthlyExceeded),
+          quotaLimitText(limit),
+          shareLimitText(limit.shares || []),
+          (limit.warnings || []).join(", ")
+        ]))}</div></div>`;
+      pricingLimitApp.onchange = loadPricing;
+      savePricing.onclick = async () => {
+        const payload = buildPricingPayload();
+        const res = await api(`/api/pricing/models/${encodeURIComponent(payload.modelId)}`, {method:"PUT", body: JSON.stringify(payload)});
+        notice(`saved ${res.model.modelId}; backfilled ${res.backfilled}`);
+        await loadPricing();
+      };
+      clearPricing.onclick = () => fillPricingForm({});
+      backfillPricing.onclick = async () => {
+        const res = await api("/api/usage/backfill-costs", {method:"POST"});
+        notice(`backfilled ${res.updated}`);
+        await loadPricing();
+      };
+      document.querySelectorAll("[data-edit-pricing]").forEach(btn => btn.onclick = () => {
+        const model = (pricing.models || []).find(item => item.modelId === btn.dataset.editPricing);
+        if (model) fillPricingForm(model);
+      });
+      document.querySelectorAll("[data-delete-pricing]").forEach(btn => btn.onclick = async () => {
+        const res = await api(`/api/pricing/models/${encodeURIComponent(btn.dataset.deletePricing)}`, {method:"DELETE"});
+        notice(res.deleted ? "deleted" : "not found");
+        await loadPricing();
+      });
+    }
+    async function loadRouter() {
+      const [status, config, tunnel, tunnels] = await Promise.all([api("/api/router/status"), api("/api/router/config"), api("/api/router/client-tunnel"), api("/api/router/tunnels")]);
+      content.innerHTML = `<div class="grid"><div class="panel"><h2>Router</h2><pre>${esc(JSON.stringify(status, null, 2))}</pre><button id="registerRouter">注册状态</button> <button id="heartbeatRouter">Heartbeat</button> <button id="batchSync">Batch sync</button> <button id="deleteAllRouterShares">Delete remote shares</button><div id="routerSyncResult" class="${status.lastError ? "bad" : "muted"}">${esc(status.lastError || "")}</div></div>
+        <div class="panel"><h2>Config</h2><label>URL</label><input id="routerUrl" value="${esc(config.router.url || "")}"><label>API base</label><input id="routerApiBase" value="${esc(config.router.apiBase || "")}"><label>Domain</label><input id="routerDomain" value="${esc(config.router.domain || "")}"><label>Region</label><input id="routerRegion" value="${esc(config.router.region || "")}"><button id="saveRouterConfig">保存</button>
+        <h2>Client tunnel</h2><label>Subdomain</label><input id="clientSubdomain" value="${esc(tunnel.tunnelSubdomain || "")}"><label>Status</label><input id="clientTunnelStatus" value="${esc(tunnel.tunnelStatus || "")}"><div>${esc(tunnel.runtimeStatus?.status || "")} ${esc(tunnel.runtimeStatus?.tunnelUrl || "")}</div><button id="saveClientTunnel">保存</button> <button id="claimClientTunnel">Claim client tunnel</button> <button id="leaseClientTunnel">Start tunnel</button> <button id="stopClientTunnel">Stop tunnel</button></div>
+        <div class="panel"><h2>Tunnels</h2>${table(["key","kind","status","url","error"], tunnels.tunnels.map(t => [t.key,t.kind,t.status,t.tunnelUrl || "",t.lastError || ""]))}</div></div>`;
+      registerRouter.onclick = async () => { await api("/api/router/register", {method:"POST"}); await loadRouter(); };
+      heartbeatRouter.onclick = async () => { await api("/api/router/heartbeat", {method:"POST"}); await loadRouter(); };
+      batchSync.onclick = async () => {
+        try {
+          const res = await api("/api/router/batch-sync", {method:"POST"});
+          routerSyncResult.className = res.remoteSynced ? "ok" : "muted";
+          routerSyncResult.textContent = res.message;
+          notice(res.message);
+        } catch (e) {
+          routerSyncResult.className = "bad";
+          routerSyncResult.textContent = e.message;
+          notice(e.message, true);
+        }
+      };
+      deleteAllRouterShares.onclick = async () => { const res = await api("/api/router/shares/delete-all", {method:"POST"}); notice(res.message); await loadRouter(); };
+      saveRouterConfig.onclick = async () => { await api("/api/router/config", {method:"POST", body: JSON.stringify({url: routerUrl.value, apiBase: routerApiBase.value || null, domain: routerDomain.value || null, region: routerRegion.value || null, custom: true})}); await loadRouter(); };
+      saveClientTunnel.onclick = async () => { await api("/api/router/client-tunnel", {method:"POST", body: JSON.stringify({tunnelSubdomain: clientSubdomain.value, tunnelStatus: clientTunnelStatus.value})}); await loadRouter(); };
+      claimClientTunnel.onclick = async () => { const res = await api("/api/router/client-tunnel/claim", {method:"POST"}); notice(res.status); await loadRouter(); };
+      leaseClientTunnel.onclick = async () => { const res = await api("/api/router/client-tunnel/lease", {method:"POST"}); notice(`${res.status?.status || "starting"} ${res.status?.tunnelUrl || ""}`); await loadRouter(); };
+      stopClientTunnel.onclick = async () => { await api("/api/router/client-tunnel/stop", {method:"POST"}); await loadRouter(); };
+    }
+    async function loadSettings() {
+      const [config, proxy, tunnel] = await Promise.all([api("/api/config"), api("/api/upstream-proxy"), api("/api/router/client-tunnel")]);
+      content.innerHTML = `<div class="grid"><div class="panel"><h2>Server</h2><pre>${esc(JSON.stringify(config, null, 2))}</pre></div>
+        <div class="panel"><h2>Upstream proxy</h2>
+          <label>Proxy URL</label><input id="settingsProxyUrl" value="${esc(proxy.upstreamProxy?.url || "")}">
+          <label><input id="settingsFollowSystemProxy" type="checkbox" ${proxy.upstreamProxy?.followSystemProxy ? "checked" : ""}>Follow system proxy</label>
+          <button id="saveUpstreamProxy">Save proxy</button>
+          <div class="muted">${esc(proxy.upstreamProxy?.maskedUrl || "")}</div>
+        </div>
+        <div class="panel"><h2>Client tunnel</h2>
+          <label>Subdomain</label><input id="settingsClientSubdomain" value="${esc(tunnel.tunnelSubdomain || "")}">
+          <label>Status</label><input id="settingsClientStatus" value="${esc(tunnel.tunnelStatus || "")}">
+          <div>${esc(tunnel.runtimeStatus?.status || "")} ${esc(tunnel.runtimeStatus?.tunnelUrl || "")}</div>
+          <button id="saveSettingsClientTunnel">Save tunnel</button>
+        </div></div>`;
+      saveUpstreamProxy.onclick = async () => {
+        await api("/api/upstream-proxy", {method:"PUT", body: JSON.stringify({url: settingsProxyUrl.value.trim() || null, followSystemProxy: settingsFollowSystemProxy.checked})});
+        await loadSettings();
+      };
+      saveSettingsClientTunnel.onclick = async () => {
+        await api("/api/router/client-tunnel", {method:"POST", body: JSON.stringify({tunnelSubdomain: settingsClientSubdomain.value, tunnelStatus: settingsClientStatus.value})});
+        await loadSettings();
+      };
+    }
+    async function loadFailover() {
+      const app = document.getElementById("failoverApp")?.value || "codex";
+      const [failover, providers] = await Promise.all([api("/api/failover"), api(`/api/providers?app=${app}`)]);
+      const config = failover.failover?.apps?.[app] || {};
+      const defaultQueue = providers.providers.map(item => item.provider.id);
+      const queue = Array.isArray(config.providerQueue) && config.providerQueue.length ? config.providerQueue : defaultQueue;
+      const breakers = (failover.failover?.breakers || []).filter(item => item.app === app);
+      content.innerHTML = `<div class="grid"><div class="panel"><h2>Failover</h2>
+        <label>App</label><select id="failoverApp"><option ${app==="claude"?"selected":""}>claude</option><option ${app==="codex"?"selected":""}>codex</option><option ${app==="gemini"?"selected":""}>gemini</option></select>
+        <label><input id="failoverEnabled" type="checkbox" ${config.enabled ? "checked" : ""}>Auto failover</label>
+        <label>Provider queue</label><textarea id="failoverQueue">${esc(queue.join("\\n"))}</textarea>
+        <div class="compact-grid">
+          <div><label>Failure threshold</label><input id="failoverThreshold" type="number" min="1" value="${esc(config.failureThreshold || 2)}"></div>
+          <div><label>Open duration ms</label><input id="failoverOpenMs" type="number" min="1" value="${esc(config.openDurationMs || 300000)}"></div>
+          <div><label>Half-open probes</label><input id="failoverHalfOpenProbes" type="number" min="1" value="${esc(config.halfOpenMaxProbes || 1)}"></div>
+        </div>
+        <button id="saveFailover">保存</button></div>
+        <div class="panel wide"><h2>Breakers</h2>${table(["provider","state","failures","status","opened","last success","error"], breakers.map(item => [
+          item.providerId,
+          item.state,
+          item.consecutiveFailures,
+          item.lastStatusCode || "",
+          formatTs(item.openedAtMs),
+          formatTs(item.lastSuccessAtMs),
+          item.lastError || ""
+        ]))}<div class="row">${breakers.map(item => `<button data-reset-failover="${esc(item.providerId)}">Reset ${esc(item.providerId)}</button>`).join("")}</div></div></div>`;
+      failoverApp.onchange = loadFailover;
+      saveFailover.onclick = async () => {
+        await api(`/api/failover/apps/${failoverApp.value}`, {method:"PUT", body: JSON.stringify({
+          enabled: failoverEnabled.checked,
+          providerQueue: textToList(failoverQueue.value),
+          failureThreshold: numberOrUndefined(failoverThreshold.value),
+          openDurationMs: numberOrUndefined(failoverOpenMs.value),
+          halfOpenMaxProbes: numberOrUndefined(failoverHalfOpenProbes.value)
+        })});
+        await loadFailover();
+      };
+      document.querySelectorAll("[data-reset-failover]").forEach(btn => btn.onclick = async () => {
+        await api(`/api/failover/providers/${btn.dataset.resetFailover}/reset?app=${failoverApp.value}`, {method:"POST"});
+        await loadFailover();
+      });
+    }
+    async function loadBackups() {
+      const data = await api("/api/backup");
+      content.innerHTML = `<div class="grid"><div class="panel"><h2>Backup</h2>
+        <label>Reason</label><input id="backupReason" value="manual">
+        <button id="createBackup">Create backup</button></div>
+        <div class="panel wide"><h2>Backups</h2>${table(["id","created","reason","files","size"], (data.backups || []).map(backup => [
+          backup.id,
+          formatTs(backup.createdAtMs),
+          backup.reason || "",
+          (backup.files || []).map(file => file.fileName).join(", "),
+          (backup.files || []).reduce((sum, file) => sum + Number(file.sizeBytes || 0), 0)
+        ]))}
+        <div class="row">${(data.backups || []).map(backup => `<button data-restore-backup="${esc(backup.id)}">Restore ${esc(backup.id)}</button>`).join("")}</div></div></div>`;
+      createBackup.onclick = async () => {
+        const res = await api("/api/backup", {method:"POST", body: JSON.stringify({reason: backupReason.value.trim() || "manual"})});
+        notice(`created ${res.backup.id}`);
+        await loadBackups();
+      };
+      document.querySelectorAll("[data-restore-backup]").forEach(btn => btn.onclick = async () => {
+        if (!confirm(`Restore backup ${btn.dataset.restoreBackup}?`)) return;
+        const res = await api(`/api/backup/${encodeURIComponent(btn.dataset.restoreBackup)}/restore`, {method:"POST"});
+        notice(`restored ${res.result.restored.id}`);
+        await load();
+      });
+    }
+    function providerTypeOptions(app, selected = "") {
+      return (providerTypesByApp[app] || []).map(type => `<option value="${esc(type)}" ${type===selected?"selected":""}>${esc(providerLabels[type] || type)}</option>`).join("");
+    }
+    function resetProviderForm(app) {
+      providerApp.value = app;
+      providerType.innerHTML = providerTypeOptions(app);
+      providerId.value = "";
+      providerName.value = "";
+      providerCategory.value = "";
+      providerAuthProvider.value = "";
+      providerAccountId.value = "";
+      providerApiKey.value = "";
+      providerAwsRegion.value = "";
+      providerAwsSecret.value = "";
+      providerAwsSession.value = "";
+      providerCostMultiplier.value = "";
+      providerQuotaPercent.value = "";
+      providerUserAgent.value = "";
+      providerPromptCacheKey.value = "";
+      providerCodexEffort.value = "";
+      providerCodexFast.checked = false;
+      providerCodexImage.checked = false;
+      providerIsFullUrl.checked = false;
+      providerNetworkTest.value = "false";
+      providerStreamTest.checked = false;
+      providerModels.value = "";
+      providerModelCatalog.value = "{}";
+      providerModelMapping.value = "{}";
+      providerModelMapping.placeholder = JSON.stringify(modelMappingSample(providerApp.value, providerType.value), null, 2);
+      providerCacheInjection.value = "{}";
+      providerCacheInjection.placeholder = JSON.stringify(cacheInjectionSample(), null, 2);
+      providerThinkingPipeline.value = "{}";
+      providerThinkingPipeline.placeholder = JSON.stringify(thinkingPipelineSample(), null, 2);
+      providerRequestGovernance.value = "{}";
+      providerRequestGovernance.placeholder = JSON.stringify(requestGovernanceSample(), null, 2);
+      providerCopilotOptimizer.value = "{}";
+      providerCopilotOptimizer.placeholder = JSON.stringify(copilotOptimizerSample(), null, 2);
+      providerCodexReasoning.value = "{}";
+      providerExtraEnv.value = "{}";
+      providerJson.value = "{}";
+      fillProviderDefaults(app, providerType.value);
+    }
+    function fillProviderDefaults(app, type) {
+      const defaults = providerDefaults[type] || providerDefaults[app] || {};
+      providerName.value = providerName.value || (providerLabels[type] || type || app);
+      providerBaseUrl.value = defaults.baseUrl || "";
+      providerApiFormat.value = defaults.apiFormat || "";
+      providerApiKeyField.value = providerApiKeyFieldValue(defaults.key || "", app);
+      providerModel.value = defaults.model || "";
+      providerTestModel.value = defaults.model || "";
+      providerNetworkTest.value = "false";
+      providerStreamTest.checked = false;
+      providerUpstreamModel.value = "";
+      providerAwsRegion.value = defaults.awsRegion || (type === "aws_bedrock" ? "us-west-2" : "");
+      providerCodexEffort.value = app === "codex" ? "high" : "";
+      providerModels.value = defaults.model ? defaults.model : "";
+      providerModelCatalog.value = "{}";
+      providerModelMapping.value = "{}";
+      providerModelMapping.placeholder = JSON.stringify(modelMappingSample(app, type), null, 2);
+      providerCacheInjection.value = "{}";
+      providerCacheInjection.placeholder = JSON.stringify(cacheInjectionSample(), null, 2);
+      providerThinkingPipeline.value = "{}";
+      providerThinkingPipeline.placeholder = JSON.stringify(thinkingPipelineSample(), null, 2);
+      providerRequestGovernance.value = "{}";
+      providerRequestGovernance.placeholder = JSON.stringify(requestGovernanceSample(), null, 2);
+      providerCopilotOptimizer.value = "{}";
+      providerCopilotOptimizer.placeholder = JSON.stringify(copilotOptimizerSample(), null, 2);
+      providerCodexReasoning.value = "{}";
+      providerExtraEnv.value = "{}";
+      updateProviderTemplateVars(type);
+    }
+    function fillProviderForm(app, providerTypeId, provider) {
+      providerApp.value = app;
+      providerType.innerHTML = providerTypeOptions(app, providerTypeId);
+      providerId.value = provider.id || "";
+      providerName.value = provider.name || "";
+      providerCategory.value = provider.category || "";
+      providerJson.value = JSON.stringify(provider, null, 2);
+      const meta = provider.meta || {};
+      const settings = provider.settingsConfig || {};
+      const env = settings.env || {};
+      providerApiFormat.value = meta.apiFormat || settings.apiFormat || settings.api_format || "";
+      providerBaseUrl.value = providerBaseUrlText(provider);
+      providerApiKey.value = "";
+      providerApiKeyField.value = providerApiKeyFieldValue(meta.apiKeyField || detectApiKeyField(settings), app);
+      providerAwsRegion.value = env.AWS_REGION || "";
+      providerAwsSecret.value = "";
+      providerAwsSession.value = "";
+      providerModel.value = modelFromProvider(provider);
+      providerUpstreamModel.value = settings.modelMapping?.upstreamModel || "";
+      providerTestModel.value = settings.testConfig?.testModel || settings.testConfig?.model || meta.testConfig?.testModel || meta.testConfig?.model || "";
+      providerCodexEffort.value = settings.codex?.reasoningEffort || settings.codex?.reasoning_effort || "";
+      providerAuthProvider.value = meta.authBinding?.authProvider || meta.providerType || providerTypeId || "";
+      providerAccountId.value = meta.authBinding?.accountId || "";
+      providerCostMultiplier.value = meta.costMultiplier || "";
+      providerQuotaPercent.value = meta.quotaDispatchLimitPercent ?? "";
+      providerUserAgent.value = meta.customUserAgent || "";
+      providerPromptCacheKey.value = meta.promptCacheKey || "";
+      providerCodexFast.checked = !!meta.codexFastMode;
+      providerCodexImage.checked = !!meta.codexImageGenerationEnabled;
+      providerIsFullUrl.checked = !!meta.isFullUrl;
+      providerModels.value = modelsToText(settings.models);
+      providerModelCatalog.value = JSON.stringify(settings.modelCatalog || settings.model_catalog || {}, null, 2);
+      providerModelMapping.value = JSON.stringify(settings.modelMapping || settings.model_mapping || {}, null, 2);
+      providerModelMapping.placeholder = JSON.stringify(modelMappingSample(app, providerTypeId), null, 2);
+      providerCacheInjection.value = JSON.stringify(settings.cacheInjection || settings.cache_injection || {}, null, 2);
+      providerCacheInjection.placeholder = JSON.stringify(cacheInjectionSample(), null, 2);
+      providerThinkingPipeline.value = JSON.stringify(settings.thinkingPipeline || settings.thinking_pipeline || settings.thinking || {}, null, 2);
+      providerThinkingPipeline.placeholder = JSON.stringify(thinkingPipelineSample(), null, 2);
+      providerRequestGovernance.value = JSON.stringify(settings.requestGovernance || settings.request_governance || {}, null, 2);
+      providerRequestGovernance.placeholder = JSON.stringify(requestGovernanceSample(), null, 2);
+      providerCopilotOptimizer.value = JSON.stringify(settings.copilotOptimizer || settings.copilot_optimizer || settings.copilot || {}, null, 2);
+      providerCopilotOptimizer.placeholder = JSON.stringify(copilotOptimizerSample(), null, 2);
+      providerCodexReasoning.value = JSON.stringify(meta.codexChatReasoning || settings.codexChatReasoning || {}, null, 2);
+      providerExtraEnv.value = "{}";
+      updateProviderTemplateVars(providerTypeId);
+      if (!providerBaseUrl.value && env.ANTHROPIC_BASE_URL) providerBaseUrl.value = env.ANTHROPIC_BASE_URL;
+    }
+    function buildProviderFromForm(base) {
+      const app = providerApp.value;
+      const type = providerType.value;
+      const settings = buildSettingsConfig(app, type);
+      const metaPatch = {
+        providerType: type,
+        apiFormat: providerApiFormat.value || undefined,
+        apiKeyField: providerApiKeyField.value !== "auto" ? providerApiKeyField.value : undefined,
+        testConfig: providerTestModel.value.trim() ? {enabled: true, testModel: providerTestModel.value.trim()} : undefined,
+        authBinding: (providerAuthProvider.value.trim() || providerAccountId.value.trim()) ? {
+          source: providerAccountId.value.trim() ? "managed_account" : "provider_config",
+          authProvider: providerAuthProvider.value.trim() || type,
+          accountId: providerAccountId.value.trim() || undefined
+        } : undefined,
+        costMultiplier: providerCostMultiplier.value.trim() || undefined,
+        quotaDispatchLimitPercent: numberOrUndefined(providerQuotaPercent.value),
+        customUserAgent: providerUserAgent.value.trim() || undefined,
+        promptCacheKey: providerPromptCacheKey.value.trim() || undefined,
+        codexChatReasoning: emptyObjectToUndefined(parseJson(providerCodexReasoning.value, {})),
+        codexFastMode: providerCodexFast.checked || undefined,
+        codexImageGenerationEnabled: providerCodexImage.checked || undefined,
+        isFullUrl: providerIsFullUrl.checked || undefined
+      };
+      const provider = Object.assign({}, base, {
+        id: providerId.value.trim() || base.id || "",
+        name: providerName.value.trim() || providerLabels[type] || type,
+        category: providerCategory.value.trim() || base.category || null,
+        settingsConfig: mergeDeep(base.settingsConfig || {}, settings),
+        meta: cleanObject(mergeDeep(base.meta || {}, metaPatch))
+      });
+      return provider;
+    }
+    function buildSettingsConfig(app, type) {
+      const env = {};
+      const baseUrl = providerBaseUrl.value.trim();
+      const apiKey = providerApiKey.value.trim();
+      const model = providerModel.value.trim();
+      const upstreamModel = providerUpstreamModel.value.trim();
+      const models = textToList(providerModels.value);
+      const keyField = providerApiKeyField.value !== "auto" ? providerApiKeyField.value : (providerDefaults[type]?.key || "");
+      if (app === "claude") {
+        if (baseUrl) env.ANTHROPIC_BASE_URL = baseUrl;
+        if (apiKey) {
+          if (keyField === "AWS_ACCESS_KEY_ID") env.AWS_ACCESS_KEY_ID = apiKey;
+          else env[keyField && keyField.startsWith("ANTHROPIC_") ? keyField : "ANTHROPIC_AUTH_TOKEN"] = apiKey;
+        }
+        if (model) {
+          env.ANTHROPIC_MODEL = model;
+          env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
+          env.ANTHROPIC_DEFAULT_SONNET_MODEL = model;
+          env.ANTHROPIC_DEFAULT_OPUS_MODEL = model;
+        }
+        if (type === "aws_bedrock") {
+          env.CLAUDE_CODE_USE_BEDROCK = "1";
+          env.AWS_REGION = providerAwsRegion.value.trim() || env.AWS_REGION || "us-west-2";
+          if (providerAwsSecret.value.trim()) env.AWS_SECRET_ACCESS_KEY = providerAwsSecret.value.trim();
+          if (providerAwsSession.value.trim()) env.AWS_SESSION_TOKEN = providerAwsSession.value.trim();
+        }
+      } else if (app === "codex") {
+        if (baseUrl) env.OPENAI_BASE_URL = baseUrl;
+        if (apiKey) env[keyField && keyField !== "auto" ? keyField : "OPENAI_API_KEY"] = apiKey;
+      } else if (app === "gemini") {
+        if (baseUrl) env.GOOGLE_GEMINI_BASE_URL = baseUrl;
+        if (apiKey) env[keyField && keyField !== "auto" ? keyField : "GEMINI_API_KEY"] = apiKey;
+        if (model) env.GEMINI_MODEL = model;
+      }
+      Object.assign(env, parseJson(providerExtraEnv.value, {}));
+      const settings = {env};
+      if (models.length) settings.models = models;
+      else if (app === "codex" && model) settings.models = [model];
+      const modelCatalog = emptyObjectToUndefined(parseJson(providerModelCatalog.value, {}));
+      if (modelCatalog) settings.modelCatalog = modelCatalog;
+      const modelMapping = emptyObjectToUndefined(parseJson(providerModelMapping.value, {}));
+      if (modelMapping) settings.modelMapping = modelMapping;
+      else if (upstreamModel) settings.modelMapping = {mode: "single", upstreamModel};
+      const cacheInjection = emptyObjectToUndefined(parseJson(providerCacheInjection.value, {}));
+      if (cacheInjection !== undefined) settings.cacheInjection = cacheInjection;
+      const thinkingPipeline = emptyObjectToUndefined(parseJson(providerThinkingPipeline.value, {}));
+      if (thinkingPipeline !== undefined) settings.thinkingPipeline = thinkingPipeline;
+      const requestGovernance = emptyObjectToUndefined(parseJson(providerRequestGovernance.value, {}));
+      if (requestGovernance !== undefined) settings.requestGovernance = requestGovernance;
+      const copilotOptimizer = emptyObjectToUndefined(parseJson(providerCopilotOptimizer.value, {}));
+      if (copilotOptimizer !== undefined) settings.copilotOptimizer = copilotOptimizer;
+      if (providerTestModel.value.trim()) settings.testConfig = {enabled: true, testModel: providerTestModel.value.trim()};
+      if (app === "codex" && providerCodexEffort.value) {
+        settings.codex = {reasoningEffort: providerCodexEffort.value};
+      }
+      return settings;
+    }
+    function fillUniversalForm(provider) {
+      universalId.value = provider.id || "";
+      universalName.value = provider.name || "";
+      universalType.value = provider.providerType || "newapi";
+      universalBaseUrl.value = provider.baseUrl || "";
+      universalApiKey.value = provider.apiKey || "";
+      universalWebsite.value = provider.websiteUrl || "";
+      universalNotes.value = provider.notes || "";
+      universalClaudeEnabled.checked = !!provider.apps?.claude;
+      universalCodexEnabled.checked = !!provider.apps?.codex;
+      universalGeminiEnabled.checked = !!provider.apps?.gemini;
+      universalClaudeModel.value = provider.models?.claude?.model || "";
+      universalClaudeHaiku.value = provider.models?.claude?.haikuModel || "";
+      universalClaudeSonnet.value = provider.models?.claude?.sonnetModel || "";
+      universalClaudeOpus.value = provider.models?.claude?.opusModel || "";
+      universalCodexModel.value = provider.models?.codex?.model || "";
+      universalCodexEffort.value = provider.models?.codex?.reasoningEffort || "high";
+      universalGeminiModel.value = provider.models?.gemini?.model || "";
+      universalClaudeCatalog.value = JSON.stringify(provider.models?.claude?.modelCatalog || {}, null, 2);
+      universalClaudeMapping.value = JSON.stringify(provider.models?.claude?.modelMapping || {}, null, 2);
+      universalClaudeMapping.placeholder = JSON.stringify(modelMappingSample("claude", provider.providerType), null, 2);
+      universalCodexCatalog.value = JSON.stringify(provider.models?.codex?.modelCatalog || {}, null, 2);
+      universalCodexMapping.value = JSON.stringify(provider.models?.codex?.modelMapping || {}, null, 2);
+      universalCodexMapping.placeholder = JSON.stringify(modelMappingSample("codex", provider.providerType), null, 2);
+      universalCodexReasoning.value = JSON.stringify(provider.models?.codex?.chatReasoning || {}, null, 2);
+      universalGeminiCatalog.value = JSON.stringify(provider.models?.gemini?.modelCatalog || {}, null, 2);
+      universalGeminiMapping.value = JSON.stringify(provider.models?.gemini?.modelMapping || {}, null, 2);
+      universalGeminiMapping.placeholder = JSON.stringify(modelMappingSample("gemini", provider.providerType), null, 2);
+      universalJson.value = JSON.stringify(provider, null, 2);
+    }
+    function buildUniversalFromForm(base) {
+      return mergeDeep(base, {
+        id: universalId.value.trim(),
+        name: universalName.value.trim(),
+        providerType: universalType.value.trim() || "custom_gateway",
+        apps: {
+          claude: universalClaudeEnabled.checked,
+          codex: universalCodexEnabled.checked,
+          gemini: universalGeminiEnabled.checked
+        },
+        baseUrl: universalBaseUrl.value.trim(),
+        apiKey: universalApiKey.value.trim(),
+        websiteUrl: universalWebsite.value.trim() || undefined,
+        notes: universalNotes.value.trim() || undefined,
+        models: {
+          claude: cleanObject({model: universalClaudeModel.value.trim() || undefined, haikuModel: universalClaudeHaiku.value.trim() || undefined, sonnetModel: universalClaudeSonnet.value.trim() || undefined, opusModel: universalClaudeOpus.value.trim() || undefined, modelCatalog: emptyObjectToUndefined(parseJson(universalClaudeCatalog.value, {})), modelMapping: emptyObjectToUndefined(parseJson(universalClaudeMapping.value, {}))}),
+          codex: cleanObject({model: universalCodexModel.value.trim() || undefined, reasoningEffort: universalCodexEffort.value || undefined, chatReasoning: emptyObjectToUndefined(parseJson(universalCodexReasoning.value, {})), modelCatalog: emptyObjectToUndefined(parseJson(universalCodexCatalog.value, {})), modelMapping: emptyObjectToUndefined(parseJson(universalCodexMapping.value, {}))}),
+          gemini: cleanObject({model: universalGeminiModel.value.trim() || undefined, modelCatalog: emptyObjectToUndefined(parseJson(universalGeminiCatalog.value, {})), modelMapping: emptyObjectToUndefined(parseJson(universalGeminiMapping.value, {}))})
+        }
+      });
+    }
+    function parseJson(text, fallback) {
+      try { return text?.trim() ? JSON.parse(text) : fallback; } catch (e) { notice(e.message, true); throw e; }
+    }
+    function mergeDeep(base, patch) {
+      if (!isObject(base) || !isObject(patch)) return patch === undefined ? base : patch;
+      const output = Object.assign({}, base);
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === undefined) continue;
+        output[key] = isObject(value) && isObject(output[key]) ? mergeDeep(output[key], value) : value;
+      }
+      return output;
+    }
+    function isObject(value) {
+      return value && typeof value === "object" && !Array.isArray(value);
+    }
+    function cleanObject(value) {
+      const out = {};
+      for (const [key, item] of Object.entries(value || {})) {
+        if (item !== undefined && item !== "") out[key] = item;
+      }
+      return out;
+    }
+    function emptyObjectToUndefined(value) {
+      if (!isObject(value)) return value === undefined ? undefined : value;
+      return Object.keys(value).length ? value : undefined;
+    }
+    function numberOrUndefined(value) {
+      if (value === "" || value === null || value === undefined) return undefined;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    }
+    function providerTestPayload(extra = {}) {
+      return cleanObject(Object.assign({
+        network: providerNetworkTest.value === "true",
+        model: providerTestModel.value.trim() || undefined,
+        stream: providerStreamTest.checked || undefined,
+        timeoutMs: providerStreamTest.checked ? 30000 : undefined
+      }, extra));
+    }
+    function providerTestParams() {
+      const payload = providerTestPayload();
+      const params = new URLSearchParams();
+      if (payload.network) params.set("network", "true");
+      if (payload.model) params.set("model", payload.model);
+      if (payload.stream) params.set("stream", "true");
+      if (payload.timeoutMs) params.set("timeoutMs", String(payload.timeoutMs));
+      return params;
+    }
+    function detectApiKeyField(settings) {
+      const env = settings?.env || {};
+      return ["ANTHROPIC_AUTH_TOKEN","ANTHROPIC_API_KEY","OPENAI_API_KEY","GEMINI_API_KEY","GOOGLE_API_KEY","AWS_ACCESS_KEY_ID"].find(key => env[key]);
+    }
+    function providerApiKeyFieldValue(value, app) {
+      if (!value) return "auto";
+      if (["ANTHROPIC_AUTH_TOKEN","ANTHROPIC_API_KEY","OPENAI_API_KEY","GEMINI_API_KEY","GOOGLE_API_KEY","AWS_ACCESS_KEY_ID"].includes(value)) return value;
+      return app === "gemini" ? "GEMINI_API_KEY" : "auto";
+    }
+    function textToList(value) {
+      return String(value || "").split(/\r?\n|,/).map(item => item.trim()).filter(Boolean);
+    }
+    function modelsToText(value) {
+      if (!Array.isArray(value)) return "";
+      return value.map(item => typeof item === "string" ? item : (item?.id || item?.name || JSON.stringify(item))).filter(Boolean).join("\n");
+    }
+    function modelMappingSample(app, providerType) {
+      const route = app === "codex" ? "responses" : (app === "claude" ? "messages" : "gemini");
+      const requested = app === "gemini" ? "gemini-2.5-pro" : (app === "claude" ? "claude-sonnet-4" : "gpt-5*");
+      const upstream = providerType === "openrouter" ? "openai/gpt-5.5" : (app === "gemini" ? "models/gemini-2.5-pro-preview" : "upstream-model");
+      return {
+        rules: [{match: requested, app, route, upstreamModel: upstream}],
+        mappings: {
+          "local-model": {upstreamModel: upstream, pricingModel: upstream}
+        },
+        upstreamModel: upstream
+      };
+    }
+    function cacheInjectionSample() {
+      return {enabled: true, ttl: "1h"};
+    }
+    function thinkingPipelineSample() {
+      return {enabled: true, optimizer: true, signatureRectifier: false, budgetRectifier: false};
+    }
+    function requestGovernanceSample() {
+      return {enabled: true, bodyFilter: true, mediaSanitizer: true, mediaHeuristic: false, privateFieldWhitelist: ["_metadata"]};
+    }
+    function copilotOptimizerSample() {
+      return {enabled: true, requestClassification: true, toolResultMerging: true, compactDetection: true, deterministicRequestId: true, subagentDetection: true, warmupDowngrade: true, warmupModel: "gpt-5-mini", stripThinking: true};
+    }
+    function updateProviderTemplateVars(type) {
+      const vars = providerTemplateEnv[type] || [];
+      providerTemplateVars.textContent = vars.join("\n");
+    }
+    function normalizeProviderImport(payload) {
+      const raw = Array.isArray(payload) ? payload : (payload.providers || []);
+      return raw.map(item => ({
+        app: item.app || providerApp?.value || "claude",
+        provider: item.provider || item
+      })).filter(item => item.provider && item.provider.name !== undefined);
+    }
+    function normalizeUniversalImport(payload) {
+      if (Array.isArray(payload)) return payload;
+      if (Array.isArray(payload.providers)) return payload.providers;
+      return Object.values(payload.providers || {});
+    }
+    function accountTypeOptions(capabilities) {
+      const types = capabilities.map(item => item.providerType);
+      const fallback = types.length ? types : ["codex_oauth","claude_oauth","gemini_cli","ollama_cloud","cursor_oauth","cursor_apikey","github_copilot","deepseek_account","kiro_oauth","antigravity_oauth","agy_oauth","aws_bedrock","nvidia","deepseek_api"];
+      return fallback.map(type => `<option value="${esc(type)}">${esc(providerLabels[type] || type)}</option>`).join("");
+    }
+    function accountTemplateOptions(templates) {
+      return (templates || []).map(t => `<option value="${esc(t.providerType)}">${esc(providerLabels[t.providerType] || t.providerType)} / ${esc(t.credentialKind)}</option>`).join("");
+    }
+    function resetAccountForm(capabilities, templates = []) {
+      accountEditBase = null;
+      accountId.value = "";
+      accountType.innerHTML = accountTypeOptions(capabilities);
+      if (typeof accountTemplate !== "undefined") accountTemplate.innerHTML = accountTemplateOptions(templates);
+      accountEmail.value = "";
+      accountSubscription.value = "";
+      accountQuotaPercent.value = "";
+      accountExpiresAt.value = "";
+      accountToken.value = "";
+      accountRefreshToken.value = "";
+      accountIdToken.value = "";
+      accountApiKey.value = "";
+      accountScopes.value = "";
+      accountProfileJson.value = "{}";
+      accountRawJson.value = "{}";
+      accountQuotaJson.value = "{}";
+      applyAccountImportTemplate(templates, accountType.value, false);
+    }
+    function fillAccountForm(account) {
+      accountEditBase = account;
+      accountId.value = account.id || "";
+      accountType.value = account.providerType || "codex_oauth";
+      if (typeof accountTemplate !== "undefined") accountTemplate.value = account.providerType || "codex_oauth";
+      accountEmail.value = account.email || "";
+      accountSubscription.value = account.subscriptionLevel || "";
+      accountQuotaPercent.value = account.quotaPercent ?? "";
+      accountExpiresAt.value = account.expiresAt ?? "";
+      accountToken.value = "";
+      accountRefreshToken.value = "";
+      accountIdToken.value = "";
+      accountApiKey.value = "";
+      accountScopes.value = (account.scopes || []).join("\n");
+      accountProfileJson.value = JSON.stringify(account.profile || {}, null, 2);
+      accountRawJson.value = JSON.stringify(account.raw || {}, null, 2);
+      accountQuotaJson.value = JSON.stringify(account.quota || {}, null, 2);
+    }
+    function applyAccountImportTemplate(templates, providerType, showNotice = true) {
+      const template = (templates || []).find(t => t.providerType === providerType);
+      if (!template) return;
+      accountToken.placeholder = template.credentialKind === "access_token" ? "required" : "";
+      accountApiKey.placeholder = template.credentialKind === "api_key" ? "required" : "";
+      accountRefreshToken.placeholder = (template.optionalFields || []).includes("refreshToken") ? "optional" : "";
+      accountRawJson.placeholder = JSON.stringify({hints: template.rawHints || []}, null, 2);
+      accountProfileJson.placeholder = JSON.stringify({hints: template.profileHints || []}, null, 2);
+      if (showNotice) notice(`${template.providerType}: ${template.credentialKind}; required: ${listText(template.requiredFields)}`);
+    }
+    function fillAccountImportSample(templates, providerType) {
+      const template = (templates || []).find(t => t.providerType === providerType);
+      if (!template) return;
+      const profile = {email: "user@example.com", name: providerLabels[providerType] || providerType};
+      if ((template.profileHints || []).some(item => /plan|subscription/i.test(item))) {
+        profile.plan = "pro";
+        if (!accountSubscription.value) accountSubscription.value = "pro";
+      }
+      if (!accountEmail.value) accountEmail.value = profile.email;
+      if ((template.optionalFields || []).includes("expiresAt") && !accountExpiresAt.value) {
+        accountExpiresAt.value = String(Date.now() + 30 * 24 * 60 * 60 * 1000);
+      }
+      accountProfileJson.value = JSON.stringify(profile, null, 2);
+      accountRawJson.value = JSON.stringify(accountRawSample(template), null, 2);
+      accountQuotaJson.value = JSON.stringify({tiers: [{name: "default", utilization: 0}]}, null, 2);
+      notice(`${template.providerType}: sample JSON filled; paste the real credential before saving`);
+    }
+    function accountRawSample(template) {
+      if (template.credentialKind === "aws_credentials") {
+        return {
+          awsAccessKeyId: "AKIA...",
+          awsSecretAccessKey: "<secret>",
+          awsRegion: "us-east-1",
+          awsSessionToken: "<optional>"
+        };
+      }
+      if (template.providerType === "codex_oauth") {
+        return {
+          tokenResponse: {accessToken: "<paste access token>", refreshToken: "<optional refresh token>"},
+          profileResponse: {email: "user@example.com", plan: "pro"},
+          bankedReset: {
+            availableCount: 1,
+            credits: [{status: "available", expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()}]
+          }
+        };
+      }
+      if (template.providerType === "github_copilot") {
+        return {
+          copilotUsage: {
+            copilotPlan: "individual_pro",
+            quotaResetDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+            quotaSnapshots: {premiumInteractions: {entitlement: 300, remaining: 240}}
+          }
+        };
+      }
+      if (template.providerType === "kiro_oauth") {
+        return {
+          kiroUsageLimits: {
+            subscriptionInfo: {subscriptionTitle: "Kiro Pro"},
+            usageBreakdownList: [{
+              currentUsageWithPrecision: 20,
+              usageLimitWithPrecision: 100,
+              nextDateReset: Math.floor((Date.now() + 30 * 24 * 60 * 60 * 1000) / 1000)
+            }]
+          }
+        };
+      }
+      if (template.providerType === "cursor_oauth" || template.providerType === "cursor_apikey") {
+        return {
+          cursorUsage: {
+            membershipType: "pro",
+            currentPeriodUsage: {
+              billingCycleEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+              planUsage: {used: 2000, limit: 50000, totalPercentUsed: 4}
+            }
+          }
+        };
+      }
+      if (template.credentialKind === "api_key") {
+        return {
+          providerAccountResponse: {email: "user@example.com", plan: "pro"},
+          billingOrQuotaSnapshot: {periodEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()}
+        };
+      }
+      return {
+        tokenResponse: {accessToken: "<paste access token>", refreshToken: "<optional refresh token>"},
+        profileResponse: {email: "user@example.com", plan: "pro"},
+        clientId: "<optional client id>"
+      };
+    }
+    function buildAccountFromForm() {
+      const patch = cleanObject({
+        id: accountId.value.trim() || undefined,
+        providerType: accountType.value,
+        email: accountEmail.value.trim() || undefined,
+        accessToken: accountToken.value.trim() || undefined,
+        refreshToken: accountRefreshToken.value.trim() || undefined,
+        idToken: accountIdToken.value.trim() || undefined,
+        apiKey: accountApiKey.value.trim() || undefined,
+        scopes: textToList(accountScopes.value),
+        profile: emptyObjectToUndefined(parseJson(accountProfileJson.value, {})),
+        raw: emptyObjectToUndefined(parseJson(accountRawJson.value, {})),
+        subscriptionLevel: accountSubscription.value.trim() || undefined,
+        quotaPercent: numberOrUndefined(accountQuotaPercent.value),
+        quota: emptyObjectToUndefined(parseJson(accountQuotaJson.value, {})),
+        expiresAt: numberOrUndefined(accountExpiresAt.value)
+      });
+      if (accountEditBase && accountEditBase.id === patch.id) {
+        return Object.assign({}, accountEditBase, patch);
+      }
+      return patch;
+    }
+    function accountCredentialText(account) {
+      const parts = [];
+      if (account.accessToken) parts.push("access");
+      if (account.refreshToken) parts.push("refresh");
+      if (account.idToken) parts.push("id");
+      if (account.apiKey) parts.push("api_key");
+      return parts.join(", ");
+    }
+    function accountRefreshStateText(account, cap) {
+      if (!cap?.supportsRefresh) return cap?.supportsRefreshPlan ? "plan only" : "disabled";
+      if (!account.refreshToken) return "missing refreshToken";
+      if (!account.accessToken) return "ready";
+      const expiresAt = Number(account.expiresAt);
+      if (!Number.isFinite(expiresAt) || expiresAt <= 0) return "ready";
+      const remainingMs = expiresAt - Date.now();
+      if (remainingMs <= 0) return "expired";
+      if (remainingMs <= 60 * 1000) return "expires soon";
+      return "ready";
+    }
+    function accountQuotaText(account) {
+      const details = [];
+      const subscriptionEnd = accountQuotaSubscriptionEnd(account);
+      if (subscriptionEnd) details.push(`sub until ${formatDateish(subscriptionEnd)}`);
+      const bankedReset = accountQuotaBankedResetText(account);
+      if (bankedReset) details.push(bankedReset);
+      const suffix = details.length ? ` (${details.join("; ")})` : "";
+      if (account.quotaPercent !== undefined && account.quotaPercent !== null) return `${account.quotaPercent}%${suffix}`;
+      const tiers = account.quota?.tiers || [];
+      const body = tiers.map(tier => `${tier.name}:${tier.utilization ?? tier.used ?? ""}`).join(", ");
+      return body ? `${body}${suffix}` : suffix.trim();
+    }
+    function accountQuotaSubscriptionEnd(account) {
+      const extra = account.quota?.extraUsage || {};
+      return extra.subscriptionPeriodEnd || extra.subscription?.expiresAt || extra.raw?.SubscriptionPeriodEnd?.Time || extra.raw?.subscriptionPeriodEnd?.time || "";
+    }
+    function accountQuotaBankedResetText(account) {
+      const extra = account.quota?.extraUsage || {};
+      const reset = extra.bankedReset || extra.codexBankedReset || account.raw?.bankedReset || account.raw?.codexBankedReset;
+      if (!reset || typeof reset !== "object") return "";
+      const count = reset.availableCount ?? reset.available_count ?? reset.available;
+      const countText = count !== undefined && count !== null && count !== "" ? String(count) : "";
+      const next = reset.nextExpiresAt || reset.next_expires_at || reset.expiresAt || reset.expires_at;
+      const parts = [`banked reset${countText ? ` ${countText}` : ""}`];
+      if (next) parts.push(`until ${formatDateish(next)}`);
+      return parts.join(" ");
+    }
+    function formatDateish(value) {
+      if (!value) return "";
+      if (typeof value === "number") return formatTs(value);
+      const ms = Date.parse(value);
+      return Number.isFinite(ms) ? new Date(ms).toISOString() : String(value);
+    }
+    function jsonPreview(value) {
+      if (!value) return "";
+      const text = JSON.stringify(value);
+      return text.length > 160 ? text.slice(0, 160) + "..." : text;
+    }
+    function listText(value) {
+      return (value || []).join(", ");
+    }
+    function formatTs(value) {
+      if (!value) return "";
+      const ms = Number(value);
+      if (!Number.isFinite(ms)) return String(value);
+      return new Date(ms).toISOString();
+    }
+    function numberText(value) {
+      if (value === null || value === undefined || value === "") return "";
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(1) : String(value);
+    }
+    function usdText(value) {
+      if (value === null || value === undefined || value === "") return "";
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(6) : String(value);
+    }
+    function buildPricingPayload() {
+      return {
+        modelId: pricingModelId.value.trim(),
+        displayName: pricingDisplayName.value.trim(),
+        inputCostPerMillion: pricingInput.value.trim(),
+        outputCostPerMillion: pricingOutput.value.trim(),
+        cacheReadCostPerMillion: pricingCacheRead.value.trim(),
+        cacheCreationCostPerMillion: pricingCacheCreate.value.trim()
+      };
+    }
+    function fillPricingForm(model) {
+      pricingModelId.value = model.modelId || "";
+      pricingDisplayName.value = model.displayName || "";
+      pricingInput.value = model.inputCostPerMillion || "";
+      pricingOutput.value = model.outputCostPerMillion || "";
+      pricingCacheRead.value = model.cacheReadCostPerMillion || "";
+      pricingCacheCreate.value = model.cacheCreationCostPerMillion || "";
+    }
+    function limitCostText(usage, limit, exceeded) {
+      const usageText = usdText(usage);
+      const limitTextValue = limit === null || limit === undefined ? "" : usdText(limit);
+      const body = limitTextValue ? `${usageText} / ${limitTextValue}` : usageText;
+      return exceeded ? `${body} exceeded` : body;
+    }
+    function quotaLimitText(limit) {
+      const quota = limit.accountQuotaPercent === null || limit.accountQuotaPercent === undefined ? "" : `${numberText(limit.accountQuotaPercent)}%`;
+      const dispatch = limit.quotaDispatchLimitPercent === null || limit.quotaDispatchLimitPercent === undefined ? "" : `limit ${numberText(limit.quotaDispatchLimitPercent)}%`;
+      const body = [quota, dispatch].filter(Boolean).join(" / ");
+      return limit.quotaDispatchExceeded && body ? `${body} exceeded` : body;
+    }
+    function shareLimitText(shares) {
+      return (shares || []).map(share => {
+        const token = share.tokenLimit ? `${share.tokensUsed}/${share.tokenLimit}` : String(share.tokensUsed || 0);
+        const flags = (share.warnings || []).join(",");
+        return `${share.shareName}:${share.status} tokens ${token}${share.parallelLimit ? ` parallel ${share.parallelLimit}` : ""}${flags ? ` ${flags}` : ""}`;
+      }).join("; ");
+    }
+	    function yesNo(value) {
+	      return value ? "yes" : "";
+	    }
+	    function capabilityYesNo(value, support) {
+	      if (value) return "yes";
+	      return support === "planned" ? "planned" : "";
+	    }
+	    function adapterSupportText(cap) {
+	      if (!cap || !cap.support) return "";
+	      const flags = [];
+	      if (cap.requiresTransform) flags.push("transform");
+	      if (cap.supportsStreamUsage) flags.push("stream");
+	      if (cap.supportsModelList) flags.push("models");
+	      return [cap.support, flags.length ? `(${flags.join(", ")})` : ""].filter(Boolean).join(" ");
+	    }
+	    function providerReadinessText(cap, accountCap, matrixEntry = {}) {
+	      if (!cap && !accountCap) return "";
+	      const flags = [];
+	      if (cap?.support === "native") flags.push(cap.requiresTransform ? "static contract" : "native adapter");
+	      if (cap?.support === "generic_fallback") flags.push("fallback adapter");
+	      if (cap?.support === "planned") flags.push("planned upstream");
+	      if (matrixEntry.visibility === "diagnostic_only") flags.push("diagnostic only");
+	      if (matrixEntry.directConfigSupported) flags.push("direct config");
+	      if (matrixEntry.managedAccountRecommended) flags.push("managed account suggested");
+	      if (accountCap?.support === "manual_token_store") {
+	        flags.push(accountCap.supportsRefresh ? "manual refresh-token import" : "manual token required");
+	      }
+	      if (accountCap?.supportsRefresh) flags.push("native refresh/profile");
+	      else if (accountCap?.supportsRefreshPlan) flags.push("refresh plan only");
+	      else if (accountCap) flags.push("refresh disabled");
+	      return flags.join(", ");
+	    }
+	    function providerNextStepText(cap, accountCap, matrixEntry = {}, provider = {}) {
+	      const notes = [];
+	      if (matrixEntry.note) notes.push(matrixEntry.note);
+	      if (cap?.support === "planned") notes.push("complete native upstream implementation");
+	      if (cap?.support === "generic_fallback") notes.push("confirm upstream protocol and add static contract");
+	      if (provider.meta?.usageScript || provider.meta?.usage_script) notes.push("usage script is desktop-only");
+	      if (accountCap?.supportsRefresh) {
+	        notes.push("import accessToken and refreshToken; login request preview only");
+	      } else if (accountCap?.blockingReason) {
+	        notes.push(accountCap.blockingReason);
+	      }
+	      return [...new Set(notes.filter(Boolean))].join("; ");
+	    }
+	    function accountCapabilityText(cap) {
+	      if (!cap) return "";
+	      const flags = [];
+	      if (cap.supportsRefreshPlan && !cap.supportsRefresh) flags.push("plan only");
+	      if (cap.supportsRefresh) flags.push("native refresh");
+	      if (cap.supportsQuota) flags.push("quota");
+	      if (cap.serverNativeStage && !cap.supportsStartLogin) flags.push("login off");
+	      if (cap.blockingReason && !cap.supportsRefresh) flags.push("blocked");
+	      return [cap.status || cap.support || "", flags.length ? `(${flags.join(", ")})` : ""].filter(Boolean).join(" ");
+	    }
+	    function disabledAttr(disabled, reason) {
+	      return disabled ? ` disabled title="${esc(reason)}"` : "";
+	    }
+	    function providerActionButtons(providers, proxyCapByKey) {
+	      return providers.map(p => {
+	        const cap = proxyCapByKey[capabilityKey(p.app, p.providerType)] || {};
+	        const planned = cap.support === "planned";
+	        return `<button data-edit-provider="${esc(p.provider.id)}">编辑 ${esc(p.provider.name)}</button><button data-test-provider="${esc(p.provider.id)}"${disabledAttr(planned, "adapter is planned")}>测试 ${esc(p.provider.name)}</button><button data-fetch-models="${esc(p.provider.id)}"${disabledAttr(planned, "adapter is planned")}>拉取模型 ${esc(p.provider.name)}</button>`;
+	      }).join("");
+	    }
+	    function accountActionButtons(accounts, capabilityByType) {
+	      return accounts.map(a => {
+	        const cap = capabilityByType[a.providerType] || {};
+	        const hasRefreshToken = Boolean(String(a.refreshToken || "").trim());
+	        const refreshDisabled = !cap.supportsRefresh || !hasRefreshToken;
+	        const refreshDisabledReason = !cap.supportsRefresh ? "native refresh is disabled" : "refreshToken is required";
+	        return [
+	          `<button data-edit-account="${esc(a.id)}">编辑 ${esc(a.id)}</button>`,
+	          `<button data-refresh-account="${esc(a.id)}"${disabledAttr(refreshDisabled, refreshDisabledReason)}>刷新 ${esc(a.id)}</button>`,
+	          `<button data-refresh-plan-account="${esc(a.id)}"${disabledAttr(!cap.supportsRefreshPlan, "refresh plan unavailable")}>Refresh plan ${esc(a.id)}</button>`,
+	          `<button data-quota-account="${esc(a.id)}"${disabledAttr(!cap.supportsQuota, "quota fetch is disabled")}>Quota ${esc(a.id)}</button>`,
+	          `<button data-delete-account="${esc(a.id)}">删除 ${esc(a.id)}</button>`
+	        ].join("");
+	      }).join("");
+	    }
+	    function capabilityKey(app, providerType) {
+	      return `${app}:${providerType}`;
+	    }
+    function table(headers, rows) {
+      return `<table><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    }
+    function accountBindingText(provider) {
+      const binding = provider?.meta?.authBinding;
+      if (!binding) return "";
+      return [binding.authProvider, binding.accountId].filter(Boolean).join(" / ");
+    }
+    function modelListText(provider) {
+      const config = provider?.settingsConfig || {};
+      const env = config.env || {};
+      const candidates = [
+        config.models,
+        config.modelList,
+        config.availableModels,
+        config.modelCatalog && Object.keys(config.modelCatalog),
+        config.modelMapping && Object.keys(config.modelMapping),
+        [env.ANTHROPIC_MODEL, env.GEMINI_MODEL].filter(Boolean)
+      ];
+      const models = candidates.find(value => Array.isArray(value) && value.length);
+      return models ? models.join(", ") : "";
+    }
+    function providerHealthText(health) {
+      if (!health) return "unknown";
+      const status = health.healthy ? "healthy" : "unhealthy";
+      const rate = health.successRate === null || health.successRate === undefined ? "" : ` ${numberText(health.successRate * 100)}%`;
+      const code = health.lastStatusCode ? ` ${health.lastStatusCode}` : "";
+      const reason = health.reason ? ` ${health.reason}` : "";
+      return `${status}${rate}${code}${reason}`;
+    }
+    function modelFromProvider(provider) {
+      const config = provider?.settingsConfig || {};
+      const env = config.env || {};
+      const firstModel = Array.isArray(config.models) ? config.models[0] : null;
+      const modelName = typeof firstModel === "string" ? firstModel : (firstModel?.id || firstModel?.name || "");
+      return env.ANTHROPIC_MODEL || env.GEMINI_MODEL || modelName || config.modelMapping?.upstreamModel || "";
+    }
+    function providerBaseUrlText(provider) {
+      const config = provider?.settingsConfig || {};
+      const env = config.env || {};
+      return env.ANTHROPIC_BASE_URL || env.OPENAI_BASE_URL || env.CODEX_BASE_URL || env.GOOGLE_GEMINI_BASE_URL || env.GEMINI_BASE_URL || config.BASE_URL || config.base_url || "";
+    }
+    function universalModelsText(provider) {
+      return [provider.models?.claude?.model, provider.models?.codex?.model, provider.models?.gemini?.model].filter(Boolean).join(", ");
+    }
+    function bindingText(share) {
+      return (share.bindings || []).map(item => `${item.app}:${item.providerId}`).join(", ");
+    }
+    function marketGrantText(grant) {
+      if (!grant) return "";
+      return [grant.status, grant.grantId, grant.lastError].filter(Boolean).join(" ");
+    }
+    function shareModelHealthText(share) {
+      const health = share.runtimeSnapshot?.modelHealth || {};
+      return ["claude","codex","gemini"].flatMap(app => (health[app] || []).map(item => {
+        const code = item.statusCode ? ` ${item.statusCode}` : "";
+        const model = item.actualModel || item.requestedModel || "";
+        const source = item.source ? ` ${item.source}` : "";
+        return `${app}:${item.status || "unknown"}${code}${model ? ` ${model}` : ""}${source}`;
+      })).join(", ");
+    }
+    init();
+  </script>
+</body>
+</html>

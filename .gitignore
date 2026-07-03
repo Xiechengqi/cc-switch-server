@@ -1,0 +1,16 @@
+/target/
+/node_modules/
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+dist/
+
+# Local refactor planning notes. Keep them on disk, but do not include them in
+# formal repository commits once they are removed from the index.
+DESKTOP_ALIGNMENT_TASKS.md
+SERVER_IMPLEMENTATION_PLAN.md
+MIGRATION_LEDGER.md
+docs/remaining-work-index.md

@@ -1,0 +1,8 @@
+target
+.git
+*.log
+server.json
+providers.json
+accounts.json
+shares.json
+usage-logs.json

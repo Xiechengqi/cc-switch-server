@@ -1,0 +1,435 @@
+use crate::core::accounts::{Account, AccountRefreshUpdate};
+use crate::core::oauth_clients::{
+    build_profile_request, build_refresh_request_for_token_url, classify_oauth_error,
+    merge_refresh_updates, oauth_provider_spec, refresh_update_from_profile_response,
+    refresh_update_from_token_response, token_expires_soon, OAuthErrorClassification,
+    OAuthErrorKind, OAuthHttpRequest, OAuthRequestBodyFormat, OAuthTokenResponse,
+};
+use crate::core::provider::ProviderType;
+
+#[derive(Debug, Clone)]
+pub struct AccountRefreshFailure {
+    pub status_code: u16,
+    pub message: String,
+    pub kind: OAuthErrorKind,
+    pub retryable: bool,
+}
+
+impl AccountRefreshFailure {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status_code: 400,
+            message: message.into(),
+            kind: OAuthErrorKind::Unsupported,
+            retryable: false,
+        }
+    }
+
+    pub fn bad_gateway(message: impl Into<String>) -> Self {
+        Self {
+            status_code: 502,
+            message: message.into(),
+            kind: OAuthErrorKind::Network,
+            retryable: true,
+        }
+    }
+
+    pub fn authorization_pending(message: impl Into<String>) -> Self {
+        Self {
+            status_code: 409,
+            message: message.into(),
+            kind: OAuthErrorKind::AuthorizationPending,
+            retryable: true,
+        }
+    }
+
+    fn parse(message: impl Into<String>) -> Self {
+        Self {
+            status_code: 502,
+            message: message.into(),
+            kind: OAuthErrorKind::Parse,
+            retryable: false,
+        }
+    }
+
+    fn from_classification(
+        upstream_status: Option<u16>,
+        classification: OAuthErrorClassification,
+        context: impl Into<String>,
+    ) -> Self {
+        let status_code = refresh_status_code(upstream_status, classification.kind);
+        let context = context.into();
+        Self {
+            status_code,
+            message: if context.is_empty() {
+                classification.message
+            } else {
+                format!("{context}: {}", classification.message)
+            },
+            kind: classification.kind,
+            retryable: classification.retryable,
+        }
+    }
+}
+
+pub fn provider_native_refresh_available(provider_type: ProviderType) -> bool {
+    oauth_provider_spec(provider_type)
+        .is_some_and(|spec| spec.server_native_refresh_enabled() && !spec.token_urls.is_empty())
+}
+
+pub fn account_has_refresh_token(account: &Account) -> bool {
+    account
+        .refresh_token
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+pub fn account_needs_native_refresh(account: &Account, now_ms: i64) -> bool {
+    provider_native_refresh_available(account.provider_type)
+        && account_has_refresh_token(account)
+        && (account
+            .access_token
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+            || token_expires_soon(account, now_ms))
+}
+
+pub async fn execute_native_account_refresh(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+    let spec = oauth_provider_spec(account.provider_type).ok_or_else(|| {
+        AccountRefreshFailure::bad_request(format!(
+            "{} does not have an OAuth refresh spec",
+            account.provider_type.as_str()
+        ))
+    })?;
+    if !spec.server_native_refresh_enabled() || spec.token_urls.is_empty() {
+        return Err(AccountRefreshFailure::bad_request(format!(
+            "{} native refresh is not enabled",
+            account.provider_type.as_str()
+        )));
+    }
+
+    let mut last_error = None;
+    for token_url in spec.token_urls {
+        let request =
+            build_refresh_request_for_token_url(account.provider_type, account, token_url)
+                .map_err(|error| {
+                    AccountRefreshFailure::from_classification(None, error, "OAuth refresh request")
+                })?;
+        let (status, body) = match execute_oauth_request(http, &request).await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(AccountRefreshFailure::bad_gateway(format!(
+                    "OAuth refresh request failed: {error}"
+                )));
+                continue;
+            }
+        };
+        if !status.is_success() {
+            let classified = classify_oauth_error(Some(status.as_u16()), &body);
+            last_error = Some(AccountRefreshFailure::from_classification(
+                Some(status.as_u16()),
+                classified,
+                format!("OAuth refresh failed at {token_url}"),
+            ));
+            continue;
+        }
+
+        let raw: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+            AccountRefreshFailure::parse(format!(
+                "OAuth refresh response is not valid JSON: {error}"
+            ))
+        })?;
+        let token_response: OAuthTokenResponse =
+            serde_json::from_value(raw.clone()).map_err(|error| {
+                AccountRefreshFailure::parse(format!(
+                    "OAuth refresh response is missing token fields: {error}"
+                ))
+            })?;
+        let mut update =
+            refresh_update_from_token_response(account.provider_type, &token_response, raw, now_ms);
+
+        if let Some(profile_request) =
+            build_profile_request(account.provider_type, &token_response.access_token)
+        {
+            update = merge_refresh_updates(
+                update,
+                execute_optional_profile_refresh(
+                    http,
+                    account.provider_type,
+                    &profile_request,
+                    now_ms,
+                )
+                .await,
+            );
+        }
+
+        return Ok(update);
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        AccountRefreshFailure::bad_request("OAuth refresh did not produce a request")
+    }))
+}
+
+pub async fn execute_oauth_token_request(
+    http: &reqwest::Client,
+    provider_type: ProviderType,
+    request: &OAuthHttpRequest,
+    context: impl Into<String>,
+) -> Result<(OAuthTokenResponse, serde_json::Value), AccountRefreshFailure> {
+    let context = context.into();
+    let requests = oauth_token_request_fallbacks(provider_type, request);
+    let mut last_error = None;
+    for request in requests {
+        match execute_single_oauth_token_request(http, provider_type, &request, &context).await {
+            Ok(response) => return Ok(response),
+            Err(error) if error.kind == OAuthErrorKind::AuthorizationPending => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        AccountRefreshFailure::bad_request(format!(
+            "{context}: OAuth token exchange did not produce a request"
+        ))
+    }))
+}
+
+pub async fn execute_oauth_json_request(
+    http: &reqwest::Client,
+    provider_type: ProviderType,
+    request: &OAuthHttpRequest,
+    context: impl Into<String>,
+) -> Result<serde_json::Value, AccountRefreshFailure> {
+    let context = context.into();
+    let (status, body) = execute_oauth_request(http, request)
+        .await
+        .map_err(|error| AccountRefreshFailure::bad_gateway(format!("{context}: {error}")))?;
+    if !status.is_success() {
+        let classified = classify_oauth_error(Some(status.as_u16()), &body);
+        return Err(AccountRefreshFailure::from_classification(
+            Some(status.as_u16()),
+            classified,
+            format!("{context} failed at {}", request.url),
+        ));
+    }
+    serde_json::from_str(&body).map_err(|error| {
+        AccountRefreshFailure::parse(format!(
+            "{context} response is not valid JSON for {}: {error}",
+            provider_type.as_str()
+        ))
+    })
+}
+
+async fn execute_single_oauth_token_request(
+    http: &reqwest::Client,
+    provider_type: ProviderType,
+    request: &OAuthHttpRequest,
+    context: &str,
+) -> Result<(OAuthTokenResponse, serde_json::Value), AccountRefreshFailure> {
+    let (status, body) = execute_oauth_request(http, request)
+        .await
+        .map_err(|error| AccountRefreshFailure::bad_gateway(format!("{context}: {error}")))?;
+    if cursor_login_is_pending(provider_type, status, &body) {
+        return Err(AccountRefreshFailure::authorization_pending(
+            "cursor oauth authorization is still pending",
+        ));
+    }
+    if !status.is_success() {
+        let classified = classify_oauth_error(Some(status.as_u16()), &body);
+        return Err(AccountRefreshFailure::from_classification(
+            Some(status.as_u16()),
+            classified,
+            format!("{context} failed at {}", request.url),
+        ));
+    }
+
+    let raw: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+        AccountRefreshFailure::parse(format!("{context} response is not valid JSON: {error}"))
+    })?;
+    let token_response: OAuthTokenResponse =
+        serde_json::from_value(raw.clone()).map_err(|error| {
+            AccountRefreshFailure::parse(format!(
+                "{context} response is missing token fields for {}: {error}",
+                provider_type.as_str()
+            ))
+        })?;
+    Ok((token_response, raw))
+}
+
+fn oauth_token_request_fallbacks(
+    provider_type: ProviderType,
+    request: &OAuthHttpRequest,
+) -> Vec<OAuthHttpRequest> {
+    let mut requests = vec![request.clone()];
+    if let Some(spec) = oauth_provider_spec(provider_type) {
+        if !spec
+            .token_urls
+            .iter()
+            .any(|token_url| request.url == *token_url)
+        {
+            return requests;
+        }
+        for token_url in spec.token_urls {
+            if *token_url != request.url && !requests.iter().any(|item| item.url == *token_url) {
+                let mut next = request.clone();
+                next.url = (*token_url).to_string();
+                requests.push(next);
+            }
+        }
+    }
+    requests
+}
+
+fn cursor_login_is_pending(
+    provider_type: ProviderType,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> bool {
+    provider_type == ProviderType::CursorOAuth
+        && (status == reqwest::StatusCode::ACCEPTED
+            || status == reqwest::StatusCode::NOT_FOUND
+            || (status.is_success() && body.trim().is_empty()))
+}
+
+async fn execute_optional_profile_refresh(
+    http: &reqwest::Client,
+    provider_type: ProviderType,
+    request: &OAuthHttpRequest,
+    now_ms: i64,
+) -> AccountRefreshUpdate {
+    match execute_oauth_request(http, request).await {
+        Ok((status, body)) if status.is_success() => {
+            match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(profile_raw) => {
+                    refresh_update_from_profile_response(provider_type, profile_raw, now_ms)
+                }
+                Err(error) => AccountRefreshUpdate {
+                    last_refresh_error: Some(format!(
+                        "profile refresh warning: response is not valid JSON: {error}"
+                    )),
+                    ..Default::default()
+                },
+            }
+        }
+        Ok((status, body)) => {
+            let classified = classify_oauth_error(Some(status.as_u16()), &body);
+            AccountRefreshUpdate {
+                last_refresh_error: Some(format!(
+                    "profile refresh warning at {}: {}",
+                    request.url, classified.message
+                )),
+                ..Default::default()
+            }
+        }
+        Err(error) => AccountRefreshUpdate {
+            last_refresh_error: Some(format!("profile refresh warning: {error}")),
+            ..Default::default()
+        },
+    }
+}
+
+async fn execute_oauth_request(
+    http: &reqwest::Client,
+    request: &OAuthHttpRequest,
+) -> Result<(reqwest::StatusCode, String), reqwest::Error> {
+    let method = match request.method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        _ => reqwest::Method::POST,
+    };
+    let mut builder = http.request(method, &request.url);
+    for (name, value) in &request.headers {
+        builder = builder.header(name, value);
+    }
+    if request.method != "GET" {
+        builder = match request.body_format {
+            OAuthRequestBodyFormat::Form => builder.form(&oauth_form_pairs(&request.body)),
+            OAuthRequestBodyFormat::Json => builder.json(&request.body),
+        };
+    }
+    let response = builder.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    Ok((status, body))
+}
+
+fn oauth_form_pairs(value: &serde_json::Value) -> Vec<(String, String)> {
+    value
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .filter(|(_, item)| !item.is_null())
+                .map(|(key, item)| (key.clone(), oauth_value_to_string(item)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn oauth_value_to_string(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn refresh_status_code(upstream_status: Option<u16>, kind: OAuthErrorKind) -> u16 {
+    match kind {
+        OAuthErrorKind::MissingCredential
+        | OAuthErrorKind::Unsupported
+        | OAuthErrorKind::InvalidGrant
+        | OAuthErrorKind::ExpiredToken => 400,
+        OAuthErrorKind::AccessDenied => 403,
+        OAuthErrorKind::RateLimited => 429,
+        OAuthErrorKind::ProviderRejected | OAuthErrorKind::Network | OAuthErrorKind::Parse => 502,
+        OAuthErrorKind::AuthorizationPending => 409,
+        OAuthErrorKind::Unknown => upstream_status
+            .filter(|status| (400..500).contains(status))
+            .unwrap_or(502),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(url: &str) -> OAuthHttpRequest {
+        OAuthHttpRequest {
+            method: "POST",
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: serde_json::Value::Null,
+            body_format: OAuthRequestBodyFormat::Json,
+        }
+    }
+
+    #[test]
+    fn token_endpoint_requests_get_provider_fallbacks() {
+        let requests = oauth_token_request_fallbacks(
+            ProviderType::ClaudeOAuth,
+            &request("https://api.anthropic.com/v1/oauth/token"),
+        );
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, "https://api.anthropic.com/v1/oauth/token");
+        assert_eq!(
+            requests[1].url,
+            "https://platform.claude.com/v1/oauth/token"
+        );
+    }
+
+    #[test]
+    fn cursor_poll_request_does_not_fallback_to_refresh_token_endpoint() {
+        let requests = oauth_token_request_fallbacks(
+            ProviderType::CursorOAuth,
+            &request("https://api2.cursor.sh/auth/poll?uuid=session&verifier=secret"),
+        );
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.contains("/auth/poll?"));
+    }
+}

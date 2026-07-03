@@ -1,0 +1,16 @@
+[Unit]
+Description=cc-switch-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CC_SWITCH_SERVER_CONFIG_DIR=/var/lib/cc-switch-server
+Environment=CC_SWITCH_SERVER_LOG=info
+ExecStart=/usr/local/bin/cc-switch-server --host 0.0.0.0 --port 15721
+Restart=always
+RestartSec=3
+StateDirectory=cc-switch-server
+
+[Install]
+WantedBy=multi-user.target
