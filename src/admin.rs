@@ -14,6 +14,7 @@ use crate::core::shares::{shares_path, ShareStore};
 use crate::core::tunnel::{tunnels_path, TunnelRuntimeStatus};
 use crate::core::usage::{usage_path, UsageStore};
 use crate::coverage::ProviderCoverage;
+use crate::web_assets;
 
 pub fn run_config_command(cli: &Cli, command: ConfigCommand) -> anyhow::Result<()> {
     match command {
@@ -46,7 +47,7 @@ fn print_config_paths(cli: &Cli) -> anyhow::Result<()> {
         web_dist_dir
             .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<none>".to_string())
+            .unwrap_or_else(|| "<embedded>".to_string())
     );
     println!("bindAddr={}", cli.bind_addr());
     Ok(())
@@ -113,7 +114,7 @@ fn validation_report(snapshot: &ConfigSnapshot) -> String {
                 .web_dist_dir
                 .as_ref()
                 .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<none>".to_string())
+                .unwrap_or_else(|| "<embedded>".to_string())
         ),
         format!("bindAddr={}", snapshot.bind_addr),
     ];
@@ -213,9 +214,16 @@ fn check_config_dir(report: &mut DoctorReport, config_dir: &Path) {
 
 fn check_web_dist_dir(report: &mut DoctorReport, web_dist_dir: Option<&Path>) {
     let Some(web_dist_dir) = web_dist_dir else {
-        report.warn(
+        if web_assets::asset_count() == 0 {
+            report.fail(
+                "web-dist",
+                "no embedded web assets were compiled into this binary".to_string(),
+            );
+            return;
+        }
+        report.ok(
             "web-dist",
-            "no web-dist directory resolved; API-only mode".to_string(),
+            format!("using {} embedded web asset(s)", web_assets::asset_count()),
         );
         return;
     };

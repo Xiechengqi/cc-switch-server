@@ -103,13 +103,8 @@ impl Cli {
     }
 
     pub fn resolved_web_dist_dir(&self) -> Option<PathBuf> {
-        self.web_dist_dir.clone().or_else(default_web_dist_dir)
+        self.web_dist_dir.clone()
     }
-}
-
-fn default_web_dist_dir() -> Option<PathBuf> {
-    let cwd_dist = std::env::current_dir().ok()?.join("web-dist");
-    cwd_dist.is_dir().then_some(cwd_dist)
 }
 
 #[cfg(test)]
@@ -149,6 +144,23 @@ mod tests {
         assert_eq!(
             cli.config_dir,
             Some(PathBuf::from("/tmp/cc-switch-server-test"))
+        );
+    }
+
+    #[test]
+    fn web_dist_dir_is_only_explicit_override() {
+        let cli = Cli::try_parse_from(["cc-switch-server"]).unwrap();
+        assert_eq!(cli.resolved_web_dist_dir(), None);
+
+        let cli = Cli::try_parse_from([
+            "cc-switch-server",
+            "--web-dist-dir",
+            "/tmp/cc-switch-server-web",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.resolved_web_dist_dir(),
+            Some(PathBuf::from("/tmp/cc-switch-server-web"))
         );
     }
 

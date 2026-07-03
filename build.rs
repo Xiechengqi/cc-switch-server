@@ -1,11 +1,12 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     configure_reruns();
+    generate_embedded_web_assets();
 
     let commit = env_or_git("CC_SWITCH_BUILD_COMMIT", &["rev-parse", "HEAD"], "unknown");
     let commit_short = env_or_git(
@@ -64,6 +65,7 @@ fn configure_reruns() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=web-dist");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-env-changed=CC_SWITCH_BUILD_COMMIT");
@@ -79,6 +81,100 @@ fn configure_reruns() {
     if let Some(head_ref) = git_head_ref() {
         println!("cargo:rerun-if-changed={head_ref}");
     }
+}
+
+fn generate_embedded_web_assets() {
+    let root = Path::new("web-dist");
+    let assets = collect_web_assets(root).unwrap_or_else(|error| {
+        panic!("failed to collect embedded web assets from web-dist: {error}");
+    });
+    for (_, path) in &assets {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    let mut output = String::from("pub static EMBEDDED_WEB_ASSETS: &[EmbeddedWebAsset] = &[\n");
+    for (relative, path) in assets {
+        let absolute = env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path);
+        output.push_str("    EmbeddedWebAsset {\n");
+        output.push_str(&format!(
+            "        path: {},\n",
+            rust_string_literal(&relative)
+        ));
+        output.push_str(&format!(
+            "        content_type: {},\n",
+            rust_string_literal(content_type_for_path(&relative))
+        ));
+        output.push_str(&format!(
+            "        bytes: include_bytes!({}),\n",
+            rust_string_literal(&absolute.display().to_string())
+        ));
+        output.push_str("    },\n");
+    }
+    output.push_str("];\n");
+
+    let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo");
+    fs::write(Path::new(&out_dir).join("embedded_web_assets.rs"), output)
+        .expect("write embedded web assets module");
+}
+
+fn collect_web_assets(root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let mut assets = Vec::new();
+    if !root.is_dir() {
+        return Ok(assets);
+    }
+    collect_web_assets_inner(root, root, &mut assets)?;
+    assets.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(assets)
+}
+
+fn collect_web_assets_inner(
+    root: &Path,
+    dir: &Path,
+    assets: &mut Vec<(String, PathBuf)>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_web_assets_inner(root, &path, assets)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let relative = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        assets.push((relative, path));
+    }
+    Ok(())
+}
+
+fn content_type_for_path(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|value| value.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+fn rust_string_literal(value: &str) -> String {
+    format!("{value:?}")
 }
 
 fn git_head_ref() -> Option<String> {

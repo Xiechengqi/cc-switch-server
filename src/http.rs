@@ -3,11 +3,11 @@ use std::convert::Infallible;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
@@ -80,6 +80,7 @@ use crate::proxy::{self, ProxyRoute};
 use crate::state::{
     save_accounts_debounced, save_shares_debounced, ServerEvent, ServerState, Session,
 };
+use crate::web_assets;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -342,12 +343,67 @@ pub fn app_router(state: ServerState) -> Router {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    if let Some(web_dist_dir) = state.web_dist_dir.as_ref().filter(|path| path.is_dir()) {
-        app = app.fallback_service(ServeDir::new(web_dist_dir));
-    } else {
-        app = app.fallback(web_dist_missing);
+    match state.web_dist_dir.as_ref() {
+        Some(web_dist_dir) if web_dist_dir.is_dir() => {
+            app = app.fallback_service(ServeDir::new(web_dist_dir));
+        }
+        Some(web_dist_dir) => {
+            tracing::warn!(
+                web_dist_dir = %web_dist_dir.display(),
+                "configured web dist directory is missing; using embedded web assets"
+            );
+            app = app.fallback(embedded_web_asset);
+        }
+        None if web_assets::asset_count() > 0 => {
+            app = app.fallback(embedded_web_asset);
+        }
+        None => {
+            app = app.fallback(web_dist_missing);
+        }
     }
     app
+}
+
+async fn embedded_web_asset(method: Method, uri: Uri) -> Response {
+    if !matches!(method, Method::GET | Method::HEAD) {
+        return web_dist_missing_response();
+    }
+    let Some(asset) = web_assets::asset_for_uri_path(uri.path()) else {
+        return web_dist_missing_response();
+    };
+
+    let cache_control = if asset.path == "index.html" {
+        "no-cache"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from(Bytes::from_static(asset.bytes))
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, asset.content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(body)
+        .unwrap_or_else(|_| web_dist_missing_response())
+}
+
+fn web_dist_missing_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            ok: false,
+            error: "web dist asset not found".to_string(),
+            code: None,
+            error_type: None,
+            status: Some(StatusCode::NOT_FOUND.as_u16()),
+            retryable: None,
+        }),
+    )
+        .into_response()
 }
 
 async fn health(State(state): State<ServerState>) -> Json<HealthResponse> {
@@ -358,6 +414,7 @@ async fn health(State(state): State<ServerState>) -> Json<HealthResponse> {
             .web_dist_dir
             .as_ref()
             .map(|path| path.display().to_string()),
+        embedded_web_assets: web_assets::asset_count(),
         unix_ms: now_ms(),
     })
 }
@@ -4430,17 +4487,7 @@ fn dedupe_non_empty(values: Vec<String>) -> Vec<String> {
 }
 
 async fn web_dist_missing() -> impl IntoResponse {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            ok: false,
-            error: "web dist directory not found".to_string(),
-            code: None,
-            error_type: None,
-            status: Some(StatusCode::NOT_FOUND.as_u16()),
-            retryable: None,
-        }),
-    )
+    web_dist_missing_response()
 }
 
 fn now_ms() -> u128 {
@@ -4877,6 +4924,7 @@ struct HealthResponse {
     ok: bool,
     config_dir: String,
     web_dist_dir: Option<String>,
+    embedded_web_assets: usize,
     unix_ms: u128,
 }
 

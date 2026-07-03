@@ -6,6 +6,7 @@ mod coverage;
 mod http;
 mod proxy;
 mod state;
+mod web_assets;
 
 use anyhow::Context;
 use cli::{Cli, Command};
