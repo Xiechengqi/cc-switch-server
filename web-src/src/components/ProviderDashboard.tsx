@@ -2,6 +2,8 @@ import {
   Boxes,
   CheckCircle2,
   FlaskConical,
+  GripVertical,
+  Link2,
   ListPlus,
   Loader2,
   Pencil,
@@ -19,6 +21,7 @@ import {
   createProviderFromPreset,
   deleteProvider,
   fetchProviderModels,
+  getCurrentProvider,
   loadProviderDashboardData,
   Provider,
   ProviderHealth,
@@ -33,6 +36,9 @@ import {
   testProvider,
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
+import { inferIconForText } from "@/config/iconInference";
+import { ProviderIcon } from "@/components/ProviderIcon";
+import { presetIcon, storedProviderIcon } from "@/lib/provider-icons";
 
 const apps: Array<{ id: AppKind; label: string }> = [
   { id: "claude", label: "Claude" },
@@ -68,9 +74,17 @@ interface ProviderDraft {
   advancedJson: string;
 }
 
-export function ProviderDashboard() {
+export function ProviderDashboard({
+  activeApp: controlledActiveApp,
+  onActiveAppChange,
+}: {
+  activeApp?: AppKind;
+  onActiveAppChange?: (app: AppKind) => void;
+}) {
   const { t, tx } = useI18n();
-  const [activeApp, setActiveApp] = useState<AppKind>("claude");
+  const [localActiveApp, setLocalActiveApp] = useState<AppKind>("claude");
+  const activeApp = controlledActiveApp || localActiveApp;
+  const setActiveApp = onActiveAppChange || setLocalActiveApp;
   const [data, setData] = useState<ProviderDashboardState>({
     providers: [],
     matrix: null,
@@ -86,7 +100,8 @@ export function ProviderDashboard() {
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [resultById, setResultById] = useState<Record<string, string>>({});
-  const [presetOpen, setPresetOpen] = useState(false);
+  const [catalogOpen, setCatalogOpen] = useState(false);
+  const [currentProviderId, setCurrentProviderId] = useState<string>("");
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -104,12 +119,25 @@ export function ProviderDashboard() {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    let active = true;
+    getCurrentProvider(activeApp)
+      .then((id) => {
+        if (active) setCurrentProviderId(id || "");
+      })
+      .catch(() => {
+        if (active) setCurrentProviderId("");
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeApp, data.providers]);
+
   const entries = useMemo(
     () => (data.matrix?.entries || []).filter((entry) => entry.app === activeApp),
     [activeApp, data.matrix],
   );
-  const visibleEntries = entries.filter((entry) => entry.uiVisible);
-  const diagnosticEntries = entries.filter((entry) => !entry.uiVisible);
+  const visibleEntries = useMemo(() => entries.filter((entry) => entry.uiVisible), [entries]);
   const activeProviders = data.providers.filter((provider) => provider.app === activeApp);
   const activePresets = data.presets[activeApp] || [];
   const healthById = new Map(
@@ -124,10 +152,20 @@ export function ProviderDashboard() {
   );
 
   function openCreate() {
-    const entry = visibleEntries[0];
-    if (!entry) return;
+    if (!visibleEntries.length && !activePresets.length) return;
+    setCatalogOpen(true);
+  }
+
+  function createFromEntry(entry: ProviderMatrixEntry) {
+    setCatalogOpen(false);
     setDraft(createDraft(activeApp, entry));
   }
+
+  useEffect(() => {
+    const handler = () => openCreate();
+    document.addEventListener("cc-switch-server:add-provider", handler);
+    return () => document.removeEventListener("cc-switch-server:add-provider", handler);
+  }, [activeApp, visibleEntries]);
 
   function openEdit(provider: StoredProvider) {
     const entry =
@@ -173,6 +211,7 @@ export function ProviderDashboard() {
       }
       if (action === "switch") {
         await switchProvider(provider.app, provider.provider.id);
+        setCurrentProviderId(provider.provider.id);
         setResultById((current) => ({
           ...current,
           [provider.provider.id]: tx("Switch check passed for server runtime"),
@@ -212,10 +251,10 @@ export function ProviderDashboard() {
   async function createPresetProvider(preset: ProviderPresetSummary) {
     const key = `preset:${activeApp}:${preset.name}`;
     setBusyId(key);
-    setError(null);
+      setError(null);
     try {
       const stored = await createProviderFromPreset(activeApp, preset.name);
-      setPresetOpen(false);
+      setCatalogOpen(false);
       setResultById((current) => ({
         ...current,
         [stored.provider.id]: tx("Created from preset {{preset}}", { preset: preset.name }),
@@ -231,18 +270,20 @@ export function ProviderDashboard() {
   return (
     <div className="provider-dashboard">
       <div className="provider-toolbar">
-        <div className="segmented">
-          {apps.map((app) => (
-            <button
-              key={app.id}
-              type="button"
-              className={app.id === activeApp ? "active" : ""}
-              onClick={() => setActiveApp(app.id)}
-            >
-              {app.label}
-            </button>
-          ))}
-        </div>
+        {!controlledActiveApp && (
+          <div className="segmented">
+            {apps.map((app) => (
+              <button
+                key={app.id}
+                type="button"
+                className={app.id === activeApp ? "active" : ""}
+                onClick={() => setActiveApp(app.id)}
+              >
+                {app.label}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="provider-toolbar-actions">
           {error && <span className="error-text">{error}</span>}
           <button className="secondary-button" type="button" onClick={() => void refresh()}>
@@ -252,8 +293,8 @@ export function ProviderDashboard() {
           <button
             className="secondary-button"
             type="button"
-            onClick={() => setPresetOpen(true)}
-            disabled={!activePresets.length}
+            onClick={openCreate}
+            disabled={!activePresets.length && !visibleEntries.length}
           >
             <ListPlus size={15} />
             <span>{t("server.common.fromPreset")}</span>
@@ -262,22 +303,12 @@ export function ProviderDashboard() {
             className="primary-button"
             type="button"
             onClick={openCreate}
-            disabled={!visibleEntries.length}
+            disabled={!visibleEntries.length && !activePresets.length}
           >
             <ListPlus size={15} />
             <span>{t("server.providers.addProvider")}</span>
           </button>
         </div>
-      </div>
-
-      <div className="provider-summary-row">
-        <SummaryTile label={t("server.providers.providers")} value={activeProviders.length} />
-        <SummaryTile label={t("server.providers.creatableTypes")} value={visibleEntries.length} />
-        <SummaryTile label={t("server.providers.diagnosticOnly")} value={diagnosticEntries.length} />
-        <SummaryTile
-          label={t("server.providers.healthy")}
-          value={data.health.filter((item) => item.app === activeApp && item.healthy).length}
-        />
       </div>
 
       {loading ? (
@@ -296,6 +327,7 @@ export function ProviderDashboard() {
               account={accountForProvider(provider, accountsById)}
               capability={capabilityForProvider(provider, capabilitiesByType)}
               limit={limitByProviderKey.get(providerKey(provider.app, provider.provider.id))}
+              current={provider.provider.id === currentProviderId}
               result={resultById[provider.provider.id]}
               busyId={busyId}
               onEdit={() => openEdit(provider)}
@@ -311,38 +343,6 @@ export function ProviderDashboard() {
         </div>
       )}
 
-      <section className="provider-matrix-section">
-        <div className="section-heading">
-          <h2>{t("server.providers.availableTypes")}</h2>
-          <span>{t("server.providers.enabledForCreation", { count: visibleEntries.length })}</span>
-        </div>
-        <div className="provider-type-grid">
-          {visibleEntries.map((entry) => (
-            <button
-              key={entry.providerTypeId}
-              type="button"
-              className="provider-type-option"
-              onClick={() => setDraft(createDraft(activeApp, entry))}
-            >
-              <strong>{entry.label}</strong>
-              <span>{entry.credentialMode}</span>
-            </button>
-          ))}
-        </div>
-        {diagnosticEntries.length > 0 && (
-          <details className="diagnostic-types">
-            <summary>{t("server.providers.diagnosticCombinations", { count: diagnosticEntries.length })}</summary>
-            <div>
-              {diagnosticEntries.map((entry) => (
-                <span key={entry.providerTypeId}>
-                  {entry.label}: {entry.note}
-                </span>
-              ))}
-            </div>
-          </details>
-        )}
-      </section>
-
       {draft && (
         <ProviderFormModal
           draft={draft}
@@ -355,13 +355,15 @@ export function ProviderDashboard() {
         />
       )}
 
-      {presetOpen && (
-        <ProviderPresetModal
+      {catalogOpen && (
+        <ProviderCatalogModal
           app={activeApp}
+          entries={visibleEntries}
           presets={activePresets}
           busyId={busyId}
+          onSelectEntry={createFromEntry}
           onSelect={(preset) => void createPresetProvider(preset)}
-          onClose={() => setPresetOpen(false)}
+          onClose={() => setCatalogOpen(false)}
         />
       )}
     </div>
@@ -375,6 +377,7 @@ function ProviderCard({
   account,
   capability,
   limit,
+  current,
   result,
   busyId,
   onEdit,
@@ -386,6 +389,7 @@ function ProviderCard({
   account?: AccountRecord;
   capability?: AccountManagerCapability;
   limit?: ProviderLimitStatus;
+  current: boolean;
   result?: string;
   busyId: string | null;
   onEdit: () => void;
@@ -394,27 +398,62 @@ function ProviderCard({
   const { tx } = useI18n();
   const model = modelFromProvider(provider.provider);
   const baseUrl = baseUrlFromProvider(provider.provider, provider.app);
+  const providerIcon = storedProviderIcon(provider);
   const accountId = provider.provider.meta?.authBinding?.accountId;
   const accountValue = account
     ? accountSummary(account)
     : accountId || tx("direct config");
+  const healthLabel = health?.healthy === false ? tx("unhealthy") : tx("healthy");
   const busyPrefix = `${provider.app}:${provider.provider.id}:`;
   return (
-    <article className="provider-card">
-      <header>
-        <div>
-          <h3>{provider.provider.name}</h3>
-          <p>{entry?.label || provider.providerTypeId}</p>
+    <article className={current ? "provider-card current" : "provider-card"}>
+      <header className="provider-card-header">
+        <div className="provider-card-title-row">
+          <button
+            className="provider-drag-handle"
+            type="button"
+            aria-label={tx("Drag provider")}
+            title={tx("Drag provider")}
+          >
+            <GripVertical size={16} />
+          </button>
+          <div className="provider-icon-frame">
+            <ProviderIcon
+              icon={providerIcon.icon}
+              name={provider.provider.name}
+              color={providerIcon.color}
+              size={22}
+            />
+          </div>
+          <div className="provider-title-stack">
+            <div className="provider-name-row">
+              <h3>{provider.provider.name}</h3>
+              {current && <StatusPill tone="success">{tx("current")}</StatusPill>}
+              {account?.subscriptionLevel && (
+                <StatusPill tone="success">{account.subscriptionLevel}</StatusPill>
+              )}
+            </div>
+            <p>{entry?.label || provider.providerTypeId}</p>
+          </div>
         </div>
-        <StatusPill tone={health?.healthy === false ? "danger" : "success"}>
-          {health?.healthy === false ? "unhealthy" : "healthy"}
-        </StatusPill>
+        <div className="provider-card-right">
+          <StatusPill tone={health?.healthy === false ? "danger" : "success"}>
+            {healthLabel}
+          </StatusPill>
+          <span>{tx("{{count}} recent requests", { count: health?.requests ?? 0 })}</span>
+        </div>
       </header>
-      <div className="provider-card-meta">
+      {baseUrl && (
+        <a className="provider-url-row" href={baseUrl} target="_blank" rel="noreferrer">
+          <Link2 size={14} />
+          <span>{baseUrl}</span>
+        </a>
+      )}
+      <div className="provider-card-meta compact">
         <KeyValue label="model" value={model || "-"} />
-        <KeyValue label="base URL" value={baseUrl || "-"} />
         <KeyValue label="api format" value={apiFormatFromProvider(provider.provider) || "-"} />
         <KeyValue label="account" value={accountValue} />
+        <KeyValue label="last status" value={health?.lastStatusCode || "-"} />
       </div>
       {entry && <ProviderReadinessPanel entry={entry} capability={capability} />}
       {account && <ProviderAccountFooter account={account} />}
@@ -455,7 +494,7 @@ function ProviderCard({
           <ServerCog size={15} />
         </IconAction>
         <button className="secondary-button compact" type="button" onClick={() => onAction("switch")}>
-          {tx("switch")}
+          {tx(current ? "current" : "switch")}
         </button>
         <IconAction
           title="Delete"
@@ -493,6 +532,12 @@ function ProviderFormModal({
   const entry = entries.find((item) => item.providerTypeId === draft.providerTypeId) || entries[0];
   const accountOptions = accounts.filter((account) =>
     accountMatchesProviderType(account, draft.providerTypeId),
+  );
+  const hasAdvancedConfig = Boolean(
+    draft.modelCatalogJson.trim() ||
+      draft.modelMappingJson.trim() ||
+      draft.pricingJson.trim() ||
+      draft.advancedJson.trim(),
   );
   function patch(next: Partial<ProviderDraft>) {
     onChange({ ...draft, ...next });
@@ -593,46 +638,46 @@ function ProviderFormModal({
               onChange={(event) => patch({ category: event.target.value })}
             />
           </label>
-          <div className="wide-field universal-json-section">
-            <div className="section-title-row compact-title">
+          <details className="wide-field provider-advanced-section" open={hasAdvancedConfig || undefined}>
+            <summary>
               <Boxes size={16} />
-              <div>
-                <h3>{tx("Model and pricing config")}</h3>
-                <span>{tx("Provider-scoped JSON overrides.")}</span>
+              <span>{tx("Advanced configuration")}</span>
+              <small>{tx("Model catalog, mapping, pricing, and provider JSON overrides")}</small>
+            </summary>
+            <div className="universal-json-section">
+              <div className="universal-json-grid">
+                <ProviderJsonField
+                  title={tx("Model Catalog")}
+                  label="modelCatalog JSON"
+                  value={draft.modelCatalogJson}
+                  placeholder={providerModelCatalogPlaceholder(draft.app)}
+                  onChange={(value) => patch({ modelCatalogJson: value })}
+                />
+                <ProviderJsonField
+                  title={tx("Model Mapping")}
+                  label="modelMapping JSON"
+                  value={draft.modelMappingJson}
+                  placeholder={providerModelMappingPlaceholder(draft.app)}
+                  onChange={(value) => patch({ modelMappingJson: value })}
+                />
+                <ProviderJsonField
+                  title={tx("Pricing")}
+                  label="pricing JSON"
+                  value={draft.pricingJson}
+                  placeholder={providerPricingPlaceholder()}
+                  onChange={(value) => patch({ pricingJson: value })}
+                />
               </div>
+              <label>
+                <span>{tx("Advanced provider JSON")}</span>
+                <textarea
+                  value={draft.advancedJson}
+                  onChange={(event) => patch({ advancedJson: event.target.value })}
+                  spellCheck={false}
+                />
+              </label>
             </div>
-            <div className="universal-json-grid">
-              <ProviderJsonField
-                title={tx("Model Catalog")}
-                label="modelCatalog JSON"
-                value={draft.modelCatalogJson}
-                placeholder={providerModelCatalogPlaceholder(draft.app)}
-                onChange={(value) => patch({ modelCatalogJson: value })}
-              />
-              <ProviderJsonField
-                title={tx("Model Mapping")}
-                label="modelMapping JSON"
-                value={draft.modelMappingJson}
-                placeholder={providerModelMappingPlaceholder(draft.app)}
-                onChange={(value) => patch({ modelMappingJson: value })}
-              />
-              <ProviderJsonField
-                title={tx("Pricing")}
-                label="pricing JSON"
-                value={draft.pricingJson}
-                placeholder={providerPricingPlaceholder()}
-                onChange={(value) => patch({ pricingJson: value })}
-              />
-            </div>
-          </div>
-          <label className="wide-field">
-            <span>{tx("Advanced provider JSON")}</span>
-            <textarea
-              value={draft.advancedJson}
-              onChange={(event) => patch({ advancedJson: event.target.value })}
-              spellCheck={false}
-            />
-          </label>
+          </details>
         </div>
         <footer>
           <button className="secondary-button" type="button" onClick={onClose}>
@@ -648,58 +693,136 @@ function ProviderFormModal({
   );
 }
 
-function ProviderPresetModal({
+function ProviderCatalogModal({
   app,
+  entries,
   presets,
   busyId,
+  onSelectEntry,
   onSelect,
   onClose,
 }: {
   app: AppKind;
+  entries: ProviderMatrixEntry[];
   presets: ProviderPresetSummary[];
   busyId: string | null;
+  onSelectEntry: (entry: ProviderMatrixEntry) => void;
   onSelect: (preset: ProviderPresetSummary) => void;
   onClose: () => void;
 }) {
   const { tx } = useI18n();
   return (
     <div className="modal-backdrop" role="presentation">
-      <section className="provider-form-modal simple-modal">
+      <section className="provider-form-modal simple-modal provider-catalog-modal">
         <header>
           <div>
-            <h2>{tx("Create From Preset")}</h2>
-            <p>{tx("Desktop provider presets available to server runtime", { app: appLabel(app) })}</p>
+            <h2>{tx("Add Provider")}</h2>
+            <p>{tx("Choose a desktop preset or provider type for {{app}}", { app: appLabel(app) })}</p>
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label={tx("Close")}>
             <X size={16} />
           </button>
         </header>
-        <div className="provider-preset-grid">
-          {presets.length ? (
-            presets.map((preset) => {
-              const busy = busyId === `preset:${app}:${preset.name}`;
-              return (
-                <button
-                  className="provider-preset-card"
-                  type="button"
-                  key={preset.name}
-                  onClick={() => onSelect(preset)}
-                  disabled={busy}
-                >
-                  <strong>{preset.name}</strong>
-                  <span>{preset.providerType || "provider"}</span>
-                  <small>{preset.apiFormat || "api format -"} · {preset.baseUrl || "base URL -"}</small>
-                  {busy && <Loader2 size={15} />}
-                </button>
-              );
-            })
-          ) : (
-            <div className="provider-empty">{tx("No presets for {{app}}", { app: appLabel(app) })}</div>
-          )}
+        <div className="provider-catalog-body">
+          <section className="provider-catalog-section">
+            <div className="section-title-row compact-title">
+              <ListPlus size={16} />
+              <div>
+                <h3>{tx("Presets")}</h3>
+                <span>{tx("Create with curated desktop defaults")}</span>
+              </div>
+            </div>
+            <div className="provider-preset-grid">
+              {presets.length ? (
+                presets.map((preset) => {
+                  const busy = busyId === `preset:${app}:${preset.name}`;
+                  const icon = presetIcon(preset);
+                  return (
+                    <button
+                      className="provider-preset-card"
+                      type="button"
+                      key={preset.name}
+                      onClick={() => onSelect(preset)}
+                      disabled={busy}
+                    >
+                      <span className="provider-preset-title">
+                        <span className="provider-icon-frame small">
+                          <ProviderIcon
+                            icon={icon.icon}
+                            name={preset.name}
+                            color={icon.color}
+                            size={18}
+                          />
+                        </span>
+                        <strong>{preset.name}</strong>
+                      </span>
+                      <span>{preset.providerType || "provider"}</span>
+                      <small>{preset.apiFormat || "api format -"} · {preset.baseUrl || "base URL -"}</small>
+                      {busy && <Loader2 size={15} />}
+                    </button>
+                  );
+                })
+              ) : (
+                <div className="provider-empty inline-empty">{tx("No presets for {{app}}", { app: appLabel(app) })}</div>
+              )}
+            </div>
+          </section>
+
+          <section className="provider-catalog-section">
+            <div className="section-title-row compact-title">
+              <ServerCog size={16} />
+              <div>
+                <h3>{tx("Provider Types")}</h3>
+                <span>{tx("Start from a server-supported adapter type")}</span>
+              </div>
+            </div>
+            <div className="provider-type-grid catalog-type-grid">
+              {entries.length ? (
+                entries.map((entry) => {
+                  const icon = entryIcon(entry);
+                  return (
+                    <button
+                      className="provider-type-option catalog-type-option"
+                      type="button"
+                      key={entry.providerTypeId}
+                      onClick={() => onSelectEntry(entry)}
+                    >
+                      <span className="provider-preset-title">
+                        <span className="provider-icon-frame small">
+                          <ProviderIcon
+                            icon={icon.icon}
+                            name={entry.label}
+                            color={icon.color}
+                            size={18}
+                          />
+                        </span>
+                        <strong>{entry.label}</strong>
+                      </span>
+                      <span>{entry.defaults.apiFormat || entry.providerType}</span>
+                      <small>{entry.defaults.baseUrl || entry.note || tx("Manual configuration")}</small>
+                    </button>
+                  );
+                })
+              ) : (
+                <div className="provider-empty inline-empty">{tx("No provider types for {{app}}", { app: appLabel(app) })}</div>
+              )}
+            </div>
+          </section>
         </div>
       </section>
     </div>
   );
+}
+
+function entryIcon(entry: ProviderMatrixEntry): { icon?: string; color?: string } {
+  const inferred = inferIconForText(
+    entry.label,
+    entry.providerType,
+    entry.providerTypeId,
+    entry.defaults.baseUrl,
+    entry.defaults.apiFormat,
+  );
+  return { icon: inferred.icon, color: inferred.iconColor };
 }
 
 function ProviderJsonField({
@@ -729,16 +852,6 @@ function ProviderJsonField({
         />
       </label>
     </section>
-  );
-}
-
-function SummaryTile({ label, value }: { label: string; value: ReactNode }) {
-  const { tx } = useI18n();
-  return (
-    <div className="summary-tile">
-      <span>{tx(label)}</span>
-      <strong>{value}</strong>
-    </div>
   );
 }
 

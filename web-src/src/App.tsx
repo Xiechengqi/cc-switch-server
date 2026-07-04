@@ -1,16 +1,20 @@
 import {
+  ArrowLeft,
   BarChart3,
-  Boxes,
-  Cloud,
+  Download,
+  FolderArchive,
   KeyRound,
   Layers3,
   Network,
+  Plus,
   RefreshCw,
   Settings,
   Share2,
+  Shuffle,
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
+import { AppKind } from "@/lib/api";
 import {
   getWebRuntimeContext,
   jsonFetch,
@@ -19,28 +23,28 @@ import {
   writeToken,
 } from "@/lib/runtime";
 import { useI18n } from "@/lib/i18n";
-import { AccountsDashboard } from "@/components/AccountsDashboard";
+import { ProviderIcon } from "@/components/ProviderIcon";
 import { ProviderDashboard } from "@/components/ProviderDashboard";
-import { SettingsDashboard } from "@/components/SettingsDashboard";
+import { SettingsDashboard, SettingsTab } from "@/components/SettingsDashboard";
 import { ShareDashboard } from "@/components/ShareDashboard";
 import { UniversalDashboard } from "@/components/UniversalDashboard";
 import { UsageDashboard } from "@/components/UsageDashboard";
+import { appIcon } from "@/lib/provider-icons";
 
-type View = "providers" | "shares" | "usage" | "settings" | "universal" | "accounts";
+type View = "providers" | "shares" | "usage" | "settings" | "universal";
 
-const views: Array<{ id: View; labelKey: string; icon: ReactNode }> = [
-  { id: "providers", labelKey: "server.nav.providers", icon: <Boxes size={17} /> },
-  { id: "shares", labelKey: "server.nav.shares", icon: <Share2 size={17} /> },
-  { id: "usage", labelKey: "server.nav.usage", icon: <BarChart3 size={17} /> },
-  { id: "settings", labelKey: "server.nav.settings", icon: <Settings size={17} /> },
-  { id: "universal", labelKey: "server.nav.universal", icon: <Layers3 size={17} /> },
-  { id: "accounts", labelKey: "server.nav.accounts", icon: <KeyRound size={17} /> },
+const appTabs: Array<{ id: AppKind; label: string; iconName: string; iconColor?: string }> = [
+  { id: "claude", label: "Claude Code", iconName: appIcon("claude").icon, iconColor: appIcon("claude").color },
+  { id: "codex", label: "Codex", iconName: appIcon("codex").icon, iconColor: appIcon("codex").color },
+  { id: "gemini", label: "Gemini", iconName: appIcon("gemini").icon, iconColor: appIcon("gemini").color },
 ];
 
 function App() {
-  const { t } = useI18n();
+  const { t, tx } = useI18n();
   const [context, setContext] = useState<WebRuntimeContext | null>(null);
   const [view, setView] = useState<View>("providers");
+  const [activeApp, setActiveApp] = useState<AppKind>("claude");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -82,65 +86,152 @@ function App() {
     }
     switch (view) {
       case "providers":
-        return <ProviderDashboard />;
+        return <ProviderDashboard activeApp={activeApp} onActiveAppChange={setActiveApp} />;
       case "shares":
         return <ShareDashboard />;
       case "usage":
         return <UsageDashboard />;
       case "settings":
-        return <SettingsDashboard />;
+        return <SettingsDashboard initialTab={settingsTab} />;
       case "universal":
         return <UniversalDashboard />;
-      case "accounts":
-        return <AccountsDashboard />;
     }
-  }, [context, loading, loadData, t, view]);
+  }, [activeApp, context, loading, loadData, settingsTab, t, view]);
 
-  const activeViewLabel = t(views.find((item) => item.id === view)?.labelKey || "server.common.server");
+  const activeViewLabel = viewLabel(view, t);
+  const isAuthenticated = context?.mode === "local-admin";
 
   return (
-    <main className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <Cloud size={21} />
-          <div>
-            <div className="brand-name">cc-switch-server</div>
-            <div className="brand-subtitle">{t("server.brand.subtitle")}</div>
-          </div>
-        </div>
-        <nav className="nav-list">
-          {views.map((item) => (
-            <button
-              key={item.id}
-              className={item.id === view ? "nav-item active" : "nav-item"}
-              type="button"
-              onClick={() => setView(item.id)}
-              disabled={context?.mode !== "local-admin"}
-            >
-              {item.icon}
-              <span>{t(item.labelKey)}</span>
-            </button>
-          ))}
-        </nav>
-        <div className="runtime-block">
-          <StatusPill tone={context?.status === "authenticated" ? "success" : "warning"}>
-            {context?.status || "loading"}
-          </StatusPill>
-          <div className="runtime-line">{context?.router?.clientSubdomain || t("server.common.local")}</div>
-        </div>
-      </aside>
-
+    <main className="app-shell desktop-shell">
       <section className="workspace">
-        <header className="topbar">
-          <div>
-            <h1>{activeViewLabel}</h1>
-            <p>{context?.auth?.ownerEmail || context?.status || t("server.common.runtime")}</p>
+        <header className="desktop-topbar">
+          <div className="desktop-topbar-left">
+            {view !== "providers" ? (
+              <div className="desktop-back-title">
+                <button
+                  className="icon-button desktop-header-icon"
+                  type="button"
+                  onClick={() => setView("providers")}
+                  aria-label={tx("Back")}
+                  title={tx("Back")}
+                >
+                  <ArrowLeft size={16} />
+                </button>
+                <h1>{activeViewLabel}</h1>
+              </div>
+            ) : (
+              <div className="desktop-brand-row">
+                <button
+                  className="desktop-brand-link"
+                  type="button"
+                  onClick={() => setView("providers")}
+                  aria-label={tx("CC Switch")}
+                  title={tx("CC Switch")}
+                >
+                  {tx("CC Switch")}
+                </button>
+                <button
+                  className="icon-button desktop-header-icon"
+                  type="button"
+                  onClick={() => openSettings("general")}
+                  disabled={!isAuthenticated}
+                  aria-label={t("server.nav.settings")}
+                  title={t("server.nav.settings")}
+                >
+                  <Settings size={16} />
+                </button>
+              </div>
+            )}
+
+            {isAuthenticated && (
+              <div className="desktop-header-switches">
+                <HeaderShareToggle active={view === "shares"} onClick={() => setView("shares")} />
+                <HeaderFailoverToggle activeApp={activeApp} />
+              </div>
+            )}
           </div>
-          <div className="topbar-actions">
+
+          <div className="desktop-app-switcher" role="tablist" aria-label={tx("App switcher")}>
+            {appTabs.map((app) => (
+              <button
+                key={app.id}
+                className={app.id === activeApp ? "active" : ""}
+                type="button"
+                role="tab"
+                aria-selected={app.id === activeApp}
+                onClick={() => {
+                  setActiveApp(app.id);
+                  setView("providers");
+                }}
+                disabled={!isAuthenticated}
+              >
+                <ProviderIcon
+                  icon={app.iconName}
+                  name={app.label}
+                  color={app.iconColor}
+                  size={16}
+                  showFallback={false}
+                />
+                <span>{app.label}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="desktop-topbar-actions">
             {error && <span className="error-text">{error}</span>}
+            <button
+              className="icon-button desktop-header-icon"
+              type="button"
+              onClick={() => setView("usage")}
+              disabled={!isAuthenticated}
+              aria-label={t("server.nav.usage")}
+              title={t("server.nav.usage")}
+            >
+              <BarChart3 size={16} />
+            </button>
+            <button
+              className="icon-button desktop-header-icon"
+              type="button"
+              onClick={() => setView("universal")}
+              disabled={!isAuthenticated}
+              aria-label={t("server.nav.universal")}
+              title={t("server.nav.universal")}
+            >
+              <Layers3 size={16} />
+            </button>
+            <button
+              className="icon-button desktop-header-icon"
+              type="button"
+              onClick={() => setView("shares")}
+              disabled={!isAuthenticated}
+              aria-label={t("server.nav.shares")}
+              title={t("server.nav.shares")}
+            >
+              <Share2 size={16} />
+            </button>
+            <button
+              className="icon-button desktop-header-icon"
+              type="button"
+              onClick={() => openSettings("backup")}
+              disabled={!isAuthenticated}
+              aria-label={tx("Backup")}
+              title={tx("Backup")}
+            >
+              <FolderArchive size={16} />
+            </button>
+            <button
+              className="icon-button desktop-header-icon"
+              type="button"
+              onClick={() => openSettings("backup")}
+              disabled={!isAuthenticated}
+              aria-label={t("common.import")}
+              title={t("common.import")}
+            >
+              <Download size={16} />
+            </button>
             {readToken() && (
               <button
-                className="icon-button"
+                className="icon-button desktop-header-icon"
                 type="button"
                 onClick={() => {
                   writeToken(null);
@@ -153,7 +244,7 @@ function App() {
               </button>
             )}
             <button
-              className="icon-button"
+              className="icon-button desktop-header-icon"
               type="button"
               onClick={() => {
                 setError(null);
@@ -167,12 +258,108 @@ function App() {
             >
               <RefreshCw size={16} />
             </button>
+            <button
+              className="desktop-add-button"
+              type="button"
+              onClick={() => {
+                setView("providers");
+                document.dispatchEvent(new CustomEvent("cc-switch-server:add-provider"));
+              }}
+              disabled={!isAuthenticated}
+              aria-label={t("server.providers.addProvider")}
+              title={t("server.providers.addProvider")}
+            >
+              <Plus size={19} />
+            </button>
           </div>
         </header>
         {content}
       </section>
     </main>
   );
+
+  function openSettings(tab: SettingsTab) {
+    setSettingsTab(tab);
+    setView("settings");
+  }
+}
+
+function HeaderShareToggle({ active, onClick }: { active: boolean; onClick: () => void }) {
+  const { tx } = useI18n();
+  return (
+    <button
+      className={active ? "desktop-mini-toggle active" : "desktop-mini-toggle"}
+      type="button"
+      onClick={onClick}
+      title={tx("Share routing")}
+      aria-pressed={active}
+    >
+      <Network size={14} />
+      <span>{tx("Share")}</span>
+    </button>
+  );
+}
+
+function HeaderFailoverToggle({ activeApp }: { activeApp: AppKind }) {
+  const { tx } = useI18n();
+  const [enabled, setEnabled] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const response = await jsonFetch<{
+      failover?: { apps?: Record<string, { enabled?: boolean }> };
+    }>("/api/failover");
+    setEnabled(Boolean(response.failover?.apps?.[activeApp]?.enabled));
+  }, [activeApp]);
+
+  useEffect(() => {
+    let active = true;
+    refresh().catch(() => {
+      if (active) setEnabled(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [refresh]);
+
+  async function toggle() {
+    setBusy(true);
+    try {
+      const response = await jsonFetch<{ config?: { enabled?: boolean } }>(`/api/failover/apps/${activeApp}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: !enabled }),
+      });
+      setEnabled(Boolean(response.config?.enabled));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <button
+      className={enabled ? "desktop-mini-toggle active" : "desktop-mini-toggle"}
+      type="button"
+      onClick={() => void toggle()}
+      disabled={busy}
+      title={tx("Auto failover")}
+      aria-pressed={enabled}
+    >
+      <Shuffle size={14} />
+      <span>{tx("Failover")}</span>
+    </button>
+  );
+}
+
+function viewLabel(view: View, t: (key: string) => string): string {
+  const labels: Record<View, string> = {
+    providers: t("server.nav.providers"),
+    shares: t("server.nav.shares"),
+    usage: t("server.nav.usage"),
+    settings: t("server.nav.settings"),
+    universal: t("server.nav.universal"),
+  };
+  return labels[view];
 }
 
 function LoginPanel({

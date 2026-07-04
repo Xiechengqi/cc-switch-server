@@ -856,6 +856,10 @@ export async function switchProvider(app: AppKind, id: string): Promise<void> {
   await invokeCommand("switch_provider", { app, id });
 }
 
+export async function getCurrentProvider(app: AppKind): Promise<string> {
+  return invokeCommand<string>("get_current_provider", { app });
+}
+
 export async function testProvider(
   app: AppKind,
   id: string,

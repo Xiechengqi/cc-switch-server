@@ -3,6 +3,7 @@ import {
   Copy,
   Download,
   Edit3,
+  Globe,
   ListPlus,
   Loader2,
   Plus,
@@ -27,6 +28,8 @@ import {
   UniversalProviderSyncResult,
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
+import { inferIconForText } from "@/config/iconInference";
+import { ProviderIcon } from "@/components/ProviderIcon";
 
 interface UniversalDraft {
   mode: "create" | "edit";
@@ -210,13 +213,6 @@ export function UniversalDashboard() {
         </div>
       </div>
 
-      <div className="provider-summary-row universal-summary-row">
-        <SummaryTile label="Claude" value={list.filter((provider) => provider.apps.claude).length} />
-        <SummaryTile label="Codex" value={list.filter((provider) => provider.apps.codex).length} />
-        <SummaryTile label="Gemini" value={list.filter((provider) => provider.apps.gemini).length} />
-        <SummaryTile label={t("server.universal.withKey")} value={list.filter((provider) => provider.apiKey).length} />
-      </div>
-
       {loading ? (
         <div className="provider-empty">
           <Loader2 size={22} />
@@ -313,49 +309,70 @@ function UniversalCard({
   onDelete: () => void;
 }) {
   const { tx } = useI18n();
+  const icon = universalProviderIcon(provider);
+  const enabledApps = enabledUniversalApps(provider);
   return (
     <article className="provider-card universal-card">
-      <header>
-        <div>
-          <h3>{provider.name}</h3>
-          <p>{provider.providerType} - {provider.baseUrl}</p>
+      <header className="universal-card-header">
+        <div className="universal-card-title-row">
+          <div className="provider-icon-frame universal-icon-frame">
+            <ProviderIcon
+              icon={icon.icon}
+              name={provider.name}
+              color={icon.color}
+              size={24}
+            />
+          </div>
+          <div className="universal-card-title">
+            <h3>{provider.name}</h3>
+            <p>{provider.providerType}</p>
+          </div>
         </div>
+        <div className="universal-card-actions">
+          <IconAction title="Sync" busy={busy === `sync:${provider.id}`} onClick={onSync}>
+            <RotateCcw size={15} />
+          </IconAction>
+          <IconAction title="Duplicate" busy={busy === `duplicate:${provider.id}`} onClick={onDuplicate}>
+            <Copy size={15} />
+          </IconAction>
+          <IconAction title="Edit" onClick={onEdit}>
+            <Edit3 size={15} />
+          </IconAction>
+          <IconAction title="Delete" busy={busy === `delete:${provider.id}`} onClick={onDelete} danger>
+            <Trash2 size={15} />
+          </IconAction>
+        </div>
+      </header>
+      <div className="universal-url-row">
+        <Globe size={14} />
+        <span>{provider.baseUrl || provider.websiteUrl || "-"}</span>
         <StatusPill tone={provider.apiKey ? "success" : "warning"}>
           {tx(provider.apiKey ? "key" : "no key")}
         </StatusPill>
-      </header>
-      <div className="universal-app-row">
-        <AppBadge label="Claude" enabled={provider.apps.claude} />
-        <AppBadge label="Codex" enabled={provider.apps.codex} />
-        <AppBadge label="Gemini" enabled={provider.apps.gemini} />
       </div>
-      <div className="provider-card-meta">
-        <KeyValue label="claude" value={provider.models?.claude?.model || "-"} />
-        <KeyValue label="codex" value={provider.models?.codex?.model || "-"} />
-        <KeyValue label="gemini" value={provider.models?.gemini?.model || "-"} />
-        <KeyValue label="website" value={provider.websiteUrl || "-"} />
-        <KeyValue label="catalog" value={configuredModelApps(provider, "modelCatalog")} />
-        <KeyValue label="mapping" value={configuredModelApps(provider, "modelMapping")} />
+      <div className="universal-app-row">
+        {enabledApps.length ? (
+          enabledApps.map((app) => <AppBadge key={app} label={app} enabled />)
+        ) : (
+          <span className="universal-no-apps">{tx("No apps enabled")}</span>
+        )}
+      </div>
+      <div className="universal-model-strip">
+        {provider.apps.claude && <KeyValue label="claude" value={provider.models?.claude?.model || "-"} />}
+        {provider.apps.codex && <KeyValue label="codex" value={provider.models?.codex?.model || "-"} />}
+        {provider.apps.gemini && <KeyValue label="gemini" value={provider.models?.gemini?.model || "-"} />}
       </div>
       {provider.notes && <div className="provider-card-result">{provider.notes}</div>}
       <details className="json-details">
         <summary>{tx("Config preview")}</summary>
+        <div className="provider-card-meta">
+          <KeyValue label="website" value={provider.websiteUrl || "-"} />
+          <KeyValue label="catalog" value={configuredModelApps(provider, "modelCatalog")} />
+          <KeyValue label="mapping" value={configuredModelApps(provider, "modelMapping")} />
+          <KeyValue label="id" value={provider.id} />
+        </div>
         <JsonPreview value={redactUniversalProvider(provider)} />
       </details>
-      <div className="provider-actions">
-        <IconAction title="Edit" onClick={onEdit}>
-          <Edit3 size={15} />
-        </IconAction>
-        <IconAction title="Sync" busy={busy === `sync:${provider.id}`} onClick={onSync}>
-          <RotateCcw size={15} />
-        </IconAction>
-        <IconAction title="Duplicate" busy={busy === `duplicate:${provider.id}`} onClick={onDuplicate}>
-          <Copy size={15} />
-        </IconAction>
-        <IconAction title="Delete" busy={busy === `delete:${provider.id}`} onClick={onDelete} danger>
-          <Trash2 size={15} />
-        </IconAction>
-      </div>
     </article>
   );
 }
@@ -377,6 +394,10 @@ function UniversalFormModal({
   function patch(next: Partial<UniversalDraft>) {
     onChange({ ...draft, ...next });
   }
+  const inferredPreviewIcon = inferIconForText(draft.name, draft.providerType, draft.baseUrl, draft.websiteUrl);
+  const previewIcon = draft.icon
+    ? { icon: draft.icon, color: draft.iconColor }
+    : { icon: inferredPreviewIcon.icon, color: inferredPreviewIcon.iconColor };
   return (
     <div className="modal-backdrop" role="presentation">
       <form className="provider-form-modal universal-form-modal" onSubmit={onSubmit}>
@@ -396,6 +417,28 @@ function UniversalFormModal({
           <TextField label="Base URL" value={draft.baseUrl} onChange={(value) => patch({ baseUrl: value })} />
           <TextField label="API key" value={draft.apiKey} onChange={(value) => patch({ apiKey: value })} />
           <TextField label="Website URL" value={draft.websiteUrl} onChange={(value) => patch({ websiteUrl: value })} />
+          <div className="universal-icon-editor">
+            <div className="provider-icon-frame universal-icon-frame">
+              <ProviderIcon
+                icon={previewIcon.icon}
+                name={draft.name || draft.providerType || "Universal"}
+                color={previewIcon.color}
+                size={24}
+              />
+            </div>
+            <label>
+              <span>{tx("Icon")}</span>
+              <input value={draft.icon} onChange={(event) => patch({ icon: event.target.value })} />
+            </label>
+            <label>
+              <span>{tx("Color")}</span>
+              <input
+                type="color"
+                value={colorInputValue(draft.iconColor || previewIcon.color)}
+                onChange={(event) => patch({ iconColor: event.target.value })}
+              />
+            </label>
+          </div>
           <label className="toggle-row">
             <input type="checkbox" checked={draft.claude} onChange={(event) => patch({ claude: event.target.checked })} />
             <span>Claude</span>
@@ -536,7 +579,17 @@ function UniversalPresetModal({
             key={preset.providerType}
             onClick={() => onSelect(preset)}
           >
-            <strong>{preset.name}</strong>
+            <span className="provider-preset-title">
+              <span className="provider-icon-frame small">
+                <ProviderIcon
+                  icon={universalPresetIcon(preset).icon}
+                  name={preset.name}
+                  color={universalPresetIcon(preset).color}
+                  size={18}
+                />
+              </span>
+              <strong>{preset.name}</strong>
+            </span>
             <span>{preset.providerType}</span>
             <small>{preset.description || tx("Universal provider template")}</small>
           </button>
@@ -609,14 +662,28 @@ function AppBadge({ label, enabled }: { label: string; enabled: boolean }) {
   return <span className={enabled ? "universal-app-badge active" : "universal-app-badge"}>{label}</span>;
 }
 
-function SummaryTile({ label, value }: { label: string; value: ReactNode }) {
-  const { tx } = useI18n();
-  return (
-    <div className="summary-tile">
-      <span>{tx(label)}</span>
-      <strong>{value}</strong>
-    </div>
-  );
+function enabledUniversalApps(provider: UniversalProvider): string[] {
+  return [
+    provider.apps.claude ? "Claude" : null,
+    provider.apps.codex ? "Codex" : null,
+    provider.apps.gemini ? "Gemini" : null,
+  ].filter((app): app is string => Boolean(app));
+}
+
+function universalProviderIcon(provider: UniversalProvider): { icon?: string; color?: string } {
+  if (provider.icon) return { icon: provider.icon, color: provider.iconColor || undefined };
+  const inferred = inferIconForText(provider.name, provider.providerType, provider.baseUrl, provider.websiteUrl);
+  return { icon: inferred.icon, color: inferred.iconColor };
+}
+
+function universalPresetIcon(preset: UniversalProviderPreset): { icon?: string; color?: string } {
+  if (preset.icon) return { icon: preset.icon, color: preset.iconColor || undefined };
+  const inferred = inferIconForText(preset.name, preset.providerType, preset.websiteUrl, preset.description);
+  return { icon: inferred.icon, color: inferred.iconColor };
+}
+
+function colorInputValue(value?: string): string {
+  return value && /^#[0-9a-f]{6}$/i.test(value) ? value : "#111827";
 }
 
 function KeyValue({ label, value }: { label: string; value: ReactNode }) {

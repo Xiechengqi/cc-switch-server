@@ -567,6 +567,7 @@ function DataSourceChip({
 
 function UsageSummaryGrid({ summary, loading }: { summary: UsageRollup; loading: boolean }) {
   const successRate = summary.requests > 0 ? (summary.successes / summary.requests) * 100 : 0;
+  const failureRate = summary.requests > 0 ? (summary.failures / summary.requests) * 100 : 0;
   const cacheRate =
     summary.inputTokens + summary.cacheReadTokens + summary.cacheCreationTokens > 0
       ? (summary.cacheReadTokens /
@@ -574,12 +575,61 @@ function UsageSummaryGrid({ summary, loading }: { summary: UsageRollup; loading:
         100
       : 0;
   return (
-    <div className="provider-summary-row">
-      <SummaryTile label="Requests" value={loading ? "..." : formatInt(summary.requests)} />
-      <SummaryTile label="Success" value={loading ? "..." : `${successRate.toFixed(1)}%`} />
-      <SummaryTile label="Tokens" value={loading ? "..." : formatInt(summary.totalTokens)} />
-      <SummaryTile label="Cache hit" value={loading ? "..." : `${cacheRate.toFixed(1)}%`} />
-      <SummaryTile label="Cost" value={loading ? "..." : formatUsd(summary.totalCostUsd, 4)} />
+    <div className="usage-summary-grid">
+      <UsageMetricCard
+        label="requests"
+        value={loading ? "..." : formatInt(summary.requests)}
+        detail={loading ? "..." : `${formatInt(summary.successes)} ok / ${formatInt(summary.failures)} failed`}
+        progress={successRate}
+      />
+      <UsageMetricCard
+        label="success"
+        value={loading ? "..." : `${successRate.toFixed(1)}%`}
+        detail={loading ? "..." : `${failureRate.toFixed(1)}% fail`}
+        progress={successRate}
+      />
+      <UsageMetricCard
+        label="tokens"
+        value={loading ? "..." : formatInt(summary.totalTokens)}
+        detail={loading ? "..." : `${formatInt(summary.inputTokens)} in / ${formatInt(summary.outputTokens)} out`}
+        progress={100}
+      />
+      <UsageMetricCard
+        label="cache hit"
+        value={loading ? "..." : `${cacheRate.toFixed(1)}%`}
+        detail={loading ? "..." : `${formatInt(summary.cacheReadTokens)} read`}
+        progress={cacheRate}
+      />
+      <UsageMetricCard
+        label="cost"
+        value={loading ? "..." : formatUsd(summary.totalCostUsd, 4)}
+        detail={loading ? "..." : `${formatUsd(summary.requests ? summary.totalCostUsd / summary.requests : 0, 6)} / req`}
+        progress={100}
+      />
+    </div>
+  );
+}
+
+function UsageMetricCard({
+  label,
+  value,
+  detail,
+  progress,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  progress: number;
+}) {
+  const { tx } = useI18n();
+  return (
+    <div className="usage-metric-card">
+      <span>{tx(label)}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+      <div className="usage-metric-progress" aria-hidden="true">
+        <span style={{ width: `${Math.max(0, Math.min(100, progress))}%` }} />
+      </div>
     </div>
   );
 }
@@ -594,12 +644,28 @@ function TrendPanel({
   onSelectRange: (point: UsageTrendPoint) => void;
 }) {
   const { tx } = useI18n();
-  const maxTokens = Math.max(1, ...trends.map((point) => point.rollup.totalTokens));
+  const chartData = useMemo(
+    () =>
+      trends.map((point) => ({
+        key: `${point.startMs}:${point.endMs}`,
+        label: compactTime(point.startMs),
+        startMs: point.startMs,
+        endMs: point.endMs,
+        requests: point.rollup.requests,
+        tokens: point.rollup.totalTokens,
+        cost: Number(point.rollup.totalCostUsd.toFixed(6)),
+        successRate: point.rollup.requests ? (point.rollup.successes / point.rollup.requests) * 100 : 0,
+      })),
+    [trends],
+  );
+  const maxTokens = Math.max(1, ...chartData.map((point) => point.tokens));
+  const maxRequests = Math.max(1, ...chartData.map((point) => point.requests));
+  const maxCost = Math.max(0.000001, ...chartData.map((point) => point.cost));
   return (
     <section className="usage-trend-panel">
       <div className="section-heading">
         <div className="section-title-row compact-title">
-          <Database size={17} />
+          <BarChart3 size={17} />
           <h2>{tx("Trend")}</h2>
         </div>
         <span>{tx("{{count}} buckets", { count: trends.length })}</span>
@@ -610,20 +676,59 @@ function TrendPanel({
           <span>{tx("Loading usage trend")}</span>
         </div>
       ) : trends.length ? (
-        <div className="usage-trend-bars">
-          {trends.map((point) => (
-            <div key={`${point.startMs}:${point.endMs}`} className="usage-trend-bar">
-              <button
-                type="button"
-                title={`${formatTime(point.startMs)} - ${formatInt(point.rollup.totalTokens)} ${tx("tokens")} - ${formatUsd(point.rollup.totalCostUsd, 4)}`}
-                aria-label={tx("Filter {{time}}", { time: formatTime(point.startMs) })}
-                onClick={() => onSelectRange(point)}
-                style={{ height: `${Math.max(6, (point.rollup.totalTokens / maxTokens) * 100)}%` }}
-              >
-                <span>{formatInt(point.rollup.requests)}</span>
-              </button>
-            </div>
-          ))}
+        <div className="usage-chart-card">
+          <div className="usage-chart-legend" aria-hidden="true">
+            <span className="tokens">{tx("Tokens")}</span>
+            <span className="requests">{tx("Requests")}</span>
+            <span className="cost">{tx("Cost")}</span>
+          </div>
+          <svg className="usage-svg-chart" viewBox="0 0 760 260" role="img" aria-label={tx("Usage trend chart")}>
+            {[40, 85, 130, 175, 220].map((y) => (
+              <line key={y} className="usage-chart-grid-line" x1="42" x2="742" y1={y} y2={y} />
+            ))}
+            <text className="usage-chart-axis-label" x="42" y="24">{compactNumber(maxTokens)}</text>
+            <text className="usage-chart-axis-label" x="708" y="24">{formatUsd(maxCost, 3)}</text>
+            {chartData.map((point, index) => {
+              const slot = 700 / Math.max(1, chartData.length);
+              const groupX = 46 + index * slot;
+              const barWidth = Math.max(3, Math.min(14, slot / 5));
+              const tokenHeight = Math.max(2, (point.tokens / maxTokens) * 178);
+              const requestHeight = Math.max(2, (point.requests / maxRequests) * 178);
+              const costHeight = Math.max(2, (point.cost / maxCost) * 178);
+              const labelEvery = Math.max(1, Math.ceil(chartData.length / 8));
+              const title = `${formatTime(point.startMs)} - ${formatInt(point.tokens)} ${tx("tokens")} - ${formatUsd(point.cost, 4)}`;
+              return (
+                <g
+                  key={point.key}
+                  className="usage-chart-group"
+                  role="button"
+                  tabIndex={0}
+                  aria-label={tx("Filter {{time}}", { time: formatTime(point.startMs) })}
+                  onClick={() => {
+                    const trend = trends.find((item) => `${item.startMs}:${item.endMs}` === point.key);
+                    if (trend) onSelectRange(trend);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    event.preventDefault();
+                    const trend = trends.find((item) => `${item.startMs}:${item.endMs}` === point.key);
+                    if (trend) onSelectRange(trend);
+                  }}
+                >
+                  <title>{title}</title>
+                  <rect className="usage-chart-hover-target" x={groupX - 4} y="30" width={Math.max(10, slot)} height="210" rx="6" />
+                  <rect className="usage-chart-bar tokens" x={groupX} y={220 - tokenHeight} width={barWidth} height={tokenHeight} rx="3" />
+                  <rect className="usage-chart-bar requests" x={groupX + barWidth + 2} y={220 - requestHeight} width={barWidth} height={requestHeight} rx="3" />
+                  <rect className="usage-chart-bar cost" x={groupX + (barWidth + 2) * 2} y={220 - costHeight} width={barWidth} height={costHeight} rx="3" />
+                  {index % labelEvery === 0 && (
+                    <text className="usage-chart-tick-label" x={groupX} y="244">
+                      {point.label}
+                    </text>
+                  )}
+                </g>
+              );
+            })}
+          </svg>
         </div>
       ) : (
         <div className="provider-empty">
@@ -1440,9 +1545,25 @@ function formatTime(value?: number | null): string {
   return new Date(value).toLocaleString();
 }
 
+function compactTime(value?: number | null): string {
+  if (value == null || value <= 0) return "-";
+  return new Date(value).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+  });
+}
+
 function formatInt(value?: number | null): string {
   if (value == null || !Number.isFinite(value)) return "0";
   return Math.trunc(value).toLocaleString();
+}
+
+function compactNumber(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return `${Math.round(value)}`;
 }
 
 function formatUsd(value: number, digits: number): string {

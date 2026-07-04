@@ -9,11 +9,15 @@ import {
   Languages,
   Loader2,
   Mail,
+  Monitor,
   Network,
+  Moon,
+  Palette,
   RefreshCw,
   RotateCcw,
   Save,
   ShieldCheck,
+  Sun,
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
 
@@ -42,6 +46,20 @@ import {
 } from "@/lib/api";
 import { Language, useI18n } from "@/lib/i18n";
 import { writeToken } from "@/lib/runtime";
+import { AccountsDashboard } from "@/components/AccountsDashboard";
+import { useTheme } from "@/components/theme-provider";
+
+export type SettingsTab = "general" | "proxy" | "router" | "tunnel" | "auth" | "backup" | "diagnostics";
+
+const settingsTabs: Array<{ id: SettingsTab; label: string }> = [
+  { id: "general", label: "General" },
+  { id: "proxy", label: "Proxy" },
+  { id: "router", label: "Router" },
+  { id: "tunnel", label: "Tunnel" },
+  { id: "auth", label: "Auth" },
+  { id: "backup", label: "Backup" },
+  { id: "diagnostics", label: "Diagnostics" },
+];
 
 interface RouterDraft {
   url: string;
@@ -69,7 +87,7 @@ interface EmailDraft {
   code: string;
 }
 
-export function SettingsDashboard() {
+export function SettingsDashboard({ initialTab = "general" }: { initialTab?: SettingsTab }) {
   const { language, languages, setLanguage, t, tx } = useI18n();
   const [data, setData] = useState<SettingsDashboardData | null>(null);
   const [routerDraft, setRouterDraft] = useState<RouterDraft>(emptyRouterDraft());
@@ -82,6 +100,11 @@ export function SettingsDashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
+
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -233,37 +256,61 @@ export function SettingsDashboard() {
         </div>
       </div>
 
-      <div className="provider-summary-row settings-summary-row">
-        <SummaryTile label={t("server.settings.owner")} value={data?.config.ownerEmail || "-"} />
-        <SummaryTile label={t("server.settings.router")} value={data?.routerStatus.registered ? "registered" : "not registered"} />
-        <SummaryTile label={t("server.settings.tunnel")} value={data?.tunnel.runtimeStatus?.status || data?.tunnel.tunnelStatus || "-"} />
-        <SummaryTile label={t("server.settings.pendingLogs")} value={data?.routerStatus.pendingRequestLogSync ?? 0} />
-        <SummaryTile label={t("server.settings.backups")} value={data?.backups.length ?? 0} />
-      </div>
-
-      {data && <SettingsReadinessPanel data={data} />}
-
       {loading && !data ? (
         <div className="provider-empty">
           <Loader2 size={22} />
           <span>{t("server.settings.loading")}</span>
         </div>
       ) : (
-        <div className="settings-layout">
-          <section className="settings-card">
-            <SectionHeader icon={<Languages size={17} />} title={t("server.settings.language")} subtitle={t("server.settings.languageSubtitle")} />
-            <label>
-              <span>{t("server.settings.displayLanguage")}</span>
-              <select value={language} onChange={(event) => setLanguage(event.target.value as Language)}>
-                {languages.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </section>
+        <div className="settings-tab-shell">
+          <div className="settings-tabs" role="tablist" aria-label={tx("Settings sections")}>
+            {settingsTabs.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.id}
+                className={activeTab === tab.id ? "active" : ""}
+                onClick={() => setActiveTab(tab.id)}
+              >
+                {tx(tab.label)}
+              </button>
+            ))}
+          </div>
 
+          <div className="settings-tab-panel">
+            {activeTab === "general" && (
+              <div className="settings-layout">
+                <div className="provider-summary-row settings-summary-row">
+                  <SummaryTile label={t("server.settings.owner")} value={data?.config.ownerEmail || "-"} />
+                  <SummaryTile label={t("server.settings.router")} value={data?.routerStatus.registered ? "registered" : "not registered"} />
+                  <SummaryTile label={t("server.settings.tunnel")} value={data?.tunnel.runtimeStatus?.status || data?.tunnel.tunnelStatus || "-"} />
+                  <SummaryTile label={t("server.settings.pendingLogs")} value={data?.routerStatus.pendingRequestLogSync ?? 0} />
+                  <SummaryTile label={t("server.settings.backups")} value={data?.backups.length ?? 0} />
+                </div>
+
+                <section className="settings-card">
+                  <SectionHeader icon={<Languages size={17} />} title={t("server.settings.language")} subtitle={t("server.settings.languageSubtitle")} />
+                  <label>
+                    <span>{t("server.settings.displayLanguage")}</span>
+                    <select value={language} onChange={(event) => setLanguage(event.target.value as Language)}>
+                      {languages.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </section>
+
+                <ThemeSettingsPanel />
+
+                {data && <SettingsReadinessPanel data={data} />}
+              </div>
+            )}
+
+            {activeTab === "proxy" && (
+              <div className="settings-layout">
           <section className="settings-card">
             <SectionHeader icon={<Cloud size={17} />} title={t("server.settings.upstreamProxy")} subtitle={data?.config.upstreamProxy.maskedUrl || t("server.settings.notConfigured")} />
             <form className="settings-form" onSubmit={saveProxy}>
@@ -294,7 +341,11 @@ export function SettingsDashboard() {
               <FormFooter busy={busy === "proxy-save"} label={t("server.settings.saveProxy")} />
             </form>
           </section>
+              </div>
+            )}
 
+            {activeTab === "router" && (
+              <div className="settings-layout">
           <section className="settings-card wide">
             <SectionHeader icon={<Network size={17} />} title={t("server.settings.router")} subtitle={routerState(data?.routerStatus)} />
             <form className="settings-form settings-form-grid" onSubmit={saveRouter}>
@@ -321,7 +372,11 @@ export function SettingsDashboard() {
             </div>
             <RouterFacts router={data?.router} status={data?.routerStatus} />
           </section>
+              </div>
+            )}
 
+            {activeTab === "tunnel" && (
+              <div className="settings-layout">
           <section className="settings-card">
             <SectionHeader icon={<Cable size={17} />} title={t("server.settings.clientTunnel")} subtitle={data?.tunnel.runtimeStatus?.tunnelUrl || data?.tunnel.tunnelSubdomain || "-"} />
             <form className="settings-form" onSubmit={saveTunnel}>
@@ -336,7 +391,11 @@ export function SettingsDashboard() {
             </div>
             <TunnelStatus status={data?.tunnel.runtimeStatus} />
           </section>
+              </div>
+            )}
 
+            {activeTab === "auth" && (
+              <div className="settings-layout">
           <section className="settings-card">
             <SectionHeader icon={<KeyRound size={17} />} title={t("server.settings.auth")} subtitle={t("server.settings.authSubtitle")} />
             <div className="settings-actions">
@@ -358,7 +417,19 @@ export function SettingsDashboard() {
               </div>
             </div>
           </section>
+          <section className="settings-card wide settings-accounts-card">
+            <SectionHeader
+              icon={<KeyRound size={17} />}
+              title={t("server.nav.accounts")}
+              subtitle={tx("OAuth accounts and quota tools")}
+            />
+            <AccountsDashboard />
+          </section>
+              </div>
+            )}
 
+            {activeTab === "backup" && (
+              <div className="settings-layout">
           <section className="settings-card wide">
             <SectionHeader icon={<Archive size={17} />} title={t("server.settings.backup")} subtitle={t("server.settings.backupSubtitle")} />
             <BackupPolicySummary backups={data?.backups || []} />
@@ -371,7 +442,11 @@ export function SettingsDashboard() {
             </form>
             <BackupTable backups={data?.backups || []} busy={busy} onRestore={(backup) => void restoreBackupAction(backup)} />
           </section>
+              </div>
+            )}
 
+            {activeTab === "diagnostics" && (
+              <div className="settings-layout">
           <section className="settings-card wide">
             <SectionHeader
               icon={<Network size={17} />}
@@ -384,6 +459,9 @@ export function SettingsDashboard() {
             <DiagnosticsSummary diagnostics={data?.diagnostics} />
             <Diagnostics diagnostics={data?.diagnostics} />
           </section>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -399,6 +477,40 @@ function SectionHeader({ icon, title, subtitle }: { icon: ReactNode; title: stri
       </div>
       <span>{subtitle}</span>
     </header>
+  );
+}
+
+function ThemeSettingsPanel() {
+  const { theme, setTheme } = useTheme();
+  const { tx } = useI18n();
+  const options: Array<{ value: "light" | "dark" | "system"; label: string; icon: ReactNode }> = [
+    { value: "light", label: "Light", icon: <Sun size={16} /> },
+    { value: "dark", label: "Dark", icon: <Moon size={16} /> },
+    { value: "system", label: "System", icon: <Monitor size={16} /> },
+  ];
+  return (
+    <section className="settings-card">
+      <SectionHeader
+        icon={<Palette size={17} />}
+        title={tx("Theme")}
+        subtitle={tx("Choose the desktop color mode for this browser")}
+      />
+      <div className="theme-option-grid" role="radiogroup" aria-label={tx("Theme")}>
+        {options.map((option) => (
+          <button
+            key={option.value}
+            className={theme === option.value ? "theme-option active" : "theme-option"}
+            type="button"
+            role="radio"
+            aria-checked={theme === option.value}
+            onClick={() => setTheme(option.value)}
+          >
+            {option.icon}
+            <span>{tx(option.label)}</span>
+          </button>
+        ))}
+      </div>
+    </section>
   );
 }
 

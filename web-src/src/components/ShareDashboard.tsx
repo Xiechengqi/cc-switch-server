@@ -53,6 +53,8 @@ import {
   verifyShareOwnerChangeCode,
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
+import { ProviderIcon } from "@/components/ProviderIcon";
+import { appIcon, storedProviderIcon } from "@/lib/provider-icons";
 
 interface ShareDashboardState {
   shares: ShareRecord[];
@@ -331,11 +333,11 @@ export function ShareDashboard() {
         </div>
       </div>
 
-      <div className="provider-summary-row">
-        <SummaryTile label={t("server.shares.active")} value={data.shares.filter((share) => share.status === "active").length} />
-        <SummaryTile label={t("server.shares.paused")} value={data.shares.filter((share) => share.status === "paused").length} />
-        <SummaryTile label={t("server.shares.forSale")} value={data.shares.filter((share) => share.forSale).length} />
-        <SummaryTile label={t("server.shares.requests")} value={data.shares.reduce((sum, share) => sum + (share.requestsCount || 0), 0)} />
+      <div className="share-stats-bar">
+        <ShareStat label={t("server.shares.active")} value={data.shares.filter((share) => share.status === "active").length} />
+        <ShareStat label={t("server.shares.paused")} value={data.shares.filter((share) => share.status === "paused").length} />
+        <ShareStat label={t("server.shares.forSale")} value={data.shares.filter((share) => share.forSale).length} />
+        <ShareStat label={t("server.shares.requests")} value={data.shares.reduce((sum, share) => sum + (share.requestsCount || 0), 0)} />
       </div>
 
       {resultById.__global && <div className="share-global-result">{resultById.__global}</div>}
@@ -613,23 +615,40 @@ function ShareCard({
   const market = markets.find((item) => item.email === share.acl?.publicMarketEmail);
   return (
     <article className="share-card">
-      <header>
-        <div>
-          <h3>{shareName(share)}</h3>
-          <p>{share.ownerEmail || "owner -"}</p>
+      <header className="share-card-header">
+        <div className="share-card-title-row">
+          <div className="provider-icon-frame share-icon-frame">
+            <Share2 size={22} />
+          </div>
+          <div>
+            <h3>{shareName(share)}</h3>
+            <p>{share.ownerEmail || "owner -"}</p>
+          </div>
         </div>
-        <StatusPill tone={share.status === "active" ? "success" : share.status === "paused" ? "warning" : "danger"}>
-          {share.status}
-        </StatusPill>
+        <div className="share-card-right">
+          {share.forSale && <StatusPill tone="success">{share.saleMarketKind || "sale"}</StatusPill>}
+          <StatusPill tone={share.status === "active" ? "success" : share.status === "paused" ? "warning" : "danger"}>
+            {share.status}
+          </StatusPill>
+        </div>
       </header>
 
       <div className="share-chip-row">
         {shareBindings(share).map((binding) => {
           const provider = providerByKey.get(providerKey(binding.app, binding.providerId));
+          const icon = provider ? storedProviderIcon(provider) : appIcon(binding.app);
           return (
             <button key={binding.app} type="button" className="share-binding-chip" onClick={() => onBinding(binding.app)}>
-              <span>{appLabel(binding.app)}</span>
-              <strong>{provider?.provider.name || binding.providerId}</strong>
+              <ProviderIcon
+                icon={icon.icon}
+                name={provider?.provider.name || appLabel(binding.app)}
+                color={icon.color}
+                size={18}
+              />
+              <span>
+                <small>{appLabel(binding.app)}</small>
+                <strong>{provider?.provider.name || binding.providerId}</strong>
+              </span>
             </button>
           );
         })}
@@ -637,8 +656,11 @@ function ShareCard({
           .filter((app) => !shareBindings(share).some((binding) => binding.app === app.id))
           .map((app) => (
             <button key={app.id} type="button" className="share-binding-chip muted" onClick={() => onBinding(app.id)}>
-              <span>{app.label}</span>
-              <strong>unbound</strong>
+              <ProviderIcon icon={appIcon(app.id).icon} name={app.label} color={appIcon(app.id).color} size={18} />
+              <span>
+                <small>{app.label}</small>
+                <strong>unbound</strong>
+              </span>
             </button>
           ))}
       </div>
@@ -1180,11 +1202,10 @@ function ModalFooter({ saving, onClose, label }: { saving: boolean; onClose: () 
   );
 }
 
-function SummaryTile({ label, value }: { label: string; value: ReactNode }) {
-  const { tx } = useI18n();
+function ShareStat({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div className="summary-tile">
-      <span>{tx(label)}</span>
+    <div className="share-stat">
+      <span>{label}</span>
       <strong>{value}</strong>
     </div>
   );
