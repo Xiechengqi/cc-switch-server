@@ -4587,7 +4587,8 @@ async fn web_invoke_dispatch(
         "claim_client_tunnel" => {
             if web_has_payload(&args) {
                 let input = web_client_tunnel_input(&args)?;
-                update_client_tunnel(State(state.clone()), headers.clone(), Json(input)).await?;
+                let _ = update_client_tunnel(State(state.clone()), headers.clone(), Json(input))
+                    .await?;
             }
             let response = claim_client_tunnel(State(state.clone()), headers.clone())
                 .await?

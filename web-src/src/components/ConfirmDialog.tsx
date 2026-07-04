@@ -1,16 +1,6 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, Info } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { useI18n } from "@/lib/i18n";
 
 interface ConfirmDialogProps {
@@ -49,48 +39,60 @@ export function ConfirmDialog({
     }
   }, [isOpen, checkboxDefaultChecked]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onCancel();
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, onCancel]);
+
+  if (!isOpen) return null;
+
   const IconComponent = variant === "info" ? Info : AlertTriangle;
-  const iconClass = variant === "info" ? "h-5 w-5 text-blue-500" : "h-5 w-5 text-red-500";
+  const dialogClass = ["confirm-dialog", `confirm-dialog-${variant}`, `confirm-dialog-z-${zIndex}`].join(" ");
 
   return (
-    <Dialog
-      open={isOpen}
-      onOpenChange={(open) => {
-        if (!open) onCancel();
-      }}
-    >
-      <DialogContent className="max-w-sm" zIndex={zIndex}>
-        <DialogHeader className="space-y-3 border-b-0 bg-transparent pb-0">
-          <DialogTitle className="flex items-center gap-2 text-lg font-semibold">
-            <IconComponent className={iconClass} />
-            {title}
-          </DialogTitle>
-          <DialogDescription className="whitespace-pre-line text-sm leading-relaxed">
-            {message}
-          </DialogDescription>
-        </DialogHeader>
+    <div className={dialogClass} role="presentation" onMouseDown={onCancel}>
+      <section
+        className="confirm-dialog-panel"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
+        aria-describedby="confirm-dialog-description"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="confirm-dialog-header">
+          <IconComponent size={20} />
+          <h2 id="confirm-dialog-title">{title}</h2>
+        </header>
+        <p id="confirm-dialog-description" className="confirm-dialog-message">
+          {message}
+        </p>
         {checkboxLabel ? (
-          <label className="flex cursor-pointer select-none items-start gap-2 px-6 pt-3">
-            <Checkbox
+          <label className="confirm-dialog-checkbox">
+            <input
+              type="checkbox"
               checked={checkboxChecked}
-              onCheckedChange={(value) => setCheckboxChecked(value === true)}
-              className="mt-0.5"
+              onChange={(event) => setCheckboxChecked(event.target.checked)}
             />
-            <span className="text-sm leading-relaxed">{checkboxLabel}</span>
+            <span>{checkboxLabel}</span>
           </label>
         ) : null}
-        <DialogFooter className="flex gap-2 border-t-0 bg-transparent pt-2 sm:justify-end">
-          <Button variant="outline" onClick={onCancel}>
+        <footer className="confirm-dialog-footer">
+          <button className="secondary-button" type="button" onClick={onCancel}>
             {cancelText || t("common.cancel")}
-          </Button>
-          <Button
-            variant={variant === "info" ? "default" : "destructive"}
+          </button>
+          <button
+            className={variant === "info" ? "primary-button" : "danger-button"}
+            type="button"
             onClick={() => onConfirm(checkboxLabel ? checkboxChecked : false)}
           >
             {confirmText || t("common.confirm")}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+          </button>
+        </footer>
+      </section>
+    </div>
   );
 }

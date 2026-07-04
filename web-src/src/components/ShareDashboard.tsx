@@ -770,6 +770,14 @@ function ShareCard({
             <button
               className="secondary-button compact"
               type="button"
+              onClick={() => void navigator.clipboard?.writeText(connectInfo.directUrl)}
+            >
+              <Copy size={13} />
+              <span>{tx("Copy URL")}</span>
+            </button>
+            <button
+              className="secondary-button compact"
+              type="button"
               onClick={() => void navigator.clipboard?.writeText(JSON.stringify(connectInfo, null, 2))}
             >
               <Copy size={13} />

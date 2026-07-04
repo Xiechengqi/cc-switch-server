@@ -344,6 +344,25 @@ input:focus {
   background: hsl(202 78% 30%);
 }
 
+.danger-button {
+  display: inline-flex;
+  width: fit-content;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid hsl(var(--danger));
+  border-radius: 8px;
+  padding: 0 14px;
+  background: hsl(var(--danger));
+  color: white;
+  font-weight: 700;
+}
+
+.danger-button:hover {
+  background: hsl(354 78% 38%);
+}
+
 .form-error,
 .error-text {
   color: hsl(var(--danger));
@@ -809,6 +828,18 @@ tbody tr:last-child td {
 .provider-card p,
 .provider-form-modal p {
   margin: 2px 0 0;
+}
+
+.provider-field {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.provider-field > span {
+  color: hsl(var(--muted));
+  font-size: 0.78rem;
+  font-weight: 750;
 }
 
 .provider-url-row {
@@ -1363,6 +1394,7 @@ tbody tr:last-child td {
 
 .provider-model-input-row {
   display: flex;
+  position: relative;
   min-width: 0;
   align-items: center;
   gap: 8px;
@@ -1377,6 +1409,120 @@ tbody tr:last-child td {
   width: 36px;
   min-width: 36px;
   padding-inline: 0;
+}
+
+.provider-api-key-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.provider-api-key-row input {
+  min-width: 0;
+  flex: 1;
+}
+
+.provider-api-key-row .icon-only {
+  width: 36px;
+  min-width: 36px;
+  padding-inline: 0;
+}
+
+.provider-api-key-hint {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+}
+
+.provider-api-key-hint span {
+  min-width: 0;
+}
+
+.provider-api-key-hint a {
+  flex: 0 0 auto;
+  color: hsl(var(--primary));
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.provider-api-key-hint a:hover {
+  text-decoration: underline;
+}
+
+.provider-endpoint-toggle-row {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  border-radius: 7px;
+  background: hsl(var(--subtle));
+  padding: 8px;
+}
+
+.provider-model-dropdown {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.provider-model-dropdown .icon-only.active {
+  border-color: hsl(var(--primary) / 0.55);
+  color: hsl(var(--primary));
+}
+
+.provider-model-menu {
+  position: absolute;
+  z-index: 80;
+  top: calc(100% + 6px);
+  right: 0;
+  display: grid;
+  width: min(360px, 78vw);
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  box-shadow: 0 18px 45px hsl(var(--foreground) / 0.14);
+  padding: 6px;
+}
+
+.provider-model-menu-label {
+  padding: 6px 8px;
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.provider-model-option {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--foreground));
+  cursor: pointer;
+  font: inherit;
+  padding: 7px 8px;
+  text-align: left;
+}
+
+.provider-model-option span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-model-option:hover,
+.provider-model-option:focus-visible,
+.provider-model-option.active {
+  background: hsl(var(--accent) / 0.62);
+  outline: none;
 }
 
 .provider-advanced-section {
@@ -1566,6 +1712,96 @@ tbody tr:last-child td {
   overflow: auto;
   background: hsl(218 22% 10% / 0.34);
   padding: 24px;
+}
+
+.confirm-dialog {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: hsl(222 47% 8% / 0.38);
+  padding: 18px;
+}
+
+.confirm-dialog-z-base {
+  z-index: 80;
+}
+
+.confirm-dialog-z-nested {
+  z-index: 90;
+}
+
+.confirm-dialog-z-alert {
+  z-index: 100;
+}
+
+.confirm-dialog-z-top {
+  z-index: 110;
+}
+
+.confirm-dialog-panel {
+  display: grid;
+  width: min(420px, 100%);
+  gap: 14px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--panel));
+  box-shadow: 0 24px 70px hsl(222 47% 8% / 0.2);
+  padding: 18px;
+}
+
+.confirm-dialog-header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.confirm-dialog-header h2 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 1rem;
+}
+
+.confirm-dialog-destructive .confirm-dialog-header svg {
+  color: hsl(var(--danger));
+}
+
+.confirm-dialog-info .confirm-dialog-header svg {
+  color: hsl(var(--primary));
+}
+
+.confirm-dialog-message {
+  margin: 0;
+  color: hsl(var(--muted));
+  font-size: 0.88rem;
+  line-height: 1.55;
+  white-space: pre-line;
+}
+
+.confirm-dialog-checkbox {
+  display: flex;
+  cursor: pointer;
+  user-select: none;
+  align-items: flex-start;
+  gap: 9px;
+  color: hsl(var(--foreground));
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.confirm-dialog-checkbox input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  accent-color: hsl(var(--primary));
+  margin-top: 2px;
+}
+
+.confirm-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .provider-form-modal {

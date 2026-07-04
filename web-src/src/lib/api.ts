@@ -50,6 +50,8 @@ export interface ProviderMatrixEntry {
   accountSupported: boolean;
   directConfigSupported: boolean;
   managedAccountRecommended: boolean;
+  apiKeyUrl?: string | null;
+  websiteUrl?: string | null;
   note: string;
 }
 

@@ -20,8 +20,11 @@ import {
   BarChart3,
   Boxes,
   CheckCircle2,
+  ChevronDown,
   Copy,
   Download,
+  Eye,
+  EyeOff,
   FlaskConical,
   GripVertical,
   Link2,
@@ -1271,6 +1274,9 @@ function ProviderAuthSection({
   onPatch: (next: Partial<ProviderDraft>) => void;
 }) {
   const { tx } = useI18n();
+  const [showApiKey, setShowApiKey] = useState(false);
+  const apiKeyUrl = apiKeyUrlForProvider(entry, draft);
+  const apiKeyOptional = entry.credentialMode === "oauth_or_manual_token" || Boolean(draft.accountId);
   return (
     <section className="wide-field provider-auth-section">
       <div className="section-title-row compact-title">
@@ -1288,15 +1294,39 @@ function ProviderAuthSection({
             </StatusPill>
             <span>{tx(entry.credentialMode)}</span>
           </header>
-          <label>
+          <div className="provider-field">
             <span>{tx(entry.defaults.key || "API key")}</span>
-            <input
-              type="password"
-              value={draft.apiKey}
-              onChange={(event) => onPatch({ apiKey: event.target.value })}
-              placeholder={entry.credentialMode === "oauth_or_manual_token" ? tx("optional account token") : ""}
-            />
-          </label>
+            <div className="provider-api-key-row">
+              <input
+                type={showApiKey ? "text" : "password"}
+                value={draft.apiKey}
+                onChange={(event) => onPatch({ apiKey: event.target.value })}
+                placeholder={apiKeyOptional ? tx("optional account token") : ""}
+                autoComplete="off"
+              />
+              <button
+                className="secondary-button compact icon-only"
+                type="button"
+                onClick={() => setShowApiKey((value) => !value)}
+                title={tx(showApiKey ? "Hide API key" : "Show API key")}
+                aria-label={tx(showApiKey ? "Hide API key" : "Show API key")}
+              >
+                {showApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            </div>
+            <div className="provider-api-key-hint">
+              <span>
+                {apiKeyOptional
+                  ? tx("API key is optional when a managed account is selected.")
+                  : tx("Enter the upstream API key for direct config.")}
+              </span>
+              {apiKeyUrl ? (
+                <a href={apiKeyUrl} target="_blank" rel="noopener noreferrer">
+                  {tx("Get API Key")}
+                </a>
+              ) : null}
+            </div>
+          </div>
         </article>
         <article className="provider-auth-card">
           <header>
@@ -1343,6 +1373,24 @@ function ProviderAuthSection({
               ))}
             </select>
           </label>
+          <div className="provider-endpoint-toggle-row">
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={draft.isFullUrl}
+                onChange={(event) => onPatch({ isFullUrl: event.target.checked })}
+              />
+              <span>{tx("Treat Base URL as full upstream URL")}</span>
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={draft.endpointAutoSelect}
+                onChange={(event) => onPatch({ endpointAutoSelect: event.target.checked })}
+              />
+              <span>{tx("Auto-select fastest endpoint")}</span>
+            </label>
+          </div>
         </article>
       </div>
     </section>
@@ -1365,23 +1413,49 @@ function ProviderModelField({
   onFetch?: () => void;
 }) {
   const { tx } = useI18n();
-  const listId = `provider-model-options-${draft.app}-${draft.id || draft.providerTypeId}`;
+  const [open, setOpen] = useState(false);
   return (
-    <label className="provider-model-field">
+    <div className="provider-model-field provider-field">
       <span>{tx("Model")}</span>
       <div className="provider-model-input-row">
         <input
           value={draft.model}
-          list={options.length ? listId : undefined}
           onChange={(event) => onChange(event.target.value)}
           autoComplete="off"
         />
         {options.length ? (
-          <datalist id={listId}>
-            {options.map((model) => (
-              <option key={model} value={model} />
-            ))}
-          </datalist>
+          <div className="provider-model-dropdown">
+            <button
+              className={open ? "secondary-button compact icon-only active" : "secondary-button compact icon-only"}
+              type="button"
+              onClick={() => setOpen((value) => !value)}
+              title={tx("Select catalog model")}
+              aria-label={tx("Select catalog model")}
+              aria-expanded={open}
+            >
+              <ChevronDown size={14} />
+            </button>
+            {open ? (
+              <div className="provider-model-menu" role="listbox" aria-label={tx("Catalog models")}>
+                <div className="provider-model-menu-label">{tx("Catalog models")}</div>
+                {options.map((model) => (
+                  <button
+                    key={model}
+                    className={model === draft.model ? "provider-model-option active" : "provider-model-option"}
+                    type="button"
+                    role="option"
+                    aria-selected={model === draft.model}
+                    onClick={() => {
+                      onChange(model);
+                      setOpen(false);
+                    }}
+                  >
+                    <span>{model}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
         ) : null}
         {onFetch ? (
           <button
@@ -1402,8 +1476,29 @@ function ProviderModelField({
             ? tx("{{count}} catalog models available", { count: options.length })
             : tx(onFetch ? "Fetch upstream models into model catalog" : "Saved model or provider default"))}
       </small>
-    </label>
+    </div>
   );
+}
+
+function apiKeyUrlForProvider(entry: ProviderMatrixEntry, draft: ProviderDraft): string | null {
+  if (entry.apiKeyUrl) return entry.apiKeyUrl;
+  if (!["api_key", "aws_credentials"].includes(entry.credentialMode)) return null;
+  const text = `${entry.providerTypeId} ${entry.label} ${draft.baseUrl}`.toLowerCase();
+  if (text.includes("openrouter")) return "https://openrouter.ai/keys";
+  if (text.includes("anthropic") || text.includes("claude")) return "https://console.anthropic.com/settings/keys";
+  if (text.includes("openai") || text.includes("codex")) return "https://platform.openai.com/api-keys";
+  if (text.includes("gemini") || text.includes("google")) return "https://aistudio.google.com/app/apikey";
+  if (text.includes("deepseek")) return "https://platform.deepseek.com/api_keys";
+  if (text.includes("nvidia")) return "https://build.nvidia.com/settings/api-keys";
+  if (text.includes("ollama")) return "https://ollama.com/settings/keys";
+  if (text.includes("cursor")) return "https://cursor.com/settings";
+  if (text.includes("github") || text.includes("copilot")) return "https://github.com/settings/tokens";
+  try {
+    const url = new URL(draft.baseUrl);
+    return `${url.origin}/`;
+  } catch {
+    return null;
+  }
 }
 
 function apiFormatOptions(app: AppKind, current: string, fallback: string): string[] {
@@ -1435,9 +1530,7 @@ function ProviderDesktopAdvancedSection({
   const { tx } = useI18n();
   const showCodexReasoning = draft.app === "codex";
   const hasValues = Boolean(
-    draft.isFullUrl ||
-      draft.endpointAutoSelect ||
-      draft.customUserAgent.trim() ||
+    draft.customUserAgent.trim() ||
       draft.localProxyHeadersJson.trim() ||
       draft.localProxyBodyJson.trim() ||
       draft.codexSupportsThinking ||
@@ -1455,32 +1548,6 @@ function ProviderDesktopAdvancedSection({
         <small>{tx("Full URL mode, endpoint selection, request overrides, and Codex reasoning")}</small>
       </summary>
       <div className="provider-desktop-advanced-grid">
-        <article className="provider-auth-card">
-          <header>
-            <StatusPill tone={draft.isFullUrl || draft.endpointAutoSelect ? "success" : "warning"}>
-              {tx("endpoint")}
-            </StatusPill>
-            <span>{tx("Desktop endpoint behavior")}</span>
-          </header>
-          <label className="checkbox-row">
-            <input
-              type="checkbox"
-              checked={draft.isFullUrl}
-              onChange={(event) => onPatch({ isFullUrl: event.target.checked })}
-            />
-            <span>{tx("Treat Base URL as full upstream URL")}</span>
-          </label>
-          <label className="checkbox-row">
-            <input
-              type="checkbox"
-              checked={draft.endpointAutoSelect}
-              onChange={(event) => onPatch({ endpointAutoSelect: event.target.checked })}
-            />
-            <span>{tx("Auto-select fastest endpoint")}</span>
-          </label>
-          <small>{tx("These flags are stored in provider metadata for desktop-compatible routing.")}</small>
-        </article>
-
         <article className="provider-auth-card provider-request-overrides-card">
           <header>
             <StatusPill tone={draft.customUserAgent.trim() ? "success" : "warning"}>

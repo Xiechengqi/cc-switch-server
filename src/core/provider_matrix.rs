@@ -24,6 +24,10 @@ pub struct ProviderTypeSummary {
     pub account_supported: bool,
     pub direct_config_supported: bool,
     pub managed_account_recommended: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_url: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +45,10 @@ pub struct ProviderMatrixEntry {
     pub account_supported: bool,
     pub direct_config_supported: bool,
     pub managed_account_recommended: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_url: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<&'static str>,
     pub note: &'static str,
 }
 
@@ -188,6 +196,8 @@ fn provider_type_summary(provider_type: ProviderType) -> ProviderTypeSummary {
         account_supported: account_supported(provider_type),
         direct_config_supported: direct_config_supported(provider_type),
         managed_account_recommended: managed_account_recommended(provider_type),
+        api_key_url: provider_api_key_url(provider_type),
+        website_url: provider_website_url(provider_type),
     }
 }
 
@@ -206,7 +216,58 @@ fn matrix_entry(app: AppKind, provider_type: ProviderType) -> ProviderMatrixEntr
         account_supported: account_supported(provider_type),
         direct_config_supported: direct_config_supported(provider_type),
         managed_account_recommended: managed_account_recommended(provider_type),
+        api_key_url: provider_api_key_url(provider_type),
+        website_url: provider_website_url(provider_type),
         note: provider_note(app, provider_type, ui_visible),
+    }
+}
+
+fn provider_api_key_url(provider_type: ProviderType) -> Option<&'static str> {
+    match provider_type {
+        ProviderType::Claude => Some("https://console.anthropic.com/settings/keys"),
+        ProviderType::Codex => Some("https://platform.openai.com/api-keys"),
+        ProviderType::Gemini => Some("https://aistudio.google.com/app/apikey"),
+        ProviderType::OpenRouter => Some("https://openrouter.ai/keys"),
+        ProviderType::CursorApiKey => Some("https://cursor.com/settings"),
+        ProviderType::OllamaCloud => Some("https://ollama.com/settings/keys"),
+        ProviderType::AwsBedrock => {
+            Some("https://console.aws.amazon.com/iam/home#/security_credentials")
+        }
+        ProviderType::Nvidia => Some("https://build.nvidia.com/settings/api-keys"),
+        ProviderType::DeepSeekApi => Some("https://platform.deepseek.com/api_keys"),
+        ProviderType::ClaudeAuth
+        | ProviderType::ClaudeOAuth
+        | ProviderType::CodexOAuth
+        | ProviderType::GeminiCli
+        | ProviderType::GitHubCopilot
+        | ProviderType::DeepSeekAccount
+        | ProviderType::KiroOAuth
+        | ProviderType::CursorOAuth
+        | ProviderType::AntigravityOAuth
+        | ProviderType::AgyOAuth => None,
+    }
+}
+
+fn provider_website_url(provider_type: ProviderType) -> Option<&'static str> {
+    match provider_type {
+        ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth => {
+            Some("https://www.anthropic.com")
+        }
+        ProviderType::Codex | ProviderType::CodexOAuth => Some("https://openai.com"),
+        ProviderType::Gemini | ProviderType::GeminiCli => Some("https://ai.google.dev"),
+        ProviderType::OpenRouter => Some("https://openrouter.ai"),
+        ProviderType::GitHubCopilot => Some("https://github.com/features/copilot"),
+        ProviderType::DeepSeekAccount | ProviderType::DeepSeekApi => {
+            Some("https://www.deepseek.com")
+        }
+        ProviderType::KiroOAuth => Some("https://kiro.dev"),
+        ProviderType::CursorOAuth | ProviderType::CursorApiKey => Some("https://cursor.com"),
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
+            Some("https://antigravity.google")
+        }
+        ProviderType::OllamaCloud => Some("https://ollama.com"),
+        ProviderType::AwsBedrock => Some("https://aws.amazon.com/bedrock"),
+        ProviderType::Nvidia => Some("https://build.nvidia.com"),
     }
 }
 
