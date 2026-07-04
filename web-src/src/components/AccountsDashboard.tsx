@@ -9,7 +9,6 @@ import {
   RefreshCw,
   RotateCcw,
   ShieldCheck,
-  Smartphone,
   Trash2,
   Upload,
   UserRound,
@@ -17,6 +16,8 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
+import { ProviderIcon } from "@/components/ProviderIcon";
+import { inferIconForText } from "@/config/iconInference";
 import {
   AccountDeviceCodeResponse,
   AccountDevicePollResponse,
@@ -230,17 +231,17 @@ export function AccountsDashboard() {
         </div>
       </div>
 
-      <div className="provider-summary-row accounts-summary-row">
-        <SummaryTile label={t("server.accounts.accounts")} value={data.accounts.length} />
-        <SummaryTile
+      <div className="accounts-stats-bar">
+        <AccountStat label={t("server.accounts.accounts")} value={data.accounts.length} />
+        <AccountStat
           label={t("server.accounts.nativeRefresh")}
           value={data.capabilities.filter((item) => item.supportsRefresh).length}
         />
-        <SummaryTile
+        <AccountStat
           label={t("server.accounts.quotaReady")}
           value={data.capabilities.filter((item) => item.supportsQuota).length}
         />
-        <SummaryTile label={t("server.accounts.importTypes")} value={data.templates.length} />
+        <AccountStat label={t("server.accounts.importTypes")} value={data.templates.length} />
       </div>
 
       <div className="accounts-layout">
@@ -346,12 +347,18 @@ function AccountGroup({
     action: "refresh" | "quota" | "forceQuota" | "plan" | "delete",
   ) => void;
 }) {
+  const icon = accountProviderIcon(providerType);
   return (
     <section className="account-group">
       <header>
-        <div>
-          <h3>{providerLabel(providerType)}</h3>
-          <span>{capability?.status || "manual_import_only"}</span>
+        <div className="account-provider-title-row">
+          <span className="account-icon-frame">
+            <ProviderIcon icon={icon.icon} color={icon.color} name={providerLabel(providerType)} size={22} />
+          </span>
+          <div>
+            <h3>{providerLabel(providerType)}</h3>
+            <span>{capability?.status || "manual_import_only"}</span>
+          </div>
         </div>
         <StatusPill tone={capability?.supportsRefresh ? "success" : "warning"}>
           {capability?.supportsRefresh ? "refresh-ready" : "manual"}
@@ -391,12 +398,18 @@ function AccountCard({
 }) {
   const busyPrefix = `${account.id}:`;
   const credentials = credentialFlags(account);
+  const icon = accountProviderIcon(account.providerType);
   return (
     <article className="account-card">
       <header>
-        <div>
-          <h4>{account.email || account.id}</h4>
-          <span>{account.id}</span>
+        <div className="account-provider-title-row">
+          <span className="account-icon-frame compact">
+            <ProviderIcon icon={icon.icon} color={icon.color} name={providerLabel(account.providerType)} size={18} />
+          </span>
+          <div>
+            <h4>{account.email || account.id}</h4>
+            <span>{account.id}</span>
+          </div>
         </div>
         <StatusPill tone={account.lastRefreshError ? "danger" : "success"}>
           {account.lastRefreshError ? "error" : "ready"}
@@ -508,12 +521,18 @@ function CapabilityPanel({
         {providerTypes.map((providerType) => {
           const capability = capabilitiesByType.get(providerType);
           const template = templatesByType.get(providerType);
+          const icon = accountProviderIcon(providerType);
           return (
             <article className="capability-card" key={providerType}>
               <header>
-                <div>
-                  <h3>{providerLabel(providerType)}</h3>
-                  <span>{template?.credentialKind || "manual"}</span>
+                <div className="account-provider-title-row">
+                  <span className="account-icon-frame compact">
+                    <ProviderIcon icon={icon.icon} color={icon.color} name={providerLabel(providerType)} size={18} />
+                  </span>
+                  <div>
+                    <h3>{providerLabel(providerType)}</h3>
+                    <span>{template?.credentialKind || "manual"}</span>
+                  </div>
                 </div>
                 <StatusPill tone={capability?.supportsRefresh ? "success" : "warning"}>
                   {capability?.status || "manual_import_only"}
@@ -841,7 +860,7 @@ function DeviceFlowPanel({ onImported }: { onImported: () => void }) {
       <div className="device-flow-grid">
         <DeviceFlowCard
           title="GitHub Copilot"
-          icon={<Smartphone size={16} />}
+          icon={<AccountProviderIcon providerType="github_copilot" size={16} />}
           fields={
             <label>
               <span>{tx("GitHub domain")}</span>
@@ -857,7 +876,7 @@ function DeviceFlowPanel({ onImported }: { onImported: () => void }) {
         />
         <DeviceFlowCard
           title="Kiro OAuth"
-          icon={<Smartphone size={16} />}
+          icon={<AccountProviderIcon providerType="kiro_oauth" size={16} />}
           fields={
             <>
               <label>
@@ -1168,14 +1187,19 @@ function parseOptionalJson(value: string, label: string): unknown {
   }
 }
 
-function SummaryTile({ label, value }: { label: string; value: ReactNode }) {
+function AccountStat({ label, value }: { label: string; value: ReactNode }) {
   const { tx } = useI18n();
   return (
-    <div className="summary-tile">
+    <div className="account-stat">
       <span>{tx(label)}</span>
       <strong>{value}</strong>
     </div>
   );
+}
+
+function AccountProviderIcon({ providerType, size = 20 }: { providerType: string; size?: number }) {
+  const icon = accountProviderIcon(providerType);
+  return <ProviderIcon icon={icon.icon} color={icon.color} name={providerLabel(providerType)} size={size} />;
 }
 
 function KeyValue({ label, value }: { label: string; value: ReactNode }) {
@@ -1256,6 +1280,14 @@ function providerLabel(providerType: string): string {
     deepseek_api: "DeepSeek API Key",
   };
   return labels[providerType] || providerType.replace(/_/g, " ");
+}
+
+function accountProviderIcon(providerType: string): { icon?: string; color?: string } {
+  const normalized = providerType
+    .replace(/_oauth|_cli|_account|_apikey|_api_key|_auth|_cloud/g, " ")
+    .replace(/_/g, " ");
+  const inferred = inferIconForText(providerType, normalized, providerLabel(providerType));
+  return { icon: inferred.icon, color: inferred.iconColor };
 }
 
 function credentialFlags(account: AccountRecord): string[] {

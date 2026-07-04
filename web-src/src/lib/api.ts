@@ -70,6 +70,11 @@ export interface ProviderPresetSummary {
   baseUrl?: string | null;
 }
 
+export interface ProviderSortUpdate {
+  id: string;
+  sortIndex: number;
+}
+
 export type ProviderPresetsByApp = Record<AppKind, ProviderPresetSummary[]>;
 
 export interface ProviderHealth {
@@ -748,6 +753,22 @@ export interface SettingsDashboardData {
   routerStatus: RouterStatusResponse;
   diagnostics: RouterDiagnosticsResponse;
   backups: BackupManifest[];
+  buildInfo: BuildInfo;
+}
+
+export interface BuildInfo {
+  name: string;
+  version: string;
+  versionLine: string;
+  commitId: string;
+  commitShort: string;
+  commitMessage: string;
+  commitTime: string;
+  buildTime: string;
+  target: string;
+  profile: string;
+  rustcVersion: string;
+  dirty: boolean;
 }
 
 export interface ProviderTestResult {
@@ -848,12 +869,38 @@ export async function saveProvider(app: AppKind, provider: Provider): Promise<St
   return result.stored;
 }
 
+export async function exportProviders(): Promise<StoredProvider[]> {
+  const result = await jsonFetch<{ providers: StoredProvider[] }>("/api/providers/export");
+  return result.providers || [];
+}
+
+export async function importProviders(providers: StoredProvider[]): Promise<number> {
+  const result = await jsonFetch<{ imported: number }>("/api/providers/import", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      providers: providers.map((item) => ({
+        app: item.app,
+        provider: item.provider,
+      })),
+    }),
+  });
+  return result.imported;
+}
+
 export async function deleteProvider(app: AppKind, id: string): Promise<boolean> {
   return invokeCommand<boolean>("delete_provider", { app, id });
 }
 
 export async function switchProvider(app: AppKind, id: string): Promise<void> {
   await invokeCommand("switch_provider", { app, id });
+}
+
+export async function updateProvidersSortOrder(
+  app: AppKind,
+  updates: ProviderSortUpdate[],
+): Promise<boolean> {
+  return invokeCommand<boolean>("update_providers_sort_order", { app, updates });
 }
 
 export async function getCurrentProvider(app: AppKind): Promise<string> {
@@ -1026,15 +1073,25 @@ export async function pollKiroDeviceLogin(input: {
 export async function loadShareDashboardData(): Promise<{
   shares: ShareRecord[];
   providers: StoredProvider[];
+  requestLogs: UsageLog[];
 }> {
-  const [shares, providers] = await Promise.all([
+  const [shares, providers, logs] = await Promise.all([
     jsonFetch<{ shares: ShareRecord[] }>("/api/shares"),
     jsonFetch<{ providers: StoredProvider[] }>("/api/providers"),
+    loadShareRequestLogs(),
   ]);
   return {
     shares: shares.shares || [],
     providers: providers.providers || [],
+    requestLogs: logs,
   };
+}
+
+export async function loadShareRequestLogs(limit = 80): Promise<UsageLog[]> {
+  const result = await jsonFetch<{ logs: UsageLog[] }>(
+    `/api/usage/logs${usageQuery({ limit }, false)}`,
+  );
+  return result.logs || [];
 }
 
 export async function saveShare(input: UpsertShareInput): Promise<ShareRecord> {
@@ -1286,13 +1343,14 @@ export async function deleteModelPricing(modelId: string): Promise<boolean> {
 }
 
 export async function loadSettingsDashboardData(): Promise<SettingsDashboardData> {
-  const [config, router, tunnel, routerStatus, diagnostics, backups] = await Promise.all([
+  const [config, router, tunnel, routerStatus, diagnostics, backups, buildInfo] = await Promise.all([
     jsonFetch<ConfigSnapshot>("/api/config"),
     jsonFetch<{ router: RouterConfigView }>("/api/router/config"),
     jsonFetch<ClientTunnelResponse>("/api/router/client-tunnel"),
     jsonFetch<RouterStatusResponse>("/api/router/status"),
     jsonFetch<RouterDiagnosticsResponse>("/api/router/diagnostics"),
     jsonFetch<{ backups: BackupManifest[] }>("/api/backups"),
+    loadBuildInfo(),
   ]);
   return {
     config,
@@ -1301,7 +1359,12 @@ export async function loadSettingsDashboardData(): Promise<SettingsDashboardData
     routerStatus,
     diagnostics,
     backups: backups.backups || [],
+    buildInfo,
   };
+}
+
+export async function loadBuildInfo(): Promise<BuildInfo> {
+  return jsonFetch<BuildInfo>("/version");
 }
 
 export async function updateUpstreamProxy(

@@ -38,6 +38,7 @@
     { "name": "get_current_provider", "support": "shim", "implemented": true, "feature": "providers", "endpoint": "GET /api/providers?app=", "notes": "Server has no live desktop config; first provider for app is exposed as the current provider shim." },
     { "name": "add_provider", "support": "native", "implemented": true, "feature": "providers", "endpoint": "POST /api/providers" },
     { "name": "update_provider", "support": "native", "implemented": true, "feature": "providers", "endpoint": "POST /api/providers" },
+    { "name": "update_providers_sort_order", "support": "shim", "implemented": true, "feature": "providers", "endpoint": "local provider store sortIndex mutation", "notes": "Server persists desktop-compatible sortIndex on provider JSON and sorts provider lists by that value." },
     { "name": "delete_provider", "support": "native", "implemented": true, "feature": "providers", "endpoint": "local provider store mutation" },
     { "name": "switch_provider", "support": "shim", "implemented": true, "feature": "providers", "endpoint": "local provider existence check", "notes": "Server share binding and explicit provider headers select runtime provider; switch returns warnings only." },
     { "name": "get_provider_health", "support": "native", "implemented": true, "feature": "providers", "endpoint": "GET /api/providers/health" },

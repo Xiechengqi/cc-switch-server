@@ -1,4 +1,21 @@
 import {
+  closestCenter,
+  DndContext,
+  DragEndEvent,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
   Boxes,
   CheckCircle2,
   FlaskConical,
@@ -12,7 +29,16 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  CSSProperties,
+  FormEvent,
+  HTMLAttributes,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import {
   AccountRecord,
@@ -34,6 +60,7 @@ import {
   StoredProvider,
   switchProvider,
   testProvider,
+  updateProvidersSortOrder,
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { inferIconForText } from "@/config/iconInference";
@@ -68,6 +95,8 @@ interface ProviderDraft {
   apiFormat: string;
   accountId: string;
   category: string;
+  icon: string;
+  iconColor: string;
   modelCatalogJson: string;
   modelMappingJson: string;
   pricingJson: string;
@@ -102,6 +131,10 @@ export function ProviderDashboard({
   const [resultById, setResultById] = useState<Record<string, string>>({});
   const [catalogOpen, setCatalogOpen] = useState(false);
   const [currentProviderId, setCurrentProviderId] = useState<string>("");
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -267,6 +300,41 @@ export function ProviderDashboard({
     }
   }
 
+  async function handleProviderDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIndex = activeProviders.findIndex((provider) => provider.provider.id === active.id);
+    const newIndex = activeProviders.findIndex((provider) => provider.provider.id === over.id);
+    if (oldIndex < 0 || newIndex < 0) return;
+    const reordered = arrayMove(activeProviders, oldIndex, newIndex);
+    const updates = reordered.map((provider, index) => ({
+      id: provider.provider.id,
+      sortIndex: index,
+    }));
+    setData((current) => {
+      const reorderedQueue = reordered.map((provider, index) => ({
+        ...provider,
+        provider: {
+          ...provider.provider,
+          sortIndex: index,
+        },
+      }));
+      return {
+        ...current,
+        providers: current.providers.map((provider) =>
+          provider.app === activeApp ? reorderedQueue.shift() || provider : provider,
+        ),
+      };
+    });
+    setError(null);
+    try {
+      await updateProvidersSortOrder(activeApp, updates);
+    } catch (reason) {
+      setError(errorMessage(reason));
+      await refresh();
+    }
+  }
+
   return (
     <div className="provider-dashboard">
       <div className="provider-toolbar">
@@ -317,24 +385,31 @@ export function ProviderDashboard({
           <span>{t("server.providers.loading")}</span>
         </div>
       ) : activeProviders.length ? (
-        <div className="provider-card-grid">
-          {activeProviders.map((provider) => (
-            <ProviderCard
-              key={`${provider.app}:${provider.provider.id}`}
-              provider={provider}
-              entry={entries.find((item) => item.providerTypeId === provider.providerTypeId)}
-              health={healthById.get(provider.provider.id)}
-              account={accountForProvider(provider, accountsById)}
-              capability={capabilityForProvider(provider, capabilitiesByType)}
-              limit={limitByProviderKey.get(providerKey(provider.app, provider.provider.id))}
-              current={provider.provider.id === currentProviderId}
-              result={resultById[provider.provider.id]}
-              busyId={busyId}
-              onEdit={() => openEdit(provider)}
-              onAction={(action) => void runAction(provider, action)}
-            />
-          ))}
-        </div>
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleProviderDragEnd(event)}>
+          <SortableContext
+            items={activeProviders.map((provider) => provider.provider.id)}
+            strategy={verticalListSortingStrategy}
+          >
+            <div className="provider-card-grid">
+              {activeProviders.map((provider) => (
+                <SortableProviderCard
+                  key={`${provider.app}:${provider.provider.id}`}
+                  provider={provider}
+                  entry={entries.find((item) => item.providerTypeId === provider.providerTypeId)}
+                  health={healthById.get(provider.provider.id)}
+                  account={accountForProvider(provider, accountsById)}
+                  capability={capabilityForProvider(provider, capabilitiesByType)}
+                  limit={limitByProviderKey.get(providerKey(provider.app, provider.provider.id))}
+                  current={provider.provider.id === currentProviderId}
+                  result={resultById[provider.provider.id]}
+                  busyId={busyId}
+                  onEdit={() => openEdit(provider)}
+                  onAction={(action) => void runAction(provider, action)}
+                />
+              ))}
+            </div>
+          </SortableContext>
+        </DndContext>
       ) : (
         <div className="provider-empty">
           <ServerCog size={24} />
@@ -370,6 +445,47 @@ export function ProviderDashboard({
   );
 }
 
+function SortableProviderCard(props: ProviderCardProps) {
+  const { attributes, listeners, setActivatorNodeRef, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: props.provider.provider.id });
+  const style: CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+  const dragHandleProps: DragHandleProps = {
+    ...attributes,
+    ...listeners,
+    ref: setActivatorNodeRef,
+  };
+  return (
+    <ProviderCard
+      {...props}
+      dragHandleProps={dragHandleProps}
+      nodeRef={setNodeRef}
+      style={style}
+      dragging={isDragging}
+    />
+  );
+}
+
+type DragHandleProps = HTMLAttributes<HTMLButtonElement> & {
+  ref?: (node: HTMLButtonElement | null) => void;
+};
+
+interface ProviderCardProps {
+  provider: StoredProvider;
+  entry?: ProviderMatrixEntry;
+  health?: ProviderHealth;
+  account?: AccountRecord;
+  capability?: AccountManagerCapability;
+  limit?: ProviderLimitStatus;
+  current: boolean;
+  result?: string;
+  busyId: string | null;
+  onEdit: () => void;
+  onAction: (action: "test" | "network" | "stream" | "models" | "switch" | "delete") => void;
+}
+
 function ProviderCard({
   provider,
   entry,
@@ -382,18 +498,15 @@ function ProviderCard({
   busyId,
   onEdit,
   onAction,
-}: {
-  provider: StoredProvider;
-  entry?: ProviderMatrixEntry;
-  health?: ProviderHealth;
-  account?: AccountRecord;
-  capability?: AccountManagerCapability;
-  limit?: ProviderLimitStatus;
-  current: boolean;
-  result?: string;
-  busyId: string | null;
-  onEdit: () => void;
-  onAction: (action: "test" | "network" | "stream" | "models" | "switch" | "delete") => void;
+  dragHandleProps,
+  nodeRef,
+  style,
+  dragging,
+}: ProviderCardProps & {
+  dragHandleProps?: DragHandleProps;
+  nodeRef?: (node: HTMLElement | null) => void;
+  style?: CSSProperties;
+  dragging?: boolean;
 }) {
   const { tx } = useI18n();
   const model = modelFromProvider(provider.provider);
@@ -406,10 +519,17 @@ function ProviderCard({
   const healthLabel = health?.healthy === false ? tx("unhealthy") : tx("healthy");
   const busyPrefix = `${provider.app}:${provider.provider.id}:`;
   return (
-    <article className={current ? "provider-card current" : "provider-card"}>
+    <article
+      ref={nodeRef}
+      className={[current ? "provider-card current" : "provider-card", dragging ? "dragging" : ""]
+        .filter(Boolean)
+        .join(" ")}
+      style={style}
+    >
       <header className="provider-card-header">
         <div className="provider-card-title-row">
           <button
+            {...dragHandleProps}
             className="provider-drag-handle"
             type="button"
             aria-label={tx("Drag provider")}
@@ -539,6 +659,15 @@ function ProviderFormModal({
       draft.pricingJson.trim() ||
       draft.advancedJson.trim(),
   );
+  const inferredPreviewIcon = inferIconForText(
+    draft.name,
+    draft.providerTypeId,
+    draft.baseUrl,
+    draft.apiFormat,
+  );
+  const previewIcon = draft.icon
+    ? { icon: draft.icon, color: draft.iconColor }
+    : { icon: inferredPreviewIcon.icon, color: inferredPreviewIcon.iconColor };
   function patch(next: Partial<ProviderDraft>) {
     onChange({ ...draft, ...next });
   }
@@ -592,6 +721,28 @@ function ProviderFormModal({
             <span>{tx("Name")}</span>
             <input value={draft.name} onChange={(event) => patch({ name: event.target.value })} />
           </label>
+          <div className="universal-icon-editor provider-icon-editor">
+            <div className="provider-icon-frame universal-icon-frame">
+              <ProviderIcon
+                icon={previewIcon.icon}
+                name={draft.name || draft.providerTypeId || "Provider"}
+                color={previewIcon.color}
+                size={24}
+              />
+            </div>
+            <label>
+              <span>{tx("Icon")}</span>
+              <input value={draft.icon} onChange={(event) => patch({ icon: event.target.value })} />
+            </label>
+            <label>
+              <span>{tx("Color")}</span>
+              <input
+                type="color"
+                value={colorInputValue(draft.iconColor || previewIcon.color)}
+                onChange={(event) => patch({ iconColor: event.target.value })}
+              />
+            </label>
+          </div>
           <label>
             <span>{tx("Model")}</span>
             <input value={draft.model} onChange={(event) => patch({ model: event.target.value })} />
@@ -1043,6 +1194,8 @@ function createDraft(app: AppKind, entry: ProviderMatrixEntry): ProviderDraft {
     apiFormat: entry.defaults.apiFormat,
     accountId: "",
     category: "",
+    icon: "",
+    iconColor: "",
     modelCatalogJson: "",
     modelMappingJson: "",
     pricingJson: "",
@@ -1064,6 +1217,8 @@ function editDraft(stored: StoredProvider, entry: ProviderMatrixEntry): Provider
     apiFormat: apiFormatFromProvider(provider) || entry.defaults.apiFormat,
     accountId: provider.meta?.authBinding?.accountId || "",
     category: provider.category || "",
+    icon: getString(provider.icon) || "",
+    iconColor: getString(provider.iconColor) || "",
     modelCatalogJson: providerSettingJson(provider, ["modelCatalog"]),
     modelMappingJson: providerSettingJson(provider, ["modelMapping"]),
     pricingJson: providerSettingJson(provider, ["pricing", "modelPricing"]),
@@ -1108,9 +1263,15 @@ function providerFromDraft(draft: ProviderDraft, entry: ProviderMatrixEntry): Pr
     id: draft.id || parsed.id || "",
     name: draft.name.trim(),
     category: draft.category.trim() || null,
+    icon: draft.icon.trim() || undefined,
+    iconColor: draft.iconColor.trim() || undefined,
     settingsConfig: settings,
     meta,
   };
+}
+
+function colorInputValue(value?: string): string {
+  return value && /^#[0-9a-f]{6}$/i.test(value) ? value : "#111827";
 }
 
 function parseProviderJson(value: string): Provider {

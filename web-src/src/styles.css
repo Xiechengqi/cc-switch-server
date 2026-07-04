@@ -602,6 +602,11 @@ tbody tr:last-child td {
     hsl(var(--panel));
 }
 
+.provider-card.dragging {
+  opacity: 0.82;
+  box-shadow: 0 12px 28px hsl(220 35% 18% / 0.14);
+}
+
 .provider-card header,
 .provider-card-header,
 .provider-card-title-row,
@@ -641,6 +646,10 @@ tbody tr:last-child td {
 .provider-drag-handle:hover {
   background: hsl(var(--muted));
   color: hsl(var(--foreground));
+}
+
+.provider-drag-handle:active {
+  cursor: grabbing;
 }
 
 .provider-icon-frame {
@@ -1178,6 +1187,42 @@ tbody tr:last-child td {
   gap: 14px;
 }
 
+.accounts-stats-bar {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 10px;
+}
+
+.account-stat {
+  display: flex;
+  min-width: 0;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 10px 12px;
+  box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
+}
+
+.account-stat span {
+  min-width: 0;
+  overflow: hidden;
+  color: hsl(var(--muted));
+  font-size: 0.78rem;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-stat strong {
+  color: hsl(var(--foreground));
+  font-size: 1.1rem;
+}
+
 .account-group-list,
 .accounts-side,
 .capability-list,
@@ -1202,6 +1247,34 @@ tbody tr:last-child td {
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
+}
+
+.account-provider-title-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.account-provider-title-row > div:last-child {
+  min-width: 0;
+}
+
+.account-icon-frame {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+}
+
+.account-icon-frame.compact {
+  width: 32px;
+  height: 32px;
 }
 
 .account-group h3,
@@ -1510,6 +1583,25 @@ tbody tr:last-child td {
   background: hsl(var(--panel));
   box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
   padding: 14px;
+}
+
+.share-request-log-panel {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 14px;
+  box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
+}
+
+.share-request-log-table table {
+  min-width: 920px;
+}
+
+.share-request-log-table td {
+  max-width: 180px;
 }
 
 .share-card header {
@@ -2520,6 +2612,67 @@ tbody tr:last-child td {
   display: none;
 }
 
+.settings-about-card {
+  align-content: start;
+}
+
+.settings-about-hero {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 12px;
+}
+
+.settings-about-hero > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.settings-about-hero strong,
+.settings-about-hero span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-about-hero strong {
+  color: hsl(var(--foreground));
+  font-size: 1rem;
+}
+
+.settings-about-hero span {
+  color: hsl(var(--muted));
+  font-size: 0.8rem;
+}
+
+.settings-commit-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 12px;
+}
+
+.settings-commit-card h3,
+.settings-commit-card p {
+  margin: 0;
+}
+
+.settings-commit-card p {
+  color: hsl(var(--muted));
+  font-size: 0.84rem;
+  overflow-wrap: anywhere;
+}
+
 .theme-option-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2563,6 +2716,56 @@ tbody tr:last-child td {
 
 .settings-policy-grid {
   grid-template-columns: repeat(3, minmax(180px, 1fr));
+}
+
+.settings-import-export-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(3, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.settings-import-export-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 12px;
+}
+
+.settings-import-export-card header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.settings-import-export-card h3 {
+  margin: 0;
+  overflow: hidden;
+  color: hsl(var(--foreground));
+  font-size: 0.94rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-import-export-card header span {
+  display: block;
+  margin-top: 3px;
+  color: hsl(var(--muted));
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.settings-import-export-card textarea {
+  min-height: 190px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, "Liberation Mono", Menlo,
+    monospace;
+  font-size: 0.78rem;
 }
 
 .settings-readiness-item {
@@ -2776,8 +2979,10 @@ tbody tr:last-child td {
   .settings-summary-row,
   .settings-readiness-grid,
   .settings-policy-grid,
+  .settings-import-export-grid,
   .theme-option-grid,
   .share-stats-bar,
+  .accounts-stats-bar,
   .pricing-default-grid,
   .pricing-default-rates,
   .universal-form-modal .provider-form-grid {

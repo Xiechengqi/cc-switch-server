@@ -222,7 +222,7 @@ function App() {
             <button
               className="icon-button desktop-header-icon"
               type="button"
-              onClick={() => openSettings("backup")}
+              onClick={() => openSettings("importExport")}
               disabled={!isAuthenticated}
               aria-label={t("common.import")}
               title={t("common.import")}

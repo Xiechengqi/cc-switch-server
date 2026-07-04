@@ -56,7 +56,7 @@ use crate::core::provider::{
     classify_provider_response, AppKind, Provider, ProviderType, ProviderTypeRequest,
     ProviderTypeResponse,
 };
-use crate::core::providers::StoredProvider;
+use crate::core::providers::{ProviderSortUpdate, StoredProvider};
 use crate::core::quota::{refresh_account_quota, QuotaRefreshFailure, QuotaRefreshResult};
 use crate::core::router_client::RouterRegisterResult;
 use crate::core::router_client::{
@@ -4360,6 +4360,19 @@ async fn web_invoke_dispatch(
             }
             state.providers.write().await.upsert(app, provider);
             state.save_providers().await.map_err(ApiError::internal)?;
+            Ok(json!(true))
+        }
+        "update_providers_sort_order" => {
+            let app = web_arg_app(&args)?;
+            let updates: Vec<ProviderSortUpdate> = web_arg_value(&args, "updates")?;
+            let changed = state
+                .providers
+                .write()
+                .await
+                .update_sort_order(app, updates);
+            if changed {
+                state.save_providers().await.map_err(ApiError::internal)?;
+            }
             Ok(json!(true))
         }
         "delete_provider" => {

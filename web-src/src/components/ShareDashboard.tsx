@@ -50,6 +50,7 @@ import {
   updateShareBinding,
   updateShareSubdomain,
   UpsertShareInput,
+  UsageLog,
   verifyShareOwnerChangeCode,
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
@@ -59,6 +60,7 @@ import { appIcon, storedProviderIcon } from "@/lib/provider-icons";
 interface ShareDashboardState {
   shares: ShareRecord[];
   providers: StoredProvider[];
+  requestLogs: UsageLog[];
 }
 
 interface ShareDraft {
@@ -98,7 +100,7 @@ const apps: Array<{ id: AppKind; label: string }> = [
 
 export function ShareDashboard() {
   const { t, tx } = useI18n();
-  const [data, setData] = useState<ShareDashboardState>({ shares: [], providers: [] });
+  const [data, setData] = useState<ShareDashboardState>({ shares: [], providers: [], requestLogs: [] });
   const [markets, setMarkets] = useState<PublicShareMarket[]>([]);
   const [marketsLoaded, setMarketsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -142,6 +144,11 @@ export function ShareDashboard() {
     data.providers.forEach((provider) => map.set(providerKey(provider.app, provider.provider.id), provider));
     return map;
   }, [data.providers]);
+
+  const shareRequestLogs = useMemo(() => {
+    const shareIds = new Set(data.shares.map((share) => share.id));
+    return data.requestLogs.filter((log) => log.shareId && shareIds.has(log.shareId));
+  }, [data.requestLogs, data.shares]);
 
   async function runShareAction(
     share: ShareRecord,
@@ -375,6 +382,8 @@ export function ShareDashboard() {
           <span>{t("server.shares.noSharesHint")}</span>
         </div>
       )}
+
+      <ShareRequestLogPanel logs={shareRequestLogs} shares={data.shares} />
 
       {draft && (
         <ShareFormModal
@@ -740,6 +749,69 @@ function ShareCard({
         </IconAction>
       </div>
     </article>
+  );
+}
+
+function ShareRequestLogPanel({ logs, shares }: { logs: UsageLog[]; shares: ShareRecord[] }) {
+  const { tx } = useI18n();
+  const shareById = new Map(shares.map((share) => [share.id, share]));
+  return (
+    <section className="share-request-log-panel">
+      <div className="section-heading">
+        <div className="section-title-row compact-title">
+          <FileJson size={16} />
+          <div>
+            <h2>{tx("Request Logs")}</h2>
+            <span>{tx("{{count}} recent share requests", { count: logs.length })}</span>
+          </div>
+        </div>
+      </div>
+      <div className="table-wrap share-request-log-table">
+        <table>
+          <thead>
+            <tr>
+              <th>{tx("Share")}</th>
+              <th>{tx("App")}</th>
+              <th>{tx("Model")}</th>
+              <th>{tx("Status")}</th>
+              <th>{tx("Tokens")}</th>
+              <th>{tx("Cost")}</th>
+              <th>{tx("Latency")}</th>
+              <th>{tx("User")}</th>
+              <th>{tx("Time")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {logs.length ? (
+              logs.slice(0, 80).map((log) => {
+                const share = log.shareId ? shareById.get(log.shareId) : undefined;
+                return (
+                  <tr key={log.requestId}>
+                    <td title={log.shareId || undefined}>{log.shareName || (share ? shareName(share) : log.shareId || "-")}</td>
+                    <td>{appLabel(log.app)}</td>
+                    <td>{log.actualModel || log.requestedModel || log.model || "-"}</td>
+                    <td>
+                      <StatusPill tone={log.statusCode >= 200 && log.statusCode < 400 ? "success" : "danger"}>
+                        {log.statusCode || "-"}
+                      </StatusPill>
+                    </td>
+                    <td>{formatTokens(log.totalTokens)}</td>
+                    <td>{formatUsd(log.totalCostUsd)}</td>
+                    <td>{formatDuration(log.durationMs)}</td>
+                    <td>{log.userEmail || "-"}</td>
+                    <td>{formatTime(log.createdAtMs)}</td>
+                  </tr>
+                );
+              })
+            ) : (
+              <tr>
+                <td className="empty-cell" colSpan={9}>{tx("No share request logs")}</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -1646,6 +1718,23 @@ function formatTime(value?: number | null): string {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(date);
+}
+
+function formatTokens(value?: number | null): string {
+  if (value == null) return "-";
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
+}
+
+function formatUsd(value?: number | null): string {
+  if (value == null) return "-";
+  if (Math.abs(value) < 0.01 && value !== 0) return `$${value.toFixed(6)}`;
+  return `$${value.toFixed(4)}`;
+}
+
+function formatDuration(value?: number | null): string {
+  if (value == null) return "-";
+  if (value < 1000) return `${Math.round(value)}ms`;
+  return `${(value / 1000).toFixed(2)}s`;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

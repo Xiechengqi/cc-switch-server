@@ -26,6 +26,13 @@ pub struct StoredProvider {
     pub provider_type_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSortUpdate {
+    pub id: String,
+    pub sort_index: usize,
+}
+
 impl ProviderStore {
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
         let providers_path = providers_path(config_dir);
@@ -93,11 +100,45 @@ impl ProviderStore {
     }
 
     pub fn list(&self, app: Option<AppKind>) -> Vec<StoredProvider> {
-        self.providers
+        let mut providers = self
+            .providers
             .iter()
             .filter(|item| app.is_none_or(|app| item.app == app))
-            .cloned()
+            .enumerate()
+            .map(|(index, provider)| (index, provider.clone()))
+            .collect::<Vec<_>>();
+        providers.sort_by(|left, right| {
+            let left_sort = provider_sort_index(&left.1).unwrap_or(usize::MAX);
+            let right_sort = provider_sort_index(&right.1).unwrap_or(usize::MAX);
+            left_sort
+                .cmp(&right_sort)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        providers
+            .into_iter()
+            .map(|(_, provider)| provider)
             .collect()
+    }
+
+    pub fn update_sort_order(&mut self, app: AppKind, updates: Vec<ProviderSortUpdate>) -> bool {
+        let mut changed = false;
+        for update in updates {
+            if let Some(provider) = self
+                .providers
+                .iter_mut()
+                .find(|provider| provider.app == app && provider.provider.id == update.id)
+            {
+                let previous = provider_sort_index(provider);
+                if previous != Some(update.sort_index) {
+                    provider.provider.extra.insert(
+                        "sortIndex".to_string(),
+                        Value::from(update.sort_index as u64),
+                    );
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     pub fn remove_universal_derivative(&mut self, universal_id: &str, app: AppKind) -> bool {
@@ -118,6 +159,19 @@ impl ProviderStore {
             .filter(|app| self.remove_universal_derivative(universal_id, *app))
             .collect()
     }
+}
+
+pub fn provider_sort_index(provider: &StoredProvider) -> Option<usize> {
+    provider
+        .provider
+        .extra
+        .get("sortIndex")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 pub fn providers_path(config_dir: &Path) -> std::path::PathBuf {
