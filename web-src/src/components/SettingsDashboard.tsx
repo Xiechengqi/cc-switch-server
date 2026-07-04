@@ -152,6 +152,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   const [emailDraft, setEmailDraft] = useState<EmailDraft>({ email: "", code: "" });
   const [backupReason, setBackupReason] = useState("");
   const [apiToken, setApiToken] = useState<string | null>(null);
+  const [apiTokenCopyStatus, setApiTokenCopyStatus] = useState<{ tone: "success" | "warning"; message: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -304,8 +305,23 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
     await runAction("api-token", async () => {
       const token = await rotateApiToken();
       setApiToken(token);
+      setApiTokenCopyStatus(null);
       return tx("new API token generated");
     });
+  }
+
+  async function copyApiToken() {
+    if (!apiToken) return;
+    if (!navigator.clipboard?.writeText) {
+      setApiTokenCopyStatus({ tone: "warning", message: tx("Clipboard unavailable; copy the visible value manually.") });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(apiToken);
+      setApiTokenCopyStatus({ tone: "success", message: tx("API token copied") });
+    } catch {
+      setApiTokenCopyStatus({ tone: "warning", message: tx("Copy failed; copy the visible value manually.") });
+    }
   }
 
   async function requestCodeAction() {
@@ -520,12 +536,13 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
             <div className="settings-actions">
               <ActionButton label={t("server.settings.rotateApiToken")} icon={<KeyRound size={15} />} busy={busy === "api-token"} onClick={() => setRotateTokenConfirm(true)} />
               {apiToken && (
-                <button className="secondary-button" type="button" onClick={() => void navigator.clipboard?.writeText(apiToken)}>
+                <button className="secondary-button" type="button" onClick={() => void copyApiToken()}>
                   <Copy size={15} />
                   <span>{t("server.settings.copyToken")}</span>
                 </button>
               )}
             </div>
+            {apiTokenCopyStatus && <div className={`connect-copy-status ${apiTokenCopyStatus.tone}`}>{apiTokenCopyStatus.message}</div>}
             {apiToken && <pre className="settings-secret-preview">{apiToken}</pre>}
             <div className="settings-form">
               <TextField label={t("server.auth.ownerEmail")} value={emailDraft.email} onChange={(value) => setEmailDraft({ ...emailDraft, email: value })} />

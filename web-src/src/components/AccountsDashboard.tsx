@@ -1,5 +1,6 @@
 import {
   CheckCircle2,
+  Copy,
   ExternalLink,
   FileJson,
   Loader2,
@@ -484,6 +485,7 @@ function AccountGroup({
     action: "refresh" | "quota" | "forceQuota" | "plan" | "delete",
   ) => void;
 }) {
+  const { tx } = useI18n();
   const icon = accountProviderIcon(providerType);
   return (
     <section className="account-group">
@@ -494,11 +496,11 @@ function AccountGroup({
           </span>
           <div>
             <h3>{providerLabel(providerType)}</h3>
-            <span>{capability?.status || "manual_import_only"}</span>
+            <span>{tx(capability?.status || "manual_import_only")}</span>
           </div>
         </div>
         <StatusPill tone={capability?.supportsRefresh ? "success" : "warning"}>
-          {capability?.supportsRefresh ? "refresh-ready" : "manual"}
+          {tx(capability?.supportsRefresh ? "refresh-ready" : "manual")}
         </StatusPill>
       </header>
       <div className="account-card-grid">
@@ -552,7 +554,7 @@ function AccountCard({
           </div>
         </div>
         <StatusPill tone={account.lastRefreshError ? "danger" : "success"}>
-          {account.lastRefreshError ? "error" : "ready"}
+          {tx(account.lastRefreshError ? "error" : "ready")}
         </StatusPill>
       </header>
       <div className="provider-card-meta">
@@ -563,15 +565,15 @@ function AccountCard({
       </div>
       <AccountRegressionStrip account={account} capability={capability} />
       <div className="credential-badges">
-        {credentials.length ? credentials.map((item) => <span key={item}>{item}</span>) : <span>no credential flag</span>}
+        {credentials.length ? credentials.map((item) => <span key={item}>{item}</span>) : <span>{tx("no credential flag")}</span>}
       </div>
       <div className="provider-card-result">
-        {result || account.lastRefreshError || quotaTierSummary(account) || capability?.blockingReason || "account imported"}
+        {result || account.lastRefreshError || quotaTierSummary(account) || capability?.blockingReason || tx("account imported")}
       </div>
       <AccountQuotaFooter account={account} capability={capability} />
       {detail && (
         <details className="json-details">
-          <summary>{detail.kind === "plan" ? "Refresh plan" : "Quota result"}</summary>
+          <summary>{tx(detail.kind === "plan" ? "Refresh plan" : "Quota result")}</summary>
           <JsonPreview value={detail.value} redact />
         </details>
       )}
@@ -738,11 +740,11 @@ function CapabilityPanel({
                   </span>
                   <div>
                     <h3>{providerLabel(providerType)}</h3>
-                    <span>{template?.credentialKind || "manual"}</span>
+                    <span>{tx(template?.credentialKind || "manual")}</span>
                   </div>
                 </div>
                 <StatusPill tone={statusTone}>
-                  {capability?.status || "manual_import_only"}
+                  {tx(capability?.status || "manual_import_only")}
                 </StatusPill>
               </header>
               <div className="auth-center-metrics">
@@ -751,9 +753,9 @@ function CapabilityPanel({
                 <KeyValue label="quota" value={capability?.supportsQuota ? tx("ready") : tx("none")} />
               </div>
               <div className="capability-flags">
-                <span>{capability?.serverNativeStage || template?.credentialKind || "manual"}</span>
-                <span>{capability?.quotaStrategy || "quota-none"}</span>
-                <span>{capability?.supportsImport ? "import" : "read-only"}</span>
+                <span>{tx(capability?.serverNativeStage || template?.credentialKind || "manual")}</span>
+                <span>{tx(capability?.quotaStrategy || "quota-none")}</span>
+                <span>{tx(capability?.supportsImport ? "import" : "read-only")}</span>
               </div>
               <details className="template-details">
                 <summary>{tx("Import template")}</summary>
@@ -900,8 +902,8 @@ function OAuthPreviewPanel({
       setFinishResult(next.login);
       setAccountResult(
         next.account
-          ? `${next.account.email || next.account.id} imported`
-          : "token request preview ready",
+          ? tx("{{account}} imported", { account: next.account.email || next.account.id })
+          : tx("token request preview ready"),
       );
       if (next.account) onImported();
     } catch (reason) {
@@ -1136,6 +1138,23 @@ function DeviceFlowCard({
   onPoll: () => void;
 }) {
   const { tx } = useI18n();
+  const [copyStatus, setCopyStatus] = useState<{ tone: "success" | "warning"; message: string } | null>(null);
+  const verificationUrl = device?.verificationUriComplete || device?.verificationUri || "";
+
+  async function copyDeviceText(value: string, successMessage: string) {
+    if (!value) return;
+    if (!navigator.clipboard?.writeText) {
+      setCopyStatus({ tone: "warning", message: tx("Clipboard unavailable; copy the visible value manually.") });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyStatus({ tone: "success", message: successMessage });
+    } catch {
+      setCopyStatus({ tone: "warning", message: tx("Copy failed; copy the visible value manually.") });
+    }
+  }
+
   return (
     <article className="device-flow-card">
       <header>
@@ -1155,7 +1174,18 @@ function DeviceFlowCard({
         <div className="device-code-block">
           <KeyValue label="user code" value={device.userCode} />
           <KeyValue label="expires" value={`${device.expiresIn}s`} />
-          <a href={device.verificationUriComplete || device.verificationUri} target="_blank" rel="noreferrer" className="inline-link">
+          <div className="modal-inline-footer compact-footer">
+            <button className="secondary-button compact" type="button" onClick={() => void copyDeviceText(device.userCode, tx("Copied code"))}>
+              <Copy size={13} />
+              <span>{tx("Copy code")}</span>
+            </button>
+            <button className="secondary-button compact" type="button" onClick={() => void copyDeviceText(verificationUrl, tx("Copied URL"))}>
+              <Copy size={13} />
+              <span>{tx("Copy URL")}</span>
+            </button>
+          </div>
+          {copyStatus && <div className={`connect-copy-status ${copyStatus.tone}`}>{copyStatus.message}</div>}
+          <a href={verificationUrl} target="_blank" rel="noreferrer" className="inline-link">
             <ExternalLink size={14} />
             <span>{tx("Open verification")}</span>
           </a>

@@ -1445,7 +1445,12 @@ function PricingDefaultsModal({
   const { tx } = useI18n();
   const missingCount = pricingDefaultTemplates.filter((template) => !hasPricingModel(models, template.modelId)).length;
   return (
-    <SimpleModal title="Default Pricing" subtitle={`${pricingDefaultTemplates.length} model templates`} onClose={onClose}>
+    <SimpleModal
+      title="Default Pricing"
+      subtitle="{{count}} model templates"
+      subtitleVariables={{ count: pricingDefaultTemplates.length }}
+      onClose={onClose}
+    >
       <div className="modal-form-stack">
         <div className="modal-inline-footer">
           <span className="usage-result">{tx("{{count}} missing", { count: missingCount })}</span>
@@ -1616,11 +1621,13 @@ function StatusPill({
 function SimpleModal({
   title,
   subtitle,
+  subtitleVariables,
   children,
   onClose,
 }: {
   title: string;
   subtitle?: string;
+  subtitleVariables?: Record<string, string | number | boolean | null | undefined>;
   children: ReactNode;
   onClose: () => void;
 }) {
@@ -1631,7 +1638,7 @@ function SimpleModal({
         <header>
           <div>
             <h2>{tx(title)}</h2>
-            {subtitle && <p>{tx(subtitle)}</p>}
+            {subtitle && <p>{tx(subtitle, subtitleVariables)}</p>}
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label={tx("Close")}>
             <X size={15} />

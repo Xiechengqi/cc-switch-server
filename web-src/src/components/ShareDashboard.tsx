@@ -121,6 +121,7 @@ export function ShareDashboard() {
   const [marketDraft, setMarketDraft] = useState<ShareRecord | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [exportText, setExportText] = useState<string | null>(null);
+  const [exportCopyStatus, setExportCopyStatus] = useState<{ tone: "success" | "warning"; message: string } | null>(null);
   const [ownerChangeDraft, setOwnerChangeDraft] = useState<ShareDraft | null>(null);
   const [shareQuery, setShareQuery] = useState("");
   const [shareFilter, setShareFilter] = useState<ShareFilter>("all");
@@ -257,6 +258,7 @@ export function ShareDashboard() {
       const shares = await exportShares();
       const text = JSON.stringify(shares, null, 2);
       setExportText(text);
+      setExportCopyStatus(null);
       let copied = false;
       try {
         if (navigator.clipboard) {
@@ -266,6 +268,10 @@ export function ShareDashboard() {
       } catch {
         copied = false;
       }
+      setExportCopyStatus({
+        tone: copied ? "success" : "warning",
+        message: copied ? tx("Copied JSON") : tx("Clipboard unavailable; copy the visible value manually."),
+      });
       setResultById((current) => ({
         ...current,
         __global: copied
@@ -276,6 +282,20 @@ export function ShareDashboard() {
       setError(errorMessage(reason));
     } finally {
       setBusyId(null);
+    }
+  }
+
+  async function copyExportText() {
+    if (!exportText) return;
+    if (!navigator.clipboard?.writeText) {
+      setExportCopyStatus({ tone: "warning", message: tx("Clipboard unavailable; copy the visible value manually.") });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(exportText);
+      setExportCopyStatus({ tone: "success", message: tx("Copied JSON") });
+    } catch {
+      setExportCopyStatus({ tone: "warning", message: tx("Copy failed; copy the visible value manually.") });
     }
   }
 
@@ -624,7 +644,12 @@ export function ShareDashboard() {
           onClose={() => setExportText(null)}
         >
           <textarea readOnly value={exportText} />
+          {exportCopyStatus && <div className={`connect-copy-status ${exportCopyStatus.tone}`}>{exportCopyStatus.message}</div>}
           <footer className="modal-inline-footer">
+            <button className="secondary-button" type="button" onClick={() => void copyExportText()}>
+              <Copy size={15} />
+              <span>{tx("Copy JSON")}</span>
+            </button>
             <button className="secondary-button" type="button" onClick={() => setExportText(null)}>
               {tx("Close")}
             </button>
@@ -676,15 +701,31 @@ function ShareCard({
   const { tx } = useI18n();
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<{ tone: "success" | "warning"; message: string } | null>(null);
   const usage = shareUsage(share);
   const syncText = share.routerLastSyncError || formatTime(share.routerLastSyncedAtMs);
   const market = markets.find((item) => item.email === share.acl?.publicMarketEmail);
+  const sharedEmailCount = share.acl?.sharedWithEmails?.length || 0;
   const shareActive = share.enabled && share.status === "active";
   const shareCanRestart = share.status === "paused" || share.status === "stopped";
   const pauseResumeAction = shareActive ? "pause" : "resume";
   const pauseResumeDisabled = !shareActive && !shareCanRestart;
   const startTunnelDisabled = shareActive || !shareCanRestart;
   const stopTunnelDisabled = !shareActive;
+
+  async function copyConnectInfo(value: string, successMessage: string) {
+    if (!navigator.clipboard?.writeText) {
+      setCopyStatus({ tone: "warning", message: tx("Clipboard unavailable; copy the visible value manually.") });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyStatus({ tone: "success", message: successMessage });
+    } catch {
+      setCopyStatus({ tone: "warning", message: tx("Copy failed; copy the visible value manually.") });
+    }
+  }
+
   return (
     <>
     <article className="share-card">
@@ -752,9 +793,9 @@ function ShareCard({
       </div>
 
       <div className="share-status-grid">
-        <ShareStatus label="ACL" value={(share.acl?.sharedWithEmails || []).length ? `${share.acl?.sharedWithEmails.length} users` : "private"} />
-        <ShareStatus label="sale" value={share.forSale ? share.saleMarketKind || "share" : "no"} />
-        <ShareStatus label="market" value={market?.displayName || share.acl?.publicMarketEmail || (marketsLoaded ? "-" : "not loaded")} />
+        <ShareStatus label="ACL" value={sharedEmailCount ? tx("{{count}} users", { count: sharedEmailCount }) : tx("private")} />
+        <ShareStatus label="sale" value={share.forSale ? share.saleMarketKind || "share" : tx("no")} />
+        <ShareStatus label="market" value={market?.displayName || share.acl?.publicMarketEmail || (marketsLoaded ? "-" : tx("not loaded"))} />
         <ShareStatus label="grant" value={share.marketGrant?.status || "-"} />
       </div>
 
@@ -770,7 +811,7 @@ function ShareCard({
             <button
               className="secondary-button compact"
               type="button"
-              onClick={() => void navigator.clipboard?.writeText(connectInfo.directUrl)}
+              onClick={() => void copyConnectInfo(connectInfo.directUrl, tx("Copied URL"))}
             >
               <Copy size={13} />
               <span>{tx("Copy URL")}</span>
@@ -778,11 +819,12 @@ function ShareCard({
             <button
               className="secondary-button compact"
               type="button"
-              onClick={() => void navigator.clipboard?.writeText(JSON.stringify(connectInfo, null, 2))}
+              onClick={() => void copyConnectInfo(JSON.stringify(connectInfo, null, 2), tx("Copied JSON"))}
             >
               <Copy size={13} />
               <span>{tx("Copy JSON")}</span>
             </button>
+            {copyStatus && <div className={`connect-copy-status ${copyStatus.tone}`}>{copyStatus.message}</div>}
             <JsonPreview value={connectInfo} />
           </div>
         </details>
@@ -1169,8 +1211,8 @@ function ShareFormModal({
           <label>
             <span>{tx("Market ACL mode")}</span>
             <select value={draft.marketAccessMode} onChange={(event) => patch({ marketAccessMode: event.target.value })}>
-              <option value="selected">selected</option>
-              <option value="all">all</option>
+              <option value="selected">{tx("selected")}</option>
+              <option value="all">{tx("all")}</option>
             </select>
           </label>
           <label className="wide-field">
@@ -1235,8 +1277,8 @@ function AclModal({
         <label>
           <span>{tx("Market mode")}</span>
           <select value={marketAccessMode} onChange={(event) => setMarketAccessMode(event.target.value)}>
-            <option value="selected">selected</option>
-            <option value="all">all</option>
+            <option value="selected">{tx("selected")}</option>
+            <option value="all">{tx("all")}</option>
           </select>
         </label>
         <ModalFooter saving={saving} onClose={onClose} label="Save ACL" />
@@ -1294,7 +1336,12 @@ function BindingModal({
 }) {
   const { tx } = useI18n();
   return (
-    <SimpleModal title={`${appLabel(draft.app)} Binding`} subtitle="Share must be paused before binding changes are accepted." onClose={onClose}>
+    <SimpleModal
+      title="{{app}} Binding"
+      titleVariables={{ app: appLabel(draft.app) }}
+      subtitle="Share must be paused before binding changes are accepted."
+      onClose={onClose}
+    >
       <form
         className="modal-form-stack"
         onSubmit={(event) => {
@@ -1534,11 +1581,13 @@ function ImportSharesModal({
 
 function SimpleModal({
   title,
+  titleVariables,
   subtitle,
   children,
   onClose,
 }: {
   title: string;
+  titleVariables?: Record<string, string | number | boolean | null | undefined>;
   subtitle?: string;
   children: ReactNode;
   onClose: () => void;
@@ -1549,7 +1598,7 @@ function SimpleModal({
       <section className="provider-form-modal simple-modal">
         <header>
           <div>
-            <h2>{tx(title)}</h2>
+            <h2>{tx(title, titleVariables)}</h2>
             {subtitle && <p>{tx(subtitle)}</p>}
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label={tx("Close")}>
@@ -1631,21 +1680,21 @@ function ShareToolbar({
           placeholder={tx("Search shares")}
         />
       </label>
-      <div className="share-filter-tabs" role="tablist" aria-label={tx("Share filters")}>
-        {filters.map((item) => (
-          <button
-            key={item.id}
-            className={filter === item.id ? "active" : ""}
-            type="button"
-            role="tab"
-            aria-selected={filter === item.id}
-            onClick={() => onFilterChange(item.id)}
-          >
-            {tx(item.label)}
-          </button>
-        ))}
-      </div>
-      <label className="share-sort">
+      <label className="share-select">
+        <SlidersHorizontal size={14} />
+        <select
+          value={filter}
+          onChange={(event) => onFilterChange(event.target.value as ShareFilter)}
+          aria-label={tx("Share filters")}
+        >
+          {filters.map((item) => (
+            <option key={item.id} value={item.id}>
+              {tx(item.label)}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="share-select">
         <SlidersHorizontal size={14} />
         <select value={sort} onChange={(event) => onSortChange(event.target.value as ShareSort)}>
           {sortOptions.map((item) => (

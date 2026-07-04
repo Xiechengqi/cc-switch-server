@@ -111,6 +111,7 @@ export function UniversalDashboard() {
   const [presetOpen, setPresetOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [exportText, setExportText] = useState<string | null>(null);
+  const [exportCopyStatus, setExportCopyStatus] = useState<{ tone: "success" | "warning"; message: string } | null>(null);
   const [providerQuery, setProviderQuery] = useState("");
   const [submitMode, setSubmitMode] = useState<"save" | "save-sync">("save");
   const sensors = useSensors(
@@ -240,6 +241,7 @@ export function UniversalDashboard() {
       const exported = await exportUniversalProviders();
       const text = JSON.stringify(exported, null, 2);
       setExportText(text);
+      setExportCopyStatus(null);
       let copied = false;
       try {
         if (navigator.clipboard) {
@@ -249,10 +251,28 @@ export function UniversalDashboard() {
       } catch {
         copied = false;
       }
+      setExportCopyStatus({
+        tone: copied ? "success" : "warning",
+        message: copied ? tx("Copied JSON") : tx("Clipboard unavailable; copy the visible value manually."),
+      });
       return copied
         ? tx("exported {{count}} providers to clipboard", { count: exported.length })
         : tx("exported {{count}} providers", { count: exported.length });
     });
+  }
+
+  async function copyExportText() {
+    if (!exportText) return;
+    if (!navigator.clipboard?.writeText) {
+      setExportCopyStatus({ tone: "warning", message: tx("Clipboard unavailable; copy the visible value manually.") });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(exportText);
+      setExportCopyStatus({ tone: "success", message: tx("Copied JSON") });
+    } catch {
+      setExportCopyStatus({ tone: "warning", message: tx("Copy failed; copy the visible value manually.") });
+    }
   }
 
   return (
@@ -364,7 +384,7 @@ export function UniversalDashboard() {
             void runAction("import", async () => {
               const imported = await importUniversalProviders(providersToImport);
               setImportOpen(false);
-              return `imported ${imported} universal providers`;
+              return tx("imported {{count}} universal providers", { count: imported });
             })
           }
         />
@@ -377,7 +397,12 @@ export function UniversalDashboard() {
           onClose={() => setExportText(null)}
         >
           <textarea readOnly value={exportText} />
+          {exportCopyStatus && <div className={`connect-copy-status ${exportCopyStatus.tone}`}>{exportCopyStatus.message}</div>}
           <footer className="modal-inline-footer">
+            <button className="secondary-button" type="button" onClick={() => void copyExportText()}>
+              <Copy size={15} />
+              <span>{tx("Copy JSON")}</span>
+            </button>
             <button className="secondary-button" type="button" onClick={() => setExportText(null)}>
               {tx("Close")}
             </button>
@@ -1167,11 +1192,13 @@ function IconAction({
 function SimpleModal({
   title,
   subtitle,
+  subtitleVariables,
   children,
   onClose,
 }: {
   title: string;
   subtitle?: string;
+  subtitleVariables?: Record<string, string | number | boolean | null | undefined>;
   children: ReactNode;
   onClose: () => void;
 }) {
@@ -1182,7 +1209,7 @@ function SimpleModal({
         <header>
           <div>
             <h2>{tx(title)}</h2>
-            {subtitle && <p>{tx(subtitle)}</p>}
+            {subtitle && <p>{tx(subtitle, subtitleVariables)}</p>}
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label={tx("Close")}>
             <X size={16} />
