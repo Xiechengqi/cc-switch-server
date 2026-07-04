@@ -42,7 +42,7 @@ import { JsonPreview } from "@/components/JsonPreview";
 import { ProviderIcon } from "@/components/ProviderIcon";
 
 export type UsageTab = "logs" | "providers" | "models" | "pricing" | "limits";
-type RangePreset = "24h" | "7d" | "30d" | "all" | "custom";
+type RangePreset = "today" | "1d" | "7d" | "14d" | "30d" | "all" | "custom";
 
 export interface UsageInitialFocus {
   app: AppKind;
@@ -105,8 +105,10 @@ const apps: Array<{ id: "all" | AppKind; label: string }> = [
 ];
 
 const rangeOptions: Array<{ id: RangePreset; label: string }> = [
-  { id: "24h", label: "24h" },
+  { id: "today", label: "Today" },
+  { id: "1d", label: "1d" },
   { id: "7d", label: "7d" },
+  { id: "14d", label: "14d" },
   { id: "30d", label: "30d" },
   { id: "all", label: "All" },
   { id: "custom", label: "Custom" },
@@ -283,12 +285,9 @@ export function UsageDashboard({ initialFocus }: { initialFocus?: UsageInitialFo
   return (
     <div className="usage-dashboard">
       <div className="provider-toolbar">
-        <div className="section-title-row">
-          <BarChart3 size={18} />
-          <div>
-            <h2>{t("server.usage.title")}</h2>
-            <span>{tx(rangeLabel(filterDraft))} - {t("server.usage.logsLoaded", { count: data.logs.length })}</span>
-          </div>
+        <div className="provider-toolbar-status">
+          <span>{tx(rangeLabel(filterDraft))}</span>
+          <span>{t("server.usage.logsLoaded", { count: data.logs.length })}</span>
         </div>
         <div className="provider-toolbar-actions">
           {error && <span className="error-text">{error}</span>}
@@ -349,8 +348,8 @@ export function UsageDashboard({ initialFocus }: { initialFocus?: UsageInitialFo
       {activeTab === "logs" && (
         <LogsPanel logs={data.logs} loading={loading} onDetail={(log) => setDetailId(log.requestId)} />
       )}
-      {activeTab === "providers" && <ProviderStatsTable providers={data.providers} loading={loading} />}
-      {activeTab === "models" && <ModelStatsTable models={data.models} loading={loading} />}
+      {activeTab === "providers" && <ProviderRankingGrid providers={data.providers} loading={loading} />}
+      {activeTab === "models" && <ModelRankingGrid models={data.models} loading={loading} />}
       {activeTab === "pricing" && (
         <PricingPanel
           models={data.pricing}
@@ -361,7 +360,7 @@ export function UsageDashboard({ initialFocus }: { initialFocus?: UsageInitialFo
           onDelete={setPricingDeleteId}
         />
       )}
-      {activeTab === "limits" && <ProviderLimitsTable limits={visibleLimits} loading={loading} />}
+      {activeTab === "limits" && <ProviderLimitsGrid limits={visibleLimits} loading={loading} />}
 
       {detailId && <RequestDetailModal requestId={detailId} onClose={() => setDetailId(null)} />}
 
@@ -465,39 +464,8 @@ function UsageFilterBar({
             </button>
           ))}
         </div>
-        <div className="segmented usage-range-segment">
-          {rangeOptions.map((range) => (
-            <button
-              key={range.id}
-              className={draft.range === range.id ? "active" : ""}
-              type="button"
-              onClick={() => patch({ range: range.id })}
-            >
-              {tx(range.label)}
-            </button>
-          ))}
-        </div>
+        <UsageRangePicker draft={draft} onPatch={patch} />
       </div>
-      {draft.range === "custom" && (
-        <div className="usage-custom-range">
-          <label>
-            <span>{tx("From")}</span>
-            <input
-              type="datetime-local"
-              value={draft.customFrom}
-              onChange={(event) => patch({ customFrom: event.target.value })}
-            />
-          </label>
-          <label>
-            <span>{tx("To")}</span>
-            <input
-              type="datetime-local"
-              value={draft.customTo}
-              onChange={(event) => patch({ customTo: event.target.value })}
-            />
-          </label>
-        </div>
-      )}
       <details className="usage-advanced-filters" open={advancedCount > 0 || undefined}>
         <summary>
           <span>{tx("Advanced filters")}</span>
@@ -551,6 +519,62 @@ function UsageFilterBar({
         </button>
       </details>
     </section>
+  );
+}
+
+function UsageRangePicker({
+  draft,
+  onPatch,
+}: {
+  draft: UsageFilterDraft;
+  onPatch: (next: Partial<UsageFilterDraft>) => void;
+}) {
+  const { tx } = useI18n();
+  const customLiveEnd = draft.range === "custom" && !draft.customTo;
+  return (
+    <div className="usage-range-picker">
+      <div className="usage-range-presets" role="group" aria-label={tx("Date range")}>
+        {rangeOptions.map((range) => (
+          <button
+            key={range.id}
+            className={draft.range === range.id ? "active" : ""}
+            type="button"
+            onClick={() => onPatch({ range: range.id })}
+          >
+            {tx(range.label)}
+          </button>
+        ))}
+      </div>
+      {draft.range === "custom" && (
+        <div className="usage-custom-range">
+          <label>
+            <span>{tx("From")}</span>
+            <input
+              type="datetime-local"
+              value={draft.customFrom}
+              onChange={(event) => onPatch({ customFrom: event.target.value })}
+            />
+          </label>
+          <label>
+            <span>{tx("To")}</span>
+            <input
+              type="datetime-local"
+              value={draft.customTo}
+              disabled={customLiveEnd}
+              onChange={(event) => onPatch({ customTo: event.target.value })}
+            />
+          </label>
+          <label className="usage-live-toggle">
+            <input
+              type="checkbox"
+              checked={customLiveEnd}
+              onChange={(event) => onPatch({ customTo: event.target.checked ? "" : dateTimeInput(Date.now()) })}
+            />
+            <span>{tx("Live end time")}</span>
+          </label>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -945,7 +969,7 @@ function UsageMiniMetric({ label, value, detail }: { label: string; value: React
   );
 }
 
-function ProviderStatsTable({ providers, loading }: { providers: ProviderUsageStats[]; loading: boolean }) {
+function ProviderRankingGrid({ providers, loading }: { providers: ProviderUsageStats[]; loading: boolean }) {
   const { tx } = useI18n();
   if (loading) return <LoadingBlock label="Loading provider stats" />;
   const maxTokens = Math.max(0, ...providers.map((provider) => provider.rollup.totalTokens || 0));
@@ -1016,7 +1040,7 @@ function ProviderRankingCard({
   );
 }
 
-function ModelStatsTable({ models, loading }: { models: ModelUsageStats[]; loading: boolean }) {
+function ModelRankingGrid({ models, loading }: { models: ModelUsageStats[]; loading: boolean }) {
   const { tx } = useI18n();
   if (loading) return <LoadingBlock label="Loading model stats" />;
   const maxTokens = Math.max(0, ...models.map((model) => model.rollup.totalTokens || 0));
@@ -1234,7 +1258,7 @@ function PricingCard({
   );
 }
 
-function ProviderLimitsTable({ limits, loading }: { limits: ProviderLimitStatus[]; loading: boolean }) {
+function ProviderLimitsGrid({ limits, loading }: { limits: ProviderLimitStatus[]; loading: boolean }) {
   const { tx } = useI18n();
   if (loading) return <LoadingBlock label="Loading provider limits" />;
   return (
@@ -1639,7 +1663,7 @@ function filterProviderLimits(limits: ProviderLimitStatus[], draft: UsageFilterD
 
 function defaultFilterDraft(): UsageFilterDraft {
   return {
-    range: "24h",
+    range: "1d",
     customFrom: "",
     customTo: "",
     app: "all",
@@ -1681,7 +1705,12 @@ function rangeBounds(draft: UsageFilterDraft): Pick<UsageStatsFilter, "fromMs" |
       toMs: dateInputToMs(draft.customTo),
     };
   }
-  const days = draft.range === "24h" ? 1 : draft.range === "7d" ? 7 : 30;
+  if (draft.range === "today") {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    return { fromMs: start.getTime(), toMs: now };
+  }
+  const days = draft.range === "1d" ? 1 : draft.range === "7d" ? 7 : draft.range === "14d" ? 14 : 30;
   return { fromMs: now - days * 24 * 60 * 60 * 1000, toMs: now };
 }
 
@@ -1791,7 +1820,9 @@ function dataSourceLabel(dataSource: string): string {
 }
 
 function rangeLabel(draft: UsageFilterDraft): string {
-  if (draft.range !== "custom") return draft.range;
+  if (draft.range !== "custom") {
+    return rangeOptions.find((option) => option.id === draft.range)?.label || draft.range;
+  }
   return `${draft.customFrom || "start"} -> ${draft.customTo || "now"}`;
 }
 

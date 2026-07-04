@@ -2,7 +2,6 @@ import {
   CheckCircle2,
   ExternalLink,
   FileJson,
-  KeyRound,
   Loader2,
   LogIn,
   Play,
@@ -210,12 +209,8 @@ export function AccountsDashboard({ embedded = false }: { embedded?: boolean } =
     <div className={embedded ? "accounts-dashboard embedded" : "accounts-dashboard"}>
       {!embedded && (
         <div className="provider-toolbar">
-          <div className="section-title-row">
-            <KeyRound size={18} />
-            <div>
-              <h2>{t("server.accounts.title")}</h2>
-              <span>{t("server.accounts.importedCredentials", { count: data.accounts.length })}</span>
-            </div>
+          <div className="provider-toolbar-status">
+            <span>{t("server.accounts.importedCredentials", { count: data.accounts.length })}</span>
           </div>
           <div className="provider-toolbar-actions">
             {error && <span className="error-text">{error}</span>}

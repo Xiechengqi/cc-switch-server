@@ -329,12 +329,8 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   return (
     <div className="settings-dashboard" ref={dashboardRef}>
       <div className="provider-toolbar">
-        <div className="section-title-row">
-          <ShieldCheck size={18} />
-          <div>
-            <h2>{t("server.settings.title")}</h2>
-            <span>{data?.config.ownerEmail || t("server.settings.runtimeSubtitle")}</span>
-          </div>
+        <div className="provider-toolbar-status">
+          <span>{data?.config.ownerEmail || t("server.settings.runtimeSubtitle")}</span>
         </div>
         <div className="provider-toolbar-actions">
           {error && <span className="error-text">{error}</span>}
@@ -563,7 +559,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
               </label>
               <FormFooter busy={busy === "backup-create"} label={t("server.settings.createBackup")} />
             </form>
-            <BackupTable backups={data?.backups || []} busy={busy} onRestore={setRestoreConfirm} />
+            <BackupSnapshotGrid backups={data?.backups || []} busy={busy} onRestore={setRestoreConfirm} />
           </section>
               </div>
             )}
@@ -1284,7 +1280,7 @@ function TunnelStatus({ status }: { status?: TunnelRuntimeStatus | null }) {
   );
 }
 
-function BackupTable({
+function BackupSnapshotGrid({
   backups,
   busy,
   onRestore,

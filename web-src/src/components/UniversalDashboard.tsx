@@ -258,12 +258,8 @@ export function UniversalDashboard() {
   return (
     <div className="universal-dashboard">
       <div className="provider-toolbar">
-        <div className="section-title-row">
-          <Boxes size={18} />
-          <div>
-            <h2>{t("server.universal.title")}</h2>
-            <span>{t("server.universal.templates", { count: list.length })}</span>
-          </div>
+        <div className="provider-toolbar-status">
+          <span>{t("server.universal.templates", { count: list.length })}</span>
         </div>
         <div className="provider-toolbar-actions">
           {error && <span className="error-text">{error}</span>}

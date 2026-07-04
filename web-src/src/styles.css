@@ -487,6 +487,23 @@ tbody tr:last-child td {
   gap: 14px;
 }
 
+.provider-toolbar-status {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: hsl(var(--muted));
+  font-size: 0.78rem;
+}
+
+.provider-toolbar-status span {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .provider-toolbar-actions,
 .provider-actions {
   flex-wrap: wrap;
@@ -2789,14 +2806,6 @@ tbody tr:last-child td {
   box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
 }
 
-.share-request-log-table table {
-  min-width: 920px;
-}
-
-.share-request-log-table td {
-  max-width: 180px;
-}
-
 .share-request-log-list {
   display: grid;
   min-width: 0;
@@ -3173,10 +3182,6 @@ tbody tr:last-child td {
   padding: 24px;
 }
 
-.universal-summary-row {
-  grid-template-columns: repeat(4, minmax(130px, 1fr));
-}
-
 .universal-card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -3483,6 +3488,7 @@ tbody tr:last-child td {
 }
 
 .usage-filter-primary,
+.usage-range-picker,
 .usage-custom-range,
 .usage-advanced-grid {
   display: grid;
@@ -3495,8 +3501,47 @@ tbody tr:last-child td {
   align-items: center;
 }
 
+.usage-range-picker {
+  align-self: stretch;
+}
+
+.usage-range-presets {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 3px;
+}
+
+.usage-range-presets button {
+  min-width: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted));
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 700;
+  line-height: 1;
+  padding: 8px 6px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.usage-range-presets button.active {
+  background: hsl(var(--panel));
+  box-shadow: 0 1px 2px hsl(220 20% 20% / 0.08);
+  color: hsl(var(--foreground));
+}
+
 .usage-custom-range {
-  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  grid-template-columns: repeat(2, minmax(180px, 1fr)) minmax(120px, 0.6fr);
+  align-items: end;
 }
 
 .usage-app-segment {
@@ -3504,13 +3549,31 @@ tbody tr:last-child td {
   min-width: 0;
 }
 
-.usage-range-segment {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  min-width: 0;
-}
-
 .usage-filter-panel .segmented {
   width: 100%;
+}
+
+.usage-live-toggle {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--subtle));
+  min-height: 38px;
+  padding: 8px 10px;
+}
+
+.usage-live-toggle input {
+  width: auto;
+  margin: 0;
+}
+
+.usage-live-toggle span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .usage-advanced-filters {
@@ -5003,6 +5066,7 @@ tbody tr:last-child td {
   .account-tool-form,
   .usage-filter-panel,
   .usage-filter-primary,
+  .usage-range-picker,
   .usage-custom-range,
   .usage-advanced-grid,
   .settings-layout,
@@ -5034,6 +5098,10 @@ tbody tr:last-child td {
   .universal-app-config-grid,
   .universal-form-modal .provider-form-grid {
     grid-template-columns: 1fr;
+  }
+
+  .usage-range-presets {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .usage-log-card header,
@@ -5098,7 +5166,6 @@ tbody tr:last-child td {
     grid-template-columns: 1fr;
   }
 
-  .universal-summary-row,
   .universal-card-grid,
   .universal-json-grid {
     grid-template-columns: 1fr;

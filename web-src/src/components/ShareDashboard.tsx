@@ -300,12 +300,8 @@ export function ShareDashboard() {
   return (
     <div className="share-dashboard">
       <div className="provider-toolbar">
-        <div className="section-title-row">
-          <Share2 size={18} />
-          <div>
-            <h2>{t("server.shares.title")}</h2>
-            <span>{t("server.shares.routes", { count: data.shares.length })}</span>
-          </div>
+        <div className="provider-toolbar-status">
+          <span>{t("server.shares.routes", { count: data.shares.length })}</span>
         </div>
         <div className="provider-toolbar-actions">
           {error && <span className="error-text">{error}</span>}
