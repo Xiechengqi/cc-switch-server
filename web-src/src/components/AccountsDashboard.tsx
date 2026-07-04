@@ -636,7 +636,7 @@ function AccountQuotaFooter({
         <span>{capability?.supportsQuota ? tx("quota ready") : tx("quota gated")}</span>
         <span>{quotaPercent == null ? tx("quota -") : `${quotaPercent.toFixed(1)}%`}</span>
         <span>{account.subscriptionLevel || tx("account")}</span>
-        <span>{formatTime(account.quotaRefreshedAt)}</span>
+        <span>{quotaRefreshedLabel(account.quotaRefreshedAt, tx)}</span>
       </div>
       {quotaPercent != null && (
         <div className="account-quota-meter" aria-label={tx("quota")}>
@@ -649,7 +649,7 @@ function AccountQuotaFooter({
             <div className="account-quota-tier" key={tier.name}>
               <div>
                 <strong>{tier.name}</strong>
-                <span>{accountTierLine(tier)}</span>
+                <span>{accountTierLine(tier, tx)}</span>
               </div>
               <div className="account-quota-tier-meter">
                 <span style={{ width: `${clampPercent(tier.utilization ?? 0)}%` }} />
@@ -661,7 +661,9 @@ function AccountQuotaFooter({
       {account.quotaNextRefreshAt != null && (
         <div className="account-quota-note">
           <span>{tx("next refresh")}</span>
-          <strong>{formatTime(account.quotaNextRefreshAt)}</strong>
+          <strong title={formatTime(account.quotaNextRefreshAt)}>
+            {quotaCountdownLabel(account.quotaNextRefreshAt, tx)}
+          </strong>
         </div>
       )}
       {account.lastRefreshError && <strong className="account-quota-error">{account.lastRefreshError}</strong>}
@@ -1588,15 +1590,72 @@ function accountQuotaPercent(account: AccountRecord): number | null {
   return utilization == null ? null : utilization;
 }
 
-function accountTierLine(tier: AccountQuotaTier): string {
+function accountTierLine(
+  tier: AccountQuotaTier,
+  tx: (key: string, vars?: Record<string, string | number | boolean | null | undefined>) => string,
+): string {
   const usage = tier.used != null && tier.limit != null
     ? `${formatCompactNumber(tier.used)}/${formatCompactNumber(tier.limit)}`
     : tier.utilization == null
       ? "-"
       : `${tier.utilization.toFixed(1)}%`;
   const unit = tier.unit ? ` ${tier.unit}` : "";
-  const reset = tier.resetsAt == null ? "" : ` · ${formatTime(tier.resetsAt)}`;
+  const reset = tier.resetsAt == null ? "" : ` · ${resetCountdownLabel(tier.resetsAt, tx)}`;
   return `${usage}${unit}${reset}`;
+}
+
+function quotaRefreshedLabel(
+  value: number | null | undefined,
+  tx: (key: string, vars?: Record<string, string | number | boolean | null | undefined>) => string,
+): string {
+  if (value == null) return tx("not refreshed");
+  return tx("refreshed {{time}}", { time: formatRelativePast(value, tx) });
+}
+
+function quotaCountdownLabel(
+  value: number,
+  tx: (key: string, vars?: Record<string, string | number | boolean | null | undefined>) => string,
+): string {
+  const countdown = formatCountdown(value);
+  return countdown ? tx("in {{time}}", { time: countdown }) : formatTime(value);
+}
+
+function resetCountdownLabel(
+  value: number,
+  tx: (key: string, vars?: Record<string, string | number | boolean | null | undefined>) => string,
+): string {
+  const countdown = formatCountdown(value);
+  return countdown ? tx("resets in {{time}}", { time: countdown }) : formatTime(value);
+}
+
+function formatRelativePast(
+  value: number,
+  tx: (key: string, vars?: Record<string, string | number | boolean | null | undefined>) => string,
+): string {
+  const millis = normalizeTimestamp(value);
+  if (millis == null) return "-";
+  const diff = Date.now() - millis;
+  if (!Number.isFinite(diff) || diff < 0) return formatTime(millis);
+  if (diff < 60_000) return tx("just now");
+  if (diff < 3_600_000) return tx("{{count}}m ago", { count: Math.max(1, Math.round(diff / 60_000)) });
+  if (diff < 86_400_000) return tx("{{count}}h ago", { count: Math.max(1, Math.round(diff / 3_600_000)) });
+  if (diff < 604_800_000) return tx("{{count}}d ago", { count: Math.max(1, Math.round(diff / 86_400_000)) });
+  return formatTime(millis);
+}
+
+function formatCountdown(value: number): string | null {
+  const millis = normalizeTimestamp(value);
+  if (millis == null) return null;
+  const diff = millis - Date.now();
+  if (!Number.isFinite(diff) || diff <= 0) return null;
+  const minutes = Math.max(1, Math.floor(diff / 60_000));
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours < 24) return remainingMinutes ? `${hours}h${remainingMinutes}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  return remainingHours ? `${days}d${remainingHours}h` : `${days}d`;
 }
 
 function clampPercent(value: number): number {

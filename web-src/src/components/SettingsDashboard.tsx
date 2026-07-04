@@ -25,7 +25,7 @@ import {
   Sun,
   Upload,
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   BackupManifest,
@@ -137,10 +137,17 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   const [result, setResult] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const [restoreConfirm, setRestoreConfirm] = useState<BackupManifest | null>(null);
+  const dashboardRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setActiveTab(initialTab);
   }, [initialTab]);
+
+  useLayoutEffect(() => {
+    if (dashboardRef.current) {
+      dashboardRef.current.scrollTop = 0;
+    }
+  }, [activeTab]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -274,7 +281,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   }
 
   return (
-    <div className="settings-dashboard">
+    <div className="settings-dashboard" ref={dashboardRef}>
       <div className="provider-toolbar">
         <div className="section-title-row">
           <ShieldCheck size={18} />

@@ -111,6 +111,7 @@ export function UniversalDashboard() {
   const [presetOpen, setPresetOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [exportText, setExportText] = useState<string | null>(null);
+  const [providerQuery, setProviderQuery] = useState("");
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -123,6 +124,10 @@ export function UniversalDashboard() {
         return sort || left.name.localeCompare(right.name) || left.id.localeCompare(right.id);
       }),
     [providers],
+  );
+  const visibleProviders = useMemo(
+    () => filterUniversalProviders(list, providerQuery),
+    [list, providerQuery],
   );
 
   const refresh = useCallback(async () => {
@@ -278,29 +283,43 @@ export function UniversalDashboard() {
         </div>
       </div>
 
+      <UniversalListToolbar
+        query={providerQuery}
+        visible={visibleProviders.length}
+        total={list.length}
+        onQueryChange={setProviderQuery}
+      />
+
       {loading ? (
         <div className="provider-empty">
           <Loader2 size={22} />
           <span>{t("server.universal.loading")}</span>
         </div>
       ) : list.length ? (
-        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleUniversalDragEnd(event)}>
-          <SortableContext items={list.map((provider) => provider.id)} strategy={rectSortingStrategy}>
-            <div className="universal-card-grid">
-              {list.map((provider) => (
-                <SortableUniversalCard
-                  key={provider.id}
-                  provider={provider}
-                  busy={busy}
-                  onEdit={() => setDraft(draftFromProvider(provider))}
-                  onSync={() => void syncProvider(provider)}
-                  onDuplicate={() => void duplicateProvider(provider)}
-                  onDelete={() => void deleteProvider(provider)}
-                />
-              ))}
-            </div>
-          </SortableContext>
-        </DndContext>
+        visibleProviders.length ? (
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleUniversalDragEnd(event)}>
+            <SortableContext items={list.map((provider) => provider.id)} strategy={rectSortingStrategy}>
+              <div className="universal-card-grid">
+                {visibleProviders.map((provider) => (
+                  <SortableUniversalCard
+                    key={provider.id}
+                    provider={provider}
+                    busy={busy}
+                    onEdit={() => setDraft(draftFromProvider(provider))}
+                    onSync={() => void syncProvider(provider)}
+                    onDuplicate={() => void duplicateProvider(provider)}
+                    onDelete={() => void deleteProvider(provider)}
+                  />
+                ))}
+              </div>
+            </SortableContext>
+          </DndContext>
+        ) : (
+          <div className="provider-empty compact-empty">
+            <Search size={20} />
+            <span>{tx("No universal providers match the current search")}</span>
+          </div>
+        )
       ) : (
         <div className="provider-empty">
           <Boxes size={24} />
@@ -388,6 +407,69 @@ function SortableUniversalCard(props: UniversalCardProps) {
 type DragHandleProps = HTMLAttributes<HTMLButtonElement> & {
   ref?: (node: HTMLButtonElement | null) => void;
 };
+
+function UniversalListToolbar({
+  query,
+  visible,
+  total,
+  onQueryChange,
+}: {
+  query: string;
+  visible: number;
+  total: number;
+  onQueryChange: (value: string) => void;
+}) {
+  const { tx } = useI18n();
+  return (
+    <section className="provider-list-toolbar universal-list-toolbar">
+      <label className="provider-list-search">
+        <Search size={15} />
+        <input
+          value={query}
+          onChange={(event) => onQueryChange(event.target.value)}
+          placeholder={tx("Search universal providers")}
+        />
+      </label>
+      <span className="provider-list-count">
+        {tx("{{visible}}/{{total}} providers", { visible, total })}
+      </span>
+    </section>
+  );
+}
+
+function filterUniversalProviders(providers: UniversalProvider[], query: string): UniversalProvider[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) return providers;
+  return providers.filter((provider) => {
+    const modelValues = universalApps.flatMap((app) => {
+      const model = provider.models?.[app];
+      if (!model) return [];
+      const record = model as Record<string, unknown>;
+      return [
+        record.model,
+        record.haikuModel,
+        record.sonnetModel,
+        record.opusModel,
+        record.reasoningEffort,
+      ];
+    });
+    return [
+      provider.id,
+      provider.name,
+      provider.providerType,
+      provider.baseUrl,
+      provider.websiteUrl,
+      provider.notes,
+      provider.icon,
+      ...enabledUniversalApps(provider),
+      ...modelValues,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+      .includes(normalizedQuery);
+  });
+}
 
 interface UniversalCardProps {
   provider: UniversalProvider;

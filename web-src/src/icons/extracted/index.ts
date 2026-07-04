@@ -38,6 +38,26 @@ import huawei from "./huawei.svg?raw";
 import newapi from "./newapi.svg?raw";
 import subrouter from "./subrouter.svg?raw";
 import bytedance from "./bytedance.svg?raw";
+import chatglm from "./chatglm.svg?raw";
+import gemma from "./gemma.svg?raw";
+import modelscopeColor from "./modelscope-color.svg?raw";
+import wenxin from "./wenxin.svg?raw";
+import yi from "./yi.svg?raw";
+import zeroone from "./zeroone.svg?raw";
+import palm from "./palm.svg?raw";
+import stability from "./stability.svg?raw";
+import midjourney from "./midjourney.svg?raw";
+import vercel from "./vercel.svg?raw";
+import ucloud from "./ucloud.svg?raw";
+import notion from "./notion.svg?raw";
+import opencodeLogoLight from "./opencode-logo-light.svg?raw";
+import aihubmixColor from "./aihubmix-color.svg?raw";
+import aicoding from "./aicoding.svg?raw";
+import algocode from "./algocode.svg?raw";
+import catcoder from "./catcoder.svg?raw";
+import claw from "./claw.svg?raw";
+import cubence from "./cubence.svg?raw";
+import longcatColor from "./longcat-color.svg?raw";
 import cursorUrl from "./cursor.png";
 import kiroUrl from "./kiro.png";
 
@@ -84,6 +104,26 @@ export const icons: Record<string, string> = {
   newapi,
   subrouter,
   bytedance,
+  chatglm,
+  gemma,
+  "modelscope-color": modelscopeColor,
+  wenxin,
+  yi,
+  zeroone,
+  palm,
+  stability,
+  midjourney,
+  vercel,
+  ucloud,
+  notion,
+  "opencode-logo-light": opencodeLogoLight,
+  "aihubmix-color": aihubmixColor,
+  aicoding,
+  algocode,
+  catcoder,
+  claw,
+  cubence,
+  "longcat-color": longcatColor,
 };
 
 export const iconUrls: Record<string, string> = {

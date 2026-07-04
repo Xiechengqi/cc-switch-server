@@ -41,8 +41,15 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { JsonPreview } from "@/components/JsonPreview";
 import { ProviderIcon } from "@/components/ProviderIcon";
 
-type UsageTab = "logs" | "providers" | "models" | "pricing" | "limits";
+export type UsageTab = "logs" | "providers" | "models" | "pricing" | "limits";
 type RangePreset = "24h" | "7d" | "30d" | "all" | "custom";
+
+export interface UsageInitialFocus {
+  app: AppKind;
+  providerId: string;
+  tab: UsageTab;
+  key: number;
+}
 
 interface UsageDashboardState {
   summary: UsageRollup;
@@ -132,7 +139,7 @@ const emptyState: UsageDashboardState = {
   limits: [],
 };
 
-export function UsageDashboard() {
+export function UsageDashboard({ initialFocus }: { initialFocus?: UsageInitialFocus | null }) {
   const { t, tx } = useI18n();
   const [filterDraft, setFilterDraft] = useState<UsageFilterDraft>(defaultFilterDraft());
   const [data, setData] = useState<UsageDashboardState>(emptyState);
@@ -148,6 +155,10 @@ export function UsageDashboard() {
 
   const filter = useMemo(() => filterFromDraft(filterDraft), [filterDraft]);
   const dataSources = useMemo(() => dataSourceBreakdown(data.sourceLogs), [data.sourceLogs]);
+  const visibleLimits = useMemo(
+    () => filterProviderLimits(data.limits, filterDraft),
+    [data.limits, filterDraft],
+  );
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -164,6 +175,19 @@ export function UsageDashboard() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (!initialFocus?.providerId) return;
+    setFilterDraft((draft) => ({
+      ...draft,
+      app: initialFocus.app,
+      providerId: initialFocus.providerId,
+      shareId: "",
+      userEmail: "",
+      sessionId: "",
+    }));
+    setActiveTab(initialFocus.tab);
+  }, [initialFocus?.app, initialFocus?.key, initialFocus?.providerId, initialFocus?.tab]);
 
   async function runBackfill() {
     setBusy("backfill");
@@ -335,7 +359,7 @@ export function UsageDashboard() {
           onDelete={setPricingDeleteId}
         />
       )}
-      {activeTab === "limits" && <ProviderLimitsTable limits={data.limits} loading={loading} />}
+      {activeTab === "limits" && <ProviderLimitsTable limits={visibleLimits} loading={loading} />}
 
       {detailId && <RequestDetailModal requestId={detailId} onClose={() => setDetailId(null)} />}
 
@@ -386,37 +410,52 @@ function UsageFilterBar({
   onChange: (draft: UsageFilterDraft) => void;
 }) {
   const { tx } = useI18n();
+  const advancedCount = usageAdvancedFilterCount(draft);
   function patch(next: Partial<UsageFilterDraft>) {
     onChange({ ...draft, ...next });
   }
+  function clearAdvanced() {
+    patch({
+      providerId: "",
+      shareId: "",
+      userEmail: "",
+      sessionId: "",
+      dataSource: "",
+      health: "all",
+      streamStatus: "",
+      limit: "100",
+    });
+  }
   return (
     <section className="usage-filter-panel">
-      <div className="segmented usage-app-segment">
-        {apps.map((app) => (
-          <button
-            key={app.id}
-            className={draft.app === app.id ? "active" : ""}
-            type="button"
-            onClick={() => patch({ app: app.id })}
-          >
-            {tx(app.label)}
-          </button>
-        ))}
-      </div>
-      <div className="segmented usage-range-segment">
-        {rangeOptions.map((range) => (
-          <button
-            key={range.id}
-            className={draft.range === range.id ? "active" : ""}
-            type="button"
-            onClick={() => patch({ range: range.id })}
-          >
-            {tx(range.label)}
-          </button>
-        ))}
+      <div className="usage-filter-primary">
+        <div className="segmented usage-app-segment">
+          {apps.map((app) => (
+            <button
+              key={app.id}
+              className={draft.app === app.id ? "active" : ""}
+              type="button"
+              onClick={() => patch({ app: app.id })}
+            >
+              {tx(app.label)}
+            </button>
+          ))}
+        </div>
+        <div className="segmented usage-range-segment">
+          {rangeOptions.map((range) => (
+            <button
+              key={range.id}
+              className={draft.range === range.id ? "active" : ""}
+              type="button"
+              onClick={() => patch({ range: range.id })}
+            >
+              {tx(range.label)}
+            </button>
+          ))}
+        </div>
       </div>
       {draft.range === "custom" && (
-        <>
+        <div className="usage-custom-range">
           <label>
             <span>{tx("From")}</span>
             <input
@@ -433,51 +472,75 @@ function UsageFilterBar({
               onChange={(event) => patch({ customTo: event.target.value })}
             />
           </label>
-        </>
+        </div>
       )}
-      <label>
-        <span>{tx("Provider ID")}</span>
-        <input value={draft.providerId} onChange={(event) => patch({ providerId: event.target.value })} />
-      </label>
-      <label>
-        <span>{tx("Share ID")}</span>
-        <input value={draft.shareId} onChange={(event) => patch({ shareId: event.target.value })} />
-      </label>
-      <label>
-        <span>{tx("User email")}</span>
-        <input value={draft.userEmail} onChange={(event) => patch({ userEmail: event.target.value })} />
-      </label>
-      <label>
-        <span>{tx("Session ID")}</span>
-        <input value={draft.sessionId} onChange={(event) => patch({ sessionId: event.target.value })} />
-      </label>
-      <label>
-        <span>{tx("Data source")}</span>
-        <input value={draft.dataSource} onChange={(event) => patch({ dataSource: event.target.value })} />
-      </label>
-      <label>
-        <span>{tx("Health check")}</span>
-        <select value={draft.health} onChange={(event) => patch({ health: event.target.value as UsageFilterDraft["health"] })}>
-          <option value="all">{tx("all")}</option>
-          <option value="true">{tx("yes")}</option>
-          <option value="false">{tx("no")}</option>
-        </select>
-      </label>
-      <label>
-        <span>{tx("Stream status")}</span>
-        <select value={draft.streamStatus} onChange={(event) => patch({ streamStatus: event.target.value })}>
-          <option value="">{tx("all")}</option>
-          <option value="completed">{tx("completed")}</option>
-          <option value="interrupted">{tx("interrupted")}</option>
-          <option value="failed">{tx("failed")}</option>
-        </select>
-      </label>
-      <label>
-        <span>{tx("Limit")}</span>
-        <input value={draft.limit} onChange={(event) => patch({ limit: event.target.value })} />
-      </label>
+      <details className="usage-advanced-filters" open={advancedCount > 0 || undefined}>
+        <summary>
+          <span>{tx("Advanced filters")}</span>
+          <small>{tx("{{count}} active", { count: advancedCount })}</small>
+        </summary>
+        <div className="usage-advanced-grid">
+          <label>
+            <span>{tx("Provider ID")}</span>
+            <input value={draft.providerId} onChange={(event) => patch({ providerId: event.target.value })} />
+          </label>
+          <label>
+            <span>{tx("Share ID")}</span>
+            <input value={draft.shareId} onChange={(event) => patch({ shareId: event.target.value })} />
+          </label>
+          <label>
+            <span>{tx("User email")}</span>
+            <input value={draft.userEmail} onChange={(event) => patch({ userEmail: event.target.value })} />
+          </label>
+          <label>
+            <span>{tx("Session ID")}</span>
+            <input value={draft.sessionId} onChange={(event) => patch({ sessionId: event.target.value })} />
+          </label>
+          <label>
+            <span>{tx("Data source")}</span>
+            <input value={draft.dataSource} onChange={(event) => patch({ dataSource: event.target.value })} />
+          </label>
+          <label>
+            <span>{tx("Health check")}</span>
+            <select value={draft.health} onChange={(event) => patch({ health: event.target.value as UsageFilterDraft["health"] })}>
+              <option value="all">{tx("all")}</option>
+              <option value="true">{tx("yes")}</option>
+              <option value="false">{tx("no")}</option>
+            </select>
+          </label>
+          <label>
+            <span>{tx("Stream status")}</span>
+            <select value={draft.streamStatus} onChange={(event) => patch({ streamStatus: event.target.value })}>
+              <option value="">{tx("all")}</option>
+              <option value="completed">{tx("completed")}</option>
+              <option value="interrupted">{tx("interrupted")}</option>
+              <option value="failed">{tx("failed")}</option>
+            </select>
+          </label>
+          <label>
+            <span>{tx("Limit")}</span>
+            <input value={draft.limit} onChange={(event) => patch({ limit: event.target.value })} />
+          </label>
+        </div>
+        <button className="secondary-button compact" type="button" onClick={clearAdvanced} disabled={advancedCount === 0}>
+          {tx("Clear advanced filters")}
+        </button>
+      </details>
     </section>
   );
+}
+
+function usageAdvancedFilterCount(draft: UsageFilterDraft): number {
+  return [
+    draft.providerId.trim(),
+    draft.shareId.trim(),
+    draft.userEmail.trim(),
+    draft.sessionId.trim(),
+    draft.dataSource.trim(),
+    draft.health !== "all" ? draft.health : "",
+    draft.streamStatus.trim(),
+    draft.limit.trim() && draft.limit.trim() !== "100" ? draft.limit.trim() : "",
+  ].filter(Boolean).length;
 }
 
 function DataSourceBar({
@@ -1501,6 +1564,28 @@ function EmptyRow({ columns, label }: { columns: number; label: string }) {
       </td>
     </tr>
   );
+}
+
+function filterProviderLimits(limits: ProviderLimitStatus[], draft: UsageFilterDraft): ProviderLimitStatus[] {
+  const app = draft.app === "all" ? "" : draft.app;
+  const providerId = draft.providerId.trim().toLowerCase();
+  if (!app && !providerId) return limits;
+  return limits.filter((limit) => {
+    if (app && limit.app !== app) return false;
+    if (!providerId) return true;
+    return [
+      limit.providerId,
+      limit.providerName,
+      limit.providerType,
+      limit.accountId,
+      limit.accountEmail,
+      ...limit.shares.map((share) => `${share.shareId} ${share.shareName} ${share.status}`),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+      .includes(providerId);
+  });
 }
 
 function defaultFilterDraft(): UsageFilterDraft {

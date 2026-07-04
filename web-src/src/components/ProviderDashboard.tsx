@@ -17,6 +17,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import {
   ArrowUpAZ,
+  BarChart3,
   Boxes,
   CheckCircle2,
   Copy,
@@ -116,10 +117,12 @@ export function ProviderDashboard({
   activeApp: controlledActiveApp,
   onActiveAppChange,
   onOpenImportExport,
+  onOpenUsage,
 }: {
   activeApp?: AppKind;
   onActiveAppChange?: (app: AppKind) => void;
   onOpenImportExport?: () => void;
+  onOpenUsage?: (target: { app: AppKind; providerId: string; tab: "logs" | "limits" }) => void;
 }) {
   const { t, tx } = useI18n();
   const [localActiveApp, setLocalActiveApp] = useState<AppKind>("claude");
@@ -445,6 +448,18 @@ export function ProviderDashboard({
                       busyId={busyId}
                       onEdit={() => openEdit(provider)}
                       onAction={(action) => void runAction(provider, action)}
+                      onOpenUsage={
+                        onOpenUsage
+                          ? () =>
+                              onOpenUsage({
+                                app: provider.app,
+                                providerId: provider.provider.id,
+                                tab: limitByProviderKey.has(providerKey(provider.app, provider.provider.id))
+                                  ? "limits"
+                                  : "logs",
+                              })
+                          : undefined
+                      }
                     />
                   );
                 })}
@@ -617,6 +632,10 @@ function SortableProviderCard(props: ProviderCardProps) {
 type DragHandleProps = HTMLAttributes<HTMLButtonElement> & {
   ref?: (node: HTMLButtonElement | null) => void;
 };
+type TranslateFn = (
+  key: string,
+  vars?: Record<string, string | number | boolean | null | undefined>,
+) => string;
 
 interface ProviderCardProps {
   provider: StoredProvider;
@@ -631,6 +650,7 @@ interface ProviderCardProps {
   busyId: string | null;
   onEdit: () => void;
   onAction: (action: "test" | "network" | "stream" | "models" | "switch" | "duplicate" | "delete") => void;
+  onOpenUsage?: () => void;
 }
 
 function ProviderCard({
@@ -646,6 +666,7 @@ function ProviderCard({
   busyId,
   onEdit,
   onAction,
+  onOpenUsage,
   dragHandleProps,
   nodeRef,
   style,
@@ -666,6 +687,7 @@ function ProviderCard({
     ? accountSummary(account)
     : accountId || tx("direct config");
   const busyPrefix = `${provider.app}:${provider.provider.id}:`;
+  const healthSummary = providerHealthSummary(health, tx);
   return (
     <>
     <article
@@ -707,8 +729,20 @@ function ProviderCard({
           </div>
         </div>
         <div className="provider-card-right">
-          <ProviderHealthIndicator health={health} />
-          <span>{tx("{{count}} recent requests", { count: health?.requests ?? 0 })}</span>
+          <div className="provider-health-stack">
+            <ProviderHealthIndicator health={health} />
+            <span>{healthSummary}</span>
+          </div>
+          <button
+            className="icon-button provider-card-refresh"
+            type="button"
+            onClick={() => onAction("test")}
+            disabled={busyId === `${busyPrefix}test`}
+            aria-label={tx("Refresh provider health")}
+            title={tx("Refresh provider health")}
+          >
+            {busyId === `${busyPrefix}test` ? <Loader2 size={14} /> : <RefreshCw size={14} />}
+          </button>
         </div>
       </header>
       {baseUrl && (
@@ -768,6 +802,11 @@ function ProviderCard({
         >
           <ServerCog size={15} />
         </IconAction>
+        {onOpenUsage && (
+          <IconAction title="Usage and limits" onClick={onOpenUsage}>
+            <BarChart3 size={15} />
+          </IconAction>
+        )}
         <button className="secondary-button compact" type="button" onClick={() => onAction("switch")}>
           {tx(current ? "current" : "switch")}
         </button>
@@ -809,6 +848,40 @@ function ProviderHealthIndicator({ health }: { health?: ProviderHealth }) {
       </span>
     </div>
   );
+}
+
+function providerHealthSummary(
+  health: ProviderHealth | undefined,
+  tx: TranslateFn,
+): string {
+  const requests = health?.requests ?? 0;
+  if (!health?.lastRequestAtMs) {
+    return tx("{{count}} recent requests", { count: requests });
+  }
+  return tx("{{time}} · {{count}} requests", {
+    time: relativeRequestTime(health.lastRequestAtMs, tx),
+    count: requests,
+  });
+}
+
+function relativeRequestTime(
+  value: number,
+  tx: TranslateFn,
+): string {
+  const millis = value < 10_000_000_000 ? value * 1000 : value;
+  const diff = Date.now() - millis;
+  if (!Number.isFinite(diff) || diff < 0) return formatRequestTime(millis);
+  if (diff < 60_000) return tx("just now");
+  if (diff < 3_600_000) return tx("{{count}}m ago", { count: Math.max(1, Math.round(diff / 60_000)) });
+  if (diff < 86_400_000) return tx("{{count}}h ago", { count: Math.max(1, Math.round(diff / 3_600_000)) });
+  if (diff < 604_800_000) return tx("{{count}}d ago", { count: Math.max(1, Math.round(diff / 86_400_000)) });
+  return formatRequestTime(millis);
+}
+
+function formatRequestTime(millis: number): string {
+  const date = new Date(millis);
+  if (Number.isNaN(date.getTime())) return "-";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
 }
 
 function providerHealthStatus(health?: ProviderHealth): "operational" | "degraded" | "failed" {
@@ -1091,15 +1164,44 @@ function ProviderAuthSection({
           </label>
           <label>
             <span>{tx("API format")}</span>
-            <input
+            <select
               value={draft.apiFormat}
               onChange={(event) => onPatch({ apiFormat: event.target.value })}
-            />
+            >
+              {apiFormatOptions(draft.app, draft.apiFormat, entry.defaults.apiFormat).map((option) => (
+                <option key={option} value={option}>
+                  {apiFormatLabel(option)}
+                </option>
+              ))}
+            </select>
           </label>
         </article>
       </div>
     </section>
   );
+}
+
+function apiFormatOptions(app: AppKind, current: string, fallback: string): string[] {
+  const base: Record<AppKind, string[]> = {
+    claude: ["anthropic", "openai_chat", "openai_responses", "gemini_native"],
+    codex: ["openai_responses", "openai_chat"],
+    gemini: ["gemini_native", "openai_chat"],
+  };
+  return uniqueStrings([...base[app], fallback, current].filter(Boolean));
+}
+
+function apiFormatLabel(value: string): string {
+  const labels: Record<string, string> = {
+    anthropic: "Anthropic Messages",
+    openai_chat: "OpenAI Chat Completions",
+    openai_responses: "OpenAI Responses",
+    gemini_native: "Gemini Native",
+  };
+  return labels[value] || value;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
 }
 
 function ProviderCatalogModal({

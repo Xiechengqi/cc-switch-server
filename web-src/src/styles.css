@@ -499,6 +499,23 @@ tbody tr:last-child td {
   gap: 8px;
 }
 
+@media (hover: hover) and (pointer: fine) {
+  .provider-card > .provider-actions,
+  .share-card > .provider-actions {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 160ms ease;
+  }
+
+  .provider-card:hover > .provider-actions,
+  .provider-card:focus-within > .provider-actions,
+  .share-card:hover > .provider-actions,
+  .share-card:focus-within > .provider-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
 .section-title-row {
   gap: 9px;
 }
@@ -711,6 +728,26 @@ tbody tr:last-child td {
   gap: 7px;
   color: hsl(var(--muted));
   font-size: 0.76rem;
+}
+
+.provider-health-stack {
+  display: grid;
+  min-width: 0;
+  justify-items: end;
+  gap: 3px;
+}
+
+.provider-health-stack > span:last-child {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-card-refresh {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
 }
 
 .provider-health-indicator {
@@ -3314,12 +3351,28 @@ tbody tr:last-child td {
 .usage-filter-panel {
   display: grid;
   min-width: 0;
-  grid-template-columns: repeat(4, minmax(160px, 1fr));
   gap: 10px;
   border: 1px solid hsl(var(--border));
   border-radius: 8px;
   background: hsl(var(--panel));
   padding: 12px;
+}
+
+.usage-filter-primary,
+.usage-custom-range,
+.usage-advanced-grid {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
+.usage-filter-primary {
+  grid-template-columns: minmax(260px, 0.9fr) minmax(320px, 1.1fr);
+  align-items: center;
+}
+
+.usage-custom-range {
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
 }
 
 .usage-app-segment {
@@ -3334,6 +3387,37 @@ tbody tr:last-child td {
 
 .usage-filter-panel .segmented {
   width: 100%;
+}
+
+.usage-advanced-filters {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  border-top: 1px solid hsl(var(--border));
+  padding-top: 10px;
+}
+
+.usage-advanced-filters summary {
+  display: flex;
+  min-width: 0;
+  cursor: pointer;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: hsl(var(--foreground));
+  font-size: 0.82rem;
+  font-weight: 750;
+}
+
+.usage-advanced-filters summary small {
+  flex: 0 0 auto;
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.usage-advanced-grid {
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
 }
 
 .usage-data-source-panel {
@@ -4491,6 +4575,9 @@ tbody tr:last-child td {
   .accounts-layout,
   .account-tool-form,
   .usage-filter-panel,
+  .usage-filter-primary,
+  .usage-custom-range,
+  .usage-advanced-grid,
   .settings-layout,
   .settings-form-grid,
   .settings-summary-row,

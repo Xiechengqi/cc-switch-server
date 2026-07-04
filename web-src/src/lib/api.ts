@@ -86,6 +86,7 @@ export interface ProviderHealth {
   successRate?: number | null;
   avgLatencyMs?: number | null;
   lastStatusCode?: number | null;
+  lastRequestAtMs?: number | null;
   healthy: boolean;
   reason?: string | null;
 }

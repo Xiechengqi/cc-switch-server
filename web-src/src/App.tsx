@@ -28,10 +28,11 @@ import { ProviderDashboard } from "@/components/ProviderDashboard";
 import { SettingsDashboard, SettingsTab } from "@/components/SettingsDashboard";
 import { ShareDashboard } from "@/components/ShareDashboard";
 import { UniversalDashboard } from "@/components/UniversalDashboard";
-import { UsageDashboard } from "@/components/UsageDashboard";
+import { UsageDashboard, UsageTab } from "@/components/UsageDashboard";
 import { appIcon } from "@/lib/provider-icons";
 
 type View = "providers" | "shares" | "usage" | "settings" | "universal";
+type UsageFocus = { app: AppKind; providerId: string; tab: UsageTab; key: number };
 
 const appTabs: Array<{ id: AppKind; label: string; iconName: string; iconColor?: string }> = [
   { id: "claude", label: "Claude Code", iconName: appIcon("claude").icon, iconColor: appIcon("claude").color },
@@ -45,6 +46,7 @@ function App() {
   const [view, setView] = useState<View>("providers");
   const [activeApp, setActiveApp] = useState<AppKind>("claude");
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  const [usageFocus, setUsageFocus] = useState<UsageFocus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
@@ -111,18 +113,27 @@ function App() {
             activeApp={activeApp}
             onActiveAppChange={setActiveApp}
             onOpenImportExport={() => openSettings("importExport")}
+            onOpenUsage={(target) => {
+              setUsageFocus({
+                app: target.app,
+                providerId: target.providerId,
+                tab: target.tab,
+                key: Date.now(),
+              });
+              setView("usage");
+            }}
           />
         );
       case "shares":
         return <ShareDashboard />;
       case "usage":
-        return <UsageDashboard />;
+        return <UsageDashboard initialFocus={usageFocus} />;
       case "settings":
         return <SettingsDashboard initialTab={settingsTab} />;
       case "universal":
         return <UniversalDashboard />;
     }
-  }, [activeApp, context, loading, loadData, settingsTab, t, view]);
+  }, [activeApp, context, loading, loadData, settingsTab, t, usageFocus, view]);
 
   const activeViewLabel = viewLabel(view, t);
 
@@ -213,7 +224,10 @@ function App() {
             <button
               className="icon-button desktop-header-icon"
               type="button"
-              onClick={() => setView("usage")}
+              onClick={() => {
+                setUsageFocus(null);
+                setView("usage");
+              }}
               disabled={!isAuthenticated}
               aria-label={t("server.nav.usage")}
               title={t("server.nav.usage")}
