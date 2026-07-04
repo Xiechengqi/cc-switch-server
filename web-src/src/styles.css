@@ -1336,6 +1336,28 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
+.provider-model-field {
+  min-width: 0;
+}
+
+.provider-model-input-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.provider-model-input-row input {
+  min-width: 0;
+  flex: 1;
+}
+
+.provider-model-input-row .icon-only {
+  width: 36px;
+  min-width: 36px;
+  padding-inline: 0;
+}
+
 .provider-advanced-section {
   min-width: 0;
   border: 1px solid hsl(var(--border));

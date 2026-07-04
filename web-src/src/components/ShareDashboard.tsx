@@ -658,6 +658,12 @@ function ShareCard({
   const usage = shareUsage(share);
   const syncText = share.routerLastSyncError || formatTime(share.routerLastSyncedAtMs);
   const market = markets.find((item) => item.email === share.acl?.publicMarketEmail);
+  const shareActive = share.enabled && share.status === "active";
+  const shareCanRestart = share.status === "paused" || share.status === "stopped";
+  const pauseResumeAction = shareActive ? "pause" : "resume";
+  const pauseResumeDisabled = !shareActive && !shareCanRestart;
+  const startTunnelDisabled = shareActive || !shareCanRestart;
+  const stopTunnelDisabled = !shareActive;
   return (
     <>
     <article className="share-card">
@@ -766,13 +772,28 @@ function ShareCard({
         <IconAction title="Connect info" busy={busyId === `${share.id}:connectInfo`} onClick={() => onAction("connectInfo")}>
           <FileJson size={15} />
         </IconAction>
-        <IconAction title={share.status === "paused" ? "Resume" : "Pause"} busy={busyId === `${share.id}:${share.status === "paused" ? "resume" : "pause"}`} onClick={() => onAction(share.status === "paused" ? "resume" : "pause")}>
-          {share.status === "paused" ? <Play size={15} /> : <Pause size={15} />}
+        <IconAction
+          title={shareActive ? "Pause" : "Resume"}
+          busy={busyId === `${share.id}:${pauseResumeAction}`}
+          disabled={pauseResumeDisabled}
+          onClick={() => onAction(pauseResumeAction)}
+        >
+          {shareActive ? <Pause size={15} /> : <Play size={15} />}
         </IconAction>
-        <IconAction title="Start tunnel" busy={busyId === `${share.id}:startTunnel`} onClick={() => onAction("startTunnel")}>
+        <IconAction
+          title="Start tunnel"
+          busy={busyId === `${share.id}:startTunnel`}
+          disabled={startTunnelDisabled}
+          onClick={() => onAction("startTunnel")}
+        >
           <Cable size={15} />
         </IconAction>
-        <IconAction title="Stop tunnel" busy={busyId === `${share.id}:stopTunnel`} onClick={() => onAction("stopTunnel")}>
+        <IconAction
+          title="Stop tunnel"
+          busy={busyId === `${share.id}:stopTunnel`}
+          disabled={stopTunnelDisabled}
+          onClick={() => onAction("stopTunnel")}
+        >
           <SlidersHorizontal size={15} />
         </IconAction>
         <IconAction title="Reset usage" busy={busyId === `${share.id}:resetUsage`} onClick={() => onAction("resetUsage")}>
@@ -1808,12 +1829,14 @@ function IconAction({
   title,
   children,
   busy,
+  disabled,
   danger,
   onClick,
 }: {
   title: string;
   children: ReactNode;
   busy?: boolean;
+  disabled?: boolean;
   danger?: boolean;
   onClick: () => void;
 }) {
@@ -1826,7 +1849,7 @@ function IconAction({
       title={translatedTitle}
       aria-label={translatedTitle}
       onClick={onClick}
-      disabled={busy}
+      disabled={busy || disabled}
     >
       {busy ? <Loader2 size={15} /> : children}
     </button>

@@ -137,7 +137,9 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   const [result, setResult] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const [restoreConfirm, setRestoreConfirm] = useState<BackupManifest | null>(null);
+  const [rotateTokenConfirm, setRotateTokenConfirm] = useState(false);
   const dashboardRef = useRef<HTMLDivElement>(null);
+  const clientTunnelRunning = isClientTunnelRunning(data?.tunnel.runtimeStatus?.status);
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -444,8 +446,20 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
             </form>
             <div className="settings-actions">
               <ActionButton label={t("server.settings.claim")} icon={<CheckCircle2 size={15} />} busy={busy === "tunnel-claim"} onClick={() => void runAction("tunnel-claim", async () => `claim ${JSON.stringify(await claimClientTunnel())}`)} />
-              <ActionButton label={t("server.settings.start")} icon={<Cable size={15} />} busy={busy === "tunnel-start"} onClick={() => void runAction("tunnel-start", async () => (await startClientTunnel()).message)} />
-              <ActionButton label={t("server.settings.stop")} icon={<AlertTriangle size={15} />} busy={busy === "tunnel-stop"} onClick={() => void runAction("tunnel-stop", async () => `stopped ${(await stopClientTunnel()).tunnelStatus || "client tunnel"}`)} />
+              <ActionButton
+                label={t("server.settings.start")}
+                icon={<Cable size={15} />}
+                busy={busy === "tunnel-start"}
+                disabled={clientTunnelRunning}
+                onClick={() => void runAction("tunnel-start", async () => (await startClientTunnel()).message)}
+              />
+              <ActionButton
+                label={t("server.settings.stop")}
+                icon={<AlertTriangle size={15} />}
+                busy={busy === "tunnel-stop"}
+                disabled={!clientTunnelRunning}
+                onClick={() => void runAction("tunnel-stop", async () => `stopped ${(await stopClientTunnel()).tunnelStatus || "client tunnel"}`)}
+              />
             </div>
             <TunnelStatus status={data?.tunnel.runtimeStatus} />
           </section>
@@ -457,7 +471,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
           <section className="settings-card">
             <SectionHeader icon={<KeyRound size={17} />} title={t("server.settings.auth")} subtitle={t("server.settings.authSubtitle")} />
             <div className="settings-actions">
-              <ActionButton label={t("server.settings.rotateApiToken")} icon={<KeyRound size={15} />} busy={busy === "api-token"} onClick={() => void rotateTokenAction()} />
+              <ActionButton label={t("server.settings.rotateApiToken")} icon={<KeyRound size={15} />} busy={busy === "api-token"} onClick={() => setRotateTokenConfirm(true)} />
               {apiToken && (
                 <button className="secondary-button" type="button" onClick={() => void navigator.clipboard?.writeText(apiToken)}>
                   <Copy size={15} />
@@ -534,6 +548,18 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
           </div>
         </div>
       )}
+      <ConfirmDialog
+        isOpen={rotateTokenConfirm}
+        title={tx("Rotate API token")}
+        message={tx("Rotate the server API token? Existing clients using the current token will stop working until updated.")}
+        confirmText={tx("Rotate")}
+        variant="destructive"
+        onConfirm={() => {
+          setRotateTokenConfirm(false);
+          void rotateTokenAction();
+        }}
+        onCancel={() => setRotateTokenConfirm(false)}
+      />
       <ConfirmDialog
         isOpen={restoreConfirm !== null}
         title={tx("Restore backup")}
@@ -816,6 +842,7 @@ function ImportExportCard<T>({
 }) {
   const { tx } = useI18n();
   const [text, setText] = useState("");
+  const [importConfirmOpen, setImportConfirmOpen] = useState(false);
   const exportBusy = busy === `import-export:${actionKey}:export`;
   const importBusy = busy === `import-export:${actionKey}:import`;
 
@@ -836,30 +863,49 @@ function ImportExportCard<T>({
   }
 
   return (
-    <article className="settings-import-export-card">
-      <header>
-        <div>
-          <h3>{title}</h3>
-          <span>{subtitle}</span>
+    <>
+      <article className="settings-import-export-card">
+        <header>
+          <div>
+            <h3>{title}</h3>
+            <span>{subtitle}</span>
+          </div>
+        </header>
+        <textarea
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          spellCheck={false}
+          placeholder={tx("Export JSON appears here, or paste JSON to import")}
+        />
+        <div className="settings-actions">
+          <button className="secondary-button" type="button" onClick={() => void exportAction()} disabled={exportBusy}>
+            {exportBusy ? <Loader2 size={15} /> : <Download size={15} />}
+            <span>{tx("Export")}</span>
+          </button>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => setImportConfirmOpen(true)}
+            disabled={importBusy || !text.trim()}
+          >
+            {importBusy ? <Loader2 size={15} /> : <Upload size={15} />}
+            <span>{tx("Import")}</span>
+          </button>
         </div>
-      </header>
-      <textarea
-        value={text}
-        onChange={(event) => setText(event.target.value)}
-        spellCheck={false}
-        placeholder={tx("Export JSON appears here, or paste JSON to import")}
+      </article>
+      <ConfirmDialog
+        isOpen={importConfirmOpen}
+        title={tx("Import {{name}}", { name: title })}
+        message={tx("Import pasted JSON into {{name}}? Existing records with matching IDs may be updated.", { name: title })}
+        confirmText={tx("Import")}
+        variant="info"
+        onConfirm={() => {
+          setImportConfirmOpen(false);
+          void importAction();
+        }}
+        onCancel={() => setImportConfirmOpen(false)}
       />
-      <div className="settings-actions">
-        <button className="secondary-button" type="button" onClick={() => void exportAction()} disabled={exportBusy}>
-          {exportBusy ? <Loader2 size={15} /> : <Download size={15} />}
-          <span>{tx("Export")}</span>
-        </button>
-        <button className="primary-button" type="button" onClick={() => void importAction()} disabled={importBusy || !text.trim()}>
-          {importBusy ? <Loader2 size={15} /> : <Upload size={15} />}
-          <span>{tx("Import")}</span>
-        </button>
-      </div>
-    </article>
+    </>
   );
 }
 
@@ -946,19 +992,29 @@ function ActionButton({
   label,
   icon,
   busy,
+  disabled,
   onClick,
 }: {
   label: string;
   icon: ReactNode;
   busy: boolean;
+  disabled?: boolean;
   onClick: () => void;
 }) {
   const { tx } = useI18n();
   return (
-    <button className="secondary-button" type="button" onClick={onClick} disabled={busy}>
+    <button className="secondary-button" type="button" onClick={onClick} disabled={busy || disabled}>
       {busy ? <Loader2 size={15} /> : icon}
       <span>{tx(label)}</span>
     </button>
+  );
+}
+
+function isClientTunnelRunning(status?: string | null): boolean {
+  const normalized = status?.trim().toLowerCase();
+  return Boolean(
+    normalized &&
+      !["stopped", "ended", "error", "failed"].includes(normalized),
   );
 }
 

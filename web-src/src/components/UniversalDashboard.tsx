@@ -112,6 +112,7 @@ export function UniversalDashboard() {
   const [importOpen, setImportOpen] = useState(false);
   const [exportText, setExportText] = useState<string | null>(null);
   const [providerQuery, setProviderQuery] = useState("");
+  const [submitMode, setSubmitMode] = useState<"save" | "save-sync">("save");
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -167,8 +168,15 @@ export function UniversalDashboard() {
   async function submitDraft(event: FormEvent) {
     event.preventDefault();
     if (!draft) return;
-    await runAction("save", async () => {
+    const mode = submitMode;
+    setSubmitMode("save");
+    await runAction(mode, async () => {
       const saved = await saveUniversalProvider(providerFromDraft(draft));
+      if (mode === "save-sync") {
+        const sync = await syncUniversalProvider(saved.id);
+        setDraft(null);
+        return tx("saved {{name}}; {{summary}}", { name: saved.name, summary: syncSummary(sync, tx) });
+      }
       setDraft(null);
       return tx("saved {{name}}", { name: saved.name });
     });
@@ -332,7 +340,9 @@ export function UniversalDashboard() {
       {draft && (
         <UniversalFormModal
           draft={draft}
-          saving={busy === "save"}
+          saving={busy === "save" || busy === "save-sync"}
+          savingMode={busy === "save-sync" ? "save-sync" : busy === "save" ? "save" : null}
+          onSubmitMode={setSubmitMode}
           onChange={setDraft}
           onClose={() => setDraft(null)}
           onSubmit={submitDraft}
@@ -542,6 +552,7 @@ function UniversalCard({
 }) {
   const { tx } = useI18n();
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [syncConfirmOpen, setSyncConfirmOpen] = useState(false);
   const icon = universalProviderIcon(provider);
   const enabledApps = enabledUniversalApps(provider);
   return (
@@ -578,7 +589,7 @@ function UniversalCard({
           </div>
         </div>
         <div className="universal-card-actions">
-          <IconAction title="Sync" busy={busy === `sync:${provider.id}`} onClick={onSync}>
+          <IconAction title="Sync" busy={busy === `sync:${provider.id}`} onClick={() => setSyncConfirmOpen(true)}>
             <RotateCcw size={15} />
           </IconAction>
           <IconAction title="Duplicate" busy={busy === `duplicate:${provider.id}`} onClick={onDuplicate}>
@@ -624,6 +635,17 @@ function UniversalCard({
       </details>
       </article>
       <ConfirmDialog
+        isOpen={syncConfirmOpen}
+        title={tx("Sync universal provider")}
+        message={tx("Sync {{name}} to enabled apps? Existing derived providers may be overwritten.", { name: provider.name })}
+        confirmText={tx("Sync")}
+        onConfirm={() => {
+          setSyncConfirmOpen(false);
+          onSync();
+        }}
+        onCancel={() => setSyncConfirmOpen(false)}
+      />
+      <ConfirmDialog
         isOpen={deleteConfirmOpen}
         title={tx("Delete universal provider")}
         message={tx("Delete universal provider {{name}}? Derived app providers will be removed.", { name: provider.name })}
@@ -641,12 +663,16 @@ function UniversalCard({
 function UniversalFormModal({
   draft,
   saving,
+  savingMode,
+  onSubmitMode,
   onChange,
   onClose,
   onSubmit,
 }: {
   draft: UniversalDraft;
   saving: boolean;
+  savingMode: "save" | "save-sync" | null;
+  onSubmitMode: (mode: "save" | "save-sync") => void;
   onChange: (draft: UniversalDraft) => void;
   onClose: () => void;
   onSubmit: (event: FormEvent) => void;
@@ -779,8 +805,22 @@ function UniversalFormModal({
           <button className="secondary-button" type="button" onClick={onClose}>
             {tx("Cancel")}
           </button>
-          <button className="primary-button" type="submit" disabled={saving}>
-            {saving && <Loader2 size={15} />}
+          <button
+            className="secondary-button"
+            type="submit"
+            disabled={saving}
+            onClick={() => onSubmitMode("save-sync")}
+          >
+            {savingMode === "save-sync" && <Loader2 size={15} />}
+            <span>{tx("Save and Sync")}</span>
+          </button>
+          <button
+            className="primary-button"
+            type="submit"
+            disabled={saving}
+            onClick={() => onSubmitMode("save")}
+          >
+            {savingMode === "save" && <Loader2 size={15} />}
             <span>{tx("Save Universal")}</span>
           </button>
         </footer>

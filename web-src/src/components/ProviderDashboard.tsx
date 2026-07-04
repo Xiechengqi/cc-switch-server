@@ -941,6 +941,8 @@ function ProviderFormModal({
   onClose: () => void;
 }) {
   const { tx } = useI18n();
+  const [modelFetchBusy, setModelFetchBusy] = useState(false);
+  const [modelFetchResult, setModelFetchResult] = useState<string | null>(null);
   const entry = entries.find((item) => item.providerTypeId === draft.providerTypeId) || entries[0];
   const accountOptions = accounts.filter((account) =>
     accountMatchesProviderType(account, draft.providerTypeId),
@@ -962,6 +964,32 @@ function ProviderFormModal({
     : { icon: inferredPreviewIcon.icon, color: inferredPreviewIcon.iconColor };
   function patch(next: Partial<ProviderDraft>) {
     onChange({ ...draft, ...next });
+  }
+  async function fetchModelsForDraft() {
+    if (draft.mode !== "edit" || !draft.id) return;
+    setModelFetchBusy(true);
+    setModelFetchResult(null);
+    try {
+      const result = await fetchProviderModels(draft.app, draft.id, true);
+      const nextProvider = result.provider;
+      const nextModelCatalogJson = nextProvider
+        ? providerSettingJson(nextProvider.provider, ["modelCatalog"])
+        : modelCatalogJsonFromFetchedModels(result.models);
+      onChange({
+        ...draft,
+        model: draft.model || result.models[0]?.id || result.models[0]?.upstreamModel || "",
+        modelCatalogJson: nextModelCatalogJson || draft.modelCatalogJson,
+        advancedJson: nextProvider ? JSON.stringify(nextProvider.provider, null, 2) : draft.advancedJson,
+      });
+      setModelFetchResult(tx("Fetched {{models}} models; merged {{merged}}", {
+        models: result.models.length,
+        merged: result.mergedCount,
+      }));
+    } catch (reason) {
+      setModelFetchResult(errorMessage(reason));
+    } finally {
+      setModelFetchBusy(false);
+    }
   }
   return (
     <div className="modal-backdrop" role="presentation">
@@ -1037,10 +1065,14 @@ function ProviderFormModal({
               onChange={(value) => patch({ iconColor: value })}
             />
           </div>
-          <label>
-            <span>{tx("Model")}</span>
-            <input value={draft.model} onChange={(event) => patch({ model: event.target.value })} />
-          </label>
+          <ProviderModelField
+            draft={draft}
+            options={modelOptionsFromCatalogJson(draft.modelCatalogJson)}
+            busy={modelFetchBusy}
+            result={modelFetchResult}
+            onChange={(model) => patch({ model })}
+            onFetch={draft.mode === "edit" && draft.id ? fetchModelsForDraft : undefined}
+          />
           <label className="wide-field">
             <span>{tx("Category")}</span>
             <input
@@ -1202,6 +1234,63 @@ function ProviderAuthSection({
         </article>
       </div>
     </section>
+  );
+}
+
+function ProviderModelField({
+  draft,
+  options,
+  busy,
+  result,
+  onChange,
+  onFetch,
+}: {
+  draft: ProviderDraft;
+  options: string[];
+  busy: boolean;
+  result: string | null;
+  onChange: (model: string) => void;
+  onFetch?: () => void;
+}) {
+  const { tx } = useI18n();
+  const listId = `provider-model-options-${draft.app}-${draft.id || draft.providerTypeId}`;
+  return (
+    <label className="provider-model-field">
+      <span>{tx("Model")}</span>
+      <div className="provider-model-input-row">
+        <input
+          value={draft.model}
+          list={options.length ? listId : undefined}
+          onChange={(event) => onChange(event.target.value)}
+          autoComplete="off"
+        />
+        {options.length ? (
+          <datalist id={listId}>
+            {options.map((model) => (
+              <option key={model} value={model} />
+            ))}
+          </datalist>
+        ) : null}
+        {onFetch ? (
+          <button
+            className="secondary-button compact icon-only"
+            type="button"
+            onClick={onFetch}
+            disabled={busy}
+            title={tx("Fetch models")}
+            aria-label={tx("Fetch models")}
+          >
+            {busy ? <Loader2 size={14} /> : <Download size={14} />}
+          </button>
+        ) : null}
+      </div>
+      <small>
+        {result ||
+          (options.length
+            ? tx("{{count}} catalog models available", { count: options.length })
+            : tx(onFetch ? "Fetch upstream models into model catalog" : "Saved model or provider default"))}
+      </small>
+    </label>
   );
 }
 
@@ -1414,6 +1503,51 @@ function ProviderDesktopAdvancedSection({
 
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+function modelOptionsFromCatalogJson(raw: string): string[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const models = Array.isArray(parsed)
+      ? parsed
+      : asRecord(parsed).models;
+    return uniqueStrings(extractModelIds(models));
+  } catch {
+    return [];
+  }
+}
+
+function extractModelIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (typeof item === "string") return [item];
+    const record = asRecord(item);
+    return [
+      getString(record.id),
+      getString(record.model),
+      getString(record.upstreamModel),
+      getString(record.name),
+    ].filter((model): model is string => Boolean(model));
+  });
+}
+
+function modelCatalogJsonFromFetchedModels(
+  models: Array<{ id: string; upstreamModel: string; displayName?: string | null }>,
+): string {
+  if (!models.length) return "";
+  return JSON.stringify(
+    {
+      models: models.map((model) => ({
+        id: model.id,
+        upstreamModel: model.upstreamModel,
+        ...(model.displayName ? { displayName: model.displayName } : {}),
+      })),
+    },
+    null,
+    2,
+  );
 }
 
 function ProviderCatalogModal({
