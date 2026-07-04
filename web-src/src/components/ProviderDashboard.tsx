@@ -16,8 +16,11 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
+  ArrowUpAZ,
   Boxes,
   CheckCircle2,
+  Copy,
+  Download,
   FlaskConical,
   GripVertical,
   Link2,
@@ -25,8 +28,10 @@ import {
   Loader2,
   Pencil,
   RefreshCw,
+  Search,
   ServerCog,
   Trash2,
+  Users,
   X,
 } from "lucide-react";
 import {
@@ -66,6 +71,7 @@ import { useI18n } from "@/lib/i18n";
 import { inferIconForText } from "@/config/iconInference";
 import { ColorPicker } from "@/components/ColorPicker";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { IconPicker } from "@/components/IconPicker";
 import JsonEditor from "@/components/JsonEditor";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { presetIcon, storedProviderIcon } from "@/lib/provider-icons";
@@ -109,9 +115,11 @@ interface ProviderDraft {
 export function ProviderDashboard({
   activeApp: controlledActiveApp,
   onActiveAppChange,
+  onOpenImportExport,
 }: {
   activeApp?: AppKind;
   onActiveAppChange?: (app: AppKind) => void;
+  onOpenImportExport?: () => void;
 }) {
   const { t, tx } = useI18n();
   const [localActiveApp, setLocalActiveApp] = useState<AppKind>("claude");
@@ -134,6 +142,7 @@ export function ProviderDashboard({
   const [resultById, setResultById] = useState<Record<string, string>>({});
   const [catalogOpen, setCatalogOpen] = useState(false);
   const [currentProviderId, setCurrentProviderId] = useState<string>("");
+  const [providerQuery, setProviderQuery] = useState("");
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -186,6 +195,10 @@ export function ProviderDashboard({
   const limitByProviderKey = new Map(
     data.limits.map((limit) => [providerKey(limit.app, limit.providerId), limit]),
   );
+  const visibleProviders = useMemo(
+    () => filterProviderList(activeProviders, providerQuery, accountsById),
+    [activeProviders, accountsById, providerQuery],
+  );
 
   function openCreate() {
     if (!visibleEntries.length && !activePresets.length) return;
@@ -234,7 +247,7 @@ export function ProviderDashboard({
 
   async function runAction(
     provider: StoredProvider,
-    action: "test" | "network" | "stream" | "models" | "switch" | "delete",
+    action: "test" | "network" | "stream" | "models" | "switch" | "duplicate" | "delete",
   ) {
     const key = `${provider.app}:${provider.provider.id}:${action}`;
     setBusyId(key);
@@ -242,6 +255,19 @@ export function ProviderDashboard({
     try {
       if (action === "delete") {
         await deleteProvider(provider.app, provider.provider.id);
+        await refresh();
+        return;
+      }
+      if (action === "duplicate") {
+        const duplicate = duplicateStoredProvider(
+          provider,
+          data.providers.filter((item) => item.app === provider.app),
+        );
+        const stored = await saveProvider(provider.app, duplicate);
+        setResultById((current) => ({
+          ...current,
+          [stored.provider.id]: tx("Duplicated provider {{name}}", { name: provider.provider.name }),
+        }));
         await refresh();
         return;
       }
@@ -382,44 +408,62 @@ export function ProviderDashboard({
         </div>
       </div>
 
+      <ProviderListToolbar
+        query={providerQuery}
+        visible={visibleProviders.length}
+        total={activeProviders.length}
+        onQueryChange={setProviderQuery}
+      />
+
       {loading ? (
         <div className="provider-empty">
           <Loader2 size={22} />
           <span>{t("server.providers.loading")}</span>
         </div>
       ) : activeProviders.length ? (
-        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleProviderDragEnd(event)}>
-          <SortableContext
-            items={activeProviders.map((provider) => provider.provider.id)}
-            strategy={verticalListSortingStrategy}
-          >
-            <div className="provider-card-grid">
-              {activeProviders.map((provider, index) => (
-                <SortableProviderCard
-                  key={`${provider.app}:${provider.provider.id}`}
-                  provider={provider}
-                  priority={index + 1}
-                  entry={entries.find((item) => item.providerTypeId === provider.providerTypeId)}
-                  health={healthById.get(provider.provider.id)}
-                  account={accountForProvider(provider, accountsById)}
-                  capability={capabilityForProvider(provider, capabilitiesByType)}
-                  limit={limitByProviderKey.get(providerKey(provider.app, provider.provider.id))}
-                  current={provider.provider.id === currentProviderId}
-                  result={resultById[provider.provider.id]}
-                  busyId={busyId}
-                  onEdit={() => openEdit(provider)}
-                  onAction={(action) => void runAction(provider, action)}
-                />
-              ))}
-            </div>
-          </SortableContext>
-        </DndContext>
+        visibleProviders.length ? (
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleProviderDragEnd(event)}>
+            <SortableContext
+              items={activeProviders.map((provider) => provider.provider.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              <div className="provider-card-grid">
+                {visibleProviders.map((provider) => {
+                  const priority = activeProviders.findIndex((item) => item.provider.id === provider.provider.id) + 1;
+                  return (
+                    <SortableProviderCard
+                      key={`${provider.app}:${provider.provider.id}`}
+                      provider={provider}
+                      priority={priority}
+                      entry={entries.find((item) => item.providerTypeId === provider.providerTypeId)}
+                      health={healthById.get(provider.provider.id)}
+                      account={accountForProvider(provider, accountsById)}
+                      capability={capabilityForProvider(provider, capabilitiesByType)}
+                      limit={limitByProviderKey.get(providerKey(provider.app, provider.provider.id))}
+                      current={provider.provider.id === currentProviderId}
+                      result={resultById[provider.provider.id]}
+                      busyId={busyId}
+                      onEdit={() => openEdit(provider)}
+                      onAction={(action) => void runAction(provider, action)}
+                    />
+                  );
+                })}
+              </div>
+            </SortableContext>
+          </DndContext>
+        ) : (
+          <div className="provider-empty compact-empty">
+            <Search size={20} />
+            <span>{tx("No providers match the current search")}</span>
+          </div>
+        )
       ) : (
-        <div className="provider-empty">
-          <ServerCog size={24} />
-          <strong>{t("server.providers.noProvidersForApp", { app: activeApp })}</strong>
-          <span>{t("server.providers.noProvidersHint")}</span>
-        </div>
+        <ProviderEmptyState
+          app={activeApp}
+          canCreate={visibleEntries.length > 0 || activePresets.length > 0}
+          onCreate={openCreate}
+          onImport={onOpenImportExport}
+        />
       )}
 
       {draft && (
@@ -447,6 +491,104 @@ export function ProviderDashboard({
       )}
     </div>
   );
+}
+
+function ProviderEmptyState({
+  app,
+  canCreate,
+  onCreate,
+  onImport,
+}: {
+  app: AppKind;
+  canCreate: boolean;
+  onCreate: () => void;
+  onImport?: () => void;
+}) {
+  const { t, tx } = useI18n();
+  const appName = appLabel(app);
+  return (
+    <div className="provider-empty provider-empty-state">
+      <div className="provider-empty-icon">
+        <Users size={28} />
+      </div>
+      <strong>{t("server.providers.noProvidersForApp", { app: appName })}</strong>
+      <p>{t("server.providers.noProvidersHint")}</p>
+      <p>{tx("Import existing configuration or create a provider from desktop presets.")}</p>
+      <div className="provider-empty-actions">
+        {onImport && (
+          <button className="primary-button" type="button" onClick={onImport}>
+            <Download size={15} />
+            <span>{t("common.import")}</span>
+          </button>
+        )}
+        <button
+          className={onImport ? "secondary-button" : "primary-button"}
+          type="button"
+          onClick={onCreate}
+          disabled={!canCreate}
+        >
+          <ListPlus size={15} />
+          <span>{t("server.providers.addProvider")}</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ProviderListToolbar({
+  query,
+  visible,
+  total,
+  onQueryChange,
+}: {
+  query: string;
+  visible: number;
+  total: number;
+  onQueryChange: (value: string) => void;
+}) {
+  const { tx } = useI18n();
+  return (
+    <section className="provider-list-toolbar">
+      <label className="provider-list-search">
+        <Search size={15} />
+        <input
+          value={query}
+          onChange={(event) => onQueryChange(event.target.value)}
+          placeholder={tx("Search providers")}
+        />
+      </label>
+      <span className="provider-list-count">{tx("{{visible}}/{{total}} providers", { visible, total })}</span>
+    </section>
+  );
+}
+
+function filterProviderList(
+  providers: StoredProvider[],
+  query: string,
+  accountsById: Map<string, AccountRecord>,
+): StoredProvider[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) return providers;
+  return providers.filter((provider) => {
+    const accountId = provider.provider.meta?.authBinding?.accountId || "";
+    const account = accountId ? accountsById.get(accountId) : undefined;
+    return [
+      provider.provider.id,
+      provider.provider.name,
+      provider.providerTypeId,
+      modelFromProvider(provider.provider),
+      baseUrlFromProvider(provider.provider, provider.app),
+      apiFormatFromProvider(provider.provider),
+      accountId,
+      account?.email,
+      account?.subscriptionLevel,
+      provider.provider.category,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+      .includes(normalizedQuery);
+  });
 }
 
 function SortableProviderCard(props: ProviderCardProps) {
@@ -488,7 +630,7 @@ interface ProviderCardProps {
   result?: string;
   busyId: string | null;
   onEdit: () => void;
-  onAction: (action: "test" | "network" | "stream" | "models" | "switch" | "delete") => void;
+  onAction: (action: "test" | "network" | "stream" | "models" | "switch" | "duplicate" | "delete") => void;
 }
 
 function ProviderCard({
@@ -523,7 +665,6 @@ function ProviderCard({
   const accountValue = account
     ? accountSummary(account)
     : accountId || tx("direct config");
-  const healthLabel = health?.healthy === false ? tx("unhealthy") : tx("healthy");
   const busyPrefix = `${provider.app}:${provider.provider.id}:`;
   return (
     <>
@@ -566,9 +707,7 @@ function ProviderCard({
           </div>
         </div>
         <div className="provider-card-right">
-          <StatusPill tone={health?.healthy === false ? "danger" : "success"}>
-            {healthLabel}
-          </StatusPill>
+          <ProviderHealthIndicator health={health} />
           <span>{tx("{{count}} recent requests", { count: health?.requests ?? 0 })}</span>
         </div>
       </header>
@@ -593,6 +732,13 @@ function ProviderCard({
       <div className="provider-actions">
         <IconAction title="Edit" onClick={onEdit}>
           <Pencil size={15} />
+        </IconAction>
+        <IconAction
+          title="Duplicate"
+          onClick={() => onAction("duplicate")}
+          busy={busyId === `${busyPrefix}duplicate`}
+        >
+          <Copy size={15} />
         </IconAction>
         <IconAction
           title="Config test"
@@ -648,6 +794,30 @@ function ProviderCard({
       />
     </>
   );
+}
+
+function ProviderHealthIndicator({ health }: { health?: ProviderHealth }) {
+  const { tx } = useI18n();
+  const status = providerHealthStatus(health);
+  const latency = health?.avgLatencyMs == null ? null : `${Math.round(health.avgLatencyMs)}ms`;
+  return (
+    <div className={`provider-health-indicator ${status}`}>
+      <span className="provider-health-dot" />
+      <span>
+        {tx(status)}
+        {latency ? ` (${latency})` : ""}
+      </span>
+    </div>
+  );
+}
+
+function providerHealthStatus(health?: ProviderHealth): "operational" | "degraded" | "failed" {
+  if (!health) return "degraded";
+  if (!health.healthy) return "failed";
+  if ((health.failures || 0) > 0 || (health.successRate != null && health.successRate < 0.95)) {
+    return "degraded";
+  }
+  return "operational";
 }
 
 function FailoverPriorityBadge({ priority }: { priority: number }) {
@@ -759,10 +929,14 @@ function ProviderFormModal({
                 size={24}
               />
             </div>
-            <label>
-              <span>{tx("Icon")}</span>
-              <input value={draft.icon} onChange={(event) => patch({ icon: event.target.value })} />
-            </label>
+            <IconPicker
+              label={tx("Icon")}
+              value={draft.icon}
+              fallbackIcon={inferredPreviewIcon.icon}
+              fallbackColor={previewIcon.color}
+              providerName={draft.name || draft.providerTypeId || "Provider"}
+              onChange={(value) => patch({ icon: value })}
+            />
             <ColorPicker
               label={tx("Color")}
               value={draft.iconColor}
@@ -946,6 +1120,16 @@ function ProviderCatalogModal({
   onClose: () => void;
 }) {
   const { tx } = useI18n();
+  const [query, setQuery] = useState("");
+  const [sortMode, setSortMode] = useState<"recommended" | "name">("recommended");
+  const visiblePresets = useMemo(
+    () => filterCatalogPresets(presets, query, sortMode),
+    [presets, query, sortMode],
+  );
+  const visibleEntries = useMemo(
+    () => filterCatalogEntries(entries, query, sortMode),
+    [entries, query, sortMode],
+  );
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="provider-form-modal simple-modal provider-catalog-modal">
@@ -959,6 +1143,32 @@ function ProviderCatalogModal({
           </button>
         </header>
         <div className="provider-catalog-body">
+          <div className="provider-catalog-toolbar">
+            <label className="provider-catalog-search">
+              <Search size={15} />
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder={tx("Search presets and provider types")}
+              />
+            </label>
+            <button
+              className={sortMode === "name" ? "secondary-button compact active" : "secondary-button compact"}
+              type="button"
+              onClick={() => setSortMode((current) => (current === "name" ? "recommended" : "name"))}
+              aria-label={tx("Sort presets")}
+              title={tx("Sort presets")}
+            >
+              <ArrowUpAZ size={14} />
+              <span>{tx(sortMode === "name" ? "A-Z" : "recommended")}</span>
+            </button>
+            <span className="provider-catalog-count">
+              {tx("{{presets}} presets / {{types}} types", {
+                presets: visiblePresets.length,
+                types: visibleEntries.length,
+              })}
+            </span>
+          </div>
           <section className="provider-catalog-section">
             <div className="section-title-row compact-title">
               <ListPlus size={16} />
@@ -968,8 +1178,8 @@ function ProviderCatalogModal({
               </div>
             </div>
             <div className="provider-preset-grid">
-              {presets.length ? (
-                presets.map((preset) => {
+              {visiblePresets.length ? (
+                visiblePresets.map((preset) => {
                   const busy = busyId === `preset:${app}:${preset.name}`;
                   const icon = presetIcon(preset);
                   return (
@@ -998,7 +1208,9 @@ function ProviderCatalogModal({
                   );
                 })
               ) : (
-                <div className="provider-empty inline-empty">{tx("No presets for {{app}}", { app: appLabel(app) })}</div>
+                <div className="provider-empty inline-empty">
+                  {query.trim() ? tx("No presets match this search") : tx("No presets for {{app}}", { app: appLabel(app) })}
+                </div>
               )}
             </div>
           </section>
@@ -1012,8 +1224,8 @@ function ProviderCatalogModal({
               </div>
             </div>
             <div className="provider-type-grid catalog-type-grid">
-              {entries.length ? (
-                entries.map((entry) => {
+              {visibleEntries.length ? (
+                visibleEntries.map((entry) => {
                   const icon = entryIcon(entry);
                   return (
                     <button
@@ -1039,7 +1251,9 @@ function ProviderCatalogModal({
                   );
                 })
               ) : (
-                <div className="provider-empty inline-empty">{tx("No provider types for {{app}}", { app: appLabel(app) })}</div>
+                <div className="provider-empty inline-empty">
+                  {query.trim() ? tx("No provider types match this search") : tx("No provider types for {{app}}", { app: appLabel(app) })}
+                </div>
               )}
             </div>
           </section>
@@ -1047,6 +1261,56 @@ function ProviderCatalogModal({
       </section>
     </div>
   );
+}
+
+function filterCatalogPresets(
+  presets: ProviderPresetSummary[],
+  query: string,
+  sortMode: "recommended" | "name",
+): ProviderPresetSummary[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = normalizedQuery
+    ? presets.filter((preset) =>
+        [
+          preset.name,
+          preset.providerType,
+          preset.apiFormat,
+          preset.baseUrl,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase()
+          .includes(normalizedQuery),
+      )
+    : presets;
+  if (sortMode === "recommended") return filtered;
+  return [...filtered].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function filterCatalogEntries(
+  entries: ProviderMatrixEntry[],
+  query: string,
+  sortMode: "recommended" | "name",
+): ProviderMatrixEntry[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = normalizedQuery
+    ? entries.filter((entry) =>
+        [
+          entry.label,
+          entry.providerType,
+          entry.providerTypeId,
+          entry.defaults.apiFormat,
+          entry.defaults.baseUrl,
+          entry.note,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase()
+          .includes(normalizedQuery),
+      )
+    : entries;
+  if (sortMode === "recommended") return filtered;
+  return [...filtered].sort((left, right) => left.label.localeCompare(right.label));
 }
 
 function entryIcon(entry: ProviderMatrixEntry): { icon?: string; color?: string } {
@@ -1408,6 +1672,40 @@ function providerFromDraft(draft: ProviderDraft, entry: ProviderMatrixEntry): Pr
     settingsConfig: settings,
     meta,
   };
+}
+
+function duplicateStoredProvider(provider: StoredProvider, existing: StoredProvider[]): Provider {
+  const source = provider.provider;
+  const nextId = uniqueProviderId(source.id || source.name || provider.providerTypeId, existing);
+  const maxSortIndex = existing.reduce(
+    (max, item, index) => Math.max(max, numberValue(item.provider.sortIndex) ?? index),
+    -1,
+  );
+  return {
+    ...source,
+    id: nextId,
+    name: `${source.name || provider.providerTypeId} copy`,
+    sortIndex: maxSortIndex + 1,
+  };
+}
+
+function uniqueProviderId(seed: string, existing: StoredProvider[]): string {
+  const existingIds = new Set(existing.map((item) => item.provider.id));
+  const base = `${seed}-copy`
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "provider-copy";
+  if (!existingIds.has(base)) return base;
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${base}-${index}`;
+    if (!existingIds.has(candidate)) return candidate;
+  }
+  return `${base}-${Date.now()}`;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function colorInputValue(value?: string): string {

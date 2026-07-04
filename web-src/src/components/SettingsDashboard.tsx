@@ -7,6 +7,7 @@ import {
   Copy,
   Download,
   FileJson,
+  FolderOpen,
   GitCommit,
   Info,
   KeyRound,
@@ -60,13 +61,16 @@ import {
   UniversalProvider,
 } from "@/lib/api";
 import { Language, useI18n } from "@/lib/i18n";
-import { writeToken } from "@/lib/runtime";
+import { getWebRuntimeContext, WebRuntimeContext, writeToken } from "@/lib/runtime";
 import { AccountsDashboard } from "@/components/AccountsDashboard";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useTheme } from "@/components/theme-provider";
 
 export type SettingsTab =
   | "general"
+  | "language"
+  | "theme"
+  | "directory"
   | "proxy"
   | "router"
   | "tunnel"
@@ -78,6 +82,9 @@ export type SettingsTab =
 
 const settingsTabs: Array<{ id: SettingsTab; label: string }> = [
   { id: "general", label: "General" },
+  { id: "language", label: "Language" },
+  { id: "theme", label: "Theme" },
+  { id: "directory", label: "Directory" },
   { id: "proxy", label: "Proxy" },
   { id: "router", label: "Router" },
   { id: "tunnel", label: "Tunnel" },
@@ -117,6 +124,7 @@ interface EmailDraft {
 export function SettingsDashboard({ initialTab = "general" }: { initialTab?: SettingsTab }) {
   const { language, languages, setLanguage, t, tx } = useI18n();
   const [data, setData] = useState<SettingsDashboardData | null>(null);
+  const [runtimeContext, setRuntimeContext] = useState<WebRuntimeContext | null>(null);
   const [routerDraft, setRouterDraft] = useState<RouterDraft>(emptyRouterDraft());
   const [tunnelDraft, setTunnelDraft] = useState<TunnelDraft>(emptyTunnelDraft());
   const [proxyDraft, setProxyDraft] = useState<ProxyDraft>(emptyProxyDraft());
@@ -138,8 +146,12 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
     setLoading(true);
     setError(null);
     try {
-      const next = await loadSettingsDashboardData();
+      const [next, context] = await Promise.all([
+        loadSettingsDashboardData(),
+        getWebRuntimeContext().catch(() => null),
+      ]);
       setData(next);
+      setRuntimeContext(context);
       setRouterDraft(routerDraftFrom(next.router));
       setTunnelDraft(tunnelDraftFrom(next.tunnel));
       setProxyDraft({
@@ -314,6 +326,12 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
                   <SummaryTile label={t("server.settings.backups")} value={data?.backups.length ?? 0} />
                 </div>
 
+                {data && <SettingsReadinessPanel data={data} />}
+              </div>
+            )}
+
+            {activeTab === "language" && (
+              <div className="settings-layout">
                 <section className="settings-card">
                   <SectionHeader icon={<Languages size={17} />} title={t("server.settings.language")} subtitle={t("server.settings.languageSubtitle")} />
                   <label>
@@ -327,10 +345,18 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
                     </select>
                   </label>
                 </section>
+              </div>
+            )}
 
+            {activeTab === "theme" && (
+              <div className="settings-layout">
                 <ThemeSettingsPanel />
+              </div>
+            )}
 
-                {data && <SettingsReadinessPanel data={data} />}
+            {activeTab === "directory" && (
+              <div className="settings-layout">
+                <DirectoryPanel runtimeContext={runtimeContext} />
               </div>
             )}
 
@@ -562,6 +588,55 @@ function ThemeSettingsPanel() {
       </div>
     </section>
   );
+}
+
+function DirectoryPanel({ runtimeContext }: { runtimeContext: WebRuntimeContext | null }) {
+  const { tx } = useI18n();
+  const configDir = runtimeContext?.runtime?.configDir || "~/.cc-switch-server";
+  const webDistDir = runtimeContext?.runtime?.webDistDir || tx("embedded web assets");
+  const embeddedAssets = runtimeContext?.runtime?.embeddedWebAssets ?? "-";
+  const files = [
+    "server.json",
+    "providers.json",
+    "universal-providers.json",
+    "accounts.json",
+    "shares.json",
+    "usage-logs.json",
+    "usage-logs.jsonl",
+    "usage-rollups.json",
+    "model-pricing.json",
+    "failover.json",
+    "tunnels.json",
+    "email-auth.json",
+  ];
+  return (
+    <section className="settings-card wide settings-directory-card">
+      <SectionHeader
+        icon={<FolderOpen size={17} />}
+        title={tx("Directory")}
+        subtitle={tx("Server data and embedded web asset locations")}
+      />
+      <div className="settings-policy-grid">
+        <KeyValue label="config dir" value={configDir} />
+        <KeyValue label="web dist" value={webDistDir} />
+        <KeyValue label="embedded assets" value={embeddedAssets} />
+        <KeyValue label="mode" value={runtimeContext?.mode || "-"} />
+      </div>
+      <div className="settings-directory-list">
+        {files.map((file) => (
+          <div className="settings-directory-row" key={file}>
+            <span>{file}</span>
+            <code>{joinPath(configDir, file)}</code>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function joinPath(dir: string, file: string): string {
+  if (!dir || dir === "~/.cc-switch-server") return `~/.cc-switch-server/${file}`;
+  return `${dir.replace(/\/+$/, "")}/${file}`;
 }
 
 function AboutPanel({ buildInfo }: { buildInfo: BuildInfo }) {

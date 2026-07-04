@@ -11,6 +11,7 @@ import {
   RefreshCw,
   RotateCcw,
   Route,
+  Search,
   Share2,
   SlidersHorizontal,
   Store,
@@ -118,6 +119,8 @@ export function ShareDashboard() {
   const [importOpen, setImportOpen] = useState(false);
   const [exportText, setExportText] = useState<string | null>(null);
   const [ownerChangeDraft, setOwnerChangeDraft] = useState<ShareDraft | null>(null);
+  const [shareQuery, setShareQuery] = useState("");
+  const [shareFilter, setShareFilter] = useState<"all" | "active" | "paused" | "sale">("all");
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -151,6 +154,10 @@ export function ShareDashboard() {
     const shareIds = new Set(data.shares.map((share) => share.id));
     return data.requestLogs.filter((log) => log.shareId && shareIds.has(log.shareId));
   }, [data.requestLogs, data.shares]);
+  const filteredShares = useMemo(
+    () => filterShares(data.shares, shareQuery, shareFilter),
+    [data.shares, shareFilter, shareQuery],
+  );
 
   async function runShareAction(
     share: ShareRecord,
@@ -348,6 +355,15 @@ export function ShareDashboard() {
         <ShareStat label={t("server.shares.requests")} value={data.shares.reduce((sum, share) => sum + (share.requestsCount || 0), 0)} />
       </div>
 
+      <ShareToolbar
+        query={shareQuery}
+        filter={shareFilter}
+        total={data.shares.length}
+        visible={filteredShares.length}
+        onQueryChange={setShareQuery}
+        onFilterChange={setShareFilter}
+      />
+
       <ShareTunnelConfigPanel
         shares={data.shares}
         markets={markets}
@@ -367,26 +383,33 @@ export function ShareDashboard() {
           <span>{t("server.shares.loading")}</span>
         </div>
       ) : data.shares.length ? (
-        <div className="share-card-grid">
-          {data.shares.map((share) => (
-            <ShareCard
-              key={share.id}
-              share={share}
-              providerByKey={providerByKey}
-              markets={markets}
-              marketsLoaded={marketsLoaded}
-              result={resultById[share.id]}
-              connectInfo={connectInfoById[share.id]}
-              busyId={busyId}
-              onEdit={() => setDraft(editShareDraft(share, providersByApp))}
-              onAcl={() => setAclDraft(share)}
-              onSubdomain={() => setSubdomainDraft(share)}
-              onBinding={(app) => setBindingDraft(createBindingDraft(share, app))}
-              onMarket={() => setMarketDraft(share)}
-              onAction={(action) => void runShareAction(share, action)}
-            />
-          ))}
-        </div>
+        filteredShares.length ? (
+          <div className="share-card-grid">
+            {filteredShares.map((share) => (
+              <ShareCard
+                key={share.id}
+                share={share}
+                providerByKey={providerByKey}
+                markets={markets}
+                marketsLoaded={marketsLoaded}
+                result={resultById[share.id]}
+                connectInfo={connectInfoById[share.id]}
+                busyId={busyId}
+                onEdit={() => setDraft(editShareDraft(share, providersByApp))}
+                onAcl={() => setAclDraft(share)}
+                onSubdomain={() => setSubdomainDraft(share)}
+                onBinding={(app) => setBindingDraft(createBindingDraft(share, app))}
+                onMarket={() => setMarketDraft(share)}
+                onAction={(action) => void runShareAction(share, action)}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="provider-empty compact-empty">
+            <SlidersHorizontal size={20} />
+            <span>{tx("No shares match the current filter")}</span>
+          </div>
+        )
       ) : (
         <div className="provider-empty">
           <Share2 size={24} />
@@ -1481,6 +1504,88 @@ function ModalFooter({
       </button>
     </footer>
   );
+}
+
+function ShareToolbar({
+  query,
+  filter,
+  total,
+  visible,
+  onQueryChange,
+  onFilterChange,
+}: {
+  query: string;
+  filter: "all" | "active" | "paused" | "sale";
+  total: number;
+  visible: number;
+  onQueryChange: (value: string) => void;
+  onFilterChange: (value: "all" | "active" | "paused" | "sale") => void;
+}) {
+  const { tx } = useI18n();
+  const filters: Array<{ id: "all" | "active" | "paused" | "sale"; label: string }> = [
+    { id: "all", label: "all" },
+    { id: "active", label: "active" },
+    { id: "paused", label: "paused" },
+    { id: "sale", label: "for sale" },
+  ];
+  return (
+    <section className="share-toolbar">
+      <label className="share-search">
+        <Search size={15} />
+        <input
+          value={query}
+          onChange={(event) => onQueryChange(event.target.value)}
+          placeholder={tx("Search shares")}
+        />
+      </label>
+      <div className="share-filter-tabs" role="tablist" aria-label={tx("Share filters")}>
+        {filters.map((item) => (
+          <button
+            key={item.id}
+            className={filter === item.id ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={filter === item.id}
+            onClick={() => onFilterChange(item.id)}
+          >
+            {tx(item.label)}
+          </button>
+        ))}
+      </div>
+      <span className="share-filter-count">{tx("{{visible}}/{{total}} shares", { visible, total })}</span>
+    </section>
+  );
+}
+
+function filterShares(
+  shares: ShareRecord[],
+  query: string,
+  filter: "all" | "active" | "paused" | "sale",
+): ShareRecord[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  return shares.filter((share) => {
+    if (filter === "active" && share.status !== "active") return false;
+    if (filter === "paused" && share.status !== "paused") return false;
+    if (filter === "sale" && !share.forSale) return false;
+    if (!normalizedQuery) return true;
+    return [
+      share.id,
+      share.displayName,
+      share.ownerEmail,
+      share.status,
+      share.tunnelSubdomain,
+      share.description,
+      share.saleMarketKind,
+      share.app,
+      share.providerId,
+      share.providerType,
+      ...(share.bindings || []).map((binding) => `${binding.app} ${binding.providerId} ${binding.providerType}`),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+      .includes(normalizedQuery);
+  });
 }
 
 function ShareStat({ label, value }: { label: string; value: ReactNode }) {

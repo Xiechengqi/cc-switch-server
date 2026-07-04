@@ -65,15 +65,15 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | U0 | 组件体系基座 | desktop `package.json`（shadcn/Radix/lucide/dnd-kit/react-query 等）、`src/components/ui/**`、design tokens（tailwind config/index.css 变量） | web-src 依赖与 desktop 对齐；复制 `components/ui` 与主题变量；建立"desktop 组件移植通道"目录约定（`web-src/src/components` 镜像 desktop 路径） | shadcn/Radix UI 基座、desktop token 层、ThemeProvider 和 Vite build/typecheck/static-checks 通过；ProviderCard 原样迁移留到 U2 | M | — | 已完成（2026-07-04，静态基座） |
 | U1 | App 壳移植（去侧边栏） | `src/App.tsx` header/视图切换、`AppSwitcher`、`ProxyToggle`、`FailoverToggle`、`UpdateBadge`、`useAutoCompact` | 移植顶栏布局与视图状态机；侧边栏删除；retained 视图映射：providers（默认）/share/universal/usage/settings；accounts 并入设置 AuthCenter tab（对齐 desktop IA）；excluded 图标不渲染；移除左下调试态 | 已完成：无侧边栏、desktop 风格 logo/设置/Share/Failover/app pills/工具图标/橙色+；Accounts 独立 view/header 图标已移除并迁入 Settings Auth tab；设置/备份/导入图标可跳转 Settings 对应 tab；desktop UpdateBadge 已按 server binary 形态替换为 build/version badge 并链接 About tab；useAutoCompact 为桌面窗口布局专属，server web 暂不渲染 | L | U0 | 部分完成（2026-07-04，壳 + settings tab + build badge） |
-| U2 | Provider 主视图 | `providers/ProviderList|ProviderCard|ProviderEmptyState|ProviderActions|HealthStatusIndicator|FailoverPriorityBadge`、dnd 排序 | 替换 ProviderDashboard：全宽卡片列表、拖拽排序（接 sort-order shim）、当前 provider 高亮、URL/刷新时间/订阅徽章/账号 email 行内展示；统计卡片行删除；类型矩阵移出主页 | 已完成主页降噪、单列列表、desktop 风格图标/拖拽手柄视觉、URL 行、行内订阅徽章、账号/状态信息、当前 provider 高亮；真实 dnd 排序已接入并持久化 provider `sortIndex`；ProviderCard 已按当前排序展示 primary/fallback failover priority badge；完整 desktop ProviderCard 行为仍待深化 | L | U1/U10 | 部分完成（2026-07-04，ProviderCard + dnd sort + failover badge） |
-| U3 | 添加/编辑对话框 | `AddProviderDialog`/`EditProviderDialog`/`providers/forms/**`（per-app fields + OAuth sections + preset picker）/`ConfirmDialog`/`JsonEditor` | 移植对话框与表单；"可用供应商类型/仅诊断"信息收进添加流程；server 专有字段（adapter readiness 等）放高级折叠 | 已完成首切：添加入口进入 provider catalog modal，presets 与 provider types 在 dialog 内选择；Provider add/edit 表单已增加图标预览、icon 名称和颜色编辑；已移植 desktop-style `ConfirmDialog` 并替换浏览器原生 confirm；已新增轻量 `JsonEditor`/`JsonPreview` 并接入 Provider/Universal/Accounts JSON 表单和各详情预览；Provider form 已新增 authentication/endpoint section，集中 manual token、managed account、base URL/API format；完整 desktop per-app form 组件复用仍待深化 | XL | U2 | 部分完成（2026-07-04，catalog + auth section + icon/JSON components） |
-| U4 | 设置面板 | `settings/SettingsPage` + `LanguageSettings`/`ThemeSettings`/`GlobalProxySettings`/`ImportExportSection`/`BackupListSection`/`AuthCenterPanel`/`AboutSection` | 移植 tab 式全屏设置；Router/tunnel/upstream proxy 作为新增 tab；主题切换入口生效；现 SettingsDashboard 退役 | 已完成 SettingsDashboard 首切：General/Proxy/Router/Tunnel/Auth/Backup/ImportExport/Diagnostics/About tabs、主题切换入口、server-only tab 归位，支持 App 顶栏图标指定初始 tab；About tab 已展示 server build/version/commit metadata；ImportExport tab 已接入 providers/shares/universal JSON 导入导出；完整 desktop `SettingsPage` 组件迁移和 AuthCenter 合并仍待深化 | L | U1 | 部分完成（2026-07-04，tab 壳 + About + ImportExport） |
-| U5 | Share 页面 | `share/**`（SharePage/ShareCard/ShareStatsBar/ShareToolbar/ShareRequestLogTable/TunnelConfigPanel/Owner 对话框族） | 替换 ShareDashboard；connect-info/market/grant/tunnel 等 server 能力接到 desktop 组件对应位置 | 已完成首切：Share stats bar、ShareCard 头部/状态/market badge、binding chips 接入 app/provider 图标；Owner/market/connect/tunnel 操作已保留；最近 share request log 已从宽表格改为 activity cards；新增 TunnelConfigPanel 汇总 router/tunnel/market 状态并复用 snapshot/restore/edits/markets 动作；Owner change 弹窗已改为 owner handoff 步骤面板；完整 desktop SharePage 组件复用仍待深化 | L | U1/U10 | 部分完成（2026-07-04，ShareCard/Stats/RequestLogCards/TunnelConfig/OwnerDialog） |
+| U2 | Provider 主视图 | `providers/ProviderList|ProviderCard|ProviderEmptyState|ProviderActions|HealthStatusIndicator|FailoverPriorityBadge`、dnd 排序 | 替换 ProviderDashboard：全宽卡片列表、拖拽排序（接 sort-order shim）、当前 provider 高亮、URL/刷新时间/订阅徽章/账号 email 行内展示；统计卡片行删除；类型矩阵移出主页 | 已完成主页降噪、单列列表、desktop 风格图标/拖拽手柄视觉、URL 行、行内订阅徽章、账号/状态信息、当前 provider 高亮；ProviderList 已补搜索与结果计数；真实 dnd 排序已接入并持久化 provider `sortIndex`；ProviderCard 已按当前排序展示 primary/fallback failover priority badge；空态已对齐 desktop `ProviderEmptyState` 的图标、说明和 import/add 双动作；ProviderCard 已补 desktop-style health dot + operational/degraded/failed + latency indicator；ProviderActions 已补 duplicate；完整 desktop ProviderCard 行为仍待深化 | L | U1/U10 | 部分完成（2026-07-04，ProviderList search + ProviderCard + dnd sort + actions） |
+| U3 | 添加/编辑对话框 | `AddProviderDialog`/`EditProviderDialog`/`providers/forms/**`（per-app fields + OAuth sections + preset picker）/`ConfirmDialog`/`JsonEditor` | 移植对话框与表单；"可用供应商类型/仅诊断"信息收进添加流程；server 专有字段（adapter readiness 等）放高级折叠 | 已完成首切：添加入口进入 provider catalog modal，presets 与 provider types 在 dialog 内选择；Provider catalog 已补搜索、推荐/A-Z 排序和结果计数；Provider add/edit 表单已增加图标预览、IconPicker 和颜色编辑；已移植 desktop-style `ConfirmDialog` 并替换浏览器原生 confirm；已新增轻量 `JsonEditor`/`JsonPreview` 并接入 Provider/Universal/Accounts JSON 表单和各详情预览；Provider form 已新增 authentication/endpoint section，集中 manual token、managed account、base URL/API format；完整 desktop per-app form 组件复用仍待深化 | XL | U2 | 部分完成（2026-07-04，catalog search/sort + auth section + icon/JSON components） |
+| U4 | 设置面板 | `settings/SettingsPage` + `LanguageSettings`/`ThemeSettings`/`GlobalProxySettings`/`ImportExportSection`/`BackupListSection`/`AuthCenterPanel`/`AboutSection` | 移植 tab 式全屏设置；Router/tunnel/upstream proxy 作为新增 tab；主题切换入口生效；现 SettingsDashboard 退役 | 已完成 SettingsDashboard 首切：General/Language/Theme/Directory/Proxy/Router/Tunnel/Auth/Backup/ImportExport/Diagnostics/About tabs、主题切换入口、server-only tab 归位，支持 App 顶栏图标指定初始 tab；Directory tab 已展示 server config dir/web dist/embedded assets 和主要 store path；About tab 已展示 server build/version/commit metadata；ImportExport tab 已接入 providers/shares/universal JSON 导入导出；完整 desktop `SettingsPage` 组件迁移和 AuthCenter 合并仍待深化 | L | U1 | 部分完成（2026-07-04，tab 壳 + Language/Theme/Directory + About + ImportExport） |
+| U5 | Share 页面 | `share/**`（SharePage/ShareCard/ShareStatsBar/ShareToolbar/ShareRequestLogTable/TunnelConfigPanel/Owner 对话框族） | 替换 ShareDashboard；connect-info/market/grant/tunnel 等 server 能力接到 desktop 组件对应位置 | 已完成首切：Share stats bar、ShareToolbar 搜索/状态/sale 过滤、ShareCard 头部/状态/market badge、binding chips 接入 app/provider 图标；Owner/market/connect/tunnel 操作已保留；最近 share request log 已从宽表格改为 activity cards；新增 TunnelConfigPanel 汇总 router/tunnel/market 状态并复用 snapshot/restore/edits/markets 动作；Owner change 弹窗已改为 owner handoff 步骤面板；完整 desktop SharePage 组件复用仍待深化 | L | U1/U10 | 部分完成（2026-07-04，ShareCard/Stats/Toolbar/RequestLogCards/TunnelConfig/OwnerDialog） |
 | U6 | Usage 页面 | desktop usage 视图（BarChart 图表、日期范围选择） | 替换 UsageDashboard 的文本表为 desktop 图表组件；保留 server 特有过滤参数 | 已完成首切：summary metric cards、轻量 SVG trend chart、range bucket 点击反填 custom range；providers/models 表格已增加 usage ranking cell 与 tokens 进度条；logs/pricing/limits 已从表格堆叠改为 desktop-style activity/pricing/limit cards；后续只剩更深的 desktop usage tab 组件复用与人工核对 | M | U1 | 部分完成（2026-07-04，图表化 + ranking + cards） |
-| U7 | Universal 面板 | `universal/UniversalProviderPanel` | 替换 UniversalDashboard | 已完成首切：移除 summary tiles，Universal 卡片改为 desktop `UniversalProviderCard` 风格（品牌图标、providerType、base URL、app chips、hover actions、折叠高级预览）；Universal 卡片已接入 dnd 排序并持久化 `sortIndex`；Universal 表单已将 Claude/Codex/Gemini 配置收进 per-app section cards；完整 desktop `UniversalProviderPanel` 组件复用仍待深化 | M | U1/U10 | 部分完成（2026-07-04，卡片视觉 + dnd sort + app sections） |
-| U8 | 账号/quota 组件 | `AuthCenterPanel` + `*QuotaFooter`（Claude/Codex/Gemini/Cursor/Copilot/Kiro/Ollama/Antigravity/Subscription） | AccountsDashboard 功能迁入 AuthCenter tab；quota footer 组件按 provider 渲染 | 已完成首切：AccountsDashboard 嵌入 Settings Auth tab，App 顶栏独立 accounts 入口删除；Auth tab 的账号/能力卡片已接入 provider 图标和 AuthCenter 式卡片头；ProviderCard 已按绑定 account 渲染 quota footer（plan/quota/expiry、进度条、tier 摘要）；Auth tab 新增 AuthCenter overview provider cards，汇总账号数、refresh/quota/import 能力并提供 import 入口；完整 desktop `AuthCenterPanel` 和各 provider 专属 quota footer 仍待迁移 | L | U4 | 部分完成（2026-07-04，accounts IA + AuthCenter overview + quota footer） |
+| U7 | Universal 面板 | `universal/UniversalProviderPanel` | 替换 UniversalDashboard | 已完成首切：移除 summary tiles，Universal 卡片改为 desktop `UniversalProviderCard` 风格（品牌图标、providerType、base URL、app chips、hover actions、折叠高级预览）；Universal 卡片已接入 dnd 排序并持久化 `sortIndex`；Universal 表单已将 Claude/Codex/Gemini 配置收进 per-app section cards；Universal preset modal 已补搜索、recommended/A-Z 排序和结果计数；完整 desktop `UniversalProviderPanel` 组件复用仍待深化 | M | U1/U10 | 部分完成（2026-07-04，卡片视觉 + dnd sort + app sections + preset search） |
+| U8 | 账号/quota 组件 | `AuthCenterPanel` + `*QuotaFooter`（Claude/Codex/Gemini/Cursor/Copilot/Kiro/Ollama/Antigravity/Subscription） | AccountsDashboard 功能迁入 AuthCenter tab；quota footer 组件按 provider 渲染 | 已完成首切：AccountsDashboard 嵌入 Settings Auth tab，App 顶栏独立 accounts 入口删除；Auth tab 的账号/能力卡片已接入 provider 图标和 AuthCenter 式卡片头；ProviderCard 已按绑定 account 渲染 quota footer（plan/quota/expiry、进度条、tier 摘要）；Auth tab 新增 AuthCenter overview provider cards，汇总账号数、refresh/quota/import 能力并提供 import 入口；AccountCard 已补 quota footer（quota readiness、percent meter、tier progress、refresh/error 信息）；完整 desktop `AuthCenterPanel` 和各 provider 专属 quota footer 仍待迁移 | L | U4 | 部分完成（2026-07-04，accounts IA + AuthCenter overview + quota footer） |
 | U9 | i18n 全量（承接 N2） | desktop `src/i18n/locales`（已复制） | 移植过程中每个组件保留 desktop 原 `t()` key，不再手写英文字面量；补 JSX 英文字面量扫描进 `static-checks.sh` | JSX 英文字面量静态审计已降为 0 并纳入门禁；四语言语义完整性仍待人工/词条级核对 | 贯穿 U1–U8 | U0 | 部分完成（2026-07-04，静态审计清零） |
-| U10 | 品牌图标与主题 | `BrandIcons.tsx`/`ProviderIcon.tsx`/`iconInference.ts`/`ColorPicker`/`mode-toggle` | 移植图标推断与品牌图标；卡片/切换器/preset 均带图标；暗色模式端到端可用 | 已移植 server-local `ProviderIcon`、小型 desktop 图标注册表、图标推断，并接入 App 切换器/ProviderCard/preset 卡片；Provider/Universal 表单均已支持图标预览与颜色编辑；新增轻量 `ColorPicker`，替换 Provider/Universal 原生颜色字段；图标集已补 GitHub/Google Cloud/Doubao/SiliconFlow/StepFun/Meta/Huawei/NewAPI/SubRouter/ByteDance 并改为长关键词优先推断；完整 desktop 图标全集仍可继续按需补齐 | M | U0 | 部分完成（2026-07-04，品牌图标 + icon edit + ColorPicker + icon expansion） |
+| U10 | 品牌图标与主题 | `BrandIcons.tsx`/`ProviderIcon.tsx`/`iconInference.ts`/`ColorPicker`/`mode-toggle` | 移植图标推断与品牌图标；卡片/切换器/preset 均带图标；暗色模式端到端可用 | 已移植 server-local `ProviderIcon`、小型 desktop 图标注册表、图标推断，并接入 App 切换器/ProviderCard/preset 卡片；Provider/Universal 表单均已支持图标预览、IconPicker 与颜色编辑；新增轻量 `ColorPicker`，替换 Provider/Universal 原生颜色字段；图标集已补 GitHub/Google Cloud/Doubao/SiliconFlow/StepFun/Meta/Huawei/NewAPI/SubRouter/ByteDance 并改为长关键词优先推断；完整 desktop 图标全集仍可继续按需补齐 | M | U0 | 部分完成（2026-07-04，品牌图标 + IconPicker + ColorPicker + icon expansion） |
 | U11 | 人工核对收口 | 两张基线截图 + `docs/manual-ui-checklist.md` | 按本文件第二节 24 点逐项核对并记录；桌面/移动宽度、亮/暗主题 | 24 点全部勾销或标注豁免理由 | S（人工） | U1–U10 | 待办 |
 
 ## 五、执行顺序
@@ -347,6 +347,83 @@ U0（基座）→ U1（壳）→ U2（Provider 主视图）→ U3（对话框，
 - 该 badge 只读展示，不改 sort-order API、不改 failover 配置；拖拽排序仍通过既有 `updateProvidersSortOrder()` 持久化。
 - 样式限制 badge 宽度，避免长 provider 名称和多个状态徽章挤压标题行。
 - 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=723099 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U8 Account quota footer
+
+- `AccountsDashboard` 的 `AccountCard` 新增 `AccountQuotaFooter`，在 Settings/Auth 的账号卡中直接展示 quota readiness、quota percent、subscription、quota refreshed time 和 next refresh。
+- 当账号存在 `quota.tiers` 时展示最多 3 个 tier 的 used/limit/unit/reset 摘要与 utilization progress；无 quota 能力且无 snapshot 时不渲染 footer，避免制造空 UI。
+- 复用 `AccountRecord` 已有 `quotaPercent`、`quota.tiers`、`quotaRefreshedAt`、`quotaNextRefreshAt`、`lastRefreshError`，不新增 API/schema；样式使用独立 `.account-quota-*` 作用域，避免影响 ProviderCard quota footer。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=726535 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U2 Provider empty state
+
+- `ProviderDashboard` 新增 server-local `ProviderEmptyState`，对齐 desktop `ProviderEmptyState` 的圆形 Users 图标、居中标题/说明和双操作区。
+- 空态的 import 动作接入 App 层 Settings/ImportExport tab；add 动作继续复用现有 provider catalog，不新增 API、不改变 provider 创建流程。
+- `.provider-empty-state`、`.provider-empty-icon`、`.provider-empty-actions` 样式独立扩展，保留 `.provider-empty` 给其他页面紧凑空态复用。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=727837 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U2 Provider health indicator
+
+- `ProviderCard` 右上角从普通 healthy/unhealthy pill 改为 server-local `ProviderHealthIndicator`，对齐 desktop `HealthStatusIndicator` 的状态圆点 + 文案 + latency 形态。
+- 基于已有 `ProviderHealth` 计算 `operational` / `degraded` / `failed`：无 health snapshot 或成功率低于 95% 显示 degraded，`healthy=false` 显示 failed；不新增后端字段。
+- 样式新增 `.provider-health-*`，保留 recent requests 文本作为辅助信息，避免丢失 server 现有 health 汇总。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=728884 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U3 Provider catalog search/sort
+
+- `ProviderCatalogModal` 新增 desktop preset selector 风格的搜索框，按名称、provider type、api format、base URL、note 同时过滤 presets 和 server provider types。
+- 新增 recommended / A-Z 排序切换与结果计数；recommended 保持后端/预设原顺序，A-Z 只在前端展示层排序，不改变创建 API。
+- 搜索无结果时分别展示 presets/types 的空态文案；选择 preset/type 的原有流程不变。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=731467 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U10 IconPicker
+
+- 新增 server-local `IconPicker`，从 `icons/extracted/metadata.ts` 读取 desktop 图标元数据，支持搜索、选择、清空和保留自定义 icon 名称。
+- Provider add/edit 与 Universal provider form 的 icon 字段从裸文本输入升级为 icon preview + searchable icon grid；仍写入原有 `icon` 字段，不改变 schema。
+- IconPicker 与 `ColorPicker` 共处同一 icon editor 区域，保留自动推断 fallback icon/color；样式限制网格与输入宽度，避免撑开 modal。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=734275 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U7 Universal preset search/sort
+
+- `UniversalPresetModal` 新增和 Provider catalog 一致的搜索工具栏，按 preset name、providerType、description、websiteUrl、icon 过滤。
+- 新增 recommended / A-Z 排序切换与结果计数；recommended 保持 API 返回顺序，A-Z 仅改变前端展示顺序。
+- 搜索无结果时显示紧凑空态；选择 preset 后进入原有 draft 编辑流程，不改变 Universal provider schema/API。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=735461 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U5 Share toolbar
+
+- Share 页面新增 `ShareToolbar`，在 stats bar 后提供 share 搜索、all/active/paused/for sale 分段过滤和当前结果计数。
+- 搜索覆盖 share id、displayName、ownerEmail、status、tunnel subdomain、description、sale market、primary binding 和所有 bindings；只改变前端展示列表，不改变后端 API。
+- 列表空过滤结果显示紧凑空态；原有 create/import/export/tunnel/market 操作保持在页面主 toolbar。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=738325 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U4 Language/Theme tabs
+
+- `SettingsDashboard` 新增 `language` 与 `theme` tabs，对齐 desktop SettingsPage 中 LanguageSettings / ThemeSettings 独立 tab 的信息架构。
+- General tab 现在只保留运行摘要和 readiness；原语言选择器迁入 Language tab，`ThemeSettingsPanel` 迁入 Theme tab，功能和状态来源不变。
+- server-only Proxy/Router/Tunnel/Auth/Backup/ImportExport/Diagnostics/About tabs 保持原位，不改变 settings API。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=738520 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U2 Provider duplicate action
+
+- ProviderCard actions 新增 duplicate 按钮，对齐 desktop `ProviderActions` 中的复制入口。
+- duplicate 通过现有 `saveProvider()` 创建 provider 副本：生成唯一 `id`，名称追加 `copy`，`sortIndex` 放到当前 app 队列末尾；不新增后端 API。
+- 复制成功后刷新列表并在新 provider 上展示结果提示；原 edit/test/network/stream/models/switch/delete 行为不变。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=739396 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U2 ProviderList search
+
+- Provider 主视图新增 `ProviderListToolbar`，提供 provider 搜索和 visible/total 结果计数，对齐 desktop ProviderList 的搜索体验。
+- 搜索覆盖 provider id/name/type、model、base URL、api format、managed account email/subscription 和 category；只影响前端展示，不改变 providers API。
+- DND 排序仍按完整 active app provider 队列计算 priority 和 sort order；过滤无结果时显示紧凑空态。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=741301 < 900000`；未启动 server，未做 UI 自动化。
+
+### 2026-07-04 U4 Directory tab
+
+- `SettingsDashboard` 新增 `directory` tab，对齐 desktop SettingsPage 的 Directory 信息架构。
+- Directory tab 复用 `/web-api/context` 的 runtime 信息展示 config dir、web dist dir、embedded web assets 数量和主要 store 文件路径；不新增后端 API。
+- `refresh()` 同步加载 settings dashboard data 与 runtime context；context 失败时只影响 Directory tab 的只读详情，不阻塞 settings 主数据加载。
+- 验证：`npm --prefix web-src run typecheck`、`npm --prefix web-src run build`、`scripts/static-checks.sh` 均通过；`webDistBytes=743588 < 900000`；未启动 server，未做 UI 自动化。
 
 ## 六、验证基线
 

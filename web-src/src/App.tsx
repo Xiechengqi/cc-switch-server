@@ -106,7 +106,13 @@ function App() {
     }
     switch (view) {
       case "providers":
-        return <ProviderDashboard activeApp={activeApp} onActiveAppChange={setActiveApp} />;
+        return (
+          <ProviderDashboard
+            activeApp={activeApp}
+            onActiveAppChange={setActiveApp}
+            onOpenImportExport={() => openSettings("importExport")}
+          />
+        );
       case "shares":
         return <ShareDashboard />;
       case "usage":

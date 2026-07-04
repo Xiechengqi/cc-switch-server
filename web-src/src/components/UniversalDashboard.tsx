@@ -16,6 +16,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
+  ArrowUpAZ,
   Boxes,
   Copy,
   Download,
@@ -27,6 +28,7 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  Search,
   Trash2,
   Upload,
   X,
@@ -59,6 +61,7 @@ import { useI18n } from "@/lib/i18n";
 import { inferIconForText } from "@/config/iconInference";
 import { ColorPicker } from "@/components/ColorPicker";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { IconPicker } from "@/components/IconPicker";
 import JsonEditor from "@/components/JsonEditor";
 import { JsonPreview } from "@/components/JsonPreview";
 import { ProviderIcon } from "@/components/ProviderIcon";
@@ -559,10 +562,14 @@ function UniversalFormModal({
                 size={24}
               />
             </div>
-            <label>
-              <span>{tx("Icon")}</span>
-              <input value={draft.icon} onChange={(event) => patch({ icon: event.target.value })} />
-            </label>
+            <IconPicker
+              label={tx("Icon")}
+              value={draft.icon}
+              fallbackIcon={inferredPreviewIcon.icon}
+              fallbackColor={previewIcon.color}
+              providerName={draft.name || draft.providerType || "Universal"}
+              onChange={(value) => patch({ icon: value })}
+            />
             <ColorPicker
               label={tx("Color")}
               value={draft.iconColor}
@@ -754,34 +761,92 @@ function UniversalPresetModal({
   onClose: () => void;
 }) {
   const { tx } = useI18n();
+  const [query, setQuery] = useState("");
+  const [sortMode, setSortMode] = useState<"recommended" | "name">("recommended");
+  const visiblePresets = useMemo(
+    () => filterUniversalPresets(presets, query, sortMode),
+    [presets, query, sortMode],
+  );
   return (
     <SimpleModal title="Create Universal From Preset" subtitle="Preset defaults are loaded into the editable form before saving." onClose={onClose}>
+      <div className="provider-catalog-toolbar universal-preset-toolbar">
+        <label className="provider-catalog-search">
+          <Search size={15} />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder={tx("Search universal presets")}
+          />
+        </label>
+        <button
+          className={sortMode === "name" ? "secondary-button compact active" : "secondary-button compact"}
+          type="button"
+          onClick={() => setSortMode((current) => (current === "name" ? "recommended" : "name"))}
+          aria-label={tx("Sort presets")}
+          title={tx("Sort presets")}
+        >
+          <ArrowUpAZ size={14} />
+          <span>{tx(sortMode === "name" ? "A-Z" : "recommended")}</span>
+        </button>
+        <span className="provider-catalog-count">
+          {tx("{{count}} presets", { count: visiblePresets.length })}
+        </span>
+      </div>
       <div className="provider-preset-grid">
-        {presets.map((preset) => (
-          <button
-            className="provider-preset-card"
-            type="button"
-            key={preset.providerType}
-            onClick={() => onSelect(preset)}
-          >
-            <span className="provider-preset-title">
-              <span className="provider-icon-frame small">
-                <ProviderIcon
-                  icon={universalPresetIcon(preset).icon}
-                  name={preset.name}
-                  color={universalPresetIcon(preset).color}
-                  size={18}
-                />
+        {visiblePresets.length ? (
+          visiblePresets.map((preset) => (
+            <button
+              className="provider-preset-card"
+              type="button"
+              key={preset.providerType}
+              onClick={() => onSelect(preset)}
+            >
+              <span className="provider-preset-title">
+                <span className="provider-icon-frame small">
+                  <ProviderIcon
+                    icon={universalPresetIcon(preset).icon}
+                    name={preset.name}
+                    color={universalPresetIcon(preset).color}
+                    size={18}
+                  />
+                </span>
+                <strong>{preset.name}</strong>
               </span>
-              <strong>{preset.name}</strong>
-            </span>
-            <span>{preset.providerType}</span>
-            <small>{preset.description || tx("Universal provider template")}</small>
-          </button>
-        ))}
+              <span>{preset.providerType}</span>
+              <small>{preset.description || tx("Universal provider template")}</small>
+            </button>
+          ))
+        ) : (
+          <div className="provider-empty inline-empty">{tx("No universal presets match this search")}</div>
+        )}
       </div>
     </SimpleModal>
   );
+}
+
+function filterUniversalPresets(
+  presets: UniversalProviderPreset[],
+  query: string,
+  sortMode: "recommended" | "name",
+): UniversalProviderPreset[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = normalizedQuery
+    ? presets.filter((preset) =>
+        [
+          preset.name,
+          preset.providerType,
+          preset.description,
+          preset.websiteUrl,
+          preset.icon,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase()
+          .includes(normalizedQuery),
+      )
+    : presets;
+  if (sortMode === "recommended") return filtered;
+  return [...filtered].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function TextField({

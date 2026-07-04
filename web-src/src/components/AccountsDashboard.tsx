@@ -553,6 +553,7 @@ function AccountCard({
       <div className="provider-card-result">
         {result || account.lastRefreshError || quotaTierSummary(account) || capability?.blockingReason || "account imported"}
       </div>
+      <AccountQuotaFooter account={account} capability={capability} />
       {detail && (
         <details className="json-details">
           <summary>{detail.kind === "plan" ? "Refresh plan" : "Quota result"}</summary>
@@ -614,6 +615,57 @@ function AccountCard({
         onCancel={() => setDeleteConfirmOpen(false)}
       />
     </>
+  );
+}
+
+function AccountQuotaFooter({
+  account,
+  capability,
+}: {
+  account: AccountRecord;
+  capability?: AccountManagerCapability;
+}) {
+  const { tx } = useI18n();
+  const quotaPercent = accountQuotaPercent(account);
+  const tiers = account.quota?.tiers || [];
+  const hasQuotaData = quotaPercent != null || tiers.length > 0 || account.quotaRefreshedAt != null || account.quotaNextRefreshAt != null;
+  if (!capability?.supportsQuota && !hasQuotaData) return null;
+  return (
+    <div className="account-quota-footer">
+      <div className="account-quota-line">
+        <span>{capability?.supportsQuota ? tx("quota ready") : tx("quota gated")}</span>
+        <span>{quotaPercent == null ? tx("quota -") : `${quotaPercent.toFixed(1)}%`}</span>
+        <span>{account.subscriptionLevel || tx("account")}</span>
+        <span>{formatTime(account.quotaRefreshedAt)}</span>
+      </div>
+      {quotaPercent != null && (
+        <div className="account-quota-meter" aria-label={tx("quota")}>
+          <span style={{ width: `${clampPercent(quotaPercent)}%` }} />
+        </div>
+      )}
+      {tiers.length > 0 && (
+        <div className="account-quota-tier-list">
+          {tiers.slice(0, 3).map((tier) => (
+            <div className="account-quota-tier" key={tier.name}>
+              <div>
+                <strong>{tier.name}</strong>
+                <span>{accountTierLine(tier)}</span>
+              </div>
+              <div className="account-quota-tier-meter">
+                <span style={{ width: `${clampPercent(tier.utilization ?? 0)}%` }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {account.quotaNextRefreshAt != null && (
+        <div className="account-quota-note">
+          <span>{tx("next refresh")}</span>
+          <strong>{formatTime(account.quotaNextRefreshAt)}</strong>
+        </div>
+      )}
+      {account.lastRefreshError && <strong className="account-quota-error">{account.lastRefreshError}</strong>}
+    </div>
   );
 }
 
@@ -1511,9 +1563,8 @@ function normalizeTimestamp(value?: number | null): number | null {
 }
 
 function formatQuotaPercent(account: AccountRecord): string {
-  if (account.quotaPercent != null) return `${account.quotaPercent.toFixed(1)}%`;
-  const utilization = account.quota?.tiers?.find((tier) => tier.utilization != null)?.utilization;
-  return utilization == null ? "-" : `${utilization.toFixed(1)}%`;
+  const quotaPercent = accountQuotaPercent(account);
+  return quotaPercent == null ? "-" : `${quotaPercent.toFixed(1)}%`;
 }
 
 function quotaTierSummary(account: AccountRecord): string | null {
@@ -1527,6 +1578,37 @@ function quotaTierSummary(account: AccountRecord): string | null {
       return `${tier.name}${usage}${unit}`;
     })
     .join("; ");
+}
+
+type AccountQuotaTier = NonNullable<NonNullable<AccountRecord["quota"]>["tiers"]>[number];
+
+function accountQuotaPercent(account: AccountRecord): number | null {
+  if (account.quotaPercent != null) return account.quotaPercent;
+  const utilization = account.quota?.tiers?.find((tier) => tier.utilization != null)?.utilization;
+  return utilization == null ? null : utilization;
+}
+
+function accountTierLine(tier: AccountQuotaTier): string {
+  const usage = tier.used != null && tier.limit != null
+    ? `${formatCompactNumber(tier.used)}/${formatCompactNumber(tier.limit)}`
+    : tier.utilization == null
+      ? "-"
+      : `${tier.utilization.toFixed(1)}%`;
+  const unit = tier.unit ? ` ${tier.unit}` : "";
+  const reset = tier.resetsAt == null ? "" : ` · ${formatTime(tier.resetsAt)}`;
+  return `${usage}${unit}${reset}`;
+}
+
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function formatCompactNumber(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`;
+  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
 }
 
 function bankedResetSummary(account: AccountRecord): BankedResetSummary | null {
