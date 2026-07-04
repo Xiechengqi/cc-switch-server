@@ -1,9 +1,27 @@
 import {
+  closestCenter,
+  DndContext,
+  DragEndEvent,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  rectSortingStrategy,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
   Boxes,
   Copy,
   Download,
   Edit3,
   Globe,
+  GripVertical,
   ListPlus,
   Loader2,
   Plus,
@@ -13,7 +31,16 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  CSSProperties,
+  FormEvent,
+  HTMLAttributes,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import {
   deleteUniversalProvider,
@@ -29,6 +56,10 @@ import {
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { inferIconForText } from "@/config/iconInference";
+import { ColorPicker } from "@/components/ColorPicker";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import JsonEditor from "@/components/JsonEditor";
+import { JsonPreview } from "@/components/JsonPreview";
 import { ProviderIcon } from "@/components/ProviderIcon";
 
 interface UniversalDraft {
@@ -75,6 +106,10 @@ export function UniversalDashboard() {
   const [presetOpen, setPresetOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [exportText, setExportText] = useState<string | null>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
 
   const list = useMemo(
     () =>
@@ -134,9 +169,6 @@ export function UniversalDashboard() {
   }
 
   async function deleteProvider(provider: UniversalProvider) {
-    if (!window.confirm(tx("Delete universal provider {{name}}? Derived app providers will be removed.", { name: provider.name }))) {
-      return;
-    }
     await runAction(`delete:${provider.id}`, async () => {
       const deleted = await deleteUniversalProvider(provider.id);
       return deleted ? tx("deleted {{name}}", { name: provider.name }) : tx("{{name}} was not found", { name: provider.name });
@@ -155,6 +187,34 @@ export function UniversalDashboard() {
       const sync = await syncUniversalProvider(saved.id);
       return tx("duplicated {{name}}; {{summary}}", { name: saved.name, summary: syncSummary(sync, tx) });
     });
+  }
+
+  async function handleUniversalDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIndex = list.findIndex((provider) => provider.id === active.id);
+    const newIndex = list.findIndex((provider) => provider.id === over.id);
+    if (oldIndex < 0 || newIndex < 0) return;
+
+    const reordered = arrayMove(list, oldIndex, newIndex);
+    const sortedProviders = reordered.map((provider, index) => ({
+      ...provider,
+      sortIndex: index,
+    }));
+    setProviders((current) => {
+      const next = { ...current };
+      for (const provider of sortedProviders) {
+        next[provider.id] = provider;
+      }
+      return next;
+    });
+    setError(null);
+    try {
+      await Promise.all(sortedProviders.map((provider) => saveUniversalProvider(provider)));
+    } catch (reason) {
+      setError(errorMessage(reason));
+      await refresh();
+    }
   }
 
   async function exportAction() {
@@ -219,19 +279,23 @@ export function UniversalDashboard() {
           <span>{t("server.universal.loading")}</span>
         </div>
       ) : list.length ? (
-        <div className="universal-card-grid">
-          {list.map((provider) => (
-            <UniversalCard
-              key={provider.id}
-              provider={provider}
-              busy={busy}
-              onEdit={() => setDraft(draftFromProvider(provider))}
-              onSync={() => void syncProvider(provider)}
-              onDuplicate={() => void duplicateProvider(provider)}
-              onDelete={() => void deleteProvider(provider)}
-            />
-          ))}
-        </div>
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleUniversalDragEnd(event)}>
+          <SortableContext items={list.map((provider) => provider.id)} strategy={rectSortingStrategy}>
+            <div className="universal-card-grid">
+              {list.map((provider) => (
+                <SortableUniversalCard
+                  key={provider.id}
+                  provider={provider}
+                  busy={busy}
+                  onEdit={() => setDraft(draftFromProvider(provider))}
+                  onSync={() => void syncProvider(provider)}
+                  onDuplicate={() => void duplicateProvider(provider)}
+                  onDelete={() => void deleteProvider(provider)}
+                />
+              ))}
+            </div>
+          </SortableContext>
+        </DndContext>
       ) : (
         <div className="provider-empty">
           <Boxes size={24} />
@@ -293,6 +357,42 @@ export function UniversalDashboard() {
   );
 }
 
+function SortableUniversalCard(props: UniversalCardProps) {
+  const { attributes, listeners, setActivatorNodeRef, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: props.provider.id });
+  const style: CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+  const dragHandleProps: DragHandleProps = {
+    ...attributes,
+    ...listeners,
+    ref: setActivatorNodeRef,
+  };
+  return (
+    <UniversalCard
+      {...props}
+      dragHandleProps={dragHandleProps}
+      nodeRef={setNodeRef}
+      style={style}
+      dragging={isDragging}
+    />
+  );
+}
+
+type DragHandleProps = HTMLAttributes<HTMLButtonElement> & {
+  ref?: (node: HTMLButtonElement | null) => void;
+};
+
+interface UniversalCardProps {
+  provider: UniversalProvider;
+  busy: string | null;
+  onEdit: () => void;
+  onSync: () => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+}
+
 function UniversalCard({
   provider,
   busy,
@@ -300,21 +400,40 @@ function UniversalCard({
   onSync,
   onDuplicate,
   onDelete,
-}: {
-  provider: UniversalProvider;
-  busy: string | null;
-  onEdit: () => void;
-  onSync: () => void;
-  onDuplicate: () => void;
-  onDelete: () => void;
+  dragHandleProps,
+  nodeRef,
+  style,
+  dragging,
+}: UniversalCardProps & {
+  dragHandleProps?: DragHandleProps;
+  nodeRef?: (node: HTMLElement | null) => void;
+  style?: CSSProperties;
+  dragging?: boolean;
 }) {
   const { tx } = useI18n();
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const icon = universalProviderIcon(provider);
   const enabledApps = enabledUniversalApps(provider);
   return (
-    <article className="provider-card universal-card">
+    <>
+      <article
+        ref={nodeRef}
+        className={["provider-card universal-card", dragging ? "dragging" : ""]
+          .filter(Boolean)
+          .join(" ")}
+        style={style}
+      >
       <header className="universal-card-header">
         <div className="universal-card-title-row">
+          <button
+            {...dragHandleProps}
+            className="provider-drag-handle"
+            type="button"
+            aria-label={tx("Drag provider")}
+            title={tx("Drag provider")}
+          >
+            <GripVertical size={16} />
+          </button>
           <div className="provider-icon-frame universal-icon-frame">
             <ProviderIcon
               icon={icon.icon}
@@ -338,7 +457,7 @@ function UniversalCard({
           <IconAction title="Edit" onClick={onEdit}>
             <Edit3 size={15} />
           </IconAction>
-          <IconAction title="Delete" busy={busy === `delete:${provider.id}`} onClick={onDelete} danger>
+          <IconAction title="Delete" busy={busy === `delete:${provider.id}`} onClick={() => setDeleteConfirmOpen(true)} danger>
             <Trash2 size={15} />
           </IconAction>
         </div>
@@ -373,7 +492,19 @@ function UniversalCard({
         </div>
         <JsonPreview value={redactUniversalProvider(provider)} />
       </details>
-    </article>
+      </article>
+      <ConfirmDialog
+        isOpen={deleteConfirmOpen}
+        title={tx("Delete universal provider")}
+        message={tx("Delete universal provider {{name}}? Derived app providers will be removed.", { name: provider.name })}
+        confirmText={tx("Delete")}
+        onConfirm={() => {
+          setDeleteConfirmOpen(false);
+          onDelete();
+        }}
+        onCancel={() => setDeleteConfirmOpen(false)}
+      />
+    </>
   );
 }
 
@@ -430,14 +561,12 @@ function UniversalFormModal({
               <span>{tx("Icon")}</span>
               <input value={draft.icon} onChange={(event) => patch({ icon: event.target.value })} />
             </label>
-            <label>
-              <span>{tx("Color")}</span>
-              <input
-                type="color"
-                value={colorInputValue(draft.iconColor || previewIcon.color)}
-                onChange={(event) => patch({ iconColor: event.target.value })}
-              />
-            </label>
+            <ColorPicker
+              label={tx("Color")}
+              value={draft.iconColor}
+              fallback={colorInputValue(previewIcon.color)}
+              onChange={(value) => patch({ iconColor: value })}
+            />
           </div>
           <label className="toggle-row">
             <input type="checkbox" checked={draft.claude} onChange={(event) => patch({ claude: event.target.checked })} />
@@ -636,24 +765,24 @@ function ModelJsonFields({
   return (
     <section className="universal-json-card">
       <h4>{app}</h4>
-      <label>
+      <div className="json-editor-field">
         <span>{tx("modelCatalog JSON")}</span>
-        <textarea
+        <JsonEditor
           value={catalog}
-          onChange={(event) => onCatalog(event.target.value)}
+          onChange={onCatalog}
           placeholder={modelCatalogPlaceholder(app)}
-          spellCheck={false}
+          rows={6}
         />
-      </label>
-      <label>
+      </div>
+      <div className="json-editor-field">
         <span>{tx("modelMapping JSON")}</span>
-        <textarea
+        <JsonEditor
           value={mapping}
-          onChange={(event) => onMapping(event.target.value)}
+          onChange={onMapping}
           placeholder={modelMappingPlaceholder(app)}
-          spellCheck={false}
+          rows={6}
         />
-      </label>
+      </div>
     </section>
   );
 }
@@ -763,10 +892,6 @@ function SimpleModal({
       </section>
     </div>
   );
-}
-
-function JsonPreview({ value }: { value: unknown }) {
-  return <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>;
 }
 
 function emptyDraft(): UniversalDraft {

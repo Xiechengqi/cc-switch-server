@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
-import { AppKind } from "@/lib/api";
+import { AppKind, BuildInfo, loadBuildInfo } from "@/lib/api";
 import {
   getWebRuntimeContext,
   jsonFetch,
@@ -47,6 +47,8 @@ function App() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
+  const isAuthenticated = context?.mode === "local-admin";
 
   const refreshContext = useCallback(async () => {
     const next = await getWebRuntimeContext();
@@ -76,6 +78,24 @@ function App() {
     };
   }, [loadData]);
 
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setBuildInfo(null);
+      return;
+    }
+    let active = true;
+    loadBuildInfo()
+      .then((info) => {
+        if (active) setBuildInfo(info);
+      })
+      .catch(() => {
+        if (active) setBuildInfo(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isAuthenticated]);
+
   const content = useMemo(() => {
     if (!context) return <EmptyState title={t("common.loading")} value={t("server.common.runtime")} />;
     if (context.mode !== "local-admin") {
@@ -99,7 +119,6 @@ function App() {
   }, [activeApp, context, loading, loadData, settingsTab, t, view]);
 
   const activeViewLabel = viewLabel(view, t);
-  const isAuthenticated = context?.mode === "local-admin";
 
   return (
     <main className="app-shell desktop-shell">
@@ -179,6 +198,12 @@ function App() {
 
           <div className="desktop-topbar-actions">
             {error && <span className="error-text">{error}</span>}
+            {isAuthenticated && (
+              <HeaderBuildBadge
+                buildInfo={buildInfo}
+                onClick={() => openSettings("about")}
+              />
+            )}
             <button
               className="icon-button desktop-header-icon"
               type="button"
@@ -282,6 +307,33 @@ function App() {
     setSettingsTab(tab);
     setView("settings");
   }
+}
+
+function HeaderBuildBadge({
+  buildInfo,
+  onClick,
+}: {
+  buildInfo: BuildInfo | null;
+  onClick: () => void;
+}) {
+  const { tx } = useI18n();
+  const label = buildInfo?.commitShort || buildInfo?.version || tx("build");
+  const title = buildInfo
+    ? [buildInfo.versionLine || buildInfo.version, buildInfo.commitMessage, buildInfo.buildTime]
+      .filter(Boolean)
+      .join(" · ")
+    : tx("Build info");
+  return (
+    <button
+      className={buildInfo?.dirty ? "desktop-build-badge dirty" : "desktop-build-badge"}
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-label={tx("Build info")}
+    >
+      <span>{label}</span>
+    </button>
+  );
 }
 
 function HeaderShareToggle({ active, onClick }: { active: boolean; onClick: () => void }) {

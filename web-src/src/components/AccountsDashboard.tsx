@@ -16,6 +16,9 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import JsonEditor from "@/components/JsonEditor";
+import { JsonPreview } from "@/components/JsonPreview";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { inferIconForText } from "@/config/iconInference";
 import {
@@ -163,7 +166,6 @@ export function AccountsDashboard() {
     setError(null);
     try {
       if (action === "delete") {
-        if (!window.confirm(tx("Delete account {{account}}?", { account: account.email || account.id }))) return;
         const deleted = await deleteAccount(account.id);
         setResultById((current) => ({
           ...current,
@@ -396,10 +398,13 @@ function AccountCard({
   detail?: AccountDetail;
   onAction: (action: "refresh" | "quota" | "forceQuota" | "plan" | "delete") => void;
 }) {
+  const { tx } = useI18n();
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const busyPrefix = `${account.id}:`;
   const credentials = credentialFlags(account);
   const icon = accountProviderIcon(account.providerType);
   return (
+    <>
     <article className="account-card">
       <header>
         <div className="account-provider-title-row">
@@ -431,7 +436,7 @@ function AccountCard({
       {detail && (
         <details className="json-details">
           <summary>{detail.kind === "plan" ? "Refresh plan" : "Quota result"}</summary>
-          <JsonPreview value={detail.value} />
+          <JsonPreview value={detail.value} redact />
         </details>
       )}
       <div className="provider-actions">
@@ -469,7 +474,7 @@ function AccountCard({
         </IconAction>
         <IconAction
           title="Delete"
-          onClick={() => onAction("delete")}
+          onClick={() => setDeleteConfirmOpen(true)}
           busy={busyId === `${busyPrefix}delete`}
           danger
         >
@@ -477,6 +482,18 @@ function AccountCard({
         </IconAction>
       </div>
     </article>
+      <ConfirmDialog
+        isOpen={deleteConfirmOpen}
+        title={tx("Delete account")}
+        message={tx("Delete account {{account}}?", { account: account.email || account.id })}
+        confirmText={tx("Delete")}
+        onConfirm={() => {
+          setDeleteConfirmOpen(false);
+          onAction("delete");
+        }}
+        onCancel={() => setDeleteConfirmOpen(false)}
+      />
+    </>
   );
 }
 
@@ -609,7 +626,7 @@ function CodexBankedResetPanel({ accounts }: { accounts: AccountRecord[] }) {
               )}
               <details className="json-details">
                 <summary>{tx("Snapshot JSON")}</summary>
-                <JsonPreview value={summary.raw} />
+                  <JsonPreview value={summary.raw} redact />
               </details>
             </article>
           ))}
@@ -769,7 +786,7 @@ function OAuthPreviewPanel({
       {finishResult?.tokenRequest && (
         <details className="json-details">
           <summary>{tx("Token request")}</summary>
-          <JsonPreview value={finishResult.tokenRequest} />
+          <JsonPreview value={finishResult.tokenRequest} redact />
         </details>
       )}
       {error && <div className="form-error">{error}</div>}
@@ -1069,18 +1086,18 @@ function AccountImportModal({
             <span>{tx("Scopes")}</span>
             <input value={draft.scopes} onChange={(event) => patch({ scopes: event.target.value })} />
           </label>
-          <label className="wide-field">
+          <div className="wide-field json-editor-field">
             <span>{tx("Profile JSON")}</span>
-            <textarea value={draft.profileJson} onChange={(event) => patch({ profileJson: event.target.value })} />
-          </label>
-          <label className="wide-field">
+            <JsonEditor value={draft.profileJson} onChange={(value) => patch({ profileJson: value })} rows={6} />
+          </div>
+          <div className="wide-field json-editor-field">
             <span>{tx("Raw JSON")}</span>
-            <textarea value={draft.rawJson} onChange={(event) => patch({ rawJson: event.target.value })} />
-          </label>
-          <label className="wide-field">
+            <JsonEditor value={draft.rawJson} onChange={(value) => patch({ rawJson: value })} rows={6} />
+          </div>
+          <div className="wide-field json-editor-field">
             <span>{tx("Quota JSON")}</span>
-            <textarea value={draft.quotaJson} onChange={(event) => patch({ quotaJson: event.target.value })} />
-          </label>
+            <JsonEditor value={draft.quotaJson} onChange={(value) => patch({ quotaJson: value })} rows={6} />
+          </div>
           <div className="wide-field template-note">
             <KeyValue label="required" value={(template?.requiredFields || []).join(", ") || "-"} />
             <p>{template?.notes || "-"}</p>
@@ -1251,10 +1268,6 @@ function IconAction({
       {busy ? <Loader2 size={15} /> : children}
     </button>
   );
-}
-
-function JsonPreview({ value }: { value: unknown }) {
-  return <pre className="json-preview">{JSON.stringify(redactSecrets(value), null, 2)}</pre>;
 }
 
 function providerLabel(providerType: string): string {
@@ -1513,39 +1526,6 @@ function numberValue(value: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null;
   }
   return null;
-}
-
-function redactSecrets(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    if (value.length === 2 && typeof value[0] === "string" && isSecretKey(value[0])) {
-      return [value[0], value[1] == null || value[1] === "" ? value[1] : "[REDACTED]"];
-    }
-    return value.map(redactSecrets);
-  }
-  if (!value || typeof value !== "object") return value;
-  const redacted: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (isSecretKey(key)) {
-      redacted[key] = item == null || item === "" ? item : "[REDACTED]";
-    } else {
-      redacted[key] = redactSecrets(item);
-    }
-  }
-  return redacted;
-}
-
-function isSecretKey(key: string): boolean {
-  const lower = key.toLowerCase();
-  return (
-    lower.includes("token") ||
-    lower.includes("secret") ||
-    lower.includes("apikey") ||
-    lower.includes("api_key") ||
-    lower === "code" ||
-    lower.includes("codeverifier") ||
-    lower.includes("code_verifier") ||
-    lower === "authorization"
-  );
 }
 
 function errorMessage(error: unknown): string {

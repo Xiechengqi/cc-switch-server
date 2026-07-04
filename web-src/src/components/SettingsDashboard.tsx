@@ -62,6 +62,7 @@ import {
 import { Language, useI18n } from "@/lib/i18n";
 import { writeToken } from "@/lib/runtime";
 import { AccountsDashboard } from "@/components/AccountsDashboard";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useTheme } from "@/components/theme-provider";
 
 export type SettingsTab =
@@ -127,6 +128,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
+  const [restoreConfirm, setRestoreConfirm] = useState<BackupManifest | null>(null);
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -224,9 +226,6 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   }
 
   async function restoreBackupAction(backup: BackupManifest) {
-    if (!window.confirm(tx("Restore backup {{id}}? Current stores will be backed up first.", { id: backup.id }))) {
-      return;
-    }
     await runAction(`backup-restore:${backup.id}`, async () => {
       const restored = await restoreBackup(backup.id);
       return tx("restored {{id}}; safety {{safety}}", {
@@ -466,7 +465,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
               </label>
               <FormFooter busy={busy === "backup-create"} label={t("server.settings.createBackup")} />
             </form>
-            <BackupTable backups={data?.backups || []} busy={busy} onRestore={(backup) => void restoreBackupAction(backup)} />
+            <BackupTable backups={data?.backups || []} busy={busy} onRestore={setRestoreConfirm} />
           </section>
               </div>
             )}
@@ -502,6 +501,19 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
           </div>
         </div>
       )}
+      <ConfirmDialog
+        isOpen={restoreConfirm !== null}
+        title={tx("Restore backup")}
+        message={tx("Restore backup {{id}}? Current stores will be backed up first.", { id: restoreConfirm?.id || "-" })}
+        confirmText={tx("Restore")}
+        variant="info"
+        onConfirm={() => {
+          const backup = restoreConfirm;
+          setRestoreConfirm(null);
+          if (backup) void restoreBackupAction(backup);
+        }}
+        onCancel={() => setRestoreConfirm(null)}
+      />
     </div>
   );
 }

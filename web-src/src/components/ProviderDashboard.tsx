@@ -64,6 +64,9 @@ import {
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { inferIconForText } from "@/config/iconInference";
+import { ColorPicker } from "@/components/ColorPicker";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import JsonEditor from "@/components/JsonEditor";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { presetIcon, storedProviderIcon } from "@/lib/provider-icons";
 
@@ -509,6 +512,7 @@ function ProviderCard({
   dragging?: boolean;
 }) {
   const { tx } = useI18n();
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const model = modelFromProvider(provider.provider);
   const baseUrl = baseUrlFromProvider(provider.provider, provider.app);
   const providerIcon = storedProviderIcon(provider);
@@ -519,6 +523,7 @@ function ProviderCard({
   const healthLabel = health?.healthy === false ? tx("unhealthy") : tx("healthy");
   const busyPrefix = `${provider.app}:${provider.provider.id}:`;
   return (
+    <>
     <article
       ref={nodeRef}
       className={[current ? "provider-card current" : "provider-card", dragging ? "dragging" : ""]
@@ -618,9 +623,7 @@ function ProviderCard({
         </button>
         <IconAction
           title="Delete"
-          onClick={() => {
-            if (window.confirm(tx("Delete provider {{name}}?", { name: provider.provider.name }))) onAction("delete");
-          }}
+          onClick={() => setDeleteConfirmOpen(true)}
           busy={busyId === `${busyPrefix}delete`}
           danger
         >
@@ -628,6 +631,18 @@ function ProviderCard({
         </IconAction>
       </div>
     </article>
+      <ConfirmDialog
+        isOpen={deleteConfirmOpen}
+        title={tx("Delete provider")}
+        message={tx("Delete provider {{name}}?", { name: provider.provider.name })}
+        confirmText={tx("Delete")}
+        onConfirm={() => {
+          setDeleteConfirmOpen(false);
+          onAction("delete");
+        }}
+        onCancel={() => setDeleteConfirmOpen(false)}
+      />
+    </>
   );
 }
 
@@ -734,14 +749,12 @@ function ProviderFormModal({
               <span>{tx("Icon")}</span>
               <input value={draft.icon} onChange={(event) => patch({ icon: event.target.value })} />
             </label>
-            <label>
-              <span>{tx("Color")}</span>
-              <input
-                type="color"
-                value={colorInputValue(draft.iconColor || previewIcon.color)}
-                onChange={(event) => patch({ iconColor: event.target.value })}
-              />
-            </label>
+            <ColorPicker
+              label={tx("Color")}
+              value={draft.iconColor}
+              fallback={colorInputValue(previewIcon.color)}
+              onChange={(value) => patch({ iconColor: value })}
+            />
           </div>
           <label>
             <span>{tx("Model")}</span>
@@ -819,14 +832,14 @@ function ProviderFormModal({
                   onChange={(value) => patch({ pricingJson: value })}
                 />
               </div>
-              <label>
+              <div className="json-editor-field">
                 <span>{tx("Advanced provider JSON")}</span>
-                <textarea
+                <JsonEditor
                   value={draft.advancedJson}
-                  onChange={(event) => patch({ advancedJson: event.target.value })}
-                  spellCheck={false}
+                  onChange={(value) => patch({ advancedJson: value })}
+                  rows={10}
                 />
-              </label>
+              </div>
             </div>
           </details>
         </div>
@@ -993,15 +1006,15 @@ function ProviderJsonField({
   return (
     <section className="universal-json-card">
       <h4>{tx(title)}</h4>
-      <label>
+      <div className="json-editor-field">
         <span>{tx(label)}</span>
-        <textarea
+        <JsonEditor
           value={value}
-          onChange={(event) => onChange(event.target.value)}
+          onChange={onChange}
           placeholder={placeholder}
-          spellCheck={false}
+          rows={7}
         />
-      </label>
+      </div>
     </section>
   );
 }
@@ -1057,15 +1070,71 @@ function ReadinessFlag({ label, enabled }: { label: string; enabled?: boolean })
 }
 
 function ProviderAccountFooter({ account }: { account: AccountRecord }) {
+  const { tx } = useI18n();
+  const quotaPercent = accountQuotaPercent(account);
+  const tiers = account.quota?.tiers || [];
   return (
     <div className="provider-account-footer">
-      <span>{account.email || account.id}</span>
-      <span>{account.subscriptionLevel || "account"}</span>
-      <span>{account.quotaPercent == null ? "quota -" : `${account.quotaPercent.toFixed(1)}%`}</span>
-      <span>{formatTime(account.expiresAt)}</span>
+      <div className="provider-account-line">
+        <span>{account.email || account.id}</span>
+        <span>{account.subscriptionLevel || tx("account")}</span>
+        <span>{quotaPercent == null ? tx("quota -") : `${quotaPercent.toFixed(1)}%`}</span>
+        <span>{formatTime(account.expiresAt)}</span>
+      </div>
+      {quotaPercent != null && (
+        <div className="provider-quota-meter" aria-label={tx("quota")}>
+          <span style={{ width: `${clampPercent(quotaPercent)}%` }} />
+        </div>
+      )}
+      {tiers.length > 0 && (
+        <div className="provider-quota-tiers">
+          {tiers.slice(0, 3).map((tier) => (
+            <div className="provider-quota-tier" key={tier.name}>
+              <div>
+                <strong>{tier.name}</strong>
+                <span>{tierLine(tier)}</span>
+              </div>
+              <div className="provider-quota-tier-meter">
+                <span style={{ width: `${clampPercent(tier.utilization ?? 0)}%` }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
       {account.lastRefreshError && <strong>{account.lastRefreshError}</strong>}
     </div>
   );
+}
+
+type ProviderQuotaTier = NonNullable<NonNullable<AccountRecord["quota"]>["tiers"]>[number];
+
+function accountQuotaPercent(account: AccountRecord): number | null {
+  if (account.quotaPercent != null) return account.quotaPercent;
+  const utilization = account.quota?.tiers?.find((tier) => tier.utilization != null)?.utilization;
+  return utilization == null ? null : utilization;
+}
+
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function tierLine(tier: ProviderQuotaTier): string {
+  const usage = tier.used != null && tier.limit != null
+    ? `${formatCompactNumber(tier.used)}/${formatCompactNumber(tier.limit)}`
+    : tier.utilization == null
+      ? "-"
+      : `${tier.utilization.toFixed(1)}%`;
+  const unit = tier.unit ? ` ${tier.unit}` : "";
+  const reset = tier.resetsAt == null ? "" : ` · ${formatTime(tier.resetsAt)}`;
+  return `${usage}${unit}${reset}`;
+}
+
+function formatCompactNumber(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`;
+  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
 }
 
 function ProviderLimitFooter({ limit }: { limit: ProviderLimitStatus }) {

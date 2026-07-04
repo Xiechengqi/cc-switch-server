@@ -21,6 +21,8 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { JsonPreview } from "@/components/JsonPreview";
 import {
   AppKind,
   authorizeShareMarket,
@@ -166,7 +168,6 @@ export function ShareDashboard() {
     setError(null);
     try {
       if (action === "delete") {
-        if (!window.confirm(tx("Delete share {{name}}?", { name: shareName(share) }))) return;
         const deleted = await deleteShare(share.id);
         setResultById((current) => ({ ...current, [share.id]: deleted ? tx("share deleted") : tx("share not found") }));
         await refresh();
@@ -346,6 +347,17 @@ export function ShareDashboard() {
         <ShareStat label={t("server.shares.forSale")} value={data.shares.filter((share) => share.forSale).length} />
         <ShareStat label={t("server.shares.requests")} value={data.shares.reduce((sum, share) => sum + (share.requestsCount || 0), 0)} />
       </div>
+
+      <ShareTunnelConfigPanel
+        shares={data.shares}
+        markets={markets}
+        marketsLoaded={marketsLoaded}
+        busyId={busyId}
+        onSnapshot={() => void toolbarAction("snapshot")}
+        onRestore={() => void toolbarAction("restore")}
+        onPullEdits={() => void toolbarAction("edits")}
+        onLoadMarkets={() => void loadMarketsAction()}
+      />
 
       {resultById.__global && <div className="share-global-result">{resultById.__global}</div>}
 
@@ -619,10 +631,12 @@ function ShareCard({
   ) => void;
 }) {
   const { tx } = useI18n();
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const usage = shareUsage(share);
   const syncText = share.routerLastSyncError || formatTime(share.routerLastSyncedAtMs);
   const market = markets.find((item) => item.email === share.acl?.publicMarketEmail);
   return (
+    <>
     <article className="share-card">
       <header className="share-card-header">
         <div className="share-card-title-row">
@@ -744,11 +758,23 @@ function ShareCard({
         <IconAction title="Authorize market" onClick={onMarket}>
           <Store size={15} />
         </IconAction>
-        <IconAction title="Delete" busy={busyId === `${share.id}:delete`} onClick={() => onAction("delete")} danger>
+        <IconAction title="Delete" busy={busyId === `${share.id}:delete`} onClick={() => setDeleteConfirmOpen(true)} danger>
           <Trash2 size={15} />
         </IconAction>
       </div>
     </article>
+      <ConfirmDialog
+        isOpen={deleteConfirmOpen}
+        title={tx("Delete share")}
+        message={tx("Delete share {{name}}?", { name: shareName(share) })}
+        confirmText={tx("Delete")}
+        onConfirm={() => {
+          setDeleteConfirmOpen(false);
+          onAction("delete");
+        }}
+        onCancel={() => setDeleteConfirmOpen(false)}
+      />
+    </>
   );
 }
 
@@ -812,6 +838,123 @@ function ShareRequestLogPanel({ logs, shares }: { logs: UsageLog[]; shares: Shar
         </table>
       </div>
     </section>
+  );
+}
+
+function ShareTunnelConfigPanel({
+  shares,
+  markets,
+  marketsLoaded,
+  busyId,
+  onSnapshot,
+  onRestore,
+  onPullEdits,
+  onLoadMarkets,
+}: {
+  shares: ShareRecord[];
+  markets: PublicShareMarket[];
+  marketsLoaded: boolean;
+  busyId: string | null;
+  onSnapshot: () => void;
+  onRestore: () => void;
+  onPullEdits: () => void;
+  onLoadMarkets: () => void;
+}) {
+  const { tx } = useI18n();
+  const tunneled = shares.filter((share) => share.tunnelSubdomain || share.routerUrl);
+  const syncErrors = shares.filter((share) => share.routerLastSyncError);
+  const marketShares = shares.filter((share) => share.acl?.publicMarketEmail);
+  const pendingGrants = shares.filter((share) => share.marketGrant?.status === "pending");
+  const visibleRoutes = [...tunneled]
+    .sort((left, right) => (right.routerLastSyncedAtMs || 0) - (left.routerLastSyncedAtMs || 0))
+    .slice(0, 4);
+  return (
+    <section className="share-tunnel-panel">
+      <header className="share-tunnel-header">
+        <div className="section-title-row compact-title">
+          <Cable size={16} />
+          <div>
+            <h2>{tx("Tunnel Config")}</h2>
+            <span>{tx("Router routes, tunnel recovery, and market authorization status")}</span>
+          </div>
+        </div>
+        <div className="share-tunnel-actions">
+          <button className="secondary-button compact" type="button" onClick={onSnapshot} disabled={busyId === "snapshot"}>
+            {busyId === "snapshot" ? <Loader2 size={14} /> : <FileJson size={14} />}
+            <span>{tx("Runtime")}</span>
+          </button>
+          <button className="secondary-button compact" type="button" onClick={onRestore} disabled={busyId === "restore"}>
+            {busyId === "restore" ? <Loader2 size={14} /> : <Cable size={14} />}
+            <span>{tx("Restore tunnels")}</span>
+          </button>
+          <button className="secondary-button compact" type="button" onClick={onPullEdits} disabled={busyId === "edits"}>
+            {busyId === "edits" ? <Loader2 size={14} /> : <Route size={14} />}
+            <span>{tx("Pull edits")}</span>
+          </button>
+          <button className="secondary-button compact" type="button" onClick={onLoadMarkets} disabled={busyId === "markets"}>
+            {busyId === "markets" ? <Loader2 size={14} /> : <Store size={14} />}
+            <span>{tx("Markets")}</span>
+          </button>
+        </div>
+      </header>
+      <div className="share-tunnel-summary">
+        <ShareTunnelMetric label="tunnel routes" value={`${tunneled.length}/${shares.length}`} tone={syncErrors.length ? "warning" : "success"} />
+        <ShareTunnelMetric label="sync errors" value={syncErrors.length} tone={syncErrors.length ? "danger" : "success"} />
+        <ShareTunnelMetric label="market access" value={marketsLoaded ? `${marketShares.length}/${markets.length || "-"}` : tx("not loaded")} tone={marketsLoaded ? "success" : "warning"} />
+        <ShareTunnelMetric label="pending grants" value={pendingGrants.length} tone={pendingGrants.length ? "warning" : "success"} />
+      </div>
+      {visibleRoutes.length ? (
+        <div className="share-tunnel-route-list">
+          {visibleRoutes.map((share) => (
+            <ShareTunnelRoute key={share.id} share={share} />
+          ))}
+        </div>
+      ) : (
+        <div className="share-tunnel-empty">
+          <Route size={16} />
+          <span>{tx("No tunnel routes yet")}</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ShareTunnelMetric({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: ReactNode;
+  tone: "success" | "warning" | "danger";
+}) {
+  const { tx } = useI18n();
+  return (
+    <div className="share-tunnel-metric">
+      <span>{tx(label)}</span>
+      <StatusPill tone={tone}>{value}</StatusPill>
+    </div>
+  );
+}
+
+function ShareTunnelRoute({ share }: { share: ShareRecord }) {
+  const { tx } = useI18n();
+  const syncTone = share.routerLastSyncError ? "danger" : share.routerLastSyncedAtMs ? "success" : "warning";
+  return (
+    <div className="share-tunnel-route">
+      <div>
+        <strong>{shareName(share)}</strong>
+        <span>{share.routerUrl || share.tunnelSubdomain || "-"}</span>
+      </div>
+      <div>
+        <StatusPill tone={share.status === "active" ? "success" : share.status === "paused" ? "warning" : "danger"}>
+          {share.status}
+        </StatusPill>
+        <StatusPill tone={syncTone}>
+          {share.routerLastSyncError ? tx("sync error") : formatTime(share.routerLastSyncedAtMs)}
+        </StatusPill>
+      </div>
+    </div>
   );
 }
 
@@ -1480,10 +1623,6 @@ function IconAction({
       {busy ? <Loader2 size={15} /> : children}
     </button>
   );
-}
-
-function JsonPreview({ value }: { value: unknown }) {
-  return <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>;
 }
 
 function createShareDraft(providersByApp: Record<AppKind, StoredProvider[]>): ShareDraft {

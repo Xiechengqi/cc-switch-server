@@ -36,6 +36,8 @@ import {
   UsageTrendPoint,
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { JsonPreview } from "@/components/JsonPreview";
 
 type UsageTab = "logs" | "providers" | "models" | "pricing" | "limits";
 type RangePreset = "24h" | "7d" | "30d" | "all" | "custom";
@@ -140,6 +142,7 @@ export function UsageDashboard() {
   const [detailId, setDetailId] = useState<string | null>(null);
   const [pricingDraft, setPricingDraft] = useState<PricingDraft | null>(null);
   const [pricingDefaultsOpen, setPricingDefaultsOpen] = useState(false);
+  const [pricingDeleteId, setPricingDeleteId] = useState<string | null>(null);
 
   const filter = useMemo(() => filterFromDraft(filterDraft), [filterDraft]);
   const dataSources = useMemo(() => dataSourceBreakdown(data.sourceLogs), [data.sourceLogs]);
@@ -236,7 +239,6 @@ export function UsageDashboard() {
   }
 
   async function removePricing(modelId: string) {
-    if (!window.confirm(tx("Delete pricing for {{model}}?", { model: modelId }))) return;
     setBusy(`delete:${modelId}`);
     setError(null);
     try {
@@ -328,7 +330,7 @@ export function UsageDashboard() {
           onAdd={() => setPricingDraft(emptyPricingDraft())}
           onDefaults={() => setPricingDefaultsOpen(true)}
           onEdit={(model) => setPricingDraft(pricingDraftFromModel(model))}
-          onDelete={(modelId) => void removePricing(modelId)}
+          onDelete={setPricingDeleteId}
         />
       )}
       {activeTab === "limits" && <ProviderLimitsTable limits={data.limits} loading={loading} />}
@@ -358,6 +360,18 @@ export function UsageDashboard() {
           onClose={() => setPricingDefaultsOpen(false)}
         />
       )}
+      <ConfirmDialog
+        isOpen={pricingDeleteId !== null}
+        title={tx("Delete pricing")}
+        message={tx("Delete pricing for {{model}}?", { model: pricingDeleteId || "-" })}
+        confirmText={tx("Delete")}
+        onConfirm={() => {
+          const modelId = pricingDeleteId;
+          setPricingDeleteId(null);
+          if (modelId) void removePricing(modelId);
+        }}
+        onCancel={() => setPricingDeleteId(null)}
+      />
     </div>
   );
 }
@@ -806,6 +820,7 @@ function LogsTable({
 function ProviderStatsTable({ providers, loading }: { providers: ProviderUsageStats[]; loading: boolean }) {
   const { tx } = useI18n();
   if (loading) return <LoadingBlock label="Loading provider stats" />;
+  const maxTokens = Math.max(0, ...providers.map((provider) => provider.rollup.totalTokens || 0));
   return (
     <div className="table-wrap usage-table">
       <table>
@@ -826,7 +841,14 @@ function ProviderStatsTable({ providers, loading }: { providers: ProviderUsageSt
           {providers.length ? (
             providers.map((provider) => (
               <tr key={`${provider.app}:${provider.providerId}`}>
-                <td title={provider.providerId}>{provider.providerName}</td>
+                <td title={provider.providerId}>
+                  <UsageRankCell
+                    label={provider.providerName}
+                    subtitle={`${provider.providerType} / ${provider.providerId}`}
+                    tokens={provider.rollup.totalTokens}
+                    maxTokens={maxTokens}
+                  />
+                </td>
                 <td>{provider.app}</td>
                 <td>{formatInt(provider.rollup.requests)}</td>
                 <td>{successRate(provider.rollup)}</td>
@@ -849,6 +871,7 @@ function ProviderStatsTable({ providers, loading }: { providers: ProviderUsageSt
 function ModelStatsTable({ models, loading }: { models: ModelUsageStats[]; loading: boolean }) {
   const { tx } = useI18n();
   if (loading) return <LoadingBlock label="Loading model stats" />;
+  const maxTokens = Math.max(0, ...models.map((model) => model.rollup.totalTokens || 0));
   return (
     <div className="table-wrap usage-table">
       <table>
@@ -868,7 +891,14 @@ function ModelStatsTable({ models, loading }: { models: ModelUsageStats[]; loadi
           {models.length ? (
             models.map((model) => (
               <tr key={`${model.app}:${model.model}:${model.pricingModel || ""}`}>
-                <td title={model.model}>{model.model}</td>
+                <td title={model.model}>
+                  <UsageRankCell
+                    label={model.model}
+                    subtitle={modelStatsRoute(model)}
+                    tokens={model.rollup.totalTokens}
+                    maxTokens={maxTokens}
+                  />
+                </td>
                 <td>{model.app}</td>
                 <td>{formatInt(model.rollup.requests)}</td>
                 <td>{formatInt(model.rollup.totalTokens)}</td>
@@ -883,6 +913,33 @@ function ModelStatsTable({ models, loading }: { models: ModelUsageStats[]; loadi
           )}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function UsageRankCell({
+  label,
+  subtitle,
+  tokens,
+  maxTokens,
+}: {
+  label: string;
+  subtitle: string;
+  tokens: number;
+  maxTokens: number;
+}) {
+  const { tx } = useI18n();
+  const percent = maxTokens > 0 ? Math.max(4, Math.min(100, (tokens / maxTokens) * 100)) : 0;
+  return (
+    <div className="usage-rank-cell">
+      <div>
+        <strong>{label || "-"}</strong>
+        <span>{subtitle || "-"}</span>
+      </div>
+      <div className="usage-rank-meter" aria-label={tx("tokens")}>
+        <span style={{ width: `${percent}%` }} />
+      </div>
+      <small>{tx("{{count}} tokens", { count: formatInt(tokens) })}</small>
     </div>
   );
 }
@@ -1290,10 +1347,6 @@ function SimpleModal({
       </section>
     </div>
   );
-}
-
-function JsonPreview({ value }: { value: unknown }) {
-  return <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>;
 }
 
 function LoadingBlock({ label }: { label: string }) {
