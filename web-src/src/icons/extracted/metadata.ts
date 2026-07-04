@@ -68,4 +68,12 @@ export const iconMetadata: Record<string, IconMetadata> = {
   claw: { name: "claw", displayName: "Claw", defaultColor: "#111827", source: "desktop" },
   cubence: { name: "cubence", displayName: "Cubence", defaultColor: "#2563EB", source: "desktop" },
   "longcat-color": { name: "longcat-color", displayName: "LongCat", defaultColor: "#111827", source: "desktop" },
+  aicodemirror: { name: "aicodemirror", displayName: "AICodeMirror", defaultColor: "#2563EB", source: "desktop" },
+  crazyrouter: { name: "crazyrouter", displayName: "CrazyRouter", defaultColor: "#7C3AED", source: "desktop" },
+  lioncc: { name: "lioncc", displayName: "LionCC", defaultColor: "#F59E0B", source: "desktop" },
+  micu: { name: "micu", displayName: "MiCu", defaultColor: "#2563EB", source: "desktop" },
+  packycode: { name: "packycode", displayName: "PackyCode", defaultColor: "#111827", source: "desktop" },
+  rc: { name: "rc", displayName: "RC", defaultColor: "#111827", source: "desktop" },
+  sssaicode: { name: "sssaicode", displayName: "SSSAI Code", defaultColor: "#2563EB", source: "desktop" },
+  xiaomimimo: { name: "xiaomimimo", displayName: "Xiaomi MiMo", defaultColor: "#FF6900", source: "desktop" },
 };

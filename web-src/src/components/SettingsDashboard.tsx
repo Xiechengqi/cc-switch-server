@@ -481,7 +481,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
               title={t("server.nav.accounts")}
               subtitle={tx("OAuth accounts and quota tools")}
             />
-            <AccountsDashboard />
+            <AccountsDashboard embedded />
           </section>
               </div>
             )}

@@ -28,6 +28,7 @@ import {
   ListPlus,
   Loader2,
   Pencil,
+  Play,
   RefreshCw,
   Search,
   ServerCog,
@@ -107,6 +108,17 @@ interface ProviderDraft {
   category: string;
   icon: string;
   iconColor: string;
+  isFullUrl: boolean;
+  endpointAutoSelect: boolean;
+  customUserAgent: string;
+  localProxyHeadersJson: string;
+  localProxyBodyJson: string;
+  codexSupportsThinking: boolean;
+  codexSupportsEffort: boolean;
+  codexThinkingParam: string;
+  codexEffortParam: string;
+  codexEffortValueMode: string;
+  codexOutputFormat: string;
   modelCatalogJson: string;
   modelMappingJson: string;
   pricingJson: string;
@@ -807,13 +819,21 @@ function ProviderCard({
             <BarChart3 size={15} />
           </IconAction>
         )}
-        <button className="secondary-button compact" type="button" onClick={() => onAction("switch")}>
-          {tx(current ? "current" : "switch")}
+        <button
+          className={current ? "secondary-button compact current-action" : "primary-button compact"}
+          type="button"
+          onClick={() => onAction("switch")}
+          disabled={current || busyId === `${busyPrefix}switch`}
+          title={tx(current ? "current" : "switch")}
+        >
+          {current ? <CheckCircle2 size={15} /> : <Play size={15} />}
+          <span>{tx(current ? "current" : "switch")}</span>
         </button>
         <IconAction
           title="Delete"
           onClick={() => setDeleteConfirmOpen(true)}
           busy={busyId === `${busyPrefix}delete`}
+          disabled={current}
           danger
         >
           <Trash2 size={15} />
@@ -1036,6 +1056,10 @@ function ProviderFormModal({
               onPatch={patch}
             />
           )}
+          <ProviderDesktopAdvancedSection
+            draft={draft}
+            onPatch={patch}
+          />
           <details className="wide-field provider-advanced-section" open={hasAdvancedConfig || undefined}>
             <summary>
               <Boxes size={16} />
@@ -1198,6 +1222,194 @@ function apiFormatLabel(value: string): string {
     gemini_native: "Gemini Native",
   };
   return labels[value] || value;
+}
+
+function ProviderDesktopAdvancedSection({
+  draft,
+  onPatch,
+}: {
+  draft: ProviderDraft;
+  onPatch: (next: Partial<ProviderDraft>) => void;
+}) {
+  const { tx } = useI18n();
+  const showCodexReasoning = draft.app === "codex";
+  const hasValues = Boolean(
+    draft.isFullUrl ||
+      draft.endpointAutoSelect ||
+      draft.customUserAgent.trim() ||
+      draft.localProxyHeadersJson.trim() ||
+      draft.localProxyBodyJson.trim() ||
+      draft.codexSupportsThinking ||
+      draft.codexSupportsEffort ||
+      draft.codexThinkingParam !== "thinking" ||
+      draft.codexEffortParam !== "reasoning_effort" ||
+      draft.codexEffortValueMode !== "passthrough" ||
+      draft.codexOutputFormat !== "auto",
+  );
+  return (
+    <details className="wide-field provider-advanced-section provider-desktop-advanced" open={hasValues || undefined}>
+      <summary>
+        <ServerCog size={16} />
+        <span>{tx("Desktop advanced options")}</span>
+        <small>{tx("Full URL mode, endpoint selection, request overrides, and Codex reasoning")}</small>
+      </summary>
+      <div className="provider-desktop-advanced-grid">
+        <article className="provider-auth-card">
+          <header>
+            <StatusPill tone={draft.isFullUrl || draft.endpointAutoSelect ? "success" : "warning"}>
+              {tx("endpoint")}
+            </StatusPill>
+            <span>{tx("Desktop endpoint behavior")}</span>
+          </header>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={draft.isFullUrl}
+              onChange={(event) => onPatch({ isFullUrl: event.target.checked })}
+            />
+            <span>{tx("Treat Base URL as full upstream URL")}</span>
+          </label>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={draft.endpointAutoSelect}
+              onChange={(event) => onPatch({ endpointAutoSelect: event.target.checked })}
+            />
+            <span>{tx("Auto-select fastest endpoint")}</span>
+          </label>
+          <small>{tx("These flags are stored in provider metadata for desktop-compatible routing.")}</small>
+        </article>
+
+        <article className="provider-auth-card provider-request-overrides-card">
+          <header>
+            <StatusPill tone={draft.customUserAgent.trim() ? "success" : "warning"}>
+              {tx("request")}
+            </StatusPill>
+            <span>{tx("Local proxy request overrides")}</span>
+          </header>
+          <label>
+            <span>{tx("Custom User-Agent")}</span>
+            <input
+              value={draft.customUserAgent}
+              onChange={(event) => onPatch({ customUserAgent: event.target.value })}
+              placeholder="cc-switch-server"
+            />
+          </label>
+          <div className="provider-request-json-grid">
+            <div className="json-editor-field">
+              <span>{tx("Headers JSON")}</span>
+              <JsonEditor
+                value={draft.localProxyHeadersJson}
+                onChange={(value) => onPatch({ localProxyHeadersJson: value })}
+                placeholder={JSON.stringify({ "x-provider-feature": "enabled" }, null, 2)}
+                rows={5}
+              />
+            </div>
+            <div className="json-editor-field">
+              <span>{tx("Body JSON")}</span>
+              <JsonEditor
+                value={draft.localProxyBodyJson}
+                onChange={(value) => onPatch({ localProxyBodyJson: value })}
+                placeholder={JSON.stringify({ extra_body: { value: true } }, null, 2)}
+                rows={5}
+              />
+            </div>
+          </div>
+        </article>
+
+        {showCodexReasoning && (
+          <article className="provider-auth-card provider-codex-reasoning-card">
+            <header>
+              <StatusPill tone={draft.codexSupportsThinking || draft.codexSupportsEffort ? "success" : "warning"}>
+                {tx("reasoning")}
+              </StatusPill>
+              <span>{tx("Codex Chat Completions capability")}</span>
+            </header>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={draft.codexSupportsThinking}
+                onChange={(event) =>
+                  onPatch({
+                    codexSupportsThinking: event.target.checked,
+                    codexSupportsEffort: event.target.checked ? draft.codexSupportsEffort : false,
+                  })
+                }
+              />
+              <span>{tx("Supports thinking mode")}</span>
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={draft.codexSupportsEffort}
+                onChange={(event) =>
+                  onPatch({
+                    codexSupportsThinking: event.target.checked ? true : draft.codexSupportsThinking,
+                    codexSupportsEffort: event.target.checked,
+                  })
+                }
+              />
+              <span>{tx("Supports reasoning effort")}</span>
+            </label>
+            <div className="provider-reasoning-grid">
+              <label>
+                <span>{tx("Thinking param")}</span>
+                <select
+                  value={draft.codexThinkingParam}
+                  onChange={(event) => onPatch({ codexThinkingParam: event.target.value })}
+                >
+                  {["thinking", "enable_thinking", "reasoning_split"].map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>{tx("Effort param")}</span>
+                <select
+                  value={draft.codexEffortParam}
+                  onChange={(event) => onPatch({ codexEffortParam: event.target.value })}
+                >
+                  {["none", "reasoning_effort", "reasoning.effort"].map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>{tx("Effort values")}</span>
+                <select
+                  value={draft.codexEffortValueMode}
+                  onChange={(event) => onPatch({ codexEffortValueMode: event.target.value })}
+                >
+                  {["passthrough", "low_high", "deepseek", "openrouter"].map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>{tx("Output format")}</span>
+                <select
+                  value={draft.codexOutputFormat}
+                  onChange={(event) => onPatch({ codexOutputFormat: event.target.value })}
+                >
+                  {["auto", "reasoning_content", "reasoning", "reasoning_details", "think_tags"].map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </article>
+        )}
+      </div>
+    </details>
+  );
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -1652,12 +1864,14 @@ function IconAction({
   title,
   children,
   busy,
+  disabled,
   danger,
   onClick,
 }: {
   title: string;
   children: ReactNode;
   busy?: boolean;
+  disabled?: boolean;
   danger?: boolean;
   onClick: () => void;
 }) {
@@ -1670,7 +1884,7 @@ function IconAction({
       title={translatedTitle}
       aria-label={translatedTitle}
       onClick={onClick}
-      disabled={busy}
+      disabled={busy || disabled}
     >
       {busy ? <Loader2 size={15} /> : children}
     </button>
@@ -1702,6 +1916,17 @@ function createDraft(app: AppKind, entry: ProviderMatrixEntry): ProviderDraft {
     category: "",
     icon: "",
     iconColor: "",
+    isFullUrl: false,
+    endpointAutoSelect: false,
+    customUserAgent: "",
+    localProxyHeadersJson: "",
+    localProxyBodyJson: "",
+    codexSupportsThinking: false,
+    codexSupportsEffort: false,
+    codexThinkingParam: "thinking",
+    codexEffortParam: "reasoning_effort",
+    codexEffortValueMode: "passthrough",
+    codexOutputFormat: "auto",
     modelCatalogJson: "",
     modelMappingJson: "",
     pricingJson: "",
@@ -1711,6 +1936,9 @@ function createDraft(app: AppKind, entry: ProviderMatrixEntry): ProviderDraft {
 
 function editDraft(stored: StoredProvider, entry: ProviderMatrixEntry): ProviderDraft {
   const provider = stored.provider;
+  const meta = asRecord(provider.meta);
+  const requestOverrides = asRecord(meta.localProxyRequestOverrides);
+  const codexReasoning = asRecord(meta.codexChatReasoning);
   return {
     mode: "edit",
     app: stored.app,
@@ -1725,6 +1953,17 @@ function editDraft(stored: StoredProvider, entry: ProviderMatrixEntry): Provider
     category: provider.category || "",
     icon: getString(provider.icon) || "",
     iconColor: getString(provider.iconColor) || "",
+    isFullUrl: boolValue(meta.isFullUrl),
+    endpointAutoSelect: boolValue(meta.endpointAutoSelect),
+    customUserAgent: getString(meta.customUserAgent) || "",
+    localProxyHeadersJson: jsonText(requestOverrides.headers),
+    localProxyBodyJson: jsonText(requestOverrides.body),
+    codexSupportsThinking: boolValue(codexReasoning.supportsThinking),
+    codexSupportsEffort: boolValue(codexReasoning.supportsEffort),
+    codexThinkingParam: getString(codexReasoning.thinkingParam) || "thinking",
+    codexEffortParam: getString(codexReasoning.effortParam) || "reasoning_effort",
+    codexEffortValueMode: getString(codexReasoning.effortValueMode) || "passthrough",
+    codexOutputFormat: getString(codexReasoning.outputFormat) || "auto",
     modelCatalogJson: providerSettingJson(provider, ["modelCatalog"]),
     modelMappingJson: providerSettingJson(provider, ["modelMapping"]),
     pricingJson: providerSettingJson(provider, ["pricing", "modelPricing"]),
@@ -1754,6 +1993,11 @@ function providerFromDraft(draft: ProviderDraft, entry: ProviderMatrixEntry): Pr
   const meta = { ...asRecord(parsed.meta) };
   meta.providerType = draft.providerTypeId;
   if (draft.apiFormat.trim()) meta.apiFormat = draft.apiFormat.trim();
+  setOptionalBooleanMeta(meta, "isFullUrl", draft.isFullUrl);
+  setOptionalBooleanMeta(meta, "endpointAutoSelect", draft.endpointAutoSelect);
+  setOptionalStringMeta(meta, "customUserAgent", draft.customUserAgent);
+  setOptionalRequestOverrides(meta, draft.localProxyHeadersJson, draft.localProxyBodyJson);
+  setOptionalCodexReasoning(meta, draft);
   if (draft.accountId.trim()) {
     meta.authBinding = {
       source: "managed_account",
@@ -1883,6 +2127,83 @@ function setPricingJsonSetting(settings: Record<string, unknown>, raw: string) {
   }
 }
 
+function setOptionalBooleanMeta(meta: Record<string, unknown>, key: string, value: boolean) {
+  if (value) {
+    meta[key] = true;
+  } else {
+    delete meta[key];
+  }
+}
+
+function setOptionalStringMeta(meta: Record<string, unknown>, key: string, value: string) {
+  const trimmed = value.trim();
+  if (trimmed) {
+    if (/[\u0000-\u001f\u007f]/.test(trimmed)) {
+      throw new Error(`${key} must not contain control characters`);
+    }
+    meta[key] = trimmed;
+  } else {
+    delete meta[key];
+  }
+}
+
+function setOptionalRequestOverrides(
+  meta: Record<string, unknown>,
+  headersRaw: string,
+  bodyRaw: string,
+) {
+  const headers = optionalJsonObject(headersRaw, "headers overrides");
+  const body = optionalJsonObject(bodyRaw, "body overrides");
+  const overrides = asRecord(meta.localProxyRequestOverrides);
+  if (headers !== undefined) {
+    overrides.headers = headers;
+  } else {
+    delete overrides.headers;
+  }
+  if (body !== undefined) {
+    overrides.body = body;
+  } else {
+    delete overrides.body;
+  }
+  if (Object.keys(overrides).length) {
+    meta.localProxyRequestOverrides = overrides;
+  } else {
+    delete meta.localProxyRequestOverrides;
+  }
+}
+
+function optionalJsonObject(raw: string, label: string): Record<string, unknown> | undefined {
+  const parsed = optionalJson(raw, label);
+  if (parsed === undefined) return undefined;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${label} JSON must be an object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function setOptionalCodexReasoning(meta: Record<string, unknown>, draft: ProviderDraft) {
+  if (draft.app !== "codex" || draft.apiFormat !== "openai_chat") {
+    delete meta.codexChatReasoning;
+    return;
+  }
+  const reasoning: Record<string, unknown> = {};
+  if (draft.codexSupportsThinking || draft.codexSupportsEffort) {
+    reasoning.supportsThinking = draft.codexSupportsThinking || draft.codexSupportsEffort;
+    reasoning.supportsEffort = draft.codexSupportsEffort;
+    reasoning.thinkingParam = draft.codexThinkingParam || "thinking";
+    reasoning.effortParam = draft.codexSupportsEffort
+      ? draft.codexEffortParam || "reasoning_effort"
+      : "none";
+    reasoning.effortValueMode = draft.codexEffortValueMode || "passthrough";
+    reasoning.outputFormat = draft.codexOutputFormat || "auto";
+  }
+  if (Object.keys(reasoning).length) {
+    meta.codexChatReasoning = reasoning;
+  } else {
+    delete meta.codexChatReasoning;
+  }
+}
+
 function optionalJson(raw: string, label: string): unknown {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
@@ -1896,6 +2217,10 @@ function optionalJson(raw: string, label: string): unknown {
 
 function jsonText(value: unknown): string {
   return value === undefined || value === null ? "" : JSON.stringify(value, null, 2);
+}
+
+function boolValue(value: unknown): boolean {
+  return value === true;
 }
 
 function baseUrlFromProvider(provider: Provider, app: AppKind): string | null {

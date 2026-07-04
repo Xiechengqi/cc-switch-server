@@ -1384,6 +1384,55 @@ tbody tr:last-child td {
   border-radius: 0 0 8px 8px;
 }
 
+.provider-desktop-advanced {
+  overflow: hidden;
+}
+
+.provider-desktop-advanced-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  border-top: 1px solid hsl(var(--border));
+  padding: 12px;
+}
+
+.provider-request-overrides-card,
+.provider-codex-reasoning-card {
+  grid-column: span 2;
+}
+
+.checkbox-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: hsl(var(--foreground));
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+
+.checkbox-row input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  accent-color: hsl(var(--primary));
+}
+
+.provider-auth-card > small {
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.provider-request-json-grid,
+.provider-reasoning-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .catalog-type-grid {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
@@ -1517,6 +1566,19 @@ tbody tr:last-child td {
   gap: 16px;
   overflow: auto;
   padding: 24px;
+}
+
+.accounts-dashboard.embedded {
+  overflow: visible;
+  padding: 0;
+}
+
+.auth-center-inline-actions {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .accounts-layout {
@@ -4103,18 +4165,20 @@ tbody tr:last-child td {
 }
 
 .settings-tabs {
-  display: grid;
+  display: flex;
   min-width: 0;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  overflow-x: auto;
   gap: 4px;
   border: 1px solid hsl(var(--border));
   border-radius: 10px;
   background: hsl(var(--muted));
   padding: 4px;
+  scrollbar-width: thin;
 }
 
 .settings-tabs button {
-  min-width: 0;
+  min-width: 104px;
+  flex: 0 0 auto;
   height: 34px;
   overflow: hidden;
   border: 0;
@@ -4162,15 +4226,6 @@ tbody tr:last-child td {
 
 .settings-accounts-card {
   overflow: hidden;
-}
-
-.settings-accounts-card .accounts-dashboard {
-  overflow: visible;
-  padding: 0;
-}
-
-.settings-accounts-card .provider-toolbar {
-  display: none;
 }
 
 .settings-about-card {
@@ -4552,13 +4607,7 @@ tbody tr:last-child td {
     min-width: 0;
   }
 
-  .settings-tabs {
-    display: flex;
-    overflow-x: auto;
-  }
-
   .settings-tabs button {
-    flex: 0 0 auto;
     min-width: 112px;
   }
 
@@ -4569,6 +4618,9 @@ tbody tr:last-child td {
   .usage-summary-grid,
   .provider-form-grid,
   .provider-auth-grid,
+  .provider-desktop-advanced-grid,
+  .provider-request-json-grid,
+  .provider-reasoning-grid,
   .provider-card-meta,
   .provider-readiness-grid,
   .provider-limit-grid,
@@ -4646,6 +4698,11 @@ tbody tr:last-child td {
   .usage-data-source-chip {
     min-width: 0;
     width: 100%;
+  }
+
+  .provider-request-overrides-card,
+  .provider-codex-reasoning-card {
+    grid-column: auto;
   }
 
   .account-card-grid {

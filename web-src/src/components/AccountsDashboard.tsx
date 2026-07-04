@@ -111,7 +111,7 @@ const oauthPreviewProviderTypes = [
   "agy_oauth",
 ];
 
-export function AccountsDashboard() {
+export function AccountsDashboard({ embedded = false }: { embedded?: boolean } = {}) {
   const { t, tx } = useI18n();
   const [data, setData] = useState<AccountsDashboardState>({
     accounts: [],
@@ -207,16 +207,36 @@ export function AccountsDashboard() {
   }
 
   return (
-    <div className="accounts-dashboard">
-      <div className="provider-toolbar">
-        <div className="section-title-row">
-          <KeyRound size={18} />
-          <div>
-            <h2>{t("server.accounts.title")}</h2>
-            <span>{t("server.accounts.importedCredentials", { count: data.accounts.length })}</span>
+    <div className={embedded ? "accounts-dashboard embedded" : "accounts-dashboard"}>
+      {!embedded && (
+        <div className="provider-toolbar">
+          <div className="section-title-row">
+            <KeyRound size={18} />
+            <div>
+              <h2>{t("server.accounts.title")}</h2>
+              <span>{t("server.accounts.importedCredentials", { count: data.accounts.length })}</span>
+            </div>
+          </div>
+          <div className="provider-toolbar-actions">
+            {error && <span className="error-text">{error}</span>}
+            <button className="secondary-button" type="button" onClick={() => void refresh()}>
+              <RefreshCw size={15} />
+              <span>{t("common.refresh")}</span>
+            </button>
+            <button
+              className="primary-button"
+              type="button"
+              onClick={() => setImportDraft(createAccountImportDraft(providerTypes[0] || "codex_oauth"))}
+            >
+              <Upload size={15} />
+              <span>{t("server.accounts.importAccount")}</span>
+            </button>
           </div>
         </div>
-        <div className="provider-toolbar-actions">
+      )}
+
+      {embedded && (
+        <div className="auth-center-inline-actions">
           {error && <span className="error-text">{error}</span>}
           <button className="secondary-button" type="button" onClick={() => void refresh()}>
             <RefreshCw size={15} />
@@ -231,7 +251,7 @@ export function AccountsDashboard() {
             <span>{t("server.accounts.importAccount")}</span>
           </button>
         </div>
-      </div>
+      )}
 
       <div className="accounts-stats-bar">
         <AccountStat label={t("server.accounts.accounts")} value={data.accounts.length} />

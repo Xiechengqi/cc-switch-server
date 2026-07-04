@@ -58,6 +58,14 @@ import catcoder from "./catcoder.svg?raw";
 import claw from "./claw.svg?raw";
 import cubence from "./cubence.svg?raw";
 import longcatColor from "./longcat-color.svg?raw";
+import aicodemirror from "./aicodemirror.svg?raw";
+import crazyrouter from "./crazyrouter.svg?raw";
+import lioncc from "./lioncc.svg?raw";
+import micu from "./micu.svg?raw";
+import packycode from "./packycode.svg?raw";
+import rc from "./rc.svg?raw";
+import sssaicode from "./sssaicode.svg?raw";
+import xiaomimimo from "./xiaomimimo.svg?raw";
 import cursorUrl from "./cursor.png";
 import kiroUrl from "./kiro.png";
 
@@ -124,6 +132,14 @@ export const icons: Record<string, string> = {
   claw,
   cubence,
   "longcat-color": longcatColor,
+  aicodemirror,
+  crazyrouter,
+  lioncc,
+  micu,
+  packycode,
+  rc,
+  sssaicode,
+  xiaomimimo,
 };
 
 export const iconUrls: Record<string, string> = {

@@ -321,11 +321,12 @@ export function UniversalDashboard() {
           </div>
         )
       ) : (
-        <div className="provider-empty">
-          <Boxes size={24} />
-          <strong>{tx("No universal providers")}</strong>
-          <span>{tx("Create one template, then sync it into Claude, Codex and Gemini providers.")}</span>
-        </div>
+        <UniversalEmptyState
+          canUsePresets={presets.length > 0}
+          onImport={() => setImportOpen(true)}
+          onPreset={() => setPresetOpen(true)}
+          onCreate={() => setDraft(emptyDraft())}
+        />
       )}
 
       {draft && (
@@ -434,6 +435,48 @@ function UniversalListToolbar({
         {tx("{{visible}}/{{total}} providers", { visible, total })}
       </span>
     </section>
+  );
+}
+
+function UniversalEmptyState({
+  canUsePresets,
+  onImport,
+  onPreset,
+  onCreate,
+}: {
+  canUsePresets: boolean;
+  onImport: () => void;
+  onPreset: () => void;
+  onCreate: () => void;
+}) {
+  const { t, tx } = useI18n();
+  return (
+    <div className="provider-empty provider-empty-state">
+      <div className="provider-empty-icon">
+        <Boxes size={28} />
+      </div>
+      <strong>{tx("No universal providers")}</strong>
+      <p>{tx("Create one template, then sync it into Claude, Codex and Gemini providers.")}</p>
+      <div className="provider-empty-actions">
+        <button className="primary-button" type="button" onClick={onImport}>
+          <Upload size={15} />
+          <span>{t("common.import")}</span>
+        </button>
+        <button
+          className="secondary-button"
+          type="button"
+          onClick={onPreset}
+          disabled={!canUsePresets}
+        >
+          <ListPlus size={15} />
+          <span>{t("server.common.fromPreset")}</span>
+        </button>
+        <button className="secondary-button" type="button" onClick={onCreate}>
+          <Plus size={15} />
+          <span>{t("server.universal.add")}</span>
+        </button>
+      </div>
+    </div>
   );
 }
 

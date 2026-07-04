@@ -7,6 +7,7 @@ import {
   Layers3,
   Network,
   Plus,
+  Radio,
   RefreshCw,
   Settings,
   Share2,
@@ -17,6 +18,7 @@ import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 
 import { AppKind, BuildInfo, loadBuildInfo } from "@/lib/api";
 import {
   getWebRuntimeContext,
+  invokeCommand,
   jsonFetch,
   readToken,
   WebRuntimeContext,
@@ -181,6 +183,7 @@ function App() {
 
             {isAuthenticated && (
               <div className="desktop-header-switches">
+                <HeaderProxyStatus onClick={() => openSettings("proxy")} />
                 <HeaderShareToggle active={view === "shares"} onClick={() => setView("shares")} />
                 <HeaderFailoverToggle activeApp={activeApp} />
               </div>
@@ -368,6 +371,52 @@ function HeaderShareToggle({ active, onClick }: { active: boolean; onClick: () =
     >
       <Network size={14} />
       <span>{tx("Share")}</span>
+    </button>
+  );
+}
+
+interface ProxyStatusView {
+  running?: boolean;
+  status?: string;
+  mode?: string;
+  baseUrl?: string;
+}
+
+function HeaderProxyStatus({ onClick }: { onClick: () => void }) {
+  const { tx } = useI18n();
+  const [status, setStatus] = useState<ProxyStatusView | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    invokeCommand<ProxyStatusView>("get_proxy_status")
+      .then((next) => {
+        if (active) setStatus(next);
+      })
+      .catch(() => {
+        if (active) setStatus({ running: false, status: "unknown" });
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const running = status?.running !== false;
+  const title = [
+    tx("Proxy status"),
+    status?.status,
+    status?.mode,
+    status?.baseUrl,
+  ].filter(Boolean).join(" · ");
+  return (
+    <button
+      className={running ? "desktop-mini-toggle active" : "desktop-mini-toggle"}
+      type="button"
+      onClick={onClick}
+      title={title || tx("Proxy status")}
+      aria-pressed={running}
+    >
+      <Radio size={14} />
+      <span>{tx("Proxy")}</span>
     </button>
   );
 }
