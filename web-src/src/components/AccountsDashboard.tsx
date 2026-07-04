@@ -246,6 +246,15 @@ export function AccountsDashboard() {
         <AccountStat label={t("server.accounts.importTypes")} value={data.templates.length} />
       </div>
 
+      <AuthCenterOverview
+        providerTypes={providerTypes}
+        accounts={data.accounts}
+        capabilitiesByType={capabilitiesByType}
+        templatesByType={templatesByType}
+        loading={loading}
+        onImport={(providerType) => setImportDraft(createAccountImportDraft(providerType))}
+      />
+
       <div className="accounts-layout">
         <section className="accounts-main">
           <div className="section-heading">
@@ -326,6 +335,117 @@ export function AccountsDashboard() {
         />
       )}
     </div>
+  );
+}
+
+function AuthCenterOverview({
+  providerTypes,
+  accounts,
+  capabilitiesByType,
+  templatesByType,
+  loading,
+  onImport,
+}: {
+  providerTypes: string[];
+  accounts: AccountRecord[];
+  capabilitiesByType: Map<string, AccountManagerCapability>;
+  templatesByType: Map<string, AccountImportTemplate>;
+  loading: boolean;
+  onImport: (providerType: string) => void;
+}) {
+  const { tx } = useI18n();
+  if (loading) {
+    return (
+      <section className="auth-center-overview">
+        <div className="provider-empty inline-empty">
+          <Loader2 size={18} />
+          <span>{tx("Loading auth center")}</span>
+        </div>
+      </section>
+    );
+  }
+  if (!providerTypes.length) return null;
+  return (
+    <section className="auth-center-overview">
+      <div className="section-heading">
+        <div className="section-title-row compact-title">
+          <ShieldCheck size={17} />
+          <div>
+            <h2>{tx("Auth Center")}</h2>
+            <span>{tx("Accounts, login methods, refresh, and quota readiness")}</span>
+          </div>
+        </div>
+      </div>
+      <div className="auth-center-grid">
+        {providerTypes.map((providerType) => {
+          const providerAccounts = accounts.filter((account) => account.providerType === providerType);
+          const capability = capabilitiesByType.get(providerType);
+          const template = templatesByType.get(providerType);
+          return (
+            <AuthCenterProviderCard
+              key={providerType}
+              providerType={providerType}
+              accounts={providerAccounts}
+              capability={capability}
+              template={template}
+              onImport={() => onImport(providerType)}
+            />
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function AuthCenterProviderCard({
+  providerType,
+  accounts,
+  capability,
+  template,
+  onImport,
+}: {
+  providerType: string;
+  accounts: AccountRecord[];
+  capability?: AccountManagerCapability;
+  template?: AccountImportTemplate;
+  onImport: () => void;
+}) {
+  const { tx } = useI18n();
+  const icon = accountProviderIcon(providerType);
+  const quotaReady = accounts.filter((account) => account.quota || account.quotaPercent != null).length;
+  const errors = accounts.filter((account) => account.lastRefreshError).length;
+  const statusTone = errors ? "danger" : capability?.supportsRefresh || capability?.supportsImport ? "success" : "warning";
+  return (
+    <article className="auth-center-card">
+      <header>
+        <div className="account-provider-title-row">
+          <span className="account-icon-frame compact">
+            <ProviderIcon icon={icon.icon} color={icon.color} name={providerLabel(providerType)} size={18} />
+          </span>
+          <div>
+            <h3>{providerLabel(providerType)}</h3>
+            <span>{template?.credentialKind || capability?.serverNativeStage || tx("manual")}</span>
+          </div>
+        </div>
+        <StatusPill tone={statusTone}>
+          {errors ? tx("error") : capability?.status || tx("ready")}
+        </StatusPill>
+      </header>
+      <div className="auth-center-metrics">
+        <KeyValue label="accounts" value={accounts.length} />
+        <KeyValue label="quota" value={`${quotaReady}/${accounts.length || "-"}`} />
+        <KeyValue label="refresh" value={capability?.supportsRefresh ? tx("ready") : tx("manual")} />
+      </div>
+      <div className="capability-flags">
+        <span>{capability?.supportsStartLogin ? tx("OAuth") : tx("manual import")}</span>
+        <span>{capability?.supportsQuota ? tx("quota") : tx("no-quota")}</span>
+        <span>{template ? tx("template") : tx("no-template")}</span>
+      </div>
+      <button className="secondary-button compact" type="button" onClick={onImport}>
+        <Upload size={13} />
+        <span>{tx(accounts.length ? "Import another" : "Import")}</span>
+      </button>
+    </article>
   );
 }
 

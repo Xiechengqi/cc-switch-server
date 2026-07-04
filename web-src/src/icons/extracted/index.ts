@@ -28,6 +28,16 @@ import xai from "./xai.svg?raw";
 import grok from "./grok.svg?raw";
 import copilot from "./copilot.svg?raw";
 import githubcopilot from "./githubcopilot.svg?raw";
+import github from "./github.svg?raw";
+import googlecloud from "./googlecloud.svg?raw";
+import doubao from "./doubao.svg?raw";
+import siliconflow from "./siliconflow.svg?raw";
+import stepfun from "./stepfun.svg?raw";
+import meta from "./meta.svg?raw";
+import huawei from "./huawei.svg?raw";
+import newapi from "./newapi.svg?raw";
+import subrouter from "./subrouter.svg?raw";
+import bytedance from "./bytedance.svg?raw";
 import cursorUrl from "./cursor.png";
 import kiroUrl from "./kiro.png";
 
@@ -64,6 +74,16 @@ export const icons: Record<string, string> = {
   grok,
   copilot,
   githubcopilot,
+  github,
+  googlecloud,
+  doubao,
+  siliconflow,
+  stepfun,
+  meta,
+  huawei,
+  newapi,
+  subrouter,
+  bytedance,
 };
 
 export const iconUrls: Record<string, string> = {

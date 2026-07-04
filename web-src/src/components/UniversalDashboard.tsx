@@ -43,6 +43,7 @@ import {
 } from "react";
 
 import {
+  AppKind,
   deleteUniversalProvider,
   exportUniversalProviders,
   importUniversalProviders,
@@ -61,6 +62,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import JsonEditor from "@/components/JsonEditor";
 import { JsonPreview } from "@/components/JsonPreview";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import { appIcon } from "@/lib/provider-icons";
 
 interface UniversalDraft {
   mode: "create" | "edit";
@@ -568,25 +570,36 @@ function UniversalFormModal({
               onChange={(value) => patch({ iconColor: value })}
             />
           </div>
-          <label className="toggle-row">
-            <input type="checkbox" checked={draft.claude} onChange={(event) => patch({ claude: event.target.checked })} />
-            <span>Claude</span>
-          </label>
-          <label className="toggle-row">
-            <input type="checkbox" checked={draft.codex} onChange={(event) => patch({ codex: event.target.checked })} />
-            <span>Codex</span>
-          </label>
-          <label className="toggle-row">
-            <input type="checkbox" checked={draft.gemini} onChange={(event) => patch({ gemini: event.target.checked })} />
-            <span>Gemini</span>
-          </label>
-          <TextField label="Claude model" value={draft.claudeModel} onChange={(value) => patch({ claudeModel: value })} />
-          <TextField label="Claude haiku" value={draft.claudeHaikuModel} onChange={(value) => patch({ claudeHaikuModel: value })} />
-          <TextField label="Claude sonnet" value={draft.claudeSonnetModel} onChange={(value) => patch({ claudeSonnetModel: value })} />
-          <TextField label="Claude opus" value={draft.claudeOpusModel} onChange={(value) => patch({ claudeOpusModel: value })} />
-          <TextField label="Codex model" value={draft.codexModel} onChange={(value) => patch({ codexModel: value })} />
-          <TextField label="Codex reasoning" value={draft.codexReasoningEffort} onChange={(value) => patch({ codexReasoningEffort: value })} />
-          <TextField label="Gemini model" value={draft.geminiModel} onChange={(value) => patch({ geminiModel: value })} />
+          <div className="wide-field universal-app-config-grid">
+            <UniversalAppConfigCard
+              app="claude"
+              label="Claude"
+              enabled={draft.claude}
+              onEnabled={(enabled) => patch({ claude: enabled })}
+            >
+              <TextField label="Claude model" value={draft.claudeModel} onChange={(value) => patch({ claudeModel: value })} />
+              <TextField label="Claude haiku" value={draft.claudeHaikuModel} onChange={(value) => patch({ claudeHaikuModel: value })} />
+              <TextField label="Claude sonnet" value={draft.claudeSonnetModel} onChange={(value) => patch({ claudeSonnetModel: value })} />
+              <TextField label="Claude opus" value={draft.claudeOpusModel} onChange={(value) => patch({ claudeOpusModel: value })} />
+            </UniversalAppConfigCard>
+            <UniversalAppConfigCard
+              app="codex"
+              label="Codex"
+              enabled={draft.codex}
+              onEnabled={(enabled) => patch({ codex: enabled })}
+            >
+              <TextField label="Codex model" value={draft.codexModel} onChange={(value) => patch({ codexModel: value })} />
+              <TextField label="Codex reasoning" value={draft.codexReasoningEffort} onChange={(value) => patch({ codexReasoningEffort: value })} />
+            </UniversalAppConfigCard>
+            <UniversalAppConfigCard
+              app="gemini"
+              label="Gemini"
+              enabled={draft.gemini}
+              onEnabled={(enabled) => patch({ gemini: enabled })}
+            >
+              <TextField label="Gemini model" value={draft.geminiModel} onChange={(value) => patch({ geminiModel: value })} />
+            </UniversalAppConfigCard>
+          </div>
           <div className="wide-field universal-json-section">
             <div className="section-title-row compact-title">
               <Boxes size={16} />
@@ -641,6 +654,49 @@ function UniversalFormModal({
         </footer>
       </form>
     </div>
+  );
+}
+
+function UniversalAppConfigCard({
+  app,
+  label,
+  enabled,
+  onEnabled,
+  children,
+}: {
+  app: AppKind;
+  label: string;
+  enabled: boolean;
+  onEnabled: (enabled: boolean) => void;
+  children: ReactNode;
+}) {
+  const { tx } = useI18n();
+  const icon = appIcon(app);
+  return (
+    <section className={enabled ? "universal-app-config active" : "universal-app-config"}>
+      <header>
+        <div className="universal-app-config-title">
+          <span className="provider-icon-frame small">
+            <ProviderIcon icon={icon.icon} color={icon.color} name={label} size={18} />
+          </span>
+          <div>
+            <h3>{tx(label)}</h3>
+            <p>{tx("Derived provider settings")}</p>
+          </div>
+        </div>
+        <label className="toggle-row compact-toggle">
+          <input type="checkbox" checked={enabled} onChange={(event) => onEnabled(event.target.checked)} />
+          <span>{tx(enabled ? "enabled" : "disabled")}</span>
+        </label>
+      </header>
+      {enabled ? (
+        <div className="universal-app-config-fields">{children}</div>
+      ) : (
+        <div className="compact-empty">
+          <span>{tx("This app will not receive a derived provider.")}</span>
+        </div>
+      )}
+    </section>
   );
 }
 

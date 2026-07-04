@@ -681,6 +681,30 @@ tbody tr:last-child td {
   gap: 7px;
 }
 
+.failover-priority-badge {
+  display: inline-flex;
+  max-width: 116px;
+  min-height: 22px;
+  flex: 0 0 auto;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--subtle));
+  padding: 0 8px;
+  color: hsl(var(--muted));
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.failover-priority-badge.primary {
+  border-color: hsl(151 58% 72%);
+  background: hsl(151 70% 95%);
+  color: hsl(var(--success));
+}
+
 .provider-card-right {
   flex: 0 0 auto;
   justify-content: flex-end;
@@ -1042,6 +1066,57 @@ tbody tr:last-child td {
   font-size: 0.95rem;
 }
 
+.provider-auth-section {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 12px;
+}
+
+.provider-auth-section .section-title-row h3 {
+  margin: 0;
+  color: hsl(var(--foreground));
+  font-size: 0.95rem;
+}
+
+.provider-auth-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.provider-auth-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 10px;
+}
+
+.provider-auth-card header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.provider-auth-card header > span:not(.status-pill) {
+  min-width: 0;
+  overflow: hidden;
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .provider-advanced-section {
   min-width: 0;
   border: 1px solid hsl(var(--border));
@@ -1284,6 +1359,68 @@ tbody tr:last-child td {
 .account-stat strong {
   color: hsl(var(--foreground));
   font-size: 1.1rem;
+}
+
+.auth-center-overview {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 14px;
+  box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
+}
+
+.auth-center-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.auth-center-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 10px;
+}
+
+.auth-center-card:hover {
+  border-color: hsl(202 56% 78%);
+  background: hsl(202 70% 96%);
+}
+
+.auth-center-card header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.auth-center-card h3 {
+  margin: 0;
+  overflow: hidden;
+  color: hsl(var(--foreground));
+  font-size: 0.9rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-center-card header span:not(.status-pill) {
+  color: hsl(var(--muted));
+  font-size: 0.74rem;
+}
+
+.auth-center-metrics {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .account-group-list,
@@ -1871,6 +2008,149 @@ tbody tr:last-child td {
   font-size: 0.8rem;
 }
 
+.owner-change-form {
+  gap: 12px;
+}
+
+.owner-change-panel {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 12px;
+}
+
+.owner-change-panel header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.owner-change-panel header > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.owner-change-panel h3,
+.owner-change-panel p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.owner-change-panel h3 {
+  margin: 0;
+  color: hsl(var(--foreground));
+  font-size: 0.95rem;
+}
+
+.owner-change-panel p {
+  margin: 0;
+  color: hsl(var(--muted));
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.owner-change-flow {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.owner-node {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  border: 1px solid hsl(202 56% 78%);
+  border-radius: 8px;
+  background: hsl(202 70% 96%);
+  padding: 10px;
+}
+
+.owner-node.muted {
+  border-color: hsl(var(--border));
+  background: hsl(var(--panel));
+}
+
+.owner-node span,
+.owner-node strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.owner-node span {
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+}
+
+.owner-node strong {
+  color: hsl(var(--foreground));
+  font-size: 0.86rem;
+}
+
+.owner-change-arrow {
+  color: hsl(var(--muted));
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.owner-change-steps {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.owner-step {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--panel));
+  padding: 6px 9px;
+  color: hsl(var(--muted));
+}
+
+.owner-step span {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: hsl(var(--border));
+}
+
+.owner-step strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.owner-step.active {
+  border-color: hsl(151 58% 72%);
+  background: hsl(151 70% 95%);
+  color: hsl(var(--success));
+}
+
+.owner-step.active span {
+  background: hsl(var(--success));
+}
+
+.owner-request-button {
+  width: fit-content;
+}
+
 .share-card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
@@ -1905,6 +2185,98 @@ tbody tr:last-child td {
 
 .share-request-log-table td {
   max-width: 180px;
+}
+
+.share-request-log-list {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 10px;
+}
+
+.share-request-log-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 10px;
+}
+
+.share-request-log-card:hover {
+  border-color: hsl(202 56% 78%);
+  background: hsl(202 70% 96%);
+}
+
+.share-request-log-card header,
+.share-request-title,
+.share-request-status,
+.share-request-tags {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.share-request-log-card header {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.share-request-title > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.share-request-title strong,
+.share-request-title span,
+.share-request-status small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.share-request-title strong {
+  color: hsl(var(--foreground));
+  font-size: 0.86rem;
+}
+
+.share-request-title span,
+.share-request-status small {
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+}
+
+.share-request-status {
+  flex: 0 0 auto;
+}
+
+.share-request-metrics {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.share-request-tags {
+  flex-wrap: wrap;
+}
+
+.share-request-tags span {
+  max-width: 180px;
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--panel));
+  padding: 3px 8px;
+  color: hsl(var(--muted));
+  font-size: 0.7rem;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .share-card header {
@@ -2348,6 +2720,83 @@ tbody tr:last-child td {
 
 .universal-icon-editor label {
   min-width: 0;
+}
+
+.universal-app-config-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.universal-app-config {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 12px;
+}
+
+.universal-app-config.active {
+  border-color: hsl(202 56% 78%);
+  background: hsl(202 70% 97%);
+}
+
+.universal-app-config header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.universal-app-config-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+
+.universal-app-config-title > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.universal-app-config h3,
+.universal-app-config p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.universal-app-config h3 {
+  margin: 0;
+  color: hsl(var(--foreground));
+  font-size: 0.9rem;
+}
+
+.universal-app-config p {
+  margin: 0;
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.universal-app-config .compact-toggle {
+  flex: 0 0 auto;
+  min-height: 30px;
+  align-self: auto;
+  padding: 0 8px;
+}
+
+.universal-app-config-fields {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 1fr;
+  gap: 8px;
 }
 
 .universal-form-modal textarea {
@@ -2808,6 +3257,240 @@ tbody tr:last-child td {
 .usage-token-cell span {
   color: hsl(var(--muted));
   font-size: 0.72rem;
+}
+
+.usage-activity-panel {
+  padding-bottom: 10px;
+}
+
+.usage-log-list {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
+.usage-log-card,
+.usage-pricing-card,
+.usage-limit-card {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 12px;
+}
+
+.usage-log-card:hover,
+.usage-pricing-card:hover,
+.usage-limit-card:hover {
+  border-color: hsl(202 56% 78%);
+  box-shadow: 0 8px 18px hsl(220 20% 20% / 0.07);
+}
+
+.usage-log-card header,
+.usage-log-card footer,
+.usage-pricing-card header,
+.usage-pricing-card footer,
+.usage-limit-card header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.usage-log-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.usage-log-title > div,
+.usage-pricing-card header > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.usage-log-title strong,
+.usage-log-title span,
+.usage-pricing-card strong,
+.usage-pricing-card span,
+.usage-log-status small,
+.usage-mini-metric strong,
+.usage-mini-metric span,
+.usage-mini-metric small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-log-title strong,
+.usage-pricing-card strong {
+  color: hsl(var(--foreground));
+  font-size: 0.88rem;
+}
+
+.usage-log-title span,
+.usage-pricing-card header span,
+.usage-log-status small {
+  color: hsl(var(--muted));
+  font-size: 0.74rem;
+}
+
+.usage-log-status {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.usage-log-metrics,
+.usage-pricing-summary,
+.usage-rate-grid,
+.usage-limit-meta {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.usage-log-metrics {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.usage-pricing-summary {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.usage-rate-grid,
+.usage-limit-meta {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.usage-mini-metric {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 8px 10px;
+}
+
+.usage-mini-metric span,
+.usage-mini-metric small {
+  color: hsl(var(--muted));
+  font-size: 0.7rem;
+}
+
+.usage-mini-metric strong {
+  color: hsl(var(--foreground));
+  font-size: 0.84rem;
+}
+
+.usage-log-tags,
+.usage-share-strip {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.usage-log-tags span,
+.usage-share-strip span {
+  max-width: 220px;
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--subtle));
+  padding: 3px 8px;
+  color: hsl(var(--muted));
+  font-size: 0.7rem;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-log-tags.warning-tags span {
+  border-color: hsl(38 92% 74%);
+  background: hsl(38 100% 96%);
+  color: hsl(var(--warning));
+}
+
+.compact-action {
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.usage-pricing-grid,
+.usage-limit-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.usage-pricing-card footer {
+  padding-top: 2px;
+}
+
+.usage-pricing-card footer > span {
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+  font-weight: 650;
+}
+
+.usage-limit-meter-stack {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.usage-limit-meter {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 180px);
+  align-items: center;
+  gap: 12px;
+}
+
+.usage-limit-meter > div:first-child {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(70px, 0.7fr) minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.usage-limit-meter span,
+.usage-limit-meter strong,
+.usage-limit-meter small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-limit-meter span,
+.usage-limit-meter small {
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+}
+
+.usage-limit-meter strong {
+  color: hsl(var(--foreground));
+  font-size: 0.84rem;
+}
+
+.usage-limit-meter.exceeded .usage-rank-meter > span {
+  background: hsl(var(--danger));
+}
+
+.usage-limit-card .usage-share-strip {
+  padding-top: 2px;
 }
 
 .pricing-default-grid {
@@ -3313,6 +3996,7 @@ tbody tr:last-child td {
   .provider-summary-row,
   .usage-summary-grid,
   .provider-form-grid,
+  .provider-auth-grid,
   .provider-card-meta,
   .provider-readiness-grid,
   .provider-limit-grid,
@@ -3327,11 +4011,46 @@ tbody tr:last-child td {
   .settings-import-export-grid,
   .theme-option-grid,
   .share-stats-bar,
+  .share-request-log-list,
+  .share-request-metrics,
   .share-tunnel-summary,
+  .owner-change-flow,
+  .owner-change-steps,
   .accounts-stats-bar,
+  .auth-center-grid,
+  .auth-center-metrics,
   .pricing-default-grid,
   .pricing-default-rates,
+  .usage-log-metrics,
+  .usage-pricing-summary,
+  .usage-pricing-grid,
+  .usage-rate-grid,
+  .usage-limit-grid,
+  .usage-limit-meta,
+  .universal-app-config-grid,
   .universal-form-modal .provider-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .usage-log-card header,
+  .usage-log-card footer,
+  .usage-pricing-card header,
+  .usage-pricing-card footer,
+  .usage-limit-card header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .usage-log-status,
+  .usage-pricing-card .provider-actions {
+    justify-content: flex-start;
+  }
+
+  .usage-limit-meter {
+    grid-template-columns: 1fr;
+  }
+
+  .usage-limit-meter > div:first-child {
     grid-template-columns: 1fr;
   }
 

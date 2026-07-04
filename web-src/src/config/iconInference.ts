@@ -36,6 +36,32 @@ const iconMappings: Record<string, { icon: string; iconColor?: string }> = {
   kiro: { icon: "kiro" },
   copilot: { icon: "copilot", iconColor: "#111827" },
   githubcopilot: { icon: "githubcopilot", iconColor: "#111827" },
+  github: { icon: "github", iconColor: "#111827" },
+  googlecloud: { icon: "googlecloud", iconColor: "#4285F4" },
+  "google cloud": { icon: "googlecloud", iconColor: "#4285F4" },
+  gcp: { icon: "googlecloud", iconColor: "#4285F4" },
+  antigravity: { icon: "google", iconColor: "#4285F4" },
+  agy: { icon: "google", iconColor: "#4285F4" },
+  doubao: { icon: "doubao", iconColor: "#1E37FC" },
+  volcengine: { icon: "doubao", iconColor: "#1E37FC" },
+  huoshan: { icon: "doubao", iconColor: "#1E37FC" },
+  bytedance: { icon: "bytedance", iconColor: "#3C8CFF" },
+  siliconflow: { icon: "siliconflow", iconColor: "#6E29F6" },
+  "silicon flow": { icon: "siliconflow", iconColor: "#6E29F6" },
+  stepfun: { icon: "stepfun", iconColor: "#005AFF" },
+  "step fun": { icon: "stepfun", iconColor: "#005AFF" },
+  step: { icon: "stepfun", iconColor: "#005AFF" },
+  meta: { icon: "meta", iconColor: "#0082FB" },
+  llama: { icon: "meta", iconColor: "#0082FB" },
+  huawei: { icon: "huawei", iconColor: "#C7000B" },
+  newapi: { icon: "newapi", iconColor: "#C738FB" },
+  "new api": { icon: "newapi", iconColor: "#C738FB" },
+  subrouter: { icon: "subrouter", iconColor: "#111827" },
+  "sub router": { icon: "subrouter", iconColor: "#111827" },
+  bedrock: { icon: "aws", iconColor: "#FF9900" },
+  "ollama cloud": { icon: "ollama", iconColor: "#111827" },
+  deepseekapi: { icon: "deepseek", iconColor: "#1E88E5" },
+  "deepseek api": { icon: "deepseek", iconColor: "#1E88E5" },
 };
 
 export function inferIconForText(...parts: Array<string | null | undefined>): {
@@ -43,7 +69,8 @@ export function inferIconForText(...parts: Array<string | null | undefined>): {
   iconColor?: string;
 } {
   const haystack = parts.filter(Boolean).join(" ").toLowerCase();
-  for (const [key, config] of Object.entries(iconMappings)) {
+  const mappings = Object.entries(iconMappings).sort((left, right) => right[0].length - left[0].length);
+  for (const [key, config] of mappings) {
     if (haystack.includes(key)) {
       return config;
     }

@@ -792,52 +792,61 @@ function ShareRequestLogPanel({ logs, shares }: { logs: UsageLog[]; shares: Shar
           </div>
         </div>
       </div>
-      <div className="table-wrap share-request-log-table">
-        <table>
-          <thead>
-            <tr>
-              <th>{tx("Share")}</th>
-              <th>{tx("App")}</th>
-              <th>{tx("Model")}</th>
-              <th>{tx("Status")}</th>
-              <th>{tx("Tokens")}</th>
-              <th>{tx("Cost")}</th>
-              <th>{tx("Latency")}</th>
-              <th>{tx("User")}</th>
-              <th>{tx("Time")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {logs.length ? (
-              logs.slice(0, 80).map((log) => {
-                const share = log.shareId ? shareById.get(log.shareId) : undefined;
-                return (
-                  <tr key={log.requestId}>
-                    <td title={log.shareId || undefined}>{log.shareName || (share ? shareName(share) : log.shareId || "-")}</td>
-                    <td>{appLabel(log.app)}</td>
-                    <td>{log.actualModel || log.requestedModel || log.model || "-"}</td>
-                    <td>
-                      <StatusPill tone={log.statusCode >= 200 && log.statusCode < 400 ? "success" : "danger"}>
-                        {log.statusCode || "-"}
-                      </StatusPill>
-                    </td>
-                    <td>{formatTokens(log.totalTokens)}</td>
-                    <td>{formatUsd(log.totalCostUsd)}</td>
-                    <td>{formatDuration(log.durationMs)}</td>
-                    <td>{log.userEmail || "-"}</td>
-                    <td>{formatTime(log.createdAtMs)}</td>
-                  </tr>
-                );
-              })
-            ) : (
-              <tr>
-                <td className="empty-cell" colSpan={9}>{tx("No share request logs")}</td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+      {logs.length ? (
+        <div className="share-request-log-list">
+          {logs.slice(0, 80).map((log) => (
+            <ShareRequestLogCard
+              key={log.requestId}
+              log={log}
+              share={log.shareId ? shareById.get(log.shareId) : undefined}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="provider-empty compact-empty">
+          <FileJson size={20} />
+          <span>{tx("No share request logs")}</span>
+        </div>
+      )}
     </section>
+  );
+}
+
+function ShareRequestLogCard({ log, share }: { log: UsageLog; share?: ShareRecord }) {
+  const { tx } = useI18n();
+  const app = appIcon(log.app);
+  const model = log.actualModel || log.requestedModel || log.model || "-";
+  const ok = log.statusCode >= 200 && log.statusCode < 400;
+  return (
+    <article className="share-request-log-card">
+      <header>
+        <div className="share-request-title">
+          <span className="provider-icon-frame small">
+            <ProviderIcon icon={app.icon} color={app.color} name={appLabel(log.app)} size={18} />
+          </span>
+          <div>
+            <strong title={log.shareId || undefined}>{log.shareName || (share ? shareName(share) : log.shareId || "-")}</strong>
+            <span title={model}>{model}</span>
+          </div>
+        </div>
+        <div className="share-request-status">
+          <StatusPill tone={ok ? "success" : "danger"}>{log.statusCode || "-"}</StatusPill>
+          <small>{formatTime(log.createdAtMs)}</small>
+        </div>
+      </header>
+      <div className="share-request-metrics">
+        <KeyValue label="app" value={appLabel(log.app)} />
+        <KeyValue label="tokens" value={formatTokens(log.totalTokens)} />
+        <KeyValue label="cost" value={formatUsd(log.totalCostUsd)} />
+        <KeyValue label="latency" value={formatDuration(log.durationMs)} />
+      </div>
+      <div className="share-request-tags">
+        <span>{log.userEmail || tx("anonymous")}</span>
+        {log.dataSource && <span>{log.dataSource}</span>}
+        {log.streamStatus && <span>{tx(log.streamStatus)}</span>}
+        {log.isHealthCheck && <span>{tx("health")}</span>}
+      </div>
+    </article>
   );
 }
 
@@ -1296,28 +1305,55 @@ function OwnerChangeModal({
   const [code, setCode] = useState("");
   const [result, setResult] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const hasCode = code.trim().length > 0;
   return (
     <SimpleModal title="Verify Share Owner" subtitle={draft.ownerEmail} onClose={onClose}>
       <form
-        className="modal-form-stack"
+        className="modal-form-stack owner-change-form"
         onSubmit={(event) => {
           event.preventDefault();
           setLocalError(null);
           void onVerify(code).catch((reason) => setLocalError(errorMessage(reason)));
         }}
       >
-        <div className="provider-card-meta">
-          <KeyValue label="current owner" value={draft.originalOwnerEmail || "-"} />
-          <KeyValue label="new owner" value={draft.ownerEmail || "-"} />
-        </div>
+        <section className="owner-change-panel">
+          <header>
+            <span className="provider-icon-frame">
+              <Users size={20} />
+            </span>
+            <div>
+              <h3>{tx("Owner handoff")}</h3>
+              <p>{tx("Email verification is required before saving this share owner change.")}</p>
+            </div>
+          </header>
+          <div className="owner-change-flow">
+            <OwnerNode label="current owner" value={draft.originalOwnerEmail || "-"} muted />
+            <span className="owner-change-arrow">-&gt;</span>
+            <OwnerNode label="new owner" value={draft.ownerEmail || "-"} />
+          </div>
+          <div className="owner-change-steps">
+            <OwnerStep label="request code" active />
+            <OwnerStep label="verify email" active={Boolean(result) || hasCode} />
+            <OwnerStep label="save share" active={hasCode} />
+          </div>
+        </section>
         <button
-          className="secondary-button"
+          className="secondary-button owner-request-button"
           type="button"
           disabled={saving}
           onClick={() => {
             setLocalError(null);
             void onRequestCode()
-              .then((response) => setResult(tx("code sent to {{destination}}", { destination: response.maskedDestination })))
+              .then((response) =>
+                setResult(
+                  response.cooldownSecs
+                    ? tx("code sent to {{destination}}; cooldown {{seconds}}s", {
+                        destination: response.maskedDestination,
+                        seconds: response.cooldownSecs,
+                      })
+                    : tx("code sent to {{destination}}", { destination: response.maskedDestination }),
+                ),
+              )
               .catch((reason) => setLocalError(errorMessage(reason)));
           }}
         >
@@ -1326,13 +1362,33 @@ function OwnerChangeModal({
         </button>
         <label>
           <span>{tx("Email code")}</span>
-          <input value={code} onChange={(event) => setCode(event.target.value)} />
+          <input value={code} onChange={(event) => setCode(event.target.value)} required />
         </label>
         {result && <div className="provider-card-result">{result}</div>}
         {localError && <div className="form-error">{localError}</div>}
-        <ModalFooter saving={saving} onClose={onClose} label="Verify Owner" />
+        <ModalFooter saving={saving} disabled={!hasCode} onClose={onClose} label="Verify Owner" />
       </form>
     </SimpleModal>
+  );
+}
+
+function OwnerNode({ label, value, muted = false }: { label: string; value: string; muted?: boolean }) {
+  const { tx } = useI18n();
+  return (
+    <div className={muted ? "owner-node muted" : "owner-node"}>
+      <span>{tx(label)}</span>
+      <strong title={value}>{value}</strong>
+    </div>
+  );
+}
+
+function OwnerStep({ label, active }: { label: string; active: boolean }) {
+  const { tx } = useI18n();
+  return (
+    <div className={active ? "owner-step active" : "owner-step"}>
+      <span />
+      <strong>{tx(label)}</strong>
+    </div>
   );
 }
 
@@ -1402,14 +1458,24 @@ function SimpleModal({
   );
 }
 
-function ModalFooter({ saving, onClose, label }: { saving: boolean; onClose: () => void; label: string }) {
+function ModalFooter({
+  saving,
+  disabled = false,
+  onClose,
+  label,
+}: {
+  saving: boolean;
+  disabled?: boolean;
+  onClose: () => void;
+  label: string;
+}) {
   const { tx } = useI18n();
   return (
     <footer className="modal-inline-footer">
       <button className="secondary-button" type="button" onClick={onClose}>
         {tx("Cancel")}
       </button>
-      <button className="primary-button" type="submit" disabled={saving}>
+      <button className="primary-button" type="submit" disabled={saving || disabled}>
         {saving && <Loader2 size={15} />}
         <span>{tx(label)}</span>
       </button>

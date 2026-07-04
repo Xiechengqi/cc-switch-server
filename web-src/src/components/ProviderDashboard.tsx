@@ -394,10 +394,11 @@ export function ProviderDashboard({
             strategy={verticalListSortingStrategy}
           >
             <div className="provider-card-grid">
-              {activeProviders.map((provider) => (
+              {activeProviders.map((provider, index) => (
                 <SortableProviderCard
                   key={`${provider.app}:${provider.provider.id}`}
                   provider={provider}
+                  priority={index + 1}
                   entry={entries.find((item) => item.providerTypeId === provider.providerTypeId)}
                   health={healthById.get(provider.provider.id)}
                   account={accountForProvider(provider, accountsById)}
@@ -477,6 +478,7 @@ type DragHandleProps = HTMLAttributes<HTMLButtonElement> & {
 
 interface ProviderCardProps {
   provider: StoredProvider;
+  priority: number;
   entry?: ProviderMatrixEntry;
   health?: ProviderHealth;
   account?: AccountRecord;
@@ -491,6 +493,7 @@ interface ProviderCardProps {
 
 function ProviderCard({
   provider,
+  priority,
   entry,
   health,
   account,
@@ -553,6 +556,7 @@ function ProviderCard({
           <div className="provider-title-stack">
             <div className="provider-name-row">
               <h3>{provider.provider.name}</h3>
+              <FailoverPriorityBadge priority={priority} />
               {current && <StatusPill tone="success">{tx("current")}</StatusPill>}
               {account?.subscriptionLevel && (
                 <StatusPill tone="success">{account.subscriptionLevel}</StatusPill>
@@ -643,6 +647,16 @@ function ProviderCard({
         onCancel={() => setDeleteConfirmOpen(false)}
       />
     </>
+  );
+}
+
+function FailoverPriorityBadge({ priority }: { priority: number }) {
+  const { tx } = useI18n();
+  const label = priority <= 1 ? tx("primary") : tx("fallback {{rank}}", { rank: priority });
+  return (
+    <span className={priority <= 1 ? "failover-priority-badge primary" : "failover-priority-badge"}>
+      {label}
+    </span>
   );
 }
 
@@ -760,41 +774,6 @@ function ProviderFormModal({
             <span>{tx("Model")}</span>
             <input value={draft.model} onChange={(event) => patch({ model: event.target.value })} />
           </label>
-          <label>
-            <span>{tx("Base URL")}</span>
-            <input
-              value={draft.baseUrl}
-              onChange={(event) => patch({ baseUrl: event.target.value })}
-            />
-          </label>
-          <label>
-            <span>{tx("API format")}</span>
-            <input
-              value={draft.apiFormat}
-              onChange={(event) => patch({ apiFormat: event.target.value })}
-            />
-          </label>
-          <label>
-            <span>{tx(entry?.defaults.key || "API key")}</span>
-            <input
-              type="password"
-              value={draft.apiKey}
-              onChange={(event) => patch({ apiKey: event.target.value })}
-              placeholder={entry?.credentialMode === "oauth_or_manual_token" ? "optional account token" : ""}
-            />
-          </label>
-          <label>
-            <span>{tx("Managed account")}</span>
-            <select value={draft.accountId} onChange={(event) => patch({ accountId: event.target.value })}>
-              <option value="">{tx("Direct config")}</option>
-              {accountOptions.map((account) => (
-                <option key={account.id} value={account.id}>
-                  {account.email || account.id}
-                  {account.subscriptionLevel ? ` (${account.subscriptionLevel})` : ""}
-                </option>
-              ))}
-            </select>
-          </label>
           <label className="wide-field">
             <span>{tx("Category")}</span>
             <input
@@ -802,6 +781,14 @@ function ProviderFormModal({
               onChange={(event) => patch({ category: event.target.value })}
             />
           </label>
+          {entry && (
+            <ProviderAuthSection
+              draft={draft}
+              entry={entry}
+              accountOptions={accountOptions}
+              onPatch={patch}
+            />
+          )}
           <details className="wide-field provider-advanced-section" open={hasAdvancedConfig || undefined}>
             <summary>
               <Boxes size={16} />
@@ -854,6 +841,90 @@ function ProviderFormModal({
         </footer>
       </form>
     </div>
+  );
+}
+
+function ProviderAuthSection({
+  draft,
+  entry,
+  accountOptions,
+  onPatch,
+}: {
+  draft: ProviderDraft;
+  entry: ProviderMatrixEntry;
+  accountOptions: AccountRecord[];
+  onPatch: (next: Partial<ProviderDraft>) => void;
+}) {
+  const { tx } = useI18n();
+  return (
+    <section className="wide-field provider-auth-section">
+      <div className="section-title-row compact-title">
+        <ServerCog size={16} />
+        <div>
+          <h3>{tx("Authentication and endpoint")}</h3>
+          <span>{tx("Manual token, managed account, and upstream routing settings")}</span>
+        </div>
+      </div>
+      <div className="provider-auth-grid">
+        <article className="provider-auth-card">
+          <header>
+            <StatusPill tone={entry.directConfigSupported ? "success" : "warning"}>
+              {tx(entry.directConfigSupported ? "direct" : "limited")}
+            </StatusPill>
+            <span>{tx(entry.credentialMode)}</span>
+          </header>
+          <label>
+            <span>{tx(entry.defaults.key || "API key")}</span>
+            <input
+              type="password"
+              value={draft.apiKey}
+              onChange={(event) => onPatch({ apiKey: event.target.value })}
+              placeholder={entry.credentialMode === "oauth_or_manual_token" ? tx("optional account token") : ""}
+            />
+          </label>
+        </article>
+        <article className="provider-auth-card">
+          <header>
+            <StatusPill tone={entry.accountSupported ? "success" : "warning"}>
+              {tx(entry.managedAccountRecommended ? "recommended" : "account")}
+            </StatusPill>
+            <span>{tx("{{count}} accounts", { count: accountOptions.length })}</span>
+          </header>
+          <label>
+            <span>{tx("Managed account")}</span>
+            <select value={draft.accountId} onChange={(event) => onPatch({ accountId: event.target.value })}>
+              <option value="">{tx("Direct config")}</option>
+              {accountOptions.map((account) => (
+                <option key={account.id} value={account.id}>
+                  {account.email || account.id}
+                  {account.subscriptionLevel ? ` (${account.subscriptionLevel})` : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+        </article>
+        <article className="provider-auth-card">
+          <header>
+            <StatusPill tone="success">{tx("endpoint")}</StatusPill>
+            <span>{entry.defaults.apiFormat || tx("api format")}</span>
+          </header>
+          <label>
+            <span>{tx("Base URL")}</span>
+            <input
+              value={draft.baseUrl}
+              onChange={(event) => onPatch({ baseUrl: event.target.value })}
+            />
+          </label>
+          <label>
+            <span>{tx("API format")}</span>
+            <input
+              value={draft.apiFormat}
+              onChange={(event) => onPatch({ apiFormat: event.target.value })}
+            />
+          </label>
+        </article>
+      </div>
+    </section>
   );
 }
 

@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
+import { inferIconForText } from "@/config/iconInference";
 import {
   AppKind,
   backfillUsageCosts,
@@ -38,6 +39,7 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { JsonPreview } from "@/components/JsonPreview";
+import { ProviderIcon } from "@/components/ProviderIcon";
 
 type UsageTab = "logs" | "providers" | "models" | "pricing" | "limits";
 type RangePreset = "24h" | "7d" | "30d" | "all" | "custom";
@@ -319,7 +321,7 @@ export function UsageDashboard() {
       </div>
 
       {activeTab === "logs" && (
-        <LogsTable logs={data.logs} loading={loading} onDetail={(log) => setDetailId(log.requestId)} />
+        <LogsPanel logs={data.logs} loading={loading} onDetail={(log) => setDetailId(log.requestId)} />
       )}
       {activeTab === "providers" && <ProviderStatsTable providers={data.providers} loading={loading} />}
       {activeTab === "models" && <ModelStatsTable models={data.models} loading={loading} />}
@@ -754,7 +756,7 @@ function TrendPanel({
   );
 }
 
-function LogsTable({
+function LogsPanel({
   logs,
   loading,
   onDetail,
@@ -766,53 +768,92 @@ function LogsTable({
   const { tx } = useI18n();
   if (loading) return <LoadingBlock label="Loading request logs" />;
   return (
-    <div className="table-wrap usage-table">
-      <table>
-        <thead>
-          <tr>
-            <th>{tx("Time")}</th>
-            <th>{tx("App")}</th>
-            <th>{tx("Provider")}</th>
-            <th>{tx("Model")}</th>
-            <th>{tx("Tokens")}</th>
-            <th>{tx("Cost")}</th>
-            <th>{tx("Latency")}</th>
-            <th>{tx("Status")}</th>
-            <th>{tx("Source")}</th>
-            <th>{tx("Detail")}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {logs.length ? (
-            logs.map((log) => (
-              <tr key={log.requestId}>
-                <td>{formatTime(log.createdAtMs)}</td>
-                <td>{log.app}</td>
-                <td title={log.providerId}>{log.providerName || log.providerId}</td>
-                <td title={modelRoute(log)}>{modelRoute(log)}</td>
-                <td>
-                  <TokenCell log={log} />
-                </td>
-                <td>{log.totalCostUsd == null ? "-" : formatUsd(log.totalCostUsd, 5)}</td>
-                <td>{formatLatency(log)}</td>
-                <td>
-                  <StatusPill tone={log.statusCode >= 200 && log.statusCode < 300 ? "success" : "danger"}>
-                    {log.statusCode}
-                  </StatusPill>
-                </td>
-                <td>{sourceText(log)}</td>
-                <td>
-                  <button className="icon-button" type="button" title={tx("Request detail")} aria-label={tx("Request detail")} onClick={() => onDetail(log)}>
-                    <Eye size={15} />
-                  </button>
-                </td>
-              </tr>
-            ))
-          ) : (
-            <EmptyRow columns={10} label="No request logs" />
-          )}
-        </tbody>
-      </table>
+    <section className="usage-panel-card usage-activity-panel">
+      <div className="section-heading">
+        <div className="section-title-row compact-title">
+          <Filter size={17} />
+          <h2>{tx("Request Logs")}</h2>
+        </div>
+        <span>{tx("{{count}} entries", { count: logs.length })}</span>
+      </div>
+      {logs.length ? (
+        <div className="usage-log-list">
+          {logs.map((log) => (
+            <UsageLogCard key={log.requestId} log={log} onDetail={onDetail} />
+          ))}
+        </div>
+      ) : (
+        <div className="provider-empty">
+          <Filter size={22} />
+          <span>{tx("No request logs")}</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function UsageLogCard({ log, onDetail }: { log: UsageLog; onDetail: (log: UsageLog) => void }) {
+  const { tx } = useI18n();
+  const icon = inferIconForText(log.providerType, log.providerName, log.providerId, log.app);
+  const ok = log.statusCode >= 200 && log.statusCode < 300;
+  const cache = (log.cacheReadTokens || 0) + (log.cacheCreationTokens || 0);
+  const totalTokens = log.totalTokens ?? freshInputTokens(log) + (log.outputTokens || 0) + cache;
+  const tokenDetail = tx("in {{input}} / out {{output}}", {
+    input: formatInt(freshInputTokens(log)),
+    output: formatInt(log.outputTokens),
+  });
+  return (
+    <article className="usage-log-card">
+      <header>
+        <div className="usage-log-title">
+          <span className="provider-icon-frame">
+            <ProviderIcon
+              icon={icon.icon}
+              color={icon.iconColor}
+              name={log.providerName || log.providerId || log.app}
+              size={22}
+            />
+          </span>
+          <div>
+            <strong title={log.providerId}>{log.providerName || log.providerId}</strong>
+            <span title={modelRoute(log)}>{modelRoute(log)}</span>
+          </div>
+        </div>
+        <div className="usage-log-status">
+          <StatusPill tone={ok ? "success" : "danger"}>{log.statusCode}</StatusPill>
+          <small>{formatTime(log.createdAtMs)}</small>
+        </div>
+      </header>
+      <div className="usage-log-metrics">
+        <UsageMiniMetric label="tokens" value={formatInt(totalTokens)} detail={tokenDetail} />
+        <UsageMiniMetric label="cost" value={log.totalCostUsd == null ? "-" : formatUsd(log.totalCostUsd, 5)} detail={log.pricingModel || "-"} />
+        <UsageMiniMetric label="latency" value={formatLatency(log)} detail={tx(log.isStreaming ? "streaming" : "non-stream")} />
+        <UsageMiniMetric label="source" value={sourceText(log) || "-"} detail={log.sessionId || log.requestAgent || "-"} />
+      </div>
+      <footer>
+        <div className="usage-log-tags">
+          <span>{tx(log.app)}</span>
+          {log.isHealthCheck && <span>{tx("health")}</span>}
+          {log.shareName || log.shareId ? <span>{log.shareName || log.shareId}</span> : null}
+          {log.userEmail && <span>{log.userEmail}</span>}
+          {log.streamStatus && <span>{tx(log.streamStatus)}</span>}
+        </div>
+        <button className="secondary-button compact-action" type="button" onClick={() => onDetail(log)}>
+          <Eye size={15} />
+          <span>{tx("Detail")}</span>
+        </button>
+      </footer>
+    </article>
+  );
+}
+
+function UsageMiniMetric({ label, value, detail }: { label: string; value: ReactNode; detail: ReactNode }) {
+  const { tx } = useI18n();
+  return (
+    <div className="usage-mini-metric">
+      <span>{tx(label)}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
     </div>
   );
 }
@@ -960,6 +1001,9 @@ function PricingPanel({
   onDelete: (modelId: string) => void;
 }) {
   const { tx } = useI18n();
+  const configuredCacheModels = models.filter(
+    (model) => Number(model.cacheReadCostPerMillion) > 0 || Number(model.cacheCreationCostPerMillion) > 0,
+  ).length;
   return (
     <section className="usage-panel-card">
       <div className="section-heading">
@@ -978,55 +1022,82 @@ function PricingPanel({
           </button>
         </div>
       </div>
-      <div className="table-wrap usage-table">
-        <table>
-        <thead>
-          <tr>
-              <th>{tx("Model")}</th>
-              <th>{tx("Name")}</th>
-              <th>{tx("Input /M")}</th>
-              <th>{tx("Output /M")}</th>
-              <th>{tx("Cache read /M")}</th>
-              <th>{tx("Cache write /M")}</th>
-              <th>{tx("Actions")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {models.length ? (
-              models.map((model) => (
-                <tr key={model.modelId}>
-                  <td title={model.modelId}>{model.modelId}</td>
-                  <td>{model.displayName}</td>
-                  <td>{formatPriceString(model.inputCostPerMillion)}</td>
-                  <td>{formatPriceString(model.outputCostPerMillion)}</td>
-                  <td>{formatPriceString(model.cacheReadCostPerMillion)}</td>
-                  <td>{formatPriceString(model.cacheCreationCostPerMillion)}</td>
-                  <td>
-                    <div className="provider-actions">
-                      <button className="icon-button" type="button" title={tx("Edit pricing")} aria-label={tx("Edit pricing")} onClick={() => onEdit(model)}>
-                        <Pencil size={15} />
-                      </button>
-                      <button
-                        className="icon-button danger"
-                        type="button"
-                        title={tx("Delete pricing")}
-                        aria-label={tx("Delete pricing")}
-                        disabled={busy === `delete:${model.modelId}`}
-                        onClick={() => onDelete(model.modelId)}
-                      >
-                        {busy === `delete:${model.modelId}` ? <Loader2 size={15} /> : <Trash2 size={15} />}
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))
-            ) : (
-              <EmptyRow columns={7} label="No pricing models" />
-            )}
-          </tbody>
-        </table>
+      <div className="usage-pricing-summary">
+        <UsageMiniMetric label="models" value={formatInt(models.length)} detail={tx("configured")} />
+        <UsageMiniMetric label="cache pricing" value={formatInt(configuredCacheModels)} detail={tx("models")} />
+        <UsageMiniMetric label="defaults" value={formatInt(pricingDefaultTemplates.length)} detail={tx("templates")} />
       </div>
+      {models.length ? (
+        <div className="usage-pricing-grid">
+          {models.map((model) => (
+            <PricingCard
+              key={model.modelId}
+              model={model}
+              deleting={busy === `delete:${model.modelId}`}
+              onEdit={onEdit}
+              onDelete={onDelete}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="provider-empty">
+          <Coins size={22} />
+          <span>{tx("No pricing models")}</span>
+        </div>
+      )}
     </section>
+  );
+}
+
+function PricingCard({
+  model,
+  deleting,
+  onEdit,
+  onDelete,
+}: {
+  model: ModelPricingEntry;
+  deleting: boolean;
+  onEdit: (model: ModelPricingEntry) => void;
+  onDelete: (modelId: string) => void;
+}) {
+  const { tx } = useI18n();
+  const icon = inferIconForText(model.modelId, model.displayName);
+  return (
+    <article className="usage-pricing-card">
+      <header>
+        <span className="provider-icon-frame">
+          <ProviderIcon icon={icon.icon} color={icon.iconColor} name={model.displayName || model.modelId} size={22} />
+        </span>
+        <div>
+          <strong>{model.displayName || model.modelId}</strong>
+          <span title={model.modelId}>{model.modelId}</span>
+        </div>
+      </header>
+      <div className="usage-rate-grid">
+        <KeyValue label="input" value={formatPriceString(model.inputCostPerMillion)} />
+        <KeyValue label="output" value={formatPriceString(model.outputCostPerMillion)} />
+        <KeyValue label="cache read" value={formatPriceString(model.cacheReadCostPerMillion)} />
+        <KeyValue label="cache write" value={formatPriceString(model.cacheCreationCostPerMillion)} />
+      </div>
+      <footer>
+        <span>{tx("per million tokens")}</span>
+        <div className="provider-actions">
+          <button className="icon-button" type="button" title={tx("Edit pricing")} aria-label={tx("Edit pricing")} onClick={() => onEdit(model)}>
+            <Pencil size={15} />
+          </button>
+          <button
+            className="icon-button danger"
+            type="button"
+            title={tx("Delete pricing")}
+            aria-label={tx("Delete pricing")}
+            disabled={deleting}
+            onClick={() => onDelete(model.modelId)}
+          >
+            {deleting ? <Loader2 size={15} /> : <Trash2 size={15} />}
+          </button>
+        </div>
+      </footer>
+    </article>
   );
 }
 
@@ -1034,43 +1105,105 @@ function ProviderLimitsTable({ limits, loading }: { limits: ProviderLimitStatus[
   const { tx } = useI18n();
   if (loading) return <LoadingBlock label="Loading provider limits" />;
   return (
-    <div className="table-wrap usage-table">
-      <table>
-        <thead>
-          <tr>
-            <th>{tx("Provider")}</th>
-            <th>{tx("App")}</th>
-            <th>{tx("Daily")}</th>
-            <th>{tx("Monthly")}</th>
-            <th>{tx("Quota")}</th>
-            <th>{tx("Shares")}</th>
-            <th>{tx("Warnings")}</th>
-            <th>{tx("State")}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {limits.length ? (
-            limits.map((limit) => (
-              <tr key={`${limit.app}:${limit.providerId}`}>
-                <td title={limit.providerId}>{limit.providerName}</td>
-                <td>{limit.app}</td>
-                <td>{limitLine(limit.dailyUsageUsd, limit.dailyLimitUsd)}</td>
-                <td>{limitLine(limit.monthlyUsageUsd, limit.monthlyLimitUsd)}</td>
-                <td>{quotaLine(limit)}</td>
-                <td>{limit.shares.length}</td>
-                <td title={limit.warnings.join(", ")}>{limit.warnings.join(", ") || "-"}</td>
-                <td>
-                  <StatusPill tone={limit.blocked ? "danger" : limit.warnings.length ? "warning" : "success"}>
-                    {tx(limit.blocked ? "blocked" : limit.warnings.length ? "warning" : "ok")}
-                  </StatusPill>
-                </td>
-              </tr>
-            ))
-          ) : (
-            <EmptyRow columns={8} label="No provider limits" />
-          )}
-        </tbody>
-      </table>
+    <section className="usage-panel-card">
+      <div className="section-heading">
+        <div className="section-title-row compact-title">
+          <AlertTriangle size={17} />
+          <h2>{tx("Provider Limits")}</h2>
+        </div>
+        <span>{tx("{{count}} providers", { count: limits.length })}</span>
+      </div>
+      {limits.length ? (
+        <div className="usage-limit-grid">
+          {limits.map((limit) => (
+            <ProviderLimitCard key={`${limit.app}:${limit.providerId}`} limit={limit} />
+          ))}
+        </div>
+      ) : (
+        <div className="provider-empty">
+          <AlertTriangle size={22} />
+          <span>{tx("No provider limits")}</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ProviderLimitCard({ limit }: { limit: ProviderLimitStatus }) {
+  const { tx } = useI18n();
+  const icon = inferIconForText(limit.providerType, limit.providerName, limit.providerId, limit.app);
+  const stateTone = limit.blocked ? "danger" : limit.warnings.length ? "warning" : "success";
+  return (
+    <article className="usage-limit-card">
+      <header>
+        <div className="usage-log-title">
+          <span className="provider-icon-frame">
+            <ProviderIcon icon={icon.icon} color={icon.iconColor} name={limit.providerName || limit.providerId} size={22} />
+          </span>
+          <div>
+            <strong title={limit.providerId}>{limit.providerName || limit.providerId}</strong>
+            <span>{`${limit.providerType} / ${limit.app}`}</span>
+          </div>
+        </div>
+        <StatusPill tone={stateTone}>{tx(limit.blocked ? "blocked" : limit.warnings.length ? "warning" : "ok")}</StatusPill>
+      </header>
+      <div className="usage-limit-meter-stack">
+        <LimitMeter label="daily" usage={formatUsd(limit.dailyUsageUsd, 4)} limit={limit.dailyLimitUsd == null ? "-" : formatUsd(limit.dailyLimitUsd, 2)} percent={limitPercent(limit.dailyUsageUsd, limit.dailyLimitUsd)} exceeded={limit.dailyExceeded} />
+        <LimitMeter label="monthly" usage={formatUsd(limit.monthlyUsageUsd, 4)} limit={limit.monthlyLimitUsd == null ? "-" : formatUsd(limit.monthlyLimitUsd, 2)} percent={limitPercent(limit.monthlyUsageUsd, limit.monthlyLimitUsd)} exceeded={limit.monthlyExceeded} />
+        <LimitMeter label="quota" usage={limit.accountQuotaPercent == null ? "-" : `${limit.accountQuotaPercent.toFixed(1)}%`} limit={limit.quotaDispatchLimitPercent == null ? "-" : `${limit.quotaDispatchLimitPercent.toFixed(1)}%`} percent={limit.accountQuotaPercent ?? 0} exceeded={limit.quotaDispatchExceeded} />
+      </div>
+      <div className="usage-limit-meta">
+        <KeyValue label="account" value={limit.accountEmail || limit.accountId || "-"} />
+        <KeyValue label="shares" value={formatInt(limit.shares.length)} />
+        <KeyValue label="quota refreshed" value={formatTime(limit.accountQuotaRefreshedAt)} />
+      </div>
+      {(limit.warnings.length || limit.accountLastRefreshError) && (
+        <div className="usage-log-tags warning-tags">
+          {limit.warnings.map((warning) => (
+            <span key={warning}>{warning}</span>
+          ))}
+          {limit.accountLastRefreshError && <span>{limit.accountLastRefreshError}</span>}
+        </div>
+      )}
+      {limit.shares.length > 0 && (
+        <div className="usage-share-strip">
+          {limit.shares.slice(0, 4).map((share) => (
+            <span key={share.shareId} title={share.warnings.join(", ")}>
+              {share.shareName || share.shareId}
+            </span>
+          ))}
+          {limit.shares.length > 4 && <span>{tx("+{{count}} more", { count: limit.shares.length - 4 })}</span>}
+        </div>
+      )}
+    </article>
+  );
+}
+
+function LimitMeter({
+  label,
+  usage,
+  limit,
+  percent,
+  exceeded,
+}: {
+  label: string;
+  usage: string;
+  limit: string;
+  percent: number;
+  exceeded: boolean;
+}) {
+  const { tx } = useI18n();
+  const width = Math.max(0, Math.min(100, percent));
+  return (
+    <div className={exceeded ? "usage-limit-meter exceeded" : "usage-limit-meter"}>
+      <div>
+        <span>{tx(label)}</span>
+        <strong>{usage}</strong>
+        <small>{tx("limit")}: {limit}</small>
+      </div>
+      <div className="usage-rank-meter" aria-label={tx(label)}>
+        <span style={{ width: `${width}%` }} />
+      </div>
     </div>
   );
 }
@@ -1370,19 +1503,6 @@ function EmptyRow({ columns, label }: { columns: number; label: string }) {
   );
 }
 
-function TokenCell({ log }: { log: UsageLog }) {
-  const freshInput = freshInputTokens(log);
-  const cache = (log.cacheReadTokens || 0) + (log.cacheCreationTokens || 0);
-  return (
-    <div className="usage-token-cell">
-      <strong>{formatInt(log.totalTokens ?? freshInput + (log.outputTokens || 0) + cache)}</strong>
-      <span>
-        in {formatInt(freshInput)} - out {formatInt(log.outputTokens)} - cache {formatInt(cache)}
-      </span>
-    </div>
-  );
-}
-
 function defaultFilterDraft(): UsageFilterDraft {
   return {
     range: "24h",
@@ -1574,14 +1694,9 @@ function successRate(rollup: UsageRollup): string {
   return rollup.requests > 0 ? `${((rollup.successes / rollup.requests) * 100).toFixed(1)}%` : "-";
 }
 
-function limitLine(usage: number, limit?: number | null): string {
-  return `${formatUsd(usage, 4)} / ${limit == null ? "-" : formatUsd(limit, 2)}`;
-}
-
-function quotaLine(limit: ProviderLimitStatus): string {
-  const quota = limit.accountQuotaPercent == null ? "-" : `${limit.accountQuotaPercent.toFixed(1)}%`;
-  const dispatch = limit.quotaDispatchLimitPercent == null ? "-" : `${limit.quotaDispatchLimitPercent.toFixed(1)}%`;
-  return `${quota} / ${dispatch}`;
+function limitPercent(usage: number, limit?: number | null): number {
+  if (!limit || limit <= 0) return 0;
+  return (usage / limit) * 100;
 }
 
 function formatLatency(log: UsageLog): string {
