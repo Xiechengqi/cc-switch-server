@@ -152,6 +152,8 @@ export function UsageDashboard({ initialFocus }: { initialFocus?: UsageInitialFo
   const [pricingDraft, setPricingDraft] = useState<PricingDraft | null>(null);
   const [pricingDefaultsOpen, setPricingDefaultsOpen] = useState(false);
   const [pricingDeleteId, setPricingDeleteId] = useState<string | null>(null);
+  const [backfillConfirmOpen, setBackfillConfirmOpen] = useState(false);
+  const [pricingDefaultsConfirmOpen, setPricingDefaultsConfirmOpen] = useState(false);
 
   const filter = useMemo(() => filterFromDraft(filterDraft), [filterDraft]);
   const dataSources = useMemo(() => dataSourceBreakdown(data.sourceLogs), [data.sourceLogs]);
@@ -295,7 +297,7 @@ export function UsageDashboard({ initialFocus }: { initialFocus?: UsageInitialFo
             <RefreshCw size={15} />
             <span>{t("common.refresh")}</span>
           </button>
-          <button className="secondary-button" type="button" onClick={() => void runBackfill()} disabled={busy === "backfill"}>
+          <button className="secondary-button" type="button" onClick={() => setBackfillConfirmOpen(true)} disabled={busy === "backfill"}>
             {busy === "backfill" ? <Loader2 size={15} /> : <RotateCcw size={15} />}
             <span>{t("server.usage.backfillCosts")}</span>
           </button>
@@ -378,7 +380,7 @@ export function UsageDashboard({ initialFocus }: { initialFocus?: UsageInitialFo
           models={data.pricing}
           busy={busy}
           onApply={(template) => void applyPricingTemplate(template)}
-          onApplyMissing={() => void applyMissingPricingTemplates()}
+          onApplyMissing={() => setPricingDefaultsConfirmOpen(true)}
           onEdit={(template) => {
             setPricingDefaultsOpen(false);
             setPricingDraft(pricingDraftFromDefault(template, hasPricingModel(data.pricing, template.modelId)));
@@ -386,6 +388,28 @@ export function UsageDashboard({ initialFocus }: { initialFocus?: UsageInitialFo
           onClose={() => setPricingDefaultsOpen(false)}
         />
       )}
+      <ConfirmDialog
+        isOpen={backfillConfirmOpen}
+        title={tx("Backfill usage costs")}
+        message={tx("Recalculate costs for existing usage records using current pricing rules? Historical cost values may change.")}
+        confirmText={tx("Backfill")}
+        onConfirm={() => {
+          setBackfillConfirmOpen(false);
+          void runBackfill();
+        }}
+        onCancel={() => setBackfillConfirmOpen(false)}
+      />
+      <ConfirmDialog
+        isOpen={pricingDefaultsConfirmOpen}
+        title={tx("Apply default pricing")}
+        message={tx("Apply missing default pricing templates? Existing usage records may be backfilled with new costs.")}
+        confirmText={tx("Apply Missing")}
+        onConfirm={() => {
+          setPricingDefaultsConfirmOpen(false);
+          void applyMissingPricingTemplates();
+        }}
+        onCancel={() => setPricingDefaultsConfirmOpen(false)}
+      />
       <ConfirmDialog
         isOpen={pricingDeleteId !== null}
         title={tx("Delete pricing")}

@@ -121,6 +121,7 @@ export function ShareDashboard() {
   const [ownerChangeDraft, setOwnerChangeDraft] = useState<ShareDraft | null>(null);
   const [shareQuery, setShareQuery] = useState("");
   const [shareFilter, setShareFilter] = useState<"all" | "active" | "paused" | "sale">("all");
+  const [toolbarConfirm, setToolbarConfirm] = useState<"restore" | "edits" | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -316,11 +317,11 @@ export function ShareDashboard() {
             {busyId === "snapshot" ? <Loader2 size={15} /> : <FileJson size={15} />}
             <span>{t("server.shares.runtime")}</span>
           </button>
-          <button className="secondary-button" type="button" onClick={() => void toolbarAction("restore")} disabled={busyId === "restore"}>
+          <button className="secondary-button" type="button" onClick={() => setToolbarConfirm("restore")} disabled={busyId === "restore"}>
             {busyId === "restore" ? <Loader2 size={15} /> : <Cable size={15} />}
             <span>{t("server.shares.restoreTunnels")}</span>
           </button>
-          <button className="secondary-button" type="button" onClick={() => void toolbarAction("edits")} disabled={busyId === "edits"}>
+          <button className="secondary-button" type="button" onClick={() => setToolbarConfirm("edits")} disabled={busyId === "edits"}>
             {busyId === "edits" ? <Loader2 size={15} /> : <Route size={15} />}
             <span>{t("server.shares.pullEdits")}</span>
           </button>
@@ -597,6 +598,23 @@ export function ShareDashboard() {
         />
       )}
 
+      <ConfirmDialog
+        isOpen={toolbarConfirm !== null}
+        title={tx(toolbarConfirm === "restore" ? "Restore share tunnels" : "Pull share edits")}
+        message={
+          toolbarConfirm === "restore"
+            ? tx("Restore share tunnel runtime from saved share configuration? Active tunnel state may be replaced.")
+            : tx("Pull and apply pending router share edits? Matching shares may be updated.")
+        }
+        confirmText={tx(toolbarConfirm === "restore" ? "Restore" : "Pull edits")}
+        onConfirm={() => {
+          const action = toolbarConfirm;
+          setToolbarConfirm(null);
+          if (action) void toolbarAction(action);
+        }}
+        onCancel={() => setToolbarConfirm(null)}
+      />
+
       {exportText && (
         <SimpleModal
           title="Export Shares"
@@ -655,6 +673,7 @@ function ShareCard({
 }) {
   const { tx } = useI18n();
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const usage = shareUsage(share);
   const syncText = share.routerLastSyncError || formatTime(share.routerLastSyncedAtMs);
   const market = markets.find((item) => item.email === share.acl?.publicMarketEmail);
@@ -796,7 +815,7 @@ function ShareCard({
         >
           <SlidersHorizontal size={15} />
         </IconAction>
-        <IconAction title="Reset usage" busy={busyId === `${share.id}:resetUsage`} onClick={() => onAction("resetUsage")}>
+        <IconAction title="Reset usage" busy={busyId === `${share.id}:resetUsage`} onClick={() => setResetConfirmOpen(true)}>
           <RotateCcw size={15} />
         </IconAction>
         <IconAction title="Authorize market" onClick={onMarket}>
@@ -807,6 +826,19 @@ function ShareCard({
         </IconAction>
       </div>
     </article>
+      <ConfirmDialog
+        isOpen={resetConfirmOpen}
+        title={tx("Reset share usage")}
+        message={tx("Reset usage counters for share {{name}}? Token and request usage will be cleared.", {
+          name: shareName(share),
+        })}
+        confirmText={tx("Reset usage")}
+        onConfirm={() => {
+          setResetConfirmOpen(false);
+          onAction("resetUsage");
+        }}
+        onCancel={() => setResetConfirmOpen(false)}
+      />
       <ConfirmDialog
         isOpen={deleteConfirmOpen}
         title={tx("Delete share")}
@@ -1448,27 +1480,45 @@ function ImportSharesModal({
   const { tx } = useI18n();
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [pendingShares, setPendingShares] = useState<ShareRecord[] | null>(null);
   return (
-    <SimpleModal title="Import Shares" subtitle="Paste an exported array or { shares } object." onClose={onClose}>
-      <form
-        className="modal-form-stack"
-        onSubmit={(event) => {
-          event.preventDefault();
-          try {
-            const parsed = JSON.parse(text) as { shares?: ShareRecord[] } | ShareRecord[];
-            const shares = Array.isArray(parsed) ? parsed : parsed.shares;
-            if (!shares?.length) throw new Error(tx("shares array is required"));
-            onSubmit(shares);
-          } catch (reason) {
-            setError(errorMessage(reason));
-          }
+    <>
+      <SimpleModal title="Import Shares" subtitle="Paste an exported array or { shares } object." onClose={onClose}>
+        <form
+          className="modal-form-stack"
+          onSubmit={(event) => {
+            event.preventDefault();
+            try {
+              const parsed = JSON.parse(text) as { shares?: ShareRecord[] } | ShareRecord[];
+              const shares = Array.isArray(parsed) ? parsed : parsed.shares;
+              if (!shares?.length) throw new Error(tx("shares array is required"));
+              setError(null);
+              setPendingShares(shares);
+            } catch (reason) {
+              setError(errorMessage(reason));
+            }
+          }}
+        >
+          {error && <div className="form-error">{error}</div>}
+          <textarea value={text} onChange={(event) => setText(event.target.value)} />
+          <ModalFooter saving={saving} onClose={onClose} label="Import Shares" />
+        </form>
+      </SimpleModal>
+      <ConfirmDialog
+        isOpen={pendingShares !== null}
+        title={tx("Import shares")}
+        message={tx("Import {{count}} shares? Existing shares with the same IDs may be updated.", {
+          count: pendingShares?.length || 0,
+        })}
+        confirmText={tx("Import")}
+        onConfirm={() => {
+          const shares = pendingShares;
+          setPendingShares(null);
+          if (shares) onSubmit(shares);
         }}
-      >
-        {error && <div className="form-error">{error}</div>}
-        <textarea value={text} onChange={(event) => setText(event.target.value)} />
-        <ModalFooter saving={saving} onClose={onClose} label="Import Shares" />
-      </form>
-    </SimpleModal>
+        onCancel={() => setPendingShares(null)}
+      />
+    </>
   );
 }
 

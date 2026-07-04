@@ -138,6 +138,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const [restoreConfirm, setRestoreConfirm] = useState<BackupManifest | null>(null);
   const [rotateTokenConfirm, setRotateTokenConfirm] = useState(false);
+  const [routerSyncConfirm, setRouterSyncConfirm] = useState(false);
   const dashboardRef = useRef<HTMLDivElement>(null);
   const clientTunnelRunning = isClientTunnelRunning(data?.tunnel.runtimeStatus?.status);
 
@@ -428,7 +429,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
             <div className="settings-actions">
               <ActionButton label={t("server.settings.register")} icon={<CheckCircle2 size={15} />} busy={busy === "router-register"} onClick={() => void runAction("router-register", async () => `registered ${JSON.stringify(await registerRouter())}`)} />
               <ActionButton label={t("server.settings.heartbeat")} icon={<RefreshCw size={15} />} busy={busy === "router-heartbeat"} onClick={() => void runAction("router-heartbeat", async () => routerStatusText(await heartbeatRouter()))} />
-              <ActionButton label={t("server.settings.batchSync")} icon={<RotateCcw size={15} />} busy={busy === "router-sync"} onClick={() => void runAction("router-sync", async () => (await batchSyncRouterShares()).message)} />
+              <ActionButton label={t("server.settings.batchSync")} icon={<RotateCcw size={15} />} busy={busy === "router-sync"} onClick={() => setRouterSyncConfirm(true)} />
             </div>
             <RouterFacts router={data?.router} status={data?.routerStatus} />
           </section>
@@ -548,6 +549,17 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
           </div>
         </div>
       )}
+      <ConfirmDialog
+        isOpen={routerSyncConfirm}
+        title={tx("Batch sync router shares")}
+        message={tx("Batch sync share state to the router? Remote router records for matching shares may be updated.")}
+        confirmText={tx("Sync")}
+        onConfirm={() => {
+          setRouterSyncConfirm(false);
+          void runAction("router-sync", async () => (await batchSyncRouterShares()).message);
+        }}
+        onCancel={() => setRouterSyncConfirm(false)}
+      />
       <ConfirmDialog
         isOpen={rotateTokenConfirm}
         title={tx("Rotate API token")}

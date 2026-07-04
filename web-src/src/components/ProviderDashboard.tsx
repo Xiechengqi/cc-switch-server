@@ -27,8 +27,10 @@ import {
   Link2,
   ListPlus,
   Loader2,
+  Minus,
   Pencil,
   Play,
+  Plus,
   RefreshCw,
   Search,
   ServerCog,
@@ -53,19 +55,23 @@ import {
   AppKind,
   createProviderFromPreset,
   deleteProvider,
+  FailoverSnapshot,
   fetchProviderModels,
   getCurrentProvider,
   loadProviderDashboardData,
   Provider,
+  ProviderBreaker,
   ProviderHealth,
   ProviderMatrix,
   ProviderMatrixEntry,
   ProviderPresetSummary,
   ProviderPresetsByApp,
   ProviderLimitStatus,
+  resetFailoverProvider,
   saveProvider,
   StoredProvider,
   switchProvider,
+  updateFailoverApp,
   testProvider,
   updateProvidersSortOrder,
 } from "@/lib/api";
@@ -92,6 +98,7 @@ interface ProviderDashboardState {
   capabilities: AccountManagerCapability[];
   limits: ProviderLimitStatus[];
   presets: ProviderPresetsByApp;
+  failover: FailoverSnapshot;
 }
 
 interface ProviderDraft {
@@ -148,6 +155,7 @@ export function ProviderDashboard({
     capabilities: [],
     limits: [],
     presets: { claude: [], codex: [], gemini: [] },
+    failover: { apps: {}, breakers: [] },
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -200,12 +208,18 @@ export function ProviderDashboard({
   const visibleEntries = useMemo(() => entries.filter((entry) => entry.uiVisible), [entries]);
   const activeProviders = data.providers.filter((provider) => provider.app === activeApp);
   const activePresets = data.presets[activeApp] || [];
+  const activeFailoverConfig = data.failover.apps[activeApp];
+  const activeFailoverQueue = activeFailoverConfig?.providerQueue || [];
+  const activeFailoverEnabled = Boolean(activeFailoverConfig?.enabled);
   const healthById = new Map(
     data.health
       .filter((health) => health.app === activeApp)
       .map((health) => [health.providerId, health]),
   );
   const accountsById = new Map(data.accounts.map((account) => [account.id, account]));
+  const breakerByProviderKey = new Map(
+    data.failover.breakers.map((breaker) => [providerKey(breaker.app, breaker.providerId), breaker]),
+  );
   const capabilitiesByType = new Map(data.capabilities.map((capability) => [capability.providerType, capability]));
   const limitByProviderKey = new Map(
     data.limits.map((limit) => [providerKey(limit.app, limit.providerId), limit]),
@@ -262,7 +276,7 @@ export function ProviderDashboard({
 
   async function runAction(
     provider: StoredProvider,
-    action: "test" | "network" | "stream" | "models" | "switch" | "duplicate" | "delete",
+    action: "test" | "network" | "stream" | "models" | "switch" | "duplicate" | "resetFailover" | "delete",
   ) {
     const key = `${provider.app}:${provider.provider.id}:${action}`;
     setBusyId(key);
@@ -284,6 +298,23 @@ export function ProviderDashboard({
           [stored.provider.id]: tx("Duplicated provider {{name}}", { name: provider.provider.name }),
         }));
         await refresh();
+        return;
+      }
+      if (action === "resetFailover") {
+        const breaker = await resetFailoverProvider(provider.app, provider.provider.id);
+        setData((current) => ({
+          ...current,
+          failover: {
+            ...current.failover,
+            breakers: current.failover.breakers.map((item) =>
+              item.app === breaker.app && item.providerId === breaker.providerId ? breaker : item,
+            ),
+          },
+        }));
+        setResultById((current) => ({
+          ...current,
+          [provider.provider.id]: tx("Reset failover breaker"),
+        }));
         return;
       }
       if (action === "switch") {
@@ -379,6 +410,43 @@ export function ProviderDashboard({
     }
   }
 
+  async function toggleProviderFailover(provider: StoredProvider, enabled: boolean) {
+    const currentConfig = data.failover.apps[provider.app];
+    const currentQueue = currentConfig?.providerQueue || [];
+    const providerId = provider.provider.id;
+    const nextQueue = enabled
+      ? [...currentQueue.filter((id) => id !== providerId), providerId]
+      : currentQueue.filter((id) => id !== providerId);
+    const key = `${provider.app}:${providerId}:failover`;
+    setBusyId(key);
+    setError(null);
+    try {
+      const config = await updateFailoverApp(provider.app, {
+        enabled: currentConfig?.enabled,
+        providerQueue: nextQueue,
+      });
+      setData((current) => ({
+        ...current,
+        failover: {
+          ...current.failover,
+          apps: {
+            ...current.failover.apps,
+            [provider.app]: config,
+          },
+        },
+      }));
+      setResultById((current) => ({
+        ...current,
+        [providerId]: enabled ? tx("Added to failover queue") : tx("Removed from failover queue"),
+      }));
+    } catch (reason) {
+      setError(errorMessage(reason));
+      await refresh();
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   return (
     <div className="provider-dashboard">
       <div className="provider-toolbar">
@@ -445,11 +513,16 @@ export function ProviderDashboard({
               <div className="provider-card-grid">
                 {visibleProviders.map((provider) => {
                   const priority = activeProviders.findIndex((item) => item.provider.id === provider.provider.id) + 1;
+                  const failoverIndex = activeFailoverQueue.indexOf(provider.provider.id);
                   return (
                     <SortableProviderCard
                       key={`${provider.app}:${provider.provider.id}`}
                       provider={provider}
                       priority={priority}
+                      failoverEnabled={activeFailoverEnabled}
+                      failoverPriority={failoverIndex >= 0 ? failoverIndex + 1 : null}
+                      inFailoverQueue={failoverIndex >= 0}
+                      breaker={breakerByProviderKey.get(providerKey(provider.app, provider.provider.id))}
                       entry={entries.find((item) => item.providerTypeId === provider.providerTypeId)}
                       health={healthById.get(provider.provider.id)}
                       account={accountForProvider(provider, accountsById)}
@@ -460,6 +533,7 @@ export function ProviderDashboard({
                       busyId={busyId}
                       onEdit={() => openEdit(provider)}
                       onAction={(action) => void runAction(provider, action)}
+                      onToggleFailover={(enabled) => void toggleProviderFailover(provider, enabled)}
                       onOpenUsage={
                         onOpenUsage
                           ? () =>
@@ -652,32 +726,42 @@ type TranslateFn = (
 interface ProviderCardProps {
   provider: StoredProvider;
   priority: number;
+  failoverEnabled: boolean;
+  failoverPriority: number | null;
+  inFailoverQueue: boolean;
   entry?: ProviderMatrixEntry;
   health?: ProviderHealth;
   account?: AccountRecord;
   capability?: AccountManagerCapability;
   limit?: ProviderLimitStatus;
+  breaker?: ProviderBreaker;
   current: boolean;
   result?: string;
   busyId: string | null;
   onEdit: () => void;
-  onAction: (action: "test" | "network" | "stream" | "models" | "switch" | "duplicate" | "delete") => void;
+  onAction: (action: "test" | "network" | "stream" | "models" | "switch" | "duplicate" | "resetFailover" | "delete") => void;
+  onToggleFailover: (enabled: boolean) => void;
   onOpenUsage?: () => void;
 }
 
 function ProviderCard({
   provider,
   priority,
+  failoverEnabled,
+  failoverPriority,
+  inFailoverQueue,
   entry,
   health,
   account,
   capability,
   limit,
+  breaker,
   current,
   result,
   busyId,
   onEdit,
   onAction,
+  onToggleFailover,
   onOpenUsage,
   dragHandleProps,
   nodeRef,
@@ -700,6 +784,7 @@ function ProviderCard({
     : accountId || tx("direct config");
   const busyPrefix = `${provider.app}:${provider.provider.id}:`;
   const healthSummary = providerHealthSummary(health, tx);
+  const breakerOpen = failoverEnabled && breaker != null && breaker.state !== "closed";
   return (
     <>
     <article
@@ -732,6 +817,14 @@ function ProviderCard({
             <div className="provider-name-row">
               <h3>{provider.provider.name}</h3>
               <FailoverPriorityBadge priority={priority} />
+              {failoverEnabled && inFailoverQueue && failoverPriority != null && (
+                <StatusPill tone="success">{tx("failover P{{priority}}", { priority: failoverPriority })}</StatusPill>
+              )}
+              {breakerOpen && (
+                <StatusPill tone={breaker.state === "open" ? "danger" : "warning"}>
+                  {tx("breaker {{state}}", { state: breaker.state })}
+                </StatusPill>
+              )}
               {current && <StatusPill tone="success">{tx("current")}</StatusPill>}
               {account?.subscriptionLevel && (
                 <StatusPill tone="success">{account.subscriptionLevel}</StatusPill>
@@ -817,6 +910,24 @@ function ProviderCard({
         {onOpenUsage && (
           <IconAction title="Usage and limits" onClick={onOpenUsage}>
             <BarChart3 size={15} />
+          </IconAction>
+        )}
+        {failoverEnabled && (
+          <IconAction
+            title={inFailoverQueue ? "Remove from failover queue" : "Add to failover queue"}
+            onClick={() => onToggleFailover(!inFailoverQueue)}
+            busy={busyId === `${busyPrefix}failover`}
+          >
+            {inFailoverQueue ? <Minus size={15} /> : <Plus size={15} />}
+          </IconAction>
+        )}
+        {breakerOpen && (
+          <IconAction
+            title="Reset failover breaker"
+            onClick={() => onAction("resetFailover")}
+            busy={busyId === `${busyPrefix}resetFailover`}
+          >
+            <RefreshCw size={15} />
           </IconAction>
         )}
         <button
@@ -1856,13 +1967,20 @@ function ProviderAccountFooter({ account }: { account: AccountRecord }) {
   const { tx } = useI18n();
   const quotaPercent = accountQuotaPercent(account);
   const tiers = account.quota?.tiers || [];
+  const expiryLabel = providerExpiryLabel(account.expiresAt, tx);
+  const refreshedLabel = account.quotaRefreshedAt == null
+    ? null
+    : tx("refreshed {{time}}", { time: formatRelativePast(account.quotaRefreshedAt, tx) });
+  const nextRefreshLabel = providerCountdownLabel(account.quotaNextRefreshAt, tx, "refresh");
   return (
     <div className="provider-account-footer">
       <div className="provider-account-line">
         <span>{account.email || account.id}</span>
         <span>{account.subscriptionLevel || tx("account")}</span>
         <span>{quotaPercent == null ? tx("quota -") : `${quotaPercent.toFixed(1)}%`}</span>
-        <span>{formatTime(account.expiresAt)}</span>
+        {expiryLabel && <span title={formatDateTime(account.expiresAt)}>{expiryLabel}</span>}
+        {refreshedLabel && <span title={formatDateTime(account.quotaRefreshedAt)}>{refreshedLabel}</span>}
+        {nextRefreshLabel && <span title={formatDateTime(account.quotaNextRefreshAt)}>{nextRefreshLabel}</span>}
       </div>
       {quotaPercent != null && (
         <div className="provider-quota-meter" aria-label={tx("quota")}>
@@ -1875,7 +1993,7 @@ function ProviderAccountFooter({ account }: { account: AccountRecord }) {
             <div className="provider-quota-tier" key={tier.name}>
               <div>
                 <strong>{tier.name}</strong>
-                <span>{tierLine(tier)}</span>
+                <span>{tierLine(tier, tx)}</span>
               </div>
               <div className="provider-quota-tier-meter">
                 <span style={{ width: `${clampPercent(tier.utilization ?? 0)}%` }} />
@@ -1890,6 +2008,7 @@ function ProviderAccountFooter({ account }: { account: AccountRecord }) {
 }
 
 type ProviderQuotaTier = NonNullable<NonNullable<AccountRecord["quota"]>["tiers"]>[number];
+type TxFn = (message: string, values?: Record<string, string | number | boolean | null | undefined>) => string;
 
 function accountQuotaPercent(account: AccountRecord): number | null {
   if (account.quotaPercent != null) return account.quotaPercent;
@@ -1902,15 +2021,63 @@ function clampPercent(value: number): number {
   return Math.max(0, Math.min(100, value));
 }
 
-function tierLine(tier: ProviderQuotaTier): string {
+function tierLine(tier: ProviderQuotaTier, tx: TxFn): string {
   const usage = tier.used != null && tier.limit != null
     ? `${formatCompactNumber(tier.used)}/${formatCompactNumber(tier.limit)}`
     : tier.utilization == null
       ? "-"
       : `${tier.utilization.toFixed(1)}%`;
   const unit = tier.unit ? ` ${tier.unit}` : "";
-  const reset = tier.resetsAt == null ? "" : ` · ${formatTime(tier.resetsAt)}`;
+  const reset = tier.resetsAt == null ? "" : ` · ${providerCountdownLabel(tier.resetsAt, tx, "resets") || formatTime(tier.resetsAt)}`;
   return `${usage}${unit}${reset}`;
+}
+
+function providerExpiryLabel(value: number | null | undefined, tx: TxFn): string | null {
+  const millis = normalizeTimestamp(value);
+  if (millis == null) return tx("expires -");
+  const delta = millis - Date.now();
+  if (delta < 0) return tx("expired {{time}} ago", { time: formatDuration(Math.abs(delta), tx) });
+  return tx("expires in {{time}}", { time: formatDuration(delta, tx) });
+}
+
+function providerCountdownLabel(value: number | null | undefined, tx: TxFn, label: string): string | null {
+  const millis = normalizeTimestamp(value);
+  if (millis == null) return null;
+  const delta = millis - Date.now();
+  if (delta < 0) return tx("{{label}} {{time}} ago", { label, time: formatDuration(Math.abs(delta), tx) });
+  return tx("{{label}} in {{time}}", { label, time: formatDuration(delta, tx) });
+}
+
+function formatRelativePast(value: number | null | undefined, tx: TxFn): string {
+  const millis = normalizeTimestamp(value);
+  if (millis == null) return "-";
+  const delta = Date.now() - millis;
+  if (delta < 0) return tx("in {{time}}", { time: formatDuration(Math.abs(delta), tx) });
+  return tx("{{time}} ago", { time: formatDuration(delta, tx) });
+}
+
+function formatDuration(millis: number, tx: TxFn): string {
+  const seconds = Math.max(0, Math.round(millis / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (days > 0) return tx("{{count}}d", { count: days });
+  if (hours > 0) return tx("{{count}}h", { count: hours });
+  if (minutes > 0) return tx("{{count}}m", { count: minutes });
+  return tx("{{count}}s", { count: seconds });
+}
+
+function normalizeTimestamp(value: number | null | undefined): number | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  return value < 10_000_000_000 ? value * 1000 : value;
+}
+
+function formatDateTime(value: number | null | undefined): string {
+  const millis = normalizeTimestamp(value);
+  if (millis == null) return "-";
+  const date = new Date(millis);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toISOString();
 }
 
 function formatCompactNumber(value: number): string {

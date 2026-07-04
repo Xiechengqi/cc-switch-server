@@ -77,6 +77,41 @@ export interface ProviderSortUpdate {
 
 export type ProviderPresetsByApp = Record<AppKind, ProviderPresetSummary[]>;
 
+export interface FailoverAppConfig {
+  enabled: boolean;
+  providerQueue: string[];
+  failureThreshold: number;
+  openDurationMs: number;
+  halfOpenMaxProbes: number;
+}
+
+export interface ProviderBreaker {
+  app: AppKind;
+  providerId: string;
+  state: string;
+  consecutiveFailures: number;
+  openedAtMs?: number | null;
+  halfOpenStartedAtMs?: number | null;
+  halfOpenProbeCount: number;
+  lastStatusCode?: number | null;
+  lastError?: string | null;
+  lastFailureAtMs?: number | null;
+  lastSuccessAtMs?: number | null;
+}
+
+export interface FailoverSnapshot {
+  apps: Partial<Record<AppKind, FailoverAppConfig>>;
+  breakers: ProviderBreaker[];
+}
+
+export interface UpdateFailoverAppInput {
+  enabled?: boolean;
+  providerQueue?: string[];
+  failureThreshold?: number;
+  openDurationMs?: number;
+  halfOpenMaxProbes?: number;
+}
+
 export interface ProviderHealth {
   providerId: string;
   app: AppKind;
@@ -811,8 +846,9 @@ export async function loadProviderDashboardData(): Promise<{
   capabilities: AccountManagerCapability[];
   limits: ProviderLimitStatus[];
   presets: ProviderPresetsByApp;
+  failover: FailoverSnapshot;
 }> {
-  const [providers, matrix, health, accounts, capabilities, limits, presets] = await Promise.all([
+  const [providers, matrix, health, accounts, capabilities, limits, presets, failover] = await Promise.all([
     jsonFetch<{ providers: StoredProvider[] }>("/api/providers"),
     jsonFetch<ProviderMatrix>("/api/provider-matrix"),
     jsonFetch<{ providers: ProviderHealth[] }>("/api/providers/health"),
@@ -820,6 +856,7 @@ export async function loadProviderDashboardData(): Promise<{
     jsonFetch<{ capabilities: AccountManagerCapability[] }>("/api/accounts/capabilities"),
     jsonFetch<{ limits: ProviderLimitStatus[] }>("/api/provider-limits"),
     loadProviderPresetsByApp(),
+    loadFailoverSnapshot(),
   ]);
   return {
     providers: providers.providers || [],
@@ -829,7 +866,37 @@ export async function loadProviderDashboardData(): Promise<{
     capabilities: capabilities.capabilities || [],
     limits: limits.limits || [],
     presets,
+    failover,
   };
+}
+
+export async function loadFailoverSnapshot(): Promise<FailoverSnapshot> {
+  const result = await jsonFetch<{ failover: FailoverSnapshot }>("/api/failover");
+  return result.failover || { apps: {}, breakers: [] };
+}
+
+export async function updateFailoverApp(
+  app: AppKind,
+  input: UpdateFailoverAppInput,
+): Promise<FailoverAppConfig> {
+  const result = await jsonFetch<{ config: FailoverAppConfig }>(`/api/failover/apps/${app}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  return result.config;
+}
+
+export async function resetFailoverProvider(
+  app: AppKind,
+  providerId: string,
+): Promise<ProviderBreaker> {
+  const params = new URLSearchParams({ app });
+  const result = await jsonFetch<{ breaker: ProviderBreaker }>(
+    `/api/failover/providers/${encodeURIComponent(providerId)}/reset?${params}`,
+    { method: "POST" },
+  );
+  return result.breaker;
 }
 
 export async function loadProviderPresets(app: AppKind): Promise<ProviderPresetSummary[]> {

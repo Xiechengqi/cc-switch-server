@@ -884,35 +884,53 @@ function ImportUniversalModal({
   const { tx } = useI18n();
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [pendingProviders, setPendingProviders] = useState<UniversalProvider[] | null>(null);
   return (
-    <SimpleModal title="Import Universal Providers" subtitle="Paste an exported array or { providers } object." onClose={onClose}>
-      <form
-        className="modal-form-stack"
-        onSubmit={(event) => {
-          event.preventDefault();
-          try {
-            const parsed = JSON.parse(text) as { providers?: UniversalProvider[] } | UniversalProvider[];
-            const providers = Array.isArray(parsed) ? parsed : parsed.providers;
-            if (!providers?.length) throw new Error(tx("providers array is required"));
-            onSubmit(providers);
-          } catch (reason) {
-            setError(errorMessage(reason));
-          }
+    <>
+      <SimpleModal title="Import Universal Providers" subtitle="Paste an exported array or { providers } object." onClose={onClose}>
+        <form
+          className="modal-form-stack"
+          onSubmit={(event) => {
+            event.preventDefault();
+            try {
+              const parsed = JSON.parse(text) as { providers?: UniversalProvider[] } | UniversalProvider[];
+              const providers = Array.isArray(parsed) ? parsed : parsed.providers;
+              if (!providers?.length) throw new Error(tx("providers array is required"));
+              setError(null);
+              setPendingProviders(providers);
+            } catch (reason) {
+              setError(errorMessage(reason));
+            }
+          }}
+        >
+          {error && <div className="form-error">{error}</div>}
+          <textarea value={text} onChange={(event) => setText(event.target.value)} />
+          <footer className="modal-inline-footer">
+            <button className="secondary-button" type="button" onClick={onClose}>
+              {tx("Cancel")}
+            </button>
+            <button className="primary-button" type="submit" disabled={saving}>
+              {saving && <Loader2 size={15} />}
+              <span>{tx("Import")}</span>
+            </button>
+          </footer>
+        </form>
+      </SimpleModal>
+      <ConfirmDialog
+        isOpen={pendingProviders !== null}
+        title={tx("Import universal providers")}
+        message={tx("Import {{count}} universal providers? Existing providers with the same IDs may be updated.", {
+          count: pendingProviders?.length || 0,
+        })}
+        confirmText={tx("Import")}
+        onConfirm={() => {
+          const providers = pendingProviders;
+          setPendingProviders(null);
+          if (providers) onSubmit(providers);
         }}
-      >
-        {error && <div className="form-error">{error}</div>}
-        <textarea value={text} onChange={(event) => setText(event.target.value)} />
-        <footer className="modal-inline-footer">
-          <button className="secondary-button" type="button" onClick={onClose}>
-            {tx("Cancel")}
-          </button>
-          <button className="primary-button" type="submit" disabled={saving}>
-            {saving && <Loader2 size={15} />}
-            <span>{tx("Import")}</span>
-          </button>
-        </footer>
-      </form>
-    </SimpleModal>
+        onCancel={() => setPendingProviders(null)}
+      />
+    </>
   );
 }
 
