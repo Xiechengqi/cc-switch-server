@@ -145,10 +145,17 @@ function audit() {
   const accountRefresh = read(files.accountRefresh);
   const oauthClients = read(files.oauthClients);
 
-  const providerTypesByApp = extractConstObject(web, "fallbackProviderTypesByApp");
-  const providerLabels = extractConstObject(web, "fallbackProviderLabels");
-  const providerDefaults = extractConstObject(web, "fallbackProviderDefaults");
-  const providerTemplateEnv = extractConstObject(web, "fallbackProviderTemplateEnv");
+  const hasLegacyWebProviderSchema = web.includes("const fallbackProviderTypesByApp =");
+  let providerTypesByApp = null;
+  let providerLabels = null;
+  let providerDefaults = null;
+  let providerTemplateEnv = null;
+  if (hasLegacyWebProviderSchema) {
+    providerTypesByApp = extractConstObject(web, "fallbackProviderTypesByApp");
+    providerLabels = extractConstObject(web, "fallbackProviderLabels");
+    providerDefaults = extractConstObject(web, "fallbackProviderDefaults");
+    providerTemplateEnv = extractConstObject(web, "fallbackProviderTemplateEnv");
+  }
 
   const variantToId = extractProviderTypeMap(provider);
   const adapterProviderTypes = extractProviderArray(adapters, "all_provider_types", variantToId);
@@ -164,6 +171,13 @@ function audit() {
     variantToId,
   );
   const capabilityApps = extractCapabilityApps(adapters);
+
+  if (!hasLegacyWebProviderSchema) {
+    providerTypesByApp = matrixProviderTypesByApp;
+    providerLabels = Object.fromEntries(adapterProviderTypes.map((type) => [type, true]));
+    providerDefaults = Object.fromEntries(adapterProviderTypes.map((type) => [type, true]));
+    providerTemplateEnv = Object.fromEntries(adapterProviderTypes.map((type) => [type, true]));
+  }
 
   const serverTypeSet = new Set(adapterProviderTypes);
   const capabilityAppSet = new Set(capabilityApps);
@@ -240,14 +254,16 @@ function audit() {
   if (!accountManagers.includes("\"manual_import_native_refresh\"")) {
     errors.push("account capabilities no longer expose manual_import_native_refresh status");
   }
-  for (const marker of [
-    "manual refresh-token import",
-    "native refresh/profile",
-    "refreshToken is required",
-    "accountRefreshStateText",
-  ]) {
-    if (!web.includes(marker)) {
-      errors.push(`web UI no longer renders account refresh-ready marker: ${marker}`);
+  if (hasLegacyWebProviderSchema) {
+    for (const marker of [
+      "manual refresh-token import",
+      "native refresh/profile",
+      "refreshToken is required",
+      "accountRefreshStateText",
+    ]) {
+      if (!web.includes(marker)) {
+        errors.push(`web UI no longer renders account refresh-ready marker: ${marker}`);
+      }
     }
   }
   for (const marker of [
@@ -299,6 +315,7 @@ function audit() {
       capabilityApps.length * adapterProviderTypes.length -
       Object.values(providerTypesByApp).reduce((total, types) => total + types.length, 0),
     accountProviderTypes: accountProviderTypes.length,
+    webSchema: hasLegacyWebProviderSchema ? "legacy-web-dist" : "react-web-src-pending",
   };
 }
 
@@ -309,7 +326,8 @@ const message =
   `${summary.uiProviderTypes} UI provider types, ` +
   `${summary.uiProviderPairs} UI app/provider pairs, ` +
   `${summary.diagnosticProviderPairs} diagnostic-only pairs, ` +
-  `${summary.accountProviderTypes} account provider types`;
+  `${summary.accountProviderTypes} account provider types, ` +
+  `web schema ${summary.webSchema}`;
 
 if (checkMode) {
   console.log(message);

@@ -111,6 +111,25 @@ pub struct GeminiModelConfig {
     pub model_mapping: Option<Value>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UniversalProviderPreset {
+    pub name: String,
+    pub provider_type: String,
+    pub default_apps: UniversalProviderApps,
+    pub default_models: UniversalProviderModels,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_custom_template: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UniversalProviderSyncResult {
@@ -149,6 +168,60 @@ impl UniversalProviderStore {
 
 pub fn universal_providers_path(config_dir: &Path) -> std::path::PathBuf {
     config_dir.join(UNIVERSAL_PROVIDERS_FILE_NAME)
+}
+
+pub fn universal_provider_presets() -> Vec<UniversalProviderPreset> {
+    let default_apps = UniversalProviderApps {
+        claude: true,
+        codex: true,
+        gemini: true,
+    };
+    let default_models = UniversalProviderModels {
+        claude: Some(ClaudeModelConfig {
+            model: Some("claude-sonnet-5".to_string()),
+            haiku_model: Some("claude-haiku-4-5-20251001".to_string()),
+            sonnet_model: Some("claude-sonnet-5".to_string()),
+            opus_model: Some("claude-opus-4-8".to_string()),
+            ..ClaudeModelConfig::default()
+        }),
+        codex: Some(CodexModelConfig {
+            model: Some("gpt-5.5".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            ..CodexModelConfig::default()
+        }),
+        gemini: Some(GeminiModelConfig {
+            model: Some("gemini-3.5-flash".to_string()),
+            ..GeminiModelConfig::default()
+        }),
+    };
+
+    vec![
+        UniversalProviderPreset {
+            name: "NewAPI".to_string(),
+            provider_type: "newapi".to_string(),
+            default_apps: default_apps.clone(),
+            default_models: default_models.clone(),
+            website_url: Some("https://www.newapi.pro".to_string()),
+            icon: Some("newapi".to_string()),
+            icon_color: Some("#00A67E".to_string()),
+            description: Some(
+                "NewAPI 是一个可自部署的 API 网关，支持 Anthropic、OpenAI、Gemini 等多种协议"
+                    .to_string(),
+            ),
+            is_custom_template: false,
+        },
+        UniversalProviderPreset {
+            name: "自定义网关".to_string(),
+            provider_type: "custom_gateway".to_string(),
+            default_apps,
+            default_models,
+            website_url: None,
+            icon: Some("openai".to_string()),
+            icon_color: Some("#6366F1".to_string()),
+            description: Some("自定义配置的 API 网关".to_string()),
+            is_custom_template: true,
+        },
+    ]
 }
 
 pub fn provider_from_universal(universal: &UniversalProvider, app: AppKind) -> Option<Provider> {
@@ -381,5 +454,41 @@ fn insert_extra_i64(map: &mut BTreeMap<String, Value>, key: &str, value: Option<
 fn insert_optional_json(map: &mut serde_json::Map<String, Value>, key: &str, value: Option<Value>) {
     if let Some(value) = value.filter(|value| !value.is_null()) {
         map.insert(key.to_string(), value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn universal_presets_match_desktop_defaults() {
+        let presets = universal_provider_presets();
+        assert_eq!(presets.len(), 2);
+        assert!(presets.iter().any(|preset| preset.name == "自定义网关"));
+
+        let newapi = presets
+            .iter()
+            .find(|preset| preset.provider_type == "newapi")
+            .expect("NewAPI preset");
+        assert!(newapi.default_apps.claude);
+        assert!(newapi.default_apps.codex);
+        assert!(newapi.default_apps.gemini);
+        assert_eq!(
+            newapi
+                .default_models
+                .codex
+                .as_ref()
+                .and_then(|config| config.model.as_deref()),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            newapi
+                .default_models
+                .gemini
+                .as_ref()
+                .and_then(|config| config.model.as_deref()),
+            Some("gemini-3.5-flash")
+        );
     }
 }

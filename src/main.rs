@@ -7,6 +7,7 @@ mod http;
 mod proxy;
 mod state;
 mod web_assets;
+mod web_runtime;
 
 use anyhow::Context;
 use cli::{Cli, Command};

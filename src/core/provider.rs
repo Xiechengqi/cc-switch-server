@@ -207,6 +207,11 @@ fn classify_claude_provider(provider: &Provider) -> ProviderType {
     match provider_type(provider) {
         Some("antigravity_oauth") => return ProviderType::AntigravityOAuth,
         Some("agy_oauth") => return ProviderType::AgyOAuth,
+        Some("claude") => return ProviderType::Claude,
+        Some("claude_auth") => return ProviderType::ClaudeAuth,
+        Some("gemini") => return ProviderType::Gemini,
+        Some("gemini_cli") | Some("google_gemini_oauth") => return ProviderType::GeminiCli,
+        Some("openrouter") => return ProviderType::OpenRouter,
         _ => {}
     }
 
@@ -260,6 +265,12 @@ fn classify_claude_provider(provider: &Provider) -> ProviderType {
 
 fn classify_codex_provider(provider: &Provider) -> ProviderType {
     match provider_type(provider) {
+        Some("claude") => ProviderType::Claude,
+        Some("claude_auth") => ProviderType::ClaudeAuth,
+        Some("claude_oauth") => ProviderType::ClaudeOAuth,
+        Some("gemini") => ProviderType::Gemini,
+        Some("gemini_cli") | Some("google_gemini_oauth") => ProviderType::GeminiCli,
+        Some("openrouter") => ProviderType::OpenRouter,
         Some("cursor_oauth") => ProviderType::CursorOAuth,
         Some("cursor_apikey") => ProviderType::CursorApiKey,
         Some("ollama_cloud") => ProviderType::OllamaCloud,
@@ -286,6 +297,16 @@ fn classify_codex_provider(provider: &Provider) -> ProviderType {
 
 fn classify_gemini_provider(provider: &Provider) -> ProviderType {
     match provider_type(provider) {
+        Some("claude") => return ProviderType::Claude,
+        Some("claude_auth") => return ProviderType::ClaudeAuth,
+        Some("claude_oauth") => return ProviderType::ClaudeOAuth,
+        Some("codex") => return ProviderType::Codex,
+        Some("codex_oauth") => return ProviderType::CodexOAuth,
+        Some("gemini") => return ProviderType::Gemini,
+        Some("gemini_cli") => return ProviderType::GeminiCli,
+        Some("openrouter") => return ProviderType::OpenRouter,
+        Some("nvidia") => return ProviderType::Nvidia,
+        Some("deepseek_api") => return ProviderType::DeepSeekApi,
         Some("antigravity_oauth") => return ProviderType::AntigravityOAuth,
         Some("agy_oauth") => return ProviderType::AgyOAuth,
         Some("google_gemini_oauth") => return ProviderType::GeminiCli,
@@ -417,8 +438,13 @@ mod tests {
     fn classifies_claude_meta_provider_types() {
         let cases = [
             ("github_copilot", ProviderType::GitHubCopilot),
+            ("claude", ProviderType::Claude),
+            ("claude_auth", ProviderType::ClaudeAuth),
             ("codex_oauth", ProviderType::CodexOAuth),
             ("claude_oauth", ProviderType::ClaudeOAuth),
+            ("gemini", ProviderType::Gemini),
+            ("gemini_cli", ProviderType::GeminiCli),
+            ("openrouter", ProviderType::OpenRouter),
             ("deepseek_account", ProviderType::DeepSeekAccount),
             ("aws_bedrock", ProviderType::AwsBedrock),
             ("nvidia", ProviderType::Nvidia),
@@ -507,6 +533,12 @@ mod tests {
     #[test]
     fn classifies_codex_meta_provider_types() {
         let cases = [
+            ("claude", ProviderType::Claude),
+            ("claude_auth", ProviderType::ClaudeAuth),
+            ("claude_oauth", ProviderType::ClaudeOAuth),
+            ("gemini", ProviderType::Gemini),
+            ("gemini_cli", ProviderType::GeminiCli),
+            ("openrouter", ProviderType::OpenRouter),
             ("cursor_oauth", ProviderType::CursorOAuth),
             ("cursor_apikey", ProviderType::CursorApiKey),
             ("ollama_cloud", ProviderType::OllamaCloud),
@@ -555,6 +587,24 @@ mod tests {
             classify_provider(AppKind::Gemini, &provider(Some("google_gemini_oauth"))),
             ProviderType::GeminiCli
         );
+        let cases = [
+            ("claude", ProviderType::Claude),
+            ("claude_auth", ProviderType::ClaudeAuth),
+            ("claude_oauth", ProviderType::ClaudeOAuth),
+            ("codex", ProviderType::Codex),
+            ("codex_oauth", ProviderType::CodexOAuth),
+            ("gemini", ProviderType::Gemini),
+            ("gemini_cli", ProviderType::GeminiCli),
+            ("openrouter", ProviderType::OpenRouter),
+            ("nvidia", ProviderType::Nvidia),
+            ("deepseek_api", ProviderType::DeepSeekApi),
+        ];
+        for (meta_type, expected) in cases {
+            assert_eq!(
+                classify_provider(AppKind::Gemini, &provider(Some(meta_type))),
+                expected
+            );
+        }
 
         let mut oauth = provider(None);
         oauth.settings_config = json!({"env": {"GEMINI_API_KEY": "ya29.token"}});

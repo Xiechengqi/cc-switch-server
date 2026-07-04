@@ -68,7 +68,8 @@ use crate::core::shares::{
     UpsertShareInput,
 };
 use crate::core::universal_providers::{
-    provider_from_universal, UniversalProvider, UniversalProviderSyncResult,
+    provider_from_universal, universal_provider_presets, UniversalProvider,
+    UniversalProviderPreset, UniversalProviderSyncResult,
 };
 use crate::core::usage::{
     ModelUsageStats, ProviderUsageStats, UsageLog, UsageLogFilter, UsageRollup, UsageStatsFilter,
@@ -81,6 +82,7 @@ use crate::state::{
     save_accounts_debounced, save_shares_debounced, ServerEvent, ServerState, Session,
 };
 use crate::web_assets;
+use crate::web_runtime::{self, WebRuntimeCommandSupport};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -161,6 +163,10 @@ pub fn app_router(state: ServerState) -> Router {
         .route(
             "/api/universal-providers/:id/sync",
             post(sync_universal_provider),
+        )
+        .route(
+            "/api/universal-provider-presets",
+            get(universal_provider_presets_route),
         )
         .route("/api/providers/health", get(provider_health))
         .route("/api/failover", get(failover_snapshot))
@@ -308,6 +314,7 @@ pub fn app_router(state: ServerState) -> Router {
             "/web-api/auth/email/verify-code",
             post(verify_email_login_code),
         )
+        .route("/web-api/context", get(web_runtime_context))
         .route("/web-api/invoke/*command", post(web_invoke_compat))
         .route("/v1/models", get(proxy_models))
         .route("/models", get(proxy_models))
@@ -1241,6 +1248,13 @@ async fn list_universal_providers(
     }))
 }
 
+async fn universal_provider_presets_route() -> Json<UniversalProviderPresetsResponse> {
+    Json(UniversalProviderPresetsResponse {
+        ok: true,
+        presets: universal_provider_presets(),
+    })
+}
+
 async fn export_universal_providers(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1504,15 +1518,7 @@ async fn test_provider(
     Query(query): Query<TestProviderQuery>,
 ) -> Result<Json<TestProviderResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let stored = state
-        .providers
-        .read()
-        .await
-        .providers
-        .iter()
-        .find(|item| item.provider.id == id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let stored = resolve_provider_by_id(&state, &id, query.app).await?;
     Ok(Json(test_provider_inner(&state, stored, &query).await?))
 }
 
@@ -1560,6 +1566,7 @@ async fn test_providers(
 ) -> Result<Json<TestProvidersResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let query = TestProviderQuery {
+        app: None,
         network: input.network,
         timeout_ms: input.timeout_ms,
         model: input.model,
@@ -4208,13 +4215,1047 @@ async fn proxy_models(
     })
 }
 
-async fn web_invoke_compat(Path(command): Path<String>) -> Result<Json<ErrorResponse>, ApiError> {
-    Err(ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        format!(
-            "desktop invoke command '{command}' is not available in cc-switch-server; use REST API"
-        ),
+async fn web_runtime_context(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let config = state.config.read().await.clone();
+    let contract = web_runtime::contract();
+    if !config.is_setup_complete() {
+        return Ok(Json(json!({
+            "mode": "client-login",
+            "appMode": "server",
+            "platform": "server",
+            "status": "setup-required",
+            "permissions": ["setup"],
+            "apps": ["claude", "codex", "gemini"],
+            "auth": {
+                "authenticated": false,
+                "setupRequired": true,
+                "ownerEmail": config.owner.email,
+                "methods": ["passwordSetup"]
+            },
+            "features": {
+                "retained": contract.retained_features,
+                "hidden": contract.hidden_features,
+                "excluded": contract.excluded_features
+            },
+            "commands": contract.commands,
+            "uiAutomation": {
+                "allowed": contract.ui_automation_allowed
+            }
+        })));
+    }
+
+    require_session(&state, &headers).await?;
+    Ok(Json(json!({
+        "mode": "local-admin",
+        "appMode": "server",
+        "platform": "server",
+        "status": "authenticated",
+        "permissions": ["admin", "providers", "shares", "usage", "settings", "accounts"],
+        "apps": ["claude", "codex", "gemini"],
+        "auth": {
+            "authenticated": true,
+            "setupRequired": false,
+            "ownerEmail": config.owner.email,
+            "methods": ["password", "apiToken", "email"]
+        },
+        "router": {
+            "url": config.router.url,
+            "domain": config.router.domain,
+            "clientSubdomain": config.client.tunnel_subdomain,
+            "clientTunnelStatus": config.client.tunnel_status
+        },
+        "runtime": {
+            "configDir": state.config_dir.display().to_string(),
+            "webDistDir": state.web_dist_dir.as_ref().map(|path| path.display().to_string()),
+            "embeddedWebAssets": web_assets::asset_count()
+        },
+        "features": {
+            "retained": contract.retained_features,
+            "hidden": contract.hidden_features,
+            "excluded": contract.excluded_features
+        },
+        "commands": contract.commands,
+        "uiAutomation": {
+            "allowed": contract.ui_automation_allowed
+        }
+    })))
+}
+
+async fn web_invoke_compat(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(command): Path<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let args = if body.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_slice(&body).map_err(ApiError::bad_request)?
+    };
+    let command_def = web_runtime::command(&command)
+        .ok_or_else(|| ApiError::web_invoke_unknown(command.clone()))?;
+    if command_def.support == WebRuntimeCommandSupport::Excluded {
+        return Err(ApiError::feature_disabled(format!(
+            "desktop invoke command '{command}' is excluded from cc-switch-server ({})",
+            command_def.feature
+        )));
+    }
+
+    require_session(&state, &headers).await?;
+    if !command_def.implemented {
+        return Err(ApiError::web_invoke_not_wired(format!(
+            "desktop invoke command '{command}' is registered as {} but is not bridged yet",
+            web_runtime_support_label(command_def.support)
+        )));
+    }
+
+    web_invoke_dispatch(&state, &headers, &command, args)
+        .await
+        .map(Json)
+}
+
+async fn web_invoke_dispatch(
+    state: &ServerState,
+    headers: &HeaderMap,
+    command: &str,
+    args: Value,
+) -> Result<Value, ApiError> {
+    match command {
+        "get_build_info" => Ok(json!(build_info())),
+        "get_settings" => {
+            let config = state.config.read().await;
+            Ok(json!({
+                "server": ConfigSnapshotResponse::from_config(&config),
+                "webRuntime": web_runtime::contract()
+            }))
+        }
+        "get_global_proxy_config" => {
+            let config = state.config.read().await;
+            Ok(json!(UpstreamProxyView::from_config(&config)))
+        }
+        "get_providers" => {
+            let app = web_arg_app(&args)?;
+            let providers = state.providers.read().await;
+            Ok(json!(provider_record_for_app(&providers.providers, app)))
+        }
+        "get_current_provider" => {
+            let app = web_arg_app(&args)?;
+            let providers = state.providers.read().await;
+            let current = providers
+                .providers
+                .iter()
+                .find(|provider| provider.app == app)
+                .map(|provider| provider.provider.id.clone())
+                .unwrap_or_default();
+            Ok(json!(current))
+        }
+        "add_provider" | "update_provider" => {
+            let app = web_arg_app(&args)?;
+            let provider: Provider = web_arg_value(&args, "provider")?;
+            if provider.name.trim().is_empty() {
+                return Err(ApiError::bad_request("provider name is required"));
+            }
+            state.providers.write().await.upsert(app, provider);
+            state.save_providers().await.map_err(ApiError::internal)?;
+            Ok(json!(true))
+        }
+        "delete_provider" => {
+            let app = web_arg_app(&args)?;
+            let id = web_arg_string(&args, "id")?;
+            let deleted = {
+                let mut providers = state.providers.write().await;
+                let before = providers.providers.len();
+                providers
+                    .providers
+                    .retain(|provider| !(provider.app == app && provider.provider.id == id));
+                providers.providers.len() != before
+            };
+            if deleted {
+                state.save_providers().await.map_err(ApiError::internal)?;
+            }
+            Ok(json!(deleted))
+        }
+        "switch_provider" => {
+            let app = web_arg_app(&args)?;
+            let id = web_arg_string(&args, "id")?;
+            let exists = state
+                .providers
+                .read()
+                .await
+                .providers
+                .iter()
+                .any(|provider| provider.app == app && provider.provider.id == id);
+            if !exists {
+                return Err(ApiError::not_found("provider not found"));
+            }
+            Ok(json!({ "warnings": [] }))
+        }
+        "get_provider_health" => {
+            let usage = state.usage.read().await.clone();
+            let providers = state
+                .providers
+                .read()
+                .await
+                .providers
+                .iter()
+                .map(|provider| crate::core::health::provider_health(provider, &usage))
+                .collect::<Vec<_>>();
+            Ok(json!(providers))
+        }
+        "get_universal_providers" => {
+            let providers = state.universal_providers.read().await.providers.clone();
+            Ok(json!(providers))
+        }
+        "get_universal_provider" => {
+            let id = web_arg_string(&args, "id")?;
+            let provider = state
+                .universal_providers
+                .read()
+                .await
+                .providers
+                .get(&id)
+                .cloned();
+            Ok(json!(provider))
+        }
+        "upsert_universal_provider" => {
+            let provider: UniversalProvider = web_arg_value_any(&args, &["provider"])?;
+            let response = upsert_universal_provider(
+                State(state.clone()),
+                headers.clone(),
+                Json(UpsertUniversalProviderRequest { provider }),
+            )
+            .await?
+            .0;
+            Ok(json!(response.provider))
+        }
+        "delete_universal_provider" => {
+            let id = web_arg_string(&args, "id")?;
+            let response =
+                delete_universal_provider(State(state.clone()), headers.clone(), Path(id))
+                    .await?
+                    .0;
+            Ok(json!(response.deleted))
+        }
+        "sync_universal_provider" => {
+            let id = web_arg_string(&args, "id")?;
+            let response = sync_universal_provider(State(state.clone()), headers.clone(), Path(id))
+                .await?
+                .0;
+            Ok(json!(response.result))
+        }
+        "list_shares" | "export_all_shares" => {
+            let shares = state.shares.read().await.shares.clone();
+            Ok(json!(shares))
+        }
+        "get_share_detail" => {
+            let id = web_arg_share_id(&args)?;
+            let share = state.shares.read().await.get(&id).cloned();
+            Ok(json!(share))
+        }
+        "get_share_connect_info" => {
+            let id = web_arg_share_id(&args)?;
+            let config = state.config.read().await.clone();
+            let share = state
+                .shares
+                .read()
+                .await
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("share not found"))?;
+            Ok(json!(connect_info_for_share(&config, &share)?))
+        }
+        "list_share_markets" => {
+            let markets = fetch_public_markets_from_router(state).await?;
+            Ok(json!(markets))
+        }
+        "create_share" => {
+            let input = web_share_upsert_input(state, &args).await?;
+            let response = upsert_share(State(state.clone()), headers.clone(), Json(input))
+                .await?
+                .0;
+            Ok(json!(response.share))
+        }
+        "delete_share" => {
+            let id = web_arg_share_id(&args)?;
+            let response = delete_share(State(state.clone()), headers.clone(), Path(id))
+                .await?
+                .0;
+            Ok(json!(response.deleted))
+        }
+        "pause_share" => {
+            let id = web_arg_share_id(&args)?;
+            let response = pause_share(State(state.clone()), headers.clone(), Path(id))
+                .await?
+                .0;
+            Ok(json!(response.share))
+        }
+        "resume_share" => {
+            let id = web_arg_share_id(&args)?;
+            let response = resume_share(State(state.clone()), headers.clone(), Path(id))
+                .await?
+                .0;
+            Ok(json!(response.share))
+        }
+        "reset_share_usage" => {
+            let id = web_arg_share_id(&args)?;
+            let response = reset_share_usage(State(state.clone()), headers.clone(), Path(id))
+                .await?
+                .0;
+            Ok(json!(response.share))
+        }
+        "update_share_provider_binding" => {
+            let (id, binding) = web_share_binding_input(state, &args).await?;
+            let response = update_share_binding(
+                State(state.clone()),
+                headers.clone(),
+                Path(id),
+                Json(UpdateShareBindingRequest { binding }),
+            )
+            .await?
+            .0;
+            Ok(json!(response.share))
+        }
+        "update_share_acl" => {
+            let share = web_update_share_acl(state, &args).await?;
+            Ok(json!(share))
+        }
+        "authorize_share_market" => {
+            let id = web_arg_share_id(&args)?;
+            let value = web_payload(&args, &["params", "input"]);
+            let market_email = web_arg_string_any(value, &["marketEmail", "market_email"])?;
+            let response = authorize_share_market(
+                State(state.clone()),
+                headers.clone(),
+                Path(id),
+                Json(AuthorizeShareMarketRequest { market_email }),
+            )
+            .await?
+            .0;
+            Ok(json!(response.share))
+        }
+        "start_share_tunnel" => {
+            let id = web_arg_share_id(&args)?;
+            let response = start_share_tunnel(State(state.clone()), headers.clone(), Path(id))
+                .await?
+                .0;
+            Ok(json!(response.share))
+        }
+        "stop_share_tunnel" => {
+            let id = web_arg_share_id(&args)?;
+            let response = stop_share_tunnel(State(state.clone()), headers.clone(), Path(id))
+                .await?
+                .0;
+            Ok(json!(response.share))
+        }
+        "get_tunnel_status" => {
+            if let Ok(id) = web_arg_share_id(&args) {
+                return Ok(json!(web_share_tunnel_status(state, &id).await?));
+            }
+            let response = router_tunnels(State(state.clone()), headers.clone())
+                .await?
+                .0;
+            Ok(json!(response.tunnels))
+        }
+        "get_client_tunnel" | "get_client_tunnel_status" => {
+            let config = state.config.read().await;
+            Ok(json!({
+                "tunnelSubdomain": config.client.tunnel_subdomain,
+                "tunnelStatus": config.client.tunnel_status,
+                "lastHeartbeatMs": config.client.last_heartbeat_ms,
+                "runtimeStatus": state
+                    .tunnels
+                    .status(&crate::core::tunnel::client_tunnel_key())
+                    .await
+            }))
+        }
+        "claim_client_tunnel" => {
+            if web_has_payload(&args) {
+                let input = web_client_tunnel_input(&args)?;
+                update_client_tunnel(State(state.clone()), headers.clone(), Json(input)).await?;
+            }
+            let response = claim_client_tunnel(State(state.clone()), headers.clone())
+                .await?
+                .0;
+            Ok(json!(response))
+        }
+        "update_client_tunnel" => {
+            let input = web_client_tunnel_input(&args)?;
+            let response = update_client_tunnel(State(state.clone()), headers.clone(), Json(input))
+                .await?
+                .0;
+            Ok(json!(response))
+        }
+        "start_client_tunnel" => {
+            let response = issue_client_tunnel_lease(State(state.clone()), headers.clone())
+                .await?
+                .0;
+            Ok(json!(response))
+        }
+        "stop_client_tunnel" => {
+            let response = stop_client_tunnel(State(state.clone()), headers.clone())
+                .await?
+                .0;
+            Ok(json!(response))
+        }
+        "get_usage_summary" => {
+            let usage = state.usage.read().await;
+            Ok(json!(usage.rollup_filtered(&UsageStatsFilter::default())))
+        }
+        "get_usage_trends" => {
+            let usage = state.usage.read().await;
+            let filter = UsageStatsFilter {
+                window_ms: Some(24 * 60 * 60 * 1000),
+                ..UsageStatsFilter::default()
+            };
+            Ok(json!(usage.trends(&filter)))
+        }
+        "get_provider_stats" => {
+            let usage = state.usage.read().await;
+            Ok(json!(usage.provider_stats(&UsageStatsFilter::default())))
+        }
+        "get_model_stats" => {
+            let usage = state.usage.read().await;
+            Ok(json!(usage.model_stats(&UsageStatsFilter::default())))
+        }
+        "get_request_logs" => {
+            let usage = state.usage.read().await;
+            Ok(json!(usage.latest_filtered(UsageLogFilter {
+                limit: Some(200),
+                ..UsageLogFilter::default()
+            })))
+        }
+        "get_request_detail" => {
+            let id = web_arg_string(&args, "id").or_else(|_| web_arg_string(&args, "requestId"))?;
+            let usage = state.usage.read().await;
+            let log = usage.logs.iter().find(|log| log.request_id == id).cloned();
+            Ok(json!(log))
+        }
+        "get_proxy_status" => Ok(json!({
+            "running": true,
+            "status": "running",
+            "mode": "server",
+            "baseUrl": format!("http://{}", state.bind_addr)
+        })),
+        "get_proxy_takeover_status" => Ok(json!({
+            "claude": false,
+            "codex": false,
+            "gemini": false
+        })),
+        "is_proxy_running" => Ok(json!(true)),
+        "is_live_takeover_active" => Ok(json!(false)),
+        "update_global_proxy_config" => {
+            let input = web_upstream_proxy_input(&args)?;
+            let response =
+                update_upstream_proxy(State(state.clone()), headers.clone(), Json(input))
+                    .await?
+                    .0;
+            Ok(json!(response.upstream_proxy))
+        }
+        "list_db_backups" => {
+            let response = list_backups(State(state.clone()), headers.clone()).await?.0;
+            Ok(json!(response.backups))
+        }
+        "create_db_backup" => {
+            let body = web_create_backup_request(&args)?;
+            let response = create_backup(State(state.clone()), headers.clone(), body)
+                .await?
+                .0;
+            Ok(json!(response.backup))
+        }
+        "restore_db_backup" => {
+            let id = web_arg_string_any(&args, &["id", "backupId", "filename"])?;
+            let response = restore_backup(State(state.clone()), headers.clone(), Path(id))
+                .await?
+                .0;
+            Ok(json!(response.result))
+        }
+        "auth_list_accounts" => {
+            let provider_type = web_optional_auth_provider_type(&args)?;
+            let accounts = state
+                .accounts
+                .read()
+                .await
+                .accounts
+                .iter()
+                .filter(|account| {
+                    provider_type
+                        .map(|provider_type| account.provider_type == provider_type)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            Ok(json!(accounts))
+        }
+        "auth_start_login" => {
+            let provider_type = web_auth_provider_type(&args)?;
+            let redirect_uri = web_optional_string_any(
+                &args,
+                &["redirectUri", "redirect_uri", "codexCallbackUrl"],
+            );
+            let response = start_account_login(
+                State(state.clone()),
+                headers.clone(),
+                Json(StartAccountLoginRequest {
+                    provider_type,
+                    redirect_uri,
+                }),
+            )
+            .await?
+            .0;
+            Ok(json!(response.login))
+        }
+        "auth_submit_oauth_code" => {
+            let session_id = web_optional_string_any(&args, &["sessionId", "session_id"]);
+            let state_arg = web_optional_string_any(&args, &["state"]).or_else(|| {
+                session_id
+                    .is_none()
+                    .then(|| web_optional_string_any(&args, &["deviceCode", "device_code"]))
+                    .flatten()
+            });
+            let code = web_optional_string_any(&args, &["code"]);
+            let response = finish_account_login(
+                State(state.clone()),
+                headers.clone(),
+                Json(FinishAccountLoginRequest {
+                    session_id,
+                    state: state_arg,
+                    code,
+                    execute_token_exchange: Some(true),
+                }),
+            )
+            .await?
+            .0;
+            Ok(json!(response))
+        }
+        "refresh_oauth_quota" => {
+            let account_id = web_resolve_account_id(state, &args).await?;
+            let Some(account_id) = account_id else {
+                return Ok(Value::Null);
+            };
+            let response = account_quota(
+                State(state.clone()),
+                headers.clone(),
+                Path(account_id),
+                Query(AccountQuotaQuery {
+                    refresh: Some(true),
+                    force: web_optional_bool(&args, &["force"]),
+                }),
+            )
+            .await?
+            .0;
+            Ok(json!(response))
+        }
+        "get_cached_oauth_quota" => {
+            let account_id = web_resolve_account_id(state, &args).await?;
+            let Some(account_id) = account_id else {
+                return Ok(Value::Null);
+            };
+            let response = account_quota(
+                State(state.clone()),
+                headers.clone(),
+                Path(account_id),
+                Query(AccountQuotaQuery {
+                    refresh: Some(false),
+                    force: None,
+                }),
+            )
+            .await?
+            .0;
+            Ok(json!(response))
+        }
+        "get_claude_oauth_quota" => {
+            let response =
+                web_provider_quota(state, headers, &args, ProviderType::ClaudeOAuth).await?;
+            Ok(response)
+        }
+        "get_codex_oauth_quota" => {
+            let response =
+                web_provider_quota(state, headers, &args, ProviderType::CodexOAuth).await?;
+            Ok(response)
+        }
+        "copilot_start_device_flow" => {
+            let response = start_copilot_device_login(
+                State(state.clone()),
+                headers.clone(),
+                Json(StartCopilotDeviceLoginRequest {
+                    github_domain: web_optional_string_any(
+                        &args,
+                        &["githubDomain", "github_domain"],
+                    ),
+                }),
+            )
+            .await?
+            .0;
+            Ok(json!(response.device))
+        }
+        "copilot_poll_for_auth" => {
+            let device_code = web_arg_string_any(&args, &["deviceCode", "device_code"])?;
+            let response = poll_copilot_device_login(
+                State(state.clone()),
+                headers.clone(),
+                Json(PollCopilotDeviceLoginRequest {
+                    device_code,
+                    github_domain: web_optional_string_any(
+                        &args,
+                        &["githubDomain", "github_domain"],
+                    ),
+                }),
+            )
+            .await?
+            .0;
+            Ok(json!(response))
+        }
+        _ => Err(ApiError::web_invoke_not_wired(format!(
+            "desktop invoke command '{command}' is registered but has no dispatcher"
+        ))),
+    }
+}
+
+async fn web_provider_quota(
+    state: &ServerState,
+    headers: &HeaderMap,
+    args: &Value,
+    provider_type: ProviderType,
+) -> Result<Value, ApiError> {
+    let account_id = web_optional_string_any(args, &["accountId", "account_id"]);
+    let account_id = match account_id {
+        Some(account_id) => account_id,
+        None => {
+            let accounts = state.accounts.read().await;
+            let Some(account) = accounts.find_for_provider(provider_type, None) else {
+                return Ok(Value::Null);
+            };
+            account.id.clone()
+        }
+    };
+    let response = account_quota(
+        State(state.clone()),
+        headers.clone(),
+        Path(account_id),
+        Query(AccountQuotaQuery {
+            refresh: Some(false),
+            force: None,
+        }),
+    )
+    .await?
+    .0;
+    Ok(json!(response))
+}
+
+async fn web_resolve_account_id(
+    state: &ServerState,
+    args: &Value,
+) -> Result<Option<String>, ApiError> {
+    if let Some(account_id) = web_optional_string_any(args, &["accountId", "account_id", "id"]) {
+        return Ok(Some(account_id));
+    }
+
+    let provider_id = web_optional_string_any(args, &["providerId", "provider_id"]);
+    let app = web_optional_string_any(args, &["appType", "app", "app_type"])
+        .map(|app| parse_app_kind(&app))
+        .transpose()?;
+    if let (Some(app), Some(provider_id)) = (app, provider_id.as_deref()) {
+        let provider = {
+            let providers = state.providers.read().await;
+            providers
+                .providers
+                .iter()
+                .find(|provider| provider.app == app && provider.provider.id == provider_id)
+                .cloned()
+        };
+        if let Some(provider) = provider {
+            let account_id_hint = provider
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.account_id.as_deref());
+            let accounts = state.accounts.read().await;
+            return Ok(accounts
+                .find_for_provider(provider.provider_type, account_id_hint)
+                .map(|account| account.id.clone()));
+        }
+    }
+
+    let provider_type = web_optional_auth_provider_type(args)?;
+    if let Some(provider_type) = provider_type {
+        let accounts = state.accounts.read().await;
+        return Ok(accounts
+            .find_for_provider(provider_type, None)
+            .map(|account| account.id.clone()));
+    }
+
+    Ok(None)
+}
+
+async fn web_share_upsert_input(
+    state: &ServerState,
+    args: &Value,
+) -> Result<UpsertShareInput, ApiError> {
+    let value = web_payload(args, &["params", "input", "share"]);
+    if let Ok(input) = serde_json::from_value::<UpsertShareInput>(value.clone()) {
+        return Ok(input);
+    }
+
+    let bindings_value = value.get("bindings").ok_or_else(|| {
+        ApiError::bad_request("share params.bindings or app/providerId is required")
+    })?;
+    let binding_map = serde_json::from_value::<BTreeMap<String, String>>(bindings_value.clone())
+        .map_err(ApiError::bad_request)?;
+    let mut bindings = Vec::new();
+    for app_name in ["claude", "codex", "gemini"] {
+        let Some(provider_id) = binding_map
+            .get(app_name)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|provider_id| !provider_id.is_empty())
+        else {
+            continue;
+        };
+        let app = parse_app_kind(app_name)?;
+        let provider_type = web_provider_type_for_binding(state, app, provider_id).await?;
+        bindings.push(ShareBinding {
+            app,
+            provider_id: provider_id.to_string(),
+            provider_type,
+        });
+    }
+    let primary = bindings
+        .first()
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("at least one share binding is required"))?;
+    let expires_at = web_optional_i64(value, &["expiresAt", "expires_at"]).or_else(|| {
+        web_optional_i64(value, &["expiresInSecs", "expires_in_secs"]).and_then(|seconds| {
+            (seconds > 0).then(|| (now_ms() as i64).saturating_add(seconds.saturating_mul(1000)))
+        })
+    });
+
+    Ok(UpsertShareInput {
+        id: web_optional_string_any(value, &["id", "shareId", "share_id"]),
+        owner_email: web_optional_string_any(value, &["ownerEmail", "owner_email"]),
+        app: primary.app,
+        provider_id: primary.provider_id.clone(),
+        provider_type: primary.provider_type,
+        display_name: web_optional_string_any(value, &["displayName", "name"]),
+        enabled: web_optional_bool(value, &["enabled"]),
+        status: web_optional_string_any(value, &["status"]),
+        subscription_level: None,
+        account_email: None,
+        quota_percent: None,
+        tunnel_subdomain: web_optional_string_any(value, &["tunnelSubdomain", "subdomain"]),
+        acl: None,
+        token_limit: web_optional_u64(value, &["tokenLimit", "token_limit"]),
+        parallel_limit: web_optional_u32(value, &["parallelLimit", "parallel_limit"]),
+        expires_at,
+        for_sale: web_optional_share_for_sale(value),
+        sale_market_kind: web_optional_string_any(value, &["saleMarketKind", "sale_market_kind"]),
+        access_by_app: BTreeMap::new(),
+        app_settings: BTreeMap::new(),
+        for_sale_official_price_percent_by_app: BTreeMap::new(),
+        official_price_percent: None,
+        auto_start: web_optional_bool(value, &["autoStart", "auto_start"]),
+        description: web_optional_string_any(value, &["description"]),
+        bindings,
+        runtime_snapshot: None,
+        market_grant: None,
+    })
+}
+
+async fn web_share_binding_input(
+    state: &ServerState,
+    args: &Value,
+) -> Result<(String, ShareBinding), ApiError> {
+    let value = web_payload(args, &["params", "input"]);
+    let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
+    if let Some(binding_value) = value.get("binding") {
+        let binding = serde_json::from_value::<ShareBinding>(binding_value.clone())
+            .map_err(ApiError::bad_request)?;
+        return Ok((share_id, binding));
+    }
+
+    let app = web_arg_string_any(value, &["appType", "app", "app_type"])
+        .and_then(|value| parse_app_kind(&value))?;
+    let provider_id = web_arg_string_any(value, &["providerId", "provider_id"])?;
+    let provider_type = web_optional_string_any(value, &["providerType", "provider_type"])
+        .map(|value| web_parse_provider_type(&value))
+        .transpose()?
+        .unwrap_or(web_provider_type_for_binding(state, app, &provider_id).await?);
+    Ok((
+        share_id,
+        ShareBinding {
+            app,
+            provider_id,
+            provider_type,
+        },
     ))
+}
+
+async fn web_update_share_acl(state: &ServerState, args: &Value) -> Result<Share, ApiError> {
+    let value = web_payload(args, &["params", "input"]);
+    let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
+    if let Some(acl_value) = value.get("acl") {
+        let acl =
+            serde_json::from_value::<ShareAcl>(acl_value.clone()).map_err(ApiError::bad_request)?;
+        let share = state
+            .shares
+            .write()
+            .await
+            .replace_acl(&share_id, acl)
+            .ok_or_else(|| ApiError::not_found("share not found"))?;
+        state.save_shares().await.map_err(ApiError::internal)?;
+        spawn_share_upsert_sync(state.clone(), share.clone());
+        emit_share_event(state, "share.changed", &share, "acl_replaced");
+        return Ok(share);
+    }
+
+    let patch = ShareSettingsPatch {
+        shared_with_emails: web_optional_deserialize(value, "sharedWithEmails")?,
+        market_access_mode: web_optional_string_any(value, &["marketAccessMode"]),
+        access_by_app: web_optional_deserialize(value, "accessByApp")?,
+        app_settings: web_optional_deserialize(value, "appSettings")?,
+        sale_market_kind: web_optional_string_any(value, &["saleMarketKind"]),
+        ..ShareSettingsPatch::default()
+    };
+    let share = state
+        .shares
+        .write()
+        .await
+        .apply_settings_patch(&share_id, patch)
+        .map_err(map_share_patch_error)?;
+    state.save_shares().await.map_err(ApiError::internal)?;
+    spawn_share_upsert_sync(state.clone(), share.clone());
+    emit_share_event(state, "share.changed", &share, "acl_replaced");
+    Ok(share)
+}
+
+async fn web_share_tunnel_status(state: &ServerState, share_id: &str) -> Result<Value, ApiError> {
+    let share = state
+        .shares
+        .read()
+        .await
+        .get(share_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("share not found"))?;
+    let runtime_status = state
+        .tunnels
+        .status(&crate::core::tunnel::share_tunnel_key(share_id))
+        .await;
+    Ok(json!({
+        "shareId": share.id,
+        "status": share.status,
+        "lastError": share.last_error,
+        "runtimeStatus": runtime_status,
+        "requiresOwnerLogin": false
+    }))
+}
+
+async fn web_provider_type_for_binding(
+    state: &ServerState,
+    app: AppKind,
+    provider_id: &str,
+) -> Result<ProviderType, ApiError> {
+    state
+        .providers
+        .read()
+        .await
+        .providers
+        .iter()
+        .find(|provider| provider.app == app && provider.provider.id == provider_id)
+        .map(|provider| provider.provider_type)
+        .ok_or_else(|| ApiError::not_found(format!("provider not found: {provider_id}")))
+}
+
+fn web_create_backup_request(args: &Value) -> Result<Option<Json<CreateBackupRequest>>, ApiError> {
+    if !web_has_payload(args) {
+        return Ok(None);
+    }
+    let value = web_payload(args, &["input", "params"]);
+    let request = serde_json::from_value::<CreateBackupRequest>(value.clone())
+        .map_err(ApiError::bad_request)?;
+    Ok(Some(Json(request)))
+}
+
+fn web_client_tunnel_input(args: &Value) -> Result<UpdateClientTunnelInput, ApiError> {
+    let value = web_payload(args, &["params", "input", "config"]);
+    Ok(UpdateClientTunnelInput {
+        tunnel_subdomain: web_optional_string_any(value, &["tunnelSubdomain", "subdomain"]),
+        tunnel_status: web_optional_string_any(value, &["tunnelStatus", "status"]),
+    })
+}
+
+fn web_upstream_proxy_input(args: &Value) -> Result<UpdateUpstreamProxyInput, ApiError> {
+    let value = web_payload(args, &["config", "input", "params"]);
+    if let Ok(input) = serde_json::from_value::<UpdateUpstreamProxyInput>(value.clone()) {
+        return Ok(input);
+    }
+    Ok(UpdateUpstreamProxyInput {
+        url: web_optional_string_any(value, &["url", "proxyUrl", "proxy_url"]),
+        clear: web_optional_bool(value, &["clear"]).or_else(|| {
+            web_optional_bool(value, &["enabled", "proxyEnabled"]).map(|enabled| !enabled)
+        }),
+        follow_system_proxy: web_optional_bool(value, &["followSystemProxy"]),
+    })
+}
+
+fn web_arg_share_id(args: &Value) -> Result<String, ApiError> {
+    let value = web_payload(args, &["params", "input"]);
+    web_arg_string_any(value, &["shareId", "share_id", "id"])
+}
+
+fn web_payload<'a>(args: &'a Value, keys: &[&str]) -> &'a Value {
+    keys.iter().find_map(|key| args.get(*key)).unwrap_or(args)
+}
+
+fn web_has_payload(args: &Value) -> bool {
+    args.as_object().is_some_and(|object| !object.is_empty())
+}
+
+fn web_arg_value_any<T>(args: &Value, keys: &[&str]) -> Result<T, ApiError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let value = web_payload(args, keys).clone();
+    serde_json::from_value(value).map_err(ApiError::bad_request)
+}
+
+fn web_arg_string_any(args: &Value, keys: &[&str]) -> Result<String, ApiError> {
+    web_optional_string_any(args, keys).ok_or_else(|| {
+        ApiError::bad_request(format!("{} is required", keys.first().unwrap_or(&"value")))
+    })
+}
+
+fn web_optional_string_any(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        args.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn web_optional_bool(args: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_bool))
+}
+
+fn web_optional_i64(args: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        args.get(*key).and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+        })
+    })
+}
+
+fn web_optional_u64(args: &Value, keys: &[&str]) -> Option<u64> {
+    web_optional_i64(args, keys).and_then(|value| (value >= 0).then_some(value as u64))
+}
+
+fn web_optional_u32(args: &Value, keys: &[&str]) -> Option<u32> {
+    web_optional_i64(args, keys).and_then(|value| u32::try_from(value).ok())
+}
+
+fn web_optional_deserialize<T>(args: &Value, key: &str) -> Result<Option<T>, ApiError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    args.get(key)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(ApiError::bad_request)
+}
+
+fn web_optional_share_for_sale(args: &Value) -> Option<bool> {
+    if let Some(value) = web_optional_bool(args, &["forSale", "for_sale"]) {
+        return Some(value);
+    }
+    web_optional_string_any(args, &["forSale", "for_sale"]).map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "yes" | "true" | "1" | "free"
+        )
+    })
+}
+
+fn web_optional_auth_provider_type(args: &Value) -> Result<Option<ProviderType>, ApiError> {
+    web_optional_string_any(args, &["providerType", "provider_type", "authProvider"])
+        .map(|value| web_parse_auth_provider_type(&value))
+        .transpose()
+}
+
+fn web_auth_provider_type(args: &Value) -> Result<ProviderType, ApiError> {
+    web_optional_auth_provider_type(args)?
+        .ok_or_else(|| ApiError::bad_request("authProvider is required"))
+}
+
+fn web_parse_auth_provider_type(value: &str) -> Result<ProviderType, ApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "google_gemini_oauth" | "gemini_cli" => Ok(ProviderType::GeminiCli),
+        "github_copilot" => Ok(ProviderType::GitHubCopilot),
+        "codex_oauth" => Ok(ProviderType::CodexOAuth),
+        "claude_oauth" => Ok(ProviderType::ClaudeOAuth),
+        "antigravity_oauth" => Ok(ProviderType::AntigravityOAuth),
+        "cursor_oauth" => Ok(ProviderType::CursorOAuth),
+        "kiro_oauth" => Ok(ProviderType::KiroOAuth),
+        "agy_oauth" => Ok(ProviderType::AgyOAuth),
+        other => web_parse_provider_type(other),
+    }
+}
+
+fn web_parse_provider_type(value: &str) -> Result<ProviderType, ApiError> {
+    serde_json::from_value(Value::String(value.trim().to_string()))
+        .map_err(|_| ApiError::bad_request(format!("invalid providerType: {value}")))
+}
+
+fn provider_record_for_app(
+    providers: &[StoredProvider],
+    app: AppKind,
+) -> BTreeMap<String, Provider> {
+    providers
+        .iter()
+        .filter(|provider| provider.app == app)
+        .map(|provider| (provider.provider.id.clone(), provider.provider.clone()))
+        .collect()
+}
+
+fn web_arg_app(args: &Value) -> Result<AppKind, ApiError> {
+    web_arg_string(args, "app")
+        .or_else(|_| web_arg_string(args, "appType"))
+        .and_then(|value| parse_app_kind(&value))
+}
+
+fn web_arg_string(args: &Value, key: &str) -> Result<String, ApiError> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::bad_request(format!("{key} is required")))
+}
+
+fn web_arg_value<T>(args: &Value, key: &str) -> Result<T, ApiError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let value = args
+        .get(key)
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request(format!("{key} is required")))?;
+    serde_json::from_value(value).map_err(ApiError::bad_request)
+}
+
+fn web_runtime_support_label(support: WebRuntimeCommandSupport) -> &'static str {
+    match support {
+        WebRuntimeCommandSupport::Native => "native",
+        WebRuntimeCommandSupport::Shim => "shim",
+        WebRuntimeCommandSupport::Excluded => "excluded",
+    }
 }
 
 async fn proxy_claude_messages(
@@ -5444,6 +6485,13 @@ struct ListUniversalProvidersResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct UniversalProviderPresetsResponse {
+    ok: bool,
+    presets: Vec<UniversalProviderPreset>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ExportUniversalProvidersResponse {
     ok: bool,
     providers: Vec<UniversalProvider>,
@@ -5492,6 +6540,8 @@ struct SyncUniversalProviderResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TestProviderQuery {
+    #[serde(default)]
+    app: Option<AppKind>,
     #[serde(default)]
     network: Option<bool>,
     #[serde(default)]
@@ -5803,6 +6853,10 @@ struct UsageLogsQuery {
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
+    from_ms: Option<u128>,
+    #[serde(default)]
+    to_ms: Option<u128>,
+    #[serde(default)]
     app: Option<AppKind>,
     #[serde(default)]
     provider_id: Option<String>,
@@ -5824,6 +6878,8 @@ impl From<UsageLogsQuery> for UsageLogFilter {
     fn from(query: UsageLogsQuery) -> Self {
         Self {
             limit: query.limit,
+            from_ms: query.from_ms,
+            to_ms: query.to_ms,
             app: query.app,
             provider_id: query.provider_id,
             share_id: query.share_id,
@@ -6321,6 +7377,39 @@ impl ApiError {
 
     fn not_implemented(error: impl std::fmt::Display) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, error.to_string())
+    }
+
+    fn feature_disabled(error: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: error.into(),
+            code: Some("cc_switch_feature_disabled"),
+            error_type: Some("feature_disabled"),
+            retryable: Some(false),
+        }
+    }
+
+    fn web_invoke_unknown(command: impl Into<String>) -> Self {
+        let command = command.into();
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: format!(
+                "desktop invoke command '{command}' is not registered in cc-switch-server"
+            ),
+            code: Some("cc_switch_web_invoke_unknown"),
+            error_type: Some("web_invoke_unknown"),
+            retryable: Some(false),
+        }
+    }
+
+    fn web_invoke_not_wired(error: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: error.into(),
+            code: Some("cc_switch_web_invoke_not_wired"),
+            error_type: Some("web_invoke_not_wired"),
+            retryable: Some(false),
+        }
     }
 
     fn bad_gateway(error: impl std::fmt::Display) -> Self {
@@ -7524,6 +8613,137 @@ mod tests {
             crate::core::account_managers::AccountManagerSupport::ManualTokenStore
         );
         assert!(capability.supports_refresh);
+    }
+
+    #[tokio::test]
+    async fn web_runtime_context_reports_setup_and_authenticated_admin() {
+        let app = app_router(test_state());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/web-api/context")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["mode"].as_str(), Some("client-login"));
+        assert_eq!(body["status"].as_str(), Some("setup-required"));
+        assert_eq!(body["uiAutomation"]["allowed"].as_bool(), Some(false));
+
+        let token = setup_and_login(&app).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/web-api/context")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(json_request(
+                Method::GET,
+                "/web-api/context",
+                Value::Null,
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["mode"].as_str(), Some("local-admin"));
+        assert_eq!(body["status"].as_str(), Some("authenticated"));
+        assert_eq!(body["apps"].as_array().unwrap().len(), 3);
+        assert!(body["commands"].as_array().unwrap().len() > 10);
+    }
+
+    #[tokio::test]
+    async fn web_invoke_registry_returns_stable_errors() {
+        let app = app_router(test_state());
+        let token = setup_and_login(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/webdav_test_connection",
+                json!({}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = json_body(response).await;
+        assert_eq!(body["code"].as_str(), Some("cc_switch_feature_disabled"));
+        assert_eq!(body["type"].as_str(), Some("feature_disabled"));
+
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/not_a_desktop_command",
+                json!({}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = json_body(response).await;
+        assert_eq!(body["code"].as_str(), Some("cc_switch_web_invoke_unknown"));
+        assert_eq!(body["type"].as_str(), Some("web_invoke_unknown"));
+    }
+
+    #[tokio::test]
+    async fn web_invoke_get_providers_returns_desktop_record_shape() {
+        let state = test_state();
+        state.providers.write().await.upsert(
+            AppKind::Codex,
+            Provider {
+                id: "codex-web".to_string(),
+                name: "Codex Web".to_string(),
+                settings_config: json!({"env": {"OPENAI_API_KEY": "sk-test"}}),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+        );
+        let app = app_router(state);
+        let token = setup_and_login(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/get_providers",
+                json!({"app": "codex"}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["codex-web"]["name"].as_str(), Some("Codex Web"));
+
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/get_current_provider",
+                json!({"app": "codex"}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await.as_str(), Some("codex-web"));
     }
 
     fn test_state() -> ServerState {

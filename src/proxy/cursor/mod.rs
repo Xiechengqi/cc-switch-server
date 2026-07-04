@@ -56,7 +56,7 @@ pub fn is_cursor_provider(provider_type: ProviderType) -> bool {
     )
 }
 
-/// Explicit opt-in while the h2 AgentService transport is being migrated.
+/// Explicit opt-in for the staged h2 AgentService transport.
 ///
 /// Defaulting to false preserves the current planned/generic behavior and
 /// prevents accidental native capability claims before real Cursor validation.
@@ -122,7 +122,7 @@ pub fn agentservice_not_ready_error(
         Ok(Some(preview)) => ProxyError {
             status: StatusCode::NOT_IMPLEMENTED,
             message: format!(
-                "Cursor AgentService native driver is staged but h2/protobuf transport is not wired yet; provider={}; model={}; protocol={}",
+                "Cursor AgentService native driver is staged behind explicit opt-in and remains planned until real Cursor validation; provider={}; model={}; protocol={}",
                 preview.provider_id, preview.model_id, preview.inbound_protocol
             ),
         },

@@ -1,0 +1,1251 @@
+import {
+  Boxes,
+  CheckCircle2,
+  FlaskConical,
+  ListPlus,
+  Loader2,
+  Pencil,
+  RefreshCw,
+  ServerCog,
+  Trash2,
+  X,
+} from "lucide-react";
+import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+
+import {
+  AccountRecord,
+  AccountManagerCapability,
+  AppKind,
+  createProviderFromPreset,
+  deleteProvider,
+  fetchProviderModels,
+  loadProviderDashboardData,
+  Provider,
+  ProviderHealth,
+  ProviderMatrix,
+  ProviderMatrixEntry,
+  ProviderPresetSummary,
+  ProviderPresetsByApp,
+  ProviderLimitStatus,
+  saveProvider,
+  StoredProvider,
+  switchProvider,
+  testProvider,
+} from "@/lib/api";
+import { useI18n } from "@/lib/i18n";
+
+const apps: Array<{ id: AppKind; label: string }> = [
+  { id: "claude", label: "Claude" },
+  { id: "codex", label: "Codex" },
+  { id: "gemini", label: "Gemini" },
+];
+
+interface ProviderDashboardState {
+  providers: StoredProvider[];
+  matrix: ProviderMatrix | null;
+  health: ProviderHealth[];
+  accounts: AccountRecord[];
+  capabilities: AccountManagerCapability[];
+  limits: ProviderLimitStatus[];
+  presets: ProviderPresetsByApp;
+}
+
+interface ProviderDraft {
+  mode: "create" | "edit";
+  app: AppKind;
+  id: string;
+  name: string;
+  providerTypeId: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  apiFormat: string;
+  accountId: string;
+  category: string;
+  modelCatalogJson: string;
+  modelMappingJson: string;
+  pricingJson: string;
+  advancedJson: string;
+}
+
+export function ProviderDashboard() {
+  const { t, tx } = useI18n();
+  const [activeApp, setActiveApp] = useState<AppKind>("claude");
+  const [data, setData] = useState<ProviderDashboardState>({
+    providers: [],
+    matrix: null,
+    health: [],
+    accounts: [],
+    capabilities: [],
+    limits: [],
+    presets: { claude: [], codex: [], gemini: [] },
+  });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<ProviderDraft | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [resultById, setResultById] = useState<Record<string, string>>({});
+  const [presetOpen, setPresetOpen] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      setData(await loadProviderDashboardData());
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const entries = useMemo(
+    () => (data.matrix?.entries || []).filter((entry) => entry.app === activeApp),
+    [activeApp, data.matrix],
+  );
+  const visibleEntries = entries.filter((entry) => entry.uiVisible);
+  const diagnosticEntries = entries.filter((entry) => !entry.uiVisible);
+  const activeProviders = data.providers.filter((provider) => provider.app === activeApp);
+  const activePresets = data.presets[activeApp] || [];
+  const healthById = new Map(
+    data.health
+      .filter((health) => health.app === activeApp)
+      .map((health) => [health.providerId, health]),
+  );
+  const accountsById = new Map(data.accounts.map((account) => [account.id, account]));
+  const capabilitiesByType = new Map(data.capabilities.map((capability) => [capability.providerType, capability]));
+  const limitByProviderKey = new Map(
+    data.limits.map((limit) => [providerKey(limit.app, limit.providerId), limit]),
+  );
+
+  function openCreate() {
+    const entry = visibleEntries[0];
+    if (!entry) return;
+    setDraft(createDraft(activeApp, entry));
+  }
+
+  function openEdit(provider: StoredProvider) {
+    const entry =
+      entries.find((item) => item.providerTypeId === provider.providerTypeId) ||
+      visibleEntries[0];
+    if (!entry) return;
+    setDraft(editDraft(provider, entry));
+  }
+
+  async function submitDraft(event: FormEvent) {
+    event.preventDefault();
+    if (!draft) return;
+    const entry = entries.find((item) => item.providerTypeId === draft.providerTypeId);
+    if (!entry) {
+      setError(tx("Provider type is not available for this app"));
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await saveProvider(draft.app, providerFromDraft(draft, entry));
+      setDraft(null);
+      await refresh();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function runAction(
+    provider: StoredProvider,
+    action: "test" | "network" | "stream" | "models" | "switch" | "delete",
+  ) {
+    const key = `${provider.app}:${provider.provider.id}:${action}`;
+    setBusyId(key);
+    setError(null);
+    try {
+      if (action === "delete") {
+        await deleteProvider(provider.app, provider.provider.id);
+        await refresh();
+        return;
+      }
+      if (action === "switch") {
+        await switchProvider(provider.app, provider.provider.id);
+        setResultById((current) => ({
+          ...current,
+          [provider.provider.id]: tx("Switch check passed for server runtime"),
+        }));
+        return;
+      }
+      if (action === "models") {
+        const result = await fetchProviderModels(provider.app, provider.provider.id, true);
+        setResultById((current) => ({
+          ...current,
+          [provider.provider.id]: tx("Fetched {{models}} models; merged {{merged}}", {
+            models: result.models.length,
+            merged: result.mergedCount,
+          }),
+        }));
+        await refresh();
+        return;
+      }
+      const result = await testProvider(provider.app, provider.provider.id, {
+        network: action === "network" || action === "stream",
+        stream: action === "stream",
+      });
+      const status = result.networkChecked
+        ? `${result.networkStatusCode || "no status"}${result.networkLatencyMs ? ` in ${result.networkLatencyMs}ms` : ""}`
+        : tx("config only");
+      setResultById((current) => ({
+        ...current,
+        [provider.provider.id]: `${result.support}: ${status}`,
+      }));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function createPresetProvider(preset: ProviderPresetSummary) {
+    const key = `preset:${activeApp}:${preset.name}`;
+    setBusyId(key);
+    setError(null);
+    try {
+      const stored = await createProviderFromPreset(activeApp, preset.name);
+      setPresetOpen(false);
+      setResultById((current) => ({
+        ...current,
+        [stored.provider.id]: tx("Created from preset {{preset}}", { preset: preset.name }),
+      }));
+      await refresh();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <div className="provider-dashboard">
+      <div className="provider-toolbar">
+        <div className="segmented">
+          {apps.map((app) => (
+            <button
+              key={app.id}
+              type="button"
+              className={app.id === activeApp ? "active" : ""}
+              onClick={() => setActiveApp(app.id)}
+            >
+              {app.label}
+            </button>
+          ))}
+        </div>
+        <div className="provider-toolbar-actions">
+          {error && <span className="error-text">{error}</span>}
+          <button className="secondary-button" type="button" onClick={() => void refresh()}>
+            <RefreshCw size={15} />
+            <span>{t("common.refresh")}</span>
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => setPresetOpen(true)}
+            disabled={!activePresets.length}
+          >
+            <ListPlus size={15} />
+            <span>{t("server.common.fromPreset")}</span>
+          </button>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={openCreate}
+            disabled={!visibleEntries.length}
+          >
+            <ListPlus size={15} />
+            <span>{t("server.providers.addProvider")}</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="provider-summary-row">
+        <SummaryTile label={t("server.providers.providers")} value={activeProviders.length} />
+        <SummaryTile label={t("server.providers.creatableTypes")} value={visibleEntries.length} />
+        <SummaryTile label={t("server.providers.diagnosticOnly")} value={diagnosticEntries.length} />
+        <SummaryTile
+          label={t("server.providers.healthy")}
+          value={data.health.filter((item) => item.app === activeApp && item.healthy).length}
+        />
+      </div>
+
+      {loading ? (
+        <div className="provider-empty">
+          <Loader2 size={22} />
+          <span>{t("server.providers.loading")}</span>
+        </div>
+      ) : activeProviders.length ? (
+        <div className="provider-card-grid">
+          {activeProviders.map((provider) => (
+            <ProviderCard
+              key={`${provider.app}:${provider.provider.id}`}
+              provider={provider}
+              entry={entries.find((item) => item.providerTypeId === provider.providerTypeId)}
+              health={healthById.get(provider.provider.id)}
+              account={accountForProvider(provider, accountsById)}
+              capability={capabilityForProvider(provider, capabilitiesByType)}
+              limit={limitByProviderKey.get(providerKey(provider.app, provider.provider.id))}
+              result={resultById[provider.provider.id]}
+              busyId={busyId}
+              onEdit={() => openEdit(provider)}
+              onAction={(action) => void runAction(provider, action)}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="provider-empty">
+          <ServerCog size={24} />
+          <strong>{t("server.providers.noProvidersForApp", { app: activeApp })}</strong>
+          <span>{t("server.providers.noProvidersHint")}</span>
+        </div>
+      )}
+
+      <section className="provider-matrix-section">
+        <div className="section-heading">
+          <h2>{t("server.providers.availableTypes")}</h2>
+          <span>{t("server.providers.enabledForCreation", { count: visibleEntries.length })}</span>
+        </div>
+        <div className="provider-type-grid">
+          {visibleEntries.map((entry) => (
+            <button
+              key={entry.providerTypeId}
+              type="button"
+              className="provider-type-option"
+              onClick={() => setDraft(createDraft(activeApp, entry))}
+            >
+              <strong>{entry.label}</strong>
+              <span>{entry.credentialMode}</span>
+            </button>
+          ))}
+        </div>
+        {diagnosticEntries.length > 0 && (
+          <details className="diagnostic-types">
+            <summary>{t("server.providers.diagnosticCombinations", { count: diagnosticEntries.length })}</summary>
+            <div>
+              {diagnosticEntries.map((entry) => (
+                <span key={entry.providerTypeId}>
+                  {entry.label}: {entry.note}
+                </span>
+              ))}
+            </div>
+          </details>
+        )}
+      </section>
+
+      {draft && (
+        <ProviderFormModal
+          draft={draft}
+          entries={entries}
+          accounts={data.accounts}
+          saving={saving}
+          onChange={setDraft}
+          onSubmit={submitDraft}
+          onClose={() => setDraft(null)}
+        />
+      )}
+
+      {presetOpen && (
+        <ProviderPresetModal
+          app={activeApp}
+          presets={activePresets}
+          busyId={busyId}
+          onSelect={(preset) => void createPresetProvider(preset)}
+          onClose={() => setPresetOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ProviderCard({
+  provider,
+  entry,
+  health,
+  account,
+  capability,
+  limit,
+  result,
+  busyId,
+  onEdit,
+  onAction,
+}: {
+  provider: StoredProvider;
+  entry?: ProviderMatrixEntry;
+  health?: ProviderHealth;
+  account?: AccountRecord;
+  capability?: AccountManagerCapability;
+  limit?: ProviderLimitStatus;
+  result?: string;
+  busyId: string | null;
+  onEdit: () => void;
+  onAction: (action: "test" | "network" | "stream" | "models" | "switch" | "delete") => void;
+}) {
+  const { tx } = useI18n();
+  const model = modelFromProvider(provider.provider);
+  const baseUrl = baseUrlFromProvider(provider.provider, provider.app);
+  const accountId = provider.provider.meta?.authBinding?.accountId;
+  const accountValue = account
+    ? accountSummary(account)
+    : accountId || tx("direct config");
+  const busyPrefix = `${provider.app}:${provider.provider.id}:`;
+  return (
+    <article className="provider-card">
+      <header>
+        <div>
+          <h3>{provider.provider.name}</h3>
+          <p>{entry?.label || provider.providerTypeId}</p>
+        </div>
+        <StatusPill tone={health?.healthy === false ? "danger" : "success"}>
+          {health?.healthy === false ? "unhealthy" : "healthy"}
+        </StatusPill>
+      </header>
+      <div className="provider-card-meta">
+        <KeyValue label="model" value={model || "-"} />
+        <KeyValue label="base URL" value={baseUrl || "-"} />
+        <KeyValue label="api format" value={apiFormatFromProvider(provider.provider) || "-"} />
+        <KeyValue label="account" value={accountValue} />
+      </div>
+      {entry && <ProviderReadinessPanel entry={entry} capability={capability} />}
+      {account && <ProviderAccountFooter account={account} />}
+      {limit && <ProviderLimitFooter limit={limit} />}
+      <div className="provider-card-result">
+        {result || health?.reason || tx("{{count}} recent requests", { count: health?.requests ?? 0 })}
+      </div>
+      <div className="provider-actions">
+        <IconAction title="Edit" onClick={onEdit}>
+          <Pencil size={15} />
+        </IconAction>
+        <IconAction
+          title="Config test"
+          onClick={() => onAction("test")}
+          busy={busyId === `${busyPrefix}test`}
+        >
+          <CheckCircle2 size={15} />
+        </IconAction>
+        <IconAction
+          title="Network test"
+          onClick={() => onAction("network")}
+          busy={busyId === `${busyPrefix}network`}
+        >
+          <FlaskConical size={15} />
+        </IconAction>
+        <IconAction
+          title="Stream test"
+          onClick={() => onAction("stream")}
+          busy={busyId === `${busyPrefix}stream`}
+        >
+          <RefreshCw size={15} />
+        </IconAction>
+        <IconAction
+          title="Fetch models"
+          onClick={() => onAction("models")}
+          busy={busyId === `${busyPrefix}models`}
+        >
+          <ServerCog size={15} />
+        </IconAction>
+        <button className="secondary-button compact" type="button" onClick={() => onAction("switch")}>
+          {tx("switch")}
+        </button>
+        <IconAction
+          title="Delete"
+          onClick={() => {
+            if (window.confirm(tx("Delete provider {{name}}?", { name: provider.provider.name }))) onAction("delete");
+          }}
+          busy={busyId === `${busyPrefix}delete`}
+          danger
+        >
+          <Trash2 size={15} />
+        </IconAction>
+      </div>
+    </article>
+  );
+}
+
+function ProviderFormModal({
+  draft,
+  entries,
+  accounts,
+  saving,
+  onChange,
+  onSubmit,
+  onClose,
+}: {
+  draft: ProviderDraft;
+  entries: ProviderMatrixEntry[];
+  accounts: AccountRecord[];
+  saving: boolean;
+  onChange: (draft: ProviderDraft) => void;
+  onSubmit: (event: FormEvent) => void;
+  onClose: () => void;
+}) {
+  const { tx } = useI18n();
+  const entry = entries.find((item) => item.providerTypeId === draft.providerTypeId) || entries[0];
+  const accountOptions = accounts.filter((account) =>
+    accountMatchesProviderType(account, draft.providerTypeId),
+  );
+  function patch(next: Partial<ProviderDraft>) {
+    onChange({ ...draft, ...next });
+  }
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <form className="provider-form-modal" onSubmit={onSubmit}>
+        <header>
+          <div>
+            <h2>{tx(draft.mode === "create" ? "Add Provider" : "Edit Provider")}</h2>
+            <p>{entry?.note || tx("Server provider configuration")}</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label={tx("Close")}>
+            <X size={16} />
+          </button>
+        </header>
+        <div className="provider-form-grid">
+          <label>
+            <span>{tx("App")}</span>
+            <select value={draft.app} disabled>
+              {apps.map((app) => (
+                <option key={app.id} value={app.id}>
+                  {app.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>{tx("Provider type")}</span>
+            <select
+              value={draft.providerTypeId}
+              onChange={(event) => {
+                const nextEntry = entries.find((item) => item.providerTypeId === event.target.value);
+                patch({
+                  providerTypeId: event.target.value,
+                  baseUrl: nextEntry?.defaults.baseUrl || draft.baseUrl,
+                  apiFormat: nextEntry?.defaults.apiFormat || draft.apiFormat,
+                  model: nextEntry?.defaults.model || draft.model,
+                });
+              }}
+            >
+              {entries
+                .filter((item) => item.uiVisible)
+                .map((item) => (
+                  <option key={item.providerTypeId} value={item.providerTypeId}>
+                    {item.label}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label>
+            <span>{tx("Name")}</span>
+            <input value={draft.name} onChange={(event) => patch({ name: event.target.value })} />
+          </label>
+          <label>
+            <span>{tx("Model")}</span>
+            <input value={draft.model} onChange={(event) => patch({ model: event.target.value })} />
+          </label>
+          <label>
+            <span>{tx("Base URL")}</span>
+            <input
+              value={draft.baseUrl}
+              onChange={(event) => patch({ baseUrl: event.target.value })}
+            />
+          </label>
+          <label>
+            <span>{tx("API format")}</span>
+            <input
+              value={draft.apiFormat}
+              onChange={(event) => patch({ apiFormat: event.target.value })}
+            />
+          </label>
+          <label>
+            <span>{tx(entry?.defaults.key || "API key")}</span>
+            <input
+              type="password"
+              value={draft.apiKey}
+              onChange={(event) => patch({ apiKey: event.target.value })}
+              placeholder={entry?.credentialMode === "oauth_or_manual_token" ? "optional account token" : ""}
+            />
+          </label>
+          <label>
+            <span>{tx("Managed account")}</span>
+            <select value={draft.accountId} onChange={(event) => patch({ accountId: event.target.value })}>
+              <option value="">{tx("Direct config")}</option>
+              {accountOptions.map((account) => (
+                <option key={account.id} value={account.id}>
+                  {account.email || account.id}
+                  {account.subscriptionLevel ? ` (${account.subscriptionLevel})` : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="wide-field">
+            <span>{tx("Category")}</span>
+            <input
+              value={draft.category}
+              onChange={(event) => patch({ category: event.target.value })}
+            />
+          </label>
+          <div className="wide-field universal-json-section">
+            <div className="section-title-row compact-title">
+              <Boxes size={16} />
+              <div>
+                <h3>{tx("Model and pricing config")}</h3>
+                <span>{tx("Provider-scoped JSON overrides.")}</span>
+              </div>
+            </div>
+            <div className="universal-json-grid">
+              <ProviderJsonField
+                title={tx("Model Catalog")}
+                label="modelCatalog JSON"
+                value={draft.modelCatalogJson}
+                placeholder={providerModelCatalogPlaceholder(draft.app)}
+                onChange={(value) => patch({ modelCatalogJson: value })}
+              />
+              <ProviderJsonField
+                title={tx("Model Mapping")}
+                label="modelMapping JSON"
+                value={draft.modelMappingJson}
+                placeholder={providerModelMappingPlaceholder(draft.app)}
+                onChange={(value) => patch({ modelMappingJson: value })}
+              />
+              <ProviderJsonField
+                title={tx("Pricing")}
+                label="pricing JSON"
+                value={draft.pricingJson}
+                placeholder={providerPricingPlaceholder()}
+                onChange={(value) => patch({ pricingJson: value })}
+              />
+            </div>
+          </div>
+          <label className="wide-field">
+            <span>{tx("Advanced provider JSON")}</span>
+            <textarea
+              value={draft.advancedJson}
+              onChange={(event) => patch({ advancedJson: event.target.value })}
+              spellCheck={false}
+            />
+          </label>
+        </div>
+        <footer>
+          <button className="secondary-button" type="button" onClick={onClose}>
+            {tx("Cancel")}
+          </button>
+          <button className="primary-button" type="submit" disabled={saving}>
+            {saving && <Loader2 size={15} />}
+            <span>{tx("Save Provider")}</span>
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+function ProviderPresetModal({
+  app,
+  presets,
+  busyId,
+  onSelect,
+  onClose,
+}: {
+  app: AppKind;
+  presets: ProviderPresetSummary[];
+  busyId: string | null;
+  onSelect: (preset: ProviderPresetSummary) => void;
+  onClose: () => void;
+}) {
+  const { tx } = useI18n();
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="provider-form-modal simple-modal">
+        <header>
+          <div>
+            <h2>{tx("Create From Preset")}</h2>
+            <p>{tx("Desktop provider presets available to server runtime", { app: appLabel(app) })}</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label={tx("Close")}>
+            <X size={16} />
+          </button>
+        </header>
+        <div className="provider-preset-grid">
+          {presets.length ? (
+            presets.map((preset) => {
+              const busy = busyId === `preset:${app}:${preset.name}`;
+              return (
+                <button
+                  className="provider-preset-card"
+                  type="button"
+                  key={preset.name}
+                  onClick={() => onSelect(preset)}
+                  disabled={busy}
+                >
+                  <strong>{preset.name}</strong>
+                  <span>{preset.providerType || "provider"}</span>
+                  <small>{preset.apiFormat || "api format -"} · {preset.baseUrl || "base URL -"}</small>
+                  {busy && <Loader2 size={15} />}
+                </button>
+              );
+            })
+          ) : (
+            <div className="provider-empty">{tx("No presets for {{app}}", { app: appLabel(app) })}</div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ProviderJsonField({
+  title,
+  label,
+  value,
+  placeholder,
+  onChange,
+}: {
+  title: string;
+  label: string;
+  value: string;
+  placeholder: string;
+  onChange: (value: string) => void;
+}) {
+  const { tx } = useI18n();
+  return (
+    <section className="universal-json-card">
+      <h4>{tx(title)}</h4>
+      <label>
+        <span>{tx(label)}</span>
+        <textarea
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={placeholder}
+          spellCheck={false}
+        />
+      </label>
+    </section>
+  );
+}
+
+function SummaryTile({ label, value }: { label: string; value: ReactNode }) {
+  const { tx } = useI18n();
+  return (
+    <div className="summary-tile">
+      <span>{tx(label)}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function KeyValue({ label, value }: { label: string; value: ReactNode }) {
+  const { tx } = useI18n();
+  return (
+    <div className="compact-kv">
+      <span>{tx(label)}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function ProviderReadinessPanel({
+  entry,
+  capability,
+}: {
+  entry: ProviderMatrixEntry;
+  capability?: AccountManagerCapability;
+}) {
+  return (
+    <div className="provider-readiness-panel">
+      <div className="provider-readiness-header">
+        <StatusPill tone={entry.uiVisible ? "success" : "warning"}>
+          {entry.visibility === "diagnostic_only" ? "diagnostic" : "creatable"}
+        </StatusPill>
+        <span>{entry.credentialMode}</span>
+      </div>
+      <div className="provider-readiness-grid">
+        <ReadinessFlag label="direct" enabled={entry.directConfigSupported} />
+        <ReadinessFlag label="account" enabled={entry.accountSupported} />
+        <ReadinessFlag label="managed" enabled={entry.managedAccountRecommended} />
+        <ReadinessFlag label="refresh" enabled={capability?.supportsRefresh} />
+        <ReadinessFlag label="quota" enabled={capability?.supportsQuota} />
+        <ReadinessFlag label="plan" enabled={capability?.supportsRefreshPlan} />
+      </div>
+      <div className="provider-readiness-note">
+        {capability?.serverNativeStage || capability?.status || "direct-config"}
+        {entry.note ? ` · ${entry.note}` : ""}
+      </div>
+    </div>
+  );
+}
+
+function ReadinessFlag({ label, enabled }: { label: string; enabled?: boolean }) {
+  const { tx } = useI18n();
+  return (
+    <span className={enabled ? "readiness-flag active" : "readiness-flag"}>
+      {tx(label)}
+    </span>
+  );
+}
+
+function ProviderAccountFooter({ account }: { account: AccountRecord }) {
+  return (
+    <div className="provider-account-footer">
+      <span>{account.email || account.id}</span>
+      <span>{account.subscriptionLevel || "account"}</span>
+      <span>{account.quotaPercent == null ? "quota -" : `${account.quotaPercent.toFixed(1)}%`}</span>
+      <span>{formatTime(account.expiresAt)}</span>
+      {account.lastRefreshError && <strong>{account.lastRefreshError}</strong>}
+    </div>
+  );
+}
+
+function ProviderLimitFooter({ limit }: { limit: ProviderLimitStatus }) {
+  const shareWarnings = limit.shares.filter((share) => share.blocked || share.warnings.length);
+  const warnings = [...limit.warnings, ...shareWarnings.flatMap((share) => share.warnings.map((warning) => `${share.shareName}: ${warning}`))];
+  return (
+    <div className="provider-limit-footer">
+      <div className="provider-limit-grid">
+        <LimitMetric
+          label="daily"
+          value={limitLine(limit.dailyUsageUsd, limit.dailyLimitUsd)}
+          tone={limit.dailyExceeded ? "danger" : "success"}
+        />
+        <LimitMetric
+          label="monthly"
+          value={limitLine(limit.monthlyUsageUsd, limit.monthlyLimitUsd)}
+          tone={limit.monthlyExceeded ? "danger" : "success"}
+        />
+        <LimitMetric
+          label="quota"
+          value={limit.accountQuotaPercent == null ? "-" : `${limit.accountQuotaPercent.toFixed(1)}%`}
+          tone={limit.quotaDispatchExceeded ? "danger" : "success"}
+        />
+        <LimitMetric
+          label="shares"
+          value={`${limit.shares.filter((share) => share.blocked).length}/${limit.shares.length} blocked`}
+          tone={shareWarnings.length ? "warning" : "success"}
+        />
+      </div>
+      {(limit.accountEmail || limit.accountLastRefreshError || limit.quotaDispatchLimitPercent != null) && (
+        <div className="provider-limit-line">
+          <span>{limit.accountEmail || "account -"}</span>
+          <span>{limit.quotaDispatchLimitPercent == null ? "dispatch -" : `dispatch ${limit.quotaDispatchLimitPercent.toFixed(1)}%`}</span>
+          <span>{limit.accountQuotaRefreshedAt == null ? "quota refresh -" : formatTime(limit.accountQuotaRefreshedAt)}</span>
+          {limit.accountLastRefreshError && <strong>{limit.accountLastRefreshError}</strong>}
+        </div>
+      )}
+      {warnings.length > 0 && (
+        <div className="provider-warning-list">
+          {warnings.slice(0, 4).map((warning, index) => (
+            <span key={`${warning}:${index}`}>{warning}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LimitMetric({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone: "success" | "warning" | "danger";
+}) {
+  const { tx } = useI18n();
+  return (
+    <div className="limit-metric">
+      <span>{tx(label)}</span>
+      <StatusPill tone={tone}>{value}</StatusPill>
+    </div>
+  );
+}
+
+function StatusPill({
+  children,
+  tone,
+}: {
+  children: ReactNode;
+  tone: "success" | "warning" | "danger";
+}) {
+  return <span className={`status-pill ${tone}`}>{children}</span>;
+}
+
+function IconAction({
+  title,
+  children,
+  busy,
+  danger,
+  onClick,
+}: {
+  title: string;
+  children: ReactNode;
+  busy?: boolean;
+  danger?: boolean;
+  onClick: () => void;
+}) {
+  const { tx } = useI18n();
+  const translatedTitle = tx(title);
+  return (
+    <button
+      className={danger ? "icon-button danger" : "icon-button"}
+      type="button"
+      title={translatedTitle}
+      aria-label={translatedTitle}
+      onClick={onClick}
+      disabled={busy}
+    >
+      {busy ? <Loader2 size={15} /> : children}
+    </button>
+  );
+}
+
+function createDraft(app: AppKind, entry: ProviderMatrixEntry): ProviderDraft {
+  const provider: Provider = {
+    id: "",
+    name: entry.label,
+    settingsConfig: {},
+    category: "",
+    meta: {
+      providerType: entry.providerTypeId,
+      apiFormat: entry.defaults.apiFormat,
+    },
+  };
+  return {
+    mode: "create",
+    app,
+    id: "",
+    name: entry.label,
+    providerTypeId: entry.providerTypeId,
+    baseUrl: entry.defaults.baseUrl,
+    apiKey: "",
+    model: entry.defaults.model,
+    apiFormat: entry.defaults.apiFormat,
+    accountId: "",
+    category: "",
+    modelCatalogJson: "",
+    modelMappingJson: "",
+    pricingJson: "",
+    advancedJson: JSON.stringify(provider, null, 2),
+  };
+}
+
+function editDraft(stored: StoredProvider, entry: ProviderMatrixEntry): ProviderDraft {
+  const provider = stored.provider;
+  return {
+    mode: "edit",
+    app: stored.app,
+    id: provider.id,
+    name: provider.name,
+    providerTypeId: stored.providerTypeId,
+    baseUrl: baseUrlFromProvider(provider, stored.app) || entry.defaults.baseUrl,
+    apiKey: apiKeyFromProvider(provider, entry) || "",
+    model: modelFromProvider(provider) || entry.defaults.model,
+    apiFormat: apiFormatFromProvider(provider) || entry.defaults.apiFormat,
+    accountId: provider.meta?.authBinding?.accountId || "",
+    category: provider.category || "",
+    modelCatalogJson: providerSettingJson(provider, ["modelCatalog"]),
+    modelMappingJson: providerSettingJson(provider, ["modelMapping"]),
+    pricingJson: providerSettingJson(provider, ["pricing", "modelPricing"]),
+    advancedJson: JSON.stringify(provider, null, 2),
+  };
+}
+
+function providerFromDraft(draft: ProviderDraft, entry: ProviderMatrixEntry): Provider {
+  const parsed = parseProviderJson(draft.advancedJson);
+  const settings = asRecord(parsed.settingsConfig);
+  const env = { ...asRecord(settings.env) };
+  const baseKey = baseUrlKeyFor(draft.app, entry);
+  if (draft.baseUrl.trim()) env[baseKey] = draft.baseUrl.trim();
+  const key = entry.defaults.key || "API_KEY";
+  if (draft.apiKey.trim()) env[key] = draft.apiKey.trim();
+  if (draft.model.trim()) settings.model = draft.model.trim();
+  if (draft.apiFormat.trim()) settings.apiFormat = draft.apiFormat.trim();
+  if (draft.providerTypeId === "claude_auth") {
+    settings.auth_mode = "bearer_only";
+    env.AUTH_MODE = "bearer_only";
+  }
+  settings.env = env;
+  setOptionalJsonSetting(settings, "modelCatalog", draft.modelCatalogJson, "modelCatalog");
+  setOptionalJsonSetting(settings, "modelMapping", draft.modelMappingJson, "modelMapping");
+  setPricingJsonSetting(settings, draft.pricingJson);
+
+  const meta = { ...asRecord(parsed.meta) };
+  meta.providerType = draft.providerTypeId;
+  if (draft.apiFormat.trim()) meta.apiFormat = draft.apiFormat.trim();
+  if (draft.accountId.trim()) {
+    meta.authBinding = {
+      source: "managed_account",
+      authProvider: authProviderForType(draft.providerTypeId),
+      accountId: draft.accountId.trim(),
+    };
+  } else {
+    delete meta.authBinding;
+  }
+
+  return {
+    ...parsed,
+    id: draft.id || parsed.id || "",
+    name: draft.name.trim(),
+    category: draft.category.trim() || null,
+    settingsConfig: settings,
+    meta,
+  };
+}
+
+function parseProviderJson(value: string): Provider {
+  const parsed = JSON.parse(value || "{}") as Provider;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("advanced provider JSON must be an object");
+  }
+  return parsed;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : {};
+}
+
+function getString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function env(provider: Provider): Record<string, unknown> {
+  return asRecord(asRecord(provider.settingsConfig).env);
+}
+
+function setting(provider: Provider, keys: string[]): string | null {
+  const settings = asRecord(provider.settingsConfig);
+  const environment = env(provider);
+  for (const key of keys) {
+    const direct = getString(settings[key]);
+    if (direct) return direct;
+    const nested = getString(environment[key]);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function providerSettingJson(provider: Provider, keys: string[]): string {
+  const settings = asRecord(provider.settingsConfig);
+  for (const key of keys) {
+    if (settings[key] !== undefined && settings[key] !== null) {
+      return jsonText(settings[key]);
+    }
+  }
+  return "";
+}
+
+function setOptionalJsonSetting(
+  settings: Record<string, unknown>,
+  key: string,
+  raw: string,
+  label: string,
+) {
+  const parsed = optionalJson(raw, label);
+  if (parsed === undefined) {
+    delete settings[key];
+  } else {
+    settings[key] = parsed;
+  }
+}
+
+function setPricingJsonSetting(settings: Record<string, unknown>, raw: string) {
+  const parsed = optionalJson(raw, "pricing");
+  if (parsed === undefined) {
+    delete settings.pricing;
+    delete settings.modelPricing;
+  } else {
+    settings.pricing = parsed;
+    delete settings.modelPricing;
+  }
+}
+
+function optionalJson(raw: string, label: string): unknown {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch (reason) {
+    const suffix = reason instanceof Error ? reason.message : String(reason);
+    throw new Error(`${label} JSON is invalid: ${suffix}`);
+  }
+}
+
+function jsonText(value: unknown): string {
+  return value === undefined || value === null ? "" : JSON.stringify(value, null, 2);
+}
+
+function baseUrlFromProvider(provider: Provider, app: AppKind): string | null {
+  const keys =
+    app === "claude"
+      ? ["ANTHROPIC_BASE_URL", "BASE_URL", "baseUrl", "base_url"]
+      : app === "codex"
+        ? ["OPENAI_BASE_URL", "CODEX_BASE_URL", "BASE_URL", "baseUrl", "base_url"]
+        : ["GOOGLE_GEMINI_BASE_URL", "GEMINI_BASE_URL", "BASE_URL", "baseUrl", "base_url"];
+  return setting(provider, keys);
+}
+
+function apiKeyFromProvider(provider: Provider, entry: ProviderMatrixEntry): string | null {
+  return setting(provider, [entry.defaults.key]);
+}
+
+function modelFromProvider(provider: Provider): string | null {
+  return setting(provider, ["model", "MODEL"]);
+}
+
+function apiFormatFromProvider(provider: Provider): string | null {
+  return (
+    getString(provider.meta?.apiFormat) ||
+    setting(provider, ["apiFormat", "api_format"])
+  );
+}
+
+function baseUrlKeyFor(app: AppKind, entry: ProviderMatrixEntry): string {
+  const fromTemplate = entry.templateEnv.find((key) => key.includes("BASE_URL"));
+  if (fromTemplate) return fromTemplate;
+  if (app === "claude") return "ANTHROPIC_BASE_URL";
+  if (app === "codex") return "OPENAI_BASE_URL";
+  return "GOOGLE_GEMINI_BASE_URL";
+}
+
+function authProviderForType(providerTypeId: string): string {
+  if (providerTypeId === "claude_auth") return "claude_oauth";
+  if (providerTypeId === "gemini_cli") return "google_gemini_oauth";
+  return providerTypeId;
+}
+
+function accountProviderTypeFor(providerTypeId: string): string {
+  if (providerTypeId === "claude_auth") return "claude_oauth";
+  if (providerTypeId === "gemini_cli") return "gemini_cli";
+  return providerTypeId;
+}
+
+function accountMatchesProviderType(account: AccountRecord, providerTypeId: string): boolean {
+  return account.providerType === providerTypeId || account.providerType === accountProviderTypeFor(providerTypeId);
+}
+
+function providerKey(app: AppKind, providerId: string): string {
+  return `${app}:${providerId}`;
+}
+
+function capabilityForProvider(
+  provider: StoredProvider,
+  capabilitiesByType: Map<string, AccountManagerCapability>,
+): AccountManagerCapability | undefined {
+  return (
+    capabilitiesByType.get(provider.providerTypeId) ||
+    capabilitiesByType.get(accountProviderTypeFor(provider.providerTypeId))
+  );
+}
+
+function accountForProvider(
+  provider: StoredProvider,
+  accountsById: Map<string, AccountRecord>,
+): AccountRecord | undefined {
+  const accountId = provider.provider.meta?.authBinding?.accountId;
+  if (accountId) return accountsById.get(accountId);
+  return undefined;
+}
+
+function appLabel(app: AppKind): string {
+  return apps.find((item) => item.id === app)?.label || app;
+}
+
+function accountSummary(account: AccountRecord): string {
+  const parts = [
+    account.email || account.id,
+    account.subscriptionLevel || null,
+    account.quotaPercent == null ? null : `${account.quotaPercent.toFixed(1)}%`,
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function providerModelCatalogPlaceholder(app: AppKind): string {
+  const model =
+    app === "gemini"
+      ? "gemini-2.5-pro"
+      : app === "codex"
+        ? "gpt-5.5"
+        : "claude-sonnet-5";
+  return JSON.stringify(
+    {
+      models: [
+        {
+          id: model,
+          upstreamModel: model,
+          displayName: model,
+        },
+      ],
+    },
+    null,
+    2,
+  );
+}
+
+function providerModelMappingPlaceholder(app: AppKind): string {
+  const target =
+    app === "gemini"
+      ? "gemini-2.5-pro"
+      : app === "codex"
+        ? "gpt-5.5"
+        : "claude-sonnet-5";
+  return JSON.stringify(
+    {
+      rules: [
+        {
+          match: "*",
+          upstreamModel: target,
+        },
+      ],
+    },
+    null,
+    2,
+  );
+}
+
+function providerPricingPlaceholder(): string {
+  return JSON.stringify(
+    {
+      default: {
+        inputUsdPerMillion: 3,
+        outputUsdPerMillion: 15,
+        cacheReadUsdPerMillion: 0.3,
+        cacheCreationUsdPerMillion: 3.75,
+      },
+    },
+    null,
+    2,
+  );
+}
+
+function limitLine(usage: number, limit?: number | null): string {
+  if (limit == null) return `${formatUsd(usage)} / -`;
+  return `${formatUsd(usage)} / ${formatUsd(limit)}`;
+}
+
+function formatUsd(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  if (Math.abs(value) >= 1) return `$${value.toFixed(2)}`;
+  return `$${value.toFixed(4)}`;
+}
+
+function formatTime(value?: number | null): string {
+  if (!value) return "expires -";
+  const millis = value < 10_000_000_000 ? value * 1000 : value;
+  const date = new Date(millis);
+  if (Number.isNaN(date.getTime())) return "expires -";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

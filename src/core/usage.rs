@@ -456,6 +456,8 @@ impl UsageStore {
 #[derive(Debug, Clone, Default)]
 pub struct UsageLogFilter {
     pub limit: Option<usize>,
+    pub from_ms: Option<u128>,
+    pub to_ms: Option<u128>,
     pub app: Option<AppKind>,
     pub provider_id: Option<String>,
     pub share_id: Option<String>,
@@ -1016,7 +1018,9 @@ fn first_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
 }
 
 fn matches_log_filter(log: &UsageLog, query: &UsageLogFilter) -> bool {
-    query.app.is_none_or(|app| log.app == app)
+    query.from_ms.is_none_or(|from| log.created_at_ms >= from)
+        && query.to_ms.is_none_or(|to| log.created_at_ms <= to)
+        && query.app.is_none_or(|app| log.app == app)
         && query
             .provider_id
             .as_deref()
@@ -1712,6 +1716,8 @@ mod tests {
         };
         let logs = store.latest_filtered(UsageLogFilter {
             limit: Some(10),
+            from_ms: None,
+            to_ms: None,
             app: Some(AppKind::Codex),
             provider_id: Some("p1".to_string()),
             share_id: Some("share-1".to_string()),
@@ -1725,6 +1731,44 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].provider_id, "p1");
         assert_eq!(logs[0].share_id.as_deref(), Some("share-1"));
+    }
+
+    #[test]
+    fn filters_latest_usage_by_time_range() {
+        let mut early = UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            UsageModelMetadata::default(),
+            TokenUsage::default(),
+        );
+        early.request_id = "req_early".to_string();
+        early.created_at_ms = 1_000;
+
+        let mut in_range = early.clone();
+        in_range.request_id = "req_in_range".to_string();
+        in_range.created_at_ms = 2_000;
+
+        let mut late = early.clone();
+        late.request_id = "req_late".to_string();
+        late.created_at_ms = 3_000;
+
+        let store = UsageStore {
+            logs: vec![early, in_range, late],
+            ..Default::default()
+        };
+        let logs = store.latest_filtered(UsageLogFilter {
+            limit: Some(10),
+            from_ms: Some(1_500),
+            to_ms: Some(2_500),
+            ..Default::default()
+        });
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].request_id, "req_in_range");
     }
 
     #[test]

@@ -1,0 +1,791 @@
+import {
+  AlertTriangle,
+  Archive,
+  Cable,
+  CheckCircle2,
+  Cloud,
+  Copy,
+  KeyRound,
+  Languages,
+  Loader2,
+  Mail,
+  Network,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  ShieldCheck,
+} from "lucide-react";
+import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
+
+import {
+  BackupManifest,
+  batchSyncRouterShares,
+  claimClientTunnel,
+  createBackup,
+  heartbeatRouter,
+  loadSettingsDashboardData,
+  registerRouter,
+  restoreBackup,
+  rotateApiToken,
+  requestEmailLoginCode,
+  RouterConfigView,
+  RouterDiagnosticsResponse,
+  RouterStatusResponse,
+  SettingsDashboardData,
+  startClientTunnel,
+  stopClientTunnel,
+  TunnelRuntimeStatus,
+  updateClientTunnel,
+  updateRouterConfig,
+  updateUpstreamProxy,
+  verifyEmailLoginCode,
+} from "@/lib/api";
+import { Language, useI18n } from "@/lib/i18n";
+import { writeToken } from "@/lib/runtime";
+
+interface RouterDraft {
+  url: string;
+  apiBase: string;
+  domain: string;
+  region: string;
+  sshHost: string;
+  sshUser: string;
+  custom: boolean;
+}
+
+interface TunnelDraft {
+  tunnelSubdomain: string;
+  tunnelStatus: string;
+}
+
+interface ProxyDraft {
+  url: string;
+  clear: boolean;
+  followSystemProxy: boolean;
+}
+
+interface EmailDraft {
+  email: string;
+  code: string;
+}
+
+export function SettingsDashboard() {
+  const { language, languages, setLanguage, t, tx } = useI18n();
+  const [data, setData] = useState<SettingsDashboardData | null>(null);
+  const [routerDraft, setRouterDraft] = useState<RouterDraft>(emptyRouterDraft());
+  const [tunnelDraft, setTunnelDraft] = useState<TunnelDraft>(emptyTunnelDraft());
+  const [proxyDraft, setProxyDraft] = useState<ProxyDraft>(emptyProxyDraft());
+  const [emailDraft, setEmailDraft] = useState<EmailDraft>({ email: "", code: "" });
+  const [backupReason, setBackupReason] = useState("");
+  const [apiToken, setApiToken] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const next = await loadSettingsDashboardData();
+      setData(next);
+      setRouterDraft(routerDraftFrom(next.router));
+      setTunnelDraft(tunnelDraftFrom(next.tunnel));
+      setProxyDraft({
+        url: "",
+        clear: false,
+        followSystemProxy: next.config.upstreamProxy.followSystemProxy,
+      });
+      setEmailDraft((current) => ({
+        ...current,
+        email: current.email || next.config.ownerEmail || "",
+      }));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function runAction(action: string, task: () => Promise<string>) {
+    setBusy(action);
+    setError(null);
+    try {
+      setResult(await task());
+      await refresh();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveRouter(event: FormEvent) {
+    event.preventDefault();
+    await runAction("router-save", async () => {
+      const router = await updateRouterConfig({
+        url: routerDraft.url,
+        apiBase: routerDraft.apiBase,
+        domain: routerDraft.domain,
+        region: routerDraft.region,
+        sshHost: routerDraft.sshHost,
+        sshUser: routerDraft.sshUser,
+        custom: routerDraft.custom,
+      });
+      return tx("router saved: {{value}}", { value: router.url || "-" });
+    });
+  }
+
+  async function saveTunnel(event: FormEvent) {
+    event.preventDefault();
+    await runAction("tunnel-save", async () => {
+      const tunnel = await updateClientTunnel({
+        tunnelSubdomain: tunnelDraft.tunnelSubdomain,
+        tunnelStatus: tunnelDraft.tunnelStatus,
+      });
+      return tx("client tunnel saved: {{value}}", { value: tunnel.tunnelSubdomain || "-" });
+    });
+  }
+
+  async function saveProxy(event: FormEvent) {
+    event.preventDefault();
+    await runAction("proxy-save", async () => {
+      const proxy = await updateUpstreamProxy({
+        url: proxyDraft.url.trim() || undefined,
+        clear: proxyDraft.clear,
+        followSystemProxy: proxyDraft.followSystemProxy,
+      });
+      return proxy.enabled
+        ? tx("proxy saved: {{value}}", { value: proxy.maskedUrl || tx("configured") })
+        : tx("proxy disabled");
+    });
+  }
+
+  async function makeBackup(event: FormEvent) {
+    event.preventDefault();
+    await runAction("backup-create", async () => {
+      const backup = await createBackup(backupReason);
+      setBackupReason("");
+      return tx("backup created: {{id}}", { id: backup.id });
+    });
+  }
+
+  async function restoreBackupAction(backup: BackupManifest) {
+    if (!window.confirm(tx("Restore backup {{id}}? Current stores will be backed up first.", { id: backup.id }))) {
+      return;
+    }
+    await runAction(`backup-restore:${backup.id}`, async () => {
+      const restored = await restoreBackup(backup.id);
+      return tx("restored {{id}}; safety {{safety}}", {
+        id: restored.restored.id,
+        safety: restored.preRestore?.id || "-",
+      });
+    });
+  }
+
+  async function rotateTokenAction() {
+    await runAction("api-token", async () => {
+      const token = await rotateApiToken();
+      setApiToken(token);
+      return tx("new API token generated");
+    });
+  }
+
+  async function requestCodeAction() {
+    await runAction("email-request", async () => {
+      const response = await requestEmailLoginCode(emailDraft.email);
+      return tx("code sent to {{destination}}; cooldown {{seconds}}s", {
+        destination: response.maskedDestination,
+        seconds: response.cooldownSecs,
+      });
+    });
+  }
+
+  async function verifyCodeAction() {
+    await runAction("email-verify", async () => {
+      const login = await verifyEmailLoginCode(emailDraft);
+      writeToken(login.token);
+      return tx("email verified and local session updated");
+    });
+  }
+
+  return (
+    <div className="settings-dashboard">
+      <div className="provider-toolbar">
+        <div className="section-title-row">
+          <ShieldCheck size={18} />
+          <div>
+            <h2>{t("server.settings.title")}</h2>
+            <span>{data?.config.ownerEmail || t("server.settings.runtimeSubtitle")}</span>
+          </div>
+        </div>
+        <div className="provider-toolbar-actions">
+          {error && <span className="error-text">{error}</span>}
+          {result && <span className="usage-result">{result}</span>}
+          <button className="secondary-button" type="button" onClick={() => void refresh()}>
+            <RefreshCw size={15} />
+            <span>{t("common.refresh")}</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="provider-summary-row settings-summary-row">
+        <SummaryTile label={t("server.settings.owner")} value={data?.config.ownerEmail || "-"} />
+        <SummaryTile label={t("server.settings.router")} value={data?.routerStatus.registered ? "registered" : "not registered"} />
+        <SummaryTile label={t("server.settings.tunnel")} value={data?.tunnel.runtimeStatus?.status || data?.tunnel.tunnelStatus || "-"} />
+        <SummaryTile label={t("server.settings.pendingLogs")} value={data?.routerStatus.pendingRequestLogSync ?? 0} />
+        <SummaryTile label={t("server.settings.backups")} value={data?.backups.length ?? 0} />
+      </div>
+
+      {data && <SettingsReadinessPanel data={data} />}
+
+      {loading && !data ? (
+        <div className="provider-empty">
+          <Loader2 size={22} />
+          <span>{t("server.settings.loading")}</span>
+        </div>
+      ) : (
+        <div className="settings-layout">
+          <section className="settings-card">
+            <SectionHeader icon={<Languages size={17} />} title={t("server.settings.language")} subtitle={t("server.settings.languageSubtitle")} />
+            <label>
+              <span>{t("server.settings.displayLanguage")}</span>
+              <select value={language} onChange={(event) => setLanguage(event.target.value as Language)}>
+                {languages.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </section>
+
+          <section className="settings-card">
+            <SectionHeader icon={<Cloud size={17} />} title={t("server.settings.upstreamProxy")} subtitle={data?.config.upstreamProxy.maskedUrl || t("server.settings.notConfigured")} />
+            <form className="settings-form" onSubmit={saveProxy}>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={proxyDraft.followSystemProxy}
+                  onChange={(event) => setProxyDraft({ ...proxyDraft, followSystemProxy: event.target.checked })}
+                />
+                <span>{t("server.settings.followSystemProxy")}</span>
+              </label>
+              <label>
+                <span>{t("server.settings.newProxyUrl")}</span>
+                <input
+                  value={proxyDraft.url}
+                  placeholder="http://127.0.0.1:7890"
+                  onChange={(event) => setProxyDraft({ ...proxyDraft, url: event.target.value })}
+                />
+              </label>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={proxyDraft.clear}
+                  onChange={(event) => setProxyDraft({ ...proxyDraft, clear: event.target.checked })}
+                />
+                <span>{t("server.settings.clearConfiguredUrl")}</span>
+              </label>
+              <FormFooter busy={busy === "proxy-save"} label={t("server.settings.saveProxy")} />
+            </form>
+          </section>
+
+          <section className="settings-card wide">
+            <SectionHeader icon={<Network size={17} />} title={t("server.settings.router")} subtitle={routerState(data?.routerStatus)} />
+            <form className="settings-form settings-form-grid" onSubmit={saveRouter}>
+              <TextField label={t("server.auth.routerUrl")} value={routerDraft.url} onChange={(value) => setRouterDraft({ ...routerDraft, url: value })} />
+              <TextField label={t("server.settings.apiBase")} value={routerDraft.apiBase} onChange={(value) => setRouterDraft({ ...routerDraft, apiBase: value })} />
+              <TextField label={t("server.settings.domain")} value={routerDraft.domain} onChange={(value) => setRouterDraft({ ...routerDraft, domain: value })} />
+              <TextField label={t("server.settings.region")} value={routerDraft.region} onChange={(value) => setRouterDraft({ ...routerDraft, region: value })} />
+              <TextField label={t("server.settings.sshHost")} value={routerDraft.sshHost} onChange={(value) => setRouterDraft({ ...routerDraft, sshHost: value })} />
+              <TextField label={t("server.settings.sshUser")} value={routerDraft.sshUser} onChange={(value) => setRouterDraft({ ...routerDraft, sshUser: value })} />
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={routerDraft.custom}
+                  onChange={(event) => setRouterDraft({ ...routerDraft, custom: event.target.checked })}
+                />
+                <span>{t("server.settings.customRouter")}</span>
+              </label>
+              <FormFooter busy={busy === "router-save"} label={t("server.settings.saveRouter")} />
+            </form>
+            <div className="settings-actions">
+              <ActionButton label={t("server.settings.register")} icon={<CheckCircle2 size={15} />} busy={busy === "router-register"} onClick={() => void runAction("router-register", async () => `registered ${JSON.stringify(await registerRouter())}`)} />
+              <ActionButton label={t("server.settings.heartbeat")} icon={<RefreshCw size={15} />} busy={busy === "router-heartbeat"} onClick={() => void runAction("router-heartbeat", async () => routerStatusText(await heartbeatRouter()))} />
+              <ActionButton label={t("server.settings.batchSync")} icon={<RotateCcw size={15} />} busy={busy === "router-sync"} onClick={() => void runAction("router-sync", async () => (await batchSyncRouterShares()).message)} />
+            </div>
+            <RouterFacts router={data?.router} status={data?.routerStatus} />
+          </section>
+
+          <section className="settings-card">
+            <SectionHeader icon={<Cable size={17} />} title={t("server.settings.clientTunnel")} subtitle={data?.tunnel.runtimeStatus?.tunnelUrl || data?.tunnel.tunnelSubdomain || "-"} />
+            <form className="settings-form" onSubmit={saveTunnel}>
+              <TextField label={t("server.settings.subdomain")} value={tunnelDraft.tunnelSubdomain} onChange={(value) => setTunnelDraft({ ...tunnelDraft, tunnelSubdomain: value })} />
+              <TextField label={t("server.settings.status")} value={tunnelDraft.tunnelStatus} onChange={(value) => setTunnelDraft({ ...tunnelDraft, tunnelStatus: value })} />
+              <FormFooter busy={busy === "tunnel-save"} label={t("server.settings.saveTunnel")} />
+            </form>
+            <div className="settings-actions">
+              <ActionButton label={t("server.settings.claim")} icon={<CheckCircle2 size={15} />} busy={busy === "tunnel-claim"} onClick={() => void runAction("tunnel-claim", async () => `claim ${JSON.stringify(await claimClientTunnel())}`)} />
+              <ActionButton label={t("server.settings.start")} icon={<Cable size={15} />} busy={busy === "tunnel-start"} onClick={() => void runAction("tunnel-start", async () => (await startClientTunnel()).message)} />
+              <ActionButton label={t("server.settings.stop")} icon={<AlertTriangle size={15} />} busy={busy === "tunnel-stop"} onClick={() => void runAction("tunnel-stop", async () => `stopped ${(await stopClientTunnel()).tunnelStatus || "client tunnel"}`)} />
+            </div>
+            <TunnelStatus status={data?.tunnel.runtimeStatus} />
+          </section>
+
+          <section className="settings-card">
+            <SectionHeader icon={<KeyRound size={17} />} title={t("server.settings.auth")} subtitle={t("server.settings.authSubtitle")} />
+            <div className="settings-actions">
+              <ActionButton label={t("server.settings.rotateApiToken")} icon={<KeyRound size={15} />} busy={busy === "api-token"} onClick={() => void rotateTokenAction()} />
+              {apiToken && (
+                <button className="secondary-button" type="button" onClick={() => void navigator.clipboard?.writeText(apiToken)}>
+                  <Copy size={15} />
+                  <span>{t("server.settings.copyToken")}</span>
+                </button>
+              )}
+            </div>
+            {apiToken && <pre className="settings-secret-preview">{apiToken}</pre>}
+            <div className="settings-form">
+              <TextField label={t("server.auth.ownerEmail")} value={emailDraft.email} onChange={(value) => setEmailDraft({ ...emailDraft, email: value })} />
+              <TextField label={t("server.settings.verificationCode")} value={emailDraft.code} onChange={(value) => setEmailDraft({ ...emailDraft, code: value })} />
+              <div className="settings-actions">
+                <ActionButton label={t("server.settings.requestCode")} icon={<Mail size={15} />} busy={busy === "email-request"} onClick={() => void requestCodeAction()} />
+                <ActionButton label={t("server.settings.verify")} icon={<CheckCircle2 size={15} />} busy={busy === "email-verify"} onClick={() => void verifyCodeAction()} />
+              </div>
+            </div>
+          </section>
+
+          <section className="settings-card wide">
+            <SectionHeader icon={<Archive size={17} />} title={t("server.settings.backup")} subtitle={t("server.settings.backupSubtitle")} />
+            <BackupPolicySummary backups={data?.backups || []} />
+            <form className="settings-form backup-create-row" onSubmit={makeBackup}>
+              <label>
+                <span>{t("server.settings.reason")}</span>
+                <input value={backupReason} onChange={(event) => setBackupReason(event.target.value)} />
+              </label>
+              <FormFooter busy={busy === "backup-create"} label={t("server.settings.createBackup")} />
+            </form>
+            <BackupTable backups={data?.backups || []} busy={busy} onRestore={(backup) => void restoreBackupAction(backup)} />
+          </section>
+
+          <section className="settings-card wide">
+            <SectionHeader
+              icon={<Network size={17} />}
+              title={t("server.settings.diagnostics")}
+              subtitle={t("server.settings.diagnosticsSubtitle", {
+                tunnels: data?.diagnostics.tunnels.length || 0,
+                shares: data?.diagnostics.shareSync.length || 0,
+              })}
+            />
+            <DiagnosticsSummary diagnostics={data?.diagnostics} />
+            <Diagnostics diagnostics={data?.diagnostics} />
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SectionHeader({ icon, title, subtitle }: { icon: ReactNode; title: string; subtitle: string }) {
+  return (
+    <header className="settings-card-header">
+      <div className="section-title-row compact-title">
+        {icon}
+        <h3>{title}</h3>
+      </div>
+      <span>{subtitle}</span>
+    </header>
+  );
+}
+
+function SettingsReadinessPanel({ data }: { data: SettingsDashboardData }) {
+  const { t } = useI18n();
+  const items = settingsReadinessItems(data);
+  return (
+    <section className="settings-card wide settings-readiness-panel">
+      <SectionHeader
+        icon={<ShieldCheck size={17} />}
+        title={t("server.settings.runtimeReadiness")}
+        subtitle={t("server.settings.readinessSubtitle", {
+          ready: items.filter((item) => item.tone === "success").length,
+          total: items.length,
+        })}
+      />
+      <div className="settings-readiness-grid">
+        {items.map((item) => (
+          <div className="settings-readiness-item" key={item.label}>
+            <div>
+              <strong>{item.label}</strong>
+              <span>{item.detail}</span>
+            </div>
+            <StatusPill tone={item.tone}>{item.value}</StatusPill>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function BackupPolicySummary({ backups }: { backups: BackupManifest[] }) {
+  const latest = [...backups].sort((left, right) => right.createdAtMs - left.createdAtMs)[0];
+  const totalBytes = backups.reduce(
+    (sum, backup) => sum + backup.files.reduce((fileSum, file) => fileSum + file.sizeBytes, 0),
+    0,
+  );
+  const latestFiles = latest?.files.map((file) => file.fileName).sort().join(", ") || "-";
+  return (
+    <div className="settings-policy-grid">
+      <KeyValue label="latest" value={formatTime(latest?.createdAtMs)} />
+      <KeyValue label="snapshots" value={backups.length} />
+      <KeyValue label="total size" value={formatBytes(totalBytes)} />
+      <KeyValue label="retention" value="24 periodic" />
+      <KeyValue label="latest files" value={latestFiles} />
+      <KeyValue label="restore safety" value="pre-restore snapshot" />
+    </div>
+  );
+}
+
+function DiagnosticsSummary({ diagnostics }: { diagnostics?: RouterDiagnosticsResponse }) {
+  if (!diagnostics) return null;
+  const tunnelErrors = diagnostics.tunnels.filter((tunnel) => tunnel.lastError).length;
+  const activeTunnels = diagnostics.tunnels.filter((tunnel) => tunnel.status === "connected" || tunnel.status === "running").length;
+  const shareErrors = diagnostics.shareSync.filter((share) => share.routerLastSyncError).length;
+  const disabledShares = diagnostics.shareSync.filter((share) => !share.enabled).length;
+  return (
+    <div className="settings-policy-grid">
+      <KeyValue label="registered" value={diagnostics.registered ? "yes" : "no"} />
+      <KeyValue label="pending logs" value={diagnostics.pendingRequestLogSync} />
+      <KeyValue label="active tunnels" value={`${activeTunnels}/${diagnostics.tunnels.length}`} />
+      <KeyValue label="tunnel errors" value={tunnelErrors} />
+      <KeyValue label="share errors" value={shareErrors} />
+      <KeyValue label="disabled shares" value={disabledShares} />
+    </div>
+  );
+}
+
+function TextField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+  const { tx } = useI18n();
+  return (
+    <label>
+      <span>{tx(label)}</span>
+      <input value={value} onChange={(event) => onChange(event.target.value)} />
+    </label>
+  );
+}
+
+function FormFooter({ busy, label }: { busy: boolean; label: string }) {
+  const { tx } = useI18n();
+  return (
+    <button className="primary-button" type="submit" disabled={busy}>
+      {busy ? <Loader2 size={15} /> : <Save size={15} />}
+      <span>{tx(label)}</span>
+    </button>
+  );
+}
+
+function ActionButton({
+  label,
+  icon,
+  busy,
+  onClick,
+}: {
+  label: string;
+  icon: ReactNode;
+  busy: boolean;
+  onClick: () => void;
+}) {
+  const { tx } = useI18n();
+  return (
+    <button className="secondary-button" type="button" onClick={onClick} disabled={busy}>
+      {busy ? <Loader2 size={15} /> : icon}
+      <span>{tx(label)}</span>
+    </button>
+  );
+}
+
+function RouterFacts({ router, status }: { router?: RouterConfigView; status?: RouterStatusResponse }) {
+  return (
+    <div className="provider-card-meta">
+      <KeyValue label="installation" value={router?.installationId || "-"} />
+      <KeyValue label="control secret" value={router?.controlSecretPresent ? "present" : "-"} />
+      <KeyValue label="registered at" value={formatTime(router?.lastRegisteredAtMs)} />
+      <KeyValue label="heartbeat" value={formatTime(status?.lastHeartbeatMs)} />
+      <KeyValue label="last error" value={router?.lastRegisterError || status?.lastError || "-"} />
+      <KeyValue label="public key" value={router?.publicKey ? `${router.publicKey.slice(0, 18)}...` : "-"} />
+    </div>
+  );
+}
+
+function TunnelStatus({ status }: { status?: TunnelRuntimeStatus | null }) {
+  return (
+    <div className="provider-card-meta">
+      <KeyValue label="status" value={status?.status || "-"} />
+      <KeyValue label="url" value={status?.tunnelUrl || "-"} />
+      <KeyValue label="lease" value={status?.leaseId || "-"} />
+      <KeyValue label="expires" value={status?.leaseExpiresAt || "-"} />
+      <KeyValue label="connected" value={formatTime(status?.connectedAtMs)} />
+      <KeyValue label="error" value={status?.lastError || "-"} />
+    </div>
+  );
+}
+
+function BackupTable({
+  backups,
+  busy,
+  onRestore,
+}: {
+  backups: BackupManifest[];
+  busy: string | null;
+  onRestore: (backup: BackupManifest) => void;
+}) {
+  const { tx } = useI18n();
+  return (
+    <div className="table-wrap settings-table">
+      <table>
+        <thead>
+          <tr>
+            <th>{tx("ID")}</th>
+            <th>{tx("Created")}</th>
+            <th>{tx("Reason")}</th>
+            <th>{tx("Files")}</th>
+            <th>{tx("Size")}</th>
+            <th>{tx("Restore")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {backups.length ? (
+            backups.map((backup) => (
+              <tr key={backup.id}>
+                <td title={backup.id}>{backup.id}</td>
+                <td>{formatTime(backup.createdAtMs)}</td>
+                <td>{backup.reason || "-"}</td>
+                <td>{backup.files.length}</td>
+                <td>{formatBytes(backup.files.reduce((sum, file) => sum + file.sizeBytes, 0))}</td>
+                <td>
+                  <button
+                    className="icon-button"
+                    type="button"
+                    title={tx("Restore backup")}
+                    aria-label={tx("Restore backup")}
+                    disabled={busy === `backup-restore:${backup.id}`}
+                    onClick={() => onRestore(backup)}
+                  >
+                    {busy === `backup-restore:${backup.id}` ? <Loader2 size={15} /> : <RotateCcw size={15} />}
+                  </button>
+                </td>
+              </tr>
+            ))
+          ) : (
+            <tr>
+              <td className="empty-cell" colSpan={6}>{tx("No backups")}</td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function Diagnostics({ diagnostics }: { diagnostics?: RouterDiagnosticsResponse }) {
+  const { tx } = useI18n();
+  if (!diagnostics) return <div className="provider-empty">{tx("No diagnostics")}</div>;
+  return (
+    <div className="diagnostics-grid">
+      <div className="table-wrap settings-table">
+        <table>
+          <thead>
+            <tr>
+              <th>{tx("Tunnel")}</th>
+              <th>{tx("Kind")}</th>
+              <th>{tx("Status")}</th>
+              <th>{tx("URL")}</th>
+              <th>{tx("Error")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {diagnostics.tunnels.length ? (
+              diagnostics.tunnels.map((tunnel) => (
+                <tr key={tunnel.key}>
+                  <td>{tunnel.key}</td>
+                  <td>{tunnel.kind}</td>
+                  <td>{tunnel.status}</td>
+                  <td>{tunnel.tunnelUrl || "-"}</td>
+                  <td>{tunnel.lastError || "-"}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td className="empty-cell" colSpan={5}>{tx("No tunnels")}</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div className="table-wrap settings-table">
+        <table>
+          <thead>
+            <tr>
+              <th>{tx("Share")}</th>
+              <th>{tx("Status")}</th>
+              <th>{tx("Synced")}</th>
+              <th>{tx("URL")}</th>
+              <th>{tx("Error")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {diagnostics.shareSync.length ? (
+              diagnostics.shareSync.map((share) => (
+                <tr key={share.shareId}>
+                  <td>{share.shareName}</td>
+                  <td>{share.enabled ? share.status : "disabled"}</td>
+                  <td>{formatTime(share.routerLastSyncedAtMs)}</td>
+                  <td>{share.routerUrl || "-"}</td>
+                  <td>{share.routerLastSyncError || "-"}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td className="empty-cell" colSpan={5}>{tx("No share sync diagnostics")}</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function SummaryTile({ label, value }: { label: string; value: ReactNode }) {
+  const { tx } = useI18n();
+  return (
+    <div className="summary-tile">
+      <span>{tx(label)}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function KeyValue({ label, value }: { label: string; value: ReactNode }) {
+  const { tx } = useI18n();
+  return (
+    <div className="compact-kv">
+      <span>{tx(label)}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function StatusPill({
+  children,
+  tone,
+}: {
+  children: ReactNode;
+  tone: "success" | "warning" | "danger";
+}) {
+  return <span className={`status-pill ${tone}`}>{children}</span>;
+}
+
+function settingsReadinessItems(data: SettingsDashboardData): Array<{
+  label: string;
+  value: string;
+  detail: string;
+  tone: "success" | "warning" | "danger";
+}> {
+  const latestBackup = [...data.backups].sort((left, right) => right.createdAtMs - left.createdAtMs)[0];
+  const latestBackupAge = latestBackup ? Date.now() - latestBackup.createdAtMs : Number.POSITIVE_INFINITY;
+  const tunnelErrors = data.diagnostics.tunnels.filter((tunnel) => tunnel.lastError).length;
+  const shareErrors = data.diagnostics.shareSync.filter((share) => share.routerLastSyncError).length;
+  const diagnosticsIssues = tunnelErrors + shareErrors + (data.routerStatus.lastError ? 1 : 0);
+  return [
+    {
+      label: "setup",
+      value: data.config.ownerEmail ? "owner" : "pending",
+      detail: data.config.ownerEmail || "no owner email",
+      tone: data.config.ownerEmail ? "success" : "warning",
+    },
+    {
+      label: "login",
+      value: "email code",
+      detail: data.config.ownerEmail ? "owner-bound" : "owner pending",
+      tone: data.config.ownerEmail ? "success" : "warning",
+    },
+    {
+      label: "router",
+      value: data.routerStatus.registered ? "registered" : "local",
+      detail: data.routerStatus.lastError || formatTime(data.routerStatus.lastHeartbeatMs),
+      tone: data.routerStatus.lastError ? "danger" : data.routerStatus.registered ? "success" : "warning",
+    },
+    {
+      label: "backup",
+      value: latestBackup ? "ready" : "missing",
+      detail: latestBackup ? formatTime(latestBackup.createdAtMs) : "no snapshots",
+      tone: latestBackupAge <= 24 * 60 * 60 * 1000 ? "success" : latestBackup ? "warning" : "danger",
+    },
+    {
+      label: "diagnostics",
+      value: diagnosticsIssues ? `${diagnosticsIssues} issue` : "clean",
+      detail: `${data.diagnostics.tunnels.length} tunnels / ${data.diagnostics.shareSync.length} shares`,
+      tone: diagnosticsIssues ? "warning" : "success",
+    },
+  ];
+}
+
+function routerState(status?: RouterStatusResponse): string {
+  if (!status) return "loading";
+  if (status.lastError) return status.lastError;
+  return status.registered ? "registered" : "not registered";
+}
+
+function routerStatusText(status: RouterStatusResponse): string {
+  return status.registered ? `heartbeat ok; pending logs ${status.pendingRequestLogSync}` : "heartbeat recorded locally";
+}
+
+function routerDraftFrom(router: RouterConfigView): RouterDraft {
+  return {
+    url: router.url || "",
+    apiBase: router.apiBase || "",
+    domain: router.domain || "",
+    region: router.region || "",
+    sshHost: router.sshHost || "",
+    sshUser: router.sshUser || "",
+    custom: router.custom,
+  };
+}
+
+function tunnelDraftFrom(tunnel: { tunnelSubdomain?: string | null; tunnelStatus?: string | null }): TunnelDraft {
+  return {
+    tunnelSubdomain: tunnel.tunnelSubdomain || "",
+    tunnelStatus: tunnel.tunnelStatus || "",
+  };
+}
+
+function emptyRouterDraft(): RouterDraft {
+  return { url: "", apiBase: "", domain: "", region: "", sshHost: "", sshUser: "", custom: false };
+}
+
+function emptyTunnelDraft(): TunnelDraft {
+  return { tunnelSubdomain: "", tunnelStatus: "" };
+}
+
+function emptyProxyDraft(): ProxyDraft {
+  return { url: "", clear: false, followSystemProxy: true };
+}
+
+function formatTime(value?: number | null): string {
+  if (value == null || value <= 0) return "-";
+  return new Date(value).toLocaleString();
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function errorMessage(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason);
+}

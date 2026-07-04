@@ -2,14 +2,39 @@
 import fs from "node:fs";
 import process from "node:process";
 
-const file = "web-dist/index.html";
-const maxBytes = Number(process.env.CC_SWITCH_WEB_DIST_MAX_BYTES || 160000);
-const size = fs.statSync(file).size;
+const root = "web-dist";
+const indexFile = `${root}/index.html`;
+const maxBytes = Number(process.env.CC_SWITCH_WEB_DIST_MAX_BYTES || 900000);
 
-console.log(`webDistBytes=${size} maxBytes=${maxBytes}`);
+function fileSize(path) {
+  return fs.statSync(path).size;
+}
+
+function walk(dir) {
+  const files = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) {
+      files.push(...walk(fullPath));
+    } else if (entry.isFile()) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+if (!fs.existsSync(indexFile)) {
+  console.error(`${indexFile} is required`);
+  process.exit(1);
+}
+
+const files = walk(root);
+const size = files.reduce((sum, file) => sum + fileSize(file), 0);
+
+console.log(`webDistFiles=${files.length} webDistBytes=${size} maxBytes=${maxBytes}`);
 if (size > maxBytes) {
   console.error(
-    `${file} exceeds the single-file ceiling; split web source or raise the reviewed limit`,
+    `${root} exceeds the reviewed embedded web asset ceiling`,
   );
   process.exit(1);
 }
