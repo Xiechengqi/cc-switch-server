@@ -384,11 +384,6 @@ input:focus {
   color: hsl(var(--danger));
 }
 
-.table-wrap {
-  width: 100%;
-  overflow: auto;
-}
-
 table {
   width: 100%;
   min-width: 760px;
@@ -562,15 +557,7 @@ tbody tr:last-child td {
   color: hsl(var(--primary));
 }
 
-.provider-summary-row {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(130px, 1fr));
-  gap: 12px;
-}
-
-.summary-tile,
-.provider-card,
-.provider-matrix-section {
+.provider-card {
   min-width: 0;
   border: 1px solid hsl(var(--border));
   border-radius: 8px;
@@ -578,13 +565,6 @@ tbody tr:last-child td {
   box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
 }
 
-.summary-tile {
-  display: grid;
-  gap: 4px;
-  padding: 12px;
-}
-
-.summary-tile span,
 .compact-kv span,
 .provider-card-result,
 .section-heading span,
@@ -592,10 +572,6 @@ tbody tr:last-child td {
 .provider-form-modal header p {
   color: hsl(var(--muted));
   font-size: 0.78rem;
-}
-
-.summary-tile strong {
-  font-size: 1.1rem;
 }
 
 .provider-card-grid {
@@ -879,6 +855,36 @@ tbody tr:last-child td {
   padding-top: 10px;
 }
 
+.provider-readiness-panel summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.provider-readiness-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.provider-readiness-panel summary > span {
+  min-width: 0;
+  overflow: hidden;
+  color: hsl(var(--muted));
+  font-size: 0.76rem;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-readiness-body {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
 .provider-readiness-header,
 .provider-limit-line,
 .provider-warning-list {
@@ -1152,12 +1158,6 @@ tbody tr:last-child td {
   color: hsl(var(--muted));
   font-size: 0.74rem;
   font-weight: 700;
-}
-
-.provider-matrix-section {
-  display: grid;
-  gap: 12px;
-  padding: 14px;
 }
 
 .section-heading {
@@ -1616,7 +1616,6 @@ tbody tr:last-child td {
 .account-tool-panel,
 .account-group,
 .account-card,
-.capability-card,
 .banked-reset-card,
 .device-flow-card {
   min-width: 0;
@@ -1726,9 +1725,56 @@ tbody tr:last-child td {
   gap: 8px;
 }
 
+.auth-readiness-panel {
+  align-content: start;
+}
+
+.auth-readiness-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.auth-readiness-card {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 12px;
+}
+
+.auth-readiness-card:hover {
+  border-color: hsl(202 56% 78%);
+  background: hsl(202 70% 96%);
+}
+
+.auth-readiness-card header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.auth-readiness-card h3 {
+  margin: 0;
+  overflow: hidden;
+  color: hsl(var(--foreground));
+  font-size: 0.92rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-readiness-card header span:not(.status-pill) {
+  color: hsl(var(--muted));
+  font-size: 0.74rem;
+}
+
 .account-group-list,
 .accounts-side,
-.capability-list,
 .banked-reset-list,
 .device-flow-grid {
   display: grid;
@@ -1742,7 +1788,6 @@ tbody tr:last-child td {
 
 .account-group > header,
 .account-card header,
-.capability-card header,
 .banked-reset-card header,
 .device-flow-card header {
   display: flex;
@@ -1782,7 +1827,6 @@ tbody tr:last-child td {
 
 .account-group h3,
 .account-card h4,
-.capability-card h3,
 .banked-reset-card h3,
 .device-flow-card h3 {
   margin: 0;
@@ -1790,7 +1834,6 @@ tbody tr:last-child td {
 
 .account-group header span,
 .account-card header span,
-.capability-card header span,
 .banked-reset-card header span {
   color: hsl(var(--muted));
   font-size: 0.78rem;
@@ -1804,7 +1847,6 @@ tbody tr:last-child td {
 
 .account-card,
 .account-tool-panel,
-.capability-card,
 .banked-reset-card,
 .device-flow-card {
   border: 1px solid hsl(var(--border));
@@ -1815,7 +1857,6 @@ tbody tr:last-child td {
 
 .account-card,
 .account-tool-panel,
-.capability-card,
 .banked-reset-card,
 .device-flow-card {
   display: grid;
@@ -1824,7 +1865,6 @@ tbody tr:last-child td {
 }
 
 .account-card h4,
-.capability-card h3,
 .banked-reset-card h3 {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3567,7 +3607,6 @@ tbody tr:last-child td {
   font-size: 0.7rem;
 }
 
-.usage-dashboard .provider-summary-row,
 .usage-summary-grid {
   grid-template-columns: repeat(5, minmax(130px, 1fr));
 }
@@ -3799,17 +3838,6 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
-.usage-table table {
-  min-width: 1040px;
-  border: 1px solid hsl(var(--border));
-  border-radius: 8px;
-  background: hsl(var(--panel));
-}
-
-.usage-table td {
-  font-size: 0.84rem;
-}
-
 .usage-rank-cell {
   display: grid;
   min-width: 190px;
@@ -3874,6 +3902,64 @@ tbody tr:last-child td {
 .usage-token-cell span {
   color: hsl(var(--muted));
   font-size: 0.72rem;
+}
+
+.usage-ranking-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px;
+}
+
+.usage-ranking-card {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 12px;
+}
+
+.usage-ranking-card header,
+.usage-ranking-card footer {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.usage-ranking-title {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.usage-ranking-title > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.usage-ranking-title strong,
+.usage-ranking-title span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-ranking-title strong {
+  color: hsl(var(--foreground));
+  font-size: 0.92rem;
+}
+
+.usage-ranking-title span {
+  color: hsl(var(--muted));
+  font-size: 0.74rem;
 }
 
 .usage-activity-panel {
@@ -4176,10 +4262,6 @@ tbody tr:last-child td {
   padding: 24px;
 }
 
-.settings-summary-row {
-  grid-template-columns: repeat(5, minmax(130px, 1fr));
-}
-
 .settings-tab-shell {
   display: grid;
   min-width: 0;
@@ -4341,6 +4423,54 @@ tbody tr:last-child td {
   margin: 0;
 }
 
+.settings-overview-strip {
+  display: grid;
+  min-width: 0;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.settings-overview-card {
+  display: flex;
+  min-width: 0;
+  min-height: 74px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 10px;
+  box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
+}
+
+.settings-overview-card > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.settings-overview-card span:not(.status-pill),
+.settings-overview-card strong,
+.settings-overview-card small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-overview-card span:not(.status-pill),
+.settings-overview-card small {
+  color: hsl(var(--muted));
+  font-size: 0.74rem;
+}
+
+.settings-overview-card strong {
+  color: hsl(var(--foreground));
+  font-size: 0.94rem;
+}
+
 .settings-readiness-grid,
 .settings-policy-grid {
   display: grid;
@@ -4445,6 +4575,138 @@ tbody tr:last-child td {
   font-size: 0.78rem;
 }
 
+.settings-failover-card {
+  align-content: start;
+}
+
+.failover-settings-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(3, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.failover-settings-app {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 12px;
+}
+
+.failover-settings-app header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.failover-settings-app header > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.failover-settings-app strong,
+.failover-settings-app header span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.failover-settings-app strong {
+  color: hsl(var(--foreground));
+  font-size: 0.94rem;
+}
+
+.failover-settings-app header span {
+  color: hsl(var(--muted));
+  font-size: 0.76rem;
+}
+
+.failover-number-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.failover-queue-summary,
+.failover-breaker-summary {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 10px;
+}
+
+.failover-queue-summary h3 {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.failover-queue-summary ol {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.failover-queue-summary li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 8px;
+  align-items: center;
+}
+
+.failover-queue-summary li span {
+  grid-row: span 2;
+  border-radius: 999px;
+  background: hsl(var(--primary) / 0.12);
+  color: hsl(var(--primary));
+  padding: 2px 7px;
+  font-size: 0.72rem;
+  font-weight: 750;
+}
+
+.failover-queue-summary li code {
+  min-width: 0;
+  overflow: hidden;
+  color: hsl(var(--muted));
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.failover-queue-summary p {
+  margin: 0;
+  color: hsl(var(--muted));
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.failover-breaker-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.failover-breaker-summary > span:first-child {
+  color: hsl(var(--muted));
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
 .settings-readiness-item {
   display: flex;
   min-width: 0;
@@ -4528,8 +4790,52 @@ tbody tr:last-child td {
   flex: 1 1 260px;
 }
 
-.settings-table table {
-  min-width: 880px;
+.backup-card-list {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
+.backup-card {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 12px;
+}
+
+.backup-card header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.backup-card header > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.backup-card strong,
+.backup-card span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backup-card strong {
+  color: hsl(var(--foreground));
+  font-size: 0.9rem;
+}
+
+.backup-card span {
+  color: hsl(var(--muted));
+  font-size: 0.74rem;
 }
 
 .settings-secret-preview {
@@ -4545,6 +4851,54 @@ tbody tr:last-child td {
   font-size: 0.78rem;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.diagnostics-card-grid {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
+.diagnostics-card {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  padding: 12px;
+}
+
+.diagnostics-card header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.diagnostics-card header > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.diagnostics-card strong,
+.diagnostics-card header span:not(.status-pill) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diagnostics-card strong {
+  color: hsl(var(--foreground));
+  font-size: 0.9rem;
+}
+
+.diagnostics-card header span:not(.status-pill) {
+  color: hsl(var(--muted));
+  font-size: 0.74rem;
 }
 
 @media (max-width: 860px) {
@@ -4636,7 +4990,6 @@ tbody tr:last-child td {
   .auth-grid,
   .settings-grid,
   .metric-grid,
-  .provider-summary-row,
   .usage-summary-grid,
   .provider-form-grid,
   .provider-auth-grid,
@@ -4653,11 +5006,13 @@ tbody tr:last-child td {
   .usage-custom-range,
   .usage-advanced-grid,
   .settings-layout,
+  .settings-overview-strip,
   .settings-form-grid,
-  .settings-summary-row,
   .settings-readiness-grid,
   .settings-policy-grid,
   .settings-import-export-grid,
+  .failover-settings-grid,
+  .failover-number-grid,
   .theme-option-grid,
   .share-stats-bar,
   .share-request-log-list,
@@ -4683,6 +5038,8 @@ tbody tr:last-child td {
 
   .usage-log-card header,
   .usage-log-card footer,
+  .usage-ranking-card header,
+  .usage-ranking-card footer,
   .usage-pricing-card header,
   .usage-pricing-card footer,
   .usage-limit-card header {
@@ -4741,7 +5098,6 @@ tbody tr:last-child td {
     grid-template-columns: 1fr;
   }
 
-  .usage-dashboard .provider-summary-row,
   .universal-summary-row,
   .universal-card-grid,
   .universal-json-grid {

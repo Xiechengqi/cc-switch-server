@@ -1930,27 +1930,33 @@ function ProviderReadinessPanel({
   entry: ProviderMatrixEntry;
   capability?: AccountManagerCapability;
 }) {
+  const { tx } = useI18n();
   return (
-    <div className="provider-readiness-panel">
-      <div className="provider-readiness-header">
-        <StatusPill tone={entry.uiVisible ? "success" : "warning"}>
-          {entry.visibility === "diagnostic_only" ? "diagnostic" : "creatable"}
-        </StatusPill>
-        <span>{entry.credentialMode}</span>
+    <details className="provider-readiness-panel">
+      <summary>
+        <span>{tx("Adapter readiness")}</span>
+        <div className="provider-readiness-header">
+          <StatusPill tone={entry.uiVisible ? "success" : "warning"}>
+            {entry.visibility === "diagnostic_only" ? tx("diagnostic") : tx("creatable")}
+          </StatusPill>
+          <span>{entry.credentialMode}</span>
+        </div>
+      </summary>
+      <div className="provider-readiness-body">
+        <div className="provider-readiness-grid">
+          <ReadinessFlag label="direct" enabled={entry.directConfigSupported} />
+          <ReadinessFlag label="account" enabled={entry.accountSupported} />
+          <ReadinessFlag label="managed" enabled={entry.managedAccountRecommended} />
+          <ReadinessFlag label="refresh" enabled={capability?.supportsRefresh} />
+          <ReadinessFlag label="quota" enabled={capability?.supportsQuota} />
+          <ReadinessFlag label="plan" enabled={capability?.supportsRefreshPlan} />
+        </div>
+        <div className="provider-readiness-note">
+          {capability?.serverNativeStage || capability?.status || "direct-config"}
+          {entry.note ? ` · ${entry.note}` : ""}
+        </div>
       </div>
-      <div className="provider-readiness-grid">
-        <ReadinessFlag label="direct" enabled={entry.directConfigSupported} />
-        <ReadinessFlag label="account" enabled={entry.accountSupported} />
-        <ReadinessFlag label="managed" enabled={entry.managedAccountRecommended} />
-        <ReadinessFlag label="refresh" enabled={capability?.supportsRefresh} />
-        <ReadinessFlag label="quota" enabled={capability?.supportsQuota} />
-        <ReadinessFlag label="plan" enabled={capability?.supportsRefreshPlan} />
-      </div>
-      <div className="provider-readiness-note">
-        {capability?.serverNativeStage || capability?.status || "direct-config"}
-        {entry.note ? ` · ${entry.note}` : ""}
-      </div>
-    </div>
+    </details>
   );
 }
 

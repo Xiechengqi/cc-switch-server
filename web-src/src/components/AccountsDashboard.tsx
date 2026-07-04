@@ -723,18 +723,19 @@ function CapabilityPanel({
 }) {
   const { tx } = useI18n();
   return (
-    <section className="account-tool-panel">
+    <section className="account-tool-panel auth-readiness-panel">
       <div className="section-heading">
-        <h2>{tx("Capability Matrix")}</h2>
-        <span>{tx("{{count}} types", { count: providerTypes.length })}</span>
+        <h2>{tx("Provider readiness")}</h2>
+        <span>{tx("{{count}} account providers", { count: providerTypes.length })}</span>
       </div>
-      <div className="capability-list">
+      <div className="auth-readiness-grid">
         {providerTypes.map((providerType) => {
           const capability = capabilitiesByType.get(providerType);
           const template = templatesByType.get(providerType);
           const icon = accountProviderIcon(providerType);
+          const statusTone = capability?.supportsRefresh || capability?.supportsImport ? "success" : "warning";
           return (
-            <article className="capability-card" key={providerType}>
+            <article className="auth-readiness-card" key={providerType}>
               <header>
                 <div className="account-provider-title-row">
                   <span className="account-icon-frame compact">
@@ -745,14 +746,19 @@ function CapabilityPanel({
                     <span>{template?.credentialKind || "manual"}</span>
                   </div>
                 </div>
-                <StatusPill tone={capability?.supportsRefresh ? "success" : "warning"}>
+                <StatusPill tone={statusTone}>
                   {capability?.status || "manual_import_only"}
                 </StatusPill>
               </header>
+              <div className="auth-center-metrics">
+                <KeyValue label="login" value={capability?.supportsStartLogin ? tx("OAuth") : tx("manual")} />
+                <KeyValue label="refresh" value={capability?.supportsRefresh ? tx("ready") : tx("manual")} />
+                <KeyValue label="quota" value={capability?.supportsQuota ? tx("ready") : tx("none")} />
+              </div>
               <div className="capability-flags">
-                <span>{capability?.serverNativeStage || "manual"}</span>
+                <span>{capability?.serverNativeStage || template?.credentialKind || "manual"}</span>
                 <span>{capability?.quotaStrategy || "quota-none"}</span>
-                <span>{capability?.supportsQuota ? "quota" : "no-quota"}</span>
+                <span>{capability?.supportsImport ? "import" : "read-only"}</span>
               </div>
               <details className="template-details">
                 <summary>{tx("Import template")}</summary>

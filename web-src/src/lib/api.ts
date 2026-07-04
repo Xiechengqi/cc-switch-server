@@ -870,6 +870,11 @@ export async function loadProviderDashboardData(): Promise<{
   };
 }
 
+export async function loadStoredProviders(): Promise<StoredProvider[]> {
+  const result = await jsonFetch<{ providers: StoredProvider[] }>("/api/providers");
+  return result.providers || [];
+}
+
 export async function loadFailoverSnapshot(): Promise<FailoverSnapshot> {
   const result = await jsonFetch<{ failover: FailoverSnapshot }>("/api/failover");
   return result.failover || { apps: {}, breakers: [] };

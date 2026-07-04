@@ -22,6 +22,7 @@ import {
   RotateCcw,
   Save,
   ShieldCheck,
+  Shuffle,
   Sun,
   Upload,
 } from "lucide-react";
@@ -30,6 +31,8 @@ import { FormEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useRef, 
 import {
   BackupManifest,
   BuildInfo,
+  AppKind,
+  FailoverSnapshot,
   batchSyncRouterShares,
   claimClientTunnel,
   createBackup,
@@ -40,7 +43,9 @@ import {
   importProviders,
   importShares,
   importUniversalProviders,
+  loadFailoverSnapshot,
   loadSettingsDashboardData,
+  loadStoredProviders,
   registerRouter,
   restoreBackup,
   rotateApiToken,
@@ -54,6 +59,7 @@ import {
   stopClientTunnel,
   StoredProvider,
   TunnelRuntimeStatus,
+  updateFailoverApp,
   updateClientTunnel,
   updateRouterConfig,
   updateUpstreamProxy,
@@ -72,6 +78,7 @@ export type SettingsTab =
   | "theme"
   | "directory"
   | "proxy"
+  | "failover"
   | "router"
   | "tunnel"
   | "auth"
@@ -86,6 +93,7 @@ const settingsTabs: Array<{ id: SettingsTab; label: string }> = [
   { id: "theme", label: "Theme" },
   { id: "directory", label: "Directory" },
   { id: "proxy", label: "Proxy" },
+  { id: "failover", label: "Failover" },
   { id: "router", label: "Router" },
   { id: "tunnel", label: "Tunnel" },
   { id: "auth", label: "Auth" },
@@ -94,6 +102,8 @@ const settingsTabs: Array<{ id: SettingsTab; label: string }> = [
   { id: "diagnostics", label: "Diagnostics" },
   { id: "about", label: "About" },
 ];
+
+const APP_KINDS: AppKind[] = ["claude", "codex", "gemini"];
 
 interface RouterDraft {
   url: string;
@@ -121,13 +131,24 @@ interface EmailDraft {
   code: string;
 }
 
+interface FailoverDraft {
+  enabled: boolean;
+  providerQueue: string[];
+  failureThreshold: string;
+  openDurationSeconds: string;
+  halfOpenMaxProbes: string;
+}
+
 export function SettingsDashboard({ initialTab = "general" }: { initialTab?: SettingsTab }) {
   const { language, languages, setLanguage, t, tx } = useI18n();
   const [data, setData] = useState<SettingsDashboardData | null>(null);
   const [runtimeContext, setRuntimeContext] = useState<WebRuntimeContext | null>(null);
+  const [failoverSnapshot, setFailoverSnapshot] = useState<FailoverSnapshot>({ apps: {}, breakers: [] });
+  const [settingsProviders, setSettingsProviders] = useState<StoredProvider[]>([]);
   const [routerDraft, setRouterDraft] = useState<RouterDraft>(emptyRouterDraft());
   const [tunnelDraft, setTunnelDraft] = useState<TunnelDraft>(emptyTunnelDraft());
   const [proxyDraft, setProxyDraft] = useState<ProxyDraft>(emptyProxyDraft());
+  const [failoverDrafts, setFailoverDrafts] = useState<Record<AppKind, FailoverDraft>>(emptyFailoverDrafts());
   const [emailDraft, setEmailDraft] = useState<EmailDraft>({ email: "", code: "" });
   const [backupReason, setBackupReason] = useState("");
   const [apiToken, setApiToken] = useState<string | null>(null);
@@ -156,12 +177,17 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
     setLoading(true);
     setError(null);
     try {
-      const [next, context] = await Promise.all([
+      const [next, context, snapshot, providers] = await Promise.all([
         loadSettingsDashboardData(),
         getWebRuntimeContext().catch(() => null),
+        loadFailoverSnapshot(),
+        loadStoredProviders(),
       ]);
       setData(next);
       setRuntimeContext(context);
+      setFailoverSnapshot(snapshot);
+      setSettingsProviders(providers);
+      setFailoverDrafts(failoverDraftsFrom(snapshot));
       setRouterDraft(routerDraftFrom(next.router));
       setTunnelDraft(tunnelDraftFrom(next.tunnel));
       setProxyDraft({
@@ -235,6 +261,23 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
       return proxy.enabled
         ? tx("proxy saved: {{value}}", { value: proxy.maskedUrl || tx("configured") })
         : tx("proxy disabled");
+    });
+  }
+
+  async function saveFailover(app: AppKind, event: FormEvent) {
+    event.preventDefault();
+    const draft = failoverDrafts[app];
+    await runAction(`failover-save:${app}`, async () => {
+      const config = await updateFailoverApp(app, {
+        enabled: draft.enabled,
+        providerQueue: draft.providerQueue,
+        failureThreshold: positiveInteger(draft.failureThreshold, 2),
+        openDurationMs: positiveInteger(draft.openDurationSeconds, 300) * 1000,
+        halfOpenMaxProbes: positiveInteger(draft.halfOpenMaxProbes, 1),
+      });
+      return config.enabled
+        ? tx("{{app}} failover enabled", { app: appLabel(app) })
+        : tx("{{app}} failover disabled", { app: appLabel(app) });
     });
   }
 
@@ -328,13 +371,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
           <div className="settings-tab-panel">
             {activeTab === "general" && (
               <div className="settings-layout">
-                <div className="provider-summary-row settings-summary-row">
-                  <SummaryTile label={t("server.settings.owner")} value={data?.config.ownerEmail || "-"} />
-                  <SummaryTile label={t("server.settings.router")} value={data?.routerStatus.registered ? "registered" : "not registered"} />
-                  <SummaryTile label={t("server.settings.tunnel")} value={data?.tunnel.runtimeStatus?.status || data?.tunnel.tunnelStatus || "-"} />
-                  <SummaryTile label={t("server.settings.pendingLogs")} value={data?.routerStatus.pendingRequestLogSync ?? 0} />
-                  <SummaryTile label={t("server.settings.backups")} value={data?.backups.length ?? 0} />
-                </div>
+                {data && <SettingsOverviewStrip data={data} />}
 
                 {data && <SettingsReadinessPanel data={data} />}
               </div>
@@ -402,6 +439,19 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
               <FormFooter busy={busy === "proxy-save"} label={t("server.settings.saveProxy")} />
             </form>
           </section>
+              </div>
+            )}
+
+            {activeTab === "failover" && (
+              <div className="settings-layout">
+                <FailoverSettingsPanel
+                  snapshot={failoverSnapshot}
+                  providers={settingsProviders}
+                  drafts={failoverDrafts}
+                  busy={busy}
+                  onDraftChange={(app, draft) => setFailoverDrafts((current) => ({ ...current, [app]: draft }))}
+                  onSave={saveFailover}
+                />
               </div>
             )}
 
@@ -635,6 +685,133 @@ function ThemeSettingsPanel() {
   );
 }
 
+function FailoverSettingsPanel({
+  snapshot,
+  providers,
+  drafts,
+  busy,
+  onDraftChange,
+  onSave,
+}: {
+  snapshot: FailoverSnapshot;
+  providers: StoredProvider[];
+  drafts: Record<AppKind, FailoverDraft>;
+  busy: string | null;
+  onDraftChange: (app: AppKind, draft: FailoverDraft) => void;
+  onSave: (app: AppKind, event: FormEvent) => void;
+}) {
+  const { tx } = useI18n();
+  const totalQueued = APP_KINDS.reduce((sum, app) => sum + (snapshot.apps[app]?.providerQueue.length || 0), 0);
+  const openBreakers = snapshot.breakers.filter((breaker) => breaker.state !== "closed").length;
+  return (
+    <section className="settings-card wide settings-failover-card">
+      <SectionHeader
+        icon={<Shuffle size={17} />}
+        title={tx("Failover")}
+        subtitle={tx("Automatic provider queue and circuit breaker strategy")}
+      />
+      <div className="settings-policy-grid">
+        <KeyValue label="enabled apps" value={APP_KINDS.filter((app) => snapshot.apps[app]?.enabled).length} />
+        <KeyValue label="queued providers" value={totalQueued} />
+        <KeyValue label="open breakers" value={openBreakers} />
+      </div>
+      <div className="failover-settings-grid">
+        {APP_KINDS.map((app) => {
+          const draft = drafts[app];
+          const appProviders = providers.filter((item) => item.app === app);
+          const providerNames = new Map(appProviders.map((item) => [item.provider.id, item.provider.name || item.provider.id]));
+          const breakers = snapshot.breakers.filter((breaker) => breaker.app === app && breaker.state !== "closed");
+          return (
+            <form className="failover-settings-app" key={app} onSubmit={(event) => onSave(app, event)}>
+              <header>
+                <div>
+                  <strong>{appLabel(app)}</strong>
+                  <span>{tx("{{count}} providers available", { count: appProviders.length })}</span>
+                </div>
+                <StatusPill tone={draft.enabled ? "success" : "warning"}>
+                  {draft.enabled ? tx("enabled") : tx("disabled")}
+                </StatusPill>
+              </header>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={draft.enabled}
+                  onChange={(event) => onDraftChange(app, { ...draft, enabled: event.target.checked })}
+                />
+                <span>{tx("Enable automatic failover")}</span>
+              </label>
+              <div className="failover-number-grid">
+                <label>
+                  <span>{tx("Failure threshold")}</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={draft.failureThreshold}
+                    onChange={(event) => onDraftChange(app, { ...draft, failureThreshold: event.target.value })}
+                  />
+                </label>
+                <label>
+                  <span>{tx("Open duration seconds")}</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={draft.openDurationSeconds}
+                    onChange={(event) => onDraftChange(app, { ...draft, openDurationSeconds: event.target.value })}
+                  />
+                </label>
+                <label>
+                  <span>{tx("Half-open probes")}</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={draft.halfOpenMaxProbes}
+                    onChange={(event) => onDraftChange(app, { ...draft, halfOpenMaxProbes: event.target.value })}
+                  />
+                </label>
+              </div>
+              <div className="failover-queue-summary">
+                <div className="section-title-row compact-title">
+                  <Shuffle size={15} />
+                  <h3>{tx("Provider queue")}</h3>
+                </div>
+                {draft.providerQueue.length ? (
+                  <ol>
+                    {draft.providerQueue.map((providerId, index) => (
+                      <li key={providerId}>
+                        <span>{tx("P{{priority}}", { priority: index + 1 })}</span>
+                        <strong>{providerNames.get(providerId) || providerId}</strong>
+                        <code>{providerId}</code>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p>{tx("Queue is empty. Add providers from provider cards.")}</p>
+                )}
+              </div>
+              <div className="failover-breaker-summary">
+                <span>{tx("Breakers")}</span>
+                {breakers.length ? (
+                  breakers.slice(0, 4).map((breaker) => (
+                    <StatusPill key={breaker.providerId} tone={breaker.state === "open" ? "danger" : "warning"}>
+                      {providerNames.get(breaker.providerId) || breaker.providerId}: {breaker.state}
+                    </StatusPill>
+                  ))
+                ) : (
+                  <StatusPill tone="success">{tx("closed")}</StatusPill>
+                )}
+              </div>
+              <FormFooter busy={busy === `failover-save:${app}`} label={tx("Save failover")} />
+            </form>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function DirectoryPanel({ runtimeContext }: { runtimeContext: WebRuntimeContext | null }) {
   const { tx } = useI18n();
   const configDir = runtimeContext?.runtime?.configDir || "~/.cc-switch-server";
@@ -755,6 +932,57 @@ function SettingsReadinessPanel({ data }: { data: SettingsDashboardData }) {
         ))}
       </div>
     </section>
+  );
+}
+
+function SettingsOverviewStrip({ data }: { data: SettingsDashboardData }) {
+  const { t, tx } = useI18n();
+  const tunnelStatus = data.tunnel.runtimeStatus?.status || data.tunnel.tunnelStatus || "-";
+  const items: Array<{ label: string; value: ReactNode; detail: string; tone: "success" | "warning" | "danger" }> = [
+    {
+      label: t("server.settings.owner"),
+      value: data.config.ownerEmail || "-",
+      detail: data.config.ownerEmail ? tx("owner-bound") : tx("owner pending"),
+      tone: data.config.ownerEmail ? "success" : "warning",
+    },
+    {
+      label: t("server.settings.router"),
+      value: data.routerStatus.registered ? tx("registered") : tx("not registered"),
+      detail: data.routerStatus.lastError || formatTime(data.routerStatus.lastHeartbeatMs),
+      tone: data.routerStatus.lastError ? "danger" : data.routerStatus.registered ? "success" : "warning",
+    },
+    {
+      label: t("server.settings.tunnel"),
+      value: tunnelStatus,
+      detail: data.tunnel.runtimeStatus?.tunnelUrl || data.tunnel.tunnelSubdomain || "-",
+      tone: diagnosticTone(tunnelStatus, data.tunnel.runtimeStatus?.lastError),
+    },
+    {
+      label: t("server.settings.pendingLogs"),
+      value: data.routerStatus.pendingRequestLogSync,
+      detail: tx("request log sync backlog"),
+      tone: data.routerStatus.pendingRequestLogSync > 0 ? "warning" : "success",
+    },
+    {
+      label: t("server.settings.backups"),
+      value: data.backups.length,
+      detail: data.backups[0] ? formatTime(Math.max(...data.backups.map((backup) => backup.createdAtMs))) : tx("no snapshots"),
+      tone: data.backups.length ? "success" : "warning",
+    },
+  ];
+  return (
+    <div className="settings-overview-strip">
+      {items.map((item) => (
+        <article className="settings-overview-card" key={item.label}>
+          <div>
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+            <small>{item.detail}</small>
+          </div>
+          <StatusPill tone={item.tone}>{item.tone}</StatusPill>
+        </article>
+      ))}
+    </div>
   );
 }
 
@@ -1067,48 +1295,41 @@ function BackupTable({
 }) {
   const { tx } = useI18n();
   return (
-    <div className="table-wrap settings-table">
-      <table>
-        <thead>
-          <tr>
-            <th>{tx("ID")}</th>
-            <th>{tx("Created")}</th>
-            <th>{tx("Reason")}</th>
-            <th>{tx("Files")}</th>
-            <th>{tx("Size")}</th>
-            <th>{tx("Restore")}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {backups.length ? (
-            backups.map((backup) => (
-              <tr key={backup.id}>
-                <td title={backup.id}>{backup.id}</td>
-                <td>{formatTime(backup.createdAtMs)}</td>
-                <td>{backup.reason || "-"}</td>
-                <td>{backup.files.length}</td>
-                <td>{formatBytes(backup.files.reduce((sum, file) => sum + file.sizeBytes, 0))}</td>
-                <td>
-                  <button
-                    className="icon-button"
-                    type="button"
-                    title={tx("Restore backup")}
-                    aria-label={tx("Restore backup")}
-                    disabled={busy === `backup-restore:${backup.id}`}
-                    onClick={() => onRestore(backup)}
-                  >
-                    {busy === `backup-restore:${backup.id}` ? <Loader2 size={15} /> : <RotateCcw size={15} />}
-                  </button>
-                </td>
-              </tr>
-            ))
-          ) : (
-            <tr>
-              <td className="empty-cell" colSpan={6}>{tx("No backups")}</td>
-            </tr>
-          )}
-        </tbody>
-      </table>
+    <div className="backup-card-list">
+      {backups.length ? (
+        backups.map((backup) => {
+          const size = backup.files.reduce((sum, file) => sum + file.sizeBytes, 0);
+          const restoring = busy === `backup-restore:${backup.id}`;
+          return (
+            <article className="backup-card" key={backup.id}>
+              <header>
+                <div>
+                  <strong title={backup.id}>{backup.id}</strong>
+                  <span>{formatTime(backup.createdAtMs)}</span>
+                </div>
+                <button
+                  className="icon-button"
+                  type="button"
+                  title={tx("Restore backup")}
+                  aria-label={tx("Restore backup")}
+                  disabled={restoring}
+                  onClick={() => onRestore(backup)}
+                >
+                  {restoring ? <Loader2 size={15} /> : <RotateCcw size={15} />}
+                </button>
+              </header>
+              <div className="settings-policy-grid">
+                <KeyValue label="reason" value={backup.reason || "-"} />
+                <KeyValue label="files" value={backup.files.length} />
+                <KeyValue label="size" value={formatBytes(size)} />
+                <KeyValue label="stored files" value={backup.files.map((file) => file.fileName).sort().join(", ") || "-"} />
+              </div>
+            </article>
+          );
+        })
+      ) : (
+        <div className="provider-empty">{tx("No backups")}</div>
+      )}
     </div>
   );
 }
@@ -1118,78 +1339,67 @@ function Diagnostics({ diagnostics }: { diagnostics?: RouterDiagnosticsResponse 
   if (!diagnostics) return <div className="provider-empty">{tx("No diagnostics")}</div>;
   return (
     <div className="diagnostics-grid">
-      <div className="table-wrap settings-table">
-        <table>
-          <thead>
-            <tr>
-              <th>{tx("Tunnel")}</th>
-              <th>{tx("Kind")}</th>
-              <th>{tx("Status")}</th>
-              <th>{tx("URL")}</th>
-              <th>{tx("Error")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {diagnostics.tunnels.length ? (
-              diagnostics.tunnels.map((tunnel) => (
-                <tr key={tunnel.key}>
-                  <td>{tunnel.key}</td>
-                  <td>{tunnel.kind}</td>
-                  <td>{tunnel.status}</td>
-                  <td>{tunnel.tunnelUrl || "-"}</td>
-                  <td>{tunnel.lastError || "-"}</td>
-                </tr>
-              ))
-            ) : (
-              <tr>
-                <td className="empty-cell" colSpan={5}>{tx("No tunnels")}</td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+      <div className="diagnostics-card-grid">
+        {diagnostics.tunnels.length ? (
+          diagnostics.tunnels.map((tunnel) => (
+            <article className="diagnostics-card" key={tunnel.key}>
+              <header>
+                <div>
+                  <strong>{tunnel.key}</strong>
+                  <span>{tunnel.kind}</span>
+                </div>
+                <StatusPill tone={diagnosticTone(tunnel.status, tunnel.lastError)}>{tx(tunnel.status || "unknown")}</StatusPill>
+              </header>
+              <div className="settings-policy-grid">
+                <KeyValue label="url" value={tunnel.tunnelUrl || "-"} />
+                <KeyValue label="subdomain" value={tunnel.subdomain || "-"} />
+                <KeyValue label="lease" value={tunnel.leaseId || "-"} />
+                <KeyValue label="connected" value={formatTime(tunnel.connectedAtMs)} />
+                <KeyValue label="updated" value={formatTime(tunnel.updatedAtMs)} />
+                <KeyValue label="error" value={tunnel.lastError || "-"} />
+              </div>
+            </article>
+          ))
+        ) : (
+          <div className="provider-empty">{tx("No tunnels")}</div>
+        )}
       </div>
-      <div className="table-wrap settings-table">
-        <table>
-          <thead>
-            <tr>
-              <th>{tx("Share")}</th>
-              <th>{tx("Status")}</th>
-              <th>{tx("Synced")}</th>
-              <th>{tx("URL")}</th>
-              <th>{tx("Error")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {diagnostics.shareSync.length ? (
-              diagnostics.shareSync.map((share) => (
-                <tr key={share.shareId}>
-                  <td>{share.shareName}</td>
-                  <td>{share.enabled ? share.status : "disabled"}</td>
-                  <td>{formatTime(share.routerLastSyncedAtMs)}</td>
-                  <td>{share.routerUrl || "-"}</td>
-                  <td>{share.routerLastSyncError || "-"}</td>
-                </tr>
-              ))
-            ) : (
-              <tr>
-                <td className="empty-cell" colSpan={5}>{tx("No share sync diagnostics")}</td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+      <div className="diagnostics-card-grid">
+        {diagnostics.shareSync.length ? (
+          diagnostics.shareSync.map((share) => {
+            const status = share.enabled ? share.status : "disabled";
+            return (
+              <article className="diagnostics-card" key={share.shareId}>
+                <header>
+                  <div>
+                    <strong>{share.shareName || share.shareId}</strong>
+                    <span>{share.shareId}</span>
+                  </div>
+                  <StatusPill tone={diagnosticTone(status, share.routerLastSyncError)}>{tx(status)}</StatusPill>
+                </header>
+                <div className="settings-policy-grid">
+                  <KeyValue label="synced" value={formatTime(share.routerLastSyncedAtMs)} />
+                  <KeyValue label="url" value={share.routerUrl || "-"} />
+                  <KeyValue label="enabled" value={share.enabled ? "yes" : "no"} />
+                  <KeyValue label="error" value={share.routerLastSyncError || "-"} />
+                </div>
+              </article>
+            );
+          })
+        ) : (
+          <div className="provider-empty">{tx("No share sync diagnostics")}</div>
+        )}
       </div>
     </div>
   );
 }
 
-function SummaryTile({ label, value }: { label: string; value: ReactNode }) {
-  const { tx } = useI18n();
-  return (
-    <div className="summary-tile">
-      <span>{tx(label)}</span>
-      <strong>{value}</strong>
-    </div>
-  );
+function diagnosticTone(status?: string | null, error?: string | null): "success" | "warning" | "danger" {
+  if (error) return "danger";
+  const normalized = status?.trim().toLowerCase();
+  if (!normalized || ["disabled", "stopped", "ended", "unknown"].includes(normalized)) return "warning";
+  if (["error", "failed", "expired", "exhausted"].includes(normalized)) return "danger";
+  return "success";
 }
 
 function KeyValue({ label, value }: { label: string; value: ReactNode }) {
@@ -1296,6 +1506,48 @@ function emptyTunnelDraft(): TunnelDraft {
 
 function emptyProxyDraft(): ProxyDraft {
   return { url: "", clear: false, followSystemProxy: true };
+}
+
+function emptyFailoverDrafts(): Record<AppKind, FailoverDraft> {
+  return APP_KINDS.reduce(
+    (drafts, app) => {
+      drafts[app] = failoverDraftFrom();
+      return drafts;
+    },
+    {} as Record<AppKind, FailoverDraft>,
+  );
+}
+
+function failoverDraftsFrom(snapshot: FailoverSnapshot): Record<AppKind, FailoverDraft> {
+  return APP_KINDS.reduce(
+    (drafts, app) => {
+      drafts[app] = failoverDraftFrom(snapshot.apps[app]);
+      return drafts;
+    },
+    {} as Record<AppKind, FailoverDraft>,
+  );
+}
+
+function failoverDraftFrom(config?: FailoverSnapshot["apps"][AppKind]): FailoverDraft {
+  return {
+    enabled: Boolean(config?.enabled),
+    providerQueue: [...(config?.providerQueue || [])],
+    failureThreshold: String(config?.failureThreshold ?? 2),
+    openDurationSeconds: String(Math.max(1, Math.round((config?.openDurationMs ?? 300000) / 1000))),
+    halfOpenMaxProbes: String(config?.halfOpenMaxProbes ?? 1),
+  };
+}
+
+function positiveInteger(value: string, fallback: number): number {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return parsed;
+}
+
+function appLabel(app: AppKind): string {
+  if (app === "claude") return "Claude Code";
+  if (app === "codex") return "Codex";
+  return "Gemini";
 }
 
 function formatTime(value?: number | null): string {
