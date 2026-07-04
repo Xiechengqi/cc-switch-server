@@ -606,9 +606,9 @@ function DataSourceBar({
   if (loading) {
     return (
       <section className="usage-data-source-panel">
-        <div className="section-title-row compact-title">
-          <Database size={17} />
-          <h2>{tx("Loaded Sources")}</h2>
+        <div className="usage-data-source-label">
+          <Database size={15} />
+          <span>{tx("Data Sources")}</span>
         </div>
         <div className="provider-empty inline-empty">
           <Loader2 size={18} />
@@ -635,9 +635,9 @@ function DataSourceBar({
 
   return (
     <section className="usage-data-source-panel" aria-label={tx("Loaded usage sources")}>
-      <div className="section-title-row compact-title">
-        <Database size={17} />
-        <h2>{tx("Loaded Sources")}</h2>
+      <div className="usage-data-source-label">
+        <Database size={15} />
+        <span>{tx("Data Sources")}</span>
       </div>
       <div className="usage-data-source-list">
         <DataSourceChip
@@ -675,7 +675,7 @@ function DataSourceChip({
   const failureRate = source.requests > 0 ? (source.failures / source.requests) * 100 : 0;
   return (
     <button className={active ? "usage-data-source-chip active" : "usage-data-source-chip"} type="button" onClick={onClick}>
-      {source.dataSource === "all" || source.dataSource.includes("session") ? <FileText size={15} /> : <Database size={15} />}
+      {dataSourceIcon(source.dataSource)}
       <span>
         <strong>{tx(label)}</strong>
         <small>{formatInt(source.requests)} req</small>
@@ -690,6 +690,20 @@ function DataSourceChip({
       </span>
     </button>
   );
+}
+
+function dataSourceIcon(dataSource: string): ReactNode {
+  if (dataSource === "all") return <Database size={15} />;
+  if (
+    dataSource === "session_log" ||
+    dataSource === "codex_session" ||
+    dataSource === "gemini_session" ||
+    dataSource === "opencode_session" ||
+    dataSource.includes("session")
+  ) {
+    return <FileText size={15} />;
+  }
+  return <Database size={15} />;
 }
 
 function UsageSummaryGrid({ summary, loading }: { summary: UsageRollup; loading: boolean }) {

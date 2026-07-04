@@ -95,6 +95,9 @@ interface BindingDraft {
   providerId: string;
 }
 
+type ShareFilter = "all" | "active" | "paused" | "expired" | "exhausted" | "sale";
+type ShareSort = "createdAtDesc" | "expiresAtAsc" | "tokensUsedDesc" | "nameAsc";
+
 const apps: Array<{ id: AppKind; label: string }> = [
   { id: "claude", label: "Claude" },
   { id: "codex", label: "Codex" },
@@ -120,7 +123,8 @@ export function ShareDashboard() {
   const [exportText, setExportText] = useState<string | null>(null);
   const [ownerChangeDraft, setOwnerChangeDraft] = useState<ShareDraft | null>(null);
   const [shareQuery, setShareQuery] = useState("");
-  const [shareFilter, setShareFilter] = useState<"all" | "active" | "paused" | "sale">("all");
+  const [shareFilter, setShareFilter] = useState<ShareFilter>("all");
+  const [shareSort, setShareSort] = useState<ShareSort>("createdAtDesc");
   const [toolbarConfirm, setToolbarConfirm] = useState<"restore" | "edits" | null>(null);
 
   const refresh = useCallback(async () => {
@@ -156,8 +160,8 @@ export function ShareDashboard() {
     return data.requestLogs.filter((log) => log.shareId && shareIds.has(log.shareId));
   }, [data.requestLogs, data.shares]);
   const filteredShares = useMemo(
-    () => filterShares(data.shares, shareQuery, shareFilter),
-    [data.shares, shareFilter, shareQuery],
+    () => filterShares(data.shares, shareQuery, shareFilter, shareSort),
+    [data.shares, shareFilter, shareQuery, shareSort],
   );
 
   async function runShareAction(
@@ -355,10 +359,12 @@ export function ShareDashboard() {
       <ShareToolbar
         query={shareQuery}
         filter={shareFilter}
+        sort={shareSort}
         total={data.shares.length}
         visible={filteredShares.length}
         onQueryChange={setShareQuery}
         onFilterChange={setShareFilter}
+        onSortChange={setShareSort}
       />
 
       <ShareTunnelConfigPanel
@@ -1576,24 +1582,36 @@ function ModalFooter({
 function ShareToolbar({
   query,
   filter,
+  sort,
   total,
   visible,
   onQueryChange,
   onFilterChange,
+  onSortChange,
 }: {
   query: string;
-  filter: "all" | "active" | "paused" | "sale";
+  filter: ShareFilter;
+  sort: ShareSort;
   total: number;
   visible: number;
   onQueryChange: (value: string) => void;
-  onFilterChange: (value: "all" | "active" | "paused" | "sale") => void;
+  onFilterChange: (value: ShareFilter) => void;
+  onSortChange: (value: ShareSort) => void;
 }) {
   const { tx } = useI18n();
-  const filters: Array<{ id: "all" | "active" | "paused" | "sale"; label: string }> = [
+  const filters: Array<{ id: ShareFilter; label: string }> = [
     { id: "all", label: "all" },
     { id: "active", label: "active" },
     { id: "paused", label: "paused" },
+    { id: "expired", label: "expired" },
+    { id: "exhausted", label: "exhausted" },
     { id: "sale", label: "for sale" },
+  ];
+  const sortOptions: Array<{ id: ShareSort; label: string }> = [
+    { id: "createdAtDesc", label: "Created time desc" },
+    { id: "expiresAtAsc", label: "Expires time asc" },
+    { id: "tokensUsedDesc", label: "Tokens used desc" },
+    { id: "nameAsc", label: "Name asc" },
   ];
   return (
     <section className="share-toolbar">
@@ -1619,6 +1637,16 @@ function ShareToolbar({
           </button>
         ))}
       </div>
+      <label className="share-sort">
+        <SlidersHorizontal size={14} />
+        <select value={sort} onChange={(event) => onSortChange(event.target.value as ShareSort)}>
+          {sortOptions.map((item) => (
+            <option key={item.id} value={item.id}>
+              {tx(item.label)}
+            </option>
+          ))}
+        </select>
+      </label>
       <span className="share-filter-count">{tx("{{visible}}/{{total}} shares", { visible, total })}</span>
     </section>
   );
@@ -1664,12 +1692,15 @@ function ShareEmptyState({
 function filterShares(
   shares: ShareRecord[],
   query: string,
-  filter: "all" | "active" | "paused" | "sale",
+  filter: ShareFilter,
+  sort: ShareSort,
 ): ShareRecord[] {
   const normalizedQuery = query.trim().toLowerCase();
   return shares.filter((share) => {
     if (filter === "active" && share.status !== "active") return false;
     if (filter === "paused" && share.status !== "paused") return false;
+    if (filter === "expired" && share.status !== "expired") return false;
+    if (filter === "exhausted" && share.status !== "exhausted") return false;
     if (filter === "sale" && !share.forSale) return false;
     if (!normalizedQuery) return true;
     return [
@@ -1689,7 +1720,66 @@ function filterShares(
       .join(" ")
       .toLowerCase()
       .includes(normalizedQuery);
-  });
+  }).sort((left, right) => compareShares(left, right, sort));
+}
+
+function compareShares(left: ShareRecord, right: ShareRecord, sort: ShareSort): number {
+  if (sort === "expiresAtAsc") {
+    return compareNullableNumber(left.expiresAt, right.expiresAt, "asc");
+  }
+  if (sort === "tokensUsedDesc") {
+    return compareNumber(right.tokensUsed, left.tokensUsed) || compareShareName(left, right);
+  }
+  if (sort === "nameAsc") {
+    return compareShareName(left, right);
+  }
+  return compareNullableNumber(shareCreatedAtMs(left), shareCreatedAtMs(right), "desc");
+}
+
+function shareCreatedAtMs(share: ShareRecord): number | null {
+  return normalizeTimeMs(
+    share.createdAtMs ??
+      share.createdAt ??
+      share.created_at_ms ??
+      share.created_at,
+  );
+}
+
+function normalizeTimeMs(value: number | string | null | undefined): number | null {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    return value > 0 && value < 10_000_000_000 ? value * 1000 : value;
+  }
+  if (typeof value !== "string" || !value.trim()) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return numeric > 0 && numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function compareNullableNumber(
+  left: number | null | undefined,
+  right: number | null | undefined,
+  direction: "asc" | "desc",
+): number {
+  const leftValid = typeof left === "number" && Number.isFinite(left);
+  const rightValid = typeof right === "number" && Number.isFinite(right);
+  if (!leftValid && !rightValid) return 0;
+  if (!leftValid) return 1;
+  if (!rightValid) return -1;
+  return direction === "asc" ? compareNumber(left, right) : compareNumber(right, left);
+}
+
+function compareNumber(left: number | null | undefined, right: number | null | undefined): number {
+  return (left || 0) - (right || 0);
+}
+
+function compareShareName(left: ShareRecord, right: ShareRecord): number {
+  const leftName = (left.displayName || left.id || "").toLowerCase();
+  const rightName = (right.displayName || right.id || "").toLowerCase();
+  return leftName.localeCompare(rightName);
 }
 
 function ShareStat({ label, value }: { label: string; value: ReactNode }) {

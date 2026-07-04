@@ -343,6 +343,10 @@ export interface ShareRecord {
   parallelLimit?: number | null;
   tokensUsed: number;
   requestsCount: number;
+  createdAtMs?: number | null;
+  createdAt?: number | string | null;
+  created_at_ms?: number | string | null;
+  created_at?: number | string | null;
   expiresAt?: number | null;
   forSale: boolean;
   saleMarketKind: string;

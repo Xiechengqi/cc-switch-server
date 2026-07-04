@@ -942,6 +942,7 @@ function ProviderCard({
         </button>
         <IconAction
           title="Delete"
+          disabledTitle="Current provider cannot be deleted"
           onClick={() => setDeleteConfirmOpen(true)}
           busy={busyId === `${busyPrefix}delete`}
           disabled={current}
@@ -2169,6 +2170,7 @@ function StatusPill({
 
 function IconAction({
   title,
+  disabledTitle,
   children,
   busy,
   disabled,
@@ -2176,6 +2178,7 @@ function IconAction({
   onClick,
 }: {
   title: string;
+  disabledTitle?: string;
   children: ReactNode;
   busy?: boolean;
   disabled?: boolean;
@@ -2183,18 +2186,19 @@ function IconAction({
   onClick: () => void;
 }) {
   const { tx } = useI18n();
-  const translatedTitle = tx(title);
+  const translatedTitle = tx(disabled && disabledTitle ? disabledTitle : title);
   return (
-    <button
-      className={danger ? "icon-button danger" : "icon-button"}
-      type="button"
-      title={translatedTitle}
-      aria-label={translatedTitle}
-      onClick={onClick}
-      disabled={busy || disabled}
-    >
-      {busy ? <Loader2 size={15} /> : children}
-    </button>
+    <span className="icon-action-wrap" title={translatedTitle}>
+      <button
+        className={danger ? "icon-button danger" : "icon-button"}
+        type="button"
+        aria-label={translatedTitle}
+        onClick={onClick}
+        disabled={busy || disabled}
+      >
+        {busy ? <Loader2 size={15} /> : children}
+      </button>
+    </span>
   );
 }
 
