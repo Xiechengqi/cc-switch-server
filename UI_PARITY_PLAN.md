@@ -984,6 +984,84 @@ U0（基座）→ U1（壳）→ U2（Provider 主视图）→ U3（对话框，
 - `UsageDataSourceSummary` 类型与 `emptyDataSourceSummary` 同步迁入 DataSourceBar 文件，由 UsageDashboard 导入复用；请求数/成本格式化 helper 在 DataSourceBar 内保持原逻辑。
 - 保留 Data Sources 横条 DOM、CSS class、source icon mapping、loading/empty 行为、source filter 选择数据流；不改变 usage API 查询或 rollup 计算。
 
+### 2026-07-05 UsageFilterBar extraction
+
+- 将 `UsageFilterBar`、`UsageRangePicker`、`usageAdvancedFilterCount` 从 `UsageDashboard.tsx` 抽到 `components/usage/UsageFilterBar.tsx`，并从 usage barrel 导出。
+- `UsageFilterDraft`、`RangePreset`、`dateTimeInput` 与 `usageRangeLabel` 同步迁入 UsageFilterBar 文件，UsageDashboard 只保留 filter-to-API 转换和页面组合逻辑。
+- 保留 app segmented control、range presets/custom live end time、高级过滤项、CSS class、i18n 文案和 usage 查询参数生成；不改变 usage API、默认 1d range 或 ProviderCard focus 行为。
+
+### 2026-07-05 UsageLogsPanel extraction
+
+- 将 `LogsPanel` 与 `UsageLogCard` 从 `UsageDashboard.tsx` 抽到 `components/usage/UsageLogsPanel.tsx`，并从 usage barrel 导出 `UsageLogsPanel`。
+- 新增 `components/usage/UsageMiniMetric.tsx` 供 logs、ranking、pricing summary 共享；新增 `components/usage/usageDisplay.ts` 集中 `freshInputTokens`、`modelRoute`、`sourceText`、`formatLatency`、`formatTime`、`formatInt`、`formatUsd`、`successRate` 等 Usage 展示 helper。
+- 保留 request log activity card DOM、CSS class、provider icon/status/detail button、detail modal 的 route/source/latency 展示和 data source rollup 计算；不改变 usage API、日志详情 API 或过滤行为。
+
+### 2026-07-05 UsageRankingGrid extraction
+
+- 将 `ProviderRankingGrid`、`ModelRankingGrid`、ranking card 与 `UsageRankCell` 从 `UsageDashboard.tsx` 抽到 `components/usage/UsageRankingGrid.tsx`，并从 usage barrel 导出。
+- `modelStatsRoute` 与 `formatMaybeMs` 同步迁入 `components/usage/usageDisplay.ts`，和 logs/detail 共享 Usage 展示 helper 归口。
+- 保留 provider/model ranking card DOM、CSS class、rank badge、token share meter、mini metrics、last request 字段、loading/empty 行为和排序数据来源；不改变 usage API 或 stats filter 行为。
+
+### 2026-07-05 Usage summary/trend extraction
+
+- 将 `UsageSummaryGrid` 与 `UsageMetricCard` 从 `UsageDashboard.tsx` 抽到 `components/usage/UsageSummaryGrid.tsx`，并从 usage barrel 导出。
+- 将 SVG `TrendPanel` 抽到 `components/usage/UsageTrendPanel.tsx`；`compactTime` 与 `compactNumber` 同步迁入 `components/usage/usageDisplay.ts`。
+- 保留 summary metric cards、trend chart SVG、bucket click/keyboard custom range 回填、loading/empty 行为、CSS class 和 i18n 文案；不改变 usage rollup/trend API 或 range 查询语义。
+
+### 2026-07-05 Usage limits extraction
+
+- 将 `ProviderLimitsGrid`、`ProviderLimitCard` 与 `LimitMeter` 从 `UsageDashboard.tsx` 抽到 `components/usage/UsageLimitsGrid.tsx`，并从 usage barrel 导出。
+- `limitPercent` 同步迁入 `components/usage/usageDisplay.ts`，与其他 Usage 展示计算 helper 归口。
+- 保留 provider limits card DOM、CSS class、daily/monthly/quota meter、warning/share strip、loading/empty 行为和 ProviderCard focus 过滤；不改变 limits API、filterProviderLimits 逻辑或任何限额判定。
+
+### 2026-07-05 Usage request detail extraction
+
+- 将只读 `RequestDetailModal` 从 `UsageDashboard.tsx` 抽到 `components/usage/UsageRequestDetailModal.tsx`，并从 usage barrel 导出。
+- 新组件直接消费 `loadUsageLogDetail()` 与 `usageDisplay` helper，保留详情弹窗字段、JSON preview、loading/error 行为和 `SimpleModal` 外观。
+- UsageDashboard 只保留 `detailId` 状态与打开/关闭编排；不改变 usage log detail API、request id 传递或详情展示字段。
+
+### 2026-07-05 Usage pricing extraction
+
+- 将 `PricingPanel`、`PricingCard`、`PricingDefaultsModal`、`PricingModal` 从 `UsageDashboard.tsx` 抽到 `components/usage/UsagePricingPanel.tsx`，并从 usage barrel 导出。
+- `PricingDraft`、`pricingDefaultTemplates`、`emptyPricingDraft`、`pricingDraftFromModel`、`pricingDraftFromDefault`、`pricingInputFromModel`、`hasPricingModel` 迁入 pricing 文件；dashboard 继续保留 save/delete/backfill/apply missing 的 API action 编排。
+- 保留 pricing card grid、default pricing modal、pricing edit modal、validation、busy states、CSS class、i18n 文案、confirm 流程和 save/delete API 行为；不改变 pricing schema 或默认模板内容。
+
+### 2026-07-05 Share request log extraction
+
+- 将 `ShareRequestLogPanel` 与 `ShareRequestLogCard` 从 `SharePage.tsx` 抽到 `components/share/ShareRequestLogPanel.tsx`，并从 share barrel 导出。
+- `formatTokens`、`formatUsd`、`formatDuration` 按原实现迁入 `components/share/shareDisplay.ts`，与 `shareName`、`formatTime` 等 share 展示 helper 归口。
+- 保留 share request activity card DOM、CSS class、app icon、status、tokens/cost/latency metrics、tags、80 条展示限制和 share id/name 映射；不改变 request log 数据来源或 share 过滤逻辑。
+
+### 2026-07-05 ShareTunnelConfigPanel extraction
+
+- 将 `ShareTunnelConfigPanel`、`ShareTunnelMetric`、`ShareTunnelRoute` 从 `SharePage.tsx` 抽到 `components/share/ShareTunnelConfigPanel.tsx`，并从 share barrel 导出。
+- 新组件通过 props 接收 shares/markets/busy 状态与 snapshot/restore/pull edits/load markets 回调，SharePage 继续负责 API action 编排和确认流程。
+- 保留 tunnel config panel DOM、CSS class、metric 计算、route list 排序、loading button 状态和 status pill 逻辑；不改变 tunnel/router/market API 调用或行为。
+
+### 2026-07-05 ImportSharesModal extraction
+
+- 将 `ImportSharesModal` 从 `SharePage.tsx` 抽到 `components/share/ImportSharesModal.tsx`，并从 share barrel 导出。
+- 新组件内部保留 JSON parse、`{ shares }`/array 兼容、pending import confirm 和本地错误展示；SharePage 继续通过 `onSubmit` 触发原 `importShares()` action。
+- 保留 modal DOM、CSS class、ModalFooter、ConfirmDialog、i18n 文案、保存 busy 状态和导入确认语义；不改变 shares import API 或导入 payload 格式。
+
+### 2026-07-05 ShareRuntimePanel extraction
+
+- 将 `ShareRuntimePanel`、`RuntimeValue`、`ShareAppRuntimeRow` 与 runtime snapshot 解析/健康展示 helper 从 `SharePage.tsx` 抽到 `components/share/ShareRuntimePanel.tsx`，并从 share barrel 导出。
+- SharePage 继续在 `ShareCard` 的 `runtimePanel` prop 位置渲染 `<ShareRuntimePanel share={share} />`，避免改变卡片 DOM 位置或 ShareCard 边界。
+- 保留 runtime grid、last request row、per-app runtime rows、model health rows、Runtime JSON preview、status tone、格式化逻辑和空态；不改变 share runtime snapshot 数据来源或任何 share API。
+
+### 2026-07-05 Share edit modals extraction
+
+- 将 `AclModal`、`SubdomainModal`、`BindingModal`、`MarketModal` 从 `SharePage.tsx` 抽到 `components/share/ShareEditModals.tsx`，并从 share barrel 导出。
+- `BindingDraft` 类型同步迁入 `ShareEditModals.tsx`；SharePage 继续持有弹窗 open/draft 状态和 replace ACL/update subdomain/update binding/authorize market 的 API action 编排。
+- 保留四个弹窗的 DOM、CSS class、ModalFooter、market loading、provider selector、ACL split 逻辑、i18n 文案和提交 payload；不改变 share ACL/subdomain/binding/market API 或行为。
+
+### 2026-07-05 OwnerChangeModal extraction
+
+- 将 owner handoff 验证弹窗从 `SharePage.tsx` 抽到 `components/share/OwnerChangeModal.tsx`，并从 share barrel 导出。
+- 新组件内部保留 request code/verify code 的本地结果与错误状态；SharePage 继续持有 owner change draft、request/verify API action 编排和保存 busy 状态。
+- 保留 owner handoff DOM、CSS class、ModalFooter、步骤展示、cooldown 文案和 email code 校验；不改变 share owner change API 或保存流程。
+
 ## 六、验证基线
 
 - 静态：`scripts/static-checks.sh`（含 i18n 字面量扫描，U9 加入）+ `npm --prefix web-src run typecheck` + Vite build。

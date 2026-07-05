@@ -51,3 +51,20 @@ export function formatTime(value?: number | null): string {
     timeStyle: "short",
   }).format(date);
 }
+
+export function formatTokens(value?: number | null): string {
+  if (value == null) return "-";
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
+}
+
+export function formatUsd(value?: number | null): string {
+  if (value == null) return "-";
+  if (Math.abs(value) < 0.01 && value !== 0) return `$${value.toFixed(6)}`;
+  return `$${value.toFixed(4)}`;
+}
+
+export function formatDuration(value?: number | null): string {
+  if (value == null) return "-";
+  if (value < 1000) return `${Math.round(value)}ms`;
+  return `${(value / 1000).toFixed(2)}s`;
+}
