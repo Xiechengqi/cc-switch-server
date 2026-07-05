@@ -1062,6 +1062,54 @@ U0（基座）→ U1（壳）→ U2（Provider 主视图）→ U3（对话框，
 - 新组件内部保留 request code/verify code 的本地结果与错误状态；SharePage 继续持有 owner change draft、request/verify API action 编排和保存 busy 状态。
 - 保留 owner handoff DOM、CSS class、ModalFooter、步骤展示、cooldown 文案和 email code 校验；不改变 share owner change API 或保存流程。
 
+### 2026-07-05 ShareFormModal extraction
+
+- 将 Share 创建/编辑表单从 `SharePage.tsx` 抽到 `components/share/ShareFormModal.tsx`，并从 share barrel 导出。
+- `ShareDraft`、`createShareDraft`、`editShareDraft`、`shareOwnerChanged`、`shareInputFromDraft`、`createBindingDraft` 与 draft/payload/date/list 转换 helper 同步迁入表单文件。
+- SharePage 继续保留页面状态、API action 编排、owner change 验证、导入导出和结果反馈；不改变 share 保存 payload、binding 选择、owner handoff 或 CRUD 行为。
+
+### 2026-07-05 Share stats/filter extraction
+
+- 将 `ShareStatsBar` 从 `SharePage.tsx` 抽到 `components/share/ShareStatsBar.tsx`，并从 share barrel 导出。
+- 将 share 搜索、状态过滤、排序与 created-at 归一化 helper 抽到 `components/share/ShareListFiltering.ts`。
+- SharePage 只保留 stats/filter 的状态编排和列表渲染；不改变 visible/total 计数、搜索字段、排序语义、空态或 share card 渲染行为。
+
+### 2026-07-05 Provider draft/helper extraction
+
+- 新增 `components/providers/providerDraft.ts`，集中 `ProviderDraft`、create/edit draft、draft-to-provider、duplicate provider、provider list search、account/capability binding 与 provider form placeholder/helper。
+- `ProviderList.tsx` 改为只导入 provider draft/helper，保留列表状态、API action 编排、dnd、failover 与卡片渲染；`ProviderFormModal.tsx` 改为从 `providerDraft.ts` 导入 `ProviderDraft` 和共享 helper。
+- 消除 `ProviderFormModal` 从 `ProviderList` 导入类型的耦合，并移除表单内重复的账号匹配、颜色 fallback、model catalog/mapping/pricing placeholder 与 error helper；不改变 provider 保存 JSON、复制、模型拉取、账号绑定或搜索行为。
+
+### 2026-07-05 Provider form sections extraction
+
+- 新增 `components/providers/ProviderFormSections.tsx`，抽出 `ProviderAuthSection`、`ProviderModelField`、`ProviderDesktopAdvancedSection`、`ProviderJsonField` 与 model catalog option/fetch merge helper，并从 providers barrel 导出主要区块。
+- `ProviderFormModal.tsx` 只保留弹窗壳、draft patch、icon editor、fetch-models action 编排和高级 JSON 容器；authentication/endpoint、model selector、desktop advanced options 与 JSON card 由子组件承接。
+- 保留 API key show/hide、managed account、API format selector、fetch models、Codex reasoning、request override、model catalog/mapping/pricing JSON 的 DOM、CSS class、i18n 和状态流；不改变 provider 保存或模型拉取行为。
+
+### 2026-07-05 Universal form/draft extraction
+
+- 新增 `components/universal/UniversalFormModal.tsx`，抽出 `UniversalDraft`、`UniversalFormModal`、per-app config card、model catalog/mapping JSON fields、draft/provider/preset 转换 helper、sync summary 与 error helper。
+- `UniversalProviderPanel.tsx` 继续保留 universal 列表状态、dnd、import/export、preset modal、sync/delete/duplicate action 编排和确认流程；form UI 与保存 payload 转换由新文件承接。
+- 保留 Universal 表单 DOM、CSS class、IconPicker/ColorPicker、Claude/Codex/Gemini per-app fields、Save and Sync、model catalog/mapping JSON、preset draft 初始化和 sync summary 文案；不改变 universal provider 保存、同步、preset 或导入导出行为。
+
+### 2026-07-05 AuthCenter display helper extraction
+
+- 新增 `components/settings/accountDisplay.ts`，集中 provider label/icon 推断、credential flags、account regression badges、quota percent/tier/relative time、banked reset summary 与时间格式化 helper。
+- `AuthCenterPanel.tsx` 继续保留账号列表、OAuth/device flow、import modal、quota/refresh/delete action 编排和卡片 DOM；AccountCard、QuotaFooter、readiness cards 与 Codex banked reset 面板改为导入共享 helper。
+- 保留账号图标、readiness badge、quota meter、tier reset 倒计时、banked reset 展示、provider label 排序和时间/日期格式；不改变账号 API、导入 payload、OAuth/device flow 或 quota refresh 行为。
+
+### 2026-07-05 Settings ImportExport extraction
+
+- 新增 `components/settings/SettingsSectionHeader.tsx`，抽出 settings card 统一标题结构，供 SettingsPage 和后续 settings 子组件复用。
+- 新增 `components/settings/ImportExportPanel.tsx`，抽出 providers/shares/universal providers 的 JSON 导入导出卡片、导入确认和 normalize helper，并从 settings barrel 导出。
+- `SettingsPage.tsx` 继续通过 `runAction` 传入 busy/result/error 编排；ImportExportPanel 直接复用原 export/import API wrapper、JSON 格式、确认文案和导入兼容逻辑，不改变设置 tab 行为或 payload 格式。
+
+### 2026-07-05 Settings status panels extraction
+
+- 新增 `components/settings/SettingsStatusPanels.tsx`，抽出 `RouterFacts`、`TunnelStatus`、`BackupPolicySummary`、`BackupSnapshotGrid`、`DiagnosticsSummary`、`Diagnostics` 和对应 status/time/size 展示 helper，并从 settings barrel 导出。
+- `SettingsPage.tsx` 继续保留 router/tunnel/backup/diagnostics tab 的 action 编排、确认流程和表单状态；状态卡片、备份快照卡片与诊断卡片由新文件承接。
+- 保留 router facts、tunnel runtime、backup restore button、backup policy summary、diagnostics tunnel/share cards 的 DOM、CSS class、i18n 文案和 busy/restore 行为；不改变 router/tunnel/backup/diagnostics API 调用。
+
 ## 六、验证基线
 
 - 静态：`scripts/static-checks.sh`（含 i18n 字面量扫描，U9 加入）+ `npm --prefix web-src run typecheck` + Vite build。

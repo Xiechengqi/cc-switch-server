@@ -5,8 +5,6 @@ import {
   CheckCircle2,
   Cloud,
   Copy,
-  Download,
-  FileJson,
   FolderOpen,
   GitCommit,
   Info,
@@ -24,7 +22,6 @@ import {
   ShieldCheck,
   Shuffle,
   Sun,
-  Upload,
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
@@ -36,13 +33,7 @@ import {
   batchSyncRouterShares,
   claimClientTunnel,
   createBackup,
-  exportProviders,
-  exportShares,
-  exportUniversalProviders,
   heartbeatRouter,
-  importProviders,
-  importShares,
-  importUniversalProviders,
   loadFailoverSnapshot,
   loadSettingsPageData,
   loadStoredProviders,
@@ -51,24 +42,30 @@ import {
   rotateApiToken,
   requestEmailLoginCode,
   RouterConfigView,
-  RouterDiagnosticsResponse,
   RouterStatusResponse,
   SettingsPageData,
-  ShareRecord,
   startClientTunnel,
   stopClientTunnel,
   StoredProvider,
-  TunnelRuntimeStatus,
   updateFailoverApp,
   updateClientTunnel,
   updateRouterConfig,
   updateUpstreamProxy,
   verifyEmailLoginCode,
-  UniversalProvider,
 } from "@/lib/api";
 import { Language, useI18n } from "@/lib/i18n";
 import { getWebRuntimeContext, WebRuntimeContext, writeToken } from "@/lib/runtime";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
+import { ImportExportPanel } from "@/components/settings/ImportExportPanel";
+import { SectionHeader } from "@/components/settings/SettingsSectionHeader";
+import {
+  BackupPolicySummary,
+  BackupSnapshotGrid,
+  Diagnostics,
+  DiagnosticsSummary,
+  RouterFacts,
+  TunnelStatus,
+} from "@/components/settings/SettingsStatusPanels";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LoadingBlock } from "@/components/LoadingBlock";
 import { TextField } from "@/components/TextField";
@@ -653,18 +650,6 @@ export function SettingsPage({ initialTab = "general" }: { initialTab?: Settings
   );
 }
 
-function SectionHeader({ icon, title, subtitle }: { icon: ReactNode; title: string; subtitle: string }) {
-  return (
-    <header className="settings-card-header">
-      <div className="section-title-row compact-title">
-        {icon}
-        <h3>{title}</h3>
-      </div>
-      <span>{subtitle}</span>
-    </header>
-  );
-}
-
 function ThemeSettingsPanel() {
   const { theme, setTheme } = useTheme();
   const { tx } = useI18n();
@@ -1000,228 +985,6 @@ function SettingsOverviewStrip({ data }: { data: SettingsPageData }) {
   );
 }
 
-function BackupPolicySummary({ backups }: { backups: BackupManifest[] }) {
-  const latest = [...backups].sort((left, right) => right.createdAtMs - left.createdAtMs)[0];
-  const totalBytes = backups.reduce(
-    (sum, backup) => sum + backup.files.reduce((fileSum, file) => fileSum + file.sizeBytes, 0),
-    0,
-  );
-  const latestFiles = latest?.files.map((file) => file.fileName).sort().join(", ") || "-";
-  return (
-    <div className="settings-policy-grid">
-      <KeyValue label="latest" value={formatTime(latest?.createdAtMs)} />
-      <KeyValue label="snapshots" value={backups.length} />
-      <KeyValue label="total size" value={formatBytes(totalBytes)} />
-      <KeyValue label="retention" value="24 periodic" />
-      <KeyValue label="latest files" value={latestFiles} />
-      <KeyValue label="restore safety" value="pre-restore snapshot" />
-    </div>
-  );
-}
-
-function ImportExportPanel({
-  busy,
-  runAction,
-}: {
-  busy: string | null;
-  runAction: (action: string, task: () => Promise<string>) => Promise<void>;
-}) {
-  const { tx } = useI18n();
-  return (
-    <>
-      <section className="settings-card wide">
-        <SectionHeader
-          icon={<FileJson size={17} />}
-          title={tx("Import / Export")}
-          subtitle={tx("Move server provider, share, and universal provider JSON data")}
-        />
-        <div className="settings-import-export-grid">
-          <ImportExportCard<StoredProvider>
-            title={tx("Providers")}
-            subtitle={tx("Claude, Codex, and Gemini provider configurations")}
-            actionKey="providers"
-            busy={busy}
-            exportData={exportProviders}
-            importData={importProviders}
-            normalize={normalizeProvidersImport}
-            runAction={runAction}
-          />
-          <ImportExportCard<ShareRecord>
-            title={tx("Shares")}
-            subtitle={tx("Share records, bindings, ACL, tunnel, and market metadata")}
-            actionKey="shares"
-            busy={busy}
-            exportData={exportShares}
-            importData={importShares}
-            normalize={normalizeSharesImport}
-            runAction={runAction}
-          />
-          <ImportExportCard<UniversalProvider>
-            title={tx("Universal Providers")}
-            subtitle={tx("Reusable provider templates shared across supported apps")}
-            actionKey="universal"
-            exportKey="providers"
-            busy={busy}
-            exportData={exportUniversalProviders}
-            importData={importUniversalProviders}
-            normalize={normalizeUniversalProvidersImport}
-            runAction={runAction}
-          />
-        </div>
-      </section>
-    </>
-  );
-}
-
-function ImportExportCard<T>({
-  title,
-  subtitle,
-  actionKey,
-  exportKey,
-  busy,
-  exportData,
-  importData,
-  normalize,
-  runAction,
-}: {
-  title: string;
-  subtitle: string;
-  actionKey: string;
-  exportKey?: string;
-  busy: string | null;
-  exportData: () => Promise<T[]>;
-  importData: (items: T[]) => Promise<number>;
-  normalize: (value: unknown) => T[];
-  runAction: (action: string, task: () => Promise<string>) => Promise<void>;
-}) {
-  const { tx } = useI18n();
-  const [text, setText] = useState("");
-  const [importConfirmOpen, setImportConfirmOpen] = useState(false);
-  const exportBusy = busy === `import-export:${actionKey}:export`;
-  const importBusy = busy === `import-export:${actionKey}:import`;
-
-  async function exportAction() {
-    await runAction(`import-export:${actionKey}:export`, async () => {
-      const items = await exportData();
-      setText(formatExportJson(exportKey || actionKey, items));
-      return tx("exported {{count}} {{name}}", { count: items.length, name: title });
-    });
-  }
-
-  async function importAction() {
-    await runAction(`import-export:${actionKey}:import`, async () => {
-      const items = normalize(parseJsonText(text));
-      const count = await importData(items);
-      return tx("imported {{count}} {{name}}", { count, name: title });
-    });
-  }
-
-  return (
-    <>
-      <article className="settings-import-export-card">
-        <header>
-          <div>
-            <h3>{title}</h3>
-            <span>{subtitle}</span>
-          </div>
-        </header>
-        <textarea
-          value={text}
-          onChange={(event) => setText(event.target.value)}
-          spellCheck={false}
-          placeholder={tx("Export JSON appears here, or paste JSON to import")}
-        />
-        <div className="settings-actions">
-          <button className="secondary-button" type="button" onClick={() => void exportAction()} disabled={exportBusy}>
-            {exportBusy ? <Loader2 size={15} /> : <Download size={15} />}
-            <span>{tx("Export")}</span>
-          </button>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={() => setImportConfirmOpen(true)}
-            disabled={importBusy || !text.trim()}
-          >
-            {importBusy ? <Loader2 size={15} /> : <Upload size={15} />}
-            <span>{tx("Import")}</span>
-          </button>
-        </div>
-      </article>
-      <ConfirmDialog
-        isOpen={importConfirmOpen}
-        title={tx("Import {{name}}", { name: title })}
-        message={tx("Import pasted JSON into {{name}}? Existing records with matching IDs may be updated.", { name: title })}
-        confirmText={tx("Import")}
-        variant="info"
-        onConfirm={() => {
-          setImportConfirmOpen(false);
-          void importAction();
-        }}
-        onCancel={() => setImportConfirmOpen(false)}
-      />
-    </>
-  );
-}
-
-function formatExportJson(key: string, items: unknown[]): string {
-  return JSON.stringify({ [key]: items }, null, 2);
-}
-
-function parseJsonText(text: string): unknown {
-  if (!text.trim()) {
-    throw new Error("import JSON is required");
-  }
-  try {
-    return JSON.parse(text);
-  } catch (error) {
-    throw new Error(`import JSON is invalid: ${errorMessage(error)}`);
-  }
-}
-
-function normalizeProvidersImport(value: unknown): StoredProvider[] {
-  return normalizeArrayProperty<StoredProvider>(value, "providers");
-}
-
-function normalizeSharesImport(value: unknown): ShareRecord[] {
-  return normalizeArrayProperty<ShareRecord>(value, "shares");
-}
-
-function normalizeUniversalProvidersImport(value: unknown): UniversalProvider[] {
-  return normalizeArrayProperty<UniversalProvider>(value, "universal");
-}
-
-function normalizeArrayProperty<T>(value: unknown, key: string): T[] {
-  if (Array.isArray(value)) return value as T[];
-  if (isRecord(value)) {
-    const byKey = value[key];
-    if (Array.isArray(byKey)) return byKey as T[];
-    if (key === "universal" && Array.isArray(value.providers)) return value.providers as T[];
-  }
-  throw new Error(`${key} import must be an array or { "${key}": [...] }`);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function DiagnosticsSummary({ diagnostics }: { diagnostics?: RouterDiagnosticsResponse }) {
-  if (!diagnostics) return null;
-  const tunnelErrors = diagnostics.tunnels.filter((tunnel) => tunnel.lastError).length;
-  const activeTunnels = diagnostics.tunnels.filter((tunnel) => tunnel.status === "connected" || tunnel.status === "running").length;
-  const shareErrors = diagnostics.shareSync.filter((share) => share.routerLastSyncError).length;
-  const disabledShares = diagnostics.shareSync.filter((share) => !share.enabled).length;
-  return (
-    <div className="settings-policy-grid">
-      <KeyValue label="registered" value={diagnostics.registered ? "yes" : "no"} />
-      <KeyValue label="pending logs" value={diagnostics.pendingRequestLogSync} />
-      <KeyValue label="active tunnels" value={`${activeTunnels}/${diagnostics.tunnels.length}`} />
-      <KeyValue label="tunnel errors" value={tunnelErrors} />
-      <KeyValue label="share errors" value={shareErrors} />
-      <KeyValue label="disabled shares" value={disabledShares} />
-    </div>
-  );
-}
-
 function FormFooter({ busy, label }: { busy: boolean; label: string }) {
   const { tx } = useI18n();
   return (
@@ -1259,142 +1022,6 @@ function isClientTunnelRunning(status?: string | null): boolean {
   return Boolean(
     normalized &&
       !["stopped", "ended", "error", "failed"].includes(normalized),
-  );
-}
-
-function RouterFacts({ router, status }: { router?: RouterConfigView; status?: RouterStatusResponse }) {
-  return (
-    <div className="provider-card-meta">
-      <KeyValue label="installation" value={router?.installationId || "-"} />
-      <KeyValue label="control secret" value={router?.controlSecretPresent ? "present" : "-"} />
-      <KeyValue label="registered at" value={formatTime(router?.lastRegisteredAtMs)} />
-      <KeyValue label="heartbeat" value={formatTime(status?.lastHeartbeatMs)} />
-      <KeyValue label="last error" value={router?.lastRegisterError || status?.lastError || "-"} />
-      <KeyValue label="public key" value={router?.publicKey ? `${router.publicKey.slice(0, 18)}...` : "-"} />
-    </div>
-  );
-}
-
-function TunnelStatus({ status }: { status?: TunnelRuntimeStatus | null }) {
-  return (
-    <div className="provider-card-meta">
-      <KeyValue label="status" value={status?.status || "-"} />
-      <KeyValue label="url" value={status?.tunnelUrl || "-"} />
-      <KeyValue label="lease" value={status?.leaseId || "-"} />
-      <KeyValue label="expires" value={status?.leaseExpiresAt || "-"} />
-      <KeyValue label="connected" value={formatTime(status?.connectedAtMs)} />
-      <KeyValue label="error" value={status?.lastError || "-"} />
-    </div>
-  );
-}
-
-function BackupSnapshotGrid({
-  backups,
-  busy,
-  onRestore,
-}: {
-  backups: BackupManifest[];
-  busy: string | null;
-  onRestore: (backup: BackupManifest) => void;
-}) {
-  const { tx } = useI18n();
-  return (
-    <div className="backup-card-list">
-      {backups.length ? (
-        backups.map((backup) => {
-          const size = backup.files.reduce((sum, file) => sum + file.sizeBytes, 0);
-          const restoring = busy === `backup-restore:${backup.id}`;
-          return (
-            <article className="backup-card" key={backup.id}>
-              <header>
-                <div>
-                  <strong title={backup.id}>{backup.id}</strong>
-                  <span>{formatTime(backup.createdAtMs)}</span>
-                </div>
-                <button
-                  className="icon-button"
-                  type="button"
-                  title={tx("Restore backup")}
-                  aria-label={tx("Restore backup")}
-                  disabled={restoring}
-                  onClick={() => onRestore(backup)}
-                >
-                  {restoring ? <Loader2 size={15} /> : <RotateCcw size={15} />}
-                </button>
-              </header>
-              <div className="settings-policy-grid">
-                <KeyValue label="reason" value={backup.reason || "-"} />
-                <KeyValue label="files" value={backup.files.length} />
-                <KeyValue label="size" value={formatBytes(size)} />
-                <KeyValue label="stored files" value={backup.files.map((file) => file.fileName).sort().join(", ") || "-"} />
-              </div>
-            </article>
-          );
-        })
-      ) : (
-        <div className="provider-empty">{tx("No backups")}</div>
-      )}
-    </div>
-  );
-}
-
-function Diagnostics({ diagnostics }: { diagnostics?: RouterDiagnosticsResponse }) {
-  const { tx } = useI18n();
-  if (!diagnostics) return <div className="provider-empty">{tx("No diagnostics")}</div>;
-  return (
-    <div className="diagnostics-grid">
-      <div className="diagnostics-card-grid">
-        {diagnostics.tunnels.length ? (
-          diagnostics.tunnels.map((tunnel) => (
-            <article className="diagnostics-card" key={tunnel.key}>
-              <header>
-                <div>
-                  <strong>{tunnel.key}</strong>
-                  <span>{tunnel.kind}</span>
-                </div>
-                <StatusPill tone={diagnosticTone(tunnel.status, tunnel.lastError)}>{tx(tunnel.status || "unknown")}</StatusPill>
-              </header>
-              <div className="settings-policy-grid">
-                <KeyValue label="url" value={tunnel.tunnelUrl || "-"} />
-                <KeyValue label="subdomain" value={tunnel.subdomain || "-"} />
-                <KeyValue label="lease" value={tunnel.leaseId || "-"} />
-                <KeyValue label="connected" value={formatTime(tunnel.connectedAtMs)} />
-                <KeyValue label="updated" value={formatTime(tunnel.updatedAtMs)} />
-                <KeyValue label="error" value={tunnel.lastError || "-"} />
-              </div>
-            </article>
-          ))
-        ) : (
-          <div className="provider-empty">{tx("No tunnels")}</div>
-        )}
-      </div>
-      <div className="diagnostics-card-grid">
-        {diagnostics.shareSync.length ? (
-          diagnostics.shareSync.map((share) => {
-            const status = share.enabled ? share.status : "disabled";
-            return (
-              <article className="diagnostics-card" key={share.shareId}>
-                <header>
-                  <div>
-                    <strong>{share.shareName || share.shareId}</strong>
-                    <span>{share.shareId}</span>
-                  </div>
-                  <StatusPill tone={diagnosticTone(status, share.routerLastSyncError)}>{tx(status)}</StatusPill>
-                </header>
-                <div className="settings-policy-grid">
-                  <KeyValue label="synced" value={formatTime(share.routerLastSyncedAtMs)} />
-                  <KeyValue label="url" value={share.routerUrl || "-"} />
-                  <KeyValue label="enabled" value={share.enabled ? "yes" : "no"} />
-                  <KeyValue label="error" value={share.routerLastSyncError || "-"} />
-                </div>
-              </article>
-            );
-          })
-        ) : (
-          <div className="provider-empty">{tx("No share sync diagnostics")}</div>
-        )}
-      </div>
-    </div>
   );
 }
 
@@ -1539,12 +1166,6 @@ function appLabel(app: AppKind): string {
 function formatTime(value?: number | null): string {
   if (value == null || value <= 0) return "-";
   return new Date(value).toLocaleString();
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function errorMessage(reason: unknown): string {
