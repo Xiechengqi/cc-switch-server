@@ -11,7 +11,6 @@ import {
   RefreshCw,
   RotateCcw,
   Route,
-  Search,
   Share2,
   SlidersHorizontal,
   Store,
@@ -23,7 +22,17 @@ import {
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { IconAction } from "@/components/IconAction";
+import { LoadingBlock } from "@/components/LoadingBlock";
+import { ModalFooter } from "@/components/ModalFooter";
+import { KeyValue } from "@/components/KeyValue";
 import { JsonPreview } from "@/components/JsonPreview";
+import { SimpleModal } from "@/components/SimpleModal";
+import { StatusPill } from "@/components/StatusPill";
+import { ShareCard } from "@/components/share/ShareCard";
+import { ShareEmptyState } from "@/components/share/ShareEmptyState";
+import { ShareToolbar, type ShareFilter, type ShareSort } from "@/components/share/ShareToolbar";
+import { appLabel, formatTime, shareName } from "@/components/share/shareDisplay";
 import {
   AppKind,
   authorizeShareMarket,
@@ -31,7 +40,7 @@ import {
   exportShares,
   importShares,
   loadShareConnectInfo,
-  loadShareDashboardData,
+  loadSharePageData,
   loadShareMarkets,
   pauseShare,
   PublicShareMarket,
@@ -60,7 +69,7 @@ import { useI18n } from "@/lib/i18n";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { appIcon, storedProviderIcon } from "@/lib/provider-icons";
 
-interface ShareDashboardState {
+interface SharePageState {
   shares: ShareRecord[];
   providers: StoredProvider[];
   requestLogs: UsageLog[];
@@ -95,8 +104,6 @@ interface BindingDraft {
   providerId: string;
 }
 
-type ShareFilter = "all" | "active" | "paused" | "expired" | "exhausted" | "sale";
-type ShareSort = "createdAtDesc" | "expiresAtAsc" | "tokensUsedDesc" | "nameAsc";
 
 const apps: Array<{ id: AppKind; label: string }> = [
   { id: "claude", label: "Claude" },
@@ -104,9 +111,9 @@ const apps: Array<{ id: AppKind; label: string }> = [
   { id: "gemini", label: "Gemini" },
 ];
 
-export function ShareDashboard() {
+export function SharePage() {
   const { t, tx } = useI18n();
-  const [data, setData] = useState<ShareDashboardState>({ shares: [], providers: [], requestLogs: [] });
+  const [data, setData] = useState<SharePageState>({ shares: [], providers: [], requestLogs: [] });
   const [markets, setMarkets] = useState<PublicShareMarket[]>([]);
   const [marketsLoaded, setMarketsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -132,7 +139,7 @@ export function ShareDashboard() {
     setLoading(true);
     setError(null);
     try {
-      setData(await loadShareDashboardData());
+      setData(await loadSharePageData());
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -322,7 +329,7 @@ export function ShareDashboard() {
   }
 
   return (
-    <div className="share-dashboard">
+    <div className="share-page">
       <div className="provider-toolbar">
         <div className="provider-toolbar-status">
           <span>{t("server.shares.routes", { count: data.shares.length })}</span>
@@ -401,10 +408,7 @@ export function ShareDashboard() {
       {resultById.__global && <div className="share-global-result">{resultById.__global}</div>}
 
       {loading ? (
-        <div className="provider-empty">
-          <Loader2 size={22} />
-          <span>{t("server.shares.loading")}</span>
-        </div>
+        <LoadingBlock label="server.shares.loading" />
       ) : data.shares.length ? (
         filteredShares.length ? (
           <div className="share-card-grid">
@@ -417,6 +421,7 @@ export function ShareDashboard() {
                 marketsLoaded={marketsLoaded}
                 result={resultById[share.id]}
                 connectInfo={connectInfoById[share.id]}
+                runtimePanel={<ShareRuntimePanel share={share} />}
                 busyId={busyId}
                 onEdit={() => setDraft(editShareDraft(share, providersByApp))}
                 onAcl={() => setAclDraft(share)}
@@ -657,252 +662,6 @@ export function ShareDashboard() {
         </SimpleModal>
       )}
     </div>
-  );
-}
-
-function ShareCard({
-  share,
-  providerByKey,
-  markets,
-  marketsLoaded,
-  result,
-  connectInfo,
-  busyId,
-  onEdit,
-  onAcl,
-  onSubdomain,
-  onBinding,
-  onMarket,
-  onAction,
-}: {
-  share: ShareRecord;
-  providerByKey: Map<string, StoredProvider>;
-  markets: PublicShareMarket[];
-  marketsLoaded: boolean;
-  result?: string;
-  connectInfo?: ShareConnectInfo;
-  busyId: string | null;
-  onEdit: () => void;
-  onAcl: () => void;
-  onSubdomain: () => void;
-  onBinding: (app: AppKind) => void;
-  onMarket: () => void;
-  onAction: (
-    action:
-      | "pause"
-      | "resume"
-      | "startTunnel"
-      | "stopTunnel"
-      | "resetUsage"
-      | "connectInfo"
-      | "delete",
-  ) => void;
-}) {
-  const { tx } = useI18n();
-  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
-  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
-  const [copyStatus, setCopyStatus] = useState<{ tone: "success" | "warning"; message: string } | null>(null);
-  const usage = shareUsage(share);
-  const syncText = share.routerLastSyncError || formatTime(share.routerLastSyncedAtMs);
-  const market = markets.find((item) => item.email === share.acl?.publicMarketEmail);
-  const sharedEmailCount = share.acl?.sharedWithEmails?.length || 0;
-  const shareActive = share.enabled && share.status === "active";
-  const shareCanRestart = share.status === "paused" || share.status === "stopped";
-  const pauseResumeAction = shareActive ? "pause" : "resume";
-  const pauseResumeDisabled = !shareActive && !shareCanRestart;
-  const startTunnelDisabled = shareActive || !shareCanRestart;
-  const stopTunnelDisabled = !shareActive;
-
-  async function copyConnectInfo(value: string, successMessage: string) {
-    if (!navigator.clipboard?.writeText) {
-      setCopyStatus({ tone: "warning", message: tx("Clipboard unavailable; copy the visible value manually.") });
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopyStatus({ tone: "success", message: successMessage });
-    } catch {
-      setCopyStatus({ tone: "warning", message: tx("Copy failed; copy the visible value manually.") });
-    }
-  }
-
-  return (
-    <>
-    <article className="share-card">
-      <header className="share-card-header">
-        <div className="share-card-title-row">
-          <div className="provider-icon-frame share-icon-frame">
-            <Share2 size={22} />
-          </div>
-          <div>
-            <h3>{shareName(share)}</h3>
-            <p>{share.ownerEmail || "owner -"}</p>
-          </div>
-        </div>
-        <div className="share-card-right">
-          {share.forSale && <StatusPill tone="success">{share.saleMarketKind || "sale"}</StatusPill>}
-          <StatusPill tone={share.status === "active" ? "success" : share.status === "paused" ? "warning" : "danger"}>
-            {share.status}
-          </StatusPill>
-        </div>
-      </header>
-
-      <div className="share-chip-row">
-        {shareBindings(share).map((binding) => {
-          const provider = providerByKey.get(providerKey(binding.app, binding.providerId));
-          const icon = provider ? storedProviderIcon(provider) : appIcon(binding.app);
-          return (
-            <button key={binding.app} type="button" className="share-binding-chip" onClick={() => onBinding(binding.app)}>
-              <ProviderIcon
-                icon={icon.icon}
-                name={provider?.provider.name || appLabel(binding.app)}
-                color={icon.color}
-                size={18}
-              />
-              <span>
-                <small>{appLabel(binding.app)}</small>
-                <strong>{provider?.provider.name || binding.providerId}</strong>
-              </span>
-            </button>
-          );
-        })}
-        {apps
-          .filter((app) => !shareBindings(share).some((binding) => binding.app === app.id))
-          .map((app) => (
-            <button key={app.id} type="button" className="share-binding-chip muted" onClick={() => onBinding(app.id)}>
-              <ProviderIcon icon={appIcon(app.id).icon} name={app.label} color={appIcon(app.id).color} size={18} />
-              <span>
-                <small>{app.label}</small>
-                <strong>unbound</strong>
-              </span>
-            </button>
-          ))}
-      </div>
-
-      <div className="provider-card-meta">
-        <KeyValue label="subdomain" value={share.tunnelSubdomain || "-"} />
-        <KeyValue label="route" value={share.routerUrl || "-"} />
-        <KeyValue label="tokens" value={usage} />
-        <KeyValue label="parallel" value={share.parallelLimit ?? "unlimited"} />
-        <KeyValue label="expires" value={formatTime(share.expiresAt)} />
-        <KeyValue label="router sync" value={syncText} />
-      </div>
-
-      <div className="share-progress" aria-label="token usage">
-        <span style={{ width: `${Math.min(100, shareUsageRatio(share) * 100)}%` }} />
-      </div>
-
-      <div className="share-status-grid">
-        <ShareStatus label="ACL" value={sharedEmailCount ? tx("{{count}} users", { count: sharedEmailCount }) : tx("private")} />
-        <ShareStatus label="sale" value={share.forSale ? share.saleMarketKind || "share" : tx("no")} />
-        <ShareStatus label="market" value={market?.displayName || share.acl?.publicMarketEmail || (marketsLoaded ? "-" : tx("not loaded"))} />
-        <ShareStatus label="grant" value={share.marketGrant?.status || "-"} />
-      </div>
-
-      <ShareRuntimePanel share={share} />
-
-      {(result || share.lastError) && <div className="provider-card-result">{result || share.lastError}</div>}
-
-      {connectInfo && (
-        <details className="json-details" open>
-          <summary>{tx("Connect info")}</summary>
-          <div className="connect-info-block">
-            <KeyValue label="direct URL" value={connectInfo.directUrl} />
-            <button
-              className="secondary-button compact"
-              type="button"
-              onClick={() => void copyConnectInfo(connectInfo.directUrl, tx("Copied URL"))}
-            >
-              <Copy size={13} />
-              <span>{tx("Copy URL")}</span>
-            </button>
-            <button
-              className="secondary-button compact"
-              type="button"
-              onClick={() => void copyConnectInfo(JSON.stringify(connectInfo, null, 2), tx("Copied JSON"))}
-            >
-              <Copy size={13} />
-              <span>{tx("Copy JSON")}</span>
-            </button>
-            {copyStatus && <div className={`connect-copy-status ${copyStatus.tone}`}>{copyStatus.message}</div>}
-            <JsonPreview value={connectInfo} />
-          </div>
-        </details>
-      )}
-
-      <div className="provider-actions">
-        <IconAction title="Edit" onClick={onEdit}>
-          <Edit3 size={15} />
-        </IconAction>
-        <IconAction title="ACL" onClick={onAcl}>
-          <Users size={15} />
-        </IconAction>
-        <IconAction title="Subdomain" onClick={onSubdomain}>
-          <Link2 size={15} />
-        </IconAction>
-        <IconAction title="Connect info" busy={busyId === `${share.id}:connectInfo`} onClick={() => onAction("connectInfo")}>
-          <FileJson size={15} />
-        </IconAction>
-        <IconAction
-          title={shareActive ? "Pause" : "Resume"}
-          busy={busyId === `${share.id}:${pauseResumeAction}`}
-          disabled={pauseResumeDisabled}
-          onClick={() => onAction(pauseResumeAction)}
-        >
-          {shareActive ? <Pause size={15} /> : <Play size={15} />}
-        </IconAction>
-        <IconAction
-          title="Start tunnel"
-          busy={busyId === `${share.id}:startTunnel`}
-          disabled={startTunnelDisabled}
-          onClick={() => onAction("startTunnel")}
-        >
-          <Cable size={15} />
-        </IconAction>
-        <IconAction
-          title="Stop tunnel"
-          busy={busyId === `${share.id}:stopTunnel`}
-          disabled={stopTunnelDisabled}
-          onClick={() => onAction("stopTunnel")}
-        >
-          <SlidersHorizontal size={15} />
-        </IconAction>
-        <IconAction title="Reset usage" busy={busyId === `${share.id}:resetUsage`} onClick={() => setResetConfirmOpen(true)}>
-          <RotateCcw size={15} />
-        </IconAction>
-        <IconAction title="Authorize market" onClick={onMarket}>
-          <Store size={15} />
-        </IconAction>
-        <IconAction title="Delete" busy={busyId === `${share.id}:delete`} onClick={() => setDeleteConfirmOpen(true)} danger>
-          <Trash2 size={15} />
-        </IconAction>
-      </div>
-    </article>
-      <ConfirmDialog
-        isOpen={resetConfirmOpen}
-        title={tx("Reset share usage")}
-        message={tx("Reset usage counters for share {{name}}? Token and request usage will be cleared.", {
-          name: shareName(share),
-        })}
-        confirmText={tx("Reset usage")}
-        onConfirm={() => {
-          setResetConfirmOpen(false);
-          onAction("resetUsage");
-        }}
-        onCancel={() => setResetConfirmOpen(false)}
-      />
-      <ConfirmDialog
-        isOpen={deleteConfirmOpen}
-        title={tx("Delete share")}
-        message={tx("Delete share {{name}}?", { name: shareName(share) })}
-        confirmText={tx("Delete")}
-        onConfirm={() => {
-          setDeleteConfirmOpen(false);
-          onAction("delete");
-        }}
-        onCancel={() => setDeleteConfirmOpen(false)}
-      />
-    </>
   );
 }
 
@@ -1579,173 +1338,6 @@ function ImportSharesModal({
   );
 }
 
-function SimpleModal({
-  title,
-  titleVariables,
-  subtitle,
-  children,
-  onClose,
-}: {
-  title: string;
-  titleVariables?: Record<string, string | number | boolean | null | undefined>;
-  subtitle?: string;
-  children: ReactNode;
-  onClose: () => void;
-}) {
-  const { tx } = useI18n();
-  return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="provider-form-modal simple-modal">
-        <header>
-          <div>
-            <h2>{tx(title, titleVariables)}</h2>
-            {subtitle && <p>{tx(subtitle)}</p>}
-          </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label={tx("Close")}>
-            <X size={16} />
-          </button>
-        </header>
-        <div className="simple-modal-body">{children}</div>
-      </section>
-    </div>
-  );
-}
-
-function ModalFooter({
-  saving,
-  disabled = false,
-  onClose,
-  label,
-}: {
-  saving: boolean;
-  disabled?: boolean;
-  onClose: () => void;
-  label: string;
-}) {
-  const { tx } = useI18n();
-  return (
-    <footer className="modal-inline-footer">
-      <button className="secondary-button" type="button" onClick={onClose}>
-        {tx("Cancel")}
-      </button>
-      <button className="primary-button" type="submit" disabled={saving || disabled}>
-        {saving && <Loader2 size={15} />}
-        <span>{tx(label)}</span>
-      </button>
-    </footer>
-  );
-}
-
-function ShareToolbar({
-  query,
-  filter,
-  sort,
-  total,
-  visible,
-  onQueryChange,
-  onFilterChange,
-  onSortChange,
-}: {
-  query: string;
-  filter: ShareFilter;
-  sort: ShareSort;
-  total: number;
-  visible: number;
-  onQueryChange: (value: string) => void;
-  onFilterChange: (value: ShareFilter) => void;
-  onSortChange: (value: ShareSort) => void;
-}) {
-  const { tx } = useI18n();
-  const filters: Array<{ id: ShareFilter; label: string }> = [
-    { id: "all", label: "all" },
-    { id: "active", label: "active" },
-    { id: "paused", label: "paused" },
-    { id: "expired", label: "expired" },
-    { id: "exhausted", label: "exhausted" },
-    { id: "sale", label: "for sale" },
-  ];
-  const sortOptions: Array<{ id: ShareSort; label: string }> = [
-    { id: "createdAtDesc", label: "Created time desc" },
-    { id: "expiresAtAsc", label: "Expires time asc" },
-    { id: "tokensUsedDesc", label: "Tokens used desc" },
-    { id: "nameAsc", label: "Name asc" },
-  ];
-  return (
-    <section className="share-toolbar">
-      <label className="share-search">
-        <Search size={15} />
-        <input
-          value={query}
-          onChange={(event) => onQueryChange(event.target.value)}
-          placeholder={tx("Search shares")}
-        />
-      </label>
-      <label className="share-select">
-        <SlidersHorizontal size={14} />
-        <select
-          value={filter}
-          onChange={(event) => onFilterChange(event.target.value as ShareFilter)}
-          aria-label={tx("Share filters")}
-        >
-          {filters.map((item) => (
-            <option key={item.id} value={item.id}>
-              {tx(item.label)}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="share-select">
-        <SlidersHorizontal size={14} />
-        <select value={sort} onChange={(event) => onSortChange(event.target.value as ShareSort)}>
-          {sortOptions.map((item) => (
-            <option key={item.id} value={item.id}>
-              {tx(item.label)}
-            </option>
-          ))}
-        </select>
-      </label>
-      <span className="share-filter-count">{tx("{{visible}}/{{total}} shares", { visible, total })}</span>
-    </section>
-  );
-}
-
-function ShareEmptyState({
-  canCreate,
-  onCreate,
-  onImport,
-}: {
-  canCreate: boolean;
-  onCreate: () => void;
-  onImport: () => void;
-}) {
-  const { t, tx } = useI18n();
-  return (
-    <div className="provider-empty provider-empty-state">
-      <div className="provider-empty-icon">
-        <Share2 size={28} />
-      </div>
-      <strong>{t("server.shares.noShares")}</strong>
-      <p>{t("server.shares.noSharesHint")}</p>
-      {!canCreate && <p>{tx("Add a provider before creating a share.")}</p>}
-      <div className="provider-empty-actions">
-        <button className="primary-button" type="button" onClick={onImport}>
-          <Upload size={15} />
-          <span>{t("common.import")}</span>
-        </button>
-        <button
-          className="secondary-button"
-          type="button"
-          onClick={onCreate}
-          disabled={!canCreate}
-        >
-          <Share2 size={15} />
-          <span>{t("server.shares.createShare")}</span>
-        </button>
-      </div>
-    </div>
-  );
-}
-
 function filterShares(
   shares: ShareRecord[],
   query: string,
@@ -1848,15 +1440,6 @@ function ShareStat({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
-function KeyValue({ label, value }: { label: string; value: ReactNode }) {
-  const { tx } = useI18n();
-  return (
-    <div className="compact-kv">
-      <span>{tx(label)}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
 
 function ShareRuntimePanel({ share }: { share: ShareRecord }) {
   const { tx } = useI18n();
@@ -2008,46 +1591,6 @@ function ShareStatus({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
-function StatusPill({
-  children,
-  tone,
-}: {
-  children: ReactNode;
-  tone: "success" | "warning" | "danger";
-}) {
-  return <span className={`status-pill ${tone}`}>{children}</span>;
-}
-
-function IconAction({
-  title,
-  children,
-  busy,
-  disabled,
-  danger,
-  onClick,
-}: {
-  title: string;
-  children: ReactNode;
-  busy?: boolean;
-  disabled?: boolean;
-  danger?: boolean;
-  onClick: () => void;
-}) {
-  const { tx } = useI18n();
-  const translatedTitle = tx(title);
-  return (
-    <button
-      className={danger ? "icon-button danger" : "icon-button"}
-      type="button"
-      title={translatedTitle}
-      aria-label={translatedTitle}
-      onClick={onClick}
-      disabled={busy || disabled}
-    >
-      {busy ? <Loader2 size={15} /> : children}
-    </button>
-  );
-}
 
 function createShareDraft(providersByApp: Record<AppKind, StoredProvider[]>): ShareDraft {
   const firstApp = apps.find((app) => providersByApp[app.id].length)?.id || "claude";
@@ -2179,21 +1722,6 @@ function bindingMap(share: ShareRecord): Record<AppKind, string> {
   return result;
 }
 
-function shareBindings(share: ShareRecord): ShareBinding[] {
-  const seen = new Set<string>();
-  const bindings: ShareBinding[] = [];
-  for (const binding of share.bindings || []) {
-    if (binding.providerId && !seen.has(binding.app)) {
-      seen.add(binding.app);
-      bindings.push(binding);
-    }
-  }
-  if (share.providerId && !seen.has(share.app)) {
-    bindings.unshift({ app: share.app, providerId: share.providerId, providerType: share.providerType });
-  }
-  return apps.flatMap((app) => bindings.filter((binding) => binding.app === app.id));
-}
-
 function firstBoundApp(bindings: Record<AppKind, string>): AppKind | null {
   return apps.find((app) => bindings[app.id])?.id || null;
 }
@@ -2206,14 +1734,6 @@ function providerKey(app: AppKind, providerId: string): string {
   return `${app}:${providerId}`;
 }
 
-function shareName(share: ShareRecord): string {
-  return share.displayName || share.id;
-}
-
-function appLabel(app: AppKind): string {
-  return apps.find((item) => item.id === app)?.label || app;
-}
-
 function shareActionLabel(action: "pause" | "resume" | "startTunnel" | "stopTunnel" | "resetUsage"): string {
   const labels: Record<typeof action, string> = {
     pause: "Pause",
@@ -2223,16 +1743,6 @@ function shareActionLabel(action: "pause" | "resume" | "startTunnel" | "stopTunn
     resetUsage: "Reset usage",
   };
   return labels[action];
-}
-
-function shareUsage(share: ShareRecord): string {
-  if (!share.tokenLimit) return `${share.tokensUsed || 0} tokens`;
-  return `${share.tokensUsed || 0}/${share.tokenLimit}`;
-}
-
-function shareUsageRatio(share: ShareRecord): number {
-  if (!share.tokenLimit) return 0;
-  return Math.max(0, Math.min(1, (share.tokensUsed || 0) / share.tokenLimit));
 }
 
 function splitList(value: string): string[] {
@@ -2270,17 +1780,6 @@ function toDateTimeInput(value?: number | null): string {
   if (Number.isNaN(date.getTime())) return "";
   const offset = date.getTimezoneOffset() * 60_000;
   return new Date(date.getTime() - offset).toISOString().slice(0, 16);
-}
-
-function formatTime(value?: number | null): string {
-  if (!value) return "-";
-  const millis = value < 10_000_000_000 ? value * 1000 : value;
-  const date = new Date(millis);
-  if (Number.isNaN(date.getTime())) return "-";
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(date);
 }
 
 function formatTokens(value?: number | null): string {

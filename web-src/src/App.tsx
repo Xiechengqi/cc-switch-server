@@ -7,11 +7,9 @@ import {
   Layers3,
   Network,
   Plus,
-  Radio,
   RefreshCw,
   Settings,
   Share2,
-  Shuffle,
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
@@ -25,12 +23,13 @@ import {
   writeToken,
 } from "@/lib/runtime";
 import { useI18n } from "@/lib/i18n";
+import { HeaderBuildBadge, HeaderFailoverToggle, HeaderProxyStatus, HeaderShareToggle } from "@/components/AppHeader";
 import { ProviderIcon } from "@/components/ProviderIcon";
-import { ProviderDashboard } from "@/components/ProviderDashboard";
-import { SettingsDashboard, SettingsTab } from "@/components/SettingsDashboard";
-import { ShareDashboard } from "@/components/ShareDashboard";
-import { UniversalDashboard } from "@/components/UniversalDashboard";
-import { UsageDashboard, UsageTab } from "@/components/UsageDashboard";
+import { ProviderList } from "@/components/providers";
+import { SettingsPage, SettingsTab } from "@/components/settings";
+import { SharePage } from "@/components/share";
+import { UniversalProviderPanel } from "@/components/universal";
+import { UsageDashboard, UsageTab } from "@/components/usage";
 import { appIcon } from "@/lib/provider-icons";
 
 type View = "providers" | "shares" | "usage" | "settings" | "universal";
@@ -111,7 +110,7 @@ function App() {
     switch (view) {
       case "providers":
         return (
-          <ProviderDashboard
+          <ProviderList
             activeApp={activeApp}
             onActiveAppChange={setActiveApp}
             onOpenImportExport={() => openSettings("importExport")}
@@ -127,13 +126,13 @@ function App() {
           />
         );
       case "shares":
-        return <ShareDashboard />;
+        return <SharePage />;
       case "usage":
         return <UsageDashboard initialFocus={usageFocus} />;
       case "settings":
-        return <SettingsDashboard initialTab={settingsTab} />;
+        return <SettingsPage initialTab={settingsTab} />;
       case "universal":
-        return <UniversalDashboard />;
+        return <UniversalProviderPanel />;
     }
   }, [activeApp, context, loading, loadData, settingsTab, t, usageFocus, view]);
 
@@ -332,146 +331,6 @@ function App() {
   }
 }
 
-function HeaderBuildBadge({
-  buildInfo,
-  onClick,
-}: {
-  buildInfo: BuildInfo | null;
-  onClick: () => void;
-}) {
-  const { tx } = useI18n();
-  const label = buildInfo?.commitShort || buildInfo?.version || tx("build");
-  const title = buildInfo
-    ? [buildInfo.versionLine || buildInfo.version, buildInfo.commitMessage, buildInfo.buildTime]
-      .filter(Boolean)
-      .join(" · ")
-    : tx("Build info");
-  return (
-    <button
-      className={buildInfo?.dirty ? "desktop-build-badge dirty" : "desktop-build-badge"}
-      type="button"
-      onClick={onClick}
-      title={title}
-      aria-label={tx("Build info")}
-    >
-      <span>{label}</span>
-    </button>
-  );
-}
-
-function HeaderShareToggle({ active, onClick }: { active: boolean; onClick: () => void }) {
-  const { tx } = useI18n();
-  return (
-    <button
-      className={active ? "desktop-mini-toggle active" : "desktop-mini-toggle"}
-      type="button"
-      onClick={onClick}
-      title={tx("Share routing")}
-      aria-pressed={active}
-    >
-      <Network size={14} />
-      <span>{tx("Share")}</span>
-    </button>
-  );
-}
-
-interface ProxyStatusView {
-  running?: boolean;
-  status?: string;
-  mode?: string;
-  baseUrl?: string;
-}
-
-function HeaderProxyStatus({ onClick }: { onClick: () => void }) {
-  const { tx } = useI18n();
-  const [status, setStatus] = useState<ProxyStatusView | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    invokeCommand<ProxyStatusView>("get_proxy_status")
-      .then((next) => {
-        if (active) setStatus(next);
-      })
-      .catch(() => {
-        if (active) setStatus({ running: false, status: "unknown" });
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  const running = status?.running !== false;
-  const title = [
-    tx("Proxy status"),
-    status?.status,
-    status?.mode,
-    status?.baseUrl,
-  ].filter(Boolean).join(" · ");
-  return (
-    <button
-      className={running ? "desktop-mini-toggle active" : "desktop-mini-toggle"}
-      type="button"
-      onClick={onClick}
-      title={title || tx("Proxy status")}
-      aria-pressed={running}
-    >
-      <Radio size={14} />
-      <span>{tx("Proxy")}</span>
-    </button>
-  );
-}
-
-function HeaderFailoverToggle({ activeApp }: { activeApp: AppKind }) {
-  const { tx } = useI18n();
-  const [enabled, setEnabled] = useState(false);
-  const [busy, setBusy] = useState(false);
-
-  const refresh = useCallback(async () => {
-    const response = await jsonFetch<{
-      failover?: { apps?: Record<string, { enabled?: boolean }> };
-    }>("/api/failover");
-    setEnabled(Boolean(response.failover?.apps?.[activeApp]?.enabled));
-  }, [activeApp]);
-
-  useEffect(() => {
-    let active = true;
-    refresh().catch(() => {
-      if (active) setEnabled(false);
-    });
-    return () => {
-      active = false;
-    };
-  }, [refresh]);
-
-  async function toggle() {
-    setBusy(true);
-    try {
-      const response = await jsonFetch<{ config?: { enabled?: boolean } }>(`/api/failover/apps/${activeApp}`, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ enabled: !enabled }),
-      });
-      setEnabled(Boolean(response.config?.enabled));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <button
-      className={enabled ? "desktop-mini-toggle active" : "desktop-mini-toggle"}
-      type="button"
-      onClick={() => void toggle()}
-      disabled={busy}
-      title={tx("Auto failover")}
-      aria-pressed={enabled}
-    >
-      <Shuffle size={14} />
-      <span>{tx("Failover")}</span>
-    </button>
-  );
-}
-
 function viewLabel(view: View, t: (key: string) => string): string {
   const labels: Record<View, string> = {
     providers: t("server.nav.providers"),
@@ -568,10 +427,6 @@ function LoginPanel({
 
 function Panel({ children }: { children: ReactNode }) {
   return <div className="panel">{children}</div>;
-}
-
-function StatusPill({ children, tone }: { children: ReactNode; tone: "success" | "warning" }) {
-  return <span className={`status-pill ${tone}`}>{children}</span>;
 }
 
 function EmptyState({ title, value }: { title: string; value: ReactNode }) {

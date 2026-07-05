@@ -5,7 +5,6 @@ import {
   Coins,
   Database,
   Eye,
-  FileText,
   Filter,
   Loader2,
   Pencil,
@@ -14,7 +13,6 @@ import {
   RotateCcw,
   Save,
   Trash2,
-  X,
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
@@ -38,8 +36,13 @@ import {
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { LoadingBlock } from "@/components/LoadingBlock";
+import { KeyValue } from "@/components/KeyValue";
 import { JsonPreview } from "@/components/JsonPreview";
+import { SimpleModal } from "@/components/SimpleModal";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import { StatusPill } from "@/components/StatusPill";
+import { DataSourceBar, emptyDataSourceSummary, type UsageDataSourceSummary } from "@/components/usage/DataSourceBar";
 
 export type UsageTab = "logs" | "providers" | "models" | "pricing" | "limits";
 type RangePreset = "today" | "1d" | "7d" | "14d" | "30d" | "all" | "custom";
@@ -85,16 +88,6 @@ interface PricingDraft {
   outputCostPerMillion: string;
   cacheReadCostPerMillion: string;
   cacheCreationCostPerMillion: string;
-}
-
-interface UsageDataSourceSummary {
-  dataSource: string;
-  requests: number;
-  successes: number;
-  failures: number;
-  totalTokens: number;
-  totalCostUsd: number;
-  healthChecks: number;
 }
 
 const apps: Array<{ id: "all" | AppKind; label: string }> = [
@@ -591,121 +584,6 @@ function usageAdvancedFilterCount(draft: UsageFilterDraft): number {
   ].filter(Boolean).length;
 }
 
-function DataSourceBar({
-  sources,
-  loading,
-  activeSource,
-  onSelect,
-}: {
-  sources: UsageDataSourceSummary[];
-  loading: boolean;
-  activeSource: string;
-  onSelect: (dataSource: string) => void;
-}) {
-  const { tx } = useI18n();
-  if (loading) {
-    return (
-      <section className="usage-data-source-panel">
-        <div className="usage-data-source-label">
-          <Database size={15} />
-          <span>{tx("Data Sources")}</span>
-        </div>
-        <div className="provider-empty inline-empty">
-          <Loader2 size={18} />
-          <span>{tx("Loading sources")}</span>
-        </div>
-      </section>
-    );
-  }
-
-  if (!sources.length) return null;
-
-  const total = sources.reduce<UsageDataSourceSummary>(
-    (next, source) => ({
-      dataSource: "all",
-      requests: next.requests + source.requests,
-      successes: next.successes + source.successes,
-      failures: next.failures + source.failures,
-      totalTokens: next.totalTokens + source.totalTokens,
-      totalCostUsd: next.totalCostUsd + source.totalCostUsd,
-      healthChecks: next.healthChecks + source.healthChecks,
-    }),
-    emptyDataSourceSummary("all"),
-  );
-
-  return (
-    <section className="usage-data-source-panel" aria-label={tx("Loaded usage sources")}>
-      <div className="usage-data-source-label">
-        <Database size={15} />
-        <span>{tx("Data Sources")}</span>
-      </div>
-      <div className="usage-data-source-list">
-        <DataSourceChip
-          source={total}
-          active={!activeSource}
-          label="All"
-          onClick={() => onSelect("")}
-        />
-        {sources.map((source) => (
-          <DataSourceChip
-            key={source.dataSource}
-            source={source}
-            active={source.dataSource === activeSource}
-            label={dataSourceLabel(source.dataSource)}
-            onClick={() => onSelect(source.dataSource)}
-          />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function DataSourceChip({
-  source,
-  active,
-  label,
-  onClick,
-}: {
-  source: UsageDataSourceSummary;
-  active: boolean;
-  label: string;
-  onClick: () => void;
-}) {
-  const { tx } = useI18n();
-  const failureRate = source.requests > 0 ? (source.failures / source.requests) * 100 : 0;
-  return (
-    <button className={active ? "usage-data-source-chip active" : "usage-data-source-chip"} type="button" onClick={onClick}>
-      {dataSourceIcon(source.dataSource)}
-      <span>
-        <strong>{tx(label)}</strong>
-        <small>{formatInt(source.requests)} req</small>
-      </span>
-      <span>
-        <strong>{formatInt(source.totalTokens)}</strong>
-        <small>{formatUsd(source.totalCostUsd, 4)}</small>
-      </span>
-      <span>
-        <strong>{failureRate.toFixed(1)}%</strong>
-        <small>{source.healthChecks ? `${formatInt(source.healthChecks)} ${tx("health")}` : tx("fail")}</small>
-      </span>
-    </button>
-  );
-}
-
-function dataSourceIcon(dataSource: string): ReactNode {
-  if (dataSource === "all") return <Database size={15} />;
-  if (
-    dataSource === "session_log" ||
-    dataSource === "codex_session" ||
-    dataSource === "gemini_session" ||
-    dataSource === "opencode_session" ||
-    dataSource.includes("session")
-  ) {
-    return <FileText size={15} />;
-  }
-  return <Database size={15} />;
-}
-
 function UsageSummaryGrid({ summary, loading }: { summary: UsageRollup; loading: boolean }) {
   const successRate = summary.requests > 0 ? (summary.successes / summary.requests) * 100 : 0;
   const failureRate = summary.requests > 0 ? (summary.failures / summary.requests) * 100 : 0;
@@ -812,10 +690,7 @@ function TrendPanel({
         <span>{tx("{{count}} buckets", { count: trends.length })}</span>
       </div>
       {loading ? (
-        <div className="provider-empty">
-          <Loader2 size={22} />
-          <span>{tx("Loading usage trend")}</span>
-        </div>
+        <LoadingBlock label="Loading usage trend" />
       ) : trends.length ? (
         <div className="usage-chart-card">
           <div className="usage-chart-legend" aria-hidden="true">
@@ -1598,68 +1473,6 @@ function TabButton({
   );
 }
 
-function KeyValue({ label, value }: { label: string; value: ReactNode }) {
-  const { tx } = useI18n();
-  return (
-    <div className="compact-kv">
-      <span>{tx(label)}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function StatusPill({
-  children,
-  tone,
-}: {
-  children: ReactNode;
-  tone: "success" | "warning" | "danger";
-}) {
-  return <span className={`status-pill ${tone}`}>{children}</span>;
-}
-
-function SimpleModal({
-  title,
-  subtitle,
-  subtitleVariables,
-  children,
-  onClose,
-}: {
-  title: string;
-  subtitle?: string;
-  subtitleVariables?: Record<string, string | number | boolean | null | undefined>;
-  children: ReactNode;
-  onClose: () => void;
-}) {
-  const { tx } = useI18n();
-  return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="provider-form-modal simple-modal">
-        <header>
-          <div>
-            <h2>{tx(title)}</h2>
-            {subtitle && <p>{tx(subtitle, subtitleVariables)}</p>}
-          </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label={tx("Close")}>
-            <X size={15} />
-          </button>
-        </header>
-        <div className="simple-modal-body">{children}</div>
-      </section>
-    </div>
-  );
-}
-
-function LoadingBlock({ label }: { label: string }) {
-  const { tx } = useI18n();
-  return (
-    <div className="provider-empty">
-      <Loader2 size={22} />
-      <span>{tx(label)}</span>
-    </div>
-  );
-}
-
 function filterProviderLimits(limits: ProviderLimitStatus[], draft: UsageFilterDraft): ProviderLimitStatus[] {
   const app = draft.app === "all" ? "" : draft.app;
   const providerId = draft.providerId.trim().toLowerCase();
@@ -1809,35 +1622,6 @@ function dataSourceBreakdown(logs: UsageLog[]): UsageDataSourceSummary[] {
     summaries.set(dataSource, summary);
   }
   return [...summaries.values()].sort((left, right) => right.requests - left.requests || left.dataSource.localeCompare(right.dataSource));
-}
-
-function emptyDataSourceSummary(dataSource: string): UsageDataSourceSummary {
-  return {
-    dataSource,
-    requests: 0,
-    successes: 0,
-    failures: 0,
-    totalTokens: 0,
-    totalCostUsd: 0,
-    healthChecks: 0,
-  };
-}
-
-function dataSourceLabel(dataSource: string): string {
-  const labels: Record<string, string> = {
-    codex_db: "Codex DB",
-    codex_session: "Codex Session",
-    direct: "Direct",
-    gemini_session: "Gemini Session",
-    health: "Health",
-    market: "Market",
-    opencode_session: "OpenCode Session",
-    proxy: "Proxy",
-    session_log: "Session Log",
-    share_market: "Share Market",
-    unknown: "Unknown",
-  };
-  return labels[dataSource] || dataSource;
 }
 
 function rangeLabel(draft: UsageFilterDraft): string {

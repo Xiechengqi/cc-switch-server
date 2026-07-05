@@ -61,10 +61,20 @@ import { useI18n } from "@/lib/i18n";
 import { inferIconForText } from "@/config/iconInference";
 import { ColorPicker } from "@/components/ColorPicker";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { IconAction } from "@/components/IconAction";
+import { KeyValue } from "@/components/KeyValue";
+import { LoadingBlock } from "@/components/LoadingBlock";
+import { ModalFooter } from "@/components/ModalFooter";
+import { SimpleModal } from "@/components/SimpleModal";
+import { TextField } from "@/components/TextField";
 import { IconPicker } from "@/components/IconPicker";
 import JsonEditor from "@/components/JsonEditor";
 import { JsonPreview } from "@/components/JsonPreview";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import { StatusPill } from "@/components/StatusPill";
+import { SortableUniversalCard } from "@/components/universal/UniversalCard";
+import { UniversalListToolbar } from "@/components/universal/UniversalListToolbar";
+import { UniversalEmptyState } from "@/components/universal/UniversalEmptyState";
 import { appIcon } from "@/lib/provider-icons";
 
 interface UniversalDraft {
@@ -99,7 +109,7 @@ interface UniversalDraft {
 
 const universalApps = ["claude", "codex", "gemini"] as const;
 
-export function UniversalDashboard() {
+export function UniversalProviderPanel() {
   const { t, tx } = useI18n();
   const [providers, setProviders] = useState<Record<string, UniversalProvider>>({});
   const [presets, setPresets] = useState<UniversalProviderPreset[]>([]);
@@ -276,7 +286,7 @@ export function UniversalDashboard() {
   }
 
   return (
-    <div className="universal-dashboard">
+    <div className="universal-provider-panel">
       <div className="provider-toolbar">
         <div className="provider-toolbar-status">
           <span>{t("server.universal.templates", { count: list.length })}</span>
@@ -315,10 +325,7 @@ export function UniversalDashboard() {
       />
 
       {loading ? (
-        <div className="provider-empty">
-          <Loader2 size={22} />
-          <span>{t("server.universal.loading")}</span>
-        </div>
+        <LoadingBlock label="server.universal.loading" />
       ) : list.length ? (
         visibleProviders.length ? (
           <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleUniversalDragEnd(event)}>
@@ -413,104 +420,6 @@ export function UniversalDashboard() {
   );
 }
 
-function SortableUniversalCard(props: UniversalCardProps) {
-  const { attributes, listeners, setActivatorNodeRef, setNodeRef, transform, transition, isDragging } =
-    useSortable({ id: props.provider.id });
-  const style: CSSProperties = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-  };
-  const dragHandleProps: DragHandleProps = {
-    ...attributes,
-    ...listeners,
-    ref: setActivatorNodeRef,
-  };
-  return (
-    <UniversalCard
-      {...props}
-      dragHandleProps={dragHandleProps}
-      nodeRef={setNodeRef}
-      style={style}
-      dragging={isDragging}
-    />
-  );
-}
-
-type DragHandleProps = HTMLAttributes<HTMLButtonElement> & {
-  ref?: (node: HTMLButtonElement | null) => void;
-};
-
-function UniversalListToolbar({
-  query,
-  visible,
-  total,
-  onQueryChange,
-}: {
-  query: string;
-  visible: number;
-  total: number;
-  onQueryChange: (value: string) => void;
-}) {
-  const { tx } = useI18n();
-  return (
-    <section className="provider-list-toolbar universal-list-toolbar">
-      <label className="provider-list-search">
-        <Search size={15} />
-        <input
-          value={query}
-          onChange={(event) => onQueryChange(event.target.value)}
-          placeholder={tx("Search universal providers")}
-        />
-      </label>
-      <span className="provider-list-count">
-        {tx("{{visible}}/{{total}} providers", { visible, total })}
-      </span>
-    </section>
-  );
-}
-
-function UniversalEmptyState({
-  canUsePresets,
-  onImport,
-  onPreset,
-  onCreate,
-}: {
-  canUsePresets: boolean;
-  onImport: () => void;
-  onPreset: () => void;
-  onCreate: () => void;
-}) {
-  const { t, tx } = useI18n();
-  return (
-    <div className="provider-empty provider-empty-state">
-      <div className="provider-empty-icon">
-        <Boxes size={28} />
-      </div>
-      <strong>{tx("No universal providers")}</strong>
-      <p>{tx("Create one template, then sync it into Claude, Codex and Gemini providers.")}</p>
-      <div className="provider-empty-actions">
-        <button className="primary-button" type="button" onClick={onImport}>
-          <Upload size={15} />
-          <span>{t("common.import")}</span>
-        </button>
-        <button
-          className="secondary-button"
-          type="button"
-          onClick={onPreset}
-          disabled={!canUsePresets}
-        >
-          <ListPlus size={15} />
-          <span>{t("server.common.fromPreset")}</span>
-        </button>
-        <button className="secondary-button" type="button" onClick={onCreate}>
-          <Plus size={15} />
-          <span>{t("server.universal.add")}</span>
-        </button>
-      </div>
-    </div>
-  );
-}
-
 function filterUniversalProviders(providers: UniversalProvider[], query: string): UniversalProvider[] {
   const normalizedQuery = query.trim().toLowerCase();
   if (!normalizedQuery) return providers;
@@ -543,142 +452,6 @@ function filterUniversalProviders(providers: UniversalProvider[], query: string)
       .toLowerCase()
       .includes(normalizedQuery);
   });
-}
-
-interface UniversalCardProps {
-  provider: UniversalProvider;
-  busy: string | null;
-  onEdit: () => void;
-  onSync: () => void;
-  onDuplicate: () => void;
-  onDelete: () => void;
-}
-
-function UniversalCard({
-  provider,
-  busy,
-  onEdit,
-  onSync,
-  onDuplicate,
-  onDelete,
-  dragHandleProps,
-  nodeRef,
-  style,
-  dragging,
-}: UniversalCardProps & {
-  dragHandleProps?: DragHandleProps;
-  nodeRef?: (node: HTMLElement | null) => void;
-  style?: CSSProperties;
-  dragging?: boolean;
-}) {
-  const { tx } = useI18n();
-  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
-  const [syncConfirmOpen, setSyncConfirmOpen] = useState(false);
-  const icon = universalProviderIcon(provider);
-  const enabledApps = enabledUniversalApps(provider);
-  return (
-    <>
-      <article
-        ref={nodeRef}
-        className={["provider-card universal-card", dragging ? "dragging" : ""]
-          .filter(Boolean)
-          .join(" ")}
-        style={style}
-      >
-      <header className="universal-card-header">
-        <div className="universal-card-title-row">
-          <button
-            {...dragHandleProps}
-            className="provider-drag-handle"
-            type="button"
-            aria-label={tx("Drag provider")}
-            title={tx("Drag provider")}
-          >
-            <GripVertical size={16} />
-          </button>
-          <div className="provider-icon-frame universal-icon-frame">
-            <ProviderIcon
-              icon={icon.icon}
-              name={provider.name}
-              color={icon.color}
-              size={24}
-            />
-          </div>
-          <div className="universal-card-title">
-            <h3>{provider.name}</h3>
-            <p>{provider.providerType}</p>
-          </div>
-        </div>
-        <div className="universal-card-actions">
-          <IconAction title="Sync" busy={busy === `sync:${provider.id}`} onClick={() => setSyncConfirmOpen(true)}>
-            <RotateCcw size={15} />
-          </IconAction>
-          <IconAction title="Duplicate" busy={busy === `duplicate:${provider.id}`} onClick={onDuplicate}>
-            <Copy size={15} />
-          </IconAction>
-          <IconAction title="Edit" onClick={onEdit}>
-            <Edit3 size={15} />
-          </IconAction>
-          <IconAction title="Delete" busy={busy === `delete:${provider.id}`} onClick={() => setDeleteConfirmOpen(true)} danger>
-            <Trash2 size={15} />
-          </IconAction>
-        </div>
-      </header>
-      <div className="universal-url-row">
-        <Globe size={14} />
-        <span>{provider.baseUrl || provider.websiteUrl || "-"}</span>
-        <StatusPill tone={provider.apiKey ? "success" : "warning"}>
-          {tx(provider.apiKey ? "key" : "no key")}
-        </StatusPill>
-      </div>
-      <div className="universal-app-row">
-        {enabledApps.length ? (
-          enabledApps.map((app) => <AppBadge key={app} label={app} enabled />)
-        ) : (
-          <span className="universal-no-apps">{tx("No apps enabled")}</span>
-        )}
-      </div>
-      <div className="universal-model-strip">
-        {provider.apps.claude && <KeyValue label="claude" value={provider.models?.claude?.model || "-"} />}
-        {provider.apps.codex && <KeyValue label="codex" value={provider.models?.codex?.model || "-"} />}
-        {provider.apps.gemini && <KeyValue label="gemini" value={provider.models?.gemini?.model || "-"} />}
-      </div>
-      {provider.notes && <div className="provider-card-result">{provider.notes}</div>}
-      <details className="json-details">
-        <summary>{tx("Config preview")}</summary>
-        <div className="provider-card-meta">
-          <KeyValue label="website" value={provider.websiteUrl || "-"} />
-          <KeyValue label="catalog" value={configuredModelApps(provider, "modelCatalog")} />
-          <KeyValue label="mapping" value={configuredModelApps(provider, "modelMapping")} />
-          <KeyValue label="id" value={provider.id} />
-        </div>
-        <JsonPreview value={redactUniversalProvider(provider)} />
-      </details>
-      </article>
-      <ConfirmDialog
-        isOpen={syncConfirmOpen}
-        title={tx("Sync universal provider")}
-        message={tx("Sync {{name}} to enabled apps? Existing derived providers may be overwritten.", { name: provider.name })}
-        confirmText={tx("Sync")}
-        onConfirm={() => {
-          setSyncConfirmOpen(false);
-          onSync();
-        }}
-        onCancel={() => setSyncConfirmOpen(false)}
-      />
-      <ConfirmDialog
-        isOpen={deleteConfirmOpen}
-        title={tx("Delete universal provider")}
-        message={tx("Delete universal provider {{name}}? Derived app providers will be removed.", { name: provider.name })}
-        confirmText={tx("Delete")}
-        onConfirm={() => {
-          setDeleteConfirmOpen(false);
-          onDelete();
-        }}
-        onCancel={() => setDeleteConfirmOpen(false)}
-      />
-    </>
-  );
 }
 
 function UniversalFormModal({
@@ -926,15 +699,7 @@ function ImportUniversalModal({
         >
           {error && <div className="form-error">{error}</div>}
           <textarea value={text} onChange={(event) => setText(event.target.value)} />
-          <footer className="modal-inline-footer">
-            <button className="secondary-button" type="button" onClick={onClose}>
-              {tx("Cancel")}
-            </button>
-            <button className="primary-button" type="submit" disabled={saving}>
-              {saving && <Loader2 size={15} />}
-              <span>{tx("Import")}</span>
-            </button>
-          </footer>
+          <ModalFooter saving={saving} onClose={onClose} label="Import" />
         </form>
       </SimpleModal>
       <ConfirmDialog
@@ -1053,25 +818,6 @@ function filterUniversalPresets(
   return [...filtered].sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function TextField({
-  label,
-  value,
-  disabled,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  disabled?: boolean;
-  onChange: (value: string) => void;
-}) {
-  const { tx } = useI18n();
-  return (
-    <label>
-      <span>{tx(label)}</span>
-      <input value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
-    </label>
-  );
-}
 
 function ModelJsonFields({
   app,
@@ -1112,22 +858,12 @@ function ModelJsonFields({
   );
 }
 
-function AppBadge({ label, enabled }: { label: string; enabled: boolean }) {
-  return <span className={enabled ? "universal-app-badge active" : "universal-app-badge"}>{label}</span>;
-}
-
 function enabledUniversalApps(provider: UniversalProvider): string[] {
   return [
     provider.apps.claude ? "Claude" : null,
     provider.apps.codex ? "Codex" : null,
     provider.apps.gemini ? "Gemini" : null,
   ].filter((app): app is string => Boolean(app));
-}
-
-function universalProviderIcon(provider: UniversalProvider): { icon?: string; color?: string } {
-  if (provider.icon) return { icon: provider.icon, color: provider.iconColor || undefined };
-  const inferred = inferIconForText(provider.name, provider.providerType, provider.baseUrl, provider.websiteUrl);
-  return { icon: inferred.icon, color: inferred.iconColor };
 }
 
 function universalPresetIcon(preset: UniversalProviderPreset): { icon?: string; color?: string } {
@@ -1140,93 +876,12 @@ function colorInputValue(value?: string): string {
   return value && /^#[0-9a-f]{6}$/i.test(value) ? value : "#111827";
 }
 
-function KeyValue({ label, value }: { label: string; value: ReactNode }) {
-  const { tx } = useI18n();
-  return (
-    <div className="compact-kv">
-      <span>{tx(label)}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function StatusPill({
-  children,
-  tone,
-}: {
-  children: ReactNode;
-  tone: "success" | "warning" | "danger";
-}) {
-  return <span className={`status-pill ${tone}`}>{children}</span>;
-}
-
-function IconAction({
-  title,
-  children,
-  busy,
-  danger,
-  onClick,
-}: {
-  title: string;
-  children: ReactNode;
-  busy?: boolean;
-  danger?: boolean;
-  onClick: () => void;
-}) {
-  const { tx } = useI18n();
-  const translatedTitle = tx(title);
-  return (
-    <button
-      className={danger ? "icon-button danger" : "icon-button"}
-      type="button"
-      title={translatedTitle}
-      aria-label={translatedTitle}
-      onClick={onClick}
-      disabled={busy}
-    >
-      {busy ? <Loader2 size={15} /> : children}
-    </button>
-  );
-}
-
-function SimpleModal({
-  title,
-  subtitle,
-  subtitleVariables,
-  children,
-  onClose,
-}: {
-  title: string;
-  subtitle?: string;
-  subtitleVariables?: Record<string, string | number | boolean | null | undefined>;
-  children: ReactNode;
-  onClose: () => void;
-}) {
-  const { tx } = useI18n();
-  return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="provider-form-modal simple-modal">
-        <header>
-          <div>
-            <h2>{tx(title)}</h2>
-            {subtitle && <p>{tx(subtitle, subtitleVariables)}</p>}
-          </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label={tx("Close")}>
-            <X size={16} />
-          </button>
-        </header>
-        <div className="simple-modal-body">{children}</div>
-      </section>
-    </div>
-  );
-}
-
 function emptyDraft(): UniversalDraft {
   return {
     mode: "create",
     id: "",
-    name: "",
     providerType: "openai-compatible",
+    name: "",
     baseUrl: "",
     apiKey: "",
     websiteUrl: "",
@@ -1392,14 +1047,6 @@ function jsonText(value: unknown): string {
   return value === undefined || value === null ? "" : JSON.stringify(value, null, 2);
 }
 
-function configuredModelApps(
-  provider: UniversalProvider,
-  key: "modelCatalog" | "modelMapping",
-): string {
-  const configured = universalApps.filter((app) => Boolean(provider.models?.[app]?.[key]));
-  return configured.length ? configured.join(", ") : "-";
-}
-
 function modelCatalogPlaceholder(app: string): string {
   return JSON.stringify(
     {
@@ -1429,13 +1076,6 @@ function modelMappingPlaceholder(app: string): string {
     null,
     2,
   );
-}
-
-function redactUniversalProvider(provider: UniversalProvider): UniversalProvider {
-  return {
-    ...provider,
-    apiKey: provider.apiKey ? "<configured>" : "",
-  };
 }
 
 function syncSummary(result: UniversalProviderSyncResult, tx: (text: string, variables?: Record<string, string | number>) => string): string {

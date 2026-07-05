@@ -485,7 +485,7 @@ tbody tr:last-child td {
   font-size: 1rem;
 }
 
-.provider-dashboard {
+.provider-list {
   display: grid;
   min-width: 0;
   gap: 16px;
@@ -1839,7 +1839,7 @@ tbody tr:last-child td {
   grid-column: 1 / -1;
 }
 
-.accounts-dashboard {
+.auth-center-panel {
   display: grid;
   min-width: 0;
   gap: 16px;
@@ -1847,7 +1847,7 @@ tbody tr:last-child td {
   padding: 24px;
 }
 
-.accounts-dashboard.embedded {
+.auth-center-panel.embedded {
   overflow: visible;
   padding: 0;
 }
@@ -2633,7 +2633,7 @@ tbody tr:last-child td {
   width: min(980px, 100%);
 }
 
-.share-dashboard {
+.share-page {
   display: grid;
   min-width: 0;
   gap: 16px;
@@ -3445,7 +3445,7 @@ tbody tr:last-child td {
   padding-top: 0;
 }
 
-.universal-dashboard {
+.universal-provider-panel {
   display: grid;
   min-width: 0;
   gap: 16px;
@@ -4602,7 +4602,7 @@ tbody tr:last-child td {
   padding: 0;
 }
 
-.settings-dashboard {
+.settings-page {
   display: grid;
   min-width: 0;
   gap: 16px;
@@ -5295,24 +5295,24 @@ tbody tr:last-child td {
     margin: 16px;
   }
 
-  .provider-dashboard {
+  .provider-list {
     padding: 16px;
   }
 
-  .accounts-dashboard {
+  .auth-center-panel {
     padding: 16px;
   }
 
-  .share-dashboard {
+  .share-page {
     padding: 16px;
   }
 
   .usage-dashboard,
-  .universal-dashboard {
+  .universal-provider-panel {
     padding: 16px;
   }
 
-  .settings-dashboard {
+  .settings-page {
     padding: 16px;
   }
 
@@ -5700,12 +5700,12 @@ tbody tr:last-child td {
 }
 
 .desktop-shell .panel,
-.desktop-shell .provider-dashboard,
-.desktop-shell .share-dashboard,
+.desktop-shell .provider-list,
+.desktop-shell .share-page,
 .desktop-shell .usage-dashboard,
-.desktop-shell .settings-dashboard,
-.desktop-shell .universal-dashboard,
-.desktop-shell .accounts-dashboard {
+.desktop-shell .settings-page,
+.desktop-shell .universal-provider-panel,
+.desktop-shell .auth-center-panel {
   min-height: 0;
 }
 

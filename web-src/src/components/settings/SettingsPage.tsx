@@ -44,7 +44,7 @@ import {
   importShares,
   importUniversalProviders,
   loadFailoverSnapshot,
-  loadSettingsDashboardData,
+  loadSettingsPageData,
   loadStoredProviders,
   registerRouter,
   restoreBackup,
@@ -53,7 +53,7 @@ import {
   RouterConfigView,
   RouterDiagnosticsResponse,
   RouterStatusResponse,
-  SettingsDashboardData,
+  SettingsPageData,
   ShareRecord,
   startClientTunnel,
   stopClientTunnel,
@@ -68,8 +68,12 @@ import {
 } from "@/lib/api";
 import { Language, useI18n } from "@/lib/i18n";
 import { getWebRuntimeContext, WebRuntimeContext, writeToken } from "@/lib/runtime";
-import { AccountsDashboard } from "@/components/AccountsDashboard";
+import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { LoadingBlock } from "@/components/LoadingBlock";
+import { TextField } from "@/components/TextField";
+import { KeyValue } from "@/components/KeyValue";
+import { StatusPill } from "@/components/StatusPill";
 import { useTheme } from "@/components/theme-provider";
 
 export type SettingsTab =
@@ -139,9 +143,9 @@ interface FailoverDraft {
   halfOpenMaxProbes: string;
 }
 
-export function SettingsDashboard({ initialTab = "general" }: { initialTab?: SettingsTab }) {
+export function SettingsPage({ initialTab = "general" }: { initialTab?: SettingsTab }) {
   const { language, languages, setLanguage, t, tx } = useI18n();
-  const [data, setData] = useState<SettingsDashboardData | null>(null);
+  const [data, setData] = useState<SettingsPageData | null>(null);
   const [runtimeContext, setRuntimeContext] = useState<WebRuntimeContext | null>(null);
   const [failoverSnapshot, setFailoverSnapshot] = useState<FailoverSnapshot>({ apps: {}, breakers: [] });
   const [settingsProviders, setSettingsProviders] = useState<StoredProvider[]>([]);
@@ -161,7 +165,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   const [restoreConfirm, setRestoreConfirm] = useState<BackupManifest | null>(null);
   const [rotateTokenConfirm, setRotateTokenConfirm] = useState(false);
   const [routerSyncConfirm, setRouterSyncConfirm] = useState(false);
-  const dashboardRef = useRef<HTMLDivElement>(null);
+  const settingsPageRef = useRef<HTMLDivElement>(null);
   const clientTunnelRunning = isClientTunnelRunning(data?.tunnel.runtimeStatus?.status);
 
   useEffect(() => {
@@ -169,8 +173,8 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   }, [initialTab]);
 
   useLayoutEffect(() => {
-    if (dashboardRef.current) {
-      dashboardRef.current.scrollTop = 0;
+    if (settingsPageRef.current) {
+      settingsPageRef.current.scrollTop = 0;
     }
   }, [activeTab]);
 
@@ -179,7 +183,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
     setError(null);
     try {
       const [next, context, snapshot, providers] = await Promise.all([
-        loadSettingsDashboardData(),
+        loadSettingsPageData(),
         getWebRuntimeContext().catch(() => null),
         loadFailoverSnapshot(),
         loadStoredProviders(),
@@ -343,7 +347,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
   }
 
   return (
-    <div className="settings-dashboard" ref={dashboardRef}>
+    <div className="settings-page" ref={settingsPageRef}>
       <div className="provider-toolbar">
         <div className="provider-toolbar-status">
           <span>{data?.config.ownerEmail || t("server.settings.runtimeSubtitle")}</span>
@@ -359,10 +363,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
       </div>
 
       {loading && !data ? (
-        <div className="provider-empty">
-          <Loader2 size={22} />
-          <span>{t("server.settings.loading")}</span>
-        </div>
+        <LoadingBlock label="server.settings.loading" />
       ) : (
         <div className="settings-tab-shell">
           <div className="settings-tabs" role="tablist" aria-label={tx("Settings sections")}>
@@ -559,7 +560,7 @@ export function SettingsDashboard({ initialTab = "general" }: { initialTab?: Set
               title={t("server.nav.accounts")}
               subtitle={tx("OAuth accounts and quota tools")}
             />
-            <AccountsDashboard embedded />
+            <AuthCenterPanel embedded />
           </section>
               </div>
             )}
@@ -920,7 +921,7 @@ function AboutPanel({ buildInfo }: { buildInfo: BuildInfo }) {
   );
 }
 
-function SettingsReadinessPanel({ data }: { data: SettingsDashboardData }) {
+function SettingsReadinessPanel({ data }: { data: SettingsPageData }) {
   const { t } = useI18n();
   const items = settingsReadinessItems(data);
   return (
@@ -948,7 +949,7 @@ function SettingsReadinessPanel({ data }: { data: SettingsDashboardData }) {
   );
 }
 
-function SettingsOverviewStrip({ data }: { data: SettingsDashboardData }) {
+function SettingsOverviewStrip({ data }: { data: SettingsPageData }) {
   const { t, tx } = useI18n();
   const tunnelStatus = data.tunnel.runtimeStatus?.status || data.tunnel.tunnelStatus || "-";
   const items: Array<{ label: string; value: ReactNode; detail: string; tone: "success" | "warning" | "danger" }> = [
@@ -1221,16 +1222,6 @@ function DiagnosticsSummary({ diagnostics }: { diagnostics?: RouterDiagnosticsRe
   );
 }
 
-function TextField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
-  const { tx } = useI18n();
-  return (
-    <label>
-      <span>{tx(label)}</span>
-      <input value={value} onChange={(event) => onChange(event.target.value)} />
-    </label>
-  );
-}
-
 function FormFooter({ busy, label }: { busy: boolean; label: string }) {
   const { tx } = useI18n();
   return (
@@ -1415,27 +1406,9 @@ function diagnosticTone(status?: string | null, error?: string | null): "success
   return "success";
 }
 
-function KeyValue({ label, value }: { label: string; value: ReactNode }) {
-  const { tx } = useI18n();
-  return (
-    <div className="compact-kv">
-      <span>{tx(label)}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
 
-function StatusPill({
-  children,
-  tone,
-}: {
-  children: ReactNode;
-  tone: "success" | "warning" | "danger";
-}) {
-  return <span className={`status-pill ${tone}`}>{children}</span>;
-}
 
-function settingsReadinessItems(data: SettingsDashboardData): Array<{
+function settingsReadinessItems(data: SettingsPageData): Array<{
   label: string;
   value: string;
   detail: string;

@@ -788,7 +788,7 @@ export interface UniversalProviderPreset {
   isCustomTemplate?: boolean;
 }
 
-export interface SettingsDashboardData {
+export interface SettingsPageData {
   config: ConfigSnapshot;
   router: RouterConfigView;
   tunnel: ClientTunnelResponse;
@@ -844,7 +844,7 @@ export interface FetchModelsResult {
   provider?: StoredProvider;
 }
 
-export async function loadProviderDashboardData(): Promise<{
+export async function loadProviderListData(): Promise<{
   providers: StoredProvider[];
   matrix: ProviderMatrix;
   health: ProviderHealth[];
@@ -1012,7 +1012,7 @@ export async function fetchProviderModels(
   });
 }
 
-export async function loadAccountsDashboardData(): Promise<{
+export async function loadAuthCenterPanelData(): Promise<{
   accounts: AccountRecord[];
   capabilities: AccountManagerCapability[];
   templates: AccountImportTemplate[];
@@ -1149,7 +1149,7 @@ export async function pollKiroDeviceLogin(input: {
   });
 }
 
-export async function loadShareDashboardData(): Promise<{
+export async function loadSharePageData(): Promise<{
   shares: ShareRecord[];
   providers: StoredProvider[];
   requestLogs: UsageLog[];
@@ -1421,7 +1421,7 @@ export async function deleteModelPricing(modelId: string): Promise<boolean> {
   return result.deleted;
 }
 
-export async function loadSettingsDashboardData(): Promise<SettingsDashboardData> {
+export async function loadSettingsPageData(): Promise<SettingsPageData> {
   const [config, router, tunnel, routerStatus, diagnostics, backups, buildInfo] = await Promise.all([
     jsonFetch<ConfigSnapshot>("/api/config"),
     jsonFetch<{ router: RouterConfigView }>("/api/router/config"),

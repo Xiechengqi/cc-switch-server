@@ -17,9 +17,13 @@ import {
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { IconAction } from "@/components/IconAction";
+import { LoadingBlock } from "@/components/LoadingBlock";
+import { KeyValue } from "@/components/KeyValue";
 import JsonEditor from "@/components/JsonEditor";
 import { JsonPreview } from "@/components/JsonPreview";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import { StatusPill } from "@/components/StatusPill";
 import { inferIconForText } from "@/config/iconInference";
 import {
   AccountDeviceCodeResponse,
@@ -33,7 +37,7 @@ import {
   finishAccountLogin,
   loadAccountQuota,
   loadAccountRefreshPlan,
-  loadAccountsDashboardData,
+  loadAuthCenterPanelData,
   OAuthLoginFinish,
   OAuthLoginStart,
   pollCopilotDeviceLogin,
@@ -47,7 +51,7 @@ import {
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 
-interface AccountsDashboardState {
+interface AuthCenterPanelState {
   accounts: AccountRecord[];
   capabilities: AccountManagerCapability[];
   templates: AccountImportTemplate[];
@@ -111,9 +115,9 @@ const oauthPreviewProviderTypes = [
   "agy_oauth",
 ];
 
-export function AccountsDashboard({ embedded = false }: { embedded?: boolean } = {}) {
+export function AuthCenterPanel({ embedded = false }: { embedded?: boolean } = {}) {
   const { t, tx } = useI18n();
-  const [data, setData] = useState<AccountsDashboardState>({
+  const [data, setData] = useState<AuthCenterPanelState>({
     accounts: [],
     capabilities: [],
     templates: [],
@@ -129,7 +133,7 @@ export function AccountsDashboard({ embedded = false }: { embedded?: boolean } =
     setLoading(true);
     setError(null);
     try {
-      setData(await loadAccountsDashboardData());
+      setData(await loadAuthCenterPanelData());
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -207,7 +211,7 @@ export function AccountsDashboard({ embedded = false }: { embedded?: boolean } =
   }
 
   return (
-    <div className={embedded ? "accounts-dashboard embedded" : "accounts-dashboard"}>
+    <div className={embedded ? "auth-center-panel embedded" : "auth-center-panel"}>
       {!embedded && (
         <div className="provider-toolbar">
           <div className="provider-toolbar-status">
@@ -278,10 +282,7 @@ export function AccountsDashboard({ embedded = false }: { embedded?: boolean } =
             <span>{loading ? t("common.loading") : t("server.accounts.providerTypes", { count: providerTypes.length })}</span>
           </div>
           {loading ? (
-            <div className="provider-empty">
-              <Loader2 size={22} />
-              <span>{t("server.accounts.loading")}</span>
-            </div>
+            <LoadingBlock label="server.accounts.loading" />
           ) : data.accounts.length ? (
             <div className="account-group-list">
               {providerTypes.map((providerType) => {
@@ -583,6 +584,7 @@ function AccountCard({
           onClick={() => onAction("refresh")}
           busy={busyId === `${busyPrefix}refresh`}
           disabled={!capability?.supportsRefresh}
+          wrap={false}
         >
           <RefreshCw size={15} />
         </IconAction>
@@ -591,6 +593,7 @@ function AccountCard({
           onClick={() => onAction("quota")}
           busy={busyId === `${busyPrefix}quota`}
           disabled={!capability?.supportsQuota}
+          wrap={false}
         >
           <FileJson size={15} />
         </IconAction>
@@ -599,6 +602,7 @@ function AccountCard({
           onClick={() => onAction("forceQuota")}
           busy={busyId === `${busyPrefix}forceQuota`}
           disabled={!capability?.supportsQuota}
+          wrap={false}
         >
           <CheckCircle2 size={15} />
         </IconAction>
@@ -607,6 +611,7 @@ function AccountCard({
           onClick={() => onAction("plan")}
           busy={busyId === `${busyPrefix}plan`}
           disabled={!capability?.supportsRefreshPlan}
+          wrap={false}
         >
           <ShieldCheck size={15} />
         </IconAction>
@@ -615,6 +620,7 @@ function AccountCard({
           onClick={() => setDeleteConfirmOpen(true)}
           busy={busyId === `${busyPrefix}delete`}
           danger
+          wrap={false}
         >
           <Trash2 size={15} />
         </IconAction>
@@ -1444,56 +1450,7 @@ function AccountProviderIcon({ providerType, size = 20 }: { providerType: string
   return <ProviderIcon icon={icon.icon} color={icon.color} name={providerLabel(providerType)} size={size} />;
 }
 
-function KeyValue({ label, value }: { label: string; value: ReactNode }) {
-  const { tx } = useI18n();
-  return (
-    <div className="compact-kv">
-      <span>{tx(label)}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
 
-function StatusPill({
-  children,
-  tone,
-}: {
-  children: ReactNode;
-  tone: "success" | "warning" | "danger";
-}) {
-  return <span className={`status-pill ${tone}`}>{children}</span>;
-}
-
-function IconAction({
-  title,
-  children,
-  busy,
-  danger,
-  disabled,
-  onClick,
-}: {
-  title: string;
-  children: ReactNode;
-  busy?: boolean;
-  danger?: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-}) {
-  const { tx } = useI18n();
-  const translatedTitle = tx(title);
-  return (
-    <button
-      className={danger ? "icon-button danger" : "icon-button"}
-      type="button"
-      title={translatedTitle}
-      aria-label={translatedTitle}
-      onClick={onClick}
-      disabled={busy || disabled}
-    >
-      {busy ? <Loader2 size={15} /> : children}
-    </button>
-  );
-}
 
 function providerLabel(providerType: string): string {
   const labels: Record<string, string> = {
