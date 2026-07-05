@@ -1,33 +1,8 @@
-import {
-  AlertTriangle,
-  Archive,
-  Cable,
-  CheckCircle2,
-  Cloud,
-  Copy,
-  FolderOpen,
-  GitCommit,
-  Info,
-  KeyRound,
-  Languages,
-  Loader2,
-  Mail,
-  Monitor,
-  Network,
-  Moon,
-  Palette,
-  RefreshCw,
-  RotateCcw,
-  Save,
-  ShieldCheck,
-  Shuffle,
-  Sun,
-} from "lucide-react";
+import { Archive, CheckCircle2, Copy, KeyRound, Languages, Loader2, Mail, Network, RefreshCw, Save } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   BackupManifest,
-  BuildInfo,
   AppKind,
   FailoverSnapshot,
   batchSyncRouterShares,
@@ -41,8 +16,6 @@ import {
   restoreBackup,
   rotateApiToken,
   requestEmailLoginCode,
-  RouterConfigView,
-  RouterStatusResponse,
   SettingsPageData,
   startClientTunnel,
   stopClientTunnel,
@@ -56,6 +29,19 @@ import {
 import { Language, useI18n } from "@/lib/i18n";
 import { getWebRuntimeContext, WebRuntimeContext, writeToken } from "@/lib/runtime";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
+import { FailoverSettingsPanel } from "@/components/settings/FailoverSettingsPanel";
+import {
+  ProxySettingsPanel,
+  RouterSettingsPanel,
+  TunnelSettingsPanel,
+} from "@/components/settings/SettingsConnectionPanels";
+import {
+  AboutPanel,
+  DirectoryPanel,
+  SettingsOverviewStrip,
+  SettingsReadinessPanel,
+  ThemeSettingsPanel,
+} from "@/components/settings/SettingsInfoPanels";
 import { ImportExportPanel } from "@/components/settings/ImportExportPanel";
 import { SectionHeader } from "@/components/settings/SettingsSectionHeader";
 import {
@@ -63,15 +49,30 @@ import {
   BackupSnapshotGrid,
   Diagnostics,
   DiagnosticsSummary,
-  RouterFacts,
-  TunnelStatus,
 } from "@/components/settings/SettingsStatusPanels";
+import {
+  appLabel,
+  emptyEmailDraft,
+  emptyFailoverDrafts,
+  emptyProxyDraft,
+  emptyRouterDraft,
+  emptyTunnelDraft,
+  errorMessage,
+  failoverDraftsFrom,
+  isClientTunnelRunning,
+  positiveInteger,
+  routerDraftFrom,
+  routerStatusText,
+  tunnelDraftFrom,
+  type EmailDraft,
+  type FailoverDraft,
+  type ProxyDraft,
+  type RouterDraft,
+  type TunnelDraft,
+} from "@/components/settings/settingsDrafts";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LoadingBlock } from "@/components/LoadingBlock";
 import { TextField } from "@/components/TextField";
-import { KeyValue } from "@/components/KeyValue";
-import { StatusPill } from "@/components/StatusPill";
-import { useTheme } from "@/components/theme-provider";
 
 export type SettingsTab =
   | "general"
@@ -104,42 +105,6 @@ const settingsTabs: Array<{ id: SettingsTab; label: string }> = [
   { id: "about", label: "About" },
 ];
 
-const APP_KINDS: AppKind[] = ["claude", "codex", "gemini"];
-
-interface RouterDraft {
-  url: string;
-  apiBase: string;
-  domain: string;
-  region: string;
-  sshHost: string;
-  sshUser: string;
-  custom: boolean;
-}
-
-interface TunnelDraft {
-  tunnelSubdomain: string;
-  tunnelStatus: string;
-}
-
-interface ProxyDraft {
-  url: string;
-  clear: boolean;
-  followSystemProxy: boolean;
-}
-
-interface EmailDraft {
-  email: string;
-  code: string;
-}
-
-interface FailoverDraft {
-  enabled: boolean;
-  providerQueue: string[];
-  failureThreshold: string;
-  openDurationSeconds: string;
-  halfOpenMaxProbes: string;
-}
-
 export function SettingsPage({ initialTab = "general" }: { initialTab?: SettingsTab }) {
   const { language, languages, setLanguage, t, tx } = useI18n();
   const [data, setData] = useState<SettingsPageData | null>(null);
@@ -150,7 +115,7 @@ export function SettingsPage({ initialTab = "general" }: { initialTab?: Settings
   const [tunnelDraft, setTunnelDraft] = useState<TunnelDraft>(emptyTunnelDraft());
   const [proxyDraft, setProxyDraft] = useState<ProxyDraft>(emptyProxyDraft());
   const [failoverDrafts, setFailoverDrafts] = useState<Record<AppKind, FailoverDraft>>(emptyFailoverDrafts());
-  const [emailDraft, setEmailDraft] = useState<EmailDraft>({ email: "", code: "" });
+  const [emailDraft, setEmailDraft] = useState<EmailDraft>(emptyEmailDraft());
   const [backupReason, setBackupReason] = useState("");
   const [apiToken, setApiToken] = useState<string | null>(null);
   const [apiTokenCopyStatus, setApiTokenCopyStatus] = useState<{ tone: "success" | "warning"; message: string } | null>(null);
@@ -419,36 +384,13 @@ export function SettingsPage({ initialTab = "general" }: { initialTab?: Settings
 
             {activeTab === "proxy" && (
               <div className="settings-layout">
-          <section className="settings-card">
-            <SectionHeader icon={<Cloud size={17} />} title={t("server.settings.upstreamProxy")} subtitle={data?.config.upstreamProxy.maskedUrl || t("server.settings.notConfigured")} />
-            <form className="settings-form" onSubmit={saveProxy}>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={proxyDraft.followSystemProxy}
-                  onChange={(event) => setProxyDraft({ ...proxyDraft, followSystemProxy: event.target.checked })}
+                <ProxySettingsPanel
+                  maskedUrl={data?.config.upstreamProxy.maskedUrl}
+                  draft={proxyDraft}
+                  busy={busy}
+                  onDraftChange={setProxyDraft}
+                  onSave={saveProxy}
                 />
-                <span>{t("server.settings.followSystemProxy")}</span>
-              </label>
-              <label>
-                <span>{t("server.settings.newProxyUrl")}</span>
-                <input
-                  value={proxyDraft.url}
-                  placeholder="http://127.0.0.1:7890"
-                  onChange={(event) => setProxyDraft({ ...proxyDraft, url: event.target.value })}
-                />
-              </label>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={proxyDraft.clear}
-                  onChange={(event) => setProxyDraft({ ...proxyDraft, clear: event.target.checked })}
-                />
-                <span>{t("server.settings.clearConfiguredUrl")}</span>
-              </label>
-              <FormFooter busy={busy === "proxy-save"} label={t("server.settings.saveProxy")} />
-            </form>
-          </section>
               </div>
             )}
 
@@ -467,63 +409,33 @@ export function SettingsPage({ initialTab = "general" }: { initialTab?: Settings
 
             {activeTab === "router" && (
               <div className="settings-layout">
-          <section className="settings-card wide">
-            <SectionHeader icon={<Network size={17} />} title={t("server.settings.router")} subtitle={routerState(data?.routerStatus)} />
-            <form className="settings-form settings-form-grid" onSubmit={saveRouter}>
-              <TextField label={t("server.auth.routerUrl")} value={routerDraft.url} onChange={(value) => setRouterDraft({ ...routerDraft, url: value })} />
-              <TextField label={t("server.settings.apiBase")} value={routerDraft.apiBase} onChange={(value) => setRouterDraft({ ...routerDraft, apiBase: value })} />
-              <TextField label={t("server.settings.domain")} value={routerDraft.domain} onChange={(value) => setRouterDraft({ ...routerDraft, domain: value })} />
-              <TextField label={t("server.settings.region")} value={routerDraft.region} onChange={(value) => setRouterDraft({ ...routerDraft, region: value })} />
-              <TextField label={t("server.settings.sshHost")} value={routerDraft.sshHost} onChange={(value) => setRouterDraft({ ...routerDraft, sshHost: value })} />
-              <TextField label={t("server.settings.sshUser")} value={routerDraft.sshUser} onChange={(value) => setRouterDraft({ ...routerDraft, sshUser: value })} />
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={routerDraft.custom}
-                  onChange={(event) => setRouterDraft({ ...routerDraft, custom: event.target.checked })}
+                <RouterSettingsPanel
+                  router={data?.router}
+                  status={data?.routerStatus}
+                  draft={routerDraft}
+                  busy={busy}
+                  onDraftChange={setRouterDraft}
+                  onSave={saveRouter}
+                  onRegister={() => void runAction("router-register", async () => `registered ${JSON.stringify(await registerRouter())}`)}
+                  onHeartbeat={() => void runAction("router-heartbeat", async () => routerStatusText(await heartbeatRouter()))}
+                  onBatchSync={() => setRouterSyncConfirm(true)}
                 />
-                <span>{t("server.settings.customRouter")}</span>
-              </label>
-              <FormFooter busy={busy === "router-save"} label={t("server.settings.saveRouter")} />
-            </form>
-            <div className="settings-actions">
-              <ActionButton label={t("server.settings.register")} icon={<CheckCircle2 size={15} />} busy={busy === "router-register"} onClick={() => void runAction("router-register", async () => `registered ${JSON.stringify(await registerRouter())}`)} />
-              <ActionButton label={t("server.settings.heartbeat")} icon={<RefreshCw size={15} />} busy={busy === "router-heartbeat"} onClick={() => void runAction("router-heartbeat", async () => routerStatusText(await heartbeatRouter()))} />
-              <ActionButton label={t("server.settings.batchSync")} icon={<RotateCcw size={15} />} busy={busy === "router-sync"} onClick={() => setRouterSyncConfirm(true)} />
-            </div>
-            <RouterFacts router={data?.router} status={data?.routerStatus} />
-          </section>
               </div>
             )}
 
             {activeTab === "tunnel" && (
               <div className="settings-layout">
-          <section className="settings-card">
-            <SectionHeader icon={<Cable size={17} />} title={t("server.settings.clientTunnel")} subtitle={data?.tunnel.runtimeStatus?.tunnelUrl || data?.tunnel.tunnelSubdomain || "-"} />
-            <form className="settings-form" onSubmit={saveTunnel}>
-              <TextField label={t("server.settings.subdomain")} value={tunnelDraft.tunnelSubdomain} onChange={(value) => setTunnelDraft({ ...tunnelDraft, tunnelSubdomain: value })} />
-              <TextField label={t("server.settings.status")} value={tunnelDraft.tunnelStatus} onChange={(value) => setTunnelDraft({ ...tunnelDraft, tunnelStatus: value })} />
-              <FormFooter busy={busy === "tunnel-save"} label={t("server.settings.saveTunnel")} />
-            </form>
-            <div className="settings-actions">
-              <ActionButton label={t("server.settings.claim")} icon={<CheckCircle2 size={15} />} busy={busy === "tunnel-claim"} onClick={() => void runAction("tunnel-claim", async () => `claim ${JSON.stringify(await claimClientTunnel())}`)} />
-              <ActionButton
-                label={t("server.settings.start")}
-                icon={<Cable size={15} />}
-                busy={busy === "tunnel-start"}
-                disabled={clientTunnelRunning}
-                onClick={() => void runAction("tunnel-start", async () => (await startClientTunnel()).message)}
-              />
-              <ActionButton
-                label={t("server.settings.stop")}
-                icon={<AlertTriangle size={15} />}
-                busy={busy === "tunnel-stop"}
-                disabled={!clientTunnelRunning}
-                onClick={() => void runAction("tunnel-stop", async () => `stopped ${(await stopClientTunnel()).tunnelStatus || "client tunnel"}`)}
-              />
-            </div>
-            <TunnelStatus status={data?.tunnel.runtimeStatus} />
-          </section>
+                <TunnelSettingsPanel
+                  tunnel={data?.tunnel}
+                  draft={tunnelDraft}
+                  busy={busy}
+                  clientTunnelRunning={clientTunnelRunning}
+                  onDraftChange={setTunnelDraft}
+                  onSave={saveTunnel}
+                  onClaim={() => void runAction("tunnel-claim", async () => `claim ${JSON.stringify(await claimClientTunnel())}`)}
+                  onStart={() => void runAction("tunnel-start", async () => (await startClientTunnel()).message)}
+                  onStop={() => void runAction("tunnel-stop", async () => `stopped ${(await stopClientTunnel()).tunnelStatus || "client tunnel"}`)}
+                />
               </div>
             )}
 
@@ -650,341 +562,6 @@ export function SettingsPage({ initialTab = "general" }: { initialTab?: Settings
   );
 }
 
-function ThemeSettingsPanel() {
-  const { theme, setTheme } = useTheme();
-  const { tx } = useI18n();
-  const options: Array<{ value: "light" | "dark" | "system"; label: string; icon: ReactNode }> = [
-    { value: "light", label: "Light", icon: <Sun size={16} /> },
-    { value: "dark", label: "Dark", icon: <Moon size={16} /> },
-    { value: "system", label: "System", icon: <Monitor size={16} /> },
-  ];
-  return (
-    <section className="settings-card">
-      <SectionHeader
-        icon={<Palette size={17} />}
-        title={tx("Theme")}
-        subtitle={tx("Choose the desktop color mode for this browser")}
-      />
-      <div className="theme-option-grid" role="radiogroup" aria-label={tx("Theme")}>
-        {options.map((option) => (
-          <button
-            key={option.value}
-            className={theme === option.value ? "theme-option active" : "theme-option"}
-            type="button"
-            role="radio"
-            aria-checked={theme === option.value}
-            onClick={() => setTheme(option.value)}
-          >
-            {option.icon}
-            <span>{tx(option.label)}</span>
-          </button>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function FailoverSettingsPanel({
-  snapshot,
-  providers,
-  drafts,
-  busy,
-  onDraftChange,
-  onSave,
-}: {
-  snapshot: FailoverSnapshot;
-  providers: StoredProvider[];
-  drafts: Record<AppKind, FailoverDraft>;
-  busy: string | null;
-  onDraftChange: (app: AppKind, draft: FailoverDraft) => void;
-  onSave: (app: AppKind, event: FormEvent) => void;
-}) {
-  const { tx } = useI18n();
-  const totalQueued = APP_KINDS.reduce((sum, app) => sum + (snapshot.apps[app]?.providerQueue.length || 0), 0);
-  const openBreakers = snapshot.breakers.filter((breaker) => breaker.state !== "closed").length;
-  return (
-    <section className="settings-card wide settings-failover-card">
-      <SectionHeader
-        icon={<Shuffle size={17} />}
-        title={tx("Failover")}
-        subtitle={tx("Automatic provider queue and circuit breaker strategy")}
-      />
-      <div className="settings-policy-grid">
-        <KeyValue label="enabled apps" value={APP_KINDS.filter((app) => snapshot.apps[app]?.enabled).length} />
-        <KeyValue label="queued providers" value={totalQueued} />
-        <KeyValue label="open breakers" value={openBreakers} />
-      </div>
-      <div className="failover-settings-grid">
-        {APP_KINDS.map((app) => {
-          const draft = drafts[app];
-          const appProviders = providers.filter((item) => item.app === app);
-          const providerNames = new Map(appProviders.map((item) => [item.provider.id, item.provider.name || item.provider.id]));
-          const breakers = snapshot.breakers.filter((breaker) => breaker.app === app && breaker.state !== "closed");
-          return (
-            <form className="failover-settings-app" key={app} onSubmit={(event) => onSave(app, event)}>
-              <header>
-                <div>
-                  <strong>{appLabel(app)}</strong>
-                  <span>{tx("{{count}} providers available", { count: appProviders.length })}</span>
-                </div>
-                <StatusPill tone={draft.enabled ? "success" : "warning"}>
-                  {draft.enabled ? tx("enabled") : tx("disabled")}
-                </StatusPill>
-              </header>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={draft.enabled}
-                  onChange={(event) => onDraftChange(app, { ...draft, enabled: event.target.checked })}
-                />
-                <span>{tx("Enable automatic failover")}</span>
-              </label>
-              <div className="failover-number-grid">
-                <label>
-                  <span>{tx("Failure threshold")}</span>
-                  <input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={draft.failureThreshold}
-                    onChange={(event) => onDraftChange(app, { ...draft, failureThreshold: event.target.value })}
-                  />
-                </label>
-                <label>
-                  <span>{tx("Open duration seconds")}</span>
-                  <input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={draft.openDurationSeconds}
-                    onChange={(event) => onDraftChange(app, { ...draft, openDurationSeconds: event.target.value })}
-                  />
-                </label>
-                <label>
-                  <span>{tx("Half-open probes")}</span>
-                  <input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={draft.halfOpenMaxProbes}
-                    onChange={(event) => onDraftChange(app, { ...draft, halfOpenMaxProbes: event.target.value })}
-                  />
-                </label>
-              </div>
-              <div className="failover-queue-summary">
-                <div className="section-title-row compact-title">
-                  <Shuffle size={15} />
-                  <h3>{tx("Provider queue")}</h3>
-                </div>
-                {draft.providerQueue.length ? (
-                  <ol>
-                    {draft.providerQueue.map((providerId, index) => (
-                      <li key={providerId}>
-                        <span>{tx("P{{priority}}", { priority: index + 1 })}</span>
-                        <strong>{providerNames.get(providerId) || providerId}</strong>
-                        <code>{providerId}</code>
-                      </li>
-                    ))}
-                  </ol>
-                ) : (
-                  <p>{tx("Queue is empty. Add providers from provider cards.")}</p>
-                )}
-              </div>
-              <div className="failover-breaker-summary">
-                <span>{tx("Breakers")}</span>
-                {breakers.length ? (
-                  breakers.slice(0, 4).map((breaker) => (
-                    <StatusPill key={breaker.providerId} tone={breaker.state === "open" ? "danger" : "warning"}>
-                      {providerNames.get(breaker.providerId) || breaker.providerId}: {breaker.state}
-                    </StatusPill>
-                  ))
-                ) : (
-                  <StatusPill tone="success">{tx("closed")}</StatusPill>
-                )}
-              </div>
-              <FormFooter busy={busy === `failover-save:${app}`} label={tx("Save failover")} />
-            </form>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function DirectoryPanel({ runtimeContext }: { runtimeContext: WebRuntimeContext | null }) {
-  const { tx } = useI18n();
-  const configDir = runtimeContext?.runtime?.configDir || "~/.cc-switch-server";
-  const webDistDir = runtimeContext?.runtime?.webDistDir || tx("embedded web assets");
-  const embeddedAssets = runtimeContext?.runtime?.embeddedWebAssets ?? "-";
-  const files = [
-    "server.json",
-    "providers.json",
-    "universal-providers.json",
-    "accounts.json",
-    "shares.json",
-    "usage-logs.json",
-    "usage-logs.jsonl",
-    "usage-rollups.json",
-    "model-pricing.json",
-    "failover.json",
-    "tunnels.json",
-    "email-auth.json",
-  ];
-  return (
-    <section className="settings-card wide settings-directory-card">
-      <SectionHeader
-        icon={<FolderOpen size={17} />}
-        title={tx("Directory")}
-        subtitle={tx("Server data and embedded web asset locations")}
-      />
-      <div className="settings-policy-grid">
-        <KeyValue label="config dir" value={configDir} />
-        <KeyValue label="web dist" value={webDistDir} />
-        <KeyValue label="embedded assets" value={embeddedAssets} />
-        <KeyValue label="mode" value={runtimeContext?.mode || "-"} />
-      </div>
-      <div className="settings-directory-list">
-        {files.map((file) => (
-          <div className="settings-directory-row" key={file}>
-            <span>{file}</span>
-            <code>{joinPath(configDir, file)}</code>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function joinPath(dir: string, file: string): string {
-  if (!dir || dir === "~/.cc-switch-server") return `~/.cc-switch-server/${file}`;
-  return `${dir.replace(/\/+$/, "")}/${file}`;
-}
-
-function AboutPanel({ buildInfo }: { buildInfo: BuildInfo }) {
-  const { tx } = useI18n();
-  const sourceUrl = buildInfo.commitId
-    ? `https://github.com/Xiechengqi/cc-switch-server/commit/${buildInfo.commitId}`
-    : "https://github.com/Xiechengqi/cc-switch-server";
-  return (
-    <section className="settings-card wide settings-about-card">
-      <SectionHeader
-        icon={<Info size={17} />}
-        title={tx("About")}
-        subtitle={buildInfo.versionLine || `${buildInfo.name} ${buildInfo.version}`}
-      />
-      <div className="settings-about-hero">
-        <div>
-          <strong>{tx("CC Switch Server")}</strong>
-          <span>{buildInfo.name}</span>
-        </div>
-        <StatusPill tone={buildInfo.dirty ? "warning" : "success"}>
-          {buildInfo.dirty ? tx("dirty build") : tx("clean build")}
-        </StatusPill>
-      </div>
-      <div className="settings-policy-grid">
-        <KeyValue label="version" value={buildInfo.version} />
-        <KeyValue label="commit" value={buildInfo.commitShort || "-"} />
-        <KeyValue label="commit time" value={buildInfo.commitTime || "-"} />
-        <KeyValue label="build time" value={buildInfo.buildTime || "-"} />
-        <KeyValue label="target" value={buildInfo.target || "-"} />
-        <KeyValue label="profile" value={buildInfo.profile || "-"} />
-        <KeyValue label="rustc" value={buildInfo.rustcVersion || "-"} />
-        <KeyValue label="dirty" value={buildInfo.dirty ? "yes" : "no"} />
-      </div>
-      <div className="settings-commit-card">
-        <div className="section-title-row compact-title">
-          <GitCommit size={16} />
-          <h3>{tx("Commit message")}</h3>
-        </div>
-        <p>{buildInfo.commitMessage || "-"}</p>
-        <a className="inline-link" href={sourceUrl} target="_blank" rel="noreferrer">
-          <GitCommit size={14} />
-          <span>{tx("Open source commit")}</span>
-        </a>
-      </div>
-    </section>
-  );
-}
-
-function SettingsReadinessPanel({ data }: { data: SettingsPageData }) {
-  const { t } = useI18n();
-  const items = settingsReadinessItems(data);
-  return (
-    <section className="settings-card wide settings-readiness-panel">
-      <SectionHeader
-        icon={<ShieldCheck size={17} />}
-        title={t("server.settings.runtimeReadiness")}
-        subtitle={t("server.settings.readinessSubtitle", {
-          ready: items.filter((item) => item.tone === "success").length,
-          total: items.length,
-        })}
-      />
-      <div className="settings-readiness-grid">
-        {items.map((item) => (
-          <div className="settings-readiness-item" key={item.label}>
-            <div>
-              <strong>{item.label}</strong>
-              <span>{item.detail}</span>
-            </div>
-            <StatusPill tone={item.tone}>{item.value}</StatusPill>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function SettingsOverviewStrip({ data }: { data: SettingsPageData }) {
-  const { t, tx } = useI18n();
-  const tunnelStatus = data.tunnel.runtimeStatus?.status || data.tunnel.tunnelStatus || "-";
-  const items: Array<{ label: string; value: ReactNode; detail: string; tone: "success" | "warning" | "danger" }> = [
-    {
-      label: t("server.settings.owner"),
-      value: data.config.ownerEmail || "-",
-      detail: data.config.ownerEmail ? tx("owner-bound") : tx("owner pending"),
-      tone: data.config.ownerEmail ? "success" : "warning",
-    },
-    {
-      label: t("server.settings.router"),
-      value: data.routerStatus.registered ? tx("registered") : tx("not registered"),
-      detail: data.routerStatus.lastError || formatTime(data.routerStatus.lastHeartbeatMs),
-      tone: data.routerStatus.lastError ? "danger" : data.routerStatus.registered ? "success" : "warning",
-    },
-    {
-      label: t("server.settings.tunnel"),
-      value: tunnelStatus,
-      detail: data.tunnel.runtimeStatus?.tunnelUrl || data.tunnel.tunnelSubdomain || "-",
-      tone: diagnosticTone(tunnelStatus, data.tunnel.runtimeStatus?.lastError),
-    },
-    {
-      label: t("server.settings.pendingLogs"),
-      value: data.routerStatus.pendingRequestLogSync,
-      detail: tx("request log sync backlog"),
-      tone: data.routerStatus.pendingRequestLogSync > 0 ? "warning" : "success",
-    },
-    {
-      label: t("server.settings.backups"),
-      value: data.backups.length,
-      detail: data.backups[0] ? formatTime(Math.max(...data.backups.map((backup) => backup.createdAtMs))) : tx("no snapshots"),
-      tone: data.backups.length ? "success" : "warning",
-    },
-  ];
-  return (
-    <div className="settings-overview-strip">
-      {items.map((item) => (
-        <article className="settings-overview-card" key={item.label}>
-          <div>
-            <span>{item.label}</span>
-            <strong>{item.value}</strong>
-            <small>{item.detail}</small>
-          </div>
-          <StatusPill tone={item.tone}>{item.tone}</StatusPill>
-        </article>
-      ))}
-    </div>
-  );
-}
-
 function FormFooter({ busy, label }: { busy: boolean; label: string }) {
   const { tx } = useI18n();
   return (
@@ -1015,159 +592,4 @@ function ActionButton({
       <span>{tx(label)}</span>
     </button>
   );
-}
-
-function isClientTunnelRunning(status?: string | null): boolean {
-  const normalized = status?.trim().toLowerCase();
-  return Boolean(
-    normalized &&
-      !["stopped", "ended", "error", "failed"].includes(normalized),
-  );
-}
-
-function diagnosticTone(status?: string | null, error?: string | null): "success" | "warning" | "danger" {
-  if (error) return "danger";
-  const normalized = status?.trim().toLowerCase();
-  if (!normalized || ["disabled", "stopped", "ended", "unknown"].includes(normalized)) return "warning";
-  if (["error", "failed", "expired", "exhausted"].includes(normalized)) return "danger";
-  return "success";
-}
-
-
-
-function settingsReadinessItems(data: SettingsPageData): Array<{
-  label: string;
-  value: string;
-  detail: string;
-  tone: "success" | "warning" | "danger";
-}> {
-  const latestBackup = [...data.backups].sort((left, right) => right.createdAtMs - left.createdAtMs)[0];
-  const latestBackupAge = latestBackup ? Date.now() - latestBackup.createdAtMs : Number.POSITIVE_INFINITY;
-  const tunnelErrors = data.diagnostics.tunnels.filter((tunnel) => tunnel.lastError).length;
-  const shareErrors = data.diagnostics.shareSync.filter((share) => share.routerLastSyncError).length;
-  const diagnosticsIssues = tunnelErrors + shareErrors + (data.routerStatus.lastError ? 1 : 0);
-  return [
-    {
-      label: "setup",
-      value: data.config.ownerEmail ? "owner" : "pending",
-      detail: data.config.ownerEmail || "no owner email",
-      tone: data.config.ownerEmail ? "success" : "warning",
-    },
-    {
-      label: "login",
-      value: "email code",
-      detail: data.config.ownerEmail ? "owner-bound" : "owner pending",
-      tone: data.config.ownerEmail ? "success" : "warning",
-    },
-    {
-      label: "router",
-      value: data.routerStatus.registered ? "registered" : "local",
-      detail: data.routerStatus.lastError || formatTime(data.routerStatus.lastHeartbeatMs),
-      tone: data.routerStatus.lastError ? "danger" : data.routerStatus.registered ? "success" : "warning",
-    },
-    {
-      label: "backup",
-      value: latestBackup ? "ready" : "missing",
-      detail: latestBackup ? formatTime(latestBackup.createdAtMs) : "no snapshots",
-      tone: latestBackupAge <= 24 * 60 * 60 * 1000 ? "success" : latestBackup ? "warning" : "danger",
-    },
-    {
-      label: "diagnostics",
-      value: diagnosticsIssues ? `${diagnosticsIssues} issue` : "clean",
-      detail: `${data.diagnostics.tunnels.length} tunnels / ${data.diagnostics.shareSync.length} shares`,
-      tone: diagnosticsIssues ? "warning" : "success",
-    },
-  ];
-}
-
-function routerState(status?: RouterStatusResponse): string {
-  if (!status) return "loading";
-  if (status.lastError) return status.lastError;
-  return status.registered ? "registered" : "not registered";
-}
-
-function routerStatusText(status: RouterStatusResponse): string {
-  return status.registered ? `heartbeat ok; pending logs ${status.pendingRequestLogSync}` : "heartbeat recorded locally";
-}
-
-function routerDraftFrom(router: RouterConfigView): RouterDraft {
-  return {
-    url: router.url || "",
-    apiBase: router.apiBase || "",
-    domain: router.domain || "",
-    region: router.region || "",
-    sshHost: router.sshHost || "",
-    sshUser: router.sshUser || "",
-    custom: router.custom,
-  };
-}
-
-function tunnelDraftFrom(tunnel: { tunnelSubdomain?: string | null; tunnelStatus?: string | null }): TunnelDraft {
-  return {
-    tunnelSubdomain: tunnel.tunnelSubdomain || "",
-    tunnelStatus: tunnel.tunnelStatus || "",
-  };
-}
-
-function emptyRouterDraft(): RouterDraft {
-  return { url: "", apiBase: "", domain: "", region: "", sshHost: "", sshUser: "", custom: false };
-}
-
-function emptyTunnelDraft(): TunnelDraft {
-  return { tunnelSubdomain: "", tunnelStatus: "" };
-}
-
-function emptyProxyDraft(): ProxyDraft {
-  return { url: "", clear: false, followSystemProxy: true };
-}
-
-function emptyFailoverDrafts(): Record<AppKind, FailoverDraft> {
-  return APP_KINDS.reduce(
-    (drafts, app) => {
-      drafts[app] = failoverDraftFrom();
-      return drafts;
-    },
-    {} as Record<AppKind, FailoverDraft>,
-  );
-}
-
-function failoverDraftsFrom(snapshot: FailoverSnapshot): Record<AppKind, FailoverDraft> {
-  return APP_KINDS.reduce(
-    (drafts, app) => {
-      drafts[app] = failoverDraftFrom(snapshot.apps[app]);
-      return drafts;
-    },
-    {} as Record<AppKind, FailoverDraft>,
-  );
-}
-
-function failoverDraftFrom(config?: FailoverSnapshot["apps"][AppKind]): FailoverDraft {
-  return {
-    enabled: Boolean(config?.enabled),
-    providerQueue: [...(config?.providerQueue || [])],
-    failureThreshold: String(config?.failureThreshold ?? 2),
-    openDurationSeconds: String(Math.max(1, Math.round((config?.openDurationMs ?? 300000) / 1000))),
-    halfOpenMaxProbes: String(config?.halfOpenMaxProbes ?? 1),
-  };
-}
-
-function positiveInteger(value: string, fallback: number): number {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
-  return parsed;
-}
-
-function appLabel(app: AppKind): string {
-  if (app === "claude") return "Claude Code";
-  if (app === "codex") return "Codex";
-  return "Gemini";
-}
-
-function formatTime(value?: number | null): string {
-  if (value == null || value <= 0) return "-";
-  return new Date(value).toLocaleString();
-}
-
-function errorMessage(reason: unknown): string {
-  return reason instanceof Error ? reason.message : String(reason);
 }

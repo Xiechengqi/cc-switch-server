@@ -1110,6 +1110,60 @@ U0（基座）→ U1（壳）→ U2（Provider 主视图）→ U3（对话框，
 - `SettingsPage.tsx` 继续保留 router/tunnel/backup/diagnostics tab 的 action 编排、确认流程和表单状态；状态卡片、备份快照卡片与诊断卡片由新文件承接。
 - 保留 router facts、tunnel runtime、backup restore button、backup policy summary、diagnostics tunnel/share cards 的 DOM、CSS class、i18n 文案和 busy/restore 行为；不改变 router/tunnel/backup/diagnostics API 调用。
 
+### 2026-07-05 Settings draft/helper extraction
+
+- 新增 `components/settings/settingsDrafts.ts`，集中 `RouterDraft`、`TunnelDraft`、`ProxyDraft`、`EmailDraft`、`FailoverDraft`、默认 draft、router/tunnel/failover 转换、positive integer 解析、app label、router status 文案、client tunnel running 判定与 error helper。
+- `SettingsPage.tsx` 继续持有 settings state、runAction、保存/确认/刷新编排；draft 初始化、snapshot-to-draft 和小型 display helper 改为导入共享文件。
+- 保留 router/tunnel/proxy/failover/email/auth 保存 payload、默认值、状态文案和 busy key；不改变 settings API、web runtime context 或任何表单行为。
+
+### 2026-07-05 Settings info panels extraction
+
+- 新增 `components/settings/SettingsInfoPanels.tsx`，抽出 `ThemeSettingsPanel`、`DirectoryPanel`、`AboutPanel`、`SettingsReadinessPanel`、`SettingsOverviewStrip` 及其只读展示 helper，并从 settings barrel 导出。
+- `SettingsPage.tsx` 从约 1173 行降至约 791 行，只保留 tab 编排、表单动作、Failover 设置表单和确认弹窗；General/Theme/Directory/About 的展示面板由新文件承接。
+- 保留主题 light/dark/system 切换、目录路径列表、build metadata、General overview/readiness DOM、CSS class、i18n 文案和数据来源；不改变 settings 数据加载或保存流程。
+
+### 2026-07-05 AuthCenter account import extraction
+
+- 新增 `components/settings/AccountImportModal.tsx`，抽出 `AccountImportModal`、`AccountImportDraft`、`createAccountImportDraft`、`accountInputFromDraft` 与账号导入 JSON/number/date/scopes 解析 helper，并从 settings barrel 导出。
+- `AuthCenterPanel.tsx` 继续保留账号列表、overview、OAuth/device flow、quota/refresh/delete action 编排和导入提交 busy/error 状态；导入表单 UI 与 payload 转换由新文件承接。
+- 保留导入弹窗 DOM、CSS class、JsonEditor 字段、required/template note、credential material 校验、UpsertAccountInput payload 和保存/刷新流程；不改变账号导入 API 或错误语义。
+
+### 2026-07-05 AuthCenter account cards extraction
+
+- 新增 `components/settings/AuthCenterAccounts.tsx`，抽出 `AuthCenterOverview`、`AccountGroup`、账号卡、quota footer、regression strip、provider card 和 `AccountDetail`/`AccountAction` 类型，并从 settings barrel 导出。
+- `AuthCenterPanel.tsx` 继续持有账号数据加载、detail/result 状态、refresh/quota/plan/delete API action 编排和导入/OAuth/device flow 侧栏；账号列表与 overview 渲染由新文件承接。
+- 保留账号卡 DOM、CSS class、IconAction 行为、delete confirm、quota meter/tier/next refresh、detail JsonPreview、provider overview metrics 和 import 回调；不改变账号刷新、quota、plan 或删除 API。
+
+### 2026-07-05 AuthCenter side panels extraction
+
+- 新增 `components/settings/AuthCenterSidePanels.tsx`，抽出 `CapabilityPanel` 与 `CodexBankedResetPanel`，并从 settings barrel 导出。
+- `AuthCenterPanel.tsx` 继续保留 OAuth preview、Copilot/Kiro device flow、账号 action 编排和 import 回调；readiness cards 与 Codex banked reset read-only snapshot 展示由新文件承接。
+- 保留 provider readiness DOM、template details、import button、banked reset credits、Snapshot JSON、status pill、i18n 文案和只读数据来源；不改变账号 capability/template 或 quota raw snapshot 解析行为。
+
+### 2026-07-05 AuthCenter flow extraction
+
+- 新增 `components/settings/AuthCenterFlows.tsx`，抽出 `OAuthPreviewPanel`、`DeviceFlowPanel`、`DeviceFlowCard` 和 flow 内部 provider icon helper，并从 settings barrel 导出。
+- `AuthCenterPanel.tsx` 降至约 291 行，只保留数据加载、账号 action 编排、导入提交、overview/list/side-panel/flow 组合；OAuth 和 Copilot/Kiro device-flow 的本地状态由新文件承接。
+- 保留 OAuth start/finish、token request preview、execute token exchange、Copilot/Kiro start/poll、user code/URL 复制反馈、JsonPreview、DOM/CSS class 和 `onImported` 刷新回调；不改变账号登录、device polling 或导入 API。
+
+### 2026-07-05 Settings failover panel extraction
+
+- 新增 `components/settings/FailoverSettingsPanel.tsx`，抽出 Failover tab 的 per-app 自动故障转移配置表单、队列摘要、breaker 摘要与保存按钮，并从 settings barrel 导出。
+- `SettingsPage.tsx` 继续持有 failover snapshot/provider 加载、draft 状态、`updateFailoverApp` 保存 action 和结果刷新；Failover tab 的展示和 draft patch UI 由新文件承接。
+- 保留 failure threshold/open duration/half-open probes、provider queue、breaker status、busy key、DOM/CSS class、i18n 文案和保存 payload；不改变 `/api/failover` 数据流或 settings tab 行为。
+
+### 2026-07-05 Universal modals extraction
+
+- 新增 `components/universal/UniversalModals.tsx`，抽出 `ImportUniversalModal`、`UniversalPresetModal`、preset 搜索/排序 helper 与 preset icon helper，并从 universal barrel 导出。
+- `UniversalProviderPanel.tsx` 继续持有 provider/preset 数据加载、draft 状态、import/export/sync/delete action 编排和 modal open 状态；import/preset modal UI 与本地 confirm/search state 由新文件承接。
+- 保留 Universal import JSON 解析、导入确认、preset 搜索、recommended/A-Z 排序、ProviderIcon 渲染、DOM/CSS class、i18n 文案和回调行为；不改变 universal provider import API、preset draft 初始化或保存流程。
+
+### 2026-07-05 Settings connection panels extraction
+
+- 新增 `components/settings/SettingsConnectionPanels.tsx`，抽出 `ProxySettingsPanel`、`RouterSettingsPanel`、`TunnelSettingsPanel` 和局部 action/form footer helper，并从 settings barrel 导出。
+- `SettingsPage.tsx` 继续持有 proxy/router/tunnel draft 状态、router register/heartbeat/batch sync、client tunnel claim/start/stop 与保存 action 编排；三个连接类 tab 的表单、状态卡片和按钮 UI 由新文件承接。
+- 保留 upstream proxy、router config、router facts、client tunnel config/runtime status、start/stop guard、busy key、DOM/CSS class、i18n 文案和所有保存/action payload；不改变 settings API 或 tunnel/router runtime 调用。
+
 ## 六、验证基线
 
 - 静态：`scripts/static-checks.sh`（含 i18n 字面量扫描，U9 加入）+ `npm --prefix web-src run typecheck` + Vite build。
