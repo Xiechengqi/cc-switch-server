@@ -12,28 +12,18 @@ import {
   rectSortingStrategy,
   SortableContext,
   sortableKeyboardCoordinates,
-  useSortable,
 } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
 import {
-  Copy,
   Download,
-  Edit3,
-  Globe,
-  GripVertical,
   ListPlus,
   Loader2,
   Plus,
   RefreshCw,
-  RotateCcw,
   Search,
-  Trash2,
   Upload,
 } from "lucide-react";
 import {
-  CSSProperties,
   FormEvent,
-  HTMLAttributes,
   useCallback,
   useEffect,
   useMemo,
@@ -52,17 +42,11 @@ import {
   UniversalProviderPreset,
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { IconAction } from "@/components/IconAction";
-import { KeyValue } from "@/components/KeyValue";
 import { LoadingBlock } from "@/components/LoadingBlock";
-import { SimpleModal } from "@/components/SimpleModal";
-import { JsonPreview } from "@/components/JsonPreview";
-import { StatusPill } from "@/components/StatusPill";
 import { SortableUniversalCard } from "@/components/universal/UniversalCard";
 import { UniversalListToolbar } from "@/components/universal/UniversalListToolbar";
 import { UniversalEmptyState } from "@/components/universal/UniversalEmptyState";
-import { ImportUniversalModal, UniversalPresetModal } from "@/components/universal/UniversalModals";
+import { ImportUniversalModal, UniversalExportModal, UniversalPresetModal } from "@/components/universal/UniversalModals";
 import {
   draftFromPreset,
   draftFromProvider,
@@ -366,23 +350,12 @@ export function UniversalProviderPanel() {
       )}
 
       {exportText && (
-        <SimpleModal
-          title="Export Universal Providers"
-          subtitle="Copy this JSON when clipboard access is unavailable."
+        <UniversalExportModal
+          exportText={exportText}
+          copyStatus={exportCopyStatus}
+          onCopy={() => void copyExportText()}
           onClose={() => setExportText(null)}
-        >
-          <textarea readOnly value={exportText} />
-          {exportCopyStatus && <div className={`connect-copy-status ${exportCopyStatus.tone}`}>{exportCopyStatus.message}</div>}
-          <footer className="modal-inline-footer">
-            <button className="secondary-button" type="button" onClick={() => void copyExportText()}>
-              <Copy size={15} />
-              <span>{tx("Copy JSON")}</span>
-            </button>
-            <button className="secondary-button" type="button" onClick={() => setExportText(null)}>
-              {tx("Close")}
-            </button>
-          </footer>
-        </SimpleModal>
+        />
       )}
     </div>
   );

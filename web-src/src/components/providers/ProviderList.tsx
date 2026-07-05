@@ -11,35 +11,15 @@ import {
   arrayMove,
   SortableContext,
   sortableKeyboardCoordinates,
-  useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
 import {
-  BarChart3,
-  CheckCircle2,
-  Copy,
-  Download,
-  FlaskConical,
-  GripVertical,
-  Link2,
   ListPlus,
-  Loader2,
-  Minus,
-  Pencil,
-  Play,
-  Plus,
   RefreshCw,
   Search,
-  ServerCog,
-  Trash2,
-  X,
 } from "lucide-react";
 import {
-  CSSProperties,
   FormEvent,
-  HTMLAttributes,
-  ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -56,10 +36,9 @@ import {
   fetchProviderModels,
   getCurrentProvider,
   loadProviderListData,
-  ProviderBreaker,
-  ProviderHealth,
   ProviderMatrix,
   ProviderMatrixEntry,
+  ProviderHealth,
   ProviderPresetSummary,
   ProviderPresetsByApp,
   ProviderLimitStatus,
@@ -72,17 +51,8 @@ import {
   updateProvidersSortOrder,
 } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
-import { inferIconForText } from "@/config/iconInference";
-import { ColorPicker } from "@/components/ColorPicker";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { IconAction } from "@/components/IconAction";
 import { LoadingBlock } from "@/components/LoadingBlock";
-import { KeyValue } from "@/components/KeyValue";
-import { IconPicker } from "@/components/IconPicker";
-import JsonEditor from "@/components/JsonEditor";
-import { FailoverPriorityBadge } from "@/components/providers/FailoverPriorityBadge";
 import { ProviderEmptyState } from "@/components/providers/ProviderEmptyState";
-import { ProviderHealthIndicator } from "@/components/providers/ProviderHealthIndicator";
 import { ProviderListToolbar } from "@/components/providers/ProviderListToolbar";
 import { ProviderCatalogModal } from "@/components/providers/ProviderCatalogModal";
 import { ProviderFormModal } from "@/components/providers/ProviderFormModal";
@@ -99,9 +69,6 @@ import {
   providerKey,
   type ProviderDraft,
 } from "@/components/providers/providerDraft";
-import { ProviderIcon } from "@/components/ProviderIcon";
-import { StatusPill } from "@/components/StatusPill";
-import { presetIcon, storedProviderIcon } from "@/lib/provider-icons";
 
 const apps: Array<{ id: AppKind; label: string }> = [
   { id: "claude", label: "Claude" },

@@ -1,5 +1,5 @@
-import { Archive, CheckCircle2, Copy, KeyRound, Languages, Loader2, Mail, Network, RefreshCw, Save } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Languages, RefreshCw } from "lucide-react";
+import { FormEvent, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   BackupManifest,
@@ -28,7 +28,11 @@ import {
 } from "@/lib/api";
 import { Language, useI18n } from "@/lib/i18n";
 import { getWebRuntimeContext, WebRuntimeContext, writeToken } from "@/lib/runtime";
-import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
+import {
+  AuthSettingsPanel,
+  BackupSettingsPanel,
+  DiagnosticsSettingsPanel,
+} from "@/components/settings/SettingsAccountPanels";
 import { FailoverSettingsPanel } from "@/components/settings/FailoverSettingsPanel";
 import {
   ProxySettingsPanel,
@@ -44,12 +48,6 @@ import {
 } from "@/components/settings/SettingsInfoPanels";
 import { ImportExportPanel } from "@/components/settings/ImportExportPanel";
 import { SectionHeader } from "@/components/settings/SettingsSectionHeader";
-import {
-  BackupPolicySummary,
-  BackupSnapshotGrid,
-  Diagnostics,
-  DiagnosticsSummary,
-} from "@/components/settings/SettingsStatusPanels";
 import {
   appLabel,
   emptyEmailDraft,
@@ -72,7 +70,6 @@ import {
 } from "@/components/settings/settingsDrafts";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LoadingBlock } from "@/components/LoadingBlock";
-import { TextField } from "@/components/TextField";
 
 export type SettingsTab =
   | "general"
@@ -441,53 +438,30 @@ export function SettingsPage({ initialTab = "general" }: { initialTab?: Settings
 
             {activeTab === "auth" && (
               <div className="settings-layout">
-          <section className="settings-card">
-            <SectionHeader icon={<KeyRound size={17} />} title={t("server.settings.auth")} subtitle={t("server.settings.authSubtitle")} />
-            <div className="settings-actions">
-              <ActionButton label={t("server.settings.rotateApiToken")} icon={<KeyRound size={15} />} busy={busy === "api-token"} onClick={() => setRotateTokenConfirm(true)} />
-              {apiToken && (
-                <button className="secondary-button" type="button" onClick={() => void copyApiToken()}>
-                  <Copy size={15} />
-                  <span>{t("server.settings.copyToken")}</span>
-                </button>
-              )}
-            </div>
-            {apiTokenCopyStatus && <div className={`connect-copy-status ${apiTokenCopyStatus.tone}`}>{apiTokenCopyStatus.message}</div>}
-            {apiToken && <pre className="settings-secret-preview">{apiToken}</pre>}
-            <div className="settings-form">
-              <TextField label={t("server.auth.ownerEmail")} value={emailDraft.email} onChange={(value) => setEmailDraft({ ...emailDraft, email: value })} />
-              <TextField label={t("server.settings.verificationCode")} value={emailDraft.code} onChange={(value) => setEmailDraft({ ...emailDraft, code: value })} />
-              <div className="settings-actions">
-                <ActionButton label={t("server.settings.requestCode")} icon={<Mail size={15} />} busy={busy === "email-request"} onClick={() => void requestCodeAction()} />
-                <ActionButton label={t("server.settings.verify")} icon={<CheckCircle2 size={15} />} busy={busy === "email-verify"} onClick={() => void verifyCodeAction()} />
-              </div>
-            </div>
-          </section>
-          <section className="settings-card wide settings-accounts-card">
-            <SectionHeader
-              icon={<KeyRound size={17} />}
-              title={t("server.nav.accounts")}
-              subtitle={tx("OAuth accounts and quota tools")}
-            />
-            <AuthCenterPanel embedded />
-          </section>
+                <AuthSettingsPanel
+                  emailDraft={emailDraft}
+                  apiToken={apiToken}
+                  apiTokenCopyStatus={apiTokenCopyStatus}
+                  busy={busy}
+                  onEmailDraftChange={setEmailDraft}
+                  onRotateToken={() => setRotateTokenConfirm(true)}
+                  onCopyToken={() => void copyApiToken()}
+                  onRequestCode={() => void requestCodeAction()}
+                  onVerifyCode={() => void verifyCodeAction()}
+                />
               </div>
             )}
 
             {activeTab === "backup" && (
               <div className="settings-layout">
-          <section className="settings-card wide">
-            <SectionHeader icon={<Archive size={17} />} title={t("server.settings.backup")} subtitle={t("server.settings.backupSubtitle")} />
-            <BackupPolicySummary backups={data?.backups || []} />
-            <form className="settings-form backup-create-row" onSubmit={makeBackup}>
-              <label>
-                <span>{t("server.settings.reason")}</span>
-                <input value={backupReason} onChange={(event) => setBackupReason(event.target.value)} />
-              </label>
-              <FormFooter busy={busy === "backup-create"} label={t("server.settings.createBackup")} />
-            </form>
-            <BackupSnapshotGrid backups={data?.backups || []} busy={busy} onRestore={setRestoreConfirm} />
-          </section>
+                <BackupSettingsPanel
+                  backups={data?.backups || []}
+                  backupReason={backupReason}
+                  busy={busy}
+                  onBackupReasonChange={setBackupReason}
+                  onCreateBackup={makeBackup}
+                  onRestore={setRestoreConfirm}
+                />
               </div>
             )}
 
@@ -499,18 +473,7 @@ export function SettingsPage({ initialTab = "general" }: { initialTab?: Settings
 
             {activeTab === "diagnostics" && (
               <div className="settings-layout">
-          <section className="settings-card wide">
-            <SectionHeader
-              icon={<Network size={17} />}
-              title={t("server.settings.diagnostics")}
-              subtitle={t("server.settings.diagnosticsSubtitle", {
-                tunnels: data?.diagnostics.tunnels.length || 0,
-                shares: data?.diagnostics.shareSync.length || 0,
-              })}
-            />
-            <DiagnosticsSummary diagnostics={data?.diagnostics} />
-            <Diagnostics diagnostics={data?.diagnostics} />
-          </section>
+                <DiagnosticsSettingsPanel diagnostics={data?.diagnostics} />
               </div>
             )}
 
@@ -559,37 +522,5 @@ export function SettingsPage({ initialTab = "general" }: { initialTab?: Settings
         onCancel={() => setRestoreConfirm(null)}
       />
     </div>
-  );
-}
-
-function FormFooter({ busy, label }: { busy: boolean; label: string }) {
-  const { tx } = useI18n();
-  return (
-    <button className="primary-button" type="submit" disabled={busy}>
-      {busy ? <Loader2 size={15} /> : <Save size={15} />}
-      <span>{tx(label)}</span>
-    </button>
-  );
-}
-
-function ActionButton({
-  label,
-  icon,
-  busy,
-  disabled,
-  onClick,
-}: {
-  label: string;
-  icon: ReactNode;
-  busy: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-}) {
-  const { tx } = useI18n();
-  return (
-    <button className="secondary-button" type="button" onClick={onClick} disabled={busy || disabled}>
-      {busy ? <Loader2 size={15} /> : icon}
-      <span>{tx(label)}</span>
-    </button>
   );
 }

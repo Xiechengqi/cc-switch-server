@@ -15,6 +15,11 @@ export { CapabilityPanel, CodexBankedResetPanel } from "./AuthCenterSidePanels";
 export { FailoverSettingsPanel } from "./FailoverSettingsPanel";
 export { ImportExportPanel } from "./ImportExportPanel";
 export {
+  AuthSettingsPanel,
+  BackupSettingsPanel,
+  DiagnosticsSettingsPanel,
+} from "./SettingsAccountPanels";
+export {
   ProxySettingsPanel,
   RouterSettingsPanel,
   TunnelSettingsPanel,

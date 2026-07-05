@@ -15,6 +15,7 @@ export type { ShareDraft } from "./ShareFormModal";
 export { OwnerChangeModal } from "./OwnerChangeModal";
 export type { OwnerChangeDraft } from "./OwnerChangeModal";
 export { ShareEmptyState } from "./ShareEmptyState";
+export { ShareExportModal } from "./ShareExportModal";
 export { ShareRequestLogPanel } from "./ShareRequestLogPanel";
 export { ShareRuntimePanel } from "./ShareRuntimePanel";
 export { ShareStatsBar } from "./ShareStatsBar";

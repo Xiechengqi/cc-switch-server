@@ -1,28 +1,20 @@
 import {
   Cable,
-  Copy,
   Download,
-  Edit3,
   FileJson,
-  Link2,
   Loader2,
-  Pause,
-  Play,
   RefreshCw,
-  RotateCcw,
   Route,
   Share2,
   SlidersHorizontal,
   Store,
-  Trash2,
   Upload,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { IconAction } from "@/components/IconAction";
 import { LoadingBlock } from "@/components/LoadingBlock";
-import { SimpleModal } from "@/components/SimpleModal";
+import { ShareExportModal } from "@/components/share/ShareExportModal";
 import { ImportSharesModal } from "@/components/share/ImportSharesModal";
 import {
   createBindingDraft,
@@ -49,7 +41,7 @@ import { ShareRuntimePanel } from "@/components/share/ShareRuntimePanel";
 import { ShareStatsBar } from "@/components/share/ShareStatsBar";
 import { ShareTunnelConfigPanel } from "@/components/share/ShareTunnelConfigPanel";
 import { ShareToolbar, type ShareFilter, type ShareSort } from "@/components/share/ShareToolbar";
-import { shareName } from "@/components/share/shareDisplay";
+import { providerKey, shareActionLabel, shareName } from "@/components/share/shareDisplay";
 import {
   AppKind,
   authorizeShareMarket,
@@ -614,41 +606,15 @@ export function SharePage() {
       />
 
       {exportText && (
-        <SimpleModal
-          title="Export Shares"
-          subtitle="Copy this JSON when clipboard access is unavailable."
+        <ShareExportModal
+          exportText={exportText}
+          copyStatus={exportCopyStatus}
+          onCopy={() => void copyExportText()}
           onClose={() => setExportText(null)}
-        >
-          <textarea readOnly value={exportText} />
-          {exportCopyStatus && <div className={`connect-copy-status ${exportCopyStatus.tone}`}>{exportCopyStatus.message}</div>}
-          <footer className="modal-inline-footer">
-            <button className="secondary-button" type="button" onClick={() => void copyExportText()}>
-              <Copy size={15} />
-              <span>{tx("Copy JSON")}</span>
-            </button>
-            <button className="secondary-button" type="button" onClick={() => setExportText(null)}>
-              {tx("Close")}
-            </button>
-          </footer>
-        </SimpleModal>
+        />
       )}
     </div>
   );
-}
-
-function providerKey(app: AppKind, providerId: string): string {
-  return `${app}:${providerId}`;
-}
-
-function shareActionLabel(action: "pause" | "resume" | "startTunnel" | "stopTunnel" | "resetUsage"): string {
-  const labels: Record<typeof action, string> = {
-    pause: "Pause",
-    resume: "Resume",
-    startTunnel: "Start tunnel",
-    stopTunnel: "Stop tunnel",
-    resetUsage: "Reset usage",
-  };
-  return labels[action];
 }
 
 function errorMessage(error: unknown): string {

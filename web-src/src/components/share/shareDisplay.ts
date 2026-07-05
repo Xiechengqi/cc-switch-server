@@ -16,6 +16,21 @@ export function appLabel(app: AppKind): string {
   return appLabels[app] || app;
 }
 
+export function providerKey(app: AppKind, providerId: string): string {
+  return `${app}:${providerId}`;
+}
+
+export function shareActionLabel(action: "pause" | "resume" | "startTunnel" | "stopTunnel" | "resetUsage"): string {
+  const labels: Record<typeof action, string> = {
+    pause: "Pause",
+    resume: "Resume",
+    startTunnel: "Start tunnel",
+    stopTunnel: "Stop tunnel",
+    resetUsage: "Reset usage",
+  };
+  return labels[action];
+}
+
 export function shareBindings(share: ShareRecord): ShareBinding[] {
   const seen = new Set<string>();
   const bindings: ShareBinding[] = [];
