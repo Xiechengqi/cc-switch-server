@@ -60,6 +60,9 @@ export const iconMetadata: Record<string, IconMetadata> = {
   vercel: { name: "vercel", displayName: "Vercel", defaultColor: "#111827", source: "desktop" },
   ucloud: { name: "ucloud", displayName: "UCloud", defaultColor: "#2B70FF", source: "desktop" },
   notion: { name: "notion", displayName: "Notion", defaultColor: "#111827", source: "desktop" },
+  opencode: { name: "opencode", displayName: "OpenCode", defaultColor: "#211E1E", source: "desktop" },
+  openclaw: { name: "openclaw", displayName: "OpenClaw", defaultColor: "#ff4d4d", source: "desktop" },
+  hermes: { name: "hermes", displayName: "Hermes", source: "desktop" },
   "opencode-logo-light": { name: "opencode-logo-light", displayName: "OpenCode", defaultColor: "#111827", source: "desktop" },
   "aihubmix-color": { name: "aihubmix-color", displayName: "AIHubMix", defaultColor: "#2563EB", source: "desktop" },
   aicoding: { name: "aicoding", displayName: "AICoding", defaultColor: "#2563EB", source: "desktop" },
@@ -77,3 +80,18 @@ export const iconMetadata: Record<string, IconMetadata> = {
   sssaicode: { name: "sssaicode", displayName: "SSSAI Code", defaultColor: "#2563EB", source: "desktop" },
   xiaomimimo: { name: "xiaomimimo", displayName: "Xiaomi MiMo", defaultColor: "#FF6900", source: "desktop" },
 };
+
+export function getIconMetadata(name: string): IconMetadata | undefined {
+  return iconMetadata[name.toLowerCase()];
+}
+
+export function searchIcons(query: string): string[] {
+  const lowerQuery = query.toLowerCase();
+  return Object.values(iconMetadata)
+    .filter(
+      (meta) =>
+        meta.name.includes(lowerQuery) ||
+        meta.displayName.toLowerCase().includes(lowerQuery),
+    )
+    .map((meta) => meta.name);
+}

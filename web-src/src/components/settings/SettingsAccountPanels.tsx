@@ -1,9 +1,8 @@
 import { Archive, CheckCircle2, Copy, KeyRound, Loader2, Mail, Network, Save } from "lucide-react";
 import type { FormEvent, ReactNode } from "react";
 
-import type { BackupManifest, RouterDiagnosticsResponse } from "@/lib/api";
+import type { BackupManifest, RouterDiagnosticsResponse } from "@/lib/server-legacy-api";
 import { useI18n } from "@/lib/i18n";
-import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { SectionHeader } from "@/components/settings/SettingsSectionHeader";
 import {
   BackupPolicySummary,
@@ -14,7 +13,7 @@ import {
 import type { EmailDraft } from "@/components/settings/settingsDrafts";
 import { TextField } from "@/components/TextField";
 
-export function AuthSettingsPanel({
+export function ServerAdminAuthPanel({
   emailDraft,
   apiToken,
   apiTokenCopyStatus,
@@ -35,64 +34,67 @@ export function AuthSettingsPanel({
   onRequestCode: () => void;
   onVerifyCode: () => void;
 }) {
-  const { t, tx } = useI18n();
+  const { t } = useI18n();
   return (
-    <>
-      <section className="settings-card">
-        <SectionHeader icon={<KeyRound size={17} />} title={t("server.settings.auth")} subtitle={t("server.settings.authSubtitle")} />
+    <section className="settings-card">
+      <SectionHeader
+        icon={<KeyRound size={17} />}
+        title={t("server.settings.auth")}
+        subtitle={t("server.settings.authSubtitle")}
+      />
+      <div className="settings-actions">
+        <SettingsActionButton
+          label={t("server.settings.rotateApiToken")}
+          icon={<KeyRound size={15} />}
+          busy={busy === "api-token"}
+          onClick={onRotateToken}
+        />
+        {apiToken && (
+          <button className="secondary-button" type="button" onClick={onCopyToken}>
+            <Copy size={15} />
+            <span>{t("server.settings.copyToken")}</span>
+          </button>
+        )}
+      </div>
+      {apiTokenCopyStatus && (
+        <div className={`connect-copy-status ${apiTokenCopyStatus.tone}`}>
+          {apiTokenCopyStatus.message}
+        </div>
+      )}
+      {apiToken && <pre className="settings-secret-preview">{apiToken}</pre>}
+      <div className="settings-form">
+        <TextField
+          label={t("server.auth.ownerEmail")}
+          value={emailDraft.email}
+          onChange={(value) => onEmailDraftChange({ ...emailDraft, email: value })}
+        />
+        <TextField
+          label={t("server.settings.verificationCode")}
+          value={emailDraft.code}
+          onChange={(value) => onEmailDraftChange({ ...emailDraft, code: value })}
+        />
         <div className="settings-actions">
           <SettingsActionButton
-            label={t("server.settings.rotateApiToken")}
-            icon={<KeyRound size={15} />}
-            busy={busy === "api-token"}
-            onClick={onRotateToken}
+            label={t("server.settings.requestCode")}
+            icon={<Mail size={15} />}
+            busy={busy === "email-request"}
+            onClick={onRequestCode}
           />
-          {apiToken && (
-            <button className="secondary-button" type="button" onClick={onCopyToken}>
-              <Copy size={15} />
-              <span>{t("server.settings.copyToken")}</span>
-            </button>
-          )}
+          <SettingsActionButton
+            label={t("server.settings.verify")}
+            icon={<CheckCircle2 size={15} />}
+            busy={busy === "email-verify"}
+            onClick={onVerifyCode}
+          />
         </div>
-        {apiTokenCopyStatus && <div className={`connect-copy-status ${apiTokenCopyStatus.tone}`}>{apiTokenCopyStatus.message}</div>}
-        {apiToken && <pre className="settings-secret-preview">{apiToken}</pre>}
-        <div className="settings-form">
-          <TextField
-            label={t("server.auth.ownerEmail")}
-            value={emailDraft.email}
-            onChange={(value) => onEmailDraftChange({ ...emailDraft, email: value })}
-          />
-          <TextField
-            label={t("server.settings.verificationCode")}
-            value={emailDraft.code}
-            onChange={(value) => onEmailDraftChange({ ...emailDraft, code: value })}
-          />
-          <div className="settings-actions">
-            <SettingsActionButton
-              label={t("server.settings.requestCode")}
-              icon={<Mail size={15} />}
-              busy={busy === "email-request"}
-              onClick={onRequestCode}
-            />
-            <SettingsActionButton
-              label={t("server.settings.verify")}
-              icon={<CheckCircle2 size={15} />}
-              busy={busy === "email-verify"}
-              onClick={onVerifyCode}
-            />
-          </div>
-        </div>
-      </section>
-      <section className="settings-card wide settings-accounts-card">
-        <SectionHeader
-          icon={<KeyRound size={17} />}
-          title={t("server.nav.accounts")}
-          subtitle={tx("OAuth accounts and quota tools")}
-        />
-        <AuthCenterPanel embedded />
-      </section>
-    </>
+      </div>
+    </section>
   );
+}
+
+/** @deprecated Server admin auth UI; kept for optional advanced-tab wiring. */
+export function AuthSettingsPanel(props: Parameters<typeof ServerAdminAuthPanel>[0]) {
+  return <ServerAdminAuthPanel {...props} />;
 }
 
 export function BackupSettingsPanel({

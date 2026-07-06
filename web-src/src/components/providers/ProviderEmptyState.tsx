@@ -1,43 +1,53 @@
-import { Download, ListPlus, Users } from "lucide-react";
-
-import { AppKind } from "@/lib/api";
-import { useI18n } from "@/lib/i18n";
-import { appLabel } from "@/components/providers/providerDisplay";
+import { Download, Users } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { Button } from "@/components/ui/button";
+import type { AppId } from "@/lib/api/types";
 
 interface ProviderEmptyStateProps {
-  app: AppKind;
-  canCreate: boolean;
-  onCreate: () => void;
+  appId: AppId;
+  onCreate?: () => void;
   onImport?: () => void;
 }
 
-export function ProviderEmptyState({ app, canCreate, onCreate, onImport }: ProviderEmptyStateProps) {
-  const { t, tx } = useI18n();
-  const appName = appLabel(app);
+export function ProviderEmptyState({
+  appId,
+  onCreate,
+  onImport,
+}: ProviderEmptyStateProps) {
+  const { t } = useTranslation();
+  const showSnippetHint =
+    appId === "claude" || appId === "codex" || appId === "gemini";
+
   return (
-    <div className="provider-empty provider-empty-state">
-      <div className="provider-empty-icon">
-        <Users size={28} />
+    <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border p-10 text-center">
+      <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
+        <Users className="h-7 w-7 text-muted-foreground" />
       </div>
-      <strong>{t("server.providers.noProvidersForApp", { app: appName })}</strong>
-      <p>{t("server.providers.noProvidersHint")}</p>
-      <p>{tx("Import existing configuration or create a provider from desktop presets.")}</p>
-      <div className="provider-empty-actions">
+      <h3 className="text-lg font-semibold">{t("provider.noProviders")}</h3>
+      <p className="mt-2 max-w-lg text-sm text-muted-foreground">
+        {t("provider.noProvidersDescription")}
+      </p>
+      {showSnippetHint && (
+        <p className="mt-1 max-w-lg text-sm text-muted-foreground">
+          {t("provider.noProvidersDescriptionSnippet")}
+        </p>
+      )}
+      <div className="mt-6 flex flex-col gap-2">
         {onImport && (
-          <button className="primary-button" type="button" onClick={onImport}>
-            <Download size={15} />
-            <span>{t("common.import")}</span>
-          </button>
+          <Button onClick={onImport}>
+            <Download className="mr-2 h-4 w-4" />
+            {appId === "claude-desktop"
+              ? t("provider.importFromClaude", {
+                  defaultValue: "将 Claude Code 中已有的供应商导入",
+                })
+              : t("provider.importCurrent")}
+          </Button>
         )}
-        <button
-          className={onImport ? "secondary-button" : "primary-button"}
-          type="button"
-          onClick={onCreate}
-          disabled={!canCreate}
-        >
-          <ListPlus size={15} />
-          <span>{t("server.providers.addProvider")}</span>
-        </button>
+        {onCreate && (
+          <Button variant={onImport ? "outline" : "default"} onClick={onCreate}>
+            {t("provider.addProvider")}
+          </Button>
+        )}
       </div>
     </div>
   );

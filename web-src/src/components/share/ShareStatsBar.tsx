@@ -1,25 +1,45 @@
-import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import { Card, CardContent } from "@/components/ui/card";
 
-import type { ShareRecord } from "@/lib/api";
-import { useI18n } from "@/lib/i18n";
-
-export function ShareStatsBar({ shares }: { shares: ShareRecord[] }) {
-  const { t } = useI18n();
-  return (
-    <div className="share-stats-bar">
-      <ShareStat label={t("server.shares.active")} value={shares.filter((share) => share.status === "active").length} />
-      <ShareStat label={t("server.shares.paused")} value={shares.filter((share) => share.status === "paused").length} />
-      <ShareStat label={t("server.shares.forSale")} value={shares.filter((share) => share.forSale).length} />
-      <ShareStat label={t("server.shares.requests")} value={shares.reduce((sum, share) => sum + (share.requestsCount || 0), 0)} />
-    </div>
-  );
+interface ShareStatsBarProps {
+  totalShares: number;
+  activeShares: number;
+  runningTunnels: number;
+  exhaustedShares: number;
+  expiringSoon: number;
 }
 
-function ShareStat({ label, value }: { label: string; value: ReactNode }) {
+export function ShareStatsBar({
+  totalShares,
+  activeShares,
+  runningTunnels,
+  exhaustedShares,
+  expiringSoon,
+}: ShareStatsBarProps) {
+  const { t } = useTranslation();
+
+  const items = [
+    { label: t("share.stats.total"), value: totalShares },
+    { label: t("share.stats.active"), value: activeShares },
+    { label: t("share.stats.runningTunnels"), value: runningTunnels },
+    { label: t("share.stats.exhausted"), value: exhaustedShares },
+    { label: t("share.stats.expiringSoon"), value: expiringSoon },
+  ];
+
   return (
-    <div className="share-stat">
-      <span>{label}</span>
-      <strong>{value}</strong>
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+      {items.map((item) => (
+        <Card key={item.label} className="border-border-default/70 bg-card/80">
+          <CardContent className="flex items-center justify-between px-4 py-4">
+            <div>
+              <div className="text-xs uppercase tracking-[0.16em] text-muted-foreground">
+                {item.label}
+              </div>
+              <div className="mt-2 text-2xl font-semibold">{item.value}</div>
+            </div>
+          </CardContent>
+        </Card>
+      ))}
     </div>
   );
 }

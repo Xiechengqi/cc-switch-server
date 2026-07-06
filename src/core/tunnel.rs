@@ -459,7 +459,7 @@ impl client::Handler for TunnelHandler {
         let actual = format!("SHA256:{}", server_public_key.fingerprint());
         match &self.expected_fingerprint {
             Some(expected) if constant_time_eq(expected.as_bytes(), actual.as_bytes()) => {
-                tracing::info!(ssh_addr = %self.ssh_addr, fingerprint = %actual, "router ssh host key verified");
+                tracing::debug!(ssh_addr = %self.ssh_addr, fingerprint = %actual, "router ssh host key verified");
                 Ok(true)
             }
             Some(expected) => {

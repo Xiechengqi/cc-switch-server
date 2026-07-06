@@ -1,81 +1,77 @@
-import { Search, SlidersHorizontal } from "lucide-react";
-
-import { useI18n } from "@/lib/i18n";
-
-export type ShareFilter = "all" | "active" | "paused" | "expired" | "exhausted" | "sale";
-export type ShareSort = "createdAtDesc" | "expiresAtAsc" | "tokensUsedDesc" | "nameAsc";
+import { useTranslation } from "react-i18next";
+import { Search } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 interface ShareToolbarProps {
-  query: string;
-  filter: ShareFilter;
-  sort: ShareSort;
-  total: number;
-  visible: number;
-  onQueryChange: (value: string) => void;
-  onFilterChange: (value: ShareFilter) => void;
-  onSortChange: (value: ShareSort) => void;
+  search: string;
+  onSearchChange: (value: string) => void;
+  statusFilter: string;
+  onStatusFilterChange: (value: string) => void;
+  sortBy: string;
+  onSortByChange: (value: string) => void;
 }
 
 export function ShareToolbar({
-  query,
-  filter,
-  sort,
-  total,
-  visible,
-  onQueryChange,
-  onFilterChange,
-  onSortChange,
+  search,
+  onSearchChange,
+  statusFilter,
+  onStatusFilterChange,
+  sortBy,
+  onSortByChange,
 }: ShareToolbarProps) {
-  const { tx } = useI18n();
-  const filters: Array<{ id: ShareFilter; label: string }> = [
-    { id: "all", label: "all" },
-    { id: "active", label: "active" },
-    { id: "paused", label: "paused" },
-    { id: "expired", label: "expired" },
-    { id: "exhausted", label: "exhausted" },
-    { id: "sale", label: "for sale" },
-  ];
-  const sortOptions: Array<{ id: ShareSort; label: string }> = [
-    { id: "createdAtDesc", label: "Created time desc" },
-    { id: "expiresAtAsc", label: "Expires time asc" },
-    { id: "tokensUsedDesc", label: "Tokens used desc" },
-    { id: "nameAsc", label: "Name asc" },
-  ];
+  const { t } = useTranslation();
+
   return (
-    <section className="share-toolbar">
-      <label className="share-search">
-        <Search size={15} />
-        <input
-          value={query}
-          onChange={(event) => onQueryChange(event.target.value)}
-          placeholder={tx("Search shares")}
+    <div className="grid gap-3 lg:grid-cols-[minmax(0,1.5fr)_repeat(2,minmax(180px,1fr))]">
+      <div className="relative">
+        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={search}
+          onChange={(event) => onSearchChange(event.target.value)}
+          className="pl-9"
+          placeholder={t("share.search")}
         />
-      </label>
-      <label className="share-select">
-        <SlidersHorizontal size={14} />
-        <select
-          value={filter}
-          onChange={(event) => onFilterChange(event.target.value as ShareFilter)}
-          aria-label={tx("Share filters")}
-        >
-          {filters.map((item) => (
-            <option key={item.id} value={item.id}>
-              {tx(item.label)}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="share-select">
-        <SlidersHorizontal size={14} />
-        <select value={sort} onChange={(event) => onSortChange(event.target.value as ShareSort)}>
-          {sortOptions.map((item) => (
-            <option key={item.id} value={item.id}>
-              {tx(item.label)}
-            </option>
-          ))}
-        </select>
-      </label>
-      <span className="share-filter-count">{tx("{{visible}}/{{total}} shares", { visible, total })}</span>
-    </section>
+      </div>
+      <Select value={statusFilter} onValueChange={onStatusFilterChange}>
+        <SelectTrigger>
+          <SelectValue placeholder={t("share.filter.status")} />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">{t("share.filter.all")}</SelectItem>
+          <SelectItem value="active">{t("share.statuses.active")}</SelectItem>
+          <SelectItem value="paused">{t("share.statuses.paused")}</SelectItem>
+          <SelectItem value="expired">{t("share.statuses.expired")}</SelectItem>
+          <SelectItem value="exhausted">
+            {t("share.statuses.exhausted")}
+          </SelectItem>
+        </SelectContent>
+      </Select>
+      <Select value={sortBy} onValueChange={onSortByChange}>
+        <SelectTrigger>
+          <SelectValue placeholder={t("share.sort")} />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="createdAtDesc">
+            {t("share.sortOptions.createdAtDesc")}
+          </SelectItem>
+          <SelectItem value="expiresAtAsc">
+            {t("share.sortOptions.expiresAtAsc")}
+          </SelectItem>
+          <SelectItem value="tokensUsedDesc">
+            {t("share.sortOptions.tokensUsedDesc")}
+          </SelectItem>
+          <SelectItem value="nameAsc">
+            {t("share.sortOptions.nameAsc")}
+          </SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
   );
 }

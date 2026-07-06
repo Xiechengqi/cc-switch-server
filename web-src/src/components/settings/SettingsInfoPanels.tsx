@@ -1,7 +1,7 @@
 import { FolderOpen, GitCommit, Info, Monitor, Moon, Palette, ShieldCheck, Sun } from "lucide-react";
 import type { ReactNode } from "react";
 
-import type { BuildInfo, SettingsPageData } from "@/lib/api";
+import type { BuildInfo, SettingsPageData } from "@/lib/server-legacy-api";
 import type { WebRuntimeContext } from "@/lib/runtime";
 import { useI18n } from "@/lib/i18n";
 import { KeyValue } from "@/components/KeyValue";
@@ -164,13 +164,14 @@ export function SettingsReadinessPanel({ data }: { data: SettingsPageData }) {
 
 export function SettingsOverviewStrip({ data }: { data: SettingsPageData }) {
   const { t, tx } = useI18n();
+  const ownerEmail = data.config?.ownerEmail;
   const tunnelStatus = data.tunnel.runtimeStatus?.status || data.tunnel.tunnelStatus || "-";
   const items: Array<{ label: string; value: ReactNode; detail: string; tone: "success" | "warning" | "danger" }> = [
     {
       label: t("server.settings.owner"),
-      value: data.config.ownerEmail || "-",
-      detail: data.config.ownerEmail ? tx("owner-bound") : tx("owner pending"),
-      tone: data.config.ownerEmail ? "success" : "warning",
+      value: ownerEmail || "-",
+      detail: ownerEmail ? tx("owner-bound") : tx("owner pending"),
+      tone: ownerEmail ? "success" : "warning",
     },
     {
       label: t("server.settings.router"),
@@ -232,6 +233,7 @@ function settingsReadinessItems(data: SettingsPageData): Array<{
   detail: string;
   tone: "success" | "warning" | "danger";
 }> {
+  const ownerEmail = data.config?.ownerEmail;
   const latestBackup = [...data.backups].sort((left, right) => right.createdAtMs - left.createdAtMs)[0];
   const latestBackupAge = latestBackup ? Date.now() - latestBackup.createdAtMs : Number.POSITIVE_INFINITY;
   const tunnelErrors = data.diagnostics.tunnels.filter((tunnel) => tunnel.lastError).length;
@@ -240,15 +242,15 @@ function settingsReadinessItems(data: SettingsPageData): Array<{
   return [
     {
       label: "setup",
-      value: data.config.ownerEmail ? "owner" : "pending",
-      detail: data.config.ownerEmail || "no owner email",
-      tone: data.config.ownerEmail ? "success" : "warning",
+      value: ownerEmail ? "owner" : "pending",
+      detail: ownerEmail || "no owner email",
+      tone: ownerEmail ? "success" : "warning",
     },
     {
       label: "login",
       value: "email code",
-      detail: data.config.ownerEmail ? "owner-bound" : "owner pending",
-      tone: data.config.ownerEmail ? "success" : "warning",
+      detail: ownerEmail ? "owner-bound" : "owner pending",
+      tone: ownerEmail ? "success" : "warning",
     },
     {
       label: "router",

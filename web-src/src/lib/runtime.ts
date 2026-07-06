@@ -1,3 +1,10 @@
+import { isRemoteWebMode } from "@/lib/api/auth";
+import {
+  clearRouterSessionTokens,
+  loginWithWebPassword,
+  routerAuthFetch,
+} from "@/lib/routerAuth";
+
 export interface WebRuntimeFeature {
   id: string;
   label: string;
@@ -49,6 +56,7 @@ export interface WebRuntimeContext {
 }
 
 const TOKEN_KEY = "cc_switch_server_token";
+const PASSWORD_KEY = "cc_switch_server_password";
 
 export function readToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
@@ -62,14 +70,82 @@ export function writeToken(token: string | null): void {
   }
 }
 
+export function readCachedPassword(): string | null {
+  return localStorage.getItem(PASSWORD_KEY);
+}
+
+export function writeCachedPassword(password: string | null): void {
+  if (password) {
+    localStorage.setItem(PASSWORD_KEY, password);
+  } else {
+    localStorage.removeItem(PASSWORD_KEY);
+  }
+}
+
+export async function loginWithPassword(password: string): Promise<string> {
+  const response = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ method: "password", password }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || `HTTP ${response.status}`);
+  }
+  const token = String(data?.token ?? "");
+  if (!token) {
+    throw new Error("login response is missing token");
+  }
+  clearRouterSessionTokens();
+  writeToken(token);
+  writeCachedPassword(password);
+  return token;
+}
+
+async function localApiFetch(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+): Promise<Response> {
+  const request = () => {
+    const headers = new Headers(init.headers || {});
+    const token = readToken();
+    if (token) headers.set("authorization", `Bearer ${token}`);
+    return fetch(input, { ...init, headers });
+  };
+
+  let response = await request();
+  if (response.status !== 401) {
+    return response;
+  }
+
+  const cachedPassword = readCachedPassword();
+  if (!cachedPassword) {
+    writeToken(null);
+    return response;
+  }
+
+  try {
+    await loginWithPassword(cachedPassword);
+  } catch {
+    writeToken(null);
+    writeCachedPassword(null);
+    return response;
+  }
+
+  return request();
+}
+
 export async function apiFetch(
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<Response> {
-  const headers = new Headers(init.headers || {});
-  const token = readToken();
-  if (token) headers.set("authorization", `Bearer ${token}`);
-  return fetch(input, { ...init, headers });
+  if (isRemoteWebMode()) {
+    return routerAuthFetch(input, init);
+  }
+  return localApiFetch(input, init);
 }
 
 export async function jsonFetch<T>(
@@ -90,18 +166,109 @@ export async function jsonFetch<T>(
   return data as T;
 }
 
-export async function getWebRuntimeContext(): Promise<WebRuntimeContext> {
+export async function getWebRuntimeContext(
+  allowAutoLogin = true,
+): Promise<WebRuntimeContext> {
+  if (isRemoteWebMode()) {
+    return getRemoteWebRuntimeContext(allowAutoLogin);
+  }
   const response = await apiFetch("/web-api/context", {
     headers: { accept: "application/json" },
   });
-  if (response.status === 401 || response.status === 403) {
-    return { mode: "client-login", status: "auth-required" };
+  if (response.status === 401) {
+    writeToken(null);
+    return tryAutoLoginFromCache(allowAutoLogin);
   }
-  const data = await response.json().catch(() => ({}));
+  if (response.status === 403) {
+    return tryAutoLoginFromCache(allowAutoLogin);
+  }
+  const data = (await response.json().catch(() => ({}))) as WebRuntimeContext;
   if (!response.ok) {
-    throw new Error(data?.error || data?.message || `HTTP ${response.status}`);
+    throw new Error(
+      (data as { error?: string; message?: string })?.error ||
+        (data as { error?: string; message?: string })?.message ||
+        `HTTP ${response.status}`,
+    );
   }
-  return data as WebRuntimeContext;
+  if (data.mode !== "local-admin") {
+    writeToken(null);
+    return tryAutoLoginFromCache(allowAutoLogin, data);
+  }
+  return data;
+}
+
+async function getRemoteWebRuntimeContext(
+  allowAutoLogin: boolean,
+): Promise<WebRuntimeContext> {
+  const response = await routerAuthFetch("/web-api/context", {
+    headers: { accept: "application/json" },
+    cache: "no-store",
+  });
+  if (response.status === 401) {
+    const retried = await tryRemoteAutoLogin(allowAutoLogin);
+    if (retried.mode !== "local-admin") {
+      clearRouterSessionTokens();
+    }
+    return retried;
+  }
+  const data = (await response.json().catch(() => ({}))) as WebRuntimeContext;
+  if (!response.ok) {
+    throw new Error(
+      (data as { error?: string; message?: string })?.error ||
+        (data as { error?: string; message?: string })?.message ||
+        `HTTP ${response.status}`,
+    );
+  }
+  if (data.mode !== "local-admin") {
+    return tryRemoteAutoLogin(allowAutoLogin, data);
+  }
+  return data;
+}
+
+async function tryRemoteAutoLogin(
+  allowAutoLogin: boolean,
+  fallback: WebRuntimeContext = {
+    mode: "client-login",
+    status: "auth-required",
+  },
+): Promise<WebRuntimeContext> {
+  if (!allowAutoLogin || fallback.auth?.setupRequired) {
+    return fallback;
+  }
+  const cachedPassword = readCachedPassword();
+  if (!cachedPassword) {
+    return fallback;
+  }
+  try {
+    await loginWithWebPassword(cachedPassword);
+    return getRemoteWebRuntimeContext(false);
+  } catch {
+    writeCachedPassword(null);
+    return fallback;
+  }
+}
+
+async function tryAutoLoginFromCache(
+  allowAutoLogin: boolean,
+  fallback: WebRuntimeContext = {
+    mode: "client-login",
+    status: "auth-required",
+  },
+): Promise<WebRuntimeContext> {
+  if (!allowAutoLogin || fallback.auth?.setupRequired) {
+    return fallback;
+  }
+  const cachedPassword = readCachedPassword();
+  if (!cachedPassword) {
+    return fallback;
+  }
+  try {
+    await loginWithPassword(cachedPassword);
+    return getWebRuntimeContext(false);
+  } catch {
+    writeCachedPassword(null);
+    return fallback;
+  }
 }
 
 export async function invokeCommand<T>(
@@ -113,4 +280,14 @@ export async function invokeCommand<T>(
     headers: { "content-type": "application/json" },
     body: JSON.stringify(args ?? {}),
   });
+}
+
+/** Server web UI always runs outside Tauri; desktop components gate on this flag. */
+export function isTauriRuntime(): boolean {
+  return false;
+}
+
+/** True when running in cc-switch-server embedded/admin web UI (not desktop Tauri). */
+export function isServerWebRuntime(): boolean {
+  return !isTauriRuntime();
 }

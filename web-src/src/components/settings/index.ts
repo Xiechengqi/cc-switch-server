@@ -15,6 +15,7 @@ export { CapabilityPanel, CodexBankedResetPanel } from "./AuthCenterSidePanels";
 export { FailoverSettingsPanel } from "./FailoverSettingsPanel";
 export { ImportExportPanel } from "./ImportExportPanel";
 export {
+  ServerAdminAuthPanel,
   AuthSettingsPanel,
   BackupSettingsPanel,
   DiagnosticsSettingsPanel,
@@ -42,4 +43,6 @@ export {
 } from "./SettingsStatusPanels";
 export { SettingsPage } from "./SettingsPage";
 export type { SettingsTab } from "./SettingsPage";
+export { ServerSettingsExtensions } from "./ServerSettingsExtensions";
+export type { ServerSettingsTab } from "./ServerSettingsExtensions";
 export type { EmailDraft, FailoverDraft, ProxyDraft, RouterDraft, TunnelDraft } from "./settingsDrafts";

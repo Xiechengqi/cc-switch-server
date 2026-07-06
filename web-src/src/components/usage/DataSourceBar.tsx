@@ -1,161 +1,125 @@
-import { Database, FileText, Loader2 } from "lucide-react";
-import { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { usageApi } from "@/lib/api/usage";
+import { usageKeys } from "@/lib/query/usage";
+import { Database, FileText, RefreshCw, Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { useState } from "react";
+import { toast } from "sonner";
 
-import { useI18n } from "@/lib/i18n";
-
-export interface UsageDataSourceSummary {
-  dataSource: string;
-  requests: number;
-  successes: number;
-  failures: number;
-  totalTokens: number;
-  totalCostUsd: number;
-  healthChecks: number;
+interface DataSourceBarProps {
+  refreshIntervalMs: number;
 }
 
-export function emptyDataSourceSummary(dataSource: string): UsageDataSourceSummary {
-  return {
-    dataSource,
-    requests: 0,
-    successes: 0,
-    failures: 0,
-    totalTokens: 0,
-    totalCostUsd: 0,
-    healthChecks: 0,
+const DATA_SOURCE_ICONS: Record<string, React.ReactNode> = {
+  proxy: <Database className="h-3.5 w-3.5" />,
+  session_log: <FileText className="h-3.5 w-3.5" />,
+  codex_db: <Database className="h-3.5 w-3.5" />,
+  codex_session: <FileText className="h-3.5 w-3.5" />,
+  gemini_session: <FileText className="h-3.5 w-3.5" />,
+  opencode_session: <FileText className="h-3.5 w-3.5" />,
+};
+
+export function DataSourceBar({ refreshIntervalMs }: DataSourceBarProps) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [syncing, setSyncing] = useState(false);
+
+  const { data: sources } = useQuery({
+    queryKey: [...usageKeys.all, "data-sources"],
+    queryFn: usageApi.getDataSourceBreakdown,
+    refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
+    refetchIntervalInBackground: false,
+  });
+
+  const handleSync = async () => {
+    setSyncing(true);
+    try {
+      const result = await usageApi.syncSessionUsage();
+      if (result.imported > 0) {
+        toast.success(
+          t("usage.sessionSync.imported", {
+            count: result.imported,
+            defaultValue: "Imported {{count}} records from session logs",
+          }),
+        );
+        // Refresh all usage data
+        queryClient.invalidateQueries({ queryKey: usageKeys.all });
+      } else {
+        toast.info(
+          t("usage.sessionSync.upToDate", {
+            defaultValue: "Session logs are up to date",
+          }),
+        );
+      }
+    } catch {
+      toast.error(
+        t("usage.sessionSync.failed", {
+          defaultValue: "Session sync failed",
+        }),
+      );
+    } finally {
+      setSyncing(false);
+    }
   };
-}
 
-export function DataSourceBar({
-  sources,
-  loading,
-  activeSource,
-  onSelect,
-}: {
-  sources: UsageDataSourceSummary[];
-  loading: boolean;
-  activeSource: string;
-  onSelect: (dataSource: string) => void;
-}) {
-  const { tx } = useI18n();
-  if (loading) {
-    return (
-      <section className="usage-data-source-panel">
-        <div className="usage-data-source-label">
-          <Database size={15} />
-          <span>{tx("Data Sources")}</span>
-        </div>
-        <div className="provider-empty inline-empty">
-          <Loader2 size={18} />
-          <span>{tx("Loading sources")}</span>
-        </div>
-      </section>
-    );
+  if (!sources || sources.length === 0) {
+    return null;
   }
 
-  if (!sources.length) return null;
-
-  const total = sources.reduce<UsageDataSourceSummary>(
-    (next, source) => ({
-      dataSource: "all",
-      requests: next.requests + source.requests,
-      successes: next.successes + source.successes,
-      failures: next.failures + source.failures,
-      totalTokens: next.totalTokens + source.totalTokens,
-      totalCostUsd: next.totalCostUsd + source.totalCostUsd,
-      healthChecks: next.healthChecks + source.healthChecks,
-    }),
-    emptyDataSourceSummary("all"),
-  );
+  const hasNonProxy = sources.some((s) => s.dataSource !== "proxy");
 
   return (
-    <section className="usage-data-source-panel" aria-label={tx("Loaded usage sources")}>
-      <div className="usage-data-source-label">
-        <Database size={15} />
-        <span>{tx("Data Sources")}</span>
-      </div>
-      <div className="usage-data-source-list">
-        <DataSourceChip
-          source={total}
-          active={!activeSource}
-          label="All"
-          onClick={() => onSelect("")}
-        />
+    <div className="flex items-center gap-3 text-xs text-muted-foreground bg-muted/30 rounded-lg px-4 py-2">
+      <span className="font-medium text-foreground/70">
+        {t("usage.dataSources", { defaultValue: "Data Sources" })}:
+      </span>
+      <div className="flex items-center gap-3 flex-wrap">
         {sources.map((source) => (
-          <DataSourceChip
+          <div
             key={source.dataSource}
-            source={source}
-            active={source.dataSource === activeSource}
-            label={dataSourceLabel(source.dataSource)}
-            onClick={() => onSelect(source.dataSource)}
-          />
+            className="flex items-center gap-1.5 bg-background/50 rounded-md px-2 py-1"
+          >
+            {DATA_SOURCE_ICONS[source.dataSource] ?? (
+              <Database className="h-3.5 w-3.5" />
+            )}
+            <span>
+              {t(`usage.dataSource.${source.dataSource}`, {
+                defaultValue: source.dataSource,
+              })}
+            </span>
+            <span className="font-mono font-medium text-foreground/80">
+              {source.requestCount.toLocaleString()}
+            </span>
+          </div>
         ))}
       </div>
-    </section>
+
+      <div className="ml-auto">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-xs"
+          onClick={handleSync}
+          disabled={syncing}
+          title={t("usage.sessionSync.trigger", {
+            defaultValue: "Sync session logs",
+          })}
+        >
+          {syncing ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3.5 w-3.5" />
+          )}
+          <span className="ml-1">
+            {hasNonProxy
+              ? t("usage.sessionSync.resync", { defaultValue: "Sync" })
+              : t("usage.sessionSync.import", {
+                  defaultValue: "Import Sessions",
+                })}
+          </span>
+        </Button>
+      </div>
+    </div>
   );
-}
-
-function DataSourceChip({
-  source,
-  active,
-  label,
-  onClick,
-}: {
-  source: UsageDataSourceSummary;
-  active: boolean;
-  label: string;
-  onClick: () => void;
-}) {
-  const { tx } = useI18n();
-  const failureRate = source.requests > 0 ? (source.failures / source.requests) * 100 : 0;
-  return (
-    <button className={active ? "usage-data-source-chip active" : "usage-data-source-chip"} type="button" onClick={onClick}>
-      {dataSourceIcon(source.dataSource)}
-      <span>
-        <strong>{tx(label)}</strong>
-        <small>{formatInt(source.requests)} req</small>
-      </span>
-      <span>
-        <strong>{formatInt(source.totalTokens)}</strong>
-        <small>{formatUsd(source.totalCostUsd, 4)}</small>
-      </span>
-      <span>
-        <strong>{failureRate.toFixed(1)}%</strong>
-        <small>{source.healthChecks ? `${formatInt(source.healthChecks)} ${tx("health")}` : tx("fail")}</small>
-      </span>
-    </button>
-  );
-}
-
-function dataSourceIcon(dataSource: string): ReactNode {
-  if (dataSource === "all") return <Database size={15} />;
-  if (
-    dataSource === "session_log" ||
-    dataSource === "codex_session" ||
-    dataSource === "gemini_session" ||
-    dataSource === "opencode_session" ||
-    dataSource.includes("session")
-  ) {
-    return <FileText size={15} />;
-  }
-  return <Database size={15} />;
-}
-
-function dataSourceLabel(dataSource: string): string {
-  if (dataSource === "proxy") return "Proxy";
-  if (dataSource === "session_log") return "Session logs";
-  if (dataSource === "codex_db") return "Codex DB";
-  if (dataSource === "codex_session") return "Codex session";
-  if (dataSource === "gemini_session") return "Gemini session";
-  if (dataSource === "opencode_session") return "OpenCode session";
-  return dataSource.replace(/[_-]+/g, " ") || "unknown";
-}
-
-function formatInt(value?: number | null): string {
-  if (value == null) return "-";
-  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
-}
-
-function formatUsd(value: number, digits: number): string {
-  if (!Number.isFinite(value)) return "-";
-  return `$${value.toFixed(digits)}`;
 }

@@ -1,7 +1,8 @@
 import { inferIconForText } from "@/config/iconInference";
-import { AppKind, ProviderPresetSummary, StoredProvider } from "@/lib/api";
+import type { AppId } from "@/lib/api";
+import type { ProviderPresetSummary, StoredProvider } from "@/lib/server-legacy-api";
 
-export function appIcon(app: AppKind): { icon: string; color?: string } {
+export function appIcon(app: AppId): { icon: string; color?: string } {
   switch (app) {
     case "claude":
       return { icon: "claude", color: "#D4915D" };
@@ -9,6 +10,8 @@ export function appIcon(app: AppKind): { icon: string; color?: string } {
       return { icon: "openai", color: "#111827" };
     case "gemini":
       return { icon: "gemini", color: "#8E75B2" };
+    default:
+      return { icon: "default", color: "#111827" };
   }
 }
 
@@ -20,11 +23,9 @@ export function storedProviderIcon(provider: StoredProvider): { icon?: string; c
   }
   const inferred = inferIconForText(
     provider.provider.name,
-    provider.providerTypeId,
-    provider.providerType,
+    provider.providerTypeId || provider.providerType,
     stringValue(provider.provider.category),
     stringValue(provider.provider.meta?.providerType),
-    stringValue(provider.provider.meta?.authBinding?.authProvider),
   );
   if (inferred.icon) {
     return { icon: inferred.icon, color: inferred.iconColor };

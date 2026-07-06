@@ -8,6 +8,8 @@ import {
   useState,
 } from "react";
 
+import i18n from "@/i18n";
+
 export type Language = "zh" | "zh-TW" | "en" | "ja";
 
 type TranslationValue = string | TranslationTree;
@@ -69,6 +71,18 @@ const serverResources: Record<Language, TranslationTree> = {
         ownerEmail: "Owner 邮箱",
         routerUrl: "Router URL",
         clientSubdomain: "Client 子域名",
+        loginTitle: "登录管理控制台",
+        setupTitle: "初始化 Server",
+        loginSubtitle: "使用密码、邮箱验证码或 API Token 登录。",
+        setupSubtitle: "设置 Owner 邮箱、Router 与管理员密码。",
+        methodPassword: "密码",
+        methodEmail: "邮箱验证码",
+        methodApiToken: "API Token",
+        apiToken: "API Token",
+        apiTokenHint: "使用初始化或设置页轮换得到的 API Token 登录。",
+        emailLoginHint: "验证码由 Router 发送到已配置的 Owner 邮箱。",
+        codeSentTo: "验证码已发送至 {{destination}}",
+        resendIn: "{{seconds}} 秒后可重发",
       },
       providers: {
         providers: "供应商",
@@ -220,6 +234,18 @@ const serverResources: Record<Language, TranslationTree> = {
         ownerEmail: "Owner 信箱",
         routerUrl: "Router URL",
         clientSubdomain: "Client 子網域",
+        loginTitle: "登入管理控制台",
+        setupTitle: "初始化 Server",
+        loginSubtitle: "使用密碼、信箱驗證碼或 API Token 登入。",
+        setupSubtitle: "設定 Owner 信箱、Router 與管理員密碼。",
+        methodPassword: "密碼",
+        methodEmail: "信箱驗證碼",
+        methodApiToken: "API Token",
+        apiToken: "API Token",
+        apiTokenHint: "使用初始化或設定頁輪換得到的 API Token 登入。",
+        emailLoginHint: "驗證碼由 Router 發送到已設定的 Owner 信箱。",
+        codeSentTo: "驗證碼已發送至 {{destination}}",
+        resendIn: "{{seconds}} 秒後可重發",
       },
       providers: {
         providers: "供應商",
@@ -371,6 +397,18 @@ const serverResources: Record<Language, TranslationTree> = {
         ownerEmail: "Owner email",
         routerUrl: "Router URL",
         clientSubdomain: "Client subdomain",
+        loginTitle: "Sign in to admin console",
+        setupTitle: "Initialize server",
+        loginSubtitle: "Sign in with password, email code, or API token.",
+        setupSubtitle: "Configure owner email, router, and admin password.",
+        methodPassword: "Password",
+        methodEmail: "Email code",
+        methodApiToken: "API Token",
+        apiToken: "API Token",
+        apiTokenHint: "Use the API token from setup or settings rotation.",
+        emailLoginHint: "The router sends a code to the configured owner email.",
+        codeSentTo: "Verification code sent to {{destination}}",
+        resendIn: "Resend in {{seconds}}s",
       },
       providers: {
         providers: "Providers",
@@ -522,6 +560,18 @@ const serverResources: Record<Language, TranslationTree> = {
         ownerEmail: "Owner メール",
         routerUrl: "Router URL",
         clientSubdomain: "Client サブドメイン",
+        loginTitle: "管理コンソールにログイン",
+        setupTitle: "Server を初期化",
+        loginSubtitle: "パスワード、メールコード、または API Token でログインします。",
+        setupSubtitle: "Owner メール、Router、管理者パスワードを設定します。",
+        methodPassword: "パスワード",
+        methodEmail: "メールコード",
+        methodApiToken: "API Token",
+        apiToken: "API Token",
+        apiTokenHint: "初期設定または設定ページで発行した API Token を使用します。",
+        emailLoginHint: "Router が設定済み Owner メールに認証コードを送信します。",
+        codeSentTo: "認証コードを {{destination}} に送信しました",
+        resendIn: "{{seconds}} 秒後に再送できます",
       },
       providers: {
         providers: "プロバイダー",
@@ -1738,10 +1788,14 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       console.warn("[i18n] Failed to persist language preference", error);
     }
+    void i18n.changeLanguage(next);
   }, []);
 
   useEffect(() => {
     document.documentElement.lang = language;
+    if (i18n.language !== language) {
+      void i18n.changeLanguage(language);
+    }
   }, [language]);
 
   const value = useMemo<I18nContextValue>(
@@ -1767,6 +1821,9 @@ export function useI18n() {
 }
 
 function translate(language: Language, key: string, variables?: Variables): string {
+  if (i18n.exists(key)) {
+    return i18n.t(key, variables as Record<string, unknown>);
+  }
   const template =
     lookup(serverResources[language], key) ??
     lookup(serverResources.en, key) ??

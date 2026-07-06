@@ -144,8 +144,13 @@ pub async fn start_device_flow(
         .send()
         .await
         .map_err(|error| {
+            let hint = if error.is_connect() || error.is_timeout() {
+                " (server cannot reach GitHub; configure upstream proxy in server settings)"
+            } else {
+                ""
+            };
             CopilotDeviceError::bad_gateway(format!(
-                "github copilot device code request failed: {error}"
+                "github copilot device code request failed: {error}{hint}"
             ))
         })?;
     let mut body: GitHubDeviceCodeResponse = handle_json_response(response).await?;

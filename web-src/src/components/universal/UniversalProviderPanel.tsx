@@ -1,396 +1,320 @@
-import {
-  closestCenter,
-  DndContext,
-  DragEndEvent,
-  KeyboardSensor,
-  PointerSensor,
-  useSensor,
-  useSensors,
-} from "@dnd-kit/core";
-import {
-  arrayMove,
-  rectSortingStrategy,
-  SortableContext,
-  sortableKeyboardCoordinates,
-} from "@dnd-kit/sortable";
-import {
-  Download,
-  ListPlus,
-  Loader2,
-  Plus,
-  RefreshCw,
-  Search,
-  Upload,
-} from "lucide-react";
-import {
-  FormEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
-
-import {
-  deleteUniversalProvider,
-  exportUniversalProviders,
-  importUniversalProviders,
-  loadUniversalProviderPresets,
-  loadUniversalProviders,
-  saveUniversalProvider,
-  syncUniversalProvider,
-  UniversalProvider,
-  UniversalProviderPreset,
-} from "@/lib/api";
-import { useI18n } from "@/lib/i18n";
-import { LoadingBlock } from "@/components/LoadingBlock";
-import { SortableUniversalCard } from "@/components/universal/UniversalCard";
-import { UniversalListToolbar } from "@/components/universal/UniversalListToolbar";
-import { UniversalEmptyState } from "@/components/universal/UniversalEmptyState";
-import { ImportUniversalModal, UniversalExportModal, UniversalPresetModal } from "@/components/universal/UniversalModals";
-import {
-  draftFromPreset,
-  draftFromProvider,
-  emptyDraft,
-  enabledUniversalApps,
-  errorMessage,
-  providerFromDraft,
-  syncSummary,
-  UniversalFormModal,
-  type UniversalDraft,
-} from "@/components/universal/UniversalFormModal";
-
-const universalApps = ["claude", "codex", "gemini"] as const;
+import { useState, useCallback, useEffect } from "react";
+import { useTranslation } from "react-i18next";
+import { Layers } from "lucide-react";
+import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { UniversalProviderCard } from "./UniversalProviderCard";
+import { UniversalProviderFormModal } from "./UniversalProviderFormModal";
+import { universalProvidersApi } from "@/lib/api";
+import type { UniversalProvider, UniversalProvidersMap } from "@/types";
+import { deepClone } from "@/utils/deepClone";
 
 export function UniversalProviderPanel() {
-  const { t, tx } = useI18n();
-  const [providers, setProviders] = useState<Record<string, UniversalProvider>>({});
-  const [presets, setPresets] = useState<UniversalProviderPreset[]>([]);
+  const { t } = useTranslation();
+
+  // 状态
+  const [providers, setProviders] = useState<UniversalProvidersMap>({});
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [draft, setDraft] = useState<UniversalDraft | null>(null);
-  const [presetOpen, setPresetOpen] = useState(false);
-  const [importOpen, setImportOpen] = useState(false);
-  const [exportText, setExportText] = useState<string | null>(null);
-  const [exportCopyStatus, setExportCopyStatus] = useState<{ tone: "success" | "warning"; message: string } | null>(null);
-  const [providerQuery, setProviderQuery] = useState("");
-  const [submitMode, setSubmitMode] = useState<"save" | "save-sync">("save");
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
+  const [isFormOpen, setIsFormOpen] = useState(false);
+  const [editingProvider, setEditingProvider] =
+    useState<UniversalProvider | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    open: boolean;
+    id: string;
+    name: string;
+  }>({ open: false, id: "", name: "" });
+  const [syncConfirm, setSyncConfirm] = useState<{
+    open: boolean;
+    id: string;
+    name: string;
+  }>({ open: false, id: "", name: "" });
 
-  const list = useMemo(
-    () =>
-      Object.values(providers).sort((left, right) => {
-        const sort = (left.sortIndex ?? 0) - (right.sortIndex ?? 0);
-        return sort || left.name.localeCompare(right.name) || left.id.localeCompare(right.id);
-      }),
-    [providers],
-  );
-  const visibleProviders = useMemo(
-    () => filterUniversalProviders(list, providerQuery),
-    [list, providerQuery],
-  );
-
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  // 加载数据
+  const loadProviders = useCallback(async () => {
     try {
-      const [providerResult, presetResult] = await Promise.all([
-        loadUniversalProviders(),
-        loadUniversalProviderPresets(),
-      ]);
-      setProviders(providerResult);
-      setPresets(presetResult);
-    } catch (reason) {
-      setError(errorMessage(reason));
+      setLoading(true);
+      const data = await universalProvidersApi.getAll();
+      setProviders(data);
+    } catch (error) {
+      console.error("Failed to load universal providers:", error);
+      toast.error(
+        t("universalProvider.loadError", {
+          defaultValue: "加载统一供应商失败",
+        }),
+      );
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    loadProviders();
+  }, [loadProviders]);
 
-  async function runAction(action: string, task: () => Promise<string>) {
-    setBusy(action);
-    setError(null);
-    try {
-      setResult(await task());
-      await refresh();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function submitDraft(event: FormEvent) {
-    event.preventDefault();
-    if (!draft) return;
-    const mode = submitMode;
-    setSubmitMode("save");
-    await runAction(mode, async () => {
-      const saved = await saveUniversalProvider(providerFromDraft(draft));
-      if (mode === "save-sync") {
-        const sync = await syncUniversalProvider(saved.id);
-        setDraft(null);
-        return tx("saved {{name}}; {{summary}}", { name: saved.name, summary: syncSummary(sync, tx) });
-      }
-      setDraft(null);
-      return tx("saved {{name}}", { name: saved.name });
-    });
-  }
-
-  async function syncProvider(provider: UniversalProvider) {
-    await runAction(`sync:${provider.id}`, async () => syncSummary(await syncUniversalProvider(provider.id), tx));
-  }
-
-  async function deleteProvider(provider: UniversalProvider) {
-    await runAction(`delete:${provider.id}`, async () => {
-      const deleted = await deleteUniversalProvider(provider.id);
-      return deleted ? tx("deleted {{name}}", { name: provider.name }) : tx("{{name}} was not found", { name: provider.name });
-    });
-  }
-
-  async function duplicateProvider(provider: UniversalProvider) {
-    const copy: UniversalProvider = {
-      ...provider,
-      id: `${provider.id}-copy-${Date.now().toString(36)}`,
-      name: `${provider.name} Copy`,
-      sortIndex: Date.now(),
-    };
-    await runAction(`duplicate:${provider.id}`, async () => {
-      const saved = await saveUniversalProvider(copy);
-      const sync = await syncUniversalProvider(saved.id);
-      return tx("duplicated {{name}}; {{summary}}", { name: saved.name, summary: syncSummary(sync, tx) });
-    });
-  }
-
-  async function handleUniversalDragEnd(event: DragEndEvent) {
-    const { active, over } = event;
-    if (!over || active.id === over.id) return;
-    const oldIndex = list.findIndex((provider) => provider.id === active.id);
-    const newIndex = list.findIndex((provider) => provider.id === over.id);
-    if (oldIndex < 0 || newIndex < 0) return;
-
-    const reordered = arrayMove(list, oldIndex, newIndex);
-    const sortedProviders = reordered.map((provider, index) => ({
-      ...provider,
-      sortIndex: index,
-    }));
-    setProviders((current) => {
-      const next = { ...current };
-      for (const provider of sortedProviders) {
-        next[provider.id] = provider;
-      }
-      return next;
-    });
-    setError(null);
-    try {
-      await Promise.all(sortedProviders.map((provider) => saveUniversalProvider(provider)));
-    } catch (reason) {
-      setError(errorMessage(reason));
-      await refresh();
-    }
-  }
-
-  async function exportAction() {
-    await runAction("export", async () => {
-      const exported = await exportUniversalProviders();
-      const text = JSON.stringify(exported, null, 2);
-      setExportText(text);
-      setExportCopyStatus(null);
-      let copied = false;
+  // 添加/编辑供应商
+  const handleSave = useCallback(
+    async (provider: UniversalProvider) => {
       try {
-        if (navigator.clipboard) {
-          await navigator.clipboard.writeText(text);
-          copied = true;
-        }
-      } catch {
-        copied = false;
-      }
-      setExportCopyStatus({
-        tone: copied ? "success" : "warning",
-        message: copied ? tx("Copied JSON") : tx("Clipboard unavailable; copy the visible value manually."),
-      });
-      return copied
-        ? tx("exported {{count}} providers to clipboard", { count: exported.length })
-        : tx("exported {{count}} providers", { count: exported.length });
-    });
-  }
+        await universalProvidersApi.upsert(provider);
 
-  async function copyExportText() {
-    if (!exportText) return;
-    if (!navigator.clipboard?.writeText) {
-      setExportCopyStatus({ tone: "warning", message: tx("Clipboard unavailable; copy the visible value manually.") });
-      return;
-    }
+        // 新建模式下自动同步到各应用
+        if (!editingProvider) {
+          await universalProvidersApi.sync(provider.id);
+        }
+
+        toast.success(
+          editingProvider
+            ? t("universalProvider.updated", {
+                defaultValue: "统一供应商已更新",
+              })
+            : t("universalProvider.addedAndSynced", {
+                defaultValue: "统一供应商已添加并同步",
+              }),
+        );
+        loadProviders();
+        setEditingProvider(null);
+      } catch (error) {
+        console.error("Failed to save universal provider:", error);
+        toast.error(
+          t("universalProvider.saveError", {
+            defaultValue: "保存统一供应商失败",
+          }),
+        );
+      }
+    },
+    [editingProvider, loadProviders, t],
+  );
+
+  // 保存并同步供应商
+  const handleSaveAndSync = useCallback(
+    async (provider: UniversalProvider) => {
+      try {
+        await universalProvidersApi.upsert(provider);
+        await universalProvidersApi.sync(provider.id);
+        toast.success(
+          t("universalProvider.savedAndSynced", {
+            defaultValue: "已保存并同步到所有应用",
+          }),
+        );
+        loadProviders();
+        setEditingProvider(null);
+      } catch (error) {
+        console.error("Failed to save and sync universal provider:", error);
+        toast.error(
+          t("universalProvider.saveAndSyncError", {
+            defaultValue: "保存并同步失败",
+          }),
+        );
+      }
+    },
+    [loadProviders, t],
+  );
+
+  // 删除供应商
+  const handleDelete = useCallback(async () => {
+    if (!deleteConfirm.id) return;
+
     try {
-      await navigator.clipboard.writeText(exportText);
-      setExportCopyStatus({ tone: "success", message: tx("Copied JSON") });
-    } catch {
-      setExportCopyStatus({ tone: "warning", message: tx("Copy failed; copy the visible value manually.") });
+      await universalProvidersApi.delete(deleteConfirm.id);
+      toast.success(
+        t("universalProvider.deleted", { defaultValue: "统一供应商已删除" }),
+      );
+      loadProviders();
+    } catch (error) {
+      console.error("Failed to delete universal provider:", error);
+      toast.error(
+        t("universalProvider.deleteError", {
+          defaultValue: "删除统一供应商失败",
+        }),
+      );
+    } finally {
+      setDeleteConfirm({ open: false, id: "", name: "" });
     }
-  }
+  }, [deleteConfirm.id, loadProviders, t]);
+
+  // 同步供应商
+  const handleSync = useCallback(async () => {
+    if (!syncConfirm.id) return;
+
+    try {
+      await universalProvidersApi.sync(syncConfirm.id);
+      toast.success(
+        t("universalProvider.synced", { defaultValue: "已同步到所有应用" }),
+      );
+    } catch (error) {
+      console.error("Failed to sync universal provider:", error);
+      toast.error(
+        t("universalProvider.syncError", {
+          defaultValue: "同步统一供应商失败",
+        }),
+      );
+    } finally {
+      setSyncConfirm({ open: false, id: "", name: "" });
+    }
+  }, [syncConfirm.id, t]);
+
+  // 打开同步确认
+  const handleSyncClick = useCallback(
+    (id: string) => {
+      const provider = providers[id];
+      setSyncConfirm({
+        open: true,
+        id,
+        name: provider?.name || id,
+      });
+    },
+    [providers],
+  );
+
+  // 复制供应商
+  const handleDuplicate = useCallback(
+    async (provider: UniversalProvider) => {
+      const duplicated: UniversalProvider = {
+        ...deepClone(provider),
+        id: crypto.randomUUID(),
+        name: `${provider.name} copy`,
+        createdAt: Date.now(),
+      };
+      try {
+        await universalProvidersApi.upsert(duplicated);
+        await universalProvidersApi.sync(duplicated.id);
+        toast.success(
+          t("universalProvider.duplicatedAndSynced", {
+            defaultValue: "统一供应商已复制并同步",
+          }),
+        );
+        loadProviders();
+      } catch (error) {
+        console.error("Failed to duplicate universal provider:", error);
+        toast.error(
+          t("universalProvider.duplicateError", {
+            defaultValue: "复制统一供应商失败",
+          }),
+        );
+      }
+    },
+    [loadProviders, t],
+  );
+
+  // 打开编辑
+  const handleEdit = useCallback((provider: UniversalProvider) => {
+    setEditingProvider(provider);
+    setIsFormOpen(true);
+  }, []);
+
+  // 打开删除确认
+  const handleDeleteClick = useCallback(
+    (id: string) => {
+      const provider = providers[id];
+      setDeleteConfirm({
+        open: true,
+        id,
+        name: provider?.name || id,
+      });
+    },
+    [providers],
+  );
+
+  const providerList = Object.values(providers);
 
   return (
-    <div className="universal-provider-panel">
-      <div className="provider-toolbar">
-        <div className="provider-toolbar-status">
-          <span>{t("server.universal.templates", { count: list.length })}</span>
-        </div>
-        <div className="provider-toolbar-actions">
-          {error && <span className="error-text">{error}</span>}
-          {result && <span className="usage-result">{result}</span>}
-          <button className="secondary-button" type="button" onClick={() => void refresh()}>
-            <RefreshCw size={15} />
-            <span>{t("common.refresh")}</span>
-          </button>
-          <button className="secondary-button" type="button" onClick={() => void exportAction()} disabled={busy === "export"}>
-            {busy === "export" ? <Loader2 size={15} /> : <Download size={15} />}
-            <span>{t("server.common.export")}</span>
-          </button>
-          <button className="secondary-button" type="button" onClick={() => setImportOpen(true)}>
-            <Upload size={15} />
-            <span>{t("common.import")}</span>
-          </button>
-          <button className="secondary-button" type="button" onClick={() => setPresetOpen(true)} disabled={!presets.length}>
-            <ListPlus size={15} />
-            <span>{t("server.common.fromPreset")}</span>
-          </button>
-          <button className="primary-button" type="button" onClick={() => setDraft(emptyDraft())}>
-            <Plus size={15} />
-            <span>{t("server.universal.add")}</span>
-          </button>
-        </div>
+    <div className="space-y-4">
+      {/* 头部 */}
+      <div className="flex items-center gap-2">
+        <Layers className="h-5 w-5 text-primary" />
+        <h2 className="text-lg font-semibold">
+          {t("universalProvider.title", { defaultValue: "统一供应商" })}
+        </h2>
+        <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+          {providerList.length}
+        </span>
       </div>
 
-      <UniversalListToolbar
-        query={providerQuery}
-        visible={visibleProviders.length}
-        total={list.length}
-        onQueryChange={setProviderQuery}
+      {/* 描述 */}
+      <p className="text-sm text-muted-foreground">
+        {t("universalProvider.description", {
+          defaultValue:
+            "统一供应商可以同时管理 Claude、Codex 和 Gemini 的配置。修改后会自动同步到所有启用的应用。",
+        })}
+      </p>
+
+      {/* 供应商列表 */}
+      {loading ? (
+        <div className="flex items-center justify-center py-12">
+          <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+        </div>
+      ) : providerList.length === 0 ? (
+        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed py-12 text-center">
+          <Layers className="mb-3 h-10 w-10 text-muted-foreground/50" />
+          <p className="text-sm text-muted-foreground">
+            {t("universalProvider.empty", {
+              defaultValue: "还没有统一供应商",
+            })}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground/70">
+            {t("universalProvider.emptyHint", {
+              defaultValue: "点击下方「添加统一供应商」按钮创建一个",
+            })}
+          </p>
+        </div>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {providerList.map((provider) => (
+            <UniversalProviderCard
+              key={provider.id}
+              provider={provider}
+              onEdit={handleEdit}
+              onDelete={handleDeleteClick}
+              onSync={handleSyncClick}
+              onDuplicate={handleDuplicate}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* 表单模态框 */}
+      <UniversalProviderFormModal
+        isOpen={isFormOpen}
+        onClose={() => {
+          setIsFormOpen(false);
+          setEditingProvider(null);
+        }}
+        onSave={handleSave}
+        onSaveAndSync={handleSaveAndSync}
+        editingProvider={editingProvider}
       />
 
-      {loading ? (
-        <LoadingBlock label="server.universal.loading" />
-      ) : list.length ? (
-        visibleProviders.length ? (
-          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleUniversalDragEnd(event)}>
-            <SortableContext items={list.map((provider) => provider.id)} strategy={rectSortingStrategy}>
-              <div className="universal-card-grid">
-                {visibleProviders.map((provider) => (
-                  <SortableUniversalCard
-                    key={provider.id}
-                    provider={provider}
-                    busy={busy}
-                    onEdit={() => setDraft(draftFromProvider(provider))}
-                    onSync={() => void syncProvider(provider)}
-                    onDuplicate={() => void duplicateProvider(provider)}
-                    onDelete={() => void deleteProvider(provider)}
-                  />
-                ))}
-              </div>
-            </SortableContext>
-          </DndContext>
-        ) : (
-          <div className="provider-empty compact-empty">
-            <Search size={20} />
-            <span>{tx("No universal providers match the current search")}</span>
-          </div>
-        )
-      ) : (
-        <UniversalEmptyState
-          canUsePresets={presets.length > 0}
-          onImport={() => setImportOpen(true)}
-          onPreset={() => setPresetOpen(true)}
-          onCreate={() => setDraft(emptyDraft())}
-        />
-      )}
+      {/* 删除确认对话框 */}
+      <ConfirmDialog
+        isOpen={deleteConfirm.open}
+        title={t("universalProvider.deleteConfirmTitle", {
+          defaultValue: "删除统一供应商",
+        })}
+        message={t("universalProvider.deleteConfirmDescription", {
+          defaultValue: `确定要删除 "${deleteConfirm.name}" 吗？这将同时删除它在各应用中生成的供应商配置。`,
+          name: deleteConfirm.name,
+        })}
+        confirmText={t("common.delete", { defaultValue: "删除" })}
+        onConfirm={handleDelete}
+        onCancel={() => setDeleteConfirm({ open: false, id: "", name: "" })}
+      />
 
-      {draft && (
-        <UniversalFormModal
-          draft={draft}
-          saving={busy === "save" || busy === "save-sync"}
-          savingMode={busy === "save-sync" ? "save-sync" : busy === "save" ? "save" : null}
-          onSubmitMode={setSubmitMode}
-          onChange={setDraft}
-          onClose={() => setDraft(null)}
-          onSubmit={submitDraft}
-        />
-      )}
-
-      {presetOpen && (
-        <UniversalPresetModal
-          presets={presets}
-          onSelect={(preset) => {
-            setDraft(draftFromPreset(preset));
-            setPresetOpen(false);
-          }}
-          onClose={() => setPresetOpen(false)}
-        />
-      )}
-
-      {importOpen && (
-        <ImportUniversalModal
-          saving={busy === "import"}
-          onClose={() => setImportOpen(false)}
-          onSubmit={(providersToImport) =>
-            void runAction("import", async () => {
-              const imported = await importUniversalProviders(providersToImport);
-              setImportOpen(false);
-              return tx("imported {{count}} universal providers", { count: imported });
-            })
-          }
-        />
-      )}
-
-      {exportText && (
-        <UniversalExportModal
-          exportText={exportText}
-          copyStatus={exportCopyStatus}
-          onCopy={() => void copyExportText()}
-          onClose={() => setExportText(null)}
-        />
-      )}
+      {/* 同步确认对话框 */}
+      <ConfirmDialog
+        isOpen={syncConfirm.open}
+        title={t("universalProvider.syncConfirmTitle", {
+          defaultValue: "同步统一供应商",
+        })}
+        message={t("universalProvider.syncConfirmDescription", {
+          defaultValue: `同步 "${syncConfirm.name}" 将会覆盖 Claude、Codex 和 Gemini 中关联的供应商配置。确定要继续吗？`,
+          name: syncConfirm.name,
+        })}
+        confirmText={t("universalProvider.syncConfirm", {
+          defaultValue: "同步",
+        })}
+        onConfirm={handleSync}
+        onCancel={() => setSyncConfirm({ open: false, id: "", name: "" })}
+      />
     </div>
   );
-}
-
-function filterUniversalProviders(providers: UniversalProvider[], query: string): UniversalProvider[] {
-  const normalizedQuery = query.trim().toLowerCase();
-  if (!normalizedQuery) return providers;
-  return providers.filter((provider) => {
-    const modelValues = universalApps.flatMap((app) => {
-      const model = provider.models?.[app];
-      if (!model) return [];
-      const record = model as Record<string, unknown>;
-      return [
-        record.model,
-        record.haikuModel,
-        record.sonnetModel,
-        record.opusModel,
-        record.reasoningEffort,
-      ];
-    });
-    return [
-      provider.id,
-      provider.name,
-      provider.providerType,
-      provider.baseUrl,
-      provider.websiteUrl,
-      provider.notes,
-      provider.icon,
-      ...enabledUniversalApps(provider),
-      ...modelValues,
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase()
-      .includes(normalizedQuery);
-  });
 }

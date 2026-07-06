@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{Cli, ConfigCommand};
+use crate::cli::{Cli, ConfigCommand, PasswordCommand};
 use crate::core::accounts::{accounts_path, AccountStore};
 use crate::core::config::{config_path, RouterIdentity, ServerConfig};
 use crate::core::providers::{providers_path, ProviderStore};
@@ -29,6 +29,51 @@ pub fn run_config_command(cli: &Cli, command: ConfigCommand) -> anyhow::Result<(
             Ok(())
         }
     }
+}
+
+pub fn run_password_command(cli: &Cli, command: PasswordCommand) -> anyhow::Result<()> {
+    match command {
+        PasswordCommand::Reset { password, stdin } => reset_password(cli, password, stdin),
+    }
+}
+
+fn reset_password(cli: &Cli, password: Option<String>, stdin: bool) -> anyhow::Result<()> {
+    if password.is_some() && stdin {
+        anyhow::bail!("use either --password or --stdin, not both");
+    }
+
+    let new_password = if stdin {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("read password from stdin")?;
+        line.trim_end_matches(['\n', '\r']).to_string()
+    } else {
+        password.context("password is required; pass --password or --stdin")?
+    };
+
+    if new_password.is_empty() {
+        anyhow::bail!("password must not be empty");
+    }
+
+    let config_dir = cli.resolved_config_dir()?;
+    let mut config = ServerConfig::load_or_default(&config_dir)?;
+    config
+        .set_password(&new_password)
+        .context("hash new web admin password")?;
+    config
+        .save(&config_dir)
+        .context("save server.json with new password")?;
+    crate::core::web_auth::WebAuthStore::load(config_dir.clone())
+        .revoke_all_sessions()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .context("revoke active web auth sessions")?;
+
+    println!(
+        "web admin password reset in {}; active web sessions revoked",
+        config_dir.display()
+    );
+    Ok(())
 }
 
 pub fn run_doctor(cli: &Cli, check_port: bool) -> anyhow::Result<()> {
@@ -712,6 +757,31 @@ mod tests {
         fs::remove_dir_all(config_dir).unwrap();
 
         assert!(error.contains("parse providers"));
+    }
+
+    #[test]
+    fn reset_password_updates_hash_and_revokes_web_sessions() {
+        let config_dir = temp_config_dir("password-reset");
+        fs::create_dir_all(&config_dir).unwrap();
+        let mut config = ServerConfig::load_or_default(&config_dir).unwrap();
+        config.set_password("old-password-1").unwrap();
+        config.save(&config_dir).unwrap();
+        let sessions_path = config_dir.join("web-auth-sessions.json");
+        fs::write(
+            &sessions_path,
+            r#"[{"id":"1","accessTokenHash":"abc","refreshTokenHash":"def","accessExpiresAt":"2999-01-01T00:00:00Z","refreshExpiresAt":"2999-01-01T00:00:00Z","createdAt":"2026-01-01T00:00:00Z","lastUsedAt":"2026-01-01T00:00:00Z","revokedAt":null}]"#,
+        )
+        .unwrap();
+
+        let cli = test_cli(config_dir.clone());
+        reset_password(&cli, Some("new-password-2".to_string()), false).unwrap();
+
+        let updated = ServerConfig::load_or_default(&config_dir).unwrap();
+        assert!(updated.verify_password("new-password-2"));
+        assert!(!updated.verify_password("old-password-1"));
+        let raw = fs::read_to_string(&sessions_path).unwrap();
+        assert!(raw.contains(r#""revokedAt":"#));
+        fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[test]

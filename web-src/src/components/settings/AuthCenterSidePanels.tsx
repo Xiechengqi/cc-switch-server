@@ -12,7 +12,7 @@ import {
   formatTime,
   providerLabel,
 } from "@/components/settings/accountDisplay";
-import type { AccountImportTemplate, AccountManagerCapability, AccountRecord } from "@/lib/api";
+import type { AccountImportTemplate, AccountManagerCapability, AccountRecord } from "@/lib/server-legacy-api";
 import { useI18n } from "@/lib/i18n";
 
 export function CapabilityPanel({

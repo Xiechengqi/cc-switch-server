@@ -1,603 +1,679 @@
-import { CSS } from "@dnd-kit/utilities";
-import { useSortable } from "@dnd-kit/sortable";
-import {
-  BarChart3,
-  CheckCircle2,
-  Copy,
-  FlaskConical,
-  GripVertical,
-  Link2,
-  Loader2,
-  Minus,
-  Pencil,
-  Play,
-  Plus,
-  RefreshCw,
-  ServerCog,
-  Trash2,
-} from "lucide-react";
-import {
-  CSSProperties,
-  HTMLAttributes,
-  ReactNode,
-  useState,
-} from "react";
-
-import {
-  AccountManagerCapability,
-  AccountRecord,
-  ProviderBreaker,
-  ProviderHealth,
-  ProviderLimitStatus,
-  ProviderMatrixEntry,
-  StoredProvider,
-} from "@/lib/api";
-import { useI18n } from "@/lib/i18n";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { FailoverPriorityBadge } from "@/components/providers/FailoverPriorityBadge";
-import { IconAction } from "@/components/IconAction";
-import { KeyValue } from "@/components/KeyValue";
-import { ProviderHealthIndicator } from "@/components/providers/ProviderHealthIndicator";
+import { useMemo, useState, useEffect } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { GripVertical, ChevronDown, ChevronUp } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import type {
+  DraggableAttributes,
+  DraggableSyntheticListeners,
+} from "@dnd-kit/core";
+import type { Provider } from "@/types";
+import { authApi, type AppId } from "@/lib/api";
+import type { ManagedAuthProvider, ManagedAuthStatus } from "@/lib/api";
+import { PROVIDER_TYPES } from "@/config/constants";
+import { cn } from "@/lib/utils";
+import { ProviderActions } from "@/components/providers/ProviderActions";
 import { ProviderIcon } from "@/components/ProviderIcon";
-import { StatusPill } from "@/components/StatusPill";
+import UsageFooter from "@/components/UsageFooter";
+import SubscriptionQuotaFooter from "@/components/SubscriptionQuotaFooter";
+import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
+import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
+import ClaudeOauthQuotaFooter from "@/components/ClaudeOauthQuotaFooter";
+import GeminiOauthQuotaFooter from "@/components/GeminiOauthQuotaFooter";
+import KiroOauthQuotaFooter from "@/components/KiroOauthQuotaFooter";
+import AntigravityOauthQuotaFooter from "@/components/AntigravityOauthQuotaFooter";
+import CursorOauthQuotaFooter from "@/components/CursorOauthQuotaFooter";
+import OllamaQuotaFooter from "@/components/OllamaQuotaFooter";
+import { TEMPLATE_TYPES } from "@/config/constants";
+import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
+import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
+import { FailoverPriorityBadge } from "@/components/providers/FailoverPriorityBadge";
 import {
-  accountSummary,
-  apiFormatFromProvider,
-  baseUrlFromProvider,
-  limitLine,
-  modelFromProvider,
-} from "@/components/providers/providerDisplay";
-import { storedProviderIcon } from "@/lib/provider-icons";
+  extractCodexBaseUrl,
+  extractCodexExperimentalBearerToken,
+} from "@/utils/providerConfigUtils";
+import {
+  canTestLinkProvider,
+  canTestModelProvider,
+  getProviderQuotaSource,
+  isManagedOauthProvider,
+} from "@/utils/providerMetaUtils";
+import { useProviderHealth } from "@/lib/query/failover";
+import { useUsageQuery } from "@/lib/query/queries";
+import { resolveManagedAccountId } from "@/lib/authBinding";
 
-type DragHandleProps = HTMLAttributes<HTMLButtonElement> & {
-  ref?: (node: HTMLButtonElement | null) => void;
-};
-type TranslateFn = (
-  key: string,
-  vars?: Record<string, string | number | boolean | null | undefined>,
-) => string;
-type TxFn = (message: string, values?: Record<string, string | number | boolean | null | undefined>) => string;
-type ProviderQuotaTier = NonNullable<NonNullable<AccountRecord["quota"]>["tiers"]>[number];
-
-export function SortableProviderCard(props: ProviderCardProps) {
-  const { attributes, listeners, setActivatorNodeRef, setNodeRef, transform, transition, isDragging } =
-    useSortable({ id: props.provider.provider.id });
-  const style: CSSProperties = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-  };
-  const dragHandleProps: DragHandleProps = {
-    ...attributes,
-    ...listeners,
-    ref: setActivatorNodeRef,
-  };
-  return (
-    <ProviderCard
-      {...props}
-      dragHandleProps={dragHandleProps}
-      nodeRef={setNodeRef}
-      style={style}
-      dragging={isDragging}
-    />
-  );
+interface DragHandleProps {
+  attributes: DraggableAttributes;
+  listeners: DraggableSyntheticListeners;
+  isDragging: boolean;
 }
 
 interface ProviderCardProps {
-  provider: StoredProvider;
-  priority: number;
-  failoverEnabled: boolean;
-  failoverPriority: number | null;
-  inFailoverQueue: boolean;
-  entry?: ProviderMatrixEntry;
-  health?: ProviderHealth;
-  account?: AccountRecord;
-  capability?: AccountManagerCapability;
-  limit?: ProviderLimitStatus;
-  breaker?: ProviderBreaker;
-  current: boolean;
-  result?: string;
-  busyId: string | null;
-  onEdit: () => void;
-  onAction: (action: "test" | "network" | "stream" | "models" | "switch" | "duplicate" | "resetFailover" | "delete") => void;
-  onToggleFailover: (enabled: boolean) => void;
-  onOpenUsage?: () => void;
+  provider: Provider;
+  isCurrent: boolean;
+  appId: AppId;
+  isInConfig?: boolean; // OpenCode: 是否已添加到 opencode.json
+  isOmo?: boolean;
+  isOmoSlim?: boolean;
+  onSwitch: (provider: Provider) => void;
+  onEdit: (provider: Provider) => void;
+  onDelete: (provider: Provider) => void;
+  onRemoveFromConfig?: (provider: Provider) => void;
+  onDisableOmo?: () => void;
+  onDisableOmoSlim?: () => void;
+  onConfigureUsage: (provider: Provider) => void;
+  onOpenWebsite: (url: string) => void;
+  onDuplicate: (provider: Provider) => void;
+  onTestLink?: (provider: Provider) => void;
+  onTestModel?: (provider: Provider) => void;
+  onOpenTerminal?: (provider: Provider) => void;
+  isTestingLink?: boolean;
+  isTestingModel?: boolean;
+  isProxyRunning: boolean;
+  isProxyTakeover?: boolean; // 代理接管模式（Live配置已被接管，切换为热切换）
+  dragHandleProps?: DragHandleProps;
+  isAutoFailoverEnabled?: boolean; // 是否开启自动故障转移
+  failoverPriority?: number; // 故障转移优先级（1 = P1, 2 = P2, ...）
+  isInFailoverQueue?: boolean; // 是否在故障转移队列中
+  onToggleFailover?: (enabled: boolean) => void; // 切换故障转移队列
+  activeProviderId?: string; // 代理当前实际使用的供应商 ID（用于故障转移模式下标注绿色边框）
+  // OpenClaw: default model
+  isDefaultModel?: boolean;
+  onSetAsDefault?: () => void;
 }
 
-function ProviderCard({
+/** 判断是否为官方供应商（无自定义 base URL / API key，直连官方 API） */
+function isOfficialProvider(provider: Provider, appId: AppId): boolean {
+  if (provider.category === "official") {
+    return true;
+  }
+
+  const config = provider.settingsConfig as Record<string, any>;
+  if (appId === "claude") {
+    const baseUrl = config?.env?.ANTHROPIC_BASE_URL;
+    return !baseUrl || (typeof baseUrl === "string" && baseUrl.trim() === "");
+  }
+  if (appId === "codex") {
+    // 无 OPENAI_API_KEY → 使用 Codex CLI 内置 OAuth（官方）
+    const apiKey = config?.auth?.OPENAI_API_KEY;
+    const bearerToken =
+      typeof config?.config === "string"
+        ? extractCodexExperimentalBearerToken(config.config)
+        : undefined;
+    return (
+      !bearerToken &&
+      (!apiKey || (typeof apiKey === "string" && apiKey.trim() === ""))
+    );
+  }
+  if (appId === "gemini") {
+    // 无 GEMINI_API_KEY 且无 GOOGLE_GEMINI_BASE_URL → Google OAuth 官方模式
+    const apiKey = config?.env?.GEMINI_API_KEY;
+    const baseUrl = config?.env?.GOOGLE_GEMINI_BASE_URL;
+    return (
+      (!apiKey || (typeof apiKey === "string" && apiKey.trim() === "")) &&
+      (!baseUrl || (typeof baseUrl === "string" && baseUrl.trim() === ""))
+    );
+  }
+  return false;
+}
+
+const extractConfiguredApiUrl = (provider: Provider) => {
+  const config = provider.settingsConfig;
+
+  if (config && typeof config === "object") {
+    const envBase =
+      (config as Record<string, any>)?.env?.ANTHROPIC_BASE_URL ||
+      (config as Record<string, any>)?.env?.GOOGLE_GEMINI_BASE_URL;
+    if (typeof envBase === "string" && envBase.trim()) {
+      return envBase;
+    }
+
+    const baseUrl = (config as Record<string, any>)?.config;
+
+    if (typeof baseUrl === "string" && baseUrl.includes("base_url")) {
+      const extractedBaseUrl = extractCodexBaseUrl(baseUrl);
+      if (extractedBaseUrl) {
+        return extractedBaseUrl;
+      }
+    }
+  }
+
+  return null;
+};
+
+const extractApiUrl = (provider: Provider, fallbackText: string) => {
+  const configuredApiUrl = extractConfiguredApiUrl(provider);
+  if (provider.category !== "official" && configuredApiUrl) {
+    return configuredApiUrl;
+  }
+
+  if (provider.notes?.trim()) {
+    return provider.notes.trim();
+  }
+
+  if (provider.websiteUrl) {
+    return provider.websiteUrl;
+  }
+
+  if (configuredApiUrl) {
+    return configuredApiUrl;
+  }
+
+  return fallbackText;
+};
+
+const quotaSourceToAuthProvider = (
+  quotaSource: ReturnType<typeof getProviderQuotaSource>,
+): ManagedAuthProvider | null => {
+  if (quotaSource === "copilot") return PROVIDER_TYPES.GITHUB_COPILOT;
+  if (quotaSource === "codex_oauth") return PROVIDER_TYPES.CODEX_OAUTH;
+  if (quotaSource === "claude_oauth") return PROVIDER_TYPES.CLAUDE_OAUTH;
+  if (quotaSource === "google_gemini_oauth")
+    return PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH;
+  if (quotaSource === "antigravity_oauth")
+    return PROVIDER_TYPES.ANTIGRAVITY_OAUTH;
+  if (quotaSource === "cursor_oauth") return PROVIDER_TYPES.CURSOR_OAUTH;
+  if (quotaSource === "cursor_apikey") return null;
+  if (quotaSource === "kiro_oauth") return PROVIDER_TYPES.KIRO_OAUTH;
+  return null;
+};
+
+function useManagedOauthAccountLogin(
+  provider: Provider,
+  quotaSource: ReturnType<typeof getProviderQuotaSource>,
+) {
+  const authProvider = quotaSourceToAuthProvider(quotaSource);
+  const { data: authStatus } = useQuery<ManagedAuthStatus>({
+    queryKey: ["managed-auth-status", authProvider],
+    queryFn: () => authApi.authGetStatus(authProvider!),
+    enabled: authProvider !== null,
+    staleTime: 30000,
+  });
+
+  if (!authProvider) {
+    return null;
+  }
+
+  const accountId =
+    resolveManagedAccountId(provider.meta, authProvider) ??
+    authStatus?.default_account_id ??
+    null;
+  const account = accountId
+    ? authStatus?.accounts.find((item) => item.id === accountId)
+    : undefined;
+
+  return account?.email || account?.login || null;
+}
+
+export function ProviderCard({
   provider,
-  priority,
-  failoverEnabled,
-  failoverPriority,
-  inFailoverQueue,
-  entry,
-  health,
-  account,
-  capability,
-  limit,
-  breaker,
-  current,
-  result,
-  busyId,
+  isCurrent,
+  appId,
+  isInConfig = true,
+  isOmo = false,
+  isOmoSlim = false,
+  onSwitch,
   onEdit,
-  onAction,
-  onToggleFailover,
-  onOpenUsage,
+  onDelete,
+  onRemoveFromConfig,
+  onDisableOmo,
+  onDisableOmoSlim,
+  onConfigureUsage,
+  onOpenWebsite,
+  onDuplicate,
+  onTestLink,
+  onTestModel,
+  onOpenTerminal,
+  isTestingLink,
+  isTestingModel,
+  isProxyRunning,
+  isProxyTakeover = false,
   dragHandleProps,
-  nodeRef,
-  style,
-  dragging,
-}: ProviderCardProps & {
-  dragHandleProps?: DragHandleProps;
-  nodeRef?: (node: HTMLElement | null) => void;
-  style?: CSSProperties;
-  dragging?: boolean;
-}) {
-  const { tx } = useI18n();
-  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
-  const model = modelFromProvider(provider.provider);
-  const baseUrl = baseUrlFromProvider(provider.provider, provider.app);
-  const providerIcon = storedProviderIcon(provider);
-  const accountId = provider.provider.meta?.authBinding?.accountId;
-  const accountValue = account
-    ? accountSummary(account)
-    : accountId || tx("direct config");
-  const busyPrefix = `${provider.app}:${provider.provider.id}:`;
-  const healthSummary = providerHealthSummary(health, tx);
-  const breakerOpen = failoverEnabled && breaker != null && breaker.state !== "closed";
+  isAutoFailoverEnabled = false,
+  failoverPriority,
+  isInFailoverQueue = false,
+  onToggleFailover,
+  activeProviderId,
+  // OpenClaw: default model
+  isDefaultModel,
+  onSetAsDefault,
+}: ProviderCardProps) {
+  const { t } = useTranslation();
+
+  // OMO and OMO Slim share the same card behavior
+  const isAnyOmo = isOmo || isOmoSlim;
+  const handleDisableAnyOmo = isOmoSlim ? onDisableOmoSlim : onDisableOmo;
+  const isAdditiveMode = appId === "opencode" && !isAnyOmo;
+
+  const { data: health } = useProviderHealth(provider.id, appId);
+
+  const fallbackUrlText = t("provider.notConfigured", {
+    defaultValue: "未配置接口地址",
+  });
+  const quotaSource = getProviderQuotaSource(provider, appId);
+  const managedOauthAccountLogin = useManagedOauthAccountLogin(
+    provider,
+    quotaSource,
+  );
+  const oauthAccountLogin = managedOauthAccountLogin;
+
+  const displayUrl = useMemo(() => {
+    if (isManagedOauthProvider(provider, appId)) {
+      return oauthAccountLogin
+        ? t("provider.oauthAccountDisplay", {
+            account: oauthAccountLogin,
+            defaultValue: `OAuth account: ${oauthAccountLogin}`,
+          })
+        : t("provider.oauthAccountResolving", {
+            defaultValue: "OAuth account",
+          });
+    }
+    return extractApiUrl(provider, fallbackUrlText);
+  }, [appId, oauthAccountLogin, provider, fallbackUrlText, t]);
+
+  const isClickableUrl = useMemo(() => {
+    if (isManagedOauthProvider(provider, appId)) {
+      return false;
+    }
+    if (provider.notes?.trim()) {
+      return false;
+    }
+    if (displayUrl === fallbackUrlText) {
+      return false;
+    }
+    return true;
+  }, [appId, provider, displayUrl, fallbackUrlText]);
+
+  const usageEnabled = provider.meta?.usage_script?.enabled ?? false;
+  const isOfficial = isOfficialProvider(provider, appId);
+  const isManagedOauth = isManagedOauthProvider(provider, appId);
+  const supportsOfficialSubscription =
+    isOfficial && ["claude", "codex", "gemini"].includes(appId);
+  const isOfficialSubscriptionUsage =
+    provider.meta?.usage_script?.templateType ===
+    TEMPLATE_TYPES.OFFICIAL_SUBSCRIPTION;
+  const officialSubscriptionEnabled =
+    supportsOfficialSubscription && usageEnabled && isOfficialSubscriptionUsage;
+  // Hermes v12+ overlay entries live under the `providers:` dict and are
+  // read-only here — writes have to go through Hermes Web UI.
+  const isHermesReadOnly =
+    appId === "hermes" && isHermesReadOnlyProvider(provider.settingsConfig);
+
+  // 获取用量数据以判断是否有多套餐
+  // 累加模式应用（OpenCode/OpenClaw/Hermes）：使用 isInConfig 代替 isCurrent
+  const shouldAutoQuery =
+    appId === "opencode" || appId === "openclaw" || appId === "hermes"
+      ? isInConfig
+      : isCurrent;
+  const autoQueryInterval = shouldAutoQuery
+    ? provider.meta?.usage_script?.autoQueryInterval || 0
+    : 0;
+
+  const { data: usage } = useUsageQuery(provider.id, appId, {
+    enabled: usageEnabled && !isOfficial && !isOfficialSubscriptionUsage,
+    autoQueryInterval,
+  });
+
+  const isTokenPlan =
+    provider.meta?.usage_script?.templateType === "token_plan";
+  const hasMultiplePlans =
+    usage?.success && usage.data && usage.data.length > 1 && !isTokenPlan;
+
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  useEffect(() => {
+    if (hasMultiplePlans) {
+      setIsExpanded(true);
+    }
+  }, [hasMultiplePlans]);
+
+  const handleOpenWebsite = () => {
+    if (!isClickableUrl) {
+      return;
+    }
+    onOpenWebsite(displayUrl);
+  };
+
+  // 判断是否是"当前使用中"的供应商
+  // - OMO/OMO Slim 供应商：使用 isCurrent
+  // - OpenClaw：使用默认模型归属的 provider 作为当前项（蓝色边框）
+  // - OpenCode（非 OMO）：不存在"当前"概念，返回 false
+  // - 故障转移模式：优先使用代理实际使用的供应商，状态未就绪时回退到当前选中项
+  // - 普通模式：isCurrent
+  const failoverActiveProviderId = activeProviderId?.trim();
+  const isActiveProvider = isAnyOmo
+    ? isCurrent
+    : appId === "openclaw"
+      ? Boolean(isDefaultModel)
+      : appId === "opencode"
+        ? false
+        : isAutoFailoverEnabled
+          ? failoverActiveProviderId
+            ? failoverActiveProviderId === provider.id
+            : isCurrent
+          : isCurrent;
+
+  const shouldUseGreen =
+    !isAnyOmo && (isProxyTakeover || isAutoFailoverEnabled) && isActiveProvider;
+  const hasPersistentConfigHighlight = isAdditiveMode && isInConfig;
+  const shouldUseBlue =
+    (isAnyOmo && isActiveProvider) ||
+    (!isAnyOmo &&
+      !isProxyTakeover &&
+      (isActiveProvider || hasPersistentConfigHighlight));
+
   return (
-    <>
-    <article
-      ref={nodeRef}
-      className={[current ? "provider-card current" : "provider-card", dragging ? "dragging" : ""]
-        .filter(Boolean)
-        .join(" ")}
-      style={style}
+    <div
+      className={cn(
+        "relative overflow-hidden rounded-xl border border-border p-4 transition-all duration-300",
+        "bg-card text-card-foreground group",
+        isAutoFailoverEnabled || isProxyTakeover
+          ? "hover:border-emerald-500/50"
+          : "hover:border-border-active",
+        shouldUseGreen &&
+          "border-emerald-500/60 shadow-sm shadow-emerald-500/10",
+        shouldUseBlue && "border-blue-500/60 shadow-sm shadow-blue-500/10",
+        !(isActiveProvider || hasPersistentConfigHighlight) &&
+          "hover:shadow-sm",
+        dragHandleProps?.isDragging &&
+          "cursor-grabbing border-primary shadow-lg scale-105 z-10",
+      )}
     >
-      <header className="provider-card-header">
-        <div className="provider-card-title-row">
+      <div
+        className={cn(
+          "absolute inset-0 bg-gradient-to-r to-transparent transition-opacity duration-500 pointer-events-none",
+          shouldUseGreen && "from-emerald-500/10",
+          shouldUseBlue && "from-blue-500/10",
+          !shouldUseGreen && !shouldUseBlue && "from-primary/10",
+          isActiveProvider || hasPersistentConfigHighlight
+            ? "opacity-100"
+            : "opacity-0",
+        )}
+      />
+      <div className="relative flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
           <button
-            {...dragHandleProps}
-            className="provider-drag-handle"
             type="button"
-            aria-label={tx("Drag provider")}
-            title={tx("Drag provider")}
+            className={cn(
+              "-ml-1.5 flex-shrink-0 cursor-grab active:cursor-grabbing p-1.5",
+              "text-muted-foreground/50 hover:text-muted-foreground transition-colors",
+              dragHandleProps?.isDragging && "cursor-grabbing",
+            )}
+            aria-label={t("provider.dragHandle")}
+            {...(dragHandleProps?.attributes ?? {})}
+            {...(dragHandleProps?.listeners ?? {})}
           >
-            <GripVertical size={16} />
+            <GripVertical className="h-4 w-4" />
           </button>
-          <div className="provider-icon-frame">
+
+          <div className="h-8 w-8 flex-shrink-0 rounded-lg bg-muted flex items-center justify-center border border-border group-hover:scale-105 transition-transform duration-300">
             <ProviderIcon
-              icon={providerIcon.icon}
-              name={provider.provider.name}
-              color={providerIcon.color}
-              size={22}
+              icon={provider.icon}
+              name={provider.name}
+              color={provider.iconColor}
+              size={20}
             />
           </div>
-          <div className="provider-title-stack">
-            <div className="provider-name-row">
-              <h3>{provider.provider.name}</h3>
-              <FailoverPriorityBadge priority={priority} />
-              {failoverEnabled && inFailoverQueue && failoverPriority != null && (
-                <StatusPill tone="success">{tx("failover P{{priority}}", { priority: failoverPriority })}</StatusPill>
+
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="flex flex-wrap items-center gap-2 min-h-7">
+              <h3 className="text-base font-semibold leading-none">
+                {provider.name}
+              </h3>
+
+              {isOmo && (
+                <span className="inline-flex items-center rounded-md bg-violet-100 px-1.5 py-0.5 text-[10px] font-semibold text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
+                  OMO
+                </span>
               )}
-              {breakerOpen && (
-                <StatusPill tone={breaker.state === "open" ? "danger" : "warning"}>
-                  {tx("breaker {{state}}", { state: breaker.state })}
-                </StatusPill>
+
+              {isOmoSlim && (
+                <span className="inline-flex items-center rounded-md bg-indigo-100 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">
+                  Slim
+                </span>
               )}
-              {current && <StatusPill tone="success">{tx("current")}</StatusPill>}
-              {account?.subscriptionLevel && (
-                <StatusPill tone="success">{account.subscriptionLevel}</StatusPill>
+
+              {isProxyRunning && isInFailoverQueue && health && (
+                <ProviderHealthBadge
+                  consecutiveFailures={health.consecutive_failures}
+                  isHealthy={health.is_healthy}
+                />
+              )}
+
+              {isAutoFailoverEnabled &&
+                isInFailoverQueue &&
+                failoverPriority && (
+                  <FailoverPriorityBadge priority={failoverPriority} />
+                )}
+
+              {provider.category === "third_party" &&
+                provider.meta?.isPartner && (
+                  <span
+                    className="text-yellow-500 dark:text-yellow-400"
+                    title={t("provider.officialPartner", {
+                      defaultValue: "官方合作伙伴",
+                    })}
+                  >
+                    ⭐
+                  </span>
+                )}
+
+              {isHermesReadOnly && (
+                <span
+                  className="inline-flex items-center rounded-md bg-slate-200 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700 dark:bg-slate-700/60 dark:text-slate-200"
+                  title={t("provider.managedByHermesHint", {
+                    defaultValue: "由 Hermes 管理，请在 Hermes Web UI 中编辑",
+                  })}
+                >
+                  {t("provider.managedByHermes", {
+                    defaultValue: "Hermes Managed",
+                  })}
+                </span>
               )}
             </div>
-            <p>{entry?.label || provider.providerTypeId}</p>
+
+            {displayUrl && (
+              <button
+                type="button"
+                onClick={handleOpenWebsite}
+                className={cn(
+                  "inline-flex max-w-full items-center overflow-hidden text-left text-sm",
+                  isClickableUrl
+                    ? "text-blue-500 transition-colors hover:underline dark:text-blue-400 cursor-pointer"
+                    : "text-muted-foreground cursor-default",
+                )}
+                title={displayUrl}
+                disabled={!isClickableUrl}
+              >
+                <span className="min-w-0 truncate">{displayUrl}</span>
+              </button>
+            )}
           </div>
         </div>
-        <div className="provider-card-right">
-          <div className="provider-health-stack">
-            <ProviderHealthIndicator health={health} />
-            <span>{healthSummary}</span>
+
+        <div className="flex w-full min-w-0 flex-col gap-2 sm:ml-auto sm:w-auto sm:max-w-[55%]">
+          <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-x-1 gap-y-1">
+            {quotaSource === "copilot" ? (
+              <CopilotQuotaFooter
+                meta={provider.meta}
+                appId={appId}
+                providerId={provider.id}
+                inline={true}
+                isCurrent={isCurrent}
+              />
+            ) : quotaSource === "codex_oauth" ? (
+              <CodexOauthQuotaFooter
+                meta={provider.meta}
+                appId={appId}
+                providerId={provider.id}
+                inline={true}
+                isCurrent={isCurrent}
+              />
+            ) : quotaSource === "claude_oauth" ? (
+              <ClaudeOauthQuotaFooter
+                meta={provider.meta}
+                appId={appId}
+                providerId={provider.id}
+                inline={true}
+                isCurrent={isCurrent}
+              />
+            ) : quotaSource === "google_gemini_oauth" ? (
+              <GeminiOauthQuotaFooter
+                meta={provider.meta}
+                inline={true}
+                appId={appId}
+                providerId={provider.id}
+                isCurrent={isCurrent}
+              />
+            ) : quotaSource === "antigravity_oauth" ? (
+              <AntigravityOauthQuotaFooter
+                meta={provider.meta}
+                inline={true}
+                appId={appId}
+                providerId={provider.id}
+                isCurrent={isCurrent}
+              />
+            ) : quotaSource === "cursor_oauth" ||
+              quotaSource === "cursor_apikey" ? (
+              <CursorOauthQuotaFooter
+                meta={provider.meta}
+                inline={true}
+                appId={appId}
+                providerId={provider.id}
+                isCurrent={isCurrent}
+              />
+            ) : quotaSource === "kiro_oauth" ? (
+              <KiroOauthQuotaFooter
+                meta={provider.meta}
+                inline={true}
+                appId={appId}
+                providerId={provider.id}
+                isCurrent={isCurrent}
+              />
+            ) : quotaSource === "ollama_cloud" ? (
+              <OllamaQuotaFooter
+                meta={provider.meta}
+                providerId={provider.id}
+                appId={appId}
+                inline={true}
+                isCurrent={isCurrent}
+              />
+            ) : isOfficial ? (
+              officialSubscriptionEnabled ? (
+                <SubscriptionQuotaFooter
+                  appId={appId}
+                  inline={true}
+                  isCurrent={isCurrent}
+                  autoQueryInterval={
+                    provider.meta?.usage_script?.autoQueryInterval ?? 0
+                  }
+                />
+              ) : null
+            ) : hasMultiplePlans ? (
+              <div className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
+                <span className="font-medium">
+                  {t("usage.multiplePlans", {
+                    count: usage?.data?.length || 0,
+                    defaultValue: `${usage?.data?.length || 0} 个套餐`,
+                  })}
+                </span>
+              </div>
+            ) : (
+              <UsageFooter
+                provider={provider}
+                providerId={provider.id}
+                appId={appId}
+                usageEnabled={usageEnabled}
+                isCurrent={isCurrent}
+                isInConfig={isInConfig}
+                inline={true}
+              />
+            )}
+            {hasMultiplePlans && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsExpanded(!isExpanded);
+                }}
+                className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-gray-500 dark:text-gray-400 flex-shrink-0"
+                title={
+                  isExpanded
+                    ? t("usage.collapse", { defaultValue: "收起" })
+                    : t("usage.expand", { defaultValue: "展开" })
+                }
+              >
+                {isExpanded ? (
+                  <ChevronUp size={14} />
+                ) : (
+                  <ChevronDown size={14} />
+                )}
+              </button>
+            )}
           </div>
-          <button
-            className="icon-button provider-card-refresh"
-            type="button"
-            onClick={() => onAction("test")}
-            disabled={busyId === `${busyPrefix}test`}
-            aria-label={tx("Refresh provider health")}
-            title={tx("Refresh provider health")}
-          >
-            {busyId === `${busyPrefix}test` ? <Loader2 size={14} /> : <RefreshCw size={14} />}
-          </button>
-        </div>
-      </header>
-      {baseUrl && (
-        <a className="provider-url-row" href={baseUrl} target="_blank" rel="noreferrer">
-          <Link2 size={14} />
-          <span>{baseUrl}</span>
-        </a>
-      )}
-      <div className="provider-card-meta compact">
-        <KeyValue label="model" value={model || "-"} />
-        <KeyValue label="api format" value={apiFormatFromProvider(provider.provider) || "-"} />
-        <KeyValue label="account" value={accountValue} />
-        <KeyValue label="last status" value={health?.lastStatusCode || "-"} />
-      </div>
-      {entry && <ProviderReadinessPanel entry={entry} capability={capability} />}
-      {account && <ProviderAccountFooter account={account} />}
-      {limit && <ProviderLimitFooter limit={limit} />}
-      <div className="provider-card-result">
-        {result || health?.reason || tx("{{count}} recent requests", { count: health?.requests ?? 0 })}
-      </div>
-      <div className="provider-actions">
-        <IconAction title="Edit" onClick={onEdit}>
-          <Pencil size={15} />
-        </IconAction>
-        <IconAction
-          title="Duplicate"
-          onClick={() => onAction("duplicate")}
-          busy={busyId === `${busyPrefix}duplicate`}
-        >
-          <Copy size={15} />
-        </IconAction>
-        <IconAction
-          title="Config test"
-          onClick={() => onAction("test")}
-          busy={busyId === `${busyPrefix}test`}
-        >
-          <CheckCircle2 size={15} />
-        </IconAction>
-        <IconAction
-          title="Network test"
-          onClick={() => onAction("network")}
-          busy={busyId === `${busyPrefix}network`}
-        >
-          <FlaskConical size={15} />
-        </IconAction>
-        <IconAction
-          title="Stream test"
-          onClick={() => onAction("stream")}
-          busy={busyId === `${busyPrefix}stream`}
-        >
-          <RefreshCw size={15} />
-        </IconAction>
-        <IconAction
-          title="Fetch models"
-          onClick={() => onAction("models")}
-          busy={busyId === `${busyPrefix}models`}
-        >
-          <ServerCog size={15} />
-        </IconAction>
-        {onOpenUsage && (
-          <IconAction title="Usage and limits" onClick={onOpenUsage}>
-            <BarChart3 size={15} />
-          </IconAction>
-        )}
-        {failoverEnabled && (
-          <IconAction
-            title={inFailoverQueue ? "Remove from failover queue" : "Add to failover queue"}
-            onClick={() => onToggleFailover(!inFailoverQueue)}
-            busy={busyId === `${busyPrefix}failover`}
-          >
-            {inFailoverQueue ? <Minus size={15} /> : <Plus size={15} />}
-          </IconAction>
-        )}
-        {breakerOpen && (
-          <IconAction
-            title="Reset failover breaker"
-            onClick={() => onAction("resetFailover")}
-            busy={busyId === `${busyPrefix}resetFailover`}
-          >
-            <RefreshCw size={15} />
-          </IconAction>
-        )}
-        <button
-          className={current ? "secondary-button compact current-action" : "primary-button compact"}
-          type="button"
-          onClick={() => onAction("switch")}
-          disabled={current || busyId === `${busyPrefix}switch`}
-          title={tx(current ? "current" : "switch")}
-        >
-          {current ? <CheckCircle2 size={15} /> : <Play size={15} />}
-          <span>{tx(current ? "current" : "switch")}</span>
-        </button>
-        <IconAction
-          title="Delete"
-          disabledTitle="Current provider cannot be deleted"
-          onClick={() => setDeleteConfirmOpen(true)}
-          busy={busyId === `${busyPrefix}delete`}
-          disabled={current}
-          danger
-        >
-          <Trash2 size={15} />
-        </IconAction>
-      </div>
-    </article>
-      <ConfirmDialog
-        isOpen={deleteConfirmOpen}
-        title={tx("Delete provider")}
-        message={tx("Delete provider {{name}}?", { name: provider.provider.name })}
-        confirmText={tx("Delete")}
-        onConfirm={() => {
-          setDeleteConfirmOpen(false);
-          onAction("delete");
-        }}
-        onCancel={() => setDeleteConfirmOpen(false)}
-      />
-    </>
-  );
-}
 
-function providerHealthSummary(
-  health: ProviderHealth | undefined,
-  tx: TranslateFn,
-): string {
-  const requests = health?.requests ?? 0;
-  if (!health?.lastRequestAtMs) {
-    return tx("{{count}} recent requests", { count: requests });
-  }
-  return tx("{{time}} · {{count}} requests", {
-    time: relativeRequestTime(health.lastRequestAtMs, tx),
-    count: requests,
-  });
-}
-
-function relativeRequestTime(
-  value: number,
-  tx: TranslateFn,
-): string {
-  const millis = value < 10_000_000_000 ? value * 1000 : value;
-  const diff = Date.now() - millis;
-  if (!Number.isFinite(diff) || diff < 0) return formatRequestTime(millis);
-  if (diff < 60_000) return tx("just now");
-  if (diff < 3_600_000) return tx("{{count}}m ago", { count: Math.max(1, Math.round(diff / 60_000)) });
-  if (diff < 86_400_000) return tx("{{count}}h ago", { count: Math.max(1, Math.round(diff / 3_600_000)) });
-  if (diff < 604_800_000) return tx("{{count}}d ago", { count: Math.max(1, Math.round(diff / 86_400_000)) });
-  return formatRequestTime(millis);
-}
-
-function formatRequestTime(millis: number): string {
-  const date = new Date(millis);
-  if (Number.isNaN(date.getTime())) return "-";
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
-}
-
-function ProviderReadinessPanel({
-  entry,
-  capability,
-}: {
-  entry: ProviderMatrixEntry;
-  capability?: AccountManagerCapability;
-}) {
-  const { tx } = useI18n();
-  return (
-    <details className="provider-readiness-panel">
-      <summary>
-        <span>{tx("Adapter readiness")}</span>
-        <div className="provider-readiness-header">
-          <StatusPill tone={entry.uiVisible ? "success" : "warning"}>
-            {entry.visibility === "diagnostic_only" ? tx("diagnostic") : tx("creatable")}
-          </StatusPill>
-          <span>{entry.credentialMode}</span>
-        </div>
-      </summary>
-      <div className="provider-readiness-body">
-        <div className="provider-readiness-grid">
-          <ReadinessFlag label="direct" enabled={entry.directConfigSupported} />
-          <ReadinessFlag label="account" enabled={entry.accountSupported} />
-          <ReadinessFlag label="managed" enabled={entry.managedAccountRecommended} />
-          <ReadinessFlag label="refresh" enabled={capability?.supportsRefresh} />
-          <ReadinessFlag label="quota" enabled={capability?.supportsQuota} />
-          <ReadinessFlag label="plan" enabled={capability?.supportsRefreshPlan} />
-        </div>
-        <div className="provider-readiness-note">
-          {capability?.serverNativeStage || capability?.status || "direct-config"}
-          {entry.note ? ` · ${entry.note}` : ""}
+          <div className="flex justify-end opacity-0 pointer-events-none group-hover:opacity-100 group-focus-within:opacity-100 group-hover:pointer-events-auto group-focus-within:pointer-events-auto max-sm:opacity-100 max-sm:pointer-events-auto transition-opacity duration-200">
+            <ProviderActions
+              appId={appId}
+              isCurrent={isCurrent}
+              isInConfig={isInConfig}
+              isTestingLink={isTestingLink}
+              isTestingModel={isTestingModel}
+              isProxyTakeover={isProxyTakeover}
+              isReadOnly={isHermesReadOnly}
+              isOmo={isAnyOmo}
+              onSwitch={() => onSwitch(provider)}
+              onEdit={() => onEdit(provider)}
+              onDuplicate={() => onDuplicate(provider)}
+              onTestLink={
+                onTestLink && canTestLinkProvider(provider, appId)
+                  ? () => onTestLink(provider)
+                  : undefined
+              }
+              onTestModel={
+                onTestModel && canTestModelProvider(provider, appId)
+                  ? () => onTestModel(provider)
+                  : undefined
+              }
+              onConfigureUsage={
+                (isOfficial && !supportsOfficialSubscription) ||
+                isManagedOauth ||
+                provider.meta?.providerType === PROVIDER_TYPES.OLLAMA_CLOUD
+                  ? undefined
+                  : () => onConfigureUsage(provider)
+              }
+              onDelete={() => onDelete(provider)}
+              onRemoveFromConfig={
+                onRemoveFromConfig
+                  ? () => onRemoveFromConfig(provider)
+                  : undefined
+              }
+              onDisableOmo={handleDisableAnyOmo}
+              onOpenTerminal={
+                onOpenTerminal ? () => onOpenTerminal(provider) : undefined
+              }
+              isAutoFailoverEnabled={isAutoFailoverEnabled}
+              isInFailoverQueue={isInFailoverQueue}
+              onToggleFailover={onToggleFailover}
+              // OpenClaw: default model
+              isDefaultModel={isDefaultModel}
+              onSetAsDefault={onSetAsDefault}
+            />
+          </div>
         </div>
       </div>
-    </details>
-  );
-}
 
-function ReadinessFlag({ label, enabled }: { label: string; enabled?: boolean }) {
-  const { tx } = useI18n();
-  return (
-    <span className={enabled ? "readiness-flag active" : "readiness-flag"}>
-      {tx(label)}
-    </span>
-  );
-}
-
-function ProviderAccountFooter({ account }: { account: AccountRecord }) {
-  const { tx } = useI18n();
-  const quotaPercent = accountQuotaPercent(account);
-  const tiers = account.quota?.tiers || [];
-  const expiryLabel = providerExpiryLabel(account.expiresAt, tx);
-  const refreshedLabel = account.quotaRefreshedAt == null
-    ? null
-    : tx("refreshed {{time}}", { time: formatRelativePast(account.quotaRefreshedAt, tx) });
-  const nextRefreshLabel = providerCountdownLabel(account.quotaNextRefreshAt, tx, "refresh");
-  return (
-    <div className="provider-account-footer">
-      <div className="provider-account-line">
-        <span>{account.email || account.id}</span>
-        <span>{account.subscriptionLevel || tx("account")}</span>
-        <span>{quotaPercent == null ? tx("quota -") : `${quotaPercent.toFixed(1)}%`}</span>
-        {expiryLabel && <span title={formatDateTime(account.expiresAt)}>{expiryLabel}</span>}
-        {refreshedLabel && <span title={formatDateTime(account.quotaRefreshedAt)}>{refreshedLabel}</span>}
-        {nextRefreshLabel && <span title={formatDateTime(account.quotaNextRefreshAt)}>{nextRefreshLabel}</span>}
-      </div>
-      {quotaPercent != null && (
-        <div className="provider-quota-meter" aria-label={tx("quota")}>
-          <span style={{ width: `${clampPercent(quotaPercent)}%` }} />
-        </div>
-      )}
-      {tiers.length > 0 && (
-        <div className="provider-quota-tiers">
-          {tiers.slice(0, 3).map((tier) => (
-            <div className="provider-quota-tier" key={tier.name}>
-              <div>
-                <strong>{tier.name}</strong>
-                <span>{tierLine(tier, tx)}</span>
-              </div>
-              <div className="provider-quota-tier-meter">
-                <span style={{ width: `${clampPercent(tier.utilization ?? 0)}%` }} />
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-      {account.lastRefreshError && <strong>{account.lastRefreshError}</strong>}
-    </div>
-  );
-}
-
-
-function accountQuotaPercent(account: AccountRecord): number | null {
-  if (account.quotaPercent != null) return account.quotaPercent;
-  const utilization = account.quota?.tiers?.find((tier) => tier.utilization != null)?.utilization;
-  return utilization == null ? null : utilization;
-}
-
-function clampPercent(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(0, Math.min(100, value));
-}
-
-function tierLine(tier: ProviderQuotaTier, tx: TxFn): string {
-  const usage = tier.used != null && tier.limit != null
-    ? `${formatCompactNumber(tier.used)}/${formatCompactNumber(tier.limit)}`
-    : tier.utilization == null
-      ? "-"
-      : `${tier.utilization.toFixed(1)}%`;
-  const unit = tier.unit ? ` ${tier.unit}` : "";
-  const reset = tier.resetsAt == null ? "" : ` · ${providerCountdownLabel(tier.resetsAt, tx, "resets") || formatTime(tier.resetsAt)}`;
-  return `${usage}${unit}${reset}`;
-}
-
-function providerExpiryLabel(value: number | null | undefined, tx: TxFn): string | null {
-  const millis = normalizeTimestamp(value);
-  if (millis == null) return tx("expires -");
-  const delta = millis - Date.now();
-  if (delta < 0) return tx("expired {{time}} ago", { time: formatDuration(Math.abs(delta), tx) });
-  return tx("expires in {{time}}", { time: formatDuration(delta, tx) });
-}
-
-function providerCountdownLabel(value: number | null | undefined, tx: TxFn, label: string): string | null {
-  const millis = normalizeTimestamp(value);
-  if (millis == null) return null;
-  const delta = millis - Date.now();
-  if (delta < 0) return tx("{{label}} {{time}} ago", { label, time: formatDuration(Math.abs(delta), tx) });
-  return tx("{{label}} in {{time}}", { label, time: formatDuration(delta, tx) });
-}
-
-function formatRelativePast(value: number | null | undefined, tx: TxFn): string {
-  const millis = normalizeTimestamp(value);
-  if (millis == null) return "-";
-  const delta = Date.now() - millis;
-  if (delta < 0) return tx("in {{time}}", { time: formatDuration(Math.abs(delta), tx) });
-  return tx("{{time}} ago", { time: formatDuration(delta, tx) });
-}
-
-function formatDuration(millis: number, tx: TxFn): string {
-  const seconds = Math.max(0, Math.round(millis / 1000));
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-  if (days > 0) return tx("{{count}}d", { count: days });
-  if (hours > 0) return tx("{{count}}h", { count: hours });
-  if (minutes > 0) return tx("{{count}}m", { count: minutes });
-  return tx("{{count}}s", { count: seconds });
-}
-
-function normalizeTimestamp(value: number | null | undefined): number | null {
-  if (value == null || !Number.isFinite(value)) return null;
-  return value < 10_000_000_000 ? value * 1000 : value;
-}
-
-function formatDateTime(value: number | null | undefined): string {
-  const millis = normalizeTimestamp(value);
-  if (millis == null) return "-";
-  const date = new Date(millis);
-  if (Number.isNaN(date.getTime())) return "-";
-  return date.toISOString();
-}
-
-function formatCompactNumber(value: number): string {
-  if (!Number.isFinite(value)) return "-";
-  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`;
-  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
-  return Number.isInteger(value) ? String(value) : value.toFixed(1);
-}
-
-function ProviderLimitFooter({ limit }: { limit: ProviderLimitStatus }) {
-  const shareWarnings = limit.shares.filter((share) => share.blocked || share.warnings.length);
-  const warnings = [...limit.warnings, ...shareWarnings.flatMap((share) => share.warnings.map((warning) => `${share.shareName}: ${warning}`))];
-  return (
-    <div className="provider-limit-footer">
-      <div className="provider-limit-grid">
-        <LimitMetric
-          label="daily"
-          value={limitLine(limit.dailyUsageUsd, limit.dailyLimitUsd)}
-          tone={limit.dailyExceeded ? "danger" : "success"}
-        />
-        <LimitMetric
-          label="monthly"
-          value={limitLine(limit.monthlyUsageUsd, limit.monthlyLimitUsd)}
-          tone={limit.monthlyExceeded ? "danger" : "success"}
-        />
-        <LimitMetric
-          label="quota"
-          value={limit.accountQuotaPercent == null ? "-" : `${limit.accountQuotaPercent.toFixed(1)}%`}
-          tone={limit.quotaDispatchExceeded ? "danger" : "success"}
-        />
-        <LimitMetric
-          label="shares"
-          value={`${limit.shares.filter((share) => share.blocked).length}/${limit.shares.length} blocked`}
-          tone={shareWarnings.length ? "warning" : "success"}
-        />
-      </div>
-      {(limit.accountEmail || limit.accountLastRefreshError || limit.quotaDispatchLimitPercent != null) && (
-        <div className="provider-limit-line">
-          <span>{limit.accountEmail || "account -"}</span>
-          <span>{limit.quotaDispatchLimitPercent == null ? "dispatch -" : `dispatch ${limit.quotaDispatchLimitPercent.toFixed(1)}%`}</span>
-          <span>{limit.accountQuotaRefreshedAt == null ? "quota refresh -" : formatTime(limit.accountQuotaRefreshedAt)}</span>
-          {limit.accountLastRefreshError && <strong>{limit.accountLastRefreshError}</strong>}
-        </div>
-      )}
-      {warnings.length > 0 && (
-        <div className="provider-warning-list">
-          {warnings.slice(0, 4).map((warning, index) => (
-            <span key={`${warning}:${index}`}>{warning}</span>
-          ))}
+      {isExpanded && hasMultiplePlans && (
+        <div className="mt-4 pt-4 border-t border-border-default">
+          <UsageFooter
+            provider={provider}
+            providerId={provider.id}
+            appId={appId}
+            usageEnabled={usageEnabled}
+            isCurrent={isCurrent}
+            isInConfig={isInConfig}
+            inline={false}
+          />
         </div>
       )}
     </div>
   );
-}
-
-function LimitMetric({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone: "success" | "warning" | "danger";
-}) {
-  const { tx } = useI18n();
-  return (
-    <div className="limit-metric">
-      <span>{tx(label)}</span>
-      <StatusPill tone={tone}>{value}</StatusPill>
-    </div>
-  );
-}
-
-
-
-function formatTime(value?: number | null): string {
-  if (!value) return "expires -";
-  const millis = value < 10_000_000_000 ? value * 1000 : value;
-  const date = new Date(millis);
-  if (Number.isNaN(date.getTime())) return "expires -";
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
 }

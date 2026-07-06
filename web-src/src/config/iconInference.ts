@@ -1,14 +1,12 @@
-const iconMappings: Record<string, { icon: string; iconColor?: string }> = {
+/**
+ * 根据供应商名称智能推断图标配置
+ */
+
+const iconMappings = {
+  // AI 服务商
   claude: { icon: "claude", iconColor: "#D4915D" },
   anthropic: { icon: "anthropic", iconColor: "#D4915D" },
-  openai: { icon: "openai", iconColor: "#111827" },
-  chatgpt: { icon: "openai", iconColor: "#111827" },
-  codex: { icon: "openai", iconColor: "#111827" },
-  gemini: { icon: "gemini", iconColor: "#8E75B2" },
-  google: { icon: "google", iconColor: "#4285F4" },
   deepseek: { icon: "deepseek", iconColor: "#1E88E5" },
-  ollama: { icon: "ollama", iconColor: "#111827" },
-  openrouter: { icon: "openrouter", iconColor: "#111827" },
   zhipu: { icon: "zhipu", iconColor: "#0F62FE" },
   glm: { icon: "zhipu", iconColor: "#0F62FE" },
   qwen: { icon: "qwen", iconColor: "#FF6A00" },
@@ -16,125 +14,79 @@ const iconMappings: Record<string, { icon: string; iconColor?: string }> = {
   alibaba: { icon: "alibaba", iconColor: "#FF6A00" },
   aliyun: { icon: "alibaba", iconColor: "#FF6A00" },
   kimi: { icon: "kimi", iconColor: "#6366F1" },
-  moonshot: { icon: "kimi", iconColor: "#6366F1" },
-  nvidia: { icon: "nvidia", iconColor: "#76B900" },
-  aws: { icon: "aws", iconColor: "#FF9900" },
-  azure: { icon: "azure", iconColor: "#0078D4" },
-  cloudflare: { icon: "cloudflare", iconColor: "#F38020" },
-  mistral: { icon: "mistral", iconColor: "#FF7000" },
-  cohere: { icon: "cohere", iconColor: "#39594D" },
-  perplexity: { icon: "perplexity", iconColor: "#20808D" },
-  huggingface: { icon: "huggingface", iconColor: "#FFD21E" },
-  novita: { icon: "novita", iconColor: "#111827" },
+  moonshot: { icon: "moonshot", iconColor: "#6366F1" },
+  stepfun: { icon: "stepfun", iconColor: "#005AFF" },
+  step: { icon: "stepfun", iconColor: "#005AFF" },
   baidu: { icon: "baidu", iconColor: "#2932E1" },
   tencent: { icon: "tencent", iconColor: "#00A4FF" },
   hunyuan: { icon: "hunyuan", iconColor: "#00A4FF" },
   minimax: { icon: "minimax", iconColor: "#FF6B6B" },
-  xai: { icon: "xai", iconColor: "#111827" },
-  grok: { icon: "grok", iconColor: "#111827" },
-  cursor: { icon: "cursor" },
-  kiro: { icon: "kiro" },
-  copilot: { icon: "copilot", iconColor: "#111827" },
-  githubcopilot: { icon: "githubcopilot", iconColor: "#111827" },
-  github: { icon: "github", iconColor: "#111827" },
-  googlecloud: { icon: "googlecloud", iconColor: "#4285F4" },
-  "google cloud": { icon: "googlecloud", iconColor: "#4285F4" },
-  gcp: { icon: "googlecloud", iconColor: "#4285F4" },
-  antigravity: { icon: "google", iconColor: "#4285F4" },
-  agy: { icon: "google", iconColor: "#4285F4" },
-  doubao: { icon: "doubao", iconColor: "#1E37FC" },
-  volcengine: { icon: "doubao", iconColor: "#1E37FC" },
-  huoshan: { icon: "doubao", iconColor: "#1E37FC" },
-  bytedance: { icon: "bytedance", iconColor: "#3C8CFF" },
-  siliconflow: { icon: "siliconflow", iconColor: "#6E29F6" },
-  "silicon flow": { icon: "siliconflow", iconColor: "#6E29F6" },
-  stepfun: { icon: "stepfun", iconColor: "#005AFF" },
-  "step fun": { icon: "stepfun", iconColor: "#005AFF" },
-  step: { icon: "stepfun", iconColor: "#005AFF" },
-  meta: { icon: "meta", iconColor: "#0082FB" },
-  llama: { icon: "meta", iconColor: "#0082FB" },
-  huawei: { icon: "huawei", iconColor: "#C7000B" },
-  newapi: { icon: "newapi", iconColor: "#C738FB" },
-  "new api": { icon: "newapi", iconColor: "#C738FB" },
-  subrouter: { icon: "subrouter", iconColor: "#111827" },
-  "sub router": { icon: "subrouter", iconColor: "#111827" },
-  chatglm: { icon: "chatglm", iconColor: "#0F62FE" },
-  "chat glm": { icon: "chatglm", iconColor: "#0F62FE" },
-  gemma: { icon: "gemma", iconColor: "#4285F4" },
-  modelscope: { icon: "modelscope-color", iconColor: "#624AFF" },
-  "model scope": { icon: "modelscope-color", iconColor: "#624AFF" },
-  wenxin: { icon: "wenxin", iconColor: "#2932E1" },
-  ernie: { icon: "wenxin", iconColor: "#2932E1" },
-  "01ai": { icon: "zeroone", iconColor: "#111827" },
-  "01.ai": { icon: "zeroone", iconColor: "#111827" },
-  zeroone: { icon: "zeroone", iconColor: "#111827" },
-  "zero one": { icon: "zeroone", iconColor: "#111827" },
-  "yi-": { icon: "yi", iconColor: "#111827" },
-  "yi ": { icon: "yi", iconColor: "#111827" },
-  palm: { icon: "palm", iconColor: "#4285F4" },
-  stability: { icon: "stability", iconColor: "#111827" },
-  "stable diffusion": { icon: "stability", iconColor: "#111827" },
-  midjourney: { icon: "midjourney", iconColor: "#111827" },
-  vercel: { icon: "vercel", iconColor: "#111827" },
-  v0: { icon: "vercel", iconColor: "#111827" },
-  ucloud: { icon: "ucloud", iconColor: "#2B70FF" },
-  notion: { icon: "notion", iconColor: "#111827" },
-  opencode: { icon: "opencode-logo-light", iconColor: "#111827" },
-  "open code": { icon: "opencode-logo-light", iconColor: "#111827" },
-  aihubmix: { icon: "aihubmix-color", iconColor: "#2563EB" },
-  "ai hub mix": { icon: "aihubmix-color", iconColor: "#2563EB" },
-  aicoding: { icon: "aicoding", iconColor: "#2563EB" },
-  "ai coding": { icon: "aicoding", iconColor: "#2563EB" },
-  algocode: { icon: "algocode", iconColor: "#2563EB" },
-  "algo code": { icon: "algocode", iconColor: "#2563EB" },
-  catcoder: { icon: "catcoder", iconColor: "#FF7A1A" },
-  "cat coder": { icon: "catcoder", iconColor: "#FF7A1A" },
-  claw: { icon: "claw", iconColor: "#111827" },
-  cubence: { icon: "cubence", iconColor: "#2563EB" },
-  longcat: { icon: "longcat-color", iconColor: "#111827" },
-  "long cat": { icon: "longcat-color", iconColor: "#111827" },
-  aicodemirror: { icon: "aicodemirror", iconColor: "#2563EB" },
-  "ai code mirror": { icon: "aicodemirror", iconColor: "#2563EB" },
-  crazyrouter: { icon: "crazyrouter", iconColor: "#7C3AED" },
-  "crazy router": { icon: "crazyrouter", iconColor: "#7C3AED" },
-  lioncc: { icon: "lioncc", iconColor: "#F59E0B" },
-  "lion cc": { icon: "lioncc", iconColor: "#F59E0B" },
-  micu: { icon: "micu", iconColor: "#2563EB" },
-  packycode: { icon: "packycode", iconColor: "#111827" },
-  "packy code": { icon: "packycode", iconColor: "#111827" },
-  sssaicode: { icon: "sssaicode", iconColor: "#2563EB" },
-  "sss ai code": { icon: "sssaicode", iconColor: "#2563EB" },
-  xiaomimimo: { icon: "xiaomimimo", iconColor: "#FF6900" },
-  "xiaomi mimo": { icon: "xiaomimimo", iconColor: "#FF6900" },
-  mimo: { icon: "xiaomimimo", iconColor: "#FF6900" },
-  bedrock: { icon: "aws", iconColor: "#FF9900" },
-  "ollama cloud": { icon: "ollama", iconColor: "#111827" },
-  deepseekapi: { icon: "deepseek", iconColor: "#1E88E5" },
-  "deepseek api": { icon: "deepseek", iconColor: "#1E88E5" },
+  google: { icon: "google", iconColor: "#4285F4" },
+  meta: { icon: "meta", iconColor: "#0081FB" },
+  mistral: { icon: "mistral", iconColor: "#FF7000" },
+  cohere: { icon: "cohere", iconColor: "#39594D" },
+  perplexity: { icon: "perplexity", iconColor: "#20808D" },
+  huggingface: { icon: "huggingface", iconColor: "#FFD21E" },
+  novita: { icon: "novita", iconColor: "#000000" },
+
+  // 云平台
+  aws: { icon: "aws", iconColor: "#FF9900" },
+  azure: { icon: "azure", iconColor: "#0078D4" },
+  huawei: { icon: "huawei", iconColor: "#FF0000" },
+  cloudflare: { icon: "cloudflare", iconColor: "#F38020" },
 };
 
-export function inferIconForText(...parts: Array<string | null | undefined>): {
+/**
+ * 根据预设名称推断图标
+ */
+export function inferIconForPreset(presetName: string): {
   icon?: string;
   iconColor?: string;
 } {
-  const haystack = parts.filter(Boolean).join(" ").toLowerCase();
-  const mappings = Object.entries(iconMappings).sort((left, right) => right[0].length - left[0].length);
-  for (const [key, config] of mappings) {
-    if (haystack.includes(key)) {
+  const nameLower = presetName.toLowerCase();
+
+  // 精确匹配或模糊匹配
+  for (const [key, config] of Object.entries(iconMappings)) {
+    if (nameLower.includes(key)) {
       return config;
     }
   }
+
   return {};
 }
 
-export function addIconsToPresets<T extends { name: string; icon?: string; iconColor?: string }>(
-  presets: T[],
-): T[] {
+/**
+ * 批量为预设添加图标配置
+ */
+export function addIconsToPresets<
+  T extends { name: string; icon?: string; iconColor?: string },
+>(presets: T[]): T[] {
   return presets.map((preset) => {
-    if (preset.icon) return preset;
+    // 如果已经配置了图标，则保留原配置
+    if (preset.icon) {
+      return preset;
+    }
+
+    // 否则根据名称推断
+    const inferred = inferIconForPreset(preset.name);
     return {
       ...preset,
-      ...inferIconForText(preset.name),
+      ...inferred,
     };
   });
+}
+
+export function inferIconForText(
+  name: string,
+  providerType?: string | null,
+  baseUrl?: string | null,
+  apiFormat?: string | null,
+): { icon: string; iconColor?: string } {
+  const inferred = inferIconForPreset(
+    [name, providerType, baseUrl, apiFormat].filter(Boolean).join(" "),
+  );
+  return {
+    icon: inferred.icon || "default",
+    iconColor: inferred.iconColor,
+  };
 }

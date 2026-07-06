@@ -35,6 +35,13 @@ struct OAuthLoginSession {
     created_at_ms: i64,
     expires_at_ms: i64,
     status: OAuthLoginStatus,
+    authorization_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthSessionPollState {
+    Pending,
+    Ready,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -160,6 +167,7 @@ impl OAuthLoginStore {
             created_at_ms: now_ms,
             expires_at_ms,
             status: OAuthLoginStatus::Pending,
+            authorization_code: None,
         };
         self.sessions.insert(session_id.clone(), session);
 
@@ -221,11 +229,15 @@ impl OAuthLoginStore {
             }
         }
 
+        if let Some(code) = code.map(str::trim).filter(|value| !value.is_empty()) {
+            session.authorization_code = Some(code.to_string());
+        }
+
         let token_request = match session.flow {
             OAuthAuthorizeFlow::AuthorizationCode | OAuthAuthorizeFlow::AuthorizationCodePkce => {
-                let code = code
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
+                let code = session
+                    .authorization_code
+                    .as_deref()
                     .ok_or(OAuthLoginError::MissingCode)?;
                 let redirect_uri = session.redirect_uri.as_deref().ok_or_else(|| {
                     OAuthLoginError::RequestShape("redirect_uri is required".to_string())
@@ -301,6 +313,49 @@ impl OAuthLoginStore {
             if session.status == OAuthLoginStatus::TokenExchangeStarted {
                 session.status = OAuthLoginStatus::TokenRequestPreviewed;
             }
+        }
+    }
+
+    pub fn poll_state_by_oauth_state(
+        &mut self,
+        state: &str,
+        now_ms: i64,
+    ) -> Result<OAuthSessionPollState, OAuthLoginError> {
+        self.cleanup_expired(now_ms);
+        let session = self
+            .sessions
+            .values()
+            .find(|session| session.state == state)
+            .ok_or(OAuthLoginError::NotFound)?;
+        if session.expires_at_ms <= now_ms {
+            return Err(OAuthLoginError::Expired);
+        }
+        if session.status == OAuthLoginStatus::TokenExchanged {
+            return Err(OAuthLoginError::AlreadyConsumed);
+        }
+        match session.flow {
+            OAuthAuthorizeFlow::CursorDeepControl => {
+                if matches!(
+                    session.status,
+                    OAuthLoginStatus::Pending | OAuthLoginStatus::TokenRequestPreviewed
+                ) {
+                    Ok(OAuthSessionPollState::Ready)
+                } else {
+                    Ok(OAuthSessionPollState::Pending)
+                }
+            }
+            OAuthAuthorizeFlow::AuthorizationCode | OAuthAuthorizeFlow::AuthorizationCodePkce => {
+                if session.status == OAuthLoginStatus::TokenRequestPreviewed
+                    && session.authorization_code.is_some()
+                {
+                    Ok(OAuthSessionPollState::Ready)
+                } else {
+                    Ok(OAuthSessionPollState::Pending)
+                }
+            }
+            OAuthAuthorizeFlow::Unsupported => Err(OAuthLoginError::Unsupported(
+                "oauth login flow is unsupported".to_string(),
+            )),
         }
     }
 

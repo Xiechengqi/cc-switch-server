@@ -34,6 +34,18 @@
 - `UPSTREAM_IMPORT.md`
 - `docs/provider-coverage.md`
 
+## UI 对齐
+
+Server Web UI 必须以 desktop 组件同源移植为准。正式实施计划见 `docs/server-desktop-ui-parity-plan.md`；人工验收见 `docs/manual-ui-checklist.md`。功能边界以 `docs/web-runtime-contract.json` 为准。
+
+本地-only 重构笔记（已 gitignore，不提交）：`UI_PARITY_PLAN.md`、`DESKTOP_ALIGNMENT_TASKS.md`、`SERVER_IMPLEMENTATION_PLAN.md`、`MIGRATION_LEDGER.md`、`docs/remaining-work-index.md`。
+
+同步 desktop 组件：
+
+```bash
+node scripts/sync-desktop-ui.mjs
+```
+
 ## 验证
 
 完成代码改动后优先运行：

@@ -1,0 +1,37 @@
+import type { Settings } from "@/types";
+
+/** Mirrors `default_ui_settings()` in `src/core/ui_settings.rs` for server web fallback. */
+export const SERVER_DEFAULT_SETTINGS: Settings = {
+  showInTray: false,
+  minimizeToTrayOnClose: false,
+  useAppWindowControls: false,
+  enableClaudePluginIntegration: false,
+  skipClaudeOnboarding: false,
+  launchOnStartup: false,
+  silentStartup: false,
+  enableLocalProxy: true,
+  proxyConfirmed: true,
+  usageConfirmed: true,
+  streamCheckConfirmed: true,
+  enableFailoverToggle: true,
+  preserveCodexOfficialAuthOnSwitch: false,
+  unifyCodexSessionHistory: false,
+  unifyCodexMigrateExisting: false,
+  failoverConfirmed: true,
+  firstRunNoticeConfirmed: true,
+  autoSyncConfirmed: true,
+  commonConfigConfirmed: false,
+  oauthQuotaRefreshIntervalMinutes: 30,
+  language: "zh",
+  visibleApps: {
+    claude: true,
+    "claude-desktop": false,
+    codex: true,
+    gemini: true,
+    opencode: false,
+    openclaw: false,
+    hermes: false,
+  },
+  backupIntervalHours: 24,
+  backupRetainCount: 10,
+};

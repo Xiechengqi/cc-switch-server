@@ -13,14 +13,21 @@
     "moduleResolution": "Bundler",
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "@tauri-apps/api/core": ["src/shims/tauri-apps/api/core.ts"],
+      "@tauri-apps/api/event": ["src/shims/tauri-apps/api/event.ts"],
+      "@tauri-apps/api/app": ["src/shims/tauri-apps/api/app.ts"],
+      "@tauri-apps/api/path": ["src/shims/tauri-apps/api/path.ts"],
+      "@tauri-apps/plugin-process": ["src/shims/tauri-apps/plugin-process.ts"],
+      "@tauri-apps/plugin-updater": ["src/shims/tauri-apps/plugin-updater.ts"]
     },
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "types": ["vite/client"]
+    "types": ["vite/client", "node"]
   },
   "include": ["src"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"],
   "references": []
 }

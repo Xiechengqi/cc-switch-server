@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use axum::body::{Body, Bytes};
@@ -43,13 +44,14 @@ use crate::core::email_auth::EmailAuthError;
 use crate::core::failover::{FailoverAppConfig, FailoverSnapshot, UpdateFailoverAppInput};
 use crate::core::health::ProviderHealth;
 use crate::core::kiro_device::KiroDeviceError;
+use crate::core::live_config_import;
 use crate::core::oauth_clients::{
     build_profile_request, build_refresh_request, oauth_provider_spec, token_expires_soon,
     upsert_input_from_login_response, OAuthAuthorizeFlow, OAuthHttpRequest, OAuthQuotaStrategy,
     OAuthSupportStage,
 };
 use crate::core::oauth_login::{
-    OAuthLoginError, OAuthLoginFinish, OAuthLoginStart, OAuthLoginStatus,
+    OAuthLoginError, OAuthLoginFinish, OAuthLoginStart, OAuthLoginStatus, OAuthSessionPollState,
 };
 use crate::core::pricing::{ModelPricingEntry, UpdateModelPricingInput};
 use crate::core::provider::{
@@ -67,6 +69,7 @@ use crate::core::shares::{
     Share, ShareAcl, ShareBinding, ShareMarketGrantStatus, ShareStore, ShareUpdateError,
     UpsertShareInput,
 };
+use crate::core::ui_settings;
 use crate::core::universal_providers::{
     provider_from_universal, universal_provider_presets, UniversalProvider,
     UniversalProviderPreset, UniversalProviderSyncResult,
@@ -124,6 +127,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/setup/status", get(setup_status))
         .route("/api/setup", post(setup))
         .route("/api/auth/login", post(login))
+        .route("/api/auth/password", put(change_password))
         .route(
             "/api/auth/email/request-code",
             post(request_email_login_code),
@@ -248,14 +252,6 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/shares/:id", delete(delete_share))
         .route("/api/shares/:id/connect-info", get(share_connect_info))
         .route("/api/shares/:id/subdomain", post(update_share_subdomain))
-        .route(
-            "/api/shares/:id/owner/request-code",
-            post(request_share_owner_change_code),
-        )
-        .route(
-            "/api/shares/:id/owner/verify-code",
-            post(verify_share_owner_change_code),
-        )
         .route("/api/shares/:id/pause", post(pause_share))
         .route("/api/shares/:id/resume", post(resume_share))
         .route("/api/shares/:id/tunnel/start", post(start_share_tunnel))
@@ -312,8 +308,15 @@ pub fn app_router(state: ServerState) -> Router {
         )
         .route(
             "/web-api/auth/email/verify-code",
-            post(verify_email_login_code),
+            post(web_verify_email_login_code),
         )
+        .route("/web-api/auth/methods", get(web_auth_methods))
+        .route("/web-api/auth/password/login", post(web_password_login))
+        .route("/web-api/auth/password/setup", post(web_password_setup))
+        .route("/web-api/auth/password/refresh", post(web_password_refresh))
+        .route("/web-api/auth/password/logout", post(web_password_logout))
+        .route("/web-api/auth/password/change", post(web_password_change))
+        .route("/web-api/auth/session/refresh", post(web_session_refresh))
         .route("/web-api/context", get(web_runtime_context))
         .route("/web-api/invoke/*command", post(web_invoke_compat))
         .route("/v1/models", get(proxy_models))
@@ -718,6 +721,148 @@ async fn verify_email_login_code(
     complete_email_login(&state, &input.email, &input.code).await
 }
 
+async fn web_verify_email_login_code(
+    State(state): State<ServerState>,
+    Json(input): Json<EmailLoginVerifyCodeRequest>,
+) -> Result<Json<crate::core::email_auth::RouterVerifyEmailCodeResponse>, ApiError> {
+    complete_client_web_email_login(&state, &input.email, &input.code).await
+}
+
+async fn complete_client_web_email_login(
+    state: &ServerState,
+    email: &str,
+    code: &str,
+) -> Result<Json<crate::core::email_auth::RouterVerifyEmailCodeResponse>, ApiError> {
+    let config = ensure_email_router_config(state).await?;
+    let email = require_configured_owner_email(&config, email)?;
+    let http_client = state.http_client().await;
+    let router_session =
+        crate::core::email_auth::verify_client_web_code(&http_client, &config, &email, code)
+            .await
+            .map_err(map_email_auth_error)?;
+    let verified_email = crate::core::email_auth::normalize_email(&router_session.user.email)
+        .map_err(map_email_auth_error)?;
+    if verified_email != email {
+        return Err(ApiError::unauthorized(
+            "verified email does not match configured owner email",
+        ));
+    }
+    let owner_binding = crate::core::email_auth::bind_owner_email(
+        &http_client,
+        &config,
+        &email,
+        &router_session.access_token,
+    )
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            crate::core::email_auth::humanize_remote_owner_binding_error(&error.message),
+        )
+    })?;
+    let bound_email = crate::core::email_auth::normalize_email(&owner_binding.owner_email)
+        .map_err(map_email_auth_error)?;
+    if !owner_binding.ok || bound_email != email {
+        return Err(ApiError::bad_gateway(
+            "router accepted email code but did not bind the configured owner email",
+        ));
+    }
+    let email_state = crate::core::email_auth::state_from_router_session(&config, &router_session)
+        .map_err(map_email_auth_error)?;
+    crate::core::email_auth::save_state(&state.config_dir, &email_state)
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(router_session))
+}
+
+async fn web_session_refresh(
+    State(state): State<ServerState>,
+    Json(input): Json<WebSessionRefreshRequest>,
+) -> Result<Json<crate::core::email_auth::RouterVerifyEmailCodeResponse>, ApiError> {
+    let config = ensure_email_router_config(&state).await?;
+    let http_client = state.http_client().await;
+    let response =
+        crate::core::email_auth::refresh_session(&http_client, &config, &input.refresh_token)
+            .await
+            .map_err(map_email_auth_error)?;
+    Ok(Json(response))
+}
+
+async fn web_auth_methods(
+    State(state): State<ServerState>,
+) -> Result<Json<crate::core::web_auth::AuthMethods>, ApiError> {
+    let config = state.config.read().await;
+    Ok(Json(crate::core::web_auth::auth_methods(&config)))
+}
+
+async fn web_password_login(
+    State(state): State<ServerState>,
+    Json(input): Json<WebPasswordRequest>,
+) -> Result<Json<crate::core::web_auth::PasswordLoginResponse>, ApiError> {
+    let config = state.config.read().await.clone();
+    state
+        .web_auth
+        .login(&config, &input.password)
+        .map(Json)
+        .map_err(map_web_auth_error)
+}
+
+async fn web_password_setup(
+    State(state): State<ServerState>,
+    Json(input): Json<WebPasswordRequest>,
+) -> Result<Json<crate::core::web_auth::PasswordLoginResponse>, ApiError> {
+    let mut config = state.config.read().await.clone();
+    let response = state
+        .web_auth
+        .setup_password(&mut config, &input.password)
+        .map_err(map_web_auth_error)?;
+    state
+        .replace_config(config)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(response))
+}
+
+async fn web_password_refresh(
+    State(state): State<ServerState>,
+    Json(input): Json<WebSessionRefreshRequest>,
+) -> Result<Json<crate::core::web_auth::PasswordLoginResponse>, ApiError> {
+    state
+        .web_auth
+        .refresh(&input.refresh_token)
+        .map(Json)
+        .map_err(map_web_auth_error)
+}
+
+async fn web_password_logout(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let token = bearer_token(&headers)
+        .ok_or_else(|| ApiError::unauthorized("authorization bearer token is required"))?;
+    state.web_auth.logout(token).map_err(map_web_auth_error)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn web_password_change(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<WebPasswordChangeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_web_admin_session(&state, &headers).await?;
+    let mut config = state.config.read().await.clone();
+    state
+        .web_auth
+        .change_password(&mut config, &input.current_password, &input.new_password)
+        .map_err(map_web_auth_error)?;
+    state
+        .replace_config(config)
+        .await
+        .map_err(ApiError::internal)?;
+    state.sessions.write().await.clear();
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn complete_email_login(
     state: &ServerState,
     email: &str,
@@ -833,6 +978,28 @@ async fn issue_login_response(state: &ServerState) -> LoginResponse {
         token,
         token_type: "bearer",
     }
+}
+
+async fn change_password(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ChangePasswordRequest>,
+) -> Result<Json<ChangePasswordResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let mut config = state.config.read().await.clone();
+    config
+        .set_password(&input.new_password)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    state
+        .replace_config(config)
+        .await
+        .map_err(ApiError::internal)?;
+    state.sessions.write().await.clear();
+    state
+        .web_auth
+        .revoke_all_sessions()
+        .map_err(ApiError::internal)?;
+    Ok(Json(ChangePasswordResponse { ok: true }))
 }
 
 async fn rotate_api_token(
@@ -3300,23 +3467,6 @@ async fn upsert_share(
     if input.owner_email.is_none() {
         input.owner_email = state.config.read().await.owner.email.clone();
     }
-    if let Some(id) = input.id.as_deref() {
-        let existing_owner = {
-            let shares = state.shares.read().await;
-            shares.get(id).and_then(|share| share.owner_email.clone())
-        };
-        if let Some(existing_owner) = existing_owner {
-            if let Some(next_owner) = input.owner_email.as_deref() {
-                let next_owner = crate::core::email_auth::normalize_email(next_owner)
-                    .map_err(map_email_auth_error)?;
-                if !existing_owner.eq_ignore_ascii_case(&next_owner) {
-                    return Err(ApiError::conflict(
-                        "share ownerEmail changes require the owner verification endpoint",
-                    ));
-                }
-            }
-        }
-    }
     let share = {
         let mut store = state.shares.write().await;
         store.upsert(input)
@@ -3394,77 +3544,6 @@ async fn update_share_subdomain(
         remote_claimed,
         share,
     }))
-}
-
-async fn request_share_owner_change_code(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(input): Json<ShareOwnerChangeCodeRequest>,
-) -> Result<Json<crate::core::email_auth::EmailCodeRequestResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let config = ensure_email_router_config(&state).await?;
-    let new_owner_email = crate::core::email_auth::normalize_email(&input.new_owner_email)
-        .map_err(map_email_auth_error)?;
-    let share = state
-        .shares
-        .read()
-        .await
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("share not found"))?;
-    if share
-        .owner_email
-        .as_deref()
-        .is_some_and(|owner| owner.eq_ignore_ascii_case(&new_owner_email))
-    {
-        return Err(ApiError::conflict(
-            "new owner email is the same as the current owner",
-        ));
-    }
-    let http_client = state.http_client().await;
-    let response = crate::core::email_auth::request_code(&http_client, &config, &new_owner_email)
-        .await
-        .map_err(map_email_auth_error)?;
-    Ok(Json(response))
-}
-
-async fn verify_share_owner_change_code(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(input): Json<ShareOwnerChangeVerifyRequest>,
-) -> Result<Json<UpsertShareResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let config = ensure_email_router_config(&state).await?;
-    let new_owner_email = crate::core::email_auth::normalize_email(&input.new_owner_email)
-        .map_err(map_email_auth_error)?;
-    let http_client = state.http_client().await;
-    let router_session = crate::core::email_auth::verify_client_web_code(
-        &http_client,
-        &config,
-        &new_owner_email,
-        &input.code,
-    )
-    .await
-    .map_err(map_email_auth_error)?;
-    let verified_email = crate::core::email_auth::normalize_email(&router_session.user.email)
-        .map_err(map_email_auth_error)?;
-    if verified_email != new_owner_email {
-        return Err(ApiError::unauthorized(
-            "verified email does not match requested owner email",
-        ));
-    }
-    let share = state
-        .shares
-        .write()
-        .await
-        .transfer_owner_verified(&id, new_owner_email)
-        .map_err(map_share_patch_error)?;
-    state.save_shares().await.map_err(ApiError::internal)?;
-    spawn_share_upsert_sync(state.clone(), share.clone());
-    emit_share_event(&state, "share.changed", &share, "owner_transferred");
-    Ok(Json(UpsertShareResponse { ok: true, share }))
 }
 
 async fn delete_share(
@@ -4247,7 +4326,13 @@ async fn web_runtime_context(
         })));
     }
 
-    require_session(&state, &headers).await?;
+    if resolve_web_admin_principal(&state, &headers)
+        .await?
+        .is_none()
+    {
+        return Ok(Json(web_runtime_auth_required_payload(&config, &contract)));
+    }
+
     Ok(Json(json!({
         "mode": "local-admin",
         "appMode": "server",
@@ -4259,7 +4344,7 @@ async fn web_runtime_context(
             "authenticated": true,
             "setupRequired": false,
             "ownerEmail": config.owner.email,
-            "methods": ["password", "apiToken", "email"]
+            "methods": web_runtime_auth_methods(&config)
         },
         "router": {
             "url": config.router.url,
@@ -4317,6 +4402,105 @@ async fn web_invoke_compat(
         .map(Json)
 }
 
+fn web_provider_health_json(
+    app: AppKind,
+    provider_id: &str,
+    breaker: Option<&crate::core::failover::ProviderBreaker>,
+) -> Value {
+    let breaker = breaker
+        .cloned()
+        .unwrap_or_else(|| crate::core::failover::ProviderBreaker::new(app, provider_id));
+    let is_healthy = breaker.state == crate::core::failover::BreakerState::Closed;
+    json!({
+        "provider_id": provider_id,
+        "app_type": app.as_str(),
+        "is_healthy": is_healthy,
+        "consecutive_failures": breaker.consecutive_failures,
+        "last_success_at": breaker.last_success_at_ms.map(|value| value.to_string()),
+        "last_failure_at": breaker.last_failure_at_ms.map(|value| value.to_string()),
+        "last_error": breaker.last_error,
+        "updated_at": breaker.last_success_at_ms
+            .or(breaker.last_failure_at_ms)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+    })
+}
+
+fn web_circuit_breaker_stats_json(
+    breaker: Option<&crate::core::failover::ProviderBreaker>,
+) -> Value {
+    let Some(breaker) = breaker else {
+        return json!({
+            "state": "closed",
+            "consecutiveFailures": 0,
+            "consecutiveSuccesses": 0,
+            "totalRequests": 0,
+            "failedRequests": 0,
+        });
+    };
+    let state = match breaker.state {
+        crate::core::failover::BreakerState::Closed => "closed",
+        crate::core::failover::BreakerState::Open => "open",
+        crate::core::failover::BreakerState::HalfOpen => "half_open",
+    };
+    json!({
+        "state": state,
+        "consecutiveFailures": breaker.consecutive_failures,
+        "consecutiveSuccesses": 0,
+        "totalRequests": breaker.consecutive_failures,
+        "failedRequests": breaker.consecutive_failures,
+    })
+}
+
+async fn web_update_proxy_config_for_app(
+    state: &ServerState,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let config: Value = web_arg_value(args, "config")?;
+    let app = config
+        .get("appType")
+        .or_else(|| config.get("app_type"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("config.appType is required"))?;
+    let app = parse_app_kind(app)?;
+    {
+        let mut store = state.ui_settings.write().await;
+        let mut proxy_app_configs = store
+            .value
+            .get("proxyAppConfigs")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if let Some(map) = proxy_app_configs.as_object_mut() {
+            map.insert(app.as_str().to_string(), config.clone());
+        }
+        store.apply_patch(json!({ "proxyAppConfigs": proxy_app_configs }));
+    }
+    state.save_ui_settings().await.map_err(ApiError::internal)?;
+
+    let failure_threshold = config
+        .get("circuitFailureThreshold")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32);
+    let timeout_seconds = config.get("circuitTimeoutSeconds").and_then(Value::as_u64);
+    let auto_enabled = config.get("autoFailoverEnabled").and_then(Value::as_bool);
+    let providers = state.providers.read().await.clone();
+    {
+        let mut failover = state.failover.write().await;
+        failover.update_app_config(
+            app,
+            UpdateFailoverAppInput {
+                enabled: auto_enabled,
+                failure_threshold,
+                open_duration_ms: timeout_seconds.map(|seconds| (seconds * 1000) as u128),
+                ..Default::default()
+            },
+            &providers,
+        );
+    }
+    state.save_failover().await.map_err(ApiError::internal)?;
+    Ok(json!(true))
+}
+
 async fn web_invoke_dispatch(
     state: &ServerState,
     headers: &HeaderMap,
@@ -4326,31 +4510,166 @@ async fn web_invoke_dispatch(
     match command {
         "get_build_info" => Ok(json!(build_info())),
         "get_settings" => {
-            let config = state.config.read().await;
-            Ok(json!({
-                "server": ConfigSnapshotResponse::from_config(&config),
-                "webRuntime": web_runtime::contract()
-            }))
+            let settings = state.ui_settings.read().await.for_frontend();
+            Ok(settings)
         }
-        "get_global_proxy_config" => {
+        "get_rectifier_config" => {
+            let store = state.ui_settings.read().await;
+            Ok(ui_settings::rectifier_config_for_frontend(&store))
+        }
+        "get_optimizer_config" => {
+            let store = state.ui_settings.read().await;
+            Ok(ui_settings::optimizer_config_for_frontend(&store))
+        }
+        "set_rectifier_config" => {
+            let config: Value = web_arg_value(&args, "config")?;
+            {
+                let mut store = state.ui_settings.write().await;
+                store.apply_patch(json!({ "rectifierConfig": config }));
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(json!(true))
+        }
+        "set_optimizer_config" => {
+            let config: Value = web_arg_value(&args, "config")?;
+            {
+                let mut store = state.ui_settings.write().await;
+                store.apply_patch(json!({ "optimizerConfig": config }));
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(json!(true))
+        }
+        "get_log_config" => {
+            let store = state.ui_settings.read().await;
+            Ok(ui_settings::log_config_for_frontend(&store))
+        }
+        "set_log_config" => {
+            let config: Value = web_arg_value(&args, "config")?;
+            {
+                let mut store = state.ui_settings.write().await;
+                store.apply_patch(json!({ "logConfig": config }));
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(json!(true))
+        }
+        "get_stream_check_config" => {
+            let store = state.ui_settings.read().await;
+            Ok(ui_settings::stream_check_config_for_frontend(&store))
+        }
+        "save_stream_check_config" => {
+            let config: Value = web_arg_value(&args, "config")?;
+            {
+                let mut store = state.ui_settings.write().await;
+                store.apply_patch(json!({ "streamCheckConfig": config }));
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(json!(true))
+        }
+        "save_settings" => {
+            let patch =
+                ui_settings::settings_patch_from_args(&args).map_err(ApiError::bad_request)?;
+            {
+                let mut store = state.ui_settings.write().await;
+                store.apply_patch(patch);
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(json!(true))
+        }
+        "get_global_proxy_config" => Ok(json!(web_global_proxy_config_json(state))),
+        "get_global_proxy_url" => {
             let config = state.config.read().await;
-            Ok(json!(UpstreamProxyView::from_config(&config)))
+            Ok(json!(config.upstream_proxy.url))
+        }
+        "get_upstream_proxy_status" => Ok(json!(web_upstream_proxy_status_json(state).await)),
+        "set_global_proxy_url" => {
+            let url = web_optional_string_any(&args, &["url", "proxyUrl", "proxy_url"])
+                .unwrap_or_default();
+            let mut config = state.config.read().await.clone();
+            let input = if url.trim().is_empty() {
+                UpdateUpstreamProxyInput {
+                    url: None,
+                    clear: Some(true),
+                    follow_system_proxy: None,
+                }
+            } else {
+                UpdateUpstreamProxyInput {
+                    url: Some(url),
+                    clear: None,
+                    follow_system_proxy: None,
+                }
+            };
+            config
+                .update_upstream_proxy(input)
+                .map_err(ApiError::bad_request)?;
+            state
+                .replace_config(config)
+                .await
+                .map_err(ApiError::internal)?;
+            Ok(Value::Null)
+        }
+        "test_proxy_url" => {
+            let url = web_arg_string_any(&args, &["url", "proxyUrl"])?;
+            Ok(json!(web_test_proxy_url(&url).await))
+        }
+        "scan_local_proxies" => Ok(json!(web_scan_local_proxies().await)),
+        "is_portable_mode" => Ok(json!(false)),
+        "get_app_config_dir_override" => Ok(json!(null)),
+        "get_app_config_path" => Ok(json!(state.config_dir.display().to_string())),
+        "get_config_dir" => {
+            let _app = web_arg_app(&args).or_else(|_| web_arg_app_type(&args))?;
+            Ok(json!(""))
         }
         "get_providers" => {
-            let app = web_arg_app(&args)?;
+            let app = match web_arg_app_for_read(&args)? {
+                Some(app) => app,
+                None => return Ok(json!({})),
+            };
             let providers = state.providers.read().await;
             Ok(json!(provider_record_for_app(&providers.providers, app)))
         }
         "get_current_provider" => {
-            let app = web_arg_app(&args)?;
+            let app = match web_arg_app_for_read(&args)? {
+                Some(app) => app,
+                None => return Ok(json!("")),
+            };
             let providers = state.providers.read().await;
-            let current = providers
-                .providers
-                .iter()
-                .find(|provider| provider.app == app)
-                .map(|provider| provider.provider.id.clone())
+            let ui_settings = state.ui_settings.read().await.for_frontend();
+            let current = live_config_import::read_current_provider_id(&ui_settings, app)
+                .filter(|id| {
+                    providers
+                        .providers
+                        .iter()
+                        .any(|provider| provider.app == app && provider.provider.id == *id)
+                })
+                .or_else(|| {
+                    providers
+                        .list(Some(app))
+                        .into_iter()
+                        .next()
+                        .map(|provider| provider.provider.id)
+                })
                 .unwrap_or_default();
             Ok(json!(current))
+        }
+        "import_default_config" => {
+            let app = web_arg_app(&args).or_else(|_| web_arg_app_type(&args))?;
+            let ui_settings = state.ui_settings.read().await.for_frontend();
+            let imported = {
+                let mut providers = state.providers.write().await;
+                live_config_import::import_default_config(&mut providers, app, &ui_settings)
+                    .map_err(|error| ApiError::bad_request(error.to_string()))?
+            };
+            if imported {
+                {
+                    let mut ui_store = state.ui_settings.write().await;
+                    ui_store.apply_patch(json!({
+                        live_config_import::current_provider_settings_key(app): "default"
+                    }));
+                }
+                state.save_providers().await.map_err(ApiError::internal)?;
+                state.save_ui_settings().await.map_err(ApiError::internal)?;
+            }
+            Ok(json!(imported))
         }
         "add_provider" | "update_provider" => {
             let app = web_arg_app(&args)?;
@@ -4404,19 +4723,22 @@ async fn web_invoke_dispatch(
             if !exists {
                 return Err(ApiError::not_found("provider not found"));
             }
+            {
+                let mut ui_store = state.ui_settings.write().await;
+                ui_store.apply_patch(json!({
+                    live_config_import::current_provider_settings_key(app): id
+                }));
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
             Ok(json!({ "warnings": [] }))
         }
         "get_provider_health" => {
-            let usage = state.usage.read().await.clone();
-            let providers = state
-                .providers
-                .read()
-                .await
-                .providers
-                .iter()
-                .map(|provider| crate::core::health::provider_health(provider, &usage))
-                .collect::<Vec<_>>();
-            Ok(json!(providers))
+            let app = web_arg_app_type(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
+            let failover = state.failover.read().await;
+            let key = format!("{}:{provider_id}", app.as_str());
+            let breaker = failover.breakers.get(&key);
+            Ok(json!(web_provider_health_json(app, &provider_id, breaker)))
         }
         "get_universal_providers" => {
             let providers = state.universal_providers.read().await.providers.clone();
@@ -4535,6 +4857,14 @@ async fn web_invoke_dispatch(
             let share = web_update_share_acl(state, &args).await?;
             Ok(json!(share))
         }
+        "update_share_owner_email" => {
+            let share = web_update_share_owner_email(state, headers, &args).await?;
+            Ok(json!(share))
+        }
+        "transfer_share_owner" => {
+            let share = web_transfer_share_owner(state, headers, &args).await?;
+            Ok(json!(share))
+        }
         "authorize_share_market" => {
             let id = web_arg_share_id(&args)?;
             let value = web_payload(&args, &["params", "input"]);
@@ -4572,17 +4902,13 @@ async fn web_invoke_dispatch(
                 .0;
             Ok(json!(response.tunnels))
         }
-        "get_client_tunnel" | "get_client_tunnel_status" => {
-            let config = state.config.read().await;
-            Ok(json!({
-                "tunnelSubdomain": config.client.tunnel_subdomain,
-                "tunnelStatus": config.client.tunnel_status,
-                "lastHeartbeatMs": config.client.last_heartbeat_ms,
-                "runtimeStatus": state
-                    .tunnels
-                    .status(&crate::core::tunnel::client_tunnel_key())
-                    .await
-            }))
+        "get_client_tunnel" => Ok(web_client_tunnel_state(state).await),
+        "get_client_tunnel_status" => {
+            let runtime = state
+                .tunnels
+                .status(&crate::core::tunnel::client_tunnel_key())
+                .await;
+            Ok(web_client_tunnel_share_status(runtime))
         }
         "claim_client_tunnel" => {
             if web_has_payload(&args) {
@@ -4590,17 +4916,14 @@ async fn web_invoke_dispatch(
                 let _ = update_client_tunnel(State(state.clone()), headers.clone(), Json(input))
                     .await?;
             }
-            let response = claim_client_tunnel(State(state.clone()), headers.clone())
-                .await?
-                .0;
-            Ok(json!(response))
+            let _ = claim_client_tunnel(State(state.clone()), headers.clone()).await?;
+            Ok(web_client_tunnel_state(state).await)
         }
         "update_client_tunnel" => {
             let input = web_client_tunnel_input(&args)?;
-            let response = update_client_tunnel(State(state.clone()), headers.clone(), Json(input))
-                .await?
-                .0;
-            Ok(json!(response))
+            let _ =
+                update_client_tunnel(State(state.clone()), headers.clone(), Json(input)).await?;
+            Ok(web_client_tunnel_state(state).await)
         }
         "start_client_tunnel" => {
             let response = issue_client_tunnel_lease(State(state.clone()), headers.clone())
@@ -4615,9 +4938,16 @@ async fn web_invoke_dispatch(
             Ok(json!(response))
         }
         "get_usage_summary" => {
+            let filter = web_usage_stats_filter_from_args(&args);
             let usage = state.usage.read().await;
-            Ok(json!(usage.rollup_filtered(&UsageStatsFilter::default())))
+            Ok(json!(usage.rollup_filtered(&filter)))
         }
+        "get_usage_summary_by_app" => {
+            let filter = web_usage_stats_filter_from_args(&args);
+            let usage = state.usage.read().await;
+            Ok(json!(usage.summary_by_app(&filter)))
+        }
+        "get_installed_skills" => Ok(json!([])),
         "get_usage_trends" => {
             let usage = state.usage.read().await;
             let filter = UsageStatsFilter {
@@ -4647,12 +4977,17 @@ async fn web_invoke_dispatch(
             let log = usage.logs.iter().find(|log| log.request_id == id).cloned();
             Ok(json!(log))
         }
-        "get_proxy_status" => Ok(json!({
-            "running": true,
-            "status": "running",
-            "mode": "server",
-            "baseUrl": format!("http://{}", state.bind_addr)
-        })),
+        "get_proxy_config_for_app" => {
+            let app = web_arg_app_type(&args)?;
+            Ok(json!(web_app_proxy_config_json(state, app).await))
+        }
+        "get_available_providers_for_failover" => {
+            let app = web_arg_app_type(&args)?;
+            Ok(json!(
+                web_available_providers_for_failover(state, app).await
+            ))
+        }
+        "get_proxy_status" => Ok(json!(web_proxy_status_json(state))),
         "get_proxy_takeover_status" => Ok(json!({
             "claude": false,
             "codex": false,
@@ -4670,7 +5005,9 @@ async fn web_invoke_dispatch(
         }
         "list_db_backups" => {
             let response = list_backups(State(state.clone()), headers.clone()).await?.0;
-            Ok(json!(response.backups))
+            Ok(json!(crate::core::backup::backup_entries_for_frontend(
+                &response.backups
+            )))
         }
         "create_db_backup" => {
             let body = web_create_backup_request(&args)?;
@@ -4685,6 +5022,106 @@ async fn web_invoke_dispatch(
                 .await?
                 .0;
             Ok(json!(response.result))
+        }
+        "get_auto_failover_enabled" => {
+            let app = web_arg_app_type(&args)?;
+            let failover = state.failover.read().await;
+            let enabled = failover
+                .apps
+                .get(&app)
+                .map(|config| config.enabled)
+                .unwrap_or(false);
+            Ok(json!(enabled))
+        }
+        "get_failover_queue" => {
+            let app = web_arg_app_type(&args)?;
+            let failover = state.failover.read().await;
+            let providers = state.providers.read().await;
+            let queue = failover
+                .apps
+                .get(&app)
+                .map(|config| config.provider_queue.as_slice())
+                .unwrap_or(&[]);
+            let items = queue
+                .iter()
+                .enumerate()
+                .map(|(index, provider_id)| {
+                    let stored = providers.providers.iter().find(|provider| {
+                        provider.app == app && provider.provider.id == *provider_id
+                    });
+                    json!({
+                        "providerId": provider_id,
+                        "providerName": stored
+                            .map(|provider| provider.provider.name.clone())
+                            .unwrap_or_else(|| provider_id.clone()),
+                        "sortIndex": index,
+                        "providerNotes": stored.and_then(|provider| {
+                            provider_extra_string(&provider.provider, "notes")
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!(items))
+        }
+        "deepseek_account_status" => {
+            let accounts = state.accounts.read().await;
+            let deepseek_accounts = accounts
+                .accounts
+                .iter()
+                .filter(|account| account.provider_type == ProviderType::DeepSeekAccount)
+                .collect::<Vec<_>>();
+            let default_account_id = deepseek_accounts.first().map(|account| account.id.clone());
+            let authenticated = deepseek_accounts
+                .iter()
+                .any(|account| account_is_authenticated(account));
+            let mapped_accounts = deepseek_accounts
+                .iter()
+                .enumerate()
+                .map(|(index, account)| {
+                    json!({
+                        "id": account.id,
+                        "login": account.email.clone().unwrap_or_else(|| account.id.clone()),
+                        "authenticated_at": account_authenticated_at(account),
+                        "is_default": default_account_id
+                            .as_deref()
+                            .map(|id| id == account.id)
+                            .unwrap_or(index == 0),
+                        "has_password": true
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "authenticated": authenticated,
+                "default_account_id": default_account_id,
+                "accounts": mapped_accounts
+            }))
+        }
+        "auth_get_status" => {
+            let provider_type = web_auth_provider_type(&args)?;
+            let provider_label = managed_auth_provider_label(provider_type);
+            let accounts = state.accounts.read().await;
+            let matching = accounts
+                .accounts
+                .iter()
+                .filter(|account| account.provider_type == provider_type)
+                .collect::<Vec<_>>();
+            let default_account_id = matching.first().map(|account| account.id.clone());
+            let authenticated = matching
+                .iter()
+                .any(|account| account_is_authenticated(account));
+            let mapped_accounts = matching
+                .iter()
+                .map(|account| {
+                    map_managed_auth_account(account, provider_label, default_account_id.as_deref())
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "provider": provider_label,
+                "authenticated": authenticated,
+                "default_account_id": default_account_id,
+                "migration_error": Value::Null,
+                "accounts": mapped_accounts
+            }))
         }
         "auth_list_accounts" => {
             let provider_type = web_optional_auth_provider_type(&args)?;
@@ -4704,24 +5141,21 @@ async fn web_invoke_dispatch(
             Ok(json!(accounts))
         }
         "auth_start_login" => {
-            let provider_type = web_auth_provider_type(&args)?;
-            let redirect_uri = web_optional_string_any(
-                &args,
-                &["redirectUri", "redirect_uri", "codexCallbackUrl"],
-            );
-            let response = start_account_login(
-                State(state.clone()),
-                headers.clone(),
-                Json(StartAccountLoginRequest {
-                    provider_type,
-                    redirect_uri,
-                }),
-            )
-            .await?
-            .0;
-            Ok(json!(response.login))
+            web_managed_auth_start_login(state.clone(), headers.clone(), &args).await
         }
+        "auth_poll_for_account" => {
+            web_managed_auth_poll_for_account(state.clone(), headers.clone(), &args).await
+        }
+        "auth_remove_account" => {
+            web_managed_auth_remove_account(state.clone(), headers.clone(), &args).await
+        }
+        "auth_set_default_account" => {
+            web_managed_auth_set_default_account(state.clone(), headers.clone(), &args).await
+        }
+        "auth_logout" => web_managed_auth_logout(state.clone(), headers.clone(), &args).await,
         "auth_submit_oauth_code" => {
+            let provider_type = web_auth_provider_type(&args)?;
+            let provider_label = managed_auth_provider_label(provider_type);
             let session_id = web_optional_string_any(&args, &["sessionId", "session_id"]);
             let state_arg = web_optional_string_any(&args, &["state"]).or_else(|| {
                 session_id
@@ -4742,7 +5176,14 @@ async fn web_invoke_dispatch(
             )
             .await?
             .0;
-            Ok(json!(response))
+            let account_id = response
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway("oauth code exchange did not import account")
+                })?;
+            web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }
         "refresh_oauth_quota" => {
             let account_id = web_resolve_account_id(state, &args).await?;
@@ -4822,10 +5263,937 @@ async fn web_invoke_dispatch(
             .0;
             Ok(json!(response))
         }
+        "start_proxy_server" => Ok(json!({
+            "address": state.bind_addr.ip().to_string(),
+            "port": state.bind_addr.port(),
+        })),
+        "stop_proxy_server" | "stop_proxy_with_restore" => Ok(json!(true)),
+        "set_proxy_takeover_for_app" => Ok(json!(true)),
+        "switch_proxy_provider" => {
+            let app = web_arg_app_type(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
+            let exists = state
+                .providers
+                .read()
+                .await
+                .providers
+                .iter()
+                .any(|provider| provider.app == app && provider.provider.id == provider_id);
+            if !exists {
+                return Err(ApiError::not_found("provider not found"));
+            }
+            Ok(json!(true))
+        }
+        "get_proxy_config" => Ok(json!(web_global_proxy_config_json(state))),
+        "update_proxy_config" => {
+            let listen_address =
+                web_optional_string_any(&args, &["listenAddress", "listen_address", "address"]);
+            let listen_port = args
+                .get("listenPort")
+                .or_else(|| args.get("listen_port"))
+                .or_else(|| args.get("port"))
+                .and_then(|value| value.as_u64().map(|port| port as u16));
+            if listen_address.is_some() || listen_port.is_some() {
+                let mut patch = serde_json::Map::new();
+                let mut proxy_patch = serde_json::Map::new();
+                if let Some(address) = listen_address {
+                    proxy_patch.insert("listenAddress".to_string(), json!(address));
+                }
+                if let Some(port) = listen_port {
+                    proxy_patch.insert("listenPort".to_string(), json!(port));
+                }
+                patch.insert("proxyRuntimeConfig".to_string(), Value::Object(proxy_patch));
+                {
+                    let mut store = state.ui_settings.write().await;
+                    store.apply_patch(Value::Object(patch));
+                }
+                state.save_ui_settings().await.map_err(ApiError::internal)?;
+            }
+            Ok(json!(true))
+        }
+        "update_proxy_config_for_app" => web_update_proxy_config_for_app(state, &args).await,
+        "add_to_failover_queue" => {
+            let app = web_arg_app_type(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
+            let providers = state.providers.read().await.clone();
+            let config = {
+                let mut failover = state.failover.write().await;
+                let mut queue = failover
+                    .apps
+                    .get(&app)
+                    .map(|config| config.provider_queue.clone())
+                    .unwrap_or_default();
+                if !queue.iter().any(|id| id == &provider_id) {
+                    queue.push(provider_id);
+                }
+                failover.update_app_config(
+                    app,
+                    UpdateFailoverAppInput {
+                        provider_queue: Some(queue),
+                        ..Default::default()
+                    },
+                    &providers,
+                )
+            };
+            state.save_failover().await.map_err(ApiError::internal)?;
+            Ok(json!(config.enabled))
+        }
+        "remove_from_failover_queue" => {
+            let app = web_arg_app_type(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
+            let providers = state.providers.read().await.clone();
+            let config = {
+                let mut failover = state.failover.write().await;
+                let queue = failover
+                    .apps
+                    .get(&app)
+                    .map(|config| {
+                        config
+                            .provider_queue
+                            .iter()
+                            .filter(|id| **id != provider_id)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                failover.update_app_config(
+                    app,
+                    UpdateFailoverAppInput {
+                        provider_queue: Some(queue),
+                        ..Default::default()
+                    },
+                    &providers,
+                )
+            };
+            state.save_failover().await.map_err(ApiError::internal)?;
+            Ok(json!(config.enabled))
+        }
+        "set_auto_failover_enabled" => {
+            let app = web_arg_app_type(&args)?;
+            let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            let providers = state.providers.read().await.clone();
+            let config = {
+                let mut failover = state.failover.write().await;
+                failover.update_app_config(
+                    app,
+                    UpdateFailoverAppInput {
+                        enabled: Some(enabled),
+                        ..Default::default()
+                    },
+                    &providers,
+                )
+            };
+            state.save_failover().await.map_err(ApiError::internal)?;
+            Ok(json!(config.enabled))
+        }
+        "get_circuit_breaker_config" => {
+            let failover = state.failover.read().await;
+            let app = web_arg_app_type(&args).unwrap_or(AppKind::Claude);
+            let config = failover.apps.get(&app).cloned().unwrap_or_default();
+            Ok(json!({
+                "failureThreshold": config.failure_threshold,
+                "successThreshold": 2,
+                "timeoutSeconds": (config.open_duration_ms / 1000).max(1),
+                "errorRateThreshold": 0.5,
+                "minRequests": 10,
+            }))
+        }
+        "update_circuit_breaker_config" => {
+            let config: Value = web_arg_value(&args, "config")?;
+            let app = web_arg_app_type(&args).unwrap_or(AppKind::Claude);
+            let providers = state.providers.read().await.clone();
+            let failure_threshold = config
+                .get("failureThreshold")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+            let timeout_seconds = config.get("timeoutSeconds").and_then(Value::as_u64);
+            let updated = {
+                let mut failover = state.failover.write().await;
+                failover.update_app_config(
+                    app,
+                    UpdateFailoverAppInput {
+                        failure_threshold,
+                        open_duration_ms: timeout_seconds.map(|seconds| (seconds * 1000) as u128),
+                        ..Default::default()
+                    },
+                    &providers,
+                )
+            };
+            state.save_failover().await.map_err(ApiError::internal)?;
+            Ok(json!({
+                "failureThreshold": updated.failure_threshold,
+                "successThreshold": 2,
+                "timeoutSeconds": (updated.open_duration_ms / 1000).max(1),
+                "errorRateThreshold": 0.5,
+                "minRequests": 10,
+            }))
+        }
+        "get_circuit_breaker_stats" => {
+            let app = web_arg_app_type(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
+            let failover = state.failover.read().await;
+            let key = format!("{}:{}", app.as_str(), provider_id);
+            let breaker = failover.breakers.get(&key);
+            Ok(json!(web_circuit_breaker_stats_json(breaker)))
+        }
+        "reset_circuit_breaker" => {
+            let app = web_arg_app_type(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
+            let breaker = {
+                let mut failover = state.failover.write().await;
+                failover.reset_provider(app, &provider_id)
+            };
+            state.save_failover().await.map_err(ApiError::internal)?;
+            Ok(json!(web_circuit_breaker_stats_json(Some(&breaker))))
+        }
+        "delete_db_backup" => {
+            let id = web_arg_string_any(&args, &["filename", "id", "backupId"])?;
+            crate::core::backup::delete_backup(&state.config_dir, &id)
+                .map_err(ApiError::bad_request)?;
+            Ok(Value::Null)
+        }
+        "rename_db_backup" => {
+            let id = web_arg_string_any(&args, &["oldFilename", "filename", "id"])?;
+            let new_name = web_arg_string_any(&args, &["newName", "new_name"])?;
+            let manifest = crate::core::backup::rename_backup(&state.config_dir, &id, &new_name)
+                .map_err(ApiError::bad_request)?;
+            Ok(json!(manifest.id))
+        }
+        "export_config_to_file" => {
+            let bundle = crate::core::config_transfer::export_config_bundle(&state.config_dir)
+                .map_err(ApiError::internal)?;
+            let encoded = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                serde_json::to_vec(&bundle).map_err(ApiError::internal)?,
+            );
+            let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+            Ok(json!({
+                "success": true,
+                "message": "config exported",
+                "fileName": format!("cc-switch-server-export-{stamp}.json"),
+                "contentBase64": encoded,
+            }))
+        }
+        "import_config_from_file" => {
+            if let Some(encoded) =
+                web_optional_string_any(&args, &["contentBase64", "content_base64", "fileContent"])
+            {
+                let backup_id = crate::core::config_transfer::import_config_bundle_from_base64(
+                    &state.config_dir,
+                    &encoded,
+                )
+                .map_err(ApiError::bad_request)?;
+                state
+                    .reload_persistent_stores()
+                    .await
+                    .map_err(ApiError::internal)?;
+                return Ok(json!({
+                    "success": true,
+                    "message": "config imported",
+                    "backupId": backup_id,
+                }));
+            }
+            Err(ApiError::bad_request(
+                "import requires contentBase64 payload on server web runtime",
+            ))
+        }
+        "open_file_dialog" | "save_file_dialog" | "pick_directory" => Ok(Value::Null),
+        "open_external" => Ok(json!(true)),
+        "open_config_folder" | "open_app_config_folder" => Ok(json!(true)),
+        "restart_app" | "check_for_updates" | "install_update_and_restart" | "update_tray_menu" => {
+            Ok(json!(true))
+        }
+        "has_codex_unify_history_backup" => Ok(json!(false)),
+        "restore_codex_unified_history" => Ok(json!({
+            "restoredJsonlFiles": 0,
+            "restoredStateRows": 0,
+            "skippedReason": "not_supported_on_server",
+        })),
+        "get_model_pricing" => {
+            let response = list_model_pricing(State(state.clone()), headers.clone())
+                .await?
+                .0;
+            Ok(json!(response.models))
+        }
+        "update_model_pricing" => {
+            let model_id = web_arg_string_any(&args, &["modelId", "model_id"])?;
+            let input = UpdateModelPricingInput {
+                model_id: Some(model_id.clone()),
+                display_name: web_arg_string_any(&args, &["displayName", "display_name"])?,
+                input_cost_per_million: web_arg_string_any(&args, &["inputCost", "input_cost"])?,
+                output_cost_per_million: web_arg_string_any(&args, &["outputCost", "output_cost"])?,
+                cache_read_cost_per_million: web_arg_string_any(
+                    &args,
+                    &["cacheReadCost", "cache_read_cost"],
+                )?,
+                cache_creation_cost_per_million: web_arg_string_any(
+                    &args,
+                    &["cacheCreationCost", "cache_creation_cost"],
+                )?,
+            };
+            let response = upsert_model_pricing(State(state.clone()), headers.clone(), Json(input))
+                .await?
+                .0;
+            Ok(json!(response.model))
+        }
+        "delete_model_pricing" => {
+            let model_id = web_arg_string_any(&args, &["modelId", "model_id"])?;
+            delete_model_pricing(State(state.clone()), headers.clone(), Path(model_id)).await?;
+            Ok(Value::Null)
+        }
+        "get_pricing_model_source" => {
+            let store = state.ui_settings.read().await;
+            let source = store
+                .value
+                .get("pricingModelSource")
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({
+                        "claude": "response",
+                        "codex": "response",
+                        "gemini": "response",
+                    })
+                });
+            Ok(source)
+        }
+        "set_pricing_model_source" => {
+            let source: Value = web_arg_value(&args, "source")?;
+            {
+                let mut store = state.ui_settings.write().await;
+                store.apply_patch(json!({ "pricingModelSource": source }));
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(json!(true))
+        }
+        "webdav_sync_save_settings" => {
+            let settings: Value = web_arg_value(&args, "settings")?;
+            {
+                let mut store = state.ui_settings.write().await;
+                store.apply_patch(json!({ "webdavSync": settings }));
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(json!({ "success": true }))
+        }
+        "s3_sync_save_settings" => {
+            let settings: Value = web_arg_value(&args, "settings")?;
+            {
+                let mut store = state.ui_settings.write().await;
+                store.apply_patch(json!({ "s3Sync": settings }));
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(json!({ "success": true }))
+        }
+        "webdav_test_connection" | "s3_test_connection" => Ok(json!({
+            "success": true,
+            "message": "connection test is not available on server web runtime; settings saved only",
+        })),
+        "webdav_sync_fetch_remote_info" | "s3_sync_fetch_remote_info" => {
+            Ok(json!({ "empty": true }))
+        }
+        "webdav_sync_upload" | "s3_sync_upload" => {
+            let backup = crate::core::backup::create_backup(
+                &state.config_dir,
+                Some("cloud-sync-upload".to_string()),
+            )
+            .map_err(ApiError::internal)?;
+            Ok(json!({ "status": format!("uploaded:{}", backup.id) }))
+        }
+        "webdav_sync_download" | "s3_sync_download" => {
+            Ok(json!({ "status": "download_not_configured" }))
+        }
+        "get_tool_versions" => Ok(json!([])),
+        "probe_tool_installations" => {
+            let tool_names = args
+                .get("toolNames")
+                .or_else(|| args.get("tool_names"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(json!(tool_names
+                .into_iter()
+                .map(|name| json!({
+                    "toolName": name,
+                    "installed": false,
+                    "needs_confirmation": false,
+                }))
+                .collect::<Vec<_>>()))
+        }
+        "run_tool_lifecycle_action" => Err(ApiError::bad_request(
+            "tool lifecycle actions are not available on server web runtime",
+        )),
+        "copilot_list_accounts" => Ok(json!([])),
+        "copilot_is_authenticated" => Ok(json!(false)),
+        "copilot_get_auth_status" => Ok(json!({ "authenticated": false, "accounts": [] })),
+        "copilot_get_token" | "copilot_get_token_for_account" => Ok(Value::Null),
+        "copilot_get_models" | "copilot_get_models_for_account" => Ok(json!([])),
+        "copilot_get_usage" | "copilot_get_usage_for_account" => Ok(Value::Null),
+        "copilot_logout" | "copilot_remove_account" => Ok(json!(true)),
+        "copilot_set_default_account" => Ok(json!(true)),
+        "copilot_poll_for_account" => Ok(Value::Null),
+        "deepseek_account_add" | "deepseek_account_remove" | "deepseek_account_set_default" => {
+            Ok(json!(true))
+        }
+        "deepseek_account_list" => Ok(json!([])),
+        "get_common_config_snippet" => {
+            let app_type = web_arg_common_config_app_type(&args)?;
+            let store = state.ui_settings.read().await;
+            Ok(ui_settings::common_config_snippet_for_frontend(
+                &store, app_type,
+            ))
+        }
+        "set_common_config_snippet" => {
+            let app_type = web_arg_common_config_app_type(&args)?;
+            let snippet = web_arg_string_any(&args, &["snippet", "value"])?;
+            {
+                let mut store = state.ui_settings.write().await;
+                let mut snippets = store
+                    .value
+                    .get("commonConfigSnippets")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                if let Some(map) = snippets.as_object_mut() {
+                    if snippet.trim().is_empty() {
+                        map.remove(app_type);
+                    } else {
+                        map.insert(app_type.to_string(), json!(snippet));
+                    }
+                }
+                store.apply_patch(json!({ "commonConfigSnippets": snippets }));
+            }
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(Value::Null)
+        }
+        "extract_common_config_snippet" => {
+            let _app_type = web_arg_common_config_app_type(&args)?;
+            if let Some(settings_config) = args.get("settingsConfig").and_then(Value::as_str) {
+                let trimmed = settings_config.trim();
+                if trimmed.is_empty() {
+                    return Ok(json!("{}"));
+                }
+                return Ok(json!(trimmed));
+            }
+            Ok(json!("{}"))
+        }
+        "stream_check_provider" => {
+            let stored = web_resolve_stored_provider(state, &args).await?;
+            let config = web_stream_check_config(state).await;
+            let http_client = state.http_client().await;
+            let result = crate::core::stream_check::check_provider_reachability(
+                &http_client,
+                &stored,
+                &config,
+            )
+            .await;
+            Ok(json!(result))
+        }
+        "stream_check_all_providers" => {
+            let app = web_arg_app_type(&args)?;
+            let proxy_targets_only = args
+                .get("proxyTargetsOnly")
+                .or_else(|| args.get("proxy_targets_only"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let config = web_stream_check_config(state).await;
+            let http_client = state.http_client().await;
+            let allowed_ids = if proxy_targets_only {
+                Some(web_proxy_target_provider_ids(state, app).await)
+            } else {
+                None
+            };
+            let providers = state.providers.read().await.providers.clone();
+            let mut results = Vec::new();
+            for stored in providers.into_iter().filter(|item| item.app == app) {
+                if allowed_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(&stored.provider.id))
+                {
+                    continue;
+                }
+                let result = crate::core::stream_check::check_provider_reachability(
+                    &http_client,
+                    &stored,
+                    &config,
+                )
+                .await;
+                results.push((stored.provider.id.clone(), result));
+            }
+            Ok(json!(results))
+        }
+        "model_test_provider" => {
+            let stored = web_resolve_stored_provider(state, &args).await?;
+            let config = web_stream_check_config(state).await;
+            let response = test_provider_inner(
+                state,
+                stored,
+                &TestProviderQuery {
+                    app: None,
+                    network: Some(true),
+                    timeout_ms: Some(config.timeout_secs.saturating_mul(1000)),
+                    model: None,
+                    stream: Some(true),
+                },
+            )
+            .await?;
+            Ok(json!(map_provider_test_to_stream_check_result(
+                &response, &config,
+            )))
+        }
+        "model_test_all_providers" => {
+            let app = web_arg_app_type(&args)?;
+            let proxy_targets_only = args
+                .get("proxyTargetsOnly")
+                .or_else(|| args.get("proxy_targets_only"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let config = web_stream_check_config(state).await;
+            let allowed_ids = if proxy_targets_only {
+                Some(web_proxy_target_provider_ids(state, app).await)
+            } else {
+                None
+            };
+            let providers = state.providers.read().await.providers.clone();
+            let mut results = Vec::new();
+            for stored in providers.into_iter().filter(|item| item.app == app) {
+                if allowed_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(&stored.provider.id))
+                {
+                    continue;
+                }
+                let response = test_provider_inner(
+                    state,
+                    stored.clone(),
+                    &TestProviderQuery {
+                        app: None,
+                        network: Some(true),
+                        timeout_ms: Some(config.timeout_secs.saturating_mul(1000)),
+                        model: None,
+                        stream: Some(true),
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    let message = error.message.clone();
+                    TestProviderResponse {
+                        ok: false,
+                        provider_id: stored.provider.id.clone(),
+                        app: stored.app,
+                        provider_type: stored.provider_type,
+                        adapter: "unknown",
+                        support: proxy::adapters::AdapterSupport::Planned,
+                        endpoint: String::new(),
+                        model: String::new(),
+                        stream: true,
+                        header_names: Vec::new(),
+                        network_checked: true,
+                        network_status_code: None,
+                        network_latency_ms: None,
+                        network_stream_completed: None,
+                        network_error: Some(message.clone()),
+                        message,
+                    }
+                });
+                results.push((
+                    stored.provider.id,
+                    map_provider_test_to_stream_check_result(&response, &config),
+                ));
+            }
+            Ok(json!(results))
+        }
+        "fetch_models_for_config" => web_fetch_models_for_config(state, &args).await,
+        "get_codex_oauth_models" | "get_antigravity_oauth_models" => Ok(json!([])),
+        "update_share_description" => {
+            let payload = web_payload(&args, &["params", "input"]);
+            let share = web_patch_share_settings(
+                state,
+                payload,
+                ShareSettingsPatch {
+                    description: web_optional_string_any(payload, &["description", "value"])
+                        .map(Some),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await?;
+            Ok(json!(share))
+        }
+        "update_share_for_sale" => {
+            let payload = web_payload(&args, &["params", "input"]);
+            let share = web_patch_share_settings(
+                state,
+                payload,
+                ShareSettingsPatch {
+                    for_sale: web_optional_string_any(payload, &["forSale", "for_sale"]),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await?;
+            Ok(json!(share))
+        }
+        "update_share_token_limit" => {
+            let payload = web_payload(&args, &["params", "input"]);
+            let token_limit = payload
+                .get("tokenLimit")
+                .or_else(|| payload.get("token_limit"))
+                .and_then(Value::as_i64);
+            let share = web_patch_share_settings(
+                state,
+                payload,
+                ShareSettingsPatch {
+                    token_limit,
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await?;
+            Ok(json!(share))
+        }
+        "update_share_parallel_limit" => {
+            let payload = web_payload(&args, &["params", "input"]);
+            let parallel_limit = payload
+                .get("parallelLimit")
+                .or_else(|| payload.get("parallel_limit"))
+                .and_then(Value::as_i64);
+            let share = web_patch_share_settings(
+                state,
+                payload,
+                ShareSettingsPatch {
+                    parallel_limit,
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await?;
+            Ok(json!(share))
+        }
+        "update_share_expiration" => {
+            let payload = web_payload(&args, &["params", "input"]);
+            let expires_at = web_optional_string_any(payload, &["expiresAt", "expires_at"]);
+            let share = web_patch_share_settings(
+                state,
+                payload,
+                ShareSettingsPatch {
+                    expires_at,
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await?;
+            Ok(json!(share))
+        }
+        "update_share_for_sale_official_price_percent" => {
+            let payload = web_payload(&args, &["params", "input"]);
+            let pricing = web_optional_deserialize::<BTreeMap<String, u16>>(
+                payload,
+                "forSaleOfficialPricePercentByApp",
+            )?
+            .or_else(|| {
+                web_optional_deserialize::<BTreeMap<String, u16>>(
+                    payload,
+                    "for_sale_official_price_percent_by_app",
+                )
+                .ok()
+                .flatten()
+            });
+            let share = web_patch_share_settings(
+                state,
+                payload,
+                ShareSettingsPatch {
+                    for_sale_official_price_percent_by_app: pricing,
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await?;
+            Ok(json!(share))
+        }
+        "update_share_subdomain" => {
+            let payload = web_payload(&args, &["params", "input"]);
+            let share_id = web_arg_share_id(payload)?;
+            let subdomain = web_arg_string_any(payload, &["subdomain"])?;
+            let response = update_share_subdomain(
+                State(state.clone()),
+                headers.clone(),
+                Path(share_id),
+                Json(UpdateShareSubdomainRequest { subdomain }),
+            )
+            .await?
+            .0;
+            Ok(json!(response.share))
+        }
+        "enable_share" => {
+            let share_id = web_arg_share_id(&args)?;
+            let _ = resume_share(
+                State(state.clone()),
+                headers.clone(),
+                Path(share_id.clone()),
+            )
+            .await?;
+            let response =
+                start_share_tunnel(State(state.clone()), headers.clone(), Path(share_id))
+                    .await?
+                    .0;
+            Ok(json!(response.share))
+        }
+        "disable_share" => {
+            let share_id = web_arg_share_id(&args)?;
+            let _ = stop_share_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Path(share_id.clone()),
+            )
+            .await?;
+            let response = pause_share(State(state.clone()), headers.clone(), Path(share_id))
+                .await?
+                .0;
+            Ok(json!(response.share))
+        }
+        "import_shares" => {
+            let shares: Vec<Share> = web_arg_value_any(&args, &["shares"])?;
+            let response = import_shares(
+                State(state.clone()),
+                headers.clone(),
+                Json(ImportSharesRequest { shares }),
+            )
+            .await?
+            .0;
+            Ok(json!(response.imported))
+        }
+        "list_share_binding_history" => {
+            let share_id = web_arg_share_id(&args)?;
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let history = state
+                .shares
+                .read()
+                .await
+                .get(&share_id)
+                .map(|share| share.binding_history.clone())
+                .ok_or_else(|| ApiError::not_found("share not found"))?;
+            let history = match limit {
+                Some(limit) => history.into_iter().rev().take(limit).rev().collect(),
+                None => history,
+            };
+            Ok(json!(history))
+        }
+        "configure_tunnel" => {
+            let config: UpdateClientTunnelInput = web_arg_value(&args, "config")?;
+            update_client_tunnel(State(state.clone()), headers.clone(), Json(config)).await?;
+            Ok(Value::Null)
+        }
+        "get_claude_common_config_snippet" => {
+            let store = state.ui_settings.read().await;
+            Ok(ui_settings::common_config_snippet_for_frontend(
+                &store, "claude",
+            ))
+        }
+        "set_claude_common_config_snippet" => {
+            let snippet = web_arg_string_any(&args, &["snippet", "value"])?;
+            let mut store = state.ui_settings.write().await;
+            let mut snippets = store
+                .value
+                .get("commonConfigSnippets")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if let Some(map) = snippets.as_object_mut() {
+                if snippet.trim().is_empty() {
+                    map.remove("claude");
+                } else {
+                    map.insert("claude".to_string(), json!(snippet));
+                }
+            }
+            store.apply_patch(json!({ "commonConfigSnippets": snippets }));
+            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            Ok(Value::Null)
+        }
+        "check_env_conflicts" => Ok(json!([])),
+        "delete_env_vars" => Ok(json!({ "backupPath": Value::Null })),
+        "restore_env_backup" => Ok(Value::Null),
+        "get_auto_launch_status" => Ok(json!(false)),
+        "set_auto_launch" => Ok(Value::Null),
+        "sync_current_providers_live" => Ok(json!({ "imported": 0, "warnings": [] })),
+        "sync_session_usage" => Ok(Value::Null),
+        "testUsageScript" => Ok(json!({ "ok": true, "output": "" })),
+        "queryProviderUsage" => Ok(json!({ "logs": [], "summary": Value::Null })),
+        "get_usage_data_sources" => Ok(json!(["server"])),
+        "check_provider_limits" => Ok(json!({ "ok": true, "withinLimits": true })),
+        "get_subscription_quota" | "get_coding_plan_quota" | "get_balance" => Ok(Value::Null),
+        "get_default_cost_multiplier" => Ok(json!(1.0)),
+        "set_default_cost_multiplier" => Ok(Value::Null),
+        "read_live_provider_settings" => Ok(json!({})),
+        "test_api_endpoints" => Ok(json!([])),
+        "get_custom_endpoints" => Ok(json!([])),
+        "add_custom_endpoint" | "remove_custom_endpoint" | "update_endpoint_last_used" => {
+            Ok(Value::Null)
+        }
+        "remove_provider_from_live_config" => Ok(json!(true)),
+        "import_opencode_providers_from_live"
+        | "import_openclaw_providers_from_live"
+        | "import_hermes_providers_from_live" => Ok(json!([])),
+        "get_opencode_live_provider_ids"
+        | "get_openclaw_live_provider_ids"
+        | "get_hermes_live_provider_ids" => Ok(json!([])),
+        "import_claude_desktop_providers_from_claude"
+        | "ensure_claude_desktop_official_provider" => Ok(json!(false)),
+        "get_claude_desktop_status" => Ok(json!({ "installed": false, "configured": false })),
+        "get_claude_desktop_default_routes" => Ok(json!([])),
+        "get_claude_code_config_path" => Ok(json!("")),
+        "set_app_config_dir_override" => Ok(Value::Null),
+        "apply_claude_plugin_config"
+        | "apply_claude_onboarding_skip"
+        | "clear_claude_onboarding_skip" => Ok(Value::Null),
+        "codex_banked_reset_status" => Ok(json!({ "enabled": false })),
+        "codex_banked_reset_invite" | "codex_banked_reset_consume" => Err(
+            ApiError::not_implemented("codex banked reset is not available on cc-switch-server"),
+        ),
+        "open_provider_terminal" => Err(ApiError::not_implemented(
+            "open_provider_terminal is not available in server web runtime",
+        )),
         _ => Err(ApiError::web_invoke_not_wired(format!(
             "desktop invoke command '{command}' is registered but has no dispatcher"
         ))),
     }
+}
+
+async fn web_resolve_stored_provider(
+    state: &ServerState,
+    args: &Value,
+) -> Result<StoredProvider, ApiError> {
+    let app = web_arg_app_type(args)?;
+    let provider_id = web_arg_string_any(args, &["providerId", "provider_id"])?;
+    resolve_provider_by_id(state, &provider_id, Some(app)).await
+}
+
+async fn web_stream_check_config(
+    state: &ServerState,
+) -> crate::core::stream_check::StreamCheckConfig {
+    let store = state.ui_settings.read().await;
+    let value = ui_settings::stream_check_config_for_frontend(&store);
+    crate::core::stream_check::stream_check_config_from_value(&value)
+}
+
+async fn web_proxy_target_provider_ids(
+    state: &ServerState,
+    app: AppKind,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let mut ids = HashSet::new();
+    let ui_settings = state.ui_settings.read().await.for_frontend();
+    if let Some(current) = live_config_import::read_current_provider_id(&ui_settings, app) {
+        ids.insert(current);
+    }
+    let failover = state.failover.read().await;
+    if let Some(config) = failover.apps.get(&app) {
+        for provider_id in &config.provider_queue {
+            ids.insert(provider_id.clone());
+        }
+    }
+    ids
+}
+
+fn map_provider_test_to_stream_check_result(
+    response: &TestProviderResponse,
+    config: &crate::core::stream_check::StreamCheckConfig,
+) -> crate::core::stream_check::StreamCheckResult {
+    use crate::core::stream_check::{HealthStatus, StreamCheckResult};
+    let success = response.network_checked
+        && response.network_error.is_none()
+        && response
+            .network_status_code
+            .is_some_and(|status| (200..400).contains(&status))
+        && response.network_stream_completed.unwrap_or(true);
+    let latency = response
+        .network_latency_ms
+        .map(|value| value.min(u64::MAX as u128) as u64);
+    let status = if !success {
+        HealthStatus::Failed
+    } else if latency.unwrap_or(0) > config.degraded_threshold_ms {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Operational
+    };
+    StreamCheckResult {
+        status,
+        success,
+        message: if success {
+            "Check succeeded".to_string()
+        } else {
+            response
+                .network_error
+                .clone()
+                .unwrap_or_else(|| response.message.clone())
+        },
+        response_time_ms: latency,
+        http_status: response.network_status_code,
+        model_used: response.model.clone(),
+        tested_at: chrono::Utc::now().timestamp(),
+        retry_count: 0,
+        error_category: response
+            .network_status_code
+            .and_then(|status| (status == 404).then_some("modelNotFound".to_string())),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+    }
+}
+
+async fn web_fetch_models_for_config(state: &ServerState, args: &Value) -> Result<Value, ApiError> {
+    let base_url = web_arg_string_any(args, &["baseUrl", "base_url"])?;
+    let api_key = web_arg_string_any(args, &["apiKey", "api_key"])?;
+    let models_url = web_optional_string_any(args, &["modelsUrl", "models_url"]);
+    let url = models_url.unwrap_or_else(|| format!("{}/models", base_url.trim_end_matches('/')));
+    let http_client = state.http_client().await;
+    let response = http_client
+        .get(&url)
+        .header("authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("fetch models failed: {error}")))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ApiError::bad_gateway(format!(
+            "fetch models failed: {status}: {}",
+            redact_provider_test_error(&body)
+        )));
+    }
+    let raw = response
+        .json::<Value>()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("parse models failed: {error}")))?;
+    let models = parse_provider_models(&raw)
+        .into_iter()
+        .map(|model| {
+            json!({
+                "id": model.id,
+                "ownedBy": Value::Null,
+                "displayName": model.display_name,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!(models))
+}
+
+async fn web_patch_share_settings(
+    state: &ServerState,
+    args: &Value,
+    patch: ShareSettingsPatch,
+) -> Result<Share, ApiError> {
+    let share_id = web_arg_share_id(args)?;
+    let share = {
+        let mut store = state.shares.write().await;
+        store
+            .apply_settings_patch(&share_id, patch)
+            .map_err(map_share_patch_error)?
+    };
+    state.save_shares().await.map_err(ApiError::internal)?;
+    spawn_share_upsert_sync(state.clone(), share.clone());
+    emit_share_event(state, "share.changed", &share, "settings_patched");
+    Ok(share)
 }
 
 async fn web_provider_quota(
@@ -5007,6 +6375,48 @@ async fn web_share_binding_input(
     ))
 }
 
+async fn web_update_share_owner_email(
+    state: &ServerState,
+    headers: &HeaderMap,
+    args: &Value,
+) -> Result<Share, ApiError> {
+    require_session(state, headers).await?;
+    let value = web_payload(args, &["params", "input"]);
+    let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
+    let owner_email = web_arg_string_any(value, &["ownerEmail", "owner_email"])?;
+    let share = state
+        .shares
+        .write()
+        .await
+        .update_owner_email(&share_id, &owner_email)
+        .map_err(map_share_patch_error)?;
+    state.save_shares().await.map_err(ApiError::internal)?;
+    spawn_share_upsert_sync(state.clone(), share.clone());
+    emit_share_event(state, "share.changed", &share, "owner_email_updated");
+    Ok(share)
+}
+
+async fn web_transfer_share_owner(
+    state: &ServerState,
+    headers: &HeaderMap,
+    args: &Value,
+) -> Result<Share, ApiError> {
+    require_session(state, headers).await?;
+    let value = web_payload(args, &["params", "input"]);
+    let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
+    let target_email = web_arg_string_any(value, &["targetEmail", "target_email"])?;
+    let share = state
+        .shares
+        .write()
+        .await
+        .transfer_owner_email(&share_id, &target_email)
+        .map_err(map_share_patch_error)?;
+    state.save_shares().await.map_err(ApiError::internal)?;
+    spawn_share_upsert_sync(state.clone(), share.clone());
+    emit_share_event(state, "share.changed", &share, "owner_transferred");
+    Ok(share)
+}
+
 async fn web_update_share_acl(state: &ServerState, args: &Value) -> Result<Share, ApiError> {
     let value = web_payload(args, &["params", "input"]);
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
@@ -5043,6 +6453,64 @@ async fn web_update_share_acl(state: &ServerState, args: &Value) -> Result<Share
     spawn_share_upsert_sync(state.clone(), share.clone());
     emit_share_event(state, "share.changed", &share, "acl_replaced");
     Ok(share)
+}
+
+fn web_client_tunnel_share_status(
+    runtime: Option<crate::core::tunnel::TunnelRuntimeStatus>,
+) -> Value {
+    let last_error = runtime
+        .as_ref()
+        .and_then(|status| status.last_error.clone());
+    let info = runtime.and_then(|status| {
+        let tunnel_url = status.tunnel_url.clone()?;
+        Some(json!({
+            "tunnelUrl": tunnel_url,
+            "subdomain": status.subdomain.clone().unwrap_or_default(),
+            "remotePort": status.remote_port.unwrap_or(0),
+            "healthy": matches!(
+                status.status.as_str(),
+                "connected" | "running" | "active"
+            ),
+        }))
+    });
+    json!({
+        "info": info,
+        "lastError": last_error,
+        "requiresOwnerLogin": false,
+    })
+}
+
+async fn web_client_tunnel_state(state: &ServerState) -> Value {
+    let config = state.config.read().await;
+    let runtime = state
+        .tunnels
+        .status(&crate::core::tunnel::client_tunnel_key())
+        .await;
+    let tunnel_url = runtime
+        .as_ref()
+        .and_then(|status| status.tunnel_url.clone());
+    let subdomain = config.client.tunnel_subdomain.clone().unwrap_or_default();
+    let owner_email = config.owner.email.clone().unwrap_or_default();
+    let enabled = matches!(
+        config.client.tunnel_status.as_deref(),
+        Some("active") | Some("running") | Some("connected")
+    ) || runtime
+        .as_ref()
+        .is_some_and(|status| matches!(status.status.as_str(), "connected" | "running" | "active"));
+    let status = web_client_tunnel_share_status(runtime);
+    let mut response = json!({
+        "config": {
+            "ownerEmail": owner_email,
+            "subdomain": subdomain,
+            "enabled": enabled,
+            "autoStart": true,
+            "tunnelUrl": tunnel_url,
+        }
+    });
+    if let Value::Object(ref mut map) = response {
+        map.insert("status".into(), status);
+    }
+    response
 }
 
 async fn web_share_tunnel_status(state: &ServerState, share_id: &str) -> Result<Value, ApiError> {
@@ -5141,6 +6609,244 @@ fn web_arg_string_any(args: &Value, keys: &[&str]) -> Result<String, ApiError> {
     })
 }
 
+fn web_runtime_auth_required_payload(
+    config: &ServerConfig,
+    contract: &web_runtime::WebRuntimeContract,
+) -> Value {
+    json!({
+        "mode": "client-login",
+        "appMode": "server",
+        "platform": "server",
+        "status": "auth-required",
+        "permissions": ["login"],
+        "apps": ["claude", "codex", "gemini"],
+        "auth": {
+            "authenticated": false,
+            "setupRequired": false,
+            "ownerEmail": config.owner.email,
+            "methods": web_runtime_auth_methods(config)
+        },
+        "features": {
+            "retained": contract.retained_features,
+            "hidden": contract.hidden_features,
+            "excluded": contract.excluded_features
+        },
+        "commands": contract.commands,
+        "uiAutomation": {
+            "allowed": contract.ui_automation_allowed
+        }
+    })
+}
+
+fn web_runtime_auth_methods(config: &ServerConfig) -> Vec<&'static str> {
+    crate::core::web_auth::auth_methods(config).methods
+}
+
+fn web_global_proxy_config_json(state: &ServerState) -> Value {
+    json!({
+        "proxyEnabled": true,
+        "listenAddress": state.bind_addr.ip().to_string(),
+        "listenPort": state.bind_addr.port(),
+        "enableLogging": true,
+    })
+}
+
+fn web_proxy_status_json(state: &ServerState) -> Value {
+    json!({
+        "running": true,
+        "address": state.bind_addr.ip().to_string(),
+        "port": state.bind_addr.port(),
+        "active_connections": 0,
+        "total_requests": 0,
+        "success_requests": 0,
+        "failed_requests": 0,
+        "success_rate": 100.0,
+        "uptime_seconds": 0,
+        "current_provider": Value::Null,
+        "current_provider_id": Value::Null,
+        "last_request_at": Value::Null,
+        "last_error": Value::Null,
+        "failover_count": 0,
+        "active_targets": [],
+    })
+}
+
+async fn web_upstream_proxy_status_json(state: &ServerState) -> Value {
+    let config = state.config.read().await;
+    let url = config.upstream_proxy.url.clone();
+    let enabled = url.as_ref().is_some_and(|value| !value.trim().is_empty());
+    json!({
+        "enabled": enabled,
+        "proxyUrl": url,
+    })
+}
+
+async fn web_test_proxy_url(url: &str) -> Value {
+    if url.trim().is_empty() {
+        return json!({
+            "success": false,
+            "latencyMs": 0,
+            "error": "Proxy URL is empty",
+        });
+    }
+
+    let start = Instant::now();
+    let proxy = match reqwest::Proxy::all(url) {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            return json!({
+                "success": false,
+                "latencyMs": 0,
+                "error": format!("Invalid proxy URL: {error}"),
+            });
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({
+                "success": false,
+                "latencyMs": 0,
+                "error": format!("Failed to build client: {error}"),
+            });
+        }
+    };
+
+    let test_urls = [
+        "https://httpbin.org/get",
+        "https://www.google.com",
+        "https://api.anthropic.com",
+    ];
+    let mut last_error = None;
+    for test_url in test_urls {
+        match client.head(test_url).send().await {
+            Ok(_) => {
+                return json!({
+                    "success": true,
+                    "latencyMs": start.elapsed().as_millis() as u64,
+                    "error": Value::Null,
+                });
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+
+    json!({
+        "success": false,
+        "latencyMs": start.elapsed().as_millis() as u64,
+        "error": last_error.unwrap_or_else(|| "All test targets failed".to_string()),
+    })
+}
+
+async fn web_scan_local_proxies() -> Vec<Value> {
+    const PROXY_PORTS: &[(u16, &str, bool)] = &[
+        (7890, "http", true),
+        (7891, "socks5", false),
+        (1080, "socks5", false),
+        (8080, "http", false),
+        (8888, "http", false),
+        (3128, "http", false),
+        (10808, "socks5", false),
+        (10809, "http", false),
+    ];
+
+    tokio::task::spawn_blocking(move || {
+        let mut found = Vec::new();
+        for &(port, primary_type, is_mixed) in PROXY_PORTS {
+            let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+            if TcpStream::connect_timeout(&addr.into(), Duration::from_millis(100)).is_ok() {
+                found.push(json!({
+                    "url": format!("{primary_type}://127.0.0.1:{port}"),
+                    "proxyType": primary_type,
+                    "port": port,
+                }));
+                if is_mixed {
+                    let alt_type = if primary_type == "http" {
+                        "socks5"
+                    } else {
+                        "http"
+                    };
+                    found.push(json!({
+                        "url": format!("{alt_type}://127.0.0.1:{port}"),
+                        "proxyType": alt_type,
+                        "port": port,
+                    }));
+                }
+            }
+        }
+        found
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn web_app_proxy_config_json(state: &ServerState, app: AppKind) -> Value {
+    let failover = state.failover.read().await;
+    let auto_failover_enabled = failover
+        .apps
+        .get(&app)
+        .map(|config| config.enabled)
+        .unwrap_or(false);
+    let app_config = state
+        .ui_settings
+        .read()
+        .await
+        .value
+        .get("proxyAppConfigs")
+        .and_then(|configs| configs.get(app.as_str()))
+        .cloned();
+    if let Some(config) = app_config {
+        return config;
+    }
+    let failure_threshold = failover
+        .apps
+        .get(&app)
+        .map(|config| config.failure_threshold)
+        .unwrap_or(4);
+    let timeout_seconds = failover
+        .apps
+        .get(&app)
+        .map(|config| (config.open_duration_ms / 1000).max(1))
+        .unwrap_or(60);
+    json!({
+        "appType": app.as_str(),
+        "enabled": true,
+        "autoFailoverEnabled": auto_failover_enabled,
+        "maxRetries": 3,
+        "streamingFirstByteTimeout": 60,
+        "streamingIdleTimeout": 120,
+        "nonStreamingTimeout": 600,
+        "circuitFailureThreshold": failure_threshold,
+        "circuitSuccessThreshold": 2,
+        "circuitTimeoutSeconds": timeout_seconds,
+        "circuitErrorRateThreshold": 0.6,
+        "circuitMinRequests": 10,
+    })
+}
+
+async fn web_available_providers_for_failover(state: &ServerState, app: AppKind) -> Vec<Provider> {
+    let failover = state.failover.read().await;
+    let providers = state.providers.read().await;
+    let queue_ids = failover
+        .apps
+        .get(&app)
+        .map(|config| config.provider_queue.as_slice())
+        .unwrap_or(&[]);
+    providers
+        .providers
+        .iter()
+        .filter(|stored| stored.app == app)
+        .filter(|stored| !queue_ids.iter().any(|id| id == &stored.provider.id))
+        .map(|stored| stored.provider.clone())
+        .collect()
+}
+
 fn web_optional_string_any(args: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         args.get(*key)
@@ -5149,6 +6855,30 @@ fn web_optional_string_any(args: &Value, keys: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+fn web_optional_u128(args: &Value, keys: &[&str]) -> Option<u128> {
+    keys.iter().find_map(|key| {
+        args.get(*key).and_then(|value| {
+            value
+                .as_u64()
+                .map(|number| number as u128)
+                .or_else(|| value.as_i64().map(|number| number.max(0) as u128))
+        })
+    })
+}
+
+fn web_usage_stats_filter_from_args(args: &Value) -> UsageStatsFilter {
+    let app = web_optional_string_any(args, &["appType", "app", "app_type"])
+        .as_deref()
+        .and_then(|value| parse_app_kind(value).ok());
+    UsageStatsFilter {
+        from_ms: web_optional_u128(args, &["startDate", "fromMs", "from_ms"]),
+        to_ms: web_optional_u128(args, &["endDate", "toMs", "to_ms"]),
+        app,
+        provider_id: web_optional_string_any(args, &["providerName", "providerId", "provider_id"]),
+        ..UsageStatsFilter::default()
+    }
 }
 
 fn web_optional_bool(args: &Value, keys: &[&str]) -> Option<bool> {
@@ -5227,6 +6957,14 @@ fn web_parse_provider_type(value: &str) -> Result<ProviderType, ApiError> {
         .map_err(|_| ApiError::bad_request(format!("invalid providerType: {value}")))
 }
 
+fn provider_extra_string(provider: &Provider, key: &str) -> Option<String> {
+    provider
+        .extra
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
 fn provider_record_for_app(
     providers: &[StoredProvider],
     app: AppKind,
@@ -5236,6 +6974,459 @@ fn provider_record_for_app(
         .filter(|provider| provider.app == app)
         .map(|provider| (provider.provider.id.clone(), provider.provider.clone()))
         .collect()
+}
+
+fn managed_auth_provider_label(provider_type: ProviderType) -> &'static str {
+    match provider_type {
+        ProviderType::GitHubCopilot => "github_copilot",
+        ProviderType::CodexOAuth => "codex_oauth",
+        ProviderType::ClaudeOAuth => "claude_oauth",
+        ProviderType::GeminiCli => "google_gemini_oauth",
+        ProviderType::AntigravityOAuth => "antigravity_oauth",
+        ProviderType::CursorOAuth => "cursor_oauth",
+        ProviderType::KiroOAuth => "kiro_oauth",
+        _ => "unknown",
+    }
+}
+
+fn account_is_authenticated(account: &Account) -> bool {
+    account
+        .access_token
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || account
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || account
+            .refresh_token
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn account_authenticated_at(account: &Account) -> i64 {
+    account.quota_refreshed_at.unwrap_or(0)
+}
+
+fn map_managed_auth_account(
+    account: &Account,
+    provider_label: &str,
+    default_account_id: Option<&str>,
+) -> Value {
+    json!({
+        "id": account.id,
+        "provider": provider_label,
+        "login": account.email.clone().unwrap_or_else(|| account.id.clone()),
+        "email": account.email,
+        "avatar_url": Value::Null,
+        "authenticated_at": account_authenticated_at(account),
+        "is_default": default_account_id == Some(account.id.as_str()),
+        "github_domain": "github.com"
+    })
+}
+
+const CLAUDE_WEB_PASTE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+
+fn managed_auth_is_cli_oauth_flow(oauth_flow_mode: Option<&str>) -> bool {
+    matches!(
+        oauth_flow_mode
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("cli") | Some("browser") | Some("cli_oauth") | Some("clioauth")
+    )
+}
+
+fn web_managed_auth_redirect_uri(
+    state: &ServerState,
+    headers: &HeaderMap,
+    args: &Value,
+    provider_type: ProviderType,
+    oauth_flow_mode: Option<&str>,
+) -> String {
+    if provider_type == ProviderType::ClaudeOAuth
+        && matches!(
+            oauth_flow_mode
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("web_paste") | Some("webpaste")
+        )
+    {
+        return CLAUDE_WEB_PASTE_REDIRECT_URI.to_string();
+    }
+    if let Some(uri) = web_optional_string_any(
+        args,
+        &[
+            "redirectUri",
+            "redirect_uri",
+            "codexCallbackUrl",
+            "codex_callback_url",
+        ],
+    ) {
+        return uri;
+    }
+    if let Some(host) = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+    {
+        if let Ok(host_str) = host.to_str() {
+            let scheme = headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("http");
+            return format!("{scheme}://{host_str}/api/accounts/login/callback");
+        }
+    }
+    default_account_login_redirect_uri(state)
+}
+
+fn map_managed_auth_device_code(
+    provider_label: &str,
+    device_code: &str,
+    user_code: &str,
+    verification_uri: &str,
+    expires_in: u64,
+    interval: u64,
+) -> Value {
+    json!({
+        "provider": provider_label,
+        "device_code": device_code,
+        "user_code": user_code,
+        "verification_uri": verification_uri,
+        "expires_in": expires_in,
+        "interval": interval,
+    })
+}
+
+fn map_managed_auth_browser_login(
+    provider_label: &str,
+    login: &OAuthLoginStart,
+    cli_prefix: bool,
+    expires_in: u64,
+    interval: u64,
+) -> Value {
+    let device_code = if cli_prefix {
+        format!("cli:{}", login.state)
+    } else {
+        login.state.clone()
+    };
+    json!({
+        "provider": provider_label,
+        "device_code": device_code,
+        "user_code": "",
+        "verification_uri": login.authorize_url,
+        "expires_in": expires_in,
+        "interval": interval,
+    })
+}
+
+async fn web_managed_auth_account_by_id(
+    state: &ServerState,
+    account_id: &str,
+    provider_label: &str,
+) -> Result<Value, ApiError> {
+    let accounts = state.accounts.read().await;
+    let provider_type = accounts
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .map(|account| account.provider_type)
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
+    let default_account_id = accounts
+        .accounts
+        .iter()
+        .filter(|account| account.provider_type == provider_type)
+        .map(|account| account.id.as_str())
+        .next();
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
+    Ok(map_managed_auth_account(
+        account,
+        provider_label,
+        default_account_id,
+    ))
+}
+
+async fn web_managed_auth_start_login(
+    state: ServerState,
+    headers: HeaderMap,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let provider_type = web_auth_provider_type(args)?;
+    let provider_label = managed_auth_provider_label(provider_type);
+    let oauth_flow_mode = web_optional_string_any(args, &["oauthFlowMode", "oauth_flow_mode"]);
+    let oauth_flow_mode_ref = oauth_flow_mode.as_deref();
+
+    match provider_type {
+        ProviderType::GitHubCopilot => {
+            let response = start_copilot_device_login(
+                State(state),
+                headers,
+                Json(StartCopilotDeviceLoginRequest {
+                    github_domain: web_optional_string_any(
+                        args,
+                        &["githubDomain", "github_domain"],
+                    ),
+                }),
+            )
+            .await?
+            .0;
+            Ok(map_managed_auth_device_code(
+                provider_label,
+                &response.device.device_code,
+                &response.device.user_code,
+                &response.device.verification_uri,
+                response.device.expires_in,
+                response.device.interval,
+            ))
+        }
+        ProviderType::KiroOAuth => {
+            let response = start_kiro_device_login(
+                State(state),
+                headers,
+                Json(StartKiroDeviceLoginRequest {
+                    region: web_optional_string_any(args, &["region"]),
+                    start_url: web_optional_string_any(args, &["startUrl", "start_url"]),
+                }),
+            )
+            .await?
+            .0;
+            Ok(map_managed_auth_device_code(
+                provider_label,
+                &response.device.device_code,
+                &response.device.user_code,
+                &response.device.verification_uri,
+                response.device.expires_in,
+                response.device.interval,
+            ))
+        }
+        _ => {
+            let redirect_uri = Some(web_managed_auth_redirect_uri(
+                &state,
+                &headers,
+                args,
+                provider_type,
+                oauth_flow_mode_ref,
+            ));
+            let response = start_account_login(
+                State(state),
+                headers,
+                Json(StartAccountLoginRequest {
+                    provider_type,
+                    redirect_uri,
+                }),
+            )
+            .await?
+            .0;
+            let (expires_in, interval, cli_prefix) = match provider_type {
+                ProviderType::CodexOAuth => {
+                    (300, 2, managed_auth_is_cli_oauth_flow(oauth_flow_mode_ref))
+                }
+                ProviderType::CursorOAuth => (300, 2, false),
+                _ => (300, 5, false),
+            };
+            Ok(map_managed_auth_browser_login(
+                provider_label,
+                &response.login,
+                cli_prefix,
+                expires_in,
+                interval,
+            ))
+        }
+    }
+}
+
+async fn web_managed_auth_poll_for_account(
+    state: ServerState,
+    headers: HeaderMap,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let provider_type = web_auth_provider_type(args)?;
+    let provider_label = managed_auth_provider_label(provider_type);
+    let device_code = web_arg_string_any(args, &["deviceCode", "device_code"])?;
+
+    match provider_type {
+        ProviderType::GitHubCopilot => {
+            let response = poll_copilot_device_login(
+                State(state.clone()),
+                headers,
+                Json(PollCopilotDeviceLoginRequest {
+                    device_code,
+                    github_domain: web_optional_string_any(
+                        args,
+                        &["githubDomain", "github_domain"],
+                    ),
+                }),
+            )
+            .await?
+            .0;
+            if response.pending {
+                return Ok(Value::Null);
+            }
+            let account_id = response
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway("copilot device flow completed without account")
+                })?;
+            web_managed_auth_account_by_id(&state, account_id, provider_label).await
+        }
+        ProviderType::KiroOAuth => {
+            let response = poll_kiro_device_login(
+                State(state.clone()),
+                headers,
+                Json(PollKiroDeviceLoginRequest { device_code }),
+            )
+            .await?
+            .0;
+            if response.pending {
+                return Ok(Value::Null);
+            }
+            let account_id = response
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway("kiro device flow completed without account")
+                })?;
+            web_managed_auth_account_by_id(&state, account_id, provider_label).await
+        }
+        _ => {
+            let poll_state = device_code
+                .strip_prefix("cli:")
+                .unwrap_or(device_code.as_str());
+            let poll_status = {
+                let mut store = state.oauth_logins.write().await;
+                store.poll_state_by_oauth_state(poll_state, now_ms() as i64)
+            };
+            match poll_status {
+                Ok(OAuthSessionPollState::Pending) => return Ok(Value::Null),
+                Err(OAuthLoginError::NotFound) => {
+                    return Err(ApiError::bad_request("oauth login session not found"));
+                }
+                Err(OAuthLoginError::Expired) => {
+                    return Err(ApiError::conflict("oauth login session expired"));
+                }
+                Err(OAuthLoginError::AlreadyConsumed) => return Ok(Value::Null),
+                Err(error) => return Err(oauth_login_api_error(error)),
+                Ok(OAuthSessionPollState::Ready) => {}
+            }
+
+            let finish_result = finish_account_login(
+                State(state.clone()),
+                headers,
+                Json(FinishAccountLoginRequest {
+                    session_id: None,
+                    state: Some(poll_state.to_string()),
+                    code: None,
+                    execute_token_exchange: Some(true),
+                }),
+            )
+            .await;
+
+            match finish_result {
+                Ok(response) => {
+                    let account_id = response
+                        .0
+                        .account
+                        .as_ref()
+                        .map(|account| account.id.as_str())
+                        .ok_or_else(|| {
+                            ApiError::bad_gateway("oauth login did not import account")
+                        })?;
+                    web_managed_auth_account_by_id(&state, account_id, provider_label).await
+                }
+                Err(error)
+                    if error.status == StatusCode::CONFLICT
+                        || error.message.contains("authorization_pending") =>
+                {
+                    Ok(Value::Null)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+async fn web_managed_auth_remove_account(
+    state: ServerState,
+    headers: HeaderMap,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let provider_type = web_auth_provider_type(args)?;
+    let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
+    let exists = state
+        .accounts
+        .read()
+        .await
+        .accounts
+        .iter()
+        .any(|account| account.id == account_id && account.provider_type == provider_type);
+    if !exists {
+        return Err(ApiError::not_found("account not found"));
+    }
+    delete_account(State(state), headers, Path(account_id)).await?;
+    Ok(Value::Null)
+}
+
+async fn web_managed_auth_set_default_account(
+    state: ServerState,
+    headers: HeaderMap,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    require_session(&state, &headers).await?;
+    let provider_type = web_auth_provider_type(args)?;
+    let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
+    let mut store = state.accounts.write().await;
+    let Some(index) = store
+        .accounts
+        .iter()
+        .position(|account| account.id == account_id && account.provider_type == provider_type)
+    else {
+        return Err(ApiError::not_found("account not found"));
+    };
+    let account = store.accounts.remove(index);
+    let insert_at = store
+        .accounts
+        .iter()
+        .position(|item| item.provider_type == provider_type)
+        .unwrap_or(store.accounts.len());
+    store.accounts.insert(insert_at, account);
+    drop(store);
+    state.save_accounts().await.map_err(ApiError::internal)?;
+    Ok(Value::Null)
+}
+
+async fn web_managed_auth_logout(
+    state: ServerState,
+    headers: HeaderMap,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    require_session(&state, &headers).await?;
+    let provider_type = web_auth_provider_type(args)?;
+    let account_ids = state
+        .accounts
+        .read()
+        .await
+        .accounts
+        .iter()
+        .filter(|account| account.provider_type == provider_type)
+        .map(|account| account.id.clone())
+        .collect::<Vec<_>>();
+    for account_id in account_ids {
+        delete_account(State(state.clone()), headers.clone(), Path(account_id)).await?;
+    }
+    Ok(Value::Null)
+}
+
+fn web_arg_app_type(args: &Value) -> Result<AppKind, ApiError> {
+    let app = web_arg_string_any(args, &["appType", "app", "app_type"])?;
+    parse_app_kind(&app)
 }
 
 fn web_arg_app(args: &Value) -> Result<AppKind, ApiError> {
@@ -5676,12 +7867,36 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn parse_app_kind(value: &str) -> Result<AppKind, ApiError> {
+    parse_supported_app_kind(value).ok_or_else(|| ApiError::bad_request("invalid appType"))
+}
+
+fn parse_supported_app_kind(value: &str) -> Option<AppKind> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "claude" => Ok(AppKind::Claude),
-        "codex" => Ok(AppKind::Codex),
-        "gemini" => Ok(AppKind::Gemini),
-        _ => Err(ApiError::bad_request("invalid appType")),
+        "claude" | "claude-desktop" => Some(AppKind::Claude),
+        "codex" | "omo" | "omo_slim" => Some(AppKind::Codex),
+        "gemini" => Some(AppKind::Gemini),
+        "opencode" | "openclaw" | "hermes" => None,
+        _ => None,
     }
+}
+
+fn web_arg_app_for_read(args: &Value) -> Result<Option<AppKind>, ApiError> {
+    let app = web_arg_string_any(args, &["appType", "app", "app_type"])?;
+    if parse_supported_app_kind(&app).is_none()
+        && !matches!(
+            app.trim().to_ascii_lowercase().as_str(),
+            "opencode" | "openclaw" | "hermes"
+        )
+    {
+        return Err(ApiError::bad_request("invalid appType"));
+    }
+    Ok(parse_supported_app_kind(&app))
+}
+
+fn web_arg_common_config_app_type(args: &Value) -> Result<&'static str, ApiError> {
+    let app = web_arg_string_any(args, &["appType", "app", "app_type"])?;
+    ui_settings::normalize_common_config_app_type(&app)
+        .ok_or_else(|| ApiError::bad_request("invalid appType"))
 }
 
 async fn resolve_share_for_internal_request(
@@ -6164,6 +8379,18 @@ struct LoginRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ChangePasswordRequest {
+    new_password: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangePasswordResponse {
+    ok: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EmailLoginCodeRequest {
     email: String,
 }
@@ -6173,6 +8400,25 @@ struct EmailLoginCodeRequest {
 struct EmailLoginVerifyCodeRequest {
     email: String,
     code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebPasswordRequest {
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSessionRefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebPasswordChangeRequest {
+    current_password: String,
+    new_password: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -7162,19 +9408,6 @@ struct UpdateShareSubdomainResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ShareOwnerChangeCodeRequest {
-    new_owner_email: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ShareOwnerChangeVerifyRequest {
-    new_owner_email: String,
-    code: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ReplaceShareAclRequest {
     acl: ShareAcl,
 }
@@ -7477,6 +9710,20 @@ fn map_email_auth_error(error: EmailAuthError) -> ApiError {
     )
 }
 
+fn map_web_auth_error(error: crate::core::web_auth::WebAuthError) -> ApiError {
+    let message = error.to_string();
+    if message.contains("invalid password")
+        || message.contains("not configured")
+        || message.contains("not found")
+        || message.contains("expired")
+        || message.contains("too many")
+    {
+        ApiError::unauthorized(message)
+    } else {
+        ApiError::bad_request(message)
+    }
+}
+
 fn map_share_patch_error(error: crate::core::shares::SharePatchError) -> ApiError {
     match error {
         crate::core::shares::SharePatchError::NotFound => ApiError::not_found("share not found"),
@@ -7499,11 +9746,96 @@ fn map_kiro_device_error(error: KiroDeviceError) -> ApiError {
 }
 
 async fn require_session(state: &ServerState, headers: &HeaderMap) -> Result<(), ApiError> {
+    require_web_admin_session(state, headers).await.map(|_| ())
+}
+
+async fn require_web_admin_session(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<WebAdminPrincipal, ApiError> {
+    resolve_web_admin_principal(state, headers)
+        .await?
+        .ok_or_else(|| ApiError::unauthorized("missing or invalid bearer token"))
+}
+
+async fn resolve_web_admin_principal(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<Option<WebAdminPrincipal>, ApiError> {
+    if let Some(user_email) = router_web_user_email(headers) {
+        return Ok(Some(WebAdminPrincipal {
+            user_email,
+            role: router_web_role(headers),
+        }));
+    }
+
     let Some(token) = bearer_token(headers) else {
-        return Err(ApiError::unauthorized("missing bearer token"));
+        return Ok(None);
     };
 
-    require_session_token(state, token).await
+    if let Ok(Some(principal)) = state.web_auth.authenticate_access_token(token) {
+        return Ok(Some(WebAdminPrincipal {
+            user_email: principal.user_email,
+            role: principal.role,
+        }));
+    }
+
+    if state
+        .sessions
+        .read()
+        .await
+        .iter()
+        .any(|session| session.token == token)
+    {
+        let config = state.config.read().await;
+        return Ok(Some(WebAdminPrincipal {
+            user_email: config
+                .owner
+                .email
+                .clone()
+                .unwrap_or_else(|| "local-admin@cc-switch.local".to_string()),
+            role: "admin".to_string(),
+        }));
+    }
+
+    let config = state.config.read().await;
+    if config.verify_api_token(token) {
+        return Ok(Some(WebAdminPrincipal {
+            user_email: config
+                .owner
+                .email
+                .clone()
+                .unwrap_or_else(|| "local-admin@cc-switch.local".to_string()),
+            role: "admin".to_string(),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn router_web_user_email(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-cc-switch-web-user-email")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn router_web_role(headers: &HeaderMap) -> String {
+    headers
+        .get("x-cc-switch-web-role")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("owner")
+        .to_string()
+}
+
+#[derive(Debug, Clone)]
+struct WebAdminPrincipal {
+    user_email: String,
+    role: String,
 }
 
 async fn require_event_session(
@@ -7511,6 +9843,9 @@ async fn require_event_session(
     headers: &HeaderMap,
     query_token: Option<&str>,
 ) -> Result<(), ApiError> {
+    if resolve_web_admin_principal(state, headers).await?.is_some() {
+        return Ok(());
+    }
     if let Some(token) = bearer_token(headers).or(query_token) {
         return require_session_token(state, token).await;
     }
@@ -8662,7 +10997,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["mode"].as_str(), Some("client-login"));
+        assert_eq!(body["status"].as_str(), Some("auth-required"));
 
         let response = app
             .oneshot(json_request(
@@ -8682,6 +11020,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_runtime_context_treats_invalid_token_as_auth_required() {
+        let app = app_router(test_state());
+        let _token = setup_and_login(&app).await;
+
+        let response = app
+            .oneshot(json_request(
+                Method::GET,
+                "/web-api/context",
+                Value::Null,
+                Some("invalid-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["mode"].as_str(), Some("client-login"));
+        assert_eq!(body["status"].as_str(), Some("auth-required"));
+    }
+
+    #[tokio::test]
     async fn web_invoke_registry_returns_stable_errors() {
         let app = app_router(test_state());
         let token = setup_and_login(&app).await;
@@ -8690,8 +11048,20 @@ mod tests {
             .clone()
             .oneshot(json_request(
                 Method::POST,
-                "/web-api/invoke/webdav_test_connection",
-                json!({}),
+                "/web-api/invoke/apply_claude_plugin_config",
+                json!({ "official": true }),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/set_window_theme",
+                json!({ "theme": "dark" }),
                 Some(&token),
             ))
             .await
@@ -8830,6 +11200,58 @@ mod tests {
             let _ = socket.shutdown().await;
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn web_password_login_authenticates_invoke() {
+        let app = app_router(test_state());
+        let _ = setup_and_login(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/auth/password/login",
+                json!({ "password": "password123" }),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let access_token = body["accessToken"].as_str().unwrap();
+
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/get_tool_versions",
+                json!({ "tools": [] }),
+                Some(access_token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_identity_headers_authenticate_invoke() {
+        let app = app_router(test_state());
+        let _ = setup_and_login(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/web-api/invoke/get_tool_versions")
+                    .header("content-type", "application/json")
+                    .header("x-cc-switch-web-user-email", "owner@example.com")
+                    .header("x-cc-switch-web-role", "owner")
+                    .body(Body::from(r#"{"tools":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn json_request(

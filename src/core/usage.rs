@@ -294,6 +294,40 @@ impl UsageStore {
         rollup
     }
 
+    pub fn summary_by_app(&self, query: &UsageStatsFilter) -> Vec<serde_json::Value> {
+        let mut by_app = BTreeMap::<String, UsageRollup>::new();
+        for log in self
+            .logs
+            .iter()
+            .filter(|log| matches_stats_filter(log, query))
+        {
+            add_log_to_rollup(by_app.entry(log.app.as_str().to_string()).or_default(), log);
+        }
+        let mut items = by_app
+            .into_iter()
+            .map(|(app_type, rollup)| {
+                let summary = usage_summary_view(&rollup);
+                (app_type, summary)
+            })
+            .filter(|(_, summary)| {
+                summary["totalRequests"].as_u64().unwrap_or(0) > 0
+                    || summary["realTotalTokens"].as_u64().unwrap_or(0) > 0
+            })
+            .map(|(app_type, summary)| {
+                serde_json::json!({
+                    "appType": app_type,
+                    "summary": summary,
+                })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            let left_tokens = left["summary"]["realTotalTokens"].as_u64().unwrap_or(0);
+            let right_tokens = right["summary"]["realTotalTokens"].as_u64().unwrap_or(0);
+            right_tokens.cmp(&left_tokens)
+        });
+        items
+    }
+
     pub fn trends(&self, query: &UsageStatsFilter) -> Vec<UsageTrendPoint> {
         if self.rollups.has_data() {
             return self.rollups.trends(query);
@@ -1081,6 +1115,36 @@ fn matches_stats_filter(log: &UsageLog, query: &UsageStatsFilter) -> bool {
             .stream_status
             .as_deref()
             .is_none_or(|status| log.stream_status.as_deref() == Some(status))
+}
+
+fn usage_summary_view(rollup: &UsageRollup) -> serde_json::Value {
+    let success_rate = if rollup.requests > 0 {
+        (rollup.successes as f32 / rollup.requests as f32) * 100.0
+    } else {
+        0.0
+    };
+    let cacheable_input =
+        rollup.input_tokens + rollup.cache_creation_tokens + rollup.cache_read_tokens;
+    let cache_hit_rate = if cacheable_input > 0 {
+        rollup.cache_read_tokens as f64 / cacheable_input as f64
+    } else {
+        0.0
+    };
+    let real_total_tokens = rollup.input_tokens
+        + rollup.output_tokens
+        + rollup.cache_creation_tokens
+        + rollup.cache_read_tokens;
+    serde_json::json!({
+        "totalRequests": rollup.requests,
+        "totalCost": format!("{:.6}", rollup.total_cost_usd),
+        "totalInputTokens": rollup.input_tokens,
+        "totalOutputTokens": rollup.output_tokens,
+        "totalCacheCreationTokens": rollup.cache_creation_tokens,
+        "totalCacheReadTokens": rollup.cache_read_tokens,
+        "successRate": success_rate,
+        "realTotalTokens": real_total_tokens,
+        "cacheHitRate": cache_hit_rate,
+    })
 }
 
 fn add_log_to_rollup(rollup: &mut UsageRollup, log: &UsageLog) {
@@ -2063,6 +2127,40 @@ mod tests {
         assert_eq!(summary.requests, 3_000);
         assert!((summary.total_cost_usd - 30.0).abs() < 0.000_001);
         assert!((store.provider_cost_since(AppKind::Codex, "p1", 0) - 30.0).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn summary_by_app_groups_logs_and_sorts_by_tokens() {
+        let mut store = UsageStore::default();
+        for (app, request_id, input_tokens) in [
+            (AppKind::Claude, "req_claude", 100),
+            (AppKind::Codex, "req_codex", 300),
+            (AppKind::Gemini, "req_gemini", 200),
+        ] {
+            let mut log = UsageLog::new(
+                app,
+                "p1".to_string(),
+                "provider 1".to_string(),
+                ProviderType::Claude,
+                200,
+                10,
+                UsageModelMetadata::default(),
+                TokenUsage {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(1),
+                    total_tokens: Some(input_tokens + 1),
+                    ..Default::default()
+                },
+            );
+            log.request_id = request_id.to_string();
+            store.push(log);
+        }
+
+        let items = store.summary_by_app(&UsageStatsFilter::default());
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["appType"].as_str(), Some("codex"));
+        assert_eq!(items[0]["summary"]["realTotalTokens"].as_u64(), Some(301));
+        assert_eq!(items[2]["appType"].as_str(), Some("claude"));
     }
 
     #[test]

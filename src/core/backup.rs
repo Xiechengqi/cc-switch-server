@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::core::usage::now_ms;
 
@@ -165,6 +166,55 @@ pub fn prune_backups(config_dir: &Path, keep: usize) -> anyhow::Result<usize> {
         }
     }
     Ok(pruned)
+}
+
+pub fn store_paths_for_export(config_dir: &Path) -> Vec<PathBuf> {
+    store_paths(config_dir)
+}
+
+pub fn validate_export_file_name(value: &str) -> anyhow::Result<()> {
+    validate_backup_file_name(value)
+}
+
+pub fn delete_backup(config_dir: &Path, backup_id: &str) -> anyhow::Result<()> {
+    validate_backup_id(backup_id)?;
+    let dir = backup_dir(config_dir, backup_id)?;
+    if dir.exists() {
+        fs::remove_dir_all(&dir).with_context(|| format!("remove backup {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+pub fn rename_backup(
+    config_dir: &Path,
+    backup_id: &str,
+    display_name: &str,
+) -> anyhow::Result<BackupManifest> {
+    validate_backup_id(backup_id)?;
+    let trimmed = display_name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("backup display name is required");
+    }
+    let mut manifest = read_manifest(config_dir, backup_id)?;
+    manifest.reason = Some(format!("label:{trimmed}"));
+    let path = backup_dir(config_dir, backup_id)?.join(BACKUP_MANIFEST_FILE_NAME);
+    crate::core::storage::write_json_pretty(&path, &manifest)
+        .with_context(|| format!("write backup manifest {}", path.display()))?;
+    Ok(manifest)
+}
+
+pub fn backup_entry_for_frontend(manifest: &BackupManifest) -> Value {
+    let size_bytes: u64 = manifest.files.iter().map(|file| file.size_bytes).sum();
+    let created_at = manifest.created_at_ms.to_string();
+    json!({
+        "filename": manifest.id,
+        "sizeBytes": size_bytes,
+        "createdAt": created_at,
+    })
+}
+
+pub fn backup_entries_for_frontend(manifests: &[BackupManifest]) -> Vec<Value> {
+    manifests.iter().map(backup_entry_for_frontend).collect()
 }
 
 fn read_manifest(config_dir: &Path, backup_id: &str) -> anyhow::Result<BackupManifest> {

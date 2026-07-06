@@ -64,6 +64,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the local web admin password stored in server.json.
+    Password {
+        #[command(subcommand)]
+        command: PasswordCommand,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -74,6 +79,19 @@ pub enum ConfigCommand {
     Print,
     /// Parse and validate local JSON stores.
     Validate,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PasswordCommand {
+    /// Set a new web admin password and revoke active web sessions.
+    Reset {
+        /// New password (at least 8 characters).
+        #[arg(long)]
+        password: Option<String>,
+        /// Read the new password from stdin instead of --password.
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 impl Cli {
@@ -187,12 +205,40 @@ mod tests {
     }
 
     #[test]
-    fn parses_version_json_subcommand() {
-        let cli = Cli::try_parse_from(["cc-switch-server", "version", "--json"]).unwrap();
+    fn parses_password_reset_subcommand() {
+        let cli = Cli::try_parse_from([
+            "cc-switch-server",
+            "password",
+            "reset",
+            "--password",
+            "new-password-123",
+        ])
+        .unwrap();
 
         assert!(matches!(
             cli.effective_command(),
-            Command::Version { json: true }
+            Command::Password {
+                command: PasswordCommand::Reset {
+                    password: Some(value),
+                    stdin: false,
+                }
+            } if value == "new-password-123"
+        ));
+    }
+
+    #[test]
+    fn parses_password_reset_stdin_subcommand() {
+        let cli =
+            Cli::try_parse_from(["cc-switch-server", "password", "reset", "--stdin"]).unwrap();
+
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Password {
+                command: PasswordCommand::Reset {
+                    password: None,
+                    stdin: true,
+                }
+            }
         ));
     }
 }

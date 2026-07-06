@@ -20,7 +20,7 @@ import {
   type RouterDraft,
   type TunnelDraft,
 } from "@/components/settings/settingsDrafts";
-import type { RouterConfigView, RouterStatusResponse, SettingsPageData } from "@/lib/api";
+import type { RouterConfigView, RouterStatusResponse, SettingsPageData } from "@/lib/server-legacy-api";
 import { useI18n } from "@/lib/i18n";
 
 export function ProxySettingsPanel({

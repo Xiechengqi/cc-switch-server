@@ -1,7 +1,16 @@
 import { useEffect, useState } from "react";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { AlertTriangle, Info } from "lucide-react";
-
-import { useI18n } from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 
 interface ConfirmDialogProps {
   isOpen: boolean;
@@ -11,6 +20,7 @@ interface ConfirmDialogProps {
   cancelText?: string;
   variant?: "destructive" | "info";
   zIndex?: "base" | "nested" | "alert" | "top";
+  /** 可选勾选项：提供 label 即显示，勾选状态经 onConfirm 参数回传 */
   checkboxLabel?: string;
   checkboxDefaultChecked?: boolean;
   onConfirm: (checkboxChecked: boolean) => void;
@@ -30,8 +40,10 @@ export function ConfirmDialog({
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
-  const { t } = useI18n();
-  const [checkboxChecked, setCheckboxChecked] = useState(checkboxDefaultChecked);
+  const { t } = useTranslation();
+  const [checkboxChecked, setCheckboxChecked] = useState(
+    checkboxDefaultChecked,
+  );
 
   useEffect(() => {
     if (isOpen) {
@@ -39,60 +51,54 @@ export function ConfirmDialog({
     }
   }, [isOpen, checkboxDefaultChecked]);
 
-  useEffect(() => {
-    if (!isOpen) return;
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") onCancel();
-    }
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [isOpen, onCancel]);
-
-  if (!isOpen) return null;
-
   const IconComponent = variant === "info" ? Info : AlertTriangle;
-  const dialogClass = ["confirm-dialog", `confirm-dialog-${variant}`, `confirm-dialog-z-${zIndex}`].join(" ");
+  const iconClass =
+    variant === "info" ? "h-5 w-5 text-blue-500" : "h-5 w-5 text-destructive";
 
   return (
-    <div className={dialogClass} role="presentation" onMouseDown={onCancel}>
-      <section
-        className="confirm-dialog-panel"
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="confirm-dialog-title"
-        aria-describedby="confirm-dialog-description"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <header className="confirm-dialog-header">
-          <IconComponent size={20} />
-          <h2 id="confirm-dialog-title">{title}</h2>
-        </header>
-        <p id="confirm-dialog-description" className="confirm-dialog-message">
-          {message}
-        </p>
+    <Dialog
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open) {
+          onCancel();
+        }
+      }}
+    >
+      <DialogContent className="max-w-sm" zIndex={zIndex}>
+        <DialogHeader className="space-y-3 border-b-0 bg-transparent pb-0">
+          <DialogTitle className="flex items-center gap-2 text-lg font-semibold">
+            <IconComponent className={iconClass} />
+            {title}
+          </DialogTitle>
+          <DialogDescription className="whitespace-pre-line text-sm leading-relaxed">
+            {message}
+          </DialogDescription>
+        </DialogHeader>
         {checkboxLabel ? (
-          <label className="confirm-dialog-checkbox">
-            <input
-              type="checkbox"
+          <label className="flex cursor-pointer select-none items-start gap-2 px-6 pt-3">
+            <Checkbox
               checked={checkboxChecked}
-              onChange={(event) => setCheckboxChecked(event.target.checked)}
+              onCheckedChange={(value) => setCheckboxChecked(value === true)}
+              className="mt-0.5"
             />
-            <span>{checkboxLabel}</span>
+            <span className="text-sm leading-relaxed">{checkboxLabel}</span>
           </label>
         ) : null}
-        <footer className="confirm-dialog-footer">
-          <button className="secondary-button" type="button" onClick={onCancel}>
+        <DialogFooter className="flex gap-2 border-t-0 bg-transparent pt-2 sm:justify-end">
+          <Button variant="outline" onClick={onCancel}>
             {cancelText || t("common.cancel")}
-          </button>
-          <button
-            className={variant === "info" ? "primary-button" : "danger-button"}
-            type="button"
-            onClick={() => onConfirm(checkboxLabel ? checkboxChecked : false)}
+          </Button>
+          <Button
+            variant={variant === "info" ? "default" : "destructive"}
+            onClick={() =>
+              // 未渲染勾选框时不得回传 defaultChecked 残留值
+              onConfirm(checkboxLabel ? checkboxChecked : false)
+            }
           >
             {confirmText || t("common.confirm")}
-          </button>
-        </footer>
-      </section>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

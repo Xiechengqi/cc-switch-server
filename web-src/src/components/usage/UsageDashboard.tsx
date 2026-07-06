@@ -1,350 +1,397 @@
+import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { UsageHero } from "./UsageHero";
+import { UsageTrendChart } from "./UsageTrendChart";
+import { RequestLogTable } from "./RequestLogTable";
+import { ProviderStatsTable } from "./ProviderStatsTable";
+import { ModelStatsTable } from "./ModelStatsTable";
 import {
-  Loader2,
+  KNOWN_APP_TYPES,
+  type AppType,
+  type AppTypeFilter,
+  type UsageRangeSelection,
+} from "@/types/usage";
+import { motion } from "framer-motion";
+import {
+  BarChart3,
+  ListFilter,
+  Activity,
   RefreshCw,
-  RotateCcw,
+  Coins,
+  LayoutGrid,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-
+import { ProviderIcon } from "@/components/ProviderIcon";
 import {
-  AppKind,
-  backfillUsageCosts,
-  deleteModelPricing,
-  loadUsageDashboardData,
-  ModelPricingEntry,
-  ModelUsageStats,
-  ProviderLimitStatus,
-  ProviderUsageStats,
-  saveModelPricing,
-  UpdateModelPricingInput,
-  UsageLog,
-  UsageRollup,
-  UsageTrendPoint,
-} from "@/lib/api";
-import { useI18n } from "@/lib/i18n";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { DataSourceBar } from "@/components/usage/DataSourceBar";
-import { UsageFilterBar, dateTimeInput, usageRangeLabel, type UsageFilterDraft } from "@/components/usage/UsageFilterBar";
-import { ProviderLimitsGrid } from "@/components/usage/UsageLimitsGrid";
-import { UsageLogsPanel } from "@/components/usage/UsageLogsPanel";
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useQueryClient } from "@tanstack/react-query";
+import { usageKeys, useModelStats, useProviderStats } from "@/lib/query/usage";
+import { useUsageEventBridge } from "@/hooks/useUsageEventBridge";
 import {
-  emptyPricingDraft,
-  hasPricingModel,
-  PricingDefaultsModal,
-  pricingDefaultTemplates,
-  pricingDraftFromDefault,
-  pricingDraftFromModel,
-  pricingInputFromModel,
-  PricingModal,
-  UsagePricingPanel,
-  type PricingDraft,
-} from "@/components/usage/UsagePricingPanel";
-import { ModelRankingGrid, ProviderRankingGrid } from "@/components/usage/UsageRankingGrid";
-import { UsageRequestDetailModal } from "@/components/usage/UsageRequestDetailModal";
-import { UsageSummaryGrid } from "@/components/usage/UsageSummaryGrid";
-import { UsageTabs, type UsageTab } from "@/components/usage/UsageTabs";
-import { UsageTrendPanel } from "@/components/usage/UsageTrendPanel";
-import {
-  dataSourceBreakdown,
-  defaultFilterDraft,
-  emptyRollup,
-  errorMessage,
-  filterFromDraft,
-  filterProviderLimits,
-} from "@/components/usage/usageState";
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
+import { PricingConfigPanel } from "@/components/usage/PricingConfigPanel";
+import { cn } from "@/lib/utils";
+import { getLocaleFromLanguage } from "./format";
+import { getUsageRangePresetLabel, resolveUsageRange } from "@/lib/usageRange";
+import { UsageDateRangePicker } from "./UsageDateRangePicker";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
-export interface UsageInitialFocus {
-  app: AppKind;
-  providerId: string;
-  tab: UsageTab;
-  key: number;
-}
+const APP_FILTER_OPTIONS: AppTypeFilter[] = ["all", ...KNOWN_APP_TYPES];
 
-interface UsageDashboardState {
-  summary: UsageRollup;
-  trends: UsageTrendPoint[];
-  providers: ProviderUsageStats[];
-  models: ModelUsageStats[];
-  logs: UsageLog[];
-  sourceLogs: UsageLog[];
-  pricing: ModelPricingEntry[];
-  limits: ProviderLimitStatus[];
-}
+// 0 表示关闭自动刷新（refetchInterval=false）
+const REFRESH_INTERVAL_OPTIONS_MS = [0, 5000, 10000, 30000, 60000] as const;
 
-const emptyState: UsageDashboardState = {
-  summary: emptyRollup(),
-  trends: [],
-  providers: [],
-  models: [],
-  logs: [],
-  sourceLogs: [],
-  pricing: [],
-  limits: [],
+// 与 AppSwitcher 的 appIconName 保持一致（codex 复用 openai 图标）
+const APP_FILTER_ICON: Record<AppType, string> = {
+  claude: "claude",
+  codex: "openai",
+  gemini: "gemini",
+  opencode: "opencode",
 };
 
-export function UsageDashboard({ initialFocus }: { initialFocus?: UsageInitialFocus | null }) {
-  const { t, tx } = useI18n();
-  const [filterDraft, setFilterDraft] = useState<UsageFilterDraft>(defaultFilterDraft());
-  const [data, setData] = useState<UsageDashboardState>(emptyState);
-  const [activeTab, setActiveTab] = useState<UsageTab>("logs");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [result, setResult] = useState<string | null>(null);
-  const [detailId, setDetailId] = useState<string | null>(null);
-  const [pricingDraft, setPricingDraft] = useState<PricingDraft | null>(null);
-  const [pricingDefaultsOpen, setPricingDefaultsOpen] = useState(false);
-  const [pricingDeleteId, setPricingDeleteId] = useState<string | null>(null);
-  const [backfillConfirmOpen, setBackfillConfirmOpen] = useState(false);
-  const [pricingDefaultsConfirmOpen, setPricingDefaultsConfirmOpen] = useState(false);
+// Select 的 "all" 哨兵和用户自定义名称同处一个值域——真有来源/模型叫 "all"
+// 就会撞名（重复 value、选中即清空筛选）。动态选项统一加前缀编码隔离值域。
+const DYNAMIC_OPTION_PREFIX = "v:";
+const encodeOptionValue = (name: string) => `${DYNAMIC_OPTION_PREFIX}${name}`;
+const decodeOptionValue = (value: string) =>
+  value === "all" ? undefined : value.slice(DYNAMIC_OPTION_PREFIX.length);
 
-  const filter = useMemo(() => filterFromDraft(filterDraft), [filterDraft]);
-  const dataSources = useMemo(() => dataSourceBreakdown(data.sourceLogs), [data.sourceLogs]);
-  const visibleLimits = useMemo(
-    () => filterProviderLimits(data.limits, filterDraft),
-    [data.limits, filterDraft],
+export function UsageDashboard() {
+  const { t, i18n } = useTranslation();
+  const queryClient = useQueryClient();
+  const [range, setRange] = useState<UsageRangeSelection>({ preset: "today" });
+  const [appType, setAppType] = useState<AppTypeFilter>("all");
+  const [providerName, setProviderName] = useState<string | undefined>(
+    undefined,
+  );
+  const [model, setModel] = useState<string | undefined>(undefined);
+  const [refreshIntervalMs, setRefreshIntervalMs] = useState(30000);
+
+  // 切应用时清掉下游筛选，避免留下一个在新范围内查无数据的"幽灵"组合；
+  // 切 Provider 同理清掉模型（模型选项随 Provider 级联）。
+  const changeAppType = (next: AppTypeFilter) => {
+    setAppType(next);
+    if (next !== appType) {
+      setProviderName(undefined);
+      setModel(undefined);
+    }
+  };
+  const changeProviderName = (next: string | undefined) => {
+    setProviderName(next);
+    if (next !== providerName) {
+      setModel(undefined);
+    }
+  };
+
+  // 后端写入新日志时 emit `usage-log-recorded`，本 hook 立刻 invalidate 所有
+  // usage 查询，实现实时刷新（仅在 Dashboard 挂载时生效，离开页面自动取消监听）
+  useUsageEventBridge();
+
+  const changeRefreshInterval = (next: number) => {
+    setRefreshIntervalMs(next);
+    queryClient.invalidateQueries({ queryKey: usageKeys.all });
+  };
+
+  const language = i18n.resolvedLanguage || i18n.language || "en";
+  const locale = getLocaleFromLanguage(language);
+  const resolvedRange = useMemo(() => resolveUsageRange(range), [range]);
+  const rangeLabel = useMemo(() => {
+    if (range.preset !== "custom") {
+      return getUsageRangePresetLabel(range.preset, t);
+    }
+
+    const startStr = new Date(resolvedRange.startDate * 1000).toLocaleString(
+      locale,
+    );
+
+    if (range.liveEndTime) {
+      return `${startStr} → ${t("usage.liveEndTimeNow", "现在")}`;
+    }
+
+    const endStr = new Date(resolvedRange.endDate * 1000).toLocaleString(
+      locale,
+    );
+    return `${startStr} - ${endStr}`;
+  }, [locale, range, resolvedRange.endDate, resolvedRange.startDate, t]);
+
+  // 顶栏下拉的选项池：Provider 列表只跟应用/时间范围走（不受自身选中值影响），
+  // 模型列表随所选 Provider 级联。两者都只列当前范围内真实有数据的条目。
+  // refetchInterval 必须跟随面板的刷新设置——未筛选时这两个查询与统计表共享
+  // query key，落下的话会以默认 30s 拖着同 key 查询一起轮询，"--" 形同虚设。
+  const optionsRefetch = {
+    refetchInterval:
+      refreshIntervalMs > 0 ? refreshIntervalMs : (false as const),
+  };
+  const { data: providerOptionsData } = useProviderStats(
+    range,
+    { appType },
+    optionsRefetch,
+  );
+  const { data: modelOptionsData } = useModelStats(
+    range,
+    { appType, providerName },
+    optionsRefetch,
   );
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      setData(await loadUsageDashboardData(filter));
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setLoading(false);
+  const providerOptions = useMemo(() => {
+    const names = new Set<string>();
+    for (const stat of providerOptionsData ?? []) {
+      names.add(stat.providerName);
     }
-  }, [filter]);
+    // 数据刷新后选中项可能掉出列表（如改了时间范围）；补回去保证 Select
+    // 仍能渲染选中文案，用户看得见才能主动清除。
+    if (providerName) names.add(providerName);
+    return Array.from(names);
+  }, [providerOptionsData, providerName]);
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  useEffect(() => {
-    if (!initialFocus?.providerId) return;
-    setFilterDraft((draft) => ({
-      ...draft,
-      app: initialFocus.app,
-      providerId: initialFocus.providerId,
-      shareId: "",
-      userEmail: "",
-      sessionId: "",
-    }));
-    setActiveTab(initialFocus.tab);
-  }, [initialFocus?.app, initialFocus?.key, initialFocus?.providerId, initialFocus?.tab]);
-
-  async function runBackfill() {
-    setBusy("backfill");
-    setError(null);
-    try {
-      const updated = await backfillUsageCosts();
-      setResult(tx("backfilled {{count}} usage records", { count: updated }));
-      await refresh();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(null);
+  const modelOptions = useMemo(() => {
+    const names = new Set<string>();
+    for (const stat of modelOptionsData ?? []) {
+      names.add(stat.model);
     }
-  }
-
-  async function submitPricing(input: UpdateModelPricingInput) {
-    setBusy("pricing");
-    setError(null);
-    try {
-      const saved = await saveModelPricing(input);
-      setResult(tx("saved {{model}}; backfilled {{count}}", {
-        model: saved.model.modelId,
-        count: saved.backfilled,
-      }));
-      setPricingDraft(null);
-      await refresh();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function applyPricingTemplate(template: ModelPricingEntry) {
-    setBusy(`template:${template.modelId}`);
-    setError(null);
-    try {
-      const saved = await saveModelPricing(pricingInputFromModel(template));
-      setResult(tx("applied {{model}}; backfilled {{count}}", {
-        model: saved.model.modelId,
-        count: saved.backfilled,
-      }));
-      await refresh();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function applyMissingPricingTemplates() {
-    const missing = pricingDefaultTemplates.filter((template) => !hasPricingModel(data.pricing, template.modelId));
-    if (!missing.length) {
-      setResult(tx("all default pricing models already exist"));
-      return;
-    }
-    setBusy("pricing-defaults");
-    setError(null);
-    try {
-      let backfilled = 0;
-      for (const template of missing) {
-        const saved = await saveModelPricing(pricingInputFromModel(template));
-        backfilled += saved.backfilled;
-      }
-      setResult(tx("applied {{count}} default pricing models; backfilled {{backfilled}}", {
-        count: missing.length,
-        backfilled,
-      }));
-      await refresh();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function removePricing(modelId: string) {
-    setBusy(`delete:${modelId}`);
-    setError(null);
-    try {
-      const deleted = await deleteModelPricing(modelId);
-      setResult(deleted ? tx("deleted {{model}}", { model: modelId }) : tx("{{model}} was not found", { model: modelId }));
-      await refresh();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(null);
-    }
-  }
+    if (model) names.add(model);
+    return Array.from(names);
+  }, [modelOptionsData, model]);
 
   return (
-    <div className="usage-dashboard">
-      <div className="provider-toolbar">
-        <div className="provider-toolbar-status">
-          <span>{tx(usageRangeLabel(filterDraft))}</span>
-          <span>{t("server.usage.logsLoaded", { count: data.logs.length })}</span>
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4 }}
+      className="space-y-8 pb-8"
+    >
+      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 mb-2">
+        <div className="flex flex-col gap-1">
+          <h2 className="text-2xl font-bold tracking-tight">
+            {t("usage.title")}
+          </h2>
+          <p className="text-sm text-muted-foreground">{t("usage.subtitle")}</p>
         </div>
-        <div className="provider-toolbar-actions">
-          {error && <span className="error-text">{error}</span>}
-          {result && <span className="usage-result">{result}</span>}
-          <button className="secondary-button" type="button" onClick={() => void refresh()}>
-            <RefreshCw size={15} />
-            <span>{t("common.refresh")}</span>
-          </button>
-          <button className="secondary-button" type="button" onClick={() => setBackfillConfirmOpen(true)} disabled={busy === "backfill"}>
-            {busy === "backfill" ? <Loader2 size={15} /> : <RotateCcw size={15} />}
-            <span>{t("server.usage.backfillCosts")}</span>
-          </button>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center p-1 bg-muted/30 rounded-lg border border-border/50">
+            {APP_FILTER_OPTIONS.map((type) => {
+              const label = t(`usage.appFilter.${type}`);
+              return (
+                <button
+                  key={type}
+                  type="button"
+                  onClick={() => changeAppType(type)}
+                  title={label}
+                  aria-label={label}
+                  className={cn(
+                    "flex h-8 items-center justify-center px-2.5 rounded-md transition-all",
+                    appType === type
+                      ? "bg-background text-primary shadow-sm"
+                      : "text-muted-foreground hover:text-foreground hover:bg-muted/50",
+                  )}
+                >
+                  {type === "all" ? (
+                    <LayoutGrid className="h-4 w-4" />
+                  ) : (
+                    <ProviderIcon
+                      icon={APP_FILTER_ICON[type]}
+                      name={label}
+                      size={16}
+                    />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          <Select
+            value={
+              providerName != null ? encodeOptionValue(providerName) : "all"
+            }
+            onValueChange={(v) => changeProviderName(decodeOptionValue(v))}
+          >
+            <SelectTrigger
+              className="h-9 w-[100px] bg-background text-xs focus:border-border-default [&>span]:min-w-0 [&>span]:truncate"
+              title={providerName ?? t("usage.filterBySource")}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent className="max-w-[280px]">
+              <SelectItem value="all">{t("usage.allSources")}</SelectItem>
+              {providerOptions.map((name) => (
+                <SelectItem
+                  key={name}
+                  value={encodeOptionValue(name)}
+                  title={name}
+                  className="[&>span]:min-w-0 [&>span]:truncate"
+                >
+                  {name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <Select
+            value={model != null ? encodeOptionValue(model) : "all"}
+            onValueChange={(v) => setModel(decodeOptionValue(v))}
+          >
+            <SelectTrigger
+              className="h-9 w-[100px] bg-background text-xs focus:border-border-default [&>span]:min-w-0 [&>span]:truncate"
+              title={model ?? t("usage.filterByModel")}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent className="max-w-[280px]">
+              <SelectItem value="all">{t("usage.allModels")}</SelectItem>
+              {modelOptions.map((name) => (
+                <SelectItem
+                  key={name}
+                  value={encodeOptionValue(name)}
+                  title={name}
+                  className="[&>span]:min-w-0 [&>span]:truncate"
+                >
+                  {name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <div className="flex items-center gap-2 ml-auto lg:ml-0">
+            <Select
+              value={String(refreshIntervalMs)}
+              onValueChange={(v) => changeRefreshInterval(Number(v))}
+            >
+              <SelectTrigger
+                className="h-9 w-[100px] bg-background text-xs focus:border-border-default"
+                title={t("usage.refreshInterval")}
+                aria-label={t("usage.refreshInterval")}
+              >
+                <span className="flex items-center gap-2">
+                  <RefreshCw className="h-3.5 w-3.5 shrink-0" />
+                  <SelectValue />
+                </span>
+              </SelectTrigger>
+              <SelectContent>
+                {REFRESH_INTERVAL_OPTIONS_MS.map((ms) => (
+                  <SelectItem key={ms} value={String(ms)}>
+                    {ms > 0 ? `${ms / 1000}s` : t("usage.refreshOff")}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <UsageDateRangePicker
+              selection={range}
+              triggerLabel={rangeLabel}
+              onApply={(nextRange) => setRange(nextRange)}
+            />
+          </div>
         </div>
       </div>
 
-      <UsageFilterBar draft={filterDraft} onChange={setFilterDraft} />
-
-      <DataSourceBar
-        sources={dataSources}
-        loading={loading}
-        activeSource={filterDraft.dataSource.trim()}
-        onSelect={(dataSource) => setFilterDraft((draft) => ({ ...draft, dataSource }))}
+      <UsageHero
+        range={range}
+        appType={appType === "all" ? undefined : appType}
+        providerName={providerName}
+        model={model}
+        refreshIntervalMs={refreshIntervalMs}
       />
 
-      <UsageSummaryGrid summary={data.summary} loading={loading} />
-
-      <UsageTrendPanel
-        trends={data.trends}
-        loading={loading}
-        onSelectRange={(point) =>
-          setFilterDraft((draft) => ({
-            ...draft,
-            range: "custom",
-            customFrom: dateTimeInput(point.startMs),
-            customTo: dateTimeInput(point.endMs),
-          }))
-        }
+      <UsageTrendChart
+        range={range}
+        rangeLabel={rangeLabel}
+        appType={appType}
+        providerName={providerName}
+        model={model}
+        refreshIntervalMs={refreshIntervalMs}
       />
 
-      <UsageTabs active={activeTab} onChange={setActiveTab} />
+      <div className="space-y-4">
+        <Tabs defaultValue="logs" className="w-full">
+          <div className="flex items-center justify-between mb-4">
+            <TabsList className="bg-muted/50">
+              <TabsTrigger value="logs" className="gap-2">
+                <ListFilter className="h-4 w-4" />
+                {t("usage.requestLogs")}
+              </TabsTrigger>
+              <TabsTrigger value="providers" className="gap-2">
+                <Activity className="h-4 w-4" />
+                {t("usage.providerStats")}
+              </TabsTrigger>
+              <TabsTrigger value="models" className="gap-2">
+                <BarChart3 className="h-4 w-4" />
+                {t("usage.modelStats")}
+              </TabsTrigger>
+            </TabsList>
+          </div>
 
-      {activeTab === "logs" && (
-        <UsageLogsPanel logs={data.logs} loading={loading} onDetail={(log) => setDetailId(log.requestId)} />
-      )}
-      {activeTab === "providers" && <ProviderRankingGrid providers={data.providers} loading={loading} />}
-      {activeTab === "models" && <ModelRankingGrid models={data.models} loading={loading} />}
-      {activeTab === "pricing" && (
-        <UsagePricingPanel
-          models={data.pricing}
-          busy={busy}
-          onAdd={() => setPricingDraft(emptyPricingDraft())}
-          onDefaults={() => setPricingDefaultsOpen(true)}
-          onEdit={(model) => setPricingDraft(pricingDraftFromModel(model))}
-          onDelete={setPricingDeleteId}
-        />
-      )}
-      {activeTab === "limits" && <ProviderLimitsGrid limits={visibleLimits} loading={loading} />}
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.2 }}
+          >
+            <TabsContent value="logs" className="mt-0">
+              <RequestLogTable
+                range={range}
+                rangeLabel={rangeLabel}
+                appType={appType}
+                providerName={providerName}
+                model={model}
+                refreshIntervalMs={refreshIntervalMs}
+                onRangeChange={setRange}
+              />
+            </TabsContent>
 
-      {detailId && <UsageRequestDetailModal requestId={detailId} onClose={() => setDetailId(null)} />}
+            <TabsContent value="providers" className="mt-0">
+              <ProviderStatsTable
+                range={range}
+                appType={appType}
+                providerName={providerName}
+                model={model}
+                refreshIntervalMs={refreshIntervalMs}
+              />
+            </TabsContent>
 
-      {pricingDraft && (
-        <PricingModal
-          draft={pricingDraft}
-          saving={busy === "pricing"}
-          onChange={setPricingDraft}
-          onClose={() => setPricingDraft(null)}
-          onSubmit={(input) => void submitPricing(input)}
-        />
-      )}
+            <TabsContent value="models" className="mt-0">
+              <ModelStatsTable
+                range={range}
+                appType={appType}
+                providerName={providerName}
+                model={model}
+                refreshIntervalMs={refreshIntervalMs}
+              />
+            </TabsContent>
+          </motion.div>
+        </Tabs>
+      </div>
 
-      {pricingDefaultsOpen && (
-        <PricingDefaultsModal
-          models={data.pricing}
-          busy={busy}
-          onApply={(template) => void applyPricingTemplate(template)}
-          onApplyMissing={() => setPricingDefaultsConfirmOpen(true)}
-          onEdit={(template) => {
-            setPricingDefaultsOpen(false);
-            setPricingDraft(pricingDraftFromDefault(template, hasPricingModel(data.pricing, template.modelId)));
-          }}
-          onClose={() => setPricingDefaultsOpen(false)}
-        />
-      )}
-      <ConfirmDialog
-        isOpen={backfillConfirmOpen}
-        title={tx("Backfill usage costs")}
-        message={tx("Recalculate costs for existing usage records using current pricing rules? Historical cost values may change.")}
-        confirmText={tx("Backfill")}
-        onConfirm={() => {
-          setBackfillConfirmOpen(false);
-          void runBackfill();
-        }}
-        onCancel={() => setBackfillConfirmOpen(false)}
-      />
-      <ConfirmDialog
-        isOpen={pricingDefaultsConfirmOpen}
-        title={tx("Apply default pricing")}
-        message={tx("Apply missing default pricing templates? Existing usage records may be backfilled with new costs.")}
-        confirmText={tx("Apply Missing")}
-        onConfirm={() => {
-          setPricingDefaultsConfirmOpen(false);
-          void applyMissingPricingTemplates();
-        }}
-        onCancel={() => setPricingDefaultsConfirmOpen(false)}
-      />
-      <ConfirmDialog
-        isOpen={pricingDeleteId !== null}
-        title={tx("Delete pricing")}
-        message={tx("Delete pricing for {{model}}?", { model: pricingDeleteId || "-" })}
-        confirmText={tx("Delete")}
-        onConfirm={() => {
-          const modelId = pricingDeleteId;
-          setPricingDeleteId(null);
-          if (modelId) void removePricing(modelId);
-        }}
-        onCancel={() => setPricingDeleteId(null)}
-      />
-    </div>
+      <Accordion type="multiple" defaultValue={[]} className="w-full space-y-4">
+        <AccordionItem
+          value="pricing"
+          className="rounded-xl glass-card overflow-hidden"
+        >
+          <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+            <div className="flex items-center gap-3">
+              <Coins className="h-5 w-5 text-yellow-500" />
+              <div className="text-left">
+                <h3 className="text-base font-semibold">
+                  {t("settings.advanced.pricing.title")}
+                </h3>
+                <p className="text-sm text-muted-foreground font-normal">
+                  {t("settings.advanced.pricing.description")}
+                </p>
+              </div>
+            </div>
+          </AccordionTrigger>
+          <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+            <PricingConfigPanel />
+          </AccordionContent>
+        </AccordionItem>
+      </Accordion>
+    </motion.div>
   );
 }

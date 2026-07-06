@@ -186,6 +186,22 @@ impl ServerConfig {
         Ok(())
     }
 
+    pub fn set_password(&mut self, new_password: &str) -> anyhow::Result<()> {
+        self.auth.password_hash = Some(hash_secret(new_password, 8)?);
+        Ok(())
+    }
+
+    pub fn change_password(
+        &mut self,
+        current_password: &str,
+        new_password: &str,
+    ) -> anyhow::Result<()> {
+        if !self.verify_password(current_password) {
+            bail!("invalid current password");
+        }
+        self.set_password(new_password)
+    }
+
     pub fn from_setup(input: SetupInput) -> anyhow::Result<Self> {
         let owner_email = normalize_email(&input.owner_email)?;
         let router_url = normalize_router_url(&input.router_url)?;
@@ -499,6 +515,26 @@ mod tests {
         });
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn change_password_updates_hash_and_rejects_invalid_current() {
+        let mut config = ServerConfig::from_setup(SetupInput {
+            password: "password123".to_string(),
+            owner_email: "owner@example.com".to_string(),
+            router_url: "https://router.example.com".to_string(),
+            client_tunnel_subdomain: Some("owner".to_string()),
+        })
+        .unwrap();
+
+        assert!(config
+            .change_password("password123", "newpassword1")
+            .is_ok());
+        assert!(config.verify_password("newpassword1"));
+        assert!(!config.verify_password("password123"));
+        assert!(config
+            .change_password("wrong-password", "anotherpass1")
+            .is_err());
     }
 
     #[test]

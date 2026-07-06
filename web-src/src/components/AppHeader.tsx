@@ -1,7 +1,7 @@
 import { Network, Radio, Shuffle } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
-import { AppKind, BuildInfo } from "@/lib/api";
+import { AppKind, BuildInfo } from "@/lib/server-legacy-api";
 import { invokeCommand, jsonFetch } from "@/lib/runtime";
 import { useI18n } from "@/lib/i18n";
 

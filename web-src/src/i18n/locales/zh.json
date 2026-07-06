@@ -324,6 +324,21 @@
       "copilotDescription": "管理 GitHub Copilot 账号",
       "codexOauthDescription": "管理 ChatGPT 账号"
     },
+    "serverSecurity": {
+      "changePasswordTitle": "密码修改",
+      "changePasswordDescription": "修改管理员登录密码。",
+      "currentPassword": "当前密码",
+      "newPassword": "新密码",
+      "confirmPassword": "确认新密码",
+      "changePassword": "修改密码",
+      "passwordMismatch": "两次输入的新密码不一致",
+      "passwordMinLength": "新密码至少 8 位",
+      "passwordChanged": "密码已修改",
+      "passwordChangedSignOut": "密码已修改，请使用新密码重新登录",
+      "passwordSavedHint": "密码已保存。",
+      "changePasswordAgain": "重新设置",
+      "signOut": "登出"
+    },
     "advanced": {
       "configDir": {
         "title": "配置文件目录",

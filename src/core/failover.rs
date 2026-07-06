@@ -76,7 +76,7 @@ pub struct ProviderBreaker {
 }
 
 impl ProviderBreaker {
-    fn new(app: AppKind, provider_id: &str) -> Self {
+    pub fn new(app: AppKind, provider_id: &str) -> Self {
         Self {
             app,
             provider_id: provider_id.to_string(),
@@ -109,7 +109,7 @@ pub struct FailoverSnapshot {
     pub breakers: Vec<ProviderBreaker>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateFailoverAppInput {
     #[serde(default)]

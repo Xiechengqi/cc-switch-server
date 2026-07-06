@@ -26,6 +26,7 @@ use crate::core::router_client::{
 };
 use crate::core::shares::{ShareMarketGrantStatus, ShareStore};
 use crate::core::tunnel::{self, LeaseFn, TunnelSupervisor};
+use crate::core::ui_settings::UiSettingsStore;
 use crate::core::universal_providers::UniversalProviderStore;
 use crate::core::usage::{UsageLog, UsageStore};
 use crate::coverage::ProviderCoverage;
@@ -45,6 +46,7 @@ pub struct ServerStateInner {
     pub pricing: RwLock<ModelPricingStore>,
     pub usage: RwLock<UsageStore>,
     pub shares: RwLock<ShareStore>,
+    pub ui_settings: RwLock<UiSettingsStore>,
     pub sessions: RwLock<Vec<Session>>,
     pub oauth_logins: RwLock<OAuthLoginStore>,
     pub kiro_device_flows: RwLock<KiroDeviceFlowStore>,
@@ -55,6 +57,7 @@ pub struct ServerStateInner {
     pub http_client: RwLock<reqwest::Client>,
     pub events: broadcast::Sender<ServerEvent>,
     pub tunnels: Arc<TunnelSupervisor>,
+    pub web_auth: crate::core::web_auth::WebAuthStore,
     pub debounced_saves: Arc<DebouncedStoreSaves>,
 }
 
@@ -284,11 +287,13 @@ impl ServerStateInner {
         let pricing = ModelPricingStore::load_or_default(&config_dir)?;
         let usage = UsageStore::load_or_default(&config_dir)?;
         let shares = ShareStore::load_or_default(&config_dir)?;
+        let ui_settings = UiSettingsStore::load_or_default(&config_dir)?;
         let bind_addr = SocketAddr::new(cli.host, cli.port);
         let http_client = build_http_client(&config, bind_addr)?;
         let (events, _) = broadcast::channel(256);
 
         let tunnels = TunnelSupervisor::load_or_default(&config_dir)?;
+        let web_auth = crate::core::web_auth::WebAuthStore::load(config_dir.clone());
 
         Ok(Arc::new(Self {
             bind_addr,
@@ -303,6 +308,7 @@ impl ServerStateInner {
             pricing: RwLock::new(pricing),
             usage: RwLock::new(usage),
             shares: RwLock::new(shares),
+            ui_settings: RwLock::new(ui_settings),
             sessions: RwLock::new(Vec::new()),
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
@@ -313,6 +319,7 @@ impl ServerStateInner {
             http_client: RwLock::new(http_client),
             events,
             tunnels,
+            web_auth,
             debounced_saves: Arc::new(DebouncedStoreSaves::default()),
         }))
     }
@@ -335,6 +342,7 @@ impl ServerStateInner {
         let pricing = ModelPricingStore::load_or_default(&self.config_dir)?;
         let usage = UsageStore::load_or_default(&self.config_dir)?;
         let shares = ShareStore::load_or_default(&self.config_dir)?;
+        let ui_settings = UiSettingsStore::load_or_default(&self.config_dir)?;
 
         *self.http_client.write().await = http_client;
         *self.config.write().await = config;
@@ -345,6 +353,7 @@ impl ServerStateInner {
         *self.pricing.write().await = pricing;
         *self.usage.write().await = usage;
         *self.shares.write().await = shares;
+        *self.ui_settings.write().await = ui_settings;
         self.tunnels.reload_statuses().await?;
         Ok(())
     }
@@ -387,6 +396,10 @@ impl ServerStateInner {
 
     pub async fn save_shares(&self) -> anyhow::Result<()> {
         self.shares.read().await.save(&self.config_dir)
+    }
+
+    pub async fn save_ui_settings(&self) -> anyhow::Result<()> {
+        self.ui_settings.read().await.save(&self.config_dir)
     }
 }
 

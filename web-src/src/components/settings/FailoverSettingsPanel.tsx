@@ -5,7 +5,7 @@ import { KeyValue } from "@/components/KeyValue";
 import { StatusPill } from "@/components/StatusPill";
 import { SectionHeader } from "@/components/settings/SettingsSectionHeader";
 import { APP_KINDS, appLabel, type FailoverDraft } from "@/components/settings/settingsDrafts";
-import type { AppKind, FailoverSnapshot, StoredProvider } from "@/lib/api";
+import type { AppKind, FailoverSnapshot, StoredProvider } from "@/lib/server-legacy-api";
 import { useI18n } from "@/lib/i18n";
 
 export function FailoverSettingsPanel({

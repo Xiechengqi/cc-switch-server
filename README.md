@@ -245,6 +245,8 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 ## 文档
 
 - [上游吸收台账](UPSTREAM_IMPORT.md)
+- [UI 对齐实施计划](docs/server-desktop-ui-parity-plan.md)
+- [UI 人工验收清单](docs/manual-ui-checklist.md)
 - [部署](docs/deployment.md)
 - [真实验收 runbook](docs/real-acceptance-runbook.md)
 - [provider 覆盖](docs/provider-coverage.md)

@@ -1,5 +1,5 @@
 import { inferIconForText } from "@/config/iconInference";
-import type { AccountManagerCapability, AccountRecord } from "@/lib/api";
+import type { AccountManagerCapability, AccountRecord } from "@/lib/server-legacy-api";
 
 export interface BankedResetCredit {
   id?: string | null;

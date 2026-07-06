@@ -1,526 +1,619 @@
-import { Languages, RefreshCw } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-
 import {
-  BackupManifest,
-  AppKind,
-  FailoverSnapshot,
-  batchSyncRouterShares,
-  claimClientTunnel,
-  createBackup,
-  heartbeatRouter,
-  loadFailoverSnapshot,
-  loadSettingsPageData,
-  loadStoredProviders,
-  registerRouter,
-  restoreBackup,
-  rotateApiToken,
-  requestEmailLoginCode,
-  SettingsPageData,
-  startClientTunnel,
-  stopClientTunnel,
-  StoredProvider,
-  updateFailoverApp,
-  updateClientTunnel,
-  updateRouterConfig,
-  updateUpstreamProxy,
-  verifyEmailLoginCode,
-} from "@/lib/api";
-import { Language, useI18n } from "@/lib/i18n";
-import { getWebRuntimeContext, WebRuntimeContext, writeToken } from "@/lib/runtime";
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { motion } from "framer-motion";
 import {
-  AuthSettingsPanel,
-  BackupSettingsPanel,
-  DiagnosticsSettingsPanel,
-} from "@/components/settings/SettingsAccountPanels";
-import { FailoverSettingsPanel } from "@/components/settings/FailoverSettingsPanel";
+  Loader2,
+  Save,
+  FolderSearch,
+  Database,
+  Cloud,
+  ScrollText,
+  HardDriveDownload,
+  FlaskConical,
+} from "lucide-react";
+import { toast } from "sonner";
 import {
-  ProxySettingsPanel,
-  RouterSettingsPanel,
-  TunnelSettingsPanel,
-} from "@/components/settings/SettingsConnectionPanels";
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
-  AboutPanel,
-  DirectoryPanel,
-  SettingsOverviewStrip,
-  SettingsReadinessPanel,
-  ThemeSettingsPanel,
-} from "@/components/settings/SettingsInfoPanels";
-import { ImportExportPanel } from "@/components/settings/ImportExportPanel";
-import { SectionHeader } from "@/components/settings/SettingsSectionHeader";
-import {
-  appLabel,
-  emptyEmailDraft,
-  emptyFailoverDrafts,
-  emptyProxyDraft,
-  emptyRouterDraft,
-  emptyTunnelDraft,
-  errorMessage,
-  failoverDraftsFrom,
-  isClientTunnelRunning,
-  positiveInteger,
-  routerDraftFrom,
-  routerStatusText,
-  tunnelDraftFrom,
-  type EmailDraft,
-  type FailoverDraft,
-  type ProxyDraft,
-  type RouterDraft,
-  type TunnelDraft,
-} from "@/components/settings/settingsDrafts";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { LoadingBlock } from "@/components/LoadingBlock";
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Button } from "@/components/ui/button";
+import { settingsApi } from "@/lib/api";
+import { LanguageSettings } from "@/components/settings/LanguageSettings";
+import { ThemeSettings } from "@/components/settings/ThemeSettings";
+import { WindowSettings } from "@/components/settings/WindowSettings";
+import { AppVisibilitySettings } from "@/components/settings/AppVisibilitySettings";
+import { SkillStorageLocationSettings } from "@/components/settings/SkillStorageLocationSettings";
+import { SkillSyncMethodSettings } from "@/components/settings/SkillSyncMethodSettings";
+import { TerminalSettings } from "@/components/settings/TerminalSettings";
+import { DirectorySettings } from "@/components/settings/DirectorySettings";
+import { ImportExportSection } from "@/components/settings/ImportExportSection";
+import { BackupListSection } from "@/components/settings/BackupListSection";
+import { WebdavSyncSection } from "@/components/settings/WebdavSyncSection";
+import { AboutSection } from "@/components/settings/AboutSection";
+import { ProxyTabContent } from "@/components/settings/ProxyTabContent";
+import { ModelTestConfigPanel } from "@/components/usage/ModelTestConfigPanel";
+import { UsageDashboard } from "@/components/usage/UsageDashboard";
+import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
+import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
+import type { ServerSettingsTab } from "@/components/settings/ServerSettingsExtensions";
+import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
+import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySettings";
+import { useInstalledSkills } from "@/hooks/useSkills";
+import { useSettings } from "@/hooks/useSettings";
+import { useImportExport } from "@/hooks/useImportExport";
+import { useTranslation } from "react-i18next";
+import type { SettingsFormState } from "@/hooks/useSettings";
+import { isServerWebRuntime } from "@/lib/runtime";
 
 export type SettingsTab =
   | "general"
-  | "language"
-  | "theme"
-  | "directory"
   | "proxy"
-  | "failover"
-  | "router"
-  | "tunnel"
   | "auth"
-  | "backup"
-  | "importExport"
-  | "diagnostics"
-  | "about";
+  | "advanced"
+  | "usage"
+  | "about"
+  | ServerSettingsTab;
 
-const settingsTabs: Array<{ id: SettingsTab; label: string }> = [
-  { id: "general", label: "General" },
-  { id: "language", label: "Language" },
-  { id: "theme", label: "Theme" },
-  { id: "directory", label: "Directory" },
-  { id: "proxy", label: "Proxy" },
-  { id: "failover", label: "Failover" },
-  { id: "router", label: "Router" },
-  { id: "tunnel", label: "Tunnel" },
-  { id: "auth", label: "Auth" },
-  { id: "backup", label: "Backup" },
-  { id: "importExport", label: "Import / Export" },
-  { id: "diagnostics", label: "Diagnostics" },
-  { id: "about", label: "About" },
-];
+interface SettingsDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onImportSuccess?: () => void | Promise<void>;
+  defaultTab?: SettingsTab;
+  onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
+}
 
-export function SettingsPage({ initialTab = "general" }: { initialTab?: SettingsTab }) {
-  const { language, languages, setLanguage, t, tx } = useI18n();
-  const [data, setData] = useState<SettingsPageData | null>(null);
-  const [runtimeContext, setRuntimeContext] = useState<WebRuntimeContext | null>(null);
-  const [failoverSnapshot, setFailoverSnapshot] = useState<FailoverSnapshot>({ apps: {}, breakers: [] });
-  const [settingsProviders, setSettingsProviders] = useState<StoredProvider[]>([]);
-  const [routerDraft, setRouterDraft] = useState<RouterDraft>(emptyRouterDraft());
-  const [tunnelDraft, setTunnelDraft] = useState<TunnelDraft>(emptyTunnelDraft());
-  const [proxyDraft, setProxyDraft] = useState<ProxyDraft>(emptyProxyDraft());
-  const [failoverDrafts, setFailoverDrafts] = useState<Record<AppKind, FailoverDraft>>(emptyFailoverDrafts());
-  const [emailDraft, setEmailDraft] = useState<EmailDraft>(emptyEmailDraft());
-  const [backupReason, setBackupReason] = useState("");
-  const [apiToken, setApiToken] = useState<string | null>(null);
-  const [apiTokenCopyStatus, setApiTokenCopyStatus] = useState<{ tone: "success" | "warning"; message: string } | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
-  const [restoreConfirm, setRestoreConfirm] = useState<BackupManifest | null>(null);
-  const [rotateTokenConfirm, setRotateTokenConfirm] = useState(false);
-  const [routerSyncConfirm, setRouterSyncConfirm] = useState(false);
-  const settingsPageRef = useRef<HTMLDivElement>(null);
-  const clientTunnelRunning = isClientTunnelRunning(data?.tunnel.runtimeStatus?.status);
+export function SettingsPage({
+  open,
+  onOpenChange,
+  onImportSuccess,
+  defaultTab = "general",
+  onSignOut,
+}: SettingsDialogProps) {
+  const { t } = useTranslation();
+  const {
+    settings,
+    isLoading,
+    isSaving,
+    isPortable,
+    appConfigDir,
+    resolvedDirs,
+    updateSettings,
+    updateDirectory,
+    updateAppConfigDir,
+    browseDirectory,
+    browseAppConfigDir,
+    resetDirectory,
+    resetAppConfigDir,
+    saveSettings,
+    autoSaveSettings,
+    requiresRestart,
+    acknowledgeRestart,
+  } = useSettings();
+
+  const {
+    selectedFile,
+    status: importStatus,
+    errorMessage,
+    backupId,
+    isImporting,
+    selectImportFile,
+    importConfig,
+    exportConfig,
+    clearSelection,
+    resetStatus,
+    serverFileInputRef,
+    onServerFileSelected,
+  } = useImportExport({ onImportSuccess });
+
+  const serverMode = isServerWebRuntime();
+  const { data: installedSkills } = useInstalledSkills({ enabled: !serverMode });
+
+  const [activeTab, setActiveTab] = useState<string>("general");
+  const [showRestartPrompt, setShowRestartPrompt] = useState(false);
+  const tabScrollContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setActiveTab(initialTab);
-  }, [initialTab]);
+    if (open) {
+      const normalizedTab =
+        defaultTab === "router" ||
+        defaultTab === "tunnel" ||
+        defaultTab === "failover" ||
+        defaultTab === "diagnostics" ||
+        defaultTab === "backup" ||
+        defaultTab === "importExport"
+          ? "advanced"
+          : defaultTab;
+      setActiveTab(normalizedTab);
+      resetStatus();
+    }
+  }, [open, resetStatus, defaultTab]);
+
+  useEffect(() => {
+    if (requiresRestart) {
+      setShowRestartPrompt(true);
+    }
+  }, [requiresRestart]);
 
   useLayoutEffect(() => {
-    if (settingsPageRef.current) {
-      settingsPageRef.current.scrollTop = 0;
+    if (tabScrollContainerRef.current) {
+      tabScrollContainerRef.current.scrollTop = 0;
     }
   }, [activeTab]);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  const closeAfterSave = useCallback(() => {
+    // 保存成功后关闭：不再重置语言，避免需要“保存两次”才生效
+    acknowledgeRestart();
+    clearSelection();
+    resetStatus();
+    onOpenChange(false);
+  }, [acknowledgeRestart, clearSelection, onOpenChange, resetStatus]);
+
+  const handleSave = useCallback(async () => {
     try {
-      const [next, context, snapshot, providers] = await Promise.all([
-        loadSettingsPageData(),
-        getWebRuntimeContext().catch(() => null),
-        loadFailoverSnapshot(),
-        loadStoredProviders(),
-      ]);
-      setData(next);
-      setRuntimeContext(context);
-      setFailoverSnapshot(snapshot);
-      setSettingsProviders(providers);
-      setFailoverDrafts(failoverDraftsFrom(snapshot));
-      setRouterDraft(routerDraftFrom(next.router));
-      setTunnelDraft(tunnelDraftFrom(next.tunnel));
-      setProxyDraft({
-        url: "",
-        clear: false,
-        followSystemProxy: next.config.upstreamProxy.followSystemProxy,
-      });
-      setEmailDraft((current) => ({
-        ...current,
-        email: current.email || next.config.ownerEmail || "",
-      }));
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setLoading(false);
+      const result = await saveSettings(undefined, { silent: false });
+      if (!result) return;
+      if (result.requiresRestart) {
+        setShowRestartPrompt(true);
+        return;
+      }
+      closeAfterSave();
+    } catch (error) {
+      console.error("[SettingsPage] Failed to save settings", error);
     }
-  }, []);
+  }, [closeAfterSave, saveSettings]);
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  const handleRestartLater = useCallback(() => {
+    setShowRestartPrompt(false);
+    closeAfterSave();
+  }, [closeAfterSave]);
 
-  async function runAction(action: string, task: () => Promise<string>) {
-    setBusy(action);
-    setError(null);
-    try {
-      setResult(await task());
-      await refresh();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function saveRouter(event: FormEvent) {
-    event.preventDefault();
-    await runAction("router-save", async () => {
-      const router = await updateRouterConfig({
-        url: routerDraft.url,
-        apiBase: routerDraft.apiBase,
-        domain: routerDraft.domain,
-        region: routerDraft.region,
-        sshHost: routerDraft.sshHost,
-        sshUser: routerDraft.sshUser,
-        custom: routerDraft.custom,
-      });
-      return tx("router saved: {{value}}", { value: router.url || "-" });
-    });
-  }
-
-  async function saveTunnel(event: FormEvent) {
-    event.preventDefault();
-    await runAction("tunnel-save", async () => {
-      const tunnel = await updateClientTunnel({
-        tunnelSubdomain: tunnelDraft.tunnelSubdomain,
-        tunnelStatus: tunnelDraft.tunnelStatus,
-      });
-      return tx("client tunnel saved: {{value}}", { value: tunnel.tunnelSubdomain || "-" });
-    });
-  }
-
-  async function saveProxy(event: FormEvent) {
-    event.preventDefault();
-    await runAction("proxy-save", async () => {
-      const proxy = await updateUpstreamProxy({
-        url: proxyDraft.url.trim() || undefined,
-        clear: proxyDraft.clear,
-        followSystemProxy: proxyDraft.followSystemProxy,
-      });
-      return proxy.enabled
-        ? tx("proxy saved: {{value}}", { value: proxy.maskedUrl || tx("configured") })
-        : tx("proxy disabled");
-    });
-  }
-
-  async function saveFailover(app: AppKind, event: FormEvent) {
-    event.preventDefault();
-    const draft = failoverDrafts[app];
-    await runAction(`failover-save:${app}`, async () => {
-      const config = await updateFailoverApp(app, {
-        enabled: draft.enabled,
-        providerQueue: draft.providerQueue,
-        failureThreshold: positiveInteger(draft.failureThreshold, 2),
-        openDurationMs: positiveInteger(draft.openDurationSeconds, 300) * 1000,
-        halfOpenMaxProbes: positiveInteger(draft.halfOpenMaxProbes, 1),
-      });
-      return config.enabled
-        ? tx("{{app}} failover enabled", { app: appLabel(app) })
-        : tx("{{app}} failover disabled", { app: appLabel(app) });
-    });
-  }
-
-  async function makeBackup(event: FormEvent) {
-    event.preventDefault();
-    await runAction("backup-create", async () => {
-      const backup = await createBackup(backupReason);
-      setBackupReason("");
-      return tx("backup created: {{id}}", { id: backup.id });
-    });
-  }
-
-  async function restoreBackupAction(backup: BackupManifest) {
-    await runAction(`backup-restore:${backup.id}`, async () => {
-      const restored = await restoreBackup(backup.id);
-      return tx("restored {{id}}; safety {{safety}}", {
-        id: restored.restored.id,
-        safety: restored.preRestore?.id || "-",
-      });
-    });
-  }
-
-  async function rotateTokenAction() {
-    await runAction("api-token", async () => {
-      const token = await rotateApiToken();
-      setApiToken(token);
-      setApiTokenCopyStatus(null);
-      return tx("new API token generated");
-    });
-  }
-
-  async function copyApiToken() {
-    if (!apiToken) return;
-    if (!navigator.clipboard?.writeText) {
-      setApiTokenCopyStatus({ tone: "warning", message: tx("Clipboard unavailable; copy the visible value manually.") });
+  const handleRestartNow = useCallback(async () => {
+    setShowRestartPrompt(false);
+    if (import.meta.env.DEV) {
+      toast.success(t("settings.devModeRestartHint"), { closeButton: true });
+      closeAfterSave();
       return;
     }
+
     try {
-      await navigator.clipboard.writeText(apiToken);
-      setApiTokenCopyStatus({ tone: "success", message: tx("API token copied") });
-    } catch {
-      setApiTokenCopyStatus({ tone: "warning", message: tx("Copy failed; copy the visible value manually.") });
+      await settingsApi.restart();
+    } catch (error) {
+      console.error("[SettingsPage] Failed to restart app", error);
+      toast.error(t("settings.restartFailed"));
+    } finally {
+      closeAfterSave();
     }
-  }
+  }, [closeAfterSave, t]);
 
-  async function requestCodeAction() {
-    await runAction("email-request", async () => {
-      const response = await requestEmailLoginCode(emailDraft.email);
-      return tx("code sent to {{destination}}; cooldown {{seconds}}s", {
-        destination: response.maskedDestination,
-        seconds: response.cooldownSecs,
-      });
-    });
-  }
+  // 通用设置即时保存（无需手动点击）
+  // 使用 autoSaveSettings 避免误触发系统 API（开机自启、Claude 插件等）
+  // 返回保存是否成功：需要在保存成功后追加动作的调用方（如统一会话历史
+  // 关闭后的备份还原）据此短路，其余调用方可忽略返回值。
+  const handleAutoSave = useCallback(
+    async (updates: Partial<SettingsFormState>): Promise<boolean> => {
+      if (!settings) return false;
+      // 乐观更新前捕获旧值：autoSaveSettings 发送的是全量表单状态，后端按
+      // diff 触发副作用（如统一会话开关的 live 重写与历史迁移）。保存失败
+      // 不回滚的话，失败的变更会滞留在表单里，被之后任意一次无关保存原样
+      // 重放，绕过确认弹窗。
+      const previousValues = Object.fromEntries(
+        Object.keys(updates).map((key) => [
+          key,
+          settings[key as keyof SettingsFormState],
+        ]),
+      ) as Partial<SettingsFormState>;
+      updateSettings(updates);
+      try {
+        await autoSaveSettings(updates);
+        return true;
+      } catch (error) {
+        console.error("[SettingsPage] Failed to autosave settings", error);
+        updateSettings(previousValues);
+        toast.error(
+          t("settings.saveFailedGeneric", {
+            defaultValue: "保存失败，请重试",
+          }),
+        );
+        return false;
+      }
+    },
+    [autoSaveSettings, settings, t, updateSettings],
+  );
 
-  async function verifyCodeAction() {
-    await runAction("email-verify", async () => {
-      const login = await verifyEmailLoginCode(emailDraft);
-      writeToken(login.token);
-      return tx("email verified and local session updated");
-    });
-  }
+  const isBusy = useMemo(() => isLoading && !settings, [isLoading, settings]);
 
   return (
-    <div className="settings-page" ref={settingsPageRef}>
-      <div className="provider-toolbar">
-        <div className="provider-toolbar-status">
-          <span>{data?.config.ownerEmail || t("server.settings.runtimeSubtitle")}</span>
+    <div className="flex flex-col h-full overflow-hidden px-6">
+      {isBusy ? (
+        <div className="flex flex-1 items-center justify-center">
+          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
         </div>
-        <div className="provider-toolbar-actions">
-          {error && <span className="error-text">{error}</span>}
-          {result && <span className="usage-result">{result}</span>}
-          <button className="secondary-button" type="button" onClick={() => void refresh()}>
-            <RefreshCw size={15} />
-            <span>{t("common.refresh")}</span>
-          </button>
-        </div>
-      </div>
-
-      {loading && !data ? (
-        <LoadingBlock label="server.settings.loading" />
       ) : (
-        <div className="settings-tab-shell">
-          <div className="settings-tabs" role="tablist" aria-label={tx("Settings sections")}>
-            {settingsTabs.map((tab) => (
-              <button
-                key={tab.id}
-                type="button"
-                role="tab"
-                aria-selected={activeTab === tab.id}
-                className={activeTab === tab.id ? "active" : ""}
-                onClick={() => setActiveTab(tab.id)}
+        <Tabs
+          value={activeTab}
+          onValueChange={setActiveTab}
+          className="flex flex-col h-full"
+        >
+          <TabsList className="grid w-full grid-cols-6 mb-6 glass rounded-lg">
+            <TabsTrigger value="general">
+              {t("settings.tabGeneral")}
+            </TabsTrigger>
+            <TabsTrigger value="proxy">{t("settings.tabProxy")}</TabsTrigger>
+            <TabsTrigger value="auth">
+              {t("settings.tabAuth", { defaultValue: "认证" })}
+            </TabsTrigger>
+            <TabsTrigger value="advanced">
+              {t("settings.tabAdvanced")}
+            </TabsTrigger>
+            <TabsTrigger value="usage">{t("usage.title")}</TabsTrigger>
+            <TabsTrigger value="about">{t("common.about")}</TabsTrigger>
+          </TabsList>
+
+          <div className="flex-1 min-h-0 flex flex-col">
+            <div
+              ref={tabScrollContainerRef}
+              className="flex-1 overflow-y-auto overflow-x-hidden pr-2"
+            >
+              <TabsContent value="general" className="space-y-6 mt-0">
+                {settings ? (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.3 }}
+                    className="space-y-6"
+                  >
+                    <LanguageSettings
+                      value={settings.language}
+                      onChange={(lang) => handleAutoSave({ language: lang })}
+                    />
+                    <ThemeSettings />
+                    <AppVisibilitySettings
+                      settings={settings}
+                      onChange={handleAutoSave}
+                    />
+                    {!serverMode && (
+                      <>
+                        <SkillStorageLocationSettings
+                          value={settings.skillStorageLocation ?? "cc_switch"}
+                          installedCount={installedSkills?.length ?? 0}
+                          onMigrated={(location) =>
+                            updateSettings({ skillStorageLocation: location })
+                          }
+                        />
+                        <SkillSyncMethodSettings
+                          value={settings.skillSyncMethod ?? "auto"}
+                          onChange={(method) =>
+                            handleAutoSave({ skillSyncMethod: method })
+                          }
+                        />
+                        <WindowSettings
+                          settings={settings}
+                          onChange={handleAutoSave}
+                        />
+                        <TerminalSettings
+                          value={settings.preferredTerminal}
+                          onChange={(terminal) =>
+                            handleAutoSave({ preferredTerminal: terminal })
+                          }
+                        />
+                      </>
+                    )}
+                    <CodexAuthSettings
+                      settings={settings}
+                      onChange={handleAutoSave}
+                    />
+                    {serverMode && (
+                      <ServerSecuritySettings onSignOut={onSignOut} />
+                    )}
+                  </motion.div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    {t("settings.loadFailed", {
+                      defaultValue: "无法加载设置，请刷新页面后重试。",
+                    })}
+                  </p>
+                )}
+              </TabsContent>
+
+              <TabsContent value="proxy" className="space-y-6 mt-0 pb-4">
+                {settings ? (
+                  <ProxyTabContent
+                    settings={settings}
+                    onAutoSave={handleAutoSave}
+                  />
+                ) : null}
+              </TabsContent>
+
+              <TabsContent value="auth" className="space-y-6 mt-0 pb-4">
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.3 }}
+                  className="space-y-6"
+                >
+                  <AuthCenterPanel />
+                </motion.div>
+              </TabsContent>
+
+              <TabsContent value="advanced" className="space-y-6 mt-0 pb-4">
+                {settings ? (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.3 }}
+                    className="space-y-4"
+                  >
+                    <Accordion
+                      type="multiple"
+                      defaultValue={[]}
+                      className="w-full space-y-4"
+                    >
+                      <AccordionItem
+                        value="directory"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
+                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                          <div className="flex items-center gap-3">
+                            <FolderSearch className="h-5 w-5 text-primary" />
+                            <div className="text-left">
+                              <h3 className="text-base font-semibold">
+                                {t("settings.advanced.configDir.title")}
+                              </h3>
+                              <p className="text-sm text-muted-foreground font-normal">
+                                {t("settings.advanced.configDir.description")}
+                              </p>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                          <DirectorySettings
+                            appConfigDir={appConfigDir}
+                            resolvedDirs={resolvedDirs}
+                            onAppConfigChange={updateAppConfigDir}
+                            onBrowseAppConfig={browseAppConfigDir}
+                            onResetAppConfig={resetAppConfigDir}
+                            claudeDir={settings.claudeConfigDir}
+                            codexDir={settings.codexConfigDir}
+                            geminiDir={settings.geminiConfigDir}
+                            opencodeDir={settings.opencodeConfigDir}
+                            openclawDir={settings.openclawConfigDir}
+                            hermesDir={settings.hermesConfigDir}
+                            onDirectoryChange={updateDirectory}
+                            onBrowseDirectory={browseDirectory}
+                            onResetDirectory={resetDirectory}
+                          />
+                        </AccordionContent>
+                      </AccordionItem>
+
+                      <AccordionItem
+                        value="data"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
+                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                          <div className="flex items-center gap-3">
+                            <Database className="h-5 w-5 text-blue-500" />
+                            <div className="text-left">
+                              <h3 className="text-base font-semibold">
+                                {t("settings.advanced.data.title")}
+                              </h3>
+                              <p className="text-sm text-muted-foreground font-normal">
+                                {t("settings.advanced.data.description")}
+                              </p>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                          <ImportExportSection
+                            status={importStatus}
+                            selectedFile={selectedFile}
+                            errorMessage={errorMessage}
+                            backupId={backupId}
+                            isImporting={isImporting}
+                            onSelectFile={selectImportFile}
+                            onImport={importConfig}
+                            onExport={exportConfig}
+                            onClear={clearSelection}
+                            serverFileInputRef={serverFileInputRef}
+                            onServerFileSelected={onServerFileSelected}
+                          />
+                        </AccordionContent>
+                      </AccordionItem>
+
+                      <AccordionItem
+                        value="backup"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
+                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                          <div className="flex items-center gap-3">
+                            <HardDriveDownload className="h-5 w-5 text-amber-500" />
+                            <div className="text-left">
+                              <h3 className="text-base font-semibold">
+                                {t("settings.advanced.backup.title", {
+                                  defaultValue: "Backup & Restore",
+                                })}
+                              </h3>
+                              <p className="text-sm text-muted-foreground font-normal">
+                                {t("settings.advanced.backup.description", {
+                                  defaultValue:
+                                    "Manage automatic backups, view and restore database snapshots",
+                                })}
+                              </p>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                          <BackupListSection
+                            backupIntervalHours={settings.backupIntervalHours}
+                            backupRetainCount={settings.backupRetainCount}
+                            onSettingsChange={(updates) =>
+                              handleAutoSave(updates)
+                            }
+                          />
+                        </AccordionContent>
+                      </AccordionItem>
+
+                      <AccordionItem
+                        value="cloudSync"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
+                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                          <div className="flex items-center gap-3">
+                            <Cloud className="h-5 w-5 text-blue-500" />
+                            <div className="text-left">
+                              <h3 className="text-base font-semibold">
+                                {t("settings.advanced.cloudSync.title")}
+                              </h3>
+                              <p className="text-sm text-muted-foreground font-normal">
+                                {t("settings.advanced.cloudSync.description")}
+                              </p>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                          <WebdavSyncSection
+                            config={settings?.webdavSync}
+                            s3Config={settings?.s3Sync}
+                            settings={settings}
+                            onAutoSave={handleAutoSave}
+                          />
+                        </AccordionContent>
+                      </AccordionItem>
+
+                      <AccordionItem
+                        value="test"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
+                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                          <div className="flex items-center gap-3">
+                            <FlaskConical className="h-5 w-5 text-emerald-500" />
+                            <div className="text-left">
+                              <h3 className="text-base font-semibold">
+                                {t("settings.advanced.modelTest.title")}
+                              </h3>
+                              <p className="text-sm text-muted-foreground font-normal">
+                                {t("settings.advanced.modelTest.description")}
+                              </p>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                          <ModelTestConfigPanel />
+                        </AccordionContent>
+                      </AccordionItem>
+
+                      <AccordionItem
+                        value="logConfig"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
+                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                          <div className="flex items-center gap-3">
+                            <ScrollText className="h-5 w-5 text-cyan-500" />
+                            <div className="text-left">
+                              <h3 className="text-base font-semibold">
+                                {t("settings.advanced.logConfig.title")}
+                              </h3>
+                              <p className="text-sm text-muted-foreground font-normal">
+                                {t("settings.advanced.logConfig.description")}
+                              </p>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                          <LogConfigPanel />
+                        </AccordionContent>
+                      </AccordionItem>
+                    </Accordion>
+                  </motion.div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    {t("settings.loadFailed", {
+                      defaultValue: "无法加载设置，请刷新页面后重试。",
+                    })}
+                  </p>
+                )}
+              </TabsContent>
+
+              <TabsContent value="about" className="mt-0">
+                <AboutSection isPortable={isPortable} />
+              </TabsContent>
+
+              <TabsContent value="usage" className="mt-0">
+                <UsageDashboard />
+              </TabsContent>
+            </div>
+
+            {activeTab === "advanced" && settings && (
+              <div
+                className="flex-shrink-0 pt-4 border-t border-border-default"
+                style={{ backgroundColor: "hsl(var(--background))" }}
               >
-                {tx(tab.label)}
-              </button>
-            ))}
-          </div>
-
-          <div className="settings-tab-panel">
-            {activeTab === "general" && (
-              <div className="settings-layout">
-                {data && <SettingsOverviewStrip data={data} />}
-
-                {data && <SettingsReadinessPanel data={data} />}
-              </div>
-            )}
-
-            {activeTab === "language" && (
-              <div className="settings-layout">
-                <section className="settings-card">
-                  <SectionHeader icon={<Languages size={17} />} title={t("server.settings.language")} subtitle={t("server.settings.languageSubtitle")} />
-                  <label>
-                    <span>{t("server.settings.displayLanguage")}</span>
-                    <select value={language} onChange={(event) => setLanguage(event.target.value as Language)}>
-                      {languages.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </section>
-              </div>
-            )}
-
-            {activeTab === "theme" && (
-              <div className="settings-layout">
-                <ThemeSettingsPanel />
-              </div>
-            )}
-
-            {activeTab === "directory" && (
-              <div className="settings-layout">
-                <DirectoryPanel runtimeContext={runtimeContext} />
-              </div>
-            )}
-
-            {activeTab === "proxy" && (
-              <div className="settings-layout">
-                <ProxySettingsPanel
-                  maskedUrl={data?.config.upstreamProxy.maskedUrl}
-                  draft={proxyDraft}
-                  busy={busy}
-                  onDraftChange={setProxyDraft}
-                  onSave={saveProxy}
-                />
-              </div>
-            )}
-
-            {activeTab === "failover" && (
-              <div className="settings-layout">
-                <FailoverSettingsPanel
-                  snapshot={failoverSnapshot}
-                  providers={settingsProviders}
-                  drafts={failoverDrafts}
-                  busy={busy}
-                  onDraftChange={(app, draft) => setFailoverDrafts((current) => ({ ...current, [app]: draft }))}
-                  onSave={saveFailover}
-                />
-              </div>
-            )}
-
-            {activeTab === "router" && (
-              <div className="settings-layout">
-                <RouterSettingsPanel
-                  router={data?.router}
-                  status={data?.routerStatus}
-                  draft={routerDraft}
-                  busy={busy}
-                  onDraftChange={setRouterDraft}
-                  onSave={saveRouter}
-                  onRegister={() => void runAction("router-register", async () => `registered ${JSON.stringify(await registerRouter())}`)}
-                  onHeartbeat={() => void runAction("router-heartbeat", async () => routerStatusText(await heartbeatRouter()))}
-                  onBatchSync={() => setRouterSyncConfirm(true)}
-                />
-              </div>
-            )}
-
-            {activeTab === "tunnel" && (
-              <div className="settings-layout">
-                <TunnelSettingsPanel
-                  tunnel={data?.tunnel}
-                  draft={tunnelDraft}
-                  busy={busy}
-                  clientTunnelRunning={clientTunnelRunning}
-                  onDraftChange={setTunnelDraft}
-                  onSave={saveTunnel}
-                  onClaim={() => void runAction("tunnel-claim", async () => `claim ${JSON.stringify(await claimClientTunnel())}`)}
-                  onStart={() => void runAction("tunnel-start", async () => (await startClientTunnel()).message)}
-                  onStop={() => void runAction("tunnel-stop", async () => `stopped ${(await stopClientTunnel()).tunnelStatus || "client tunnel"}`)}
-                />
-              </div>
-            )}
-
-            {activeTab === "auth" && (
-              <div className="settings-layout">
-                <AuthSettingsPanel
-                  emailDraft={emailDraft}
-                  apiToken={apiToken}
-                  apiTokenCopyStatus={apiTokenCopyStatus}
-                  busy={busy}
-                  onEmailDraftChange={setEmailDraft}
-                  onRotateToken={() => setRotateTokenConfirm(true)}
-                  onCopyToken={() => void copyApiToken()}
-                  onRequestCode={() => void requestCodeAction()}
-                  onVerifyCode={() => void verifyCodeAction()}
-                />
-              </div>
-            )}
-
-            {activeTab === "backup" && (
-              <div className="settings-layout">
-                <BackupSettingsPanel
-                  backups={data?.backups || []}
-                  backupReason={backupReason}
-                  busy={busy}
-                  onBackupReasonChange={setBackupReason}
-                  onCreateBackup={makeBackup}
-                  onRestore={setRestoreConfirm}
-                />
-              </div>
-            )}
-
-            {activeTab === "importExport" && (
-              <div className="settings-layout">
-                <ImportExportPanel busy={busy} runAction={runAction} />
-              </div>
-            )}
-
-            {activeTab === "diagnostics" && (
-              <div className="settings-layout">
-                <DiagnosticsSettingsPanel diagnostics={data?.diagnostics} />
-              </div>
-            )}
-
-            {activeTab === "about" && (
-              <div className="settings-layout">
-                {data && <AboutPanel buildInfo={data.buildInfo} />}
+                <div className="px-6 flex items-center justify-end gap-3">
+                  <Button onClick={handleSave} disabled={isSaving}>
+                    {isSaving ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        {t("settings.saving")}
+                      </span>
+                    ) : (
+                      <>
+                        <Save className="mr-2 h-4 w-4" />
+                        {t("common.save")}
+                      </>
+                    )}
+                  </Button>
+                </div>
               </div>
             )}
           </div>
-        </div>
+        </Tabs>
       )}
-      <ConfirmDialog
-        isOpen={routerSyncConfirm}
-        title={tx("Batch sync router shares")}
-        message={tx("Batch sync share state to the router? Remote router records for matching shares may be updated.")}
-        confirmText={tx("Sync")}
-        onConfirm={() => {
-          setRouterSyncConfirm(false);
-          void runAction("router-sync", async () => (await batchSyncRouterShares()).message);
-        }}
-        onCancel={() => setRouterSyncConfirm(false)}
-      />
-      <ConfirmDialog
-        isOpen={rotateTokenConfirm}
-        title={tx("Rotate API token")}
-        message={tx("Rotate the server API token? Existing clients using the current token will stop working until updated.")}
-        confirmText={tx("Rotate")}
-        variant="destructive"
-        onConfirm={() => {
-          setRotateTokenConfirm(false);
-          void rotateTokenAction();
-        }}
-        onCancel={() => setRotateTokenConfirm(false)}
-      />
-      <ConfirmDialog
-        isOpen={restoreConfirm !== null}
-        title={tx("Restore backup")}
-        message={tx("Restore backup {{id}}? Current stores will be backed up first.", { id: restoreConfirm?.id || "-" })}
-        confirmText={tx("Restore")}
-        variant="info"
-        onConfirm={() => {
-          const backup = restoreConfirm;
-          setRestoreConfirm(null);
-          if (backup) void restoreBackupAction(backup);
-        }}
-        onCancel={() => setRestoreConfirm(null)}
-      />
+
+      <Dialog
+        open={showRestartPrompt}
+        onOpenChange={(open) => !open && handleRestartLater()}
+      >
+        <DialogContent zIndex="alert" className="max-w-md glass border-border">
+          <DialogHeader>
+            <DialogTitle>{t("settings.restartRequired")}</DialogTitle>
+          </DialogHeader>
+          <div className="px-6">
+            <p className="text-sm text-muted-foreground">
+              {t("settings.restartRequiredMessage")}
+            </p>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={handleRestartLater}
+              className="hover:bg-muted/50"
+            >
+              {t("settings.restartLater")}
+            </Button>
+            <Button
+              onClick={handleRestartNow}
+              className="bg-primary hover:bg-primary/90"
+            >
+              {t("settings.restartNow")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

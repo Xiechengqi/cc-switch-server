@@ -51,6 +51,8 @@ import vercel from "./vercel.svg?raw";
 import ucloud from "./ucloud.svg?raw";
 import notion from "./notion.svg?raw";
 import opencodeLogoLight from "./opencode-logo-light.svg?raw";
+import opencode from "./opencode.svg?raw";
+import openclaw from "./openclaw.svg?raw";
 import aihubmixColor from "./aihubmix-color.svg?raw";
 import aicoding from "./aicoding.svg?raw";
 import algocode from "./algocode.svg?raw";
@@ -68,6 +70,7 @@ import sssaicode from "./sssaicode.svg?raw";
 import xiaomimimo from "./xiaomimimo.svg?raw";
 import cursorUrl from "./cursor.png";
 import kiroUrl from "./kiro.png";
+import hermesUrl from "./hermes.png";
 
 import { IconMetadata, iconMetadata } from "./metadata";
 
@@ -124,6 +127,8 @@ export const icons: Record<string, string> = {
   vercel,
   ucloud,
   notion,
+  opencode,
+  openclaw,
   "opencode-logo-light": opencodeLogoLight,
   "aihubmix-color": aihubmixColor,
   aicoding,
@@ -145,7 +150,10 @@ export const icons: Record<string, string> = {
 export const iconUrls: Record<string, string> = {
   cursor: cursorUrl,
   kiro: kiroUrl,
+  hermes: hermesUrl,
 };
+
+export const iconList = [...Object.keys(icons), ...Object.keys(iconUrls)].sort();
 
 export function normalizeIconName(icon: string): string {
   return icon.trim().toLowerCase().replace(/[\s_]+/g, "-");

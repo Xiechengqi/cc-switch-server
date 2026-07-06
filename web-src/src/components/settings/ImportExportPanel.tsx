@@ -13,7 +13,7 @@ import {
   ShareRecord,
   StoredProvider,
   UniversalProvider,
-} from "@/lib/api";
+} from "@/lib/server-legacy-api";
 import { useI18n } from "@/lib/i18n";
 
 export function ImportExportPanel({

@@ -324,6 +324,21 @@
       "copilotDescription": "Manage GitHub Copilot accounts",
       "codexOauthDescription": "Manage ChatGPT accounts"
     },
+    "serverSecurity": {
+      "changePasswordTitle": "Change Password",
+      "changePasswordDescription": "Update the admin login password.",
+      "currentPassword": "Current password",
+      "newPassword": "New password",
+      "confirmPassword": "Confirm new password",
+      "changePassword": "Change password",
+      "passwordMismatch": "New passwords do not match",
+      "passwordMinLength": "New password must be at least 8 characters",
+      "passwordChanged": "Password updated",
+      "passwordChangedSignOut": "Password updated. Please sign in again with the new password.",
+      "passwordSavedHint": "Password saved.",
+      "changePasswordAgain": "Set again",
+      "signOut": "Sign out"
+    },
     "advanced": {
       "configDir": {
         "title": "Configuration Directory",

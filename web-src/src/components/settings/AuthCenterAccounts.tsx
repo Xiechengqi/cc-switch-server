@@ -27,7 +27,7 @@ import type {
   AccountQuotaResponse,
   AccountRecord,
   AccountRefreshPlanResponse,
-} from "@/lib/api";
+} from "@/lib/server-legacy-api";
 import { useI18n } from "@/lib/i18n";
 
 export type AccountAction = "refresh" | "quota" | "forceQuota" | "plan" | "delete";

@@ -1,5 +1,6 @@
 /target/
 /node_modules/
+/cc-switch-server
 node_modules/
 .env
 .env.*
@@ -11,6 +12,7 @@ dist/
 
 # Local refactor planning notes. Keep them on disk, but do not include them in
 # formal repository commits once they are removed from the index.
+UI_PARITY_PLAN.md
 DESKTOP_ALIGNMENT_TASKS.md
 SERVER_IMPLEMENTATION_PLAN.md
 MIGRATION_LEDGER.md

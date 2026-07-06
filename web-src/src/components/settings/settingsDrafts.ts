@@ -1,4 +1,4 @@
-import type { AppKind, FailoverSnapshot, RouterConfigView, RouterStatusResponse } from "@/lib/api";
+import type { AppKind, FailoverSnapshot, RouterConfigView, RouterStatusResponse } from "@/lib/server-legacy-api";
 
 export const APP_KINDS: AppKind[] = ["claude", "codex", "gemini"];
 

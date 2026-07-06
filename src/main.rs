@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Config { command } => admin::run_config_command(&cli, command),
         Command::Doctor { check_port } => admin::run_doctor(&cli, check_port),
         Command::Version { json } => print_version(json),
+        Command::Password { command } => admin::run_password_command(&cli, command),
     }
 }
 

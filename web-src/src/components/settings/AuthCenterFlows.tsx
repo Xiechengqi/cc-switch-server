@@ -17,7 +17,7 @@ import {
   startAccountLogin,
   startCopilotDeviceLogin,
   startKiroDeviceLogin,
-} from "@/lib/api";
+} from "@/lib/server-legacy-api";
 import { useI18n } from "@/lib/i18n";
 
 const oauthPreviewProviderTypes = [

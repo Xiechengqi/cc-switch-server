@@ -3,125 +3,1777 @@
   "product": "cc-switch desktop server version",
   "uiAutomationAllowed": false,
   "retainedFeatures": [
-    { "id": "providers", "label": "Providers" },
-    { "id": "shares", "label": "Shares" },
-    { "id": "usage", "label": "Usage and pricing" },
-    { "id": "settings", "label": "Settings, auth, router, backup" },
-    { "id": "universalProviders", "label": "Universal providers" },
-    { "id": "accounts", "label": "Accounts, OAuth, quota" },
-    { "id": "router", "label": "Router and tunnels" },
-    { "id": "failover", "label": "Failover" },
-    { "id": "proxy", "label": "Proxy status" }
+    {
+      "id": "providers",
+      "label": "Providers"
+    },
+    {
+      "id": "shares",
+      "label": "Shares"
+    },
+    {
+      "id": "usage",
+      "label": "Usage and pricing"
+    },
+    {
+      "id": "settings",
+      "label": "Settings, auth, router, backup"
+    },
+    {
+      "id": "universalProviders",
+      "label": "Universal providers"
+    },
+    {
+      "id": "accounts",
+      "label": "Accounts, OAuth, quota"
+    },
+    {
+      "id": "router",
+      "label": "Router and tunnels"
+    },
+    {
+      "id": "failover",
+      "label": "Failover"
+    },
+    {
+      "id": "proxy",
+      "label": "Proxy status"
+    }
   ],
   "hiddenFeatures": [
-    { "id": "prompts", "label": "Prompts", "reason": "Hidden until token server product need is confirmed" },
-    { "id": "sessions", "label": "Session manager", "reason": "Hidden until token server product need is confirmed" }
+    {
+      "id": "prompts",
+      "label": "Prompts",
+      "reason": "Hidden until token server product need is confirmed"
+    },
+    {
+      "id": "sessions",
+      "label": "Session manager",
+      "reason": "Hidden until token server product need is confirmed"
+    }
   ],
   "excludedFeatures": [
-    { "id": "skills", "label": "Skills", "reason": "Not part of token server mainline" },
-    { "id": "mcp", "label": "MCP", "reason": "Not part of token server mainline" },
-    { "id": "openclaw", "label": "OpenClaw workspace/tools/agents", "reason": "Desktop-only workspace feature" },
-    { "id": "hermes", "label": "Hermes", "reason": "Desktop-only workspace feature" },
-    { "id": "omo", "label": "OMO", "reason": "Desktop-only workspace feature" },
-    { "id": "tauriShell", "label": "Tauri shell/window/updater/deeplink", "reason": "Server has no desktop shell" },
-    { "id": "claudeDesktopProfile", "label": "Claude Desktop profile/env writing", "reason": "Not part of token server mainline" },
-    { "id": "cloudSync", "label": "WebDAV/S3 config sync", "reason": "Server uses local backup/restore" },
-    { "id": "speedtest", "label": "Speedtest", "reason": "Not required for token server" },
-    { "id": "localCliSessions", "label": "Local CLI session parsing", "reason": "Server records only proxied usage" },
-    { "id": "codexResponsesWs", "label": "codex_responses_ws", "reason": "Server exposes HTTP proxy/API only" },
-    { "id": "codexImages", "label": "Codex OAuth image generation", "reason": "Out of current text/code-agent proxy scope" }
+    {
+      "id": "skills",
+      "label": "Skills",
+      "reason": "Not part of token server mainline"
+    },
+    {
+      "id": "mcp",
+      "label": "MCP",
+      "reason": "Not part of token server mainline"
+    },
+    {
+      "id": "openclaw",
+      "label": "OpenClaw workspace/tools/agents",
+      "reason": "Desktop-only workspace feature"
+    },
+    {
+      "id": "hermes",
+      "label": "Hermes",
+      "reason": "Desktop-only workspace feature"
+    },
+    {
+      "id": "omo",
+      "label": "OMO",
+      "reason": "Desktop-only workspace feature"
+    },
+    {
+      "id": "tauriShell",
+      "label": "Tauri shell/window/updater/deeplink",
+      "reason": "Server has no desktop shell"
+    },
+    {
+      "id": "claudeDesktopProfile",
+      "label": "Claude Desktop profile/env writing",
+      "reason": "Not part of token server mainline"
+    },
+    {
+      "id": "cloudSync",
+      "label": "WebDAV/S3 config sync",
+      "reason": "Server uses local backup/restore"
+    },
+    {
+      "id": "speedtest",
+      "label": "Speedtest",
+      "reason": "Not required for token server"
+    },
+    {
+      "id": "localCliSessions",
+      "label": "Local CLI session parsing",
+      "reason": "Server records only proxied usage"
+    },
+    {
+      "id": "codexResponsesWs",
+      "label": "codex_responses_ws",
+      "reason": "Server exposes HTTP proxy/API only"
+    },
+    {
+      "id": "codexImages",
+      "label": "Codex OAuth image generation",
+      "reason": "Out of current text/code-agent proxy scope"
+    }
   ],
   "commands": [
-    { "name": "get_build_info", "support": "native", "implemented": true, "feature": "settings", "endpoint": "GET /version" },
-    { "name": "get_settings", "support": "native", "implemented": true, "feature": "settings", "endpoint": "GET /api/config" },
-    { "name": "get_providers", "support": "native", "implemented": true, "feature": "providers", "endpoint": "GET /api/providers?app=" },
-    { "name": "get_current_provider", "support": "shim", "implemented": true, "feature": "providers", "endpoint": "GET /api/providers?app=", "notes": "Server has no live desktop config; first provider for app is exposed as the current provider shim." },
-    { "name": "add_provider", "support": "native", "implemented": true, "feature": "providers", "endpoint": "POST /api/providers" },
-    { "name": "update_provider", "support": "native", "implemented": true, "feature": "providers", "endpoint": "POST /api/providers" },
-    { "name": "update_providers_sort_order", "support": "shim", "implemented": true, "feature": "providers", "endpoint": "local provider store sortIndex mutation", "notes": "Server persists desktop-compatible sortIndex on provider JSON and sorts provider lists by that value." },
-    { "name": "delete_provider", "support": "native", "implemented": true, "feature": "providers", "endpoint": "local provider store mutation" },
-    { "name": "switch_provider", "support": "shim", "implemented": true, "feature": "providers", "endpoint": "local provider existence check", "notes": "Server share binding and explicit provider headers select runtime provider; switch returns warnings only." },
-    { "name": "get_provider_health", "support": "native", "implemented": true, "feature": "providers", "endpoint": "GET /api/providers/health" },
-    { "name": "get_universal_providers", "support": "native", "implemented": true, "feature": "universalProviders", "endpoint": "GET /api/universal-providers" },
-    { "name": "get_universal_provider", "support": "native", "implemented": true, "feature": "universalProviders", "endpoint": "GET /api/universal-providers/:id" },
-    { "name": "upsert_universal_provider", "support": "native", "implemented": true, "feature": "universalProviders", "endpoint": "POST /api/universal-providers" },
-    { "name": "delete_universal_provider", "support": "native", "implemented": true, "feature": "universalProviders", "endpoint": "DELETE /api/universal-providers/:id" },
-    { "name": "sync_universal_provider", "support": "native", "implemented": true, "feature": "universalProviders", "endpoint": "POST /api/universal-providers/:id/sync" },
-    { "name": "list_shares", "support": "native", "implemented": true, "feature": "shares", "endpoint": "GET /api/shares" },
-    { "name": "get_share_detail", "support": "native", "implemented": true, "feature": "shares", "endpoint": "GET /api/shares" },
-    { "name": "get_share_connect_info", "support": "native", "implemented": true, "feature": "shares", "endpoint": "GET /api/shares/:id/connect-info" },
-    { "name": "list_share_markets", "support": "native", "implemented": true, "feature": "shares", "endpoint": "GET /api/share-markets" },
-    { "name": "export_all_shares", "support": "native", "implemented": true, "feature": "shares", "endpoint": "GET /api/shares/export" },
-    { "name": "create_share", "support": "native", "implemented": true, "feature": "shares", "endpoint": "POST /api/shares" },
-    { "name": "delete_share", "support": "native", "implemented": true, "feature": "shares", "endpoint": "DELETE /api/shares/:id" },
-    { "name": "pause_share", "support": "native", "implemented": true, "feature": "shares", "endpoint": "POST /api/shares/:id/pause" },
-    { "name": "resume_share", "support": "native", "implemented": true, "feature": "shares", "endpoint": "POST /api/shares/:id/resume" },
-    { "name": "reset_share_usage", "support": "native", "implemented": true, "feature": "shares", "endpoint": "POST /api/shares/:id/reset-usage" },
-    { "name": "update_share_provider_binding", "support": "native", "implemented": true, "feature": "shares", "endpoint": "POST /api/shares/:id/binding" },
-    { "name": "update_share_acl", "support": "native", "implemented": true, "feature": "shares", "endpoint": "POST /api/shares/:id/acl" },
-    { "name": "authorize_share_market", "support": "native", "implemented": true, "feature": "shares", "endpoint": "POST /api/shares/:id/authorize-market" },
-    { "name": "start_share_tunnel", "support": "native", "implemented": true, "feature": "shares", "endpoint": "POST /api/shares/:id/tunnel/start" },
-    { "name": "stop_share_tunnel", "support": "native", "implemented": true, "feature": "shares", "endpoint": "POST /api/shares/:id/tunnel/stop" },
-    { "name": "get_tunnel_status", "support": "native", "implemented": true, "feature": "shares", "endpoint": "GET /api/router/tunnels" },
-    { "name": "get_client_tunnel", "support": "native", "implemented": true, "feature": "router", "endpoint": "GET /api/router/client-tunnel" },
-    { "name": "get_client_tunnel_status", "support": "native", "implemented": true, "feature": "router", "endpoint": "GET /api/router/client-tunnel" },
-    { "name": "claim_client_tunnel", "support": "native", "implemented": true, "feature": "router", "endpoint": "POST /api/router/client-tunnel/claim" },
-    { "name": "update_client_tunnel", "support": "native", "implemented": true, "feature": "router", "endpoint": "POST /api/router/client-tunnel" },
-    { "name": "start_client_tunnel", "support": "native", "implemented": true, "feature": "router", "endpoint": "POST /api/router/client-tunnel/lease" },
-    { "name": "stop_client_tunnel", "support": "native", "implemented": true, "feature": "router", "endpoint": "POST /api/router/client-tunnel/stop" },
-    { "name": "get_usage_summary", "support": "native", "implemented": true, "feature": "usage", "endpoint": "GET /api/usage/summary" },
-    { "name": "get_usage_trends", "support": "native", "implemented": true, "feature": "usage", "endpoint": "GET /api/usage/trends" },
-    { "name": "get_provider_stats", "support": "native", "implemented": true, "feature": "usage", "endpoint": "GET /api/usage/provider-stats" },
-    { "name": "get_model_stats", "support": "native", "implemented": true, "feature": "usage", "endpoint": "GET /api/usage/model-stats" },
-    { "name": "get_request_logs", "support": "native", "implemented": true, "feature": "usage", "endpoint": "GET /api/usage/logs" },
-    { "name": "get_request_detail", "support": "native", "implemented": true, "feature": "usage", "endpoint": "GET /api/usage/logs/:id" },
-    { "name": "get_proxy_status", "support": "shim", "implemented": true, "feature": "proxy", "endpoint": "server process status" },
-    { "name": "get_proxy_takeover_status", "support": "shim", "implemented": true, "feature": "proxy", "endpoint": "server process status" },
-    { "name": "is_proxy_running", "support": "shim", "implemented": true, "feature": "proxy", "endpoint": "server process status" },
-    { "name": "is_live_takeover_active", "support": "shim", "implemented": true, "feature": "proxy", "endpoint": "server process status" },
-    { "name": "get_global_proxy_config", "support": "native", "implemented": true, "feature": "settings", "endpoint": "GET /api/upstream-proxy" },
-    { "name": "update_global_proxy_config", "support": "native", "implemented": true, "feature": "settings", "endpoint": "PUT /api/upstream-proxy" },
-    { "name": "create_db_backup", "support": "native", "implemented": true, "feature": "settings", "endpoint": "POST /api/backup" },
-    { "name": "list_db_backups", "support": "native", "implemented": true, "feature": "settings", "endpoint": "GET /api/backup" },
-    { "name": "restore_db_backup", "support": "native", "implemented": true, "feature": "settings", "endpoint": "POST /api/backup/:id/restore" },
-    { "name": "auth_list_accounts", "support": "native", "implemented": true, "feature": "accounts", "endpoint": "GET /api/accounts" },
-    { "name": "auth_start_login", "support": "native", "implemented": true, "feature": "accounts", "endpoint": "POST /api/accounts/login/start" },
-    { "name": "auth_submit_oauth_code", "support": "native", "implemented": true, "feature": "accounts", "endpoint": "POST /api/accounts/login/finish" },
-    { "name": "refresh_oauth_quota", "support": "native", "implemented": true, "feature": "accounts", "endpoint": "GET /api/accounts/:id/quota?refresh=true" },
-    { "name": "get_cached_oauth_quota", "support": "native", "implemented": true, "feature": "accounts", "endpoint": "GET /api/accounts/:id/quota" },
-    { "name": "get_claude_oauth_quota", "support": "native", "implemented": true, "feature": "accounts", "endpoint": "GET /api/accounts/:id/quota" },
-    { "name": "get_codex_oauth_quota", "support": "native", "implemented": true, "feature": "accounts", "endpoint": "GET /api/accounts/:id/quota" },
-    { "name": "copilot_start_device_flow", "support": "native", "implemented": true, "feature": "accounts", "endpoint": "POST /api/accounts/copilot/device/start" },
-    { "name": "copilot_poll_for_auth", "support": "native", "implemented": true, "feature": "accounts", "endpoint": "POST /api/accounts/copilot/device/poll" },
-    { "name": "check_for_updates", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "install_update_and_restart", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "restart_app", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "set_window_theme", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "update_tray_menu", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "open_config_folder", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "open_app_config_folder", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "open_external", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "pick_directory", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "save_file_dialog", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "open_file_dialog", "support": "excluded", "implemented": false, "feature": "tauriShell" },
-    { "name": "apply_claude_plugin_config", "support": "excluded", "implemented": false, "feature": "claudeDesktopProfile" },
-    { "name": "apply_claude_onboarding_skip", "support": "excluded", "implemented": false, "feature": "claudeDesktopProfile" },
-    { "name": "clear_claude_onboarding_skip", "support": "excluded", "implemented": false, "feature": "claudeDesktopProfile" },
-    { "name": "get_claude_desktop_status", "support": "excluded", "implemented": false, "feature": "claudeDesktopProfile" },
-    { "name": "get_claude_desktop_default_routes", "support": "excluded", "implemented": false, "feature": "claudeDesktopProfile" },
-    { "name": "import_claude_desktop_providers_from_claude", "support": "excluded", "implemented": false, "feature": "claudeDesktopProfile" },
-    { "name": "ensure_claude_desktop_official_provider", "support": "excluded", "implemented": false, "feature": "claudeDesktopProfile" },
-    { "name": "webdav_test_connection", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "webdav_sync_upload", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "webdav_sync_download", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "webdav_sync_save_settings", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "webdav_sync_fetch_remote_info", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "s3_test_connection", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "s3_sync_upload", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "s3_sync_download", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "s3_sync_save_settings", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "s3_sync_fetch_remote_info", "support": "excluded", "implemented": false, "feature": "cloudSync" },
-    { "name": "sync_session_usage", "support": "excluded", "implemented": false, "feature": "localCliSessions" },
-    { "name": "testUsageScript", "support": "excluded", "implemented": false, "feature": "localCliSessions" }
+    {
+      "name": "add_custom_endpoint",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "add_provider",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /api/providers",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "add_to_failover_queue",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "apply_claude_onboarding_skip",
+      "support": "shim",
+      "implemented": true,
+      "feature": "claudeDesktopProfile",
+      "notes": "Server web runtime shim for desktop-synced UI."
+    },
+    {
+      "name": "apply_claude_plugin_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "claudeDesktopProfile",
+      "notes": "Server web runtime shim for desktop-synced UI."
+    },
+    {
+      "name": "auth_get_status",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "GET /api/accounts",
+      "notes": "Maps server accounts.json into desktop ManagedAuthStatus shape."
+    },
+    {
+      "name": "auth_list_accounts",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "GET /api/accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "auth_logout",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "DELETE /api/accounts/:id",
+      "notes": "Removes all managed accounts for the provider via server accounts.json."
+    },
+    {
+      "name": "auth_poll_for_account",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Routes copilot/kiro device poll and browser oauth callback polling into ManagedAuthAccount."
+    },
+    {
+      "name": "auth_remove_account",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "DELETE /api/accounts/:id",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "auth_set_default_account",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Reorders provider accounts so the selected account is treated as default."
+    },
+    {
+      "name": "auth_start_login",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Returns ManagedAuthDeviceCodeResponse for copilot/kiro device flow and browser oauth providers."
+    },
+    {
+      "name": "auth_submit_oauth_code",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/login/finish",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "authorize_share_market",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/authorize-market",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "check_env_conflicts",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "check_for_updates",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "check_provider_limits",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "claim_client_tunnel",
+      "support": "native",
+      "implemented": true,
+      "feature": "router",
+      "endpoint": "POST /api/router/client-tunnel/claim",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "clear_claude_onboarding_skip",
+      "support": "shim",
+      "implemented": true,
+      "feature": "claudeDesktopProfile",
+      "notes": "Server web runtime shim for desktop-synced UI."
+    },
+    {
+      "name": "codex_banked_reset_consume",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "codex_banked_reset_invite",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "codex_banked_reset_status",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "configure_tunnel",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "copilot_get_auth_status",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_get_models",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_get_models_for_account",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_get_token",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_get_token_for_account",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_get_usage",
+      "support": "shim",
+      "implemented": true,
+      "feature": "usage",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_get_usage_for_account",
+      "support": "shim",
+      "implemented": true,
+      "feature": "usage",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_is_authenticated",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_list_accounts",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_logout",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_poll_for_account",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_poll_for_auth",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/copilot/device/poll",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_remove_account",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_set_default_account",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "copilot_start_device_flow",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/copilot/device/start",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "create_db_backup",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /api/backup",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "create_share",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "deepseek_account_add",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "deepseek_account_list",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "deepseek_account_remove",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "deepseek_account_set_default",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "deepseek_account_status",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "GET /api/accounts",
+      "notes": "Maps DeepSeekAccount entries from accounts.json."
+    },
+    {
+      "name": "delete_db_backup",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "delete_env_vars",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "delete_model_pricing",
+      "support": "shim",
+      "implemented": true,
+      "feature": "usage",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "delete_provider",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "local provider store mutation",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "delete_share",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "DELETE /api/shares/:id",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "delete_universal_provider",
+      "support": "native",
+      "implemented": true,
+      "feature": "universalProviders",
+      "endpoint": "DELETE /api/universal-providers/:id",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "disable_share",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "enable_share",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "ensure_claude_desktop_official_provider",
+      "support": "shim",
+      "implemented": true,
+      "feature": "claudeDesktopProfile",
+      "notes": "Server web runtime shim for desktop-synced UI."
+    },
+    {
+      "name": "export_all_shares",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "GET /api/shares/export",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "export_config_to_file",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "extract_common_config_snippet",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persisted in ui-settings.json commonConfigSnippets."
+    },
+    {
+      "name": "fetch_models_for_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_antigravity_oauth_models",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_app_config_dir_override",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "GET /api/config",
+      "notes": "Server web UI has no portable app config override; always returns null."
+    },
+    {
+      "name": "get_app_config_path",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "GET /api/config",
+      "notes": "Returns server configDir for About/runtime display."
+    },
+    {
+      "name": "get_auto_failover_enabled",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "endpoint": "GET /api/failover",
+      "notes": "Reads FailoverAppConfig.enabled for the requested app."
+    },
+    {
+      "name": "get_auto_launch_status",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_available_providers_for_failover",
+      "support": "shim",
+      "implemented": true,
+      "feature": "failover",
+      "notes": "Returns providers for the app that are not already in the failover queue."
+    },
+    {
+      "name": "get_balance",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_build_info",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "GET /version",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_cached_oauth_quota",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "GET /api/accounts/:id/quota",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_circuit_breaker_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_circuit_breaker_stats",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_claude_code_config_path",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_claude_common_config_snippet",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_claude_desktop_default_routes",
+      "support": "shim",
+      "implemented": true,
+      "feature": "claudeDesktopProfile",
+      "notes": "Server web runtime shim for desktop-synced UI."
+    },
+    {
+      "name": "get_claude_desktop_status",
+      "support": "shim",
+      "implemented": true,
+      "feature": "claudeDesktopProfile",
+      "notes": "Server web runtime shim for desktop-synced UI."
+    },
+    {
+      "name": "get_claude_oauth_quota",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "GET /api/accounts/:id/quota",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_client_tunnel",
+      "support": "native",
+      "implemented": true,
+      "feature": "router",
+      "endpoint": "GET /api/router/client-tunnel",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_client_tunnel_status",
+      "support": "native",
+      "implemented": true,
+      "feature": "router",
+      "endpoint": "GET /api/router/client-tunnel",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_codex_oauth_models",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_codex_oauth_quota",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "GET /api/accounts/:id/quota",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_coding_plan_quota",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_common_config_snippet",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persisted in ui-settings.json commonConfigSnippets."
+    },
+    {
+      "name": "get_config_dir",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "GET /api/config",
+      "notes": "Server has no per-app live config dirs; returns empty string."
+    },
+    {
+      "name": "get_current_provider",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/providers?app=",
+      "notes": "Server has no live desktop config; first provider for app is exposed as the current provider shim."
+    },
+    {
+      "name": "get_custom_endpoints",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_default_cost_multiplier",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_failover_queue",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "endpoint": "GET /api/failover",
+      "notes": "Maps FailoverAppConfig.providerQueue into desktop FailoverQueueItem shape."
+    },
+    {
+      "name": "get_global_proxy_config",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "GET /api/upstream-proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_global_proxy_url",
+      "support": "native",
+      "implemented": true,
+      "feature": "proxy",
+      "endpoint": "GET /api/upstream-proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_upstream_proxy_status",
+      "support": "native",
+      "implemented": true,
+      "feature": "proxy",
+      "endpoint": "GET /api/upstream-proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_installed_skills",
+      "support": "shim",
+      "implemented": true,
+      "feature": "skills",
+      "notes": "Skills are desktop-only; server web UI returns an empty list."
+    },
+    {
+      "name": "get_hermes_live_provider_ids",
+      "support": "shim",
+      "implemented": true,
+      "feature": "openclaw",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_log_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persisted in ui-settings.json logConfig; defaults match desktop."
+    },
+    {
+      "name": "get_model_pricing",
+      "support": "shim",
+      "implemented": true,
+      "feature": "usage",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_model_stats",
+      "support": "native",
+      "implemented": true,
+      "feature": "usage",
+      "endpoint": "GET /api/usage/model-stats",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_openclaw_live_provider_ids",
+      "support": "shim",
+      "implemented": true,
+      "feature": "openclaw",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_opencode_live_provider_ids",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_optimizer_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persisted in ui-settings.json optimizerConfig; defaults match desktop."
+    },
+    {
+      "name": "get_pricing_model_source",
+      "support": "shim",
+      "implemented": true,
+      "feature": "usage",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_provider_health",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/providers/health",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_provider_stats",
+      "support": "native",
+      "implemented": true,
+      "feature": "usage",
+      "endpoint": "GET /api/usage/provider-stats",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_providers",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/providers?app=",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_proxy_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_proxy_config_for_app",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server uses default per-app proxy settings with failover toggle from failover.json."
+    },
+    {
+      "name": "get_proxy_status",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "endpoint": "server process status"
+    },
+    {
+      "name": "get_proxy_takeover_status",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "endpoint": "server process status"
+    },
+    {
+      "name": "get_rectifier_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persisted in ui-settings.json rectifierConfig; defaults match desktop."
+    },
+    {
+      "name": "get_request_detail",
+      "support": "native",
+      "implemented": true,
+      "feature": "usage",
+      "endpoint": "GET /api/usage/logs/:id",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_request_logs",
+      "support": "native",
+      "implemented": true,
+      "feature": "usage",
+      "endpoint": "GET /api/usage/logs",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_settings",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "GET /api/config",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_share_connect_info",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "GET /api/shares/:id/connect-info",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_share_detail",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "GET /api/shares",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_stream_check_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persisted in ui-settings.json streamCheckConfig; defaults match desktop."
+    },
+    {
+      "name": "get_subscription_quota",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_tool_versions",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_tunnel_status",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "GET /api/router/tunnels",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_universal_provider",
+      "support": "native",
+      "implemented": true,
+      "feature": "universalProviders",
+      "endpoint": "GET /api/universal-providers/:id",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_universal_providers",
+      "support": "native",
+      "implemented": true,
+      "feature": "universalProviders",
+      "endpoint": "GET /api/universal-providers",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_usage_data_sources",
+      "support": "shim",
+      "implemented": true,
+      "feature": "usage",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_usage_summary",
+      "support": "native",
+      "implemented": true,
+      "feature": "usage",
+      "endpoint": "GET /api/usage/summary",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_usage_summary_by_app",
+      "support": "native",
+      "implemented": true,
+      "feature": "usage",
+      "endpoint": "GET /api/usage/summary-by-app",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_usage_trends",
+      "support": "native",
+      "implemented": true,
+      "feature": "usage",
+      "endpoint": "GET /api/usage/trends",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "has_codex_unify_history_backup",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "import_claude_desktop_providers_from_claude",
+      "support": "shim",
+      "implemented": true,
+      "feature": "claudeDesktopProfile",
+      "notes": "Server web runtime shim for desktop-synced UI."
+    },
+    {
+      "name": "import_config_from_file",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "import_default_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Imports Claude/Codex/Gemini live config into a default provider from configured or home config dirs."
+    },
+    {
+      "name": "import_hermes_providers_from_live",
+      "support": "shim",
+      "implemented": true,
+      "feature": "openclaw",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "import_openclaw_providers_from_live",
+      "support": "shim",
+      "implemented": true,
+      "feature": "openclaw",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "import_opencode_providers_from_live",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "import_shares",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "install_update_and_restart",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "is_live_takeover_active",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "endpoint": "server process status"
+    },
+    {
+      "name": "is_portable_mode",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server deployment is never portable mode."
+    },
+    {
+      "name": "is_proxy_running",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "endpoint": "server process status"
+    },
+    {
+      "name": "list_db_backups",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "GET /api/backup",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "list_share_binding_history",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "list_share_markets",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "GET /api/share-markets",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "list_shares",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "GET /api/shares",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "model_test_all_providers",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "model_test_provider",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "open_app_config_folder",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "open_config_folder",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "open_external",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "open_file_dialog",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "open_provider_terminal",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "pause_share",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/pause",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "pick_directory",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "probe_tool_installations",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "queryProviderUsage",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "read_live_provider_settings",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "refresh_oauth_quota",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "GET /api/accounts/:id/quota?refresh=true",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "remove_custom_endpoint",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "remove_from_failover_queue",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "remove_provider_from_live_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "rename_db_backup",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "reset_circuit_breaker",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "reset_share_usage",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/reset-usage",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "restart_app",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "restore_codex_unified_history",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "restore_db_backup",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /api/backup/:id/restore",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "restore_env_backup",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "resume_share",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/resume",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "run_tool_lifecycle_action",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "scan_local_proxies",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Scans common localhost proxy ports; matches desktop scan_local_proxies."
+    },
+    {
+      "name": "s3_sync_download",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "s3_sync_fetch_remote_info",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "s3_sync_save_settings",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "s3_sync_upload",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "s3_test_connection",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "save_file_dialog",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "save_settings",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "ui-settings.json",
+      "notes": "Persists desktop-compatible UI settings for server web admin."
+    },
+    {
+      "name": "save_stream_check_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persisted in ui-settings.json streamCheckConfig."
+    },
+    {
+      "name": "set_app_config_dir_override",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "set_auto_failover_enabled",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "set_auto_launch",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "set_claude_common_config_snippet",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "set_common_config_snippet",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persisted in ui-settings.json commonConfigSnippets."
+    },
+    {
+      "name": "set_default_cost_multiplier",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "set_global_proxy_url",
+      "support": "native",
+      "implemented": true,
+      "feature": "proxy",
+      "endpoint": "PUT /api/upstream-proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "set_log_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persisted in ui-settings.json logConfig."
+    },
+    {
+      "name": "set_optimizer_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Writes optimizerConfig into ui-settings.json."
+    },
+    {
+      "name": "set_pricing_model_source",
+      "support": "shim",
+      "implemented": true,
+      "feature": "usage",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "set_proxy_takeover_for_app",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "set_rectifier_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Writes rectifierConfig into ui-settings.json."
+    },
+    {
+      "name": "set_window_theme",
+      "support": "excluded",
+      "implemented": false,
+      "feature": "tauriShell"
+    },
+    {
+      "name": "start_client_tunnel",
+      "support": "native",
+      "implemented": true,
+      "feature": "router",
+      "endpoint": "POST /api/router/client-tunnel/lease",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "start_proxy_server",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "start_share_tunnel",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/tunnel/start",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "stop_client_tunnel",
+      "support": "native",
+      "implemented": true,
+      "feature": "router",
+      "endpoint": "POST /api/router/client-tunnel/stop",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "stop_proxy_server",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "stop_proxy_with_restore",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "stop_share_tunnel",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/tunnel/stop",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "stream_check_all_providers",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "stream_check_provider",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "switch_provider",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "local provider existence check",
+      "notes": "Server share binding and explicit provider headers select runtime provider; switch returns warnings only."
+    },
+    {
+      "name": "switch_proxy_provider",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "sync_current_providers_live",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "sync_session_usage",
+      "support": "shim",
+      "implemented": true,
+      "feature": "localCliSessions",
+      "notes": "Server web runtime shim for desktop-synced UI."
+    },
+    {
+      "name": "sync_universal_provider",
+      "support": "native",
+      "implemented": true,
+      "feature": "universalProviders",
+      "endpoint": "POST /api/universal-providers/:id/sync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "test_proxy_url",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Tests outbound proxy connectivity via HEAD requests to public endpoints."
+    },
+    {
+      "name": "test_api_endpoints",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "testUsageScript",
+      "support": "shim",
+      "implemented": true,
+      "feature": "localCliSessions",
+      "notes": "Server web runtime shim for desktop-synced UI."
+    },
+    {
+      "name": "transfer_share_owner",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/transfer_share_owner",
+      "notes": "Desktop-aligned direct owner transfer from an existing share ACL email."
+    },
+    {
+      "name": "update_circuit_breaker_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "update_client_tunnel",
+      "support": "native",
+      "implemented": true,
+      "feature": "router",
+      "endpoint": "POST /api/router/client-tunnel",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "update_endpoint_last_used",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "update_global_proxy_config",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "PUT /api/upstream-proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "update_model_pricing",
+      "support": "shim",
+      "implemented": true,
+      "feature": "usage",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "update_provider",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /api/providers",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "update_providers_sort_order",
+      "support": "shim",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "local provider store sortIndex mutation",
+      "notes": "Server persists desktop-compatible sortIndex on provider JSON and sorts provider lists by that value."
+    },
+    {
+      "name": "update_proxy_config",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "update_proxy_config_for_app",
+      "support": "shim",
+      "implemented": true,
+      "feature": "proxy",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "update_share_acl",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/acl",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "update_share_description",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "update_share_expiration",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "update_share_for_sale",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "update_share_for_sale_official_price_percent",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "update_share_owner_email",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/update_share_owner_email",
+      "notes": "Desktop-aligned direct share owner email update without email verification."
+    },
+    {
+      "name": "update_share_parallel_limit",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "update_share_provider_binding",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/binding",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "update_share_subdomain",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "update_share_token_limit",
+      "support": "shim",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "update_tray_menu",
+      "support": "shim",
+      "implemented": true,
+      "feature": "tauriShell",
+      "notes": "No-op on server web runtime; desktop tray menu is not available."
+    },
+    {
+      "name": "upsert_universal_provider",
+      "support": "native",
+      "implemented": true,
+      "feature": "universalProviders",
+      "endpoint": "POST /api/universal-providers",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "webdav_sync_download",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "webdav_sync_fetch_remote_info",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "webdav_sync_save_settings",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "webdav_sync_upload",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "webdav_test_connection",
+      "support": "shim",
+      "implemented": true,
+      "feature": "cloudSync",
+      "notes": "Server web runtime shim for desktop-synced settings UI."
+    }
   ]
 }

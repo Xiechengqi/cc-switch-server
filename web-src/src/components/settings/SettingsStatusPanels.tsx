@@ -8,7 +8,7 @@ import {
   RouterDiagnosticsResponse,
   RouterStatusResponse,
   TunnelRuntimeStatus,
-} from "@/lib/api";
+} from "@/lib/server-legacy-api";
 import { useI18n } from "@/lib/i18n";
 
 export function BackupPolicySummary({ backups }: { backups: BackupManifest[] }) {
