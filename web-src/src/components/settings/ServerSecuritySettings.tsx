@@ -105,7 +105,7 @@ export function ServerSecuritySettings({ onSignOut }: ServerSecuritySettingsProp
           <Button
             type="button"
             className="bg-red-600 text-white hover:bg-red-700"
-            onClick={onSignOut}
+            onClick={() => onSignOut()}
           >
             <LogOut className="mr-2 h-4 w-4" />
             {t("settings.serverSecurity.signOut", {
