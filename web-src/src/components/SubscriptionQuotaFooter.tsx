@@ -4,6 +4,10 @@ import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
 import { useSubscriptionQuota } from "@/lib/query/subscription";
 import type { QuotaTier, SubscriptionQuota } from "@/types/subscription";
+import {
+  PROVIDER_REFRESH_TITLE_KEY,
+  resolveQuotaQueriedAt,
+} from "@/utils/providerQuotaUi";
 
 interface SubscriptionQuotaFooterProps {
   appId: AppId;
@@ -15,7 +19,7 @@ interface SubscriptionQuotaFooterProps {
 interface SubscriptionQuotaViewProps {
   quota: SubscriptionQuota | undefined;
   loading: boolean;
-  refetch: () => void;
+  refetch: () => void | Promise<unknown>;
   /** 用于 `subscription.expiredHint` 的 {tool} 插值；解耦了 hook 的 appId */
   appIdForExpiredHint: string;
   inline?: boolean;
@@ -226,12 +230,34 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   visibleTierNames,
 }) => {
   const { t } = useTranslation();
+  const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
+    defaultValue: "供应商信息刷新",
+  });
+  const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
+    number | null
+  >(null);
+
+  const handleRefresh = React.useCallback(async () => {
+    setLastManualRefreshAt(Date.now());
+    await refetch();
+  }, [refetch]);
+
+  React.useEffect(() => {
+    if (quota?.queriedAt && quota.queriedAt > 0) {
+      setLastManualRefreshAt(null);
+    }
+  }, [quota?.queriedAt]);
+
+  const displayQueriedAt = resolveQuotaQueriedAt(
+    quota?.queriedAt,
+    lastManualRefreshAt,
+  );
 
   // 定期更新相对时间显示
   const [now, setNow] = React.useState(Date.now());
   React.useEffect(() => {
     if (
-      !quota?.queriedAt &&
+      !displayQueriedAt &&
       !quota?.subscription?.expiresAt &&
       !quota?.tiers?.some((tier) => tier.resetsAt)
     ) {
@@ -239,7 +265,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     }
     const interval = setInterval(() => setNow(Date.now()), 30000);
     return () => clearInterval(interval);
-  }, [quota?.queriedAt, quota?.subscription?.expiresAt, quota?.tiers]);
+  }, [displayQueriedAt, quota?.subscription?.expiresAt, quota?.tiers]);
 
   // 无凭据 → 不显示
   if (!quota || quota.credentialStatus === "not_found") return null;
@@ -257,10 +283,10 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
             <span className="break-words">{t("subscription.expired")}</span>
           </div>
           <button
-            onClick={() => refetch()}
+            onClick={() => void handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -280,10 +306,10 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
             </div>
           </div>
           <button
-            onClick={() => refetch()}
+            onClick={() => void handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-amber-100 dark:hover:bg-amber-800/30 transition-colors disabled:opacity-50 flex-shrink-0"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -302,10 +328,10 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
             <span className="break-words">{t("subscription.queryFailed")}</span>
           </div>
           <button
-            onClick={() => refetch()}
+            onClick={() => void handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -320,10 +346,10 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
             <span>{quota.error || t("subscription.queryFailed")}</span>
           </div>
           <button
-            onClick={() => refetch()}
+            onClick={() => void handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors disabled:opacity-50 flex-shrink-0"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -357,18 +383,18 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
         <div className="flex items-center gap-2 justify-end">
           <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
             <Clock size={10} />
-            {quota.queriedAt
-              ? formatRelativeTime(quota.queriedAt, now, t)
-              : t("usage.never", { defaultValue: "从未更新" })}
+            {displayQueriedAt
+              ? formatRelativeTime(displayQueriedAt, now, t)
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
           </span>
           <button
             onClick={(e) => {
               e.stopPropagation();
-              refetch();
+              void handleRefresh();
             }}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -390,17 +416,17 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           {t("subscription.title", { defaultValue: "Subscription Quota" })}
         </span>
         <div className="flex items-center gap-2">
-          {quota.queriedAt && (
+          {displayQueriedAt && (
             <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Clock size={10} />
-              {formatRelativeTime(quota.queriedAt, now, t)}
+              {formatRelativeTime(displayQueriedAt, now, t)}
             </span>
           )}
           <button
-            onClick={() => refetch()}
+            onClick={() => void handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>

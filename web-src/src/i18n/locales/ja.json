@@ -101,6 +101,8 @@
   },
   "provider": {
     "connectivityCheck": "接続チェック",
+    "refreshProviderInfo": "プロバイダー情報を更新",
+    "quotaNeverUpdated": "未更新",
     "testLink": "リンクテスト",
     "testModel": "モデルテスト",
     "tabProvider": "プロバイダー",

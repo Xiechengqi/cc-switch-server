@@ -156,11 +156,12 @@ static CODEX_TOKEN_URLS: &[&str] = &["https://auth.openai.com/oauth/token"];
 static CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 static CODEX_AUTHORIZE_SCOPE: &str = "openid profile email offline_access";
 static CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
-static CLAUDE_TOKEN_URLS: &[&str] = &[
-    "https://api.anthropic.com/v1/oauth/token",
-    "https://platform.claude.com/v1/oauth/token",
-];
+static CLAUDE_TOKEN_URLS: &[&str] = &[CLAUDE_API_TOKEN_URL, CLAUDE_PLATFORM_TOKEN_URL];
 static CLAUDE_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+pub const CLAUDE_WEB_PASTE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+pub const CLAUDE_API_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
+pub const CLAUDE_PLATFORM_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_PLATFORM_TOKEN_USER_AGENT: &str = "axios/1.13.6";
 static GEMINI_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"];
 static GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 static CURSOR_TOKEN_URLS: &[&str] = &["https://api2.cursor.sh/oauth/token"];
@@ -169,6 +170,91 @@ static CURSOR_POLL_URL: &str = "https://api2.cursor.sh/auth/poll";
 static CURSOR_USER_AGENT: &str = "Cursor/1.1.6 (cc-switch browser login)";
 static ANTIGRAVITY_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"];
 static ANTIGRAVITY_AUTHORIZE_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+
+pub fn claude_oauth_token_urls_for_redirect(redirect_uri: &str) -> Vec<&'static str> {
+    if redirect_uri == CLAUDE_WEB_PASTE_REDIRECT_URI {
+        vec![CLAUDE_PLATFORM_TOKEN_URL, CLAUDE_API_TOKEN_URL]
+    } else {
+        vec![CLAUDE_API_TOKEN_URL, CLAUDE_PLATFORM_TOKEN_URL]
+    }
+}
+
+pub fn claude_oauth_user_agent_for_token_url(token_url: &str) -> &'static str {
+    if token_url == CLAUDE_PLATFORM_TOKEN_URL {
+        CLAUDE_PLATFORM_TOKEN_USER_AGENT
+    } else {
+        "cc-switch-server-claude-oauth"
+    }
+}
+
+pub fn parse_claude_authorization_code_input(
+    raw_code: &str,
+    expected_state: &str,
+) -> Result<(String, String), OAuthErrorClassification> {
+    let trimmed = raw_code.trim();
+    if trimmed.is_empty() {
+        return Err(OAuthErrorClassification {
+            kind: OAuthErrorKind::Unsupported,
+            message: "authorization code is empty; paste the full code from platform.claude.com"
+                .to_string(),
+            retryable: false,
+            refresh_token_may_have_rotated: false,
+        });
+    }
+
+    let (code, state_from_code) = match trimmed.split_once('#') {
+        Some((code, state)) => (code.trim(), Some(state.trim())),
+        None => (trimmed, None),
+    };
+
+    if code.is_empty() {
+        return Err(OAuthErrorClassification {
+            kind: OAuthErrorKind::Unsupported,
+            message: "authorization code format is invalid: missing code segment".to_string(),
+            retryable: false,
+            refresh_token_may_have_rotated: false,
+        });
+    }
+
+    let token_state = match state_from_code {
+        Some(state) if state.is_empty() => expected_state.to_string(),
+        Some(state) => {
+            if state != expected_state {
+                return Err(OAuthErrorClassification {
+                    kind: OAuthErrorKind::Unsupported,
+                    message: format!("state mismatch: expected {expected_state}, received {state}"),
+                    retryable: false,
+                    refresh_token_may_have_rotated: false,
+                });
+            }
+            state.to_string()
+        }
+        None => expected_state.to_string(),
+    };
+
+    Ok((code.to_string(), token_state))
+}
+
+fn set_oauth_user_agent(
+    headers: &mut Vec<(String, String)>,
+    provider_type: ProviderType,
+    token_url: &str,
+    default_user_agent: Option<&str>,
+) {
+    let user_agent = if provider_type == ProviderType::ClaudeOAuth {
+        claude_oauth_user_agent_for_token_url(token_url)
+    } else {
+        default_user_agent.unwrap_or("cc-switch-server-oauth")
+    };
+    if let Some(entry) = headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        entry.1 = user_agent.to_string();
+    } else {
+        headers.push(("User-Agent".to_string(), user_agent.to_string()));
+    }
+}
 
 pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderSpec> {
     match provider_type {
@@ -439,11 +525,14 @@ pub fn build_authorization_code_request(
     ) {
         return Err(unsupported_login(provider_type));
     }
-    let token_url = spec
-        .token_urls
-        .first()
-        .copied()
-        .ok_or_else(|| unsupported(provider_type))?;
+    let token_url = if provider_type == ProviderType::ClaudeOAuth {
+        claude_oauth_token_urls_for_redirect(redirect_uri)[0]
+    } else {
+        spec.token_urls
+            .first()
+            .copied()
+            .ok_or_else(|| unsupported(provider_type))?
+    };
     let client_id = resolve_spec_client_id(&spec)?;
     let client_secret = resolve_spec_client_secret(&spec);
 
@@ -460,9 +549,7 @@ pub fn build_authorization_code_request(
             "application/json, text/plain, */*".to_string(),
         ),
     ];
-    if let Some(user_agent) = spec.user_agent {
-        headers.push(("User-Agent".to_string(), user_agent.to_string()));
-    }
+    set_oauth_user_agent(&mut headers, provider_type, token_url, spec.user_agent);
 
     let mut body = json!({
         "grant_type": "authorization_code",
@@ -552,9 +639,7 @@ pub fn build_refresh_request_for_token_url(
             OAuthRequestBodyFormat::Json => "application/json".to_string(),
         },
     )];
-    if let Some(user_agent) = spec.user_agent {
-        headers.push(("User-Agent".to_string(), user_agent.to_string()));
-    }
+    set_oauth_user_agent(&mut headers, provider_type, token_url, spec.user_agent);
 
     let mut body = json!({
         "grant_type": "refresh_token",
@@ -1307,6 +1392,38 @@ mod tests {
         assert_eq!(request.body["refresh_token"], "refresh-token");
         assert_eq!(request.body["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann");
         assert_eq!(request.body["scope"], "openid profile email");
+    }
+
+    #[test]
+    fn claude_web_paste_authorization_request_prefers_platform_token_url() {
+        let request = build_authorization_code_request(
+            ProviderType::ClaudeOAuth,
+            "auth-code",
+            CLAUDE_WEB_PASTE_REDIRECT_URI,
+            Some("verifier"),
+            "state-1",
+        )
+        .expect("claude request");
+        assert_eq!(request.url, CLAUDE_PLATFORM_TOKEN_URL);
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "User-Agent" && value == "axios/1.13.6"));
+    }
+
+    #[test]
+    fn parse_claude_authorization_code_input_accepts_code_with_state_fragment() {
+        let (code, state) =
+            parse_claude_authorization_code_input("auth-code#state-1", "state-1").expect("parsed");
+        assert_eq!(code, "auth-code");
+        assert_eq!(state, "state-1");
+    }
+
+    #[test]
+    fn parse_claude_authorization_code_input_rejects_state_mismatch() {
+        let error = parse_claude_authorization_code_input("auth-code#other", "state-1")
+            .expect_err("mismatch");
+        assert!(error.message.contains("state mismatch"));
     }
 
     #[test]

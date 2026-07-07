@@ -7,6 +7,10 @@ import { useOllamaQuota } from "@/lib/query/ollama";
 import { subscriptionApi } from "@/lib/api/subscription";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatExpireDistance } from "@/components/SubscriptionQuotaFooter";
+import {
+  PROVIDER_REFRESH_TITLE_KEY,
+  resolveQuotaQueriedAt,
+} from "@/utils/providerQuotaUi";
 
 interface OllamaQuotaFooterProps {
   meta?: ProviderMeta;
@@ -36,6 +40,12 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
   inline = false,
 }) => {
   const { t } = useTranslation();
+  const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
+    defaultValue: "供应商信息刷新",
+  });
+  const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
+    number | null
+  >(null);
   const queryClient = useQueryClient();
 
   const {
@@ -45,6 +55,7 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
   } = useOllamaQuota(providerId, { enabled: true, appId });
 
   const handleRefresh = React.useCallback(async () => {
+    setLastManualRefreshAt(Date.now());
     await subscriptionApi.refreshOauthQuota(
       "ollama_cloud",
       providerId,
@@ -56,12 +67,24 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
     queryClient.invalidateQueries({
       queryKey: ["ollama", "quota", providerId],
     });
-  }, [refetch, queryClient, providerId]);
+  }, [refetch, queryClient, providerId, appId]);
+
+  const displayQueriedAt = resolveQuotaQueriedAt(
+    cached?.refreshedAt ?? cached?.quota?.queriedAt ?? null,
+    lastManualRefreshAt,
+  );
 
   const [now, setNow] = React.useState(Date.now());
   React.useEffect(() => {
+    const serverQueriedAt = cached?.refreshedAt ?? cached?.quota?.queriedAt;
+    if (serverQueriedAt && serverQueriedAt > 0) {
+      setLastManualRefreshAt(null);
+    }
+  }, [cached?.refreshedAt, cached?.quota?.queriedAt]);
+
+  React.useEffect(() => {
     if (
-      !cached?.refreshedAt &&
+      !displayQueriedAt &&
       !cached?.quota?.subscription?.expiresAt &&
       !cached?.quota?.tiers?.some((tier) => tier.resetsAt)
     ) {
@@ -70,7 +93,7 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
     const interval = setInterval(() => setNow(Date.now()), 30000);
     return () => clearInterval(interval);
   }, [
-    cached?.refreshedAt,
+    displayQueriedAt,
     cached?.quota?.subscription?.expiresAt,
     cached?.quota?.tiers,
   ]);
@@ -91,7 +114,7 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
             onClick={() => handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -115,9 +138,9 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
         <div className="flex items-center gap-2 justify-end">
           <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
             <Clock size={10} />
-            {cached.refreshedAt
-              ? formatRelativeTime(cached.refreshedAt, now, t)
-              : t("usage.never", { defaultValue: "Never" })}
+            {displayQueriedAt
+              ? formatRelativeTime(displayQueriedAt, now, t)
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
           </span>
           <button
             onClick={(e) => {
@@ -126,7 +149,7 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
             }}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -145,17 +168,17 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
           {t("subscription.title", { defaultValue: "Subscription" })}
         </span>
         <div className="flex items-center gap-2">
-          {cached.refreshedAt && (
+          {displayQueriedAt && (
             <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Clock size={10} />
-              {formatRelativeTime(cached.refreshedAt, now, t)}
+              {formatRelativeTime(displayQueriedAt, now, t)}
             </span>
           )}
           <button
             onClick={() => handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>

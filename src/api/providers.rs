@@ -515,16 +515,32 @@ pub(in crate::api) async fn test_provider_inner(
         let accounts = state.accounts.read().await.clone();
         let started = std::time::Instant::now();
         let body = provider_test_body(stored.app, &stored, Some(&model), stream);
-        let adapter_request = adapter
+        let mut adapter_request = adapter
             .transform_request_for_route(Bytes::from(body), &stored, route, gemini_path.as_deref())
             .map_err(ApiError::proxy)?;
-        let endpoint_for_request = adapter
+        let mut endpoint_for_request = adapter
             .resolve_endpoint_for_request(route, gemini_path.clone(), &stored, &adapter_request)
             .map_err(ApiError::proxy)?;
         target_headers = adapter
             .build_headers(stored.app, &stored, &accounts)
             .map_err(ApiError::proxy)?;
         target_headers.extend(adapter_request.upstream_headers.iter().cloned());
+        if stored.app == AppKind::Claude && stored.provider_type == ProviderType::ClaudeOAuth {
+            let (beta_name, beta_value) = proxy::claude_oauth::apply_forward_contract(
+                &mut endpoint_for_request,
+                &mut adapter_request.body,
+                &axum::http::HeaderMap::new(),
+            )
+            .map_err(ApiError::proxy)?;
+            if let Some((_, existing)) = target_headers
+                .iter_mut()
+                .find(|(name, _)| name.eq_ignore_ascii_case(beta_name))
+            {
+                *existing = beta_value;
+            } else {
+                target_headers.push((beta_name, beta_value));
+            }
+        }
         let stream = adapter_request.stream_requested || stream;
         let http_client = state.http_client().await;
         let mut endpoints = vec![endpoint_for_request.clone()];

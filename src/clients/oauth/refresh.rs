@@ -264,6 +264,35 @@ fn oauth_token_request_fallbacks(
     provider_type: ProviderType,
     request: &OAuthHttpRequest,
 ) -> Vec<OAuthHttpRequest> {
+    if provider_type == ProviderType::ClaudeOAuth {
+        let redirect_uri = request
+            .body
+            .get("redirect_uri")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let ordered =
+            crate::domain::accounts::oauth::claude_oauth_token_urls_for_redirect(redirect_uri);
+        let mut requests: Vec<OAuthHttpRequest> = Vec::new();
+        for token_url in ordered {
+            if requests.iter().any(|item| item.url == *token_url) {
+                continue;
+            }
+            let mut next = if request.url == *token_url {
+                request.clone()
+            } else {
+                let mut cloned = request.clone();
+                cloned.url = (*token_url).to_string();
+                cloned
+            };
+            set_claude_oauth_user_agent(&mut next, token_url);
+            requests.push(next);
+        }
+        if requests.is_empty() {
+            requests.push(request.clone());
+        }
+        return requests;
+    }
+
     let mut requests = vec![request.clone()];
     if let Some(spec) = oauth_provider_spec(provider_type) {
         if !spec
@@ -282,6 +311,22 @@ fn oauth_token_request_fallbacks(
         }
     }
     requests
+}
+
+fn set_claude_oauth_user_agent(request: &mut OAuthHttpRequest, token_url: &str) {
+    let user_agent =
+        crate::domain::accounts::oauth::claude_oauth_user_agent_for_token_url(token_url);
+    if let Some(entry) = request
+        .headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        entry.1 = user_agent.to_string();
+    } else {
+        request
+            .headers
+            .push(("User-Agent".to_string(), user_agent.to_string()));
+    }
 }
 
 fn cursor_login_is_pending(
@@ -484,6 +529,26 @@ mod tests {
             requests[1].url,
             "https://platform.claude.com/v1/oauth/token"
         );
+    }
+
+    #[test]
+    fn web_paste_token_endpoint_requests_prefer_platform_first() {
+        let mut request = request("https://platform.claude.com/v1/oauth/token");
+        request.body["redirect_uri"] = serde_json::Value::String(
+            crate::domain::accounts::oauth::CLAUDE_WEB_PASTE_REDIRECT_URI.to_string(),
+        );
+        let requests = oauth_token_request_fallbacks(ProviderType::ClaudeOAuth, &request);
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].url,
+            "https://platform.claude.com/v1/oauth/token"
+        );
+        assert_eq!(requests[1].url, "https://api.anthropic.com/v1/oauth/token");
+        assert!(requests[0]
+            .headers
+            .iter()
+            .any(|(name, value)| name == "User-Agent" && value == "axios/1.13.6"));
     }
 
     #[test]

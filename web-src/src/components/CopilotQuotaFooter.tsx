@@ -3,6 +3,7 @@ import { RefreshCw, AlertCircle, Clock } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { ProviderMeta } from "@/types";
 import { useCopilotQuota } from "@/lib/query/copilot";
+import { subscriptionApi } from "@/lib/api/subscription";
 import type { AppId } from "@/lib/api";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { PROVIDER_TYPES } from "@/config/constants";
@@ -10,6 +11,10 @@ import {
   TierBadge,
   utilizationColor,
 } from "@/components/SubscriptionQuotaFooter";
+import {
+  PROVIDER_REFRESH_TITLE_KEY,
+  resolveQuotaQueriedAt,
+} from "@/utils/providerQuotaUi";
 
 interface CopilotQuotaFooterProps {
   meta?: ProviderMeta;
@@ -40,6 +45,12 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
   inline = false,
 }) => {
   const { t } = useTranslation();
+  const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
+    defaultValue: "供应商信息刷新",
+  });
+  const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
+    number | null
+  >(null);
   const accountId = resolveManagedAccountId(
     meta,
     PROVIDER_TYPES.GITHUB_COPILOT,
@@ -52,15 +63,28 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
   } = useCopilotQuota(accountId, { enabled: true });
   const effectiveLoading = loading;
   const handleRefresh = React.useCallback(async () => {
+    setLastManualRefreshAt(Date.now());
+    await subscriptionApi.refreshOauthQuota("github_copilot", accountId);
     await refetch();
-  }, [refetch]);
+  }, [accountId, refetch]);
+
+  const displayQueriedAt = resolveQuotaQueriedAt(
+    quota?.queriedAt,
+    lastManualRefreshAt,
+  );
 
   const [now, setNow] = React.useState(Date.now());
   React.useEffect(() => {
-    if (!quota?.queriedAt) return;
+    if (quota?.queriedAt && quota.queriedAt > 0) {
+      setLastManualRefreshAt(null);
+    }
+  }, [quota?.queriedAt]);
+
+  React.useEffect(() => {
+    if (!displayQueriedAt) return;
     const interval = setInterval(() => setNow(Date.now()), 30000);
     return () => clearInterval(interval);
-  }, [quota?.queriedAt]);
+  }, [displayQueriedAt]);
 
   if (!quota) return null;
 
@@ -77,7 +101,7 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
             onClick={() => handleRefresh()}
             disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw
               size={12}
@@ -104,9 +128,9 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
           )}
           <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
             <Clock size={10} />
-            {quota.queriedAt
-              ? formatRelativeTime(quota.queriedAt, now, t)
-              : t("usage.never", { defaultValue: "Never" })}
+            {displayQueriedAt
+              ? formatRelativeTime(displayQueriedAt, now, t)
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
           </span>
           <button
             onClick={(e) => {
@@ -115,7 +139,7 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
             }}
             disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw
               size={12}
@@ -141,17 +165,17 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
           {quota.plan || t("subscription.title")}
         </span>
         <div className="flex items-center gap-2">
-          {quota.queriedAt && (
+          {displayQueriedAt && (
             <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Clock size={10} />
-              {formatRelativeTime(quota.queriedAt, now, t)}
+              {formatRelativeTime(displayQueriedAt, now, t)}
             </span>
           )}
           <button
             onClick={() => handleRefresh()}
             disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw
               size={12}

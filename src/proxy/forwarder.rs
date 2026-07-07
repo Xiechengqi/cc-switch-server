@@ -124,6 +124,7 @@ pub async fn forward(
         gemini_path_for_request.as_deref(),
         &copilot_metadata,
     )?;
+    let mut adapter_request = adapter_request;
     let mut url =
         adapter.resolve_endpoint_for_request(route, gemini_path, &stored, &adapter_request)?;
     refresh_managed_account_if_needed(&state, app, &stored).await?;
@@ -142,6 +143,14 @@ pub async fn forward(
     target_headers.extend(adapter_request.upstream_headers.iter().cloned());
     if stored.provider_type == ProviderType::CodexOAuth {
         append_codex_oauth_session_headers(&mut target_headers, codex_oauth_session_id.as_deref());
+    }
+    if app == AppKind::Claude && stored.provider_type == ProviderType::ClaudeOAuth {
+        let (beta_name, beta_value) = super::claude_oauth::apply_forward_contract(
+            &mut url,
+            &mut adapter_request.body,
+            &headers,
+        )?;
+        replace_or_push_header(&mut target_headers, beta_name, beta_value);
     }
     if let Some(auth) = copilot_upstream_auth {
         url = super::join_url(&auth.api_endpoint, "/chat/completions");

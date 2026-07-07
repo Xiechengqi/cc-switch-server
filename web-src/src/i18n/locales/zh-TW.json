@@ -99,6 +99,8 @@
   },
   "provider": {
     "connectivityCheck": "檢測連通",
+    "refreshProviderInfo": "供應商資訊刷新",
+    "quotaNeverUpdated": "從未更新",
     "testLink": "測試連結",
     "testModel": "測試模型",
     "tabProvider": "供應商",

@@ -13,6 +13,10 @@ import {
   SubscriptionQuotaView,
   utilizationColor,
 } from "@/components/SubscriptionQuotaFooter";
+import {
+  PROVIDER_REFRESH_TITLE_KEY,
+  resolveQuotaQueriedAt,
+} from "@/utils/providerQuotaUi";
 
 interface KiroOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -27,6 +31,12 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
   inline = false,
 }) => {
   const { t, i18n } = useTranslation();
+  const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
+    defaultValue: "供应商信息刷新",
+  });
+  const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
+    number | null
+  >(null);
   const {
     data: quota,
     isFetching: loading,
@@ -34,16 +44,28 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
   } = useKiroOauthQuota(meta, { enabled: true });
   const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.KIRO_OAUTH);
   const handleRefresh = React.useCallback(async () => {
+    setLastManualRefreshAt(Date.now());
     await subscriptionApi.refreshOauthQuota("kiro_oauth", accountId);
     await refetch();
   }, [accountId, refetch]);
 
+  const displayQueriedAt = resolveQuotaQueriedAt(
+    quota?.queriedAt,
+    lastManualRefreshAt,
+  );
+
   const [now, setNow] = React.useState(Date.now());
   React.useEffect(() => {
-    if (!quota?.queriedAt) return;
+    if (quota?.queriedAt && quota.queriedAt > 0) {
+      setLastManualRefreshAt(null);
+    }
+  }, [quota?.queriedAt]);
+
+  React.useEffect(() => {
+    if (!displayQueriedAt) return;
     const interval = setInterval(() => setNow(Date.now()), 30000);
     return () => clearInterval(interval);
-  }, [quota?.queriedAt]);
+  }, [displayQueriedAt]);
 
   const tier = quota?.tiers?.find(
     (item) => item.name === "kiro_agentic_requests",
@@ -90,9 +112,9 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
         <div className="flex items-center gap-2 justify-end">
           <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
             <Clock size={10} />
-            {quota.queriedAt
-              ? formatRelativeTime(quota.queriedAt, now, t)
-              : t("usage.never", { defaultValue: "从未更新" })}
+            {displayQueriedAt
+              ? formatRelativeTime(displayQueriedAt, now, t)
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
           </span>
           <button
             onClick={(event) => {
@@ -101,7 +123,7 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
             }}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -153,17 +175,17 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {quota.queriedAt && (
+          {displayQueriedAt && (
             <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Clock size={10} />
-              {formatRelativeTime(quota.queriedAt, now, t)}
+              {formatRelativeTime(displayQueriedAt, now, t)}
             </span>
           )}
           <button
             onClick={() => handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>

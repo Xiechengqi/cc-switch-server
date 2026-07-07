@@ -101,6 +101,8 @@
   },
   "provider": {
     "connectivityCheck": "检测连通",
+    "refreshProviderInfo": "供应商信息刷新",
+    "quotaNeverUpdated": "从未更新",
     "testLink": "测试链接",
     "testModel": "测试模型",
     "tabProvider": "供应商",

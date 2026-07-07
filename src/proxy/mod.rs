@@ -2,6 +2,7 @@
 
 pub mod adapters;
 mod cache_injector;
+pub(crate) mod claude_oauth;
 mod copilot_model_map;
 mod copilot_optimizer;
 pub(crate) mod cursor;

@@ -1,6 +1,7 @@
 use super::super::*;
 use std::collections::BTreeMap;
 
+use crate::domain::accounts::oauth::CLAUDE_WEB_PASTE_REDIRECT_URI;
 use crate::domain::sharing::router_contract::ShareSettingsPatch;
 
 pub(in crate::api) fn web_provider_health_json(
@@ -1512,8 +1513,6 @@ pub(in crate::api) fn map_managed_auth_account(
         "github_domain": "github.com"
     })
 }
-
-const CLAUDE_WEB_PASTE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 
 pub(in crate::api) fn managed_auth_is_cli_oauth_flow(oauth_flow_mode: Option<&str>) -> bool {
     matches!(

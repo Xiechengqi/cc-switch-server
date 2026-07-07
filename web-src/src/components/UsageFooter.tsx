@@ -6,6 +6,10 @@ import { useUsageQuery } from "@/lib/query/queries";
 import { UsageData, Provider } from "@/types";
 import { TierBadge } from "@/components/SubscriptionQuotaFooter";
 import type { QuotaTier } from "@/types/subscription";
+import {
+  PROVIDER_REFRESH_TITLE_KEY,
+  resolveQuotaQueriedAt,
+} from "@/utils/providerQuotaUi";
 
 interface UsageFooterProps {
   provider: Provider;
@@ -52,6 +56,12 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
   inline = false,
 }) => {
   const { t } = useTranslation();
+  const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
+    defaultValue: "供应商信息刷新",
+  });
+  const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
+    number | null
+  >(null);
   const isTokenPlan =
     provider.meta?.usage_script?.templateType === "token_plan";
 
@@ -72,11 +82,27 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
     autoQueryInterval,
   });
 
+  const displayQueriedAt = resolveQuotaQueriedAt(
+    lastQueriedAt,
+    lastManualRefreshAt,
+  );
+
+  const handleRefresh = React.useCallback(async () => {
+    setLastManualRefreshAt(Date.now());
+    await refetch();
+  }, [refetch]);
+
+  React.useEffect(() => {
+    if (lastQueriedAt && lastQueriedAt > 0) {
+      setLastManualRefreshAt(null);
+    }
+  }, [lastQueriedAt]);
+
   // 🆕 定期更新当前时间，用于刷新相对时间显示
   const [now, setNow] = React.useState(Date.now());
 
   React.useEffect(() => {
-    if (!lastQueriedAt) return;
+    if (!displayQueriedAt) return;
 
     // 每30秒更新一次当前时间，触发相对时间显示的刷新
     const interval = setInterval(() => {
@@ -84,7 +110,7 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
     }, 30000); // 30秒
 
     return () => clearInterval(interval);
-  }, [lastQueriedAt]);
+  }, [displayQueriedAt]);
 
   // 只在启用用量查询且有数据时显示
   if (!usageEnabled || !usage) return null;
@@ -99,10 +125,10 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
             <span className="break-words">{t("usage.queryFailed")}</span>
           </div>
           <button
-            onClick={() => refetch()}
+            onClick={() => void handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
-            title={t("usage.refreshUsage")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -120,10 +146,10 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
 
           {/* 刷新按钮 */}
           <button
-            onClick={() => refetch()}
+            onClick={() => void handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors disabled:opacity-50 flex-shrink-0"
-            title={t("usage.refreshUsage")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -145,18 +171,18 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
         <div className="flex items-center gap-2 justify-end">
           <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
             <Clock size={10} />
-            {lastQueriedAt
-              ? formatRelativeTime(lastQueriedAt, now, t)
-              : t("usage.never", { defaultValue: "从未更新" })}
+            {displayQueriedAt
+              ? formatRelativeTime(displayQueriedAt, now, t)
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
           </span>
           <button
             onClick={(e) => {
               e.stopPropagation();
-              refetch();
+              void handleRefresh();
             }}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={t("usage.refreshUsage")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -196,20 +222,20 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
           {/* 上次查询时间 */}
           <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
             <Clock size={10} />
-            {lastQueriedAt
-              ? formatRelativeTime(lastQueriedAt, now, t)
-              : t("usage.never", { defaultValue: "从未更新" })}
+            {displayQueriedAt
+              ? formatRelativeTime(displayQueriedAt, now, t)
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
           </span>
 
           {/* 刷新按钮 */}
           <button
             onClick={(e) => {
               e.stopPropagation();
-              refetch();
+              void handleRefresh();
             }}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={t("usage.refreshUsage")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -280,17 +306,17 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
         </span>
         <div className="flex items-center gap-2">
           {/* 自动查询时间提示 */}
-          {lastQueriedAt && (
+          {displayQueriedAt && (
             <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Clock size={10} />
-              {formatRelativeTime(lastQueriedAt, now, t)}
+              {formatRelativeTime(displayQueriedAt, now, t)}
             </span>
           )}
           <button
-            onClick={() => refetch()}
+            onClick={() => void handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
-            title={t("usage.refreshUsage")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>

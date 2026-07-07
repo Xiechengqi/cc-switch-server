@@ -76,3 +76,13 @@ Note: server compatibility provider types are explicit cc-switch-server classifi
 | --- | --- |
 | NewAPI | `newapi` |
 | 自定义网关 | `custom_gateway` |
+
+## Server parity notes
+
+### `claude_oauth` (Claude Official)
+
+Server-native parity with desktop `cc-switch` forwarder and `claude_oauth_auth` (2026-07-07):
+
+- Proxy hot path: `?beta=true`, `anthropic-beta` assembly (`claude-code-20250219`, `oauth-2025-04-20`, `interleaved-thinking-2025-05-14`), billing `system` injection, `cch=` body signing (`src/proxy/claude_oauth.rs`).
+- OAuth web-paste: `code#state` parsing, platform token endpoint first, platform User-Agent (`axios/1.13.6`).
+- Local callback uses `/api/accounts/login/callback` instead of desktop `localhost:54545` (deployment difference, not a capability gap).

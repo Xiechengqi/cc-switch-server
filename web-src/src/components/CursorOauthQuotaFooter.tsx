@@ -13,6 +13,10 @@ import {
   SubscriptionQuotaView,
   utilizationColor,
 } from "@/components/SubscriptionQuotaFooter";
+import {
+  PROVIDER_REFRESH_TITLE_KEY,
+  resolveQuotaQueriedAt,
+} from "@/utils/providerQuotaUi";
 
 interface CursorOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -29,6 +33,12 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
   inline = false,
 }) => {
   const { t, i18n } = useTranslation();
+  const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
+    defaultValue: "供应商信息刷新",
+  });
+  const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
+    number | null
+  >(null);
   const isCursorApiKey = meta?.providerType === PROVIDER_TYPES.CURSOR_APIKEY;
   const authProvider = isCursorApiKey
     ? PROVIDER_TYPES.CURSOR_APIKEY
@@ -42,6 +52,7 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     ? null
     : resolveManagedAccountId(meta, PROVIDER_TYPES.CURSOR_OAUTH);
   const handleRefresh = React.useCallback(async () => {
+    setLastManualRefreshAt(Date.now());
     await subscriptionApi.refreshOauthQuota(
       authProvider,
       accountId,
@@ -52,10 +63,21 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     await refetch();
   }, [accountId, appId, authProvider, meta?.providerType, providerId, refetch]);
 
+  const displayQueriedAt = resolveQuotaQueriedAt(
+    quota?.queriedAt,
+    lastManualRefreshAt,
+  );
+
   const [now, setNow] = React.useState(Date.now());
   React.useEffect(() => {
+    if (quota?.queriedAt && quota.queriedAt > 0) {
+      setLastManualRefreshAt(null);
+    }
+  }, [quota?.queriedAt]);
+
+  React.useEffect(() => {
     if (
-      !quota?.queriedAt &&
+      !displayQueriedAt &&
       !quota?.subscription?.expiresAt &&
       !quota?.tiers?.some((item) => item.resetsAt)
     ) {
@@ -63,7 +85,7 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     }
     const interval = setInterval(() => setNow(Date.now()), 30000);
     return () => clearInterval(interval);
-  }, [quota?.queriedAt, quota?.subscription?.expiresAt, quota?.tiers]);
+  }, [displayQueriedAt, quota?.subscription?.expiresAt, quota?.tiers]);
 
   const membership = quota?.credentialMessage ?? undefined;
   const tier = quota?.tiers?.find(
@@ -114,9 +136,9 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
           )}
           <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
             <Clock size={10} />
-            {quota.queriedAt
-              ? formatRelativeTime(quota.queriedAt, now, t)
-              : t("usage.never", { defaultValue: "从未更新" })}
+            {displayQueriedAt
+              ? formatRelativeTime(displayQueriedAt, now, t)
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
           </span>
           <button
             onClick={(event) => {
@@ -125,7 +147,7 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
             }}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -158,17 +180,17 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {quota.queriedAt && (
+          {displayQueriedAt && (
             <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Clock size={10} />
-              {formatRelativeTime(quota.queriedAt, now, t)}
+              {formatRelativeTime(displayQueriedAt, now, t)}
             </span>
           )}
           <button
             onClick={() => handleRefresh()}
             disabled={loading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
-            title={t("subscription.refresh")}
+            title={refreshTitle}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>

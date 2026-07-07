@@ -37,9 +37,7 @@ pub(in crate::api) fn subscription_quota_from_response(
         tool,
         credential_status,
         quota,
-        account
-            .quota_refreshed_at
-            .or_else(|| response.next_refresh_at),
+        account.quota_refreshed_at,
         account.last_refresh_error.as_deref(),
         account.subscription_level.as_deref(),
     )
@@ -62,7 +60,9 @@ pub(in crate::api) fn cached_oauth_quota_from_response(
         "providerName": Value::Null,
         "appType": app_type,
         "quota": quota,
-        "refreshedAt": account.quota_refreshed_at.unwrap_or(0),
+        "refreshedAt": account
+            .quota_refreshed_at
+            .filter(|value| *value > 0),
         "nextRefreshAt": response.next_refresh_at,
         "source": source,
     })
@@ -121,7 +121,8 @@ fn subscription_quota_from_parts(
         .extra_usage
         .as_ref()
         .and_then(|extra| extra.get("queriedAt").and_then(Value::as_i64))
-        .or(queried_at);
+        .or(queried_at)
+        .filter(|value| *value > 0);
 
     let subscription = quota
         .extra_usage
@@ -136,6 +137,13 @@ fn subscription_quota_from_parts(
         .or_else(|| subscription_level.map(str::to_string));
 
     let success = quota.success && credential_status == "valid";
+    let queried_at = queried_at.or_else(|| {
+        if success || !quota.tiers.is_empty() {
+            Some(crate::infra::time::now_ms() as i64)
+        } else {
+            None
+        }
+    });
     let error = if success {
         Value::Null
     } else {

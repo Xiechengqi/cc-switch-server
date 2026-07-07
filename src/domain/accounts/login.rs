@@ -8,9 +8,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::oauth::{
-    build_authorization_code_request, build_authorize_url, build_cursor_poll_request,
-    oauth_provider_spec, provider_login_request_shape_available, provider_token_exchange_available,
-    OAuthAuthorizeFlow, OAuthHttpRequest, OAuthSupportStage,
+    build_authorize_url, build_cursor_poll_request, oauth_provider_spec,
+    provider_login_request_shape_available, provider_token_exchange_available, OAuthAuthorizeFlow,
+    OAuthHttpRequest, OAuthSupportStage,
 };
 use crate::domain::providers::model::ProviderType;
 
@@ -246,13 +246,20 @@ impl OAuthLoginStore {
                 let code_verifier =
                     matches!(session.flow, OAuthAuthorizeFlow::AuthorizationCodePkce)
                         .then_some(session.code_verifier.as_str());
+                let (authorization_code, token_state) =
+                    if session.provider_type == ProviderType::ClaudeOAuth {
+                        super::oauth::parse_claude_authorization_code_input(code, &session.state)
+                            .map_err(|error| OAuthLoginError::RequestShape(error.message))?
+                    } else {
+                        (code.to_string(), session.state.clone())
+                    };
                 Some(
-                    build_authorization_code_request(
+                    super::oauth::build_authorization_code_request(
                         session.provider_type,
-                        code,
+                        &authorization_code,
                         redirect_uri,
                         code_verifier,
-                        &session.state,
+                        &token_state,
                     )
                     .map_err(|error| OAuthLoginError::RequestShape(error.message))?,
                 )

@@ -42,6 +42,7 @@
 
 | 日期 | 上游提交/范围 | 分类 | 处理 | 说明 |
 | --- | --- | --- | --- | --- |
+| 2026-07-07 | desktop `forwarder.rs` Claude OAuth hot path + `claude_oauth_auth.rs` web-paste token exchange | Must Review / proxy + oauth | 已移植 | `src/proxy/claude_oauth.rs` 补齐 `beta=true`、`anthropic-beta`、billing `system` 注入、`cch` 签名；`domain/accounts/oauth.rs` + `clients/oauth/refresh.rs` 补齐 web-paste `code#state` 解析、platform token 优先与 UA；`docs/provider-coverage.md` parity notes 已更新 |
 | 2026-07-07 | `d7d33e51` Ollama Codex reasoning effort clamp | Must Review / proxy | 已移植(X2) | Codex Responses→OpenAI Chat 上游归一时，Ollama 目标按 desktop `effort_value_mode="ollama"` 映射 `xhigh→max`、`minimal→low`，并保留显式 `none/off/disabled→none`；非 Ollama 目标继续透传 |
 | 2026-07-02 | `d73527f1` Codex chat completions bridge for OAuth responses | Must Review / proxy | 已移植(A6) | `src/proxy/transforms.rs` 新增 Codex/OpenAI Chat↔Responses 直接请求、响应和 SSE 桥接；Codex OAuth `/chat/completions` 上游归一保留 max/reasoning/response_format/tool/usage 字段 |
 | 2026-07-02 | `273cc48c` Codex CN provider native Responses | Must Review / provider routing | 已移植(A6) | `scripts/audit-provider-coverage.mjs` preset 来源切到 official，上游 `openai_responses` CN preset 进入 `docs/provider-coverage.*`；server 继续由显式 `apiFormat` 驱动 Responses/Chat 路由 |
