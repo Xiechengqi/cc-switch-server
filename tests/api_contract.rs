@@ -13,7 +13,7 @@ use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, patch, post};
 use axum::Router;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -1168,6 +1168,328 @@ async fn router_heartbeat_records_probe_failure_without_marking_online() {
         .unwrap()
         .contains("router pending share edits failed"));
     assert!(body["lastHeartbeatMs"].is_null());
+}
+
+#[tokio::test]
+async fn client_tunnel_status_queries_remote_tunnel_when_registered() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let router =
+        Router::new()
+            .route(
+                "/v1/installations/client-tunnel",
+                get(
+                    |State(seen): State<Arc<AtomicUsize>>,
+                     axum::extract::Query(query): axum::extract::Query<
+                        BTreeMap<String, String>,
+                    >| async move {
+                        assert_eq!(
+                            query.get("installationId").map(String::as_str),
+                            Some("inst-tunnel")
+                        );
+                        assert!(query.contains_key("timestampMs"));
+                        assert!(query.contains_key("nonce"));
+                        assert!(query.contains_key("signature"));
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({
+                            "tunnel": {
+                                "ownerEmail": "owner@example.com",
+                                "subdomain": "ownerabcde",
+                                "enabled": true,
+                                "tunnelUrl": "https://ownerabcde.example.test"
+                            }
+                        }))
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config.read().await.clone();
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-tunnel".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/router/client-tunnel",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["remoteTunnel"]["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        body["remoteTunnel"]["tunnelUrl"].as_str(),
+        Some("https://ownerabcde.example.test")
+    );
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn stop_client_tunnel_releases_remote_tunnel_without_blocking_local_stop() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route(
+            "/v1/installations/client-tunnel",
+            patch(
+                |State(seen): State<Arc<AtomicUsize>>, axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(body["installationId"].as_str(), Some("inst-tunnel"));
+                    assert_eq!(body["tunnel"]["ownerEmail"].as_str(), Some("owner@example.com"));
+                    assert_eq!(body["tunnel"]["subdomain"].as_str(), Some("ownerabcde"));
+                    assert_eq!(body["tunnel"]["enabled"].as_bool(), Some(false));
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({
+                        "tunnel": {
+                            "ownerEmail": "owner@example.com",
+                            "subdomain": "ownerabcde",
+                            "enabled": false
+                        }
+                    }))
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config.read().await.clone();
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-tunnel".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    config.client.tunnel_status = Some("connected".to_string());
+    state.replace_config(config).await.unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/router/client-tunnel/stop",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tunnelStatus"].as_str(), Some("stopped"));
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn router_batch_sync_notifies_runtime_refresh_after_remote_sync() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let batch_seen = Arc::new(AtomicUsize::new(0));
+    let refresh_seen = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route(
+            "/v1/shares/batch-sync",
+            post(
+                |State((batch_seen, _refresh_seen)): State<(
+                    Arc<AtomicUsize>,
+                    Arc<AtomicUsize>,
+                )>,
+                 axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(body["installationId"].as_str(), Some("inst-runtime"));
+                    assert_eq!(body["ops"].as_array().map(Vec::len), Some(1));
+                    assert_eq!(body["ops"][0]["kind"].as_str(), Some("upsert"));
+                    assert_eq!(
+                        body["ops"][0]["share"]["shareId"].as_str(),
+                        Some("share-runtime")
+                    );
+                    batch_seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"ok": true}))
+                },
+            ),
+        )
+        .route(
+            "/v1/shares/runtime-refresh",
+            post(
+                |State((_batch_seen, refresh_seen)): State<(
+                    Arc<AtomicUsize>,
+                    Arc<AtomicUsize>,
+                )>,
+                 axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(body["installationId"].as_str(), Some("inst-runtime"));
+                    assert_eq!(body["refresh"]["shareId"].as_str(), Some("share-runtime"));
+                    assert_eq!(body["refresh"]["subdomain"].as_str(), Some("runtime-sub"));
+                    refresh_seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"ok": true}))
+                },
+            ),
+        )
+        .with_state((batch_seen.clone(), refresh_seen.clone()));
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config.read().await.clone();
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-runtime".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+    let mut share = test_share_input("share-runtime", "provider-runtime", ProviderType::Codex);
+    share.tunnel_subdomain = Some("runtime-sub".to_string());
+    state
+        .mutate_shares_immediate(|store| {
+            store.upsert(share);
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/router/batch-sync",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["remoteSynced"].as_bool(), Some(true));
+    assert_eq!(batch_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(refresh_seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn router_batch_sync_records_runtime_refresh_failure_without_failing_local_response() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let refresh_seen = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route(
+            "/v1/shares/batch-sync",
+            post(|| async { axum::Json(json!({"ok": true})) }),
+        )
+        .route(
+            "/v1/shares/runtime-refresh",
+            post(
+                |State(refresh_seen): State<Arc<AtomicUsize>>,
+                 axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(
+                        body["refresh"]["shareId"].as_str(),
+                        Some("share-runtime-fail")
+                    );
+                    refresh_seen.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::SERVICE_UNAVAILABLE, "refresh unavailable")
+                },
+            ),
+        )
+        .with_state(refresh_seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config.read().await.clone();
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-runtime-fail".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+    let mut share = test_share_input(
+        "share-runtime-fail",
+        "provider-runtime",
+        ProviderType::Codex,
+    );
+    share.tunnel_subdomain = Some("runtime-fail".to_string());
+    state
+        .mutate_shares_immediate(|store| {
+            store.upsert(share);
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/router/batch-sync",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["remoteSynced"].as_bool(), Some(false));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("runtime refresh failed"));
+    assert_eq!(refresh_seen.load(Ordering::SeqCst), 1);
+
+    let status = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/router/status",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    let body = json_body(status).await;
+    assert!(body["lastError"]
+        .as_str()
+        .unwrap()
+        .contains("runtime refresh failed"));
 }
 
 #[tokio::test]

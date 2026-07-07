@@ -301,6 +301,10 @@ pub(in crate::api) struct ClientTunnelResponse {
     pub(in crate::api) tunnel_status: Option<String>,
     pub(in crate::api) last_heartbeat_ms: Option<u128>,
     pub(in crate::api) runtime_status: Option<crate::clients::router::tunnel::TunnelRuntimeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) remote_tunnel: Option<crate::clients::router::client::ClientTunnelView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) remote_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -56,6 +56,25 @@ pub struct ClientTunnelPayload {
     pub tunnel: ClientTunnelConfig,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTunnelView {
+    pub owner_email: String,
+    pub subdomain: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTunnelResponse {
+    #[serde(default)]
+    pub tunnel: Option<ClientTunnelView>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientTunnelClaimRequest {
@@ -64,6 +83,33 @@ struct ClientTunnelClaimRequest {
     nonce: String,
     signature: String,
     tunnel: ClientTunnelConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientTunnelUpdateRequest {
+    installation_id: String,
+    timestamp_ms: i64,
+    nonce: String,
+    signature: String,
+    tunnel: ClientTunnelConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareRuntimeRefreshRequest {
+    installation_id: String,
+    timestamp_ms: i64,
+    nonce: String,
+    signature: String,
+    refresh: ShareRuntimeRefreshPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareRuntimeRefreshPayload {
+    share_id: String,
+    subdomain: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +358,123 @@ pub async fn claim_client_tunnel(
     bail!("router client tunnel claim failed: {status}: {body}");
 }
 
+pub async fn get_client_tunnel(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+) -> anyhow::Result<Option<ClientTunnelView>> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/')
+        .to_string();
+    let identity = config
+        .router
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let empty = serde_json::json!({});
+    let signature = sign_payload(identity, "client_tunnel_get", &empty, timestamp_ms, &nonce)?;
+    let timestamp_ms = timestamp_ms.to_string();
+    let response = http
+        .get(format!("{api_base}/v1/installations/client-tunnel"))
+        .query(&[
+            ("installationId", identity.installation_id.as_str()),
+            ("timestampMs", timestamp_ms.as_str()),
+            ("nonce", nonce.as_str()),
+            ("signature", signature.as_str()),
+        ])
+        .send()
+        .await
+        .context("send router client tunnel get")?;
+    if response.status().is_success() {
+        return Ok(response
+            .json::<ClientTunnelResponse>()
+            .await
+            .context("parse router client tunnel get response")?
+            .tunnel);
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    bail!("router client tunnel get failed: {status}: {body}");
+}
+
+pub async fn update_client_tunnel(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    tunnel: ClientTunnelConfig,
+) -> anyhow::Result<Option<ClientTunnelView>> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/')
+        .to_string();
+    let identity = config
+        .router
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let signature = sign_payload(
+        identity,
+        "client_tunnel_update",
+        &tunnel,
+        timestamp_ms,
+        &nonce,
+    )?;
+    let request = ClientTunnelUpdateRequest {
+        installation_id: identity.installation_id.clone(),
+        timestamp_ms,
+        nonce,
+        signature,
+        tunnel,
+    };
+    let response = http
+        .patch(format!("{api_base}/v1/installations/client-tunnel"))
+        .json(&request)
+        .send()
+        .await
+        .context("send router client tunnel update")?;
+    if response.status().is_success() {
+        return Ok(response
+            .json::<ClientTunnelResponse>()
+            .await
+            .context("parse router client tunnel update response")?
+            .tunnel);
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    bail!("router client tunnel update failed: {status}: {body}");
+}
+
+pub async fn release_client_tunnel(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+) -> anyhow::Result<Option<ClientTunnelView>> {
+    let owner_email = config
+        .owner
+        .email
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("owner email is not configured"))?;
+    let subdomain = config
+        .client
+        .tunnel_subdomain
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))?;
+    update_client_tunnel(
+        http,
+        config,
+        ClientTunnelConfig {
+            owner_email,
+            subdomain,
+            enabled: false,
+        },
+    )
+    .await
+}
+
 pub async fn issue_client_web_lease(
     http: &reqwest::Client,
     config: &ServerConfig,
@@ -417,6 +580,56 @@ pub async fn batch_sync_shares(
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     bail!("router share batch sync failed: {status}: {body}");
+}
+
+pub async fn notify_runtime_refresh(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    share_id: String,
+    subdomain: String,
+) -> anyhow::Result<()> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/')
+        .to_string();
+    let identity = config
+        .router
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let refresh = ShareRuntimeRefreshPayload {
+        share_id,
+        subdomain,
+    };
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let signature = sign_payload(
+        identity,
+        "share_runtime_refresh",
+        &refresh,
+        timestamp_ms,
+        &nonce,
+    )?;
+    let request = ShareRuntimeRefreshRequest {
+        installation_id: identity.installation_id.clone(),
+        timestamp_ms,
+        nonce,
+        signature,
+        refresh,
+    };
+    let response = http
+        .post(format!("{api_base}/v1/shares/runtime-refresh"))
+        .json(&request)
+        .send()
+        .await
+        .context("send router share runtime refresh")?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    bail!("router share runtime refresh failed: {status}: {body}");
 }
 
 pub async fn delete_all_shares(

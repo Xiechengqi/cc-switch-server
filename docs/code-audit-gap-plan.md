@@ -9,7 +9,7 @@
 | 维度 | 实测结果 |
 | --- | --- |
 | 命令面 | desktop 338 个注册命令中 227 个进入 server 契约（226 implemented），其余 111 个全部为客户端专属功能，主线零遗漏 |
-| router 契约 | router→client 控制面（`/_ctl/*`、`/_share-router/*`）全部实现；client→router 调用面缺 3 个次要端点（见 X9/X10） |
+| router 契约 | router→client 控制面（`/_ctl/*`、`/_share-router/*`）全部实现；client→router 次要端点已补齐 heartbeat 探测、runtime-refresh、client-tunnel 状态/释放（见 X9/X10） |
 | proxy 管线 | 主流组合 native 已落地；Copilot/Kiro/DeepSeekAccount 为 fallback skeleton，Cursor/Bedrock 为 planned；in-module 测试深度约为 desktop 的 1/5（见 X5–X7） |
 | 前端 | desktop 231 个组件文件中 217 个同路径存在、203 个字节级相同；i18n 四语言为 desktop 严格超集；1 个 TS 编译错误（见 X1）；`styles.css` 5817 行过渡层仍被引入（见 X8） |
 | 工程 | `cargo test` 503/503 通过；`sync-desktop-ui.mjs --check` 处于失败状态（见 X3）；desktop 新提交 `d7d33e51` 未吸收（见 X2） |
@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；X7 第一批 transform 覆盖已落地，跟踪清单见 `docs/transform-coverage.md`；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；X7 第一批 transform 覆盖已落地，跟踪清单见 `docs/transform-coverage.md`；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -131,11 +131,12 @@
 
 ### X9 router 次要契约补齐：runtime-refresh 通知 + client-tunnel 状态/释放
 
+- **状态（2026-07-07）**：**已完成**。`src/clients/router/client.rs` 已新增 `notify_runtime_refresh()`、`get_client_tunnel()`、`update_client_tunnel()` / `release_client_tunnel()`；`/api/router/batch-sync` 与 share upsert 同步成功后会追加 `POST /v1/shares/runtime-refresh`，失败只记录 `last_router_error`；`/api/router/client-tunnel` GET 会 best-effort 查询 router 远端状态，stop 路径会 PATCH `/v1/installations/client-tunnel` 写入 `enabled=false` 后返回本地 stopped 状态。合同测试覆盖状态查询、释放请求 shape、runtime-refresh 请求 shape。
 - **现状证据**：desktop `tunnel/sync.rs:524` 在本地 share/provider 变更后调用 router `POST /v1/shares/runtime-refresh` 主动触发 router 重拉 runtime；desktop `tunnel/connection.rs:157` 使用 `/v1/installations/client-tunnel`（状态查询/释放）。server 均未调用——runtime 时效依赖 batch-sync 推送与 router 自主经 `_share-router/share-runtime` 拉取，client tunnel stop 只做本地清理，router 侧 lease 悬挂到自然过期。
 - **实施细节**：
-  1. `src/core/router_client.rs` 新增 `notify_runtime_refresh()`（POST `v1/shares/runtime-refresh`，签名与既有调用一致），在 share 绑定/暂停/恢复/usage reset 等影响 runtime 的写路径成功后异步触发（失败仅记 `last_router_error`，不阻塞主流程）；
-  2. `src/core/tunnel.rs` stop 路径追加对 router `/v1/installations/client-tunnel` 的释放调用（DELETE/POST 以 router `api.rs` 实际 handler 为准，实施前核对），未注册 identity 时跳过；
-  3. fixture：两个调用的请求 shape + 失败降级不影响本地状态。
+  1. ✅ `src/clients/router/client.rs` 新增 `notify_runtime_refresh()`（POST `v1/shares/runtime-refresh`，签名与既有调用一致），在 share batch-sync / upsert 成功后触发（失败仅记 `last_router_error`，不阻塞本地写路径）；
+  2. ✅ `src/api/router.rs` stop 路径追加对 router `/v1/installations/client-tunnel` 的释放调用（PATCH `enabled=false`，按 router 实际 handler 对齐），未注册 identity 时跳过；
+  3. ✅ fixture：状态查询、释放、runtime-refresh 的请求 shape 已覆盖；失败降级逻辑保持为记录 `last_router_error`。
 - **验收标准**：静态 fixture 通过；真实时效改善归入隧道真实验收观察。
 - **工作量**：S–M。**依赖**：无。
 
@@ -179,7 +180,7 @@
   → X4（owner 验证流，按方案 A 对齐 desktop）‖ ✅ X7 第一批（transform 用例，75% 门禁）
 ✅ R4-accounts 收敛（X5 硬性前置已满足）→ ✅ X5（Copilot token 交换静态实现）→ X6（Kiro 桥，复用 X5 基建）
   → X7 第二批（streaming 用例）
-  → X8 / X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
+  → X8 / ✅ X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
 ```
 
 > **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 剩余的存储收敛（42 处直接写）与 `api/types.rs` DTO 就近化随 X 系列功能 PR 摊销，accounts 域已完成并解除 X5 前置。
@@ -208,3 +209,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | X5 静态实现完成：Copilot managed-account 请求时 token 交换、endpoint 发现、per-account 缓存与 forwarder 接线落地；真实 capability 升级仍待外部账号验收 |
 | 2026-07-07 | X10 方案 A 完成：router heartbeat 改为已签名 pending-edits 空拉真实探测，失败不再伪造在线状态 |
 | 2026-07-07 | X11 完成：登记 24 个品牌图标/MCP excluded 图标体积豁免，保留 `iconInference` 回退 |
+| 2026-07-07 | X9 完成：补齐 router runtime-refresh 通知、client-tunnel 远端状态查询与 stop 释放合同；新增 API 合同测试覆盖请求 shape |

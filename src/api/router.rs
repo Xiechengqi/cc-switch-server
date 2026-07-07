@@ -37,17 +37,29 @@ pub(in crate::api) async fn client_tunnel_status(
     headers: HeaderMap,
 ) -> Result<Json<ClientTunnelResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let config = state.config.read().await;
-    Ok(Json(ClientTunnelResponse {
-        ok: true,
-        tunnel_subdomain: config.client.tunnel_subdomain.clone(),
-        tunnel_status: config.client.tunnel_status.clone(),
-        last_heartbeat_ms: config.client.last_heartbeat_ms,
-        runtime_status: state
-            .tunnels
-            .status(&crate::clients::router::tunnel::client_tunnel_key())
-            .await,
-    }))
+    let config = state.config.read().await.clone();
+    let mut remote_tunnel = None;
+    let mut remote_error = None;
+    if config.router.identity.is_some() {
+        let http_client = state.http_client().await;
+        match crate::clients::router::client::get_client_tunnel(&http_client, &config).await {
+            Ok(tunnel) => remote_tunnel = tunnel,
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(error = %message, "router client tunnel status failed");
+                state
+                    .mutate_shares_immediate(|shares| {
+                        shares.last_router_error = Some(message.clone());
+                    })
+                    .await
+                    .map_err(ApiError::internal)?;
+                remote_error = Some(message);
+            }
+        }
+    }
+    Ok(Json(
+        client_tunnel_response(&state, &config, remote_tunnel, remote_error).await,
+    ))
 }
 
 pub(in crate::api) async fn update_client_tunnel(
@@ -69,6 +81,8 @@ pub(in crate::api) async fn update_client_tunnel(
             .tunnels
             .status(&crate::clients::router::tunnel::client_tunnel_key())
             .await,
+        remote_tunnel: None,
+        remote_error: None,
     };
     state
         .replace_config(config)
@@ -167,12 +181,34 @@ pub(in crate::api) async fn stop_client_tunnel(
     crate::state::stop_client_tunnel(&state).await;
     let mut config = state.config.read().await.clone();
     config.client.tunnel_status = Some("stopped".to_string());
+    let release_config = config.clone();
     state
         .replace_config(config)
         .await
         .map_err(ApiError::internal)?;
+    if release_config.router.identity.is_some()
+        && release_config.owner.email.is_some()
+        && release_config.client.tunnel_subdomain.is_some()
+    {
+        let http_client = state.http_client().await;
+        if let Err(error) =
+            crate::clients::router::client::release_client_tunnel(&http_client, &release_config)
+                .await
+        {
+            let message = error.to_string();
+            tracing::warn!(error = %message, "router client tunnel release failed");
+            state
+                .mutate_shares_immediate(|shares| {
+                    shares.last_router_error = Some(message);
+                })
+                .await
+                .map_err(ApiError::internal)?;
+        }
+    }
     emit_tunnel_event(&state, "tunnel.changed", "client", "stopped");
-    client_tunnel_status(State(state), headers).await
+    Ok(Json(
+        client_tunnel_response(&state, &release_config, None, None).await,
+    ))
 }
 
 pub(in crate::api) async fn router_tunnels(
@@ -341,6 +377,7 @@ pub(in crate::api) async fn router_batch_sync(
     let mut remote_synced = false;
     let mut remote_error = None;
     if config.router.identity.is_some() {
+        let mut refresh_targets = Vec::new();
         let ops = shares
             .iter()
             .map(|share| {
@@ -350,6 +387,7 @@ pub(in crate::api) async fn router_batch_sync(
                     Some(&accounts),
                     Some(&usage),
                 );
+                refresh_targets.push((descriptor.share_id.clone(), descriptor.subdomain.clone()));
                 ShareSyncOperation {
                     kind: "upsert".to_string(),
                     share_id: None,
@@ -362,6 +400,10 @@ pub(in crate::api) async fn router_batch_sync(
             crate::clients::router::client::batch_sync_shares(&http_client, &config, ops).await
         {
             remote_error = Some(error.to_string());
+        } else if let Some(error) =
+            notify_runtime_refreshes(&http_client, &config, &refresh_targets).await
+        {
+            remote_error = Some(error);
         }
         remote_synced = remote_error.is_none();
     } else {
@@ -483,6 +525,15 @@ pub(in crate::api) async fn sync_share_ops(state: ServerState, ops: Vec<ShareSyn
                 .or_else(|| op.share_id.clone())
         })
         .collect::<Vec<_>>();
+    let refresh_targets = ops
+        .iter()
+        .filter(|op| op.kind == "upsert")
+        .filter_map(|op| {
+            op.share
+                .as_ref()
+                .map(|share| (share.share_id.clone(), share.subdomain.clone()))
+        })
+        .collect::<Vec<_>>();
     let config = state.config.read().await.clone();
     if config.router.identity.is_none() {
         return;
@@ -492,10 +543,12 @@ pub(in crate::api) async fn sync_share_ops(state: ServerState, ops: Vec<ShareSyn
     match crate::clients::router::client::batch_sync_shares(&http_client, &config, ops).await {
         Ok(()) => {
             let now = now_ms();
+            let refresh_error =
+                notify_runtime_refreshes(&http_client, &config, &refresh_targets).await;
             state
                 .mutate_shares_debounced(|store| {
                     store.router_registered = true;
-                    store.last_router_error = None;
+                    store.last_router_error = refresh_error.clone();
                     for share_id in &synced_share_ids {
                         store.mark_router_sync(share_id, router_base.clone(), Ok(now));
                     }
@@ -514,5 +567,53 @@ pub(in crate::api) async fn sync_share_ops(state: ServerState, ops: Vec<ShareSyn
                 })
                 .await;
         }
+    }
+}
+
+async fn notify_runtime_refreshes(
+    http_client: &reqwest::Client,
+    config: &crate::domain::settings::config::ServerConfig,
+    refresh_targets: &[(String, String)],
+) -> Option<String> {
+    let mut last_error = None;
+    for (share_id, subdomain) in refresh_targets {
+        if let Err(error) = crate::clients::router::client::notify_runtime_refresh(
+            http_client,
+            config,
+            share_id.clone(),
+            subdomain.clone(),
+        )
+        .await
+        {
+            let message = error.to_string();
+            tracing::warn!(
+                share_id = %share_id,
+                subdomain = %subdomain,
+                error = %message,
+                "router share runtime refresh failed"
+            );
+            last_error = Some(message);
+        }
+    }
+    last_error
+}
+
+async fn client_tunnel_response(
+    state: &ServerState,
+    config: &crate::domain::settings::config::ServerConfig,
+    remote_tunnel: Option<crate::clients::router::client::ClientTunnelView>,
+    remote_error: Option<String>,
+) -> ClientTunnelResponse {
+    ClientTunnelResponse {
+        ok: true,
+        tunnel_subdomain: config.client.tunnel_subdomain.clone(),
+        tunnel_status: config.client.tunnel_status.clone(),
+        last_heartbeat_ms: config.client.last_heartbeat_ms,
+        runtime_status: state
+            .tunnels
+            .status(&crate::clients::router::tunnel::client_tunnel_key())
+            .await,
+        remote_tunnel,
+        remote_error,
     }
 }
