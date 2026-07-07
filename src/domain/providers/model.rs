@@ -493,9 +493,7 @@ mod tests {
         let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
 
         assert_eq!(
-            value
-                .get("costMultiplier")
-                .and_then(|item| item.as_str()),
+            value.get("costMultiplier").and_then(|item| item.as_str()),
             Some("1.5")
         );
         assert_eq!(

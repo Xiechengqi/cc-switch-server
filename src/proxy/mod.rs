@@ -225,7 +225,8 @@ mod tests {
             headers,
             vec![
                 ("authorization", "Bearer token".to_string()),
-                ("chatgpt-account-id", "acct_123".to_string())
+                ("chatgpt-account-id", "acct_123".to_string()),
+                ("originator", "cc-switch".to_string()),
             ]
         );
     }

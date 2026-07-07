@@ -1346,7 +1346,54 @@ fn base_url_for_upstream(
     value.ok_or_else(|| ProxyError::bad_request("provider base url is not configured"))
 }
 
+/// Aligns with desktop `CodexAdapter::build_url` for OpenAI Responses/Chat paths.
+fn is_origin_only_url(value: &str) -> bool {
+    let trimmed = value.trim_end_matches('/');
+    match trimmed.split_once("://") {
+        Some((_scheme, rest)) => !rest.contains('/'),
+        None => !trimmed.contains('/'),
+    }
+}
+
+fn uses_codex_openai_upstream_join(path: &str) -> bool {
+    let path_trimmed = path.trim_start_matches('/');
+    path_trimmed == "responses"
+        || path_trimmed == "chat/completions"
+        || path_trimmed.starts_with("v1/responses")
+        || path_trimmed.starts_with("v1/chat/completions")
+}
+
+fn join_codex_openai_upstream_url(base_trimmed: &str, path: &str) -> String {
+    let path_trimmed = path.trim_start_matches('/');
+    let endpoint = path_trimmed.strip_prefix("v1/").unwrap_or(path_trimmed);
+    let already_has_v1 = base_trimmed.ends_with("/v1");
+    let origin_only = is_origin_only_url(base_trimmed);
+
+    let mut url = if already_has_v1 {
+        format!("{base_trimmed}/{endpoint}")
+    } else if origin_only {
+        format!("{base_trimmed}/v1/{endpoint}")
+    } else {
+        format!("{base_trimmed}/{endpoint}")
+    };
+
+    while url.contains("/v1/v1") {
+        url = url.replace("/v1/v1", "/v1");
+    }
+    url
+}
+
+fn should_use_codex_custom_prefix_join(base_trimmed: &str) -> bool {
+    let lower = base_trimmed.to_ascii_lowercase();
+    lower.contains("chatgpt.com/backend-api/codex") || lower.ends_with("/openai")
+}
+
 fn join_upstream_url(base_url: &str, path: &str) -> String {
+    if uses_codex_openai_upstream_join(path)
+        && should_use_codex_custom_prefix_join(base_url.trim_end_matches('/'))
+    {
+        return join_codex_openai_upstream_url(base_url.trim_end_matches('/'), path);
+    }
     join_url(&base_without_duplicate_version(base_url, path), path)
 }
 
@@ -1939,6 +1986,7 @@ fn apply_auth_headers(
                     )
                 })?;
                 headers.push(("chatgpt-account-id", account_id));
+                headers.push(("originator", "cc-switch".to_string()));
             }
         }
         AppKind::Gemini => {
@@ -4583,10 +4631,7 @@ mod tests {
             capability_for(AppKind::Codex, ProviderType::CodexOAuth).support,
             AdapterSupport::Native
         );
-        assert_eq!(
-            endpoint,
-            "https://chatgpt.com/backend-api/codex/v1/responses"
-        );
+        assert_eq!(endpoint, "https://chatgpt.com/backend-api/codex/responses");
         assert_eq!(
             value
                 .pointer("/input/0/content/0/text")
@@ -4687,12 +4732,20 @@ mod tests {
             "https://api.openai.com/v1/responses"
         );
         assert_eq!(
+            join_upstream_url("https://api.openai.com", "/v1/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            join_upstream_url("https://chatgpt.com/backend-api/codex", "/v1/responses"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
             join_upstream_url("https://chatgpt.com/backend-api/codex/v1", "/v1/responses"),
             "https://chatgpt.com/backend-api/codex/v1/responses"
         );
         assert_eq!(
             join_upstream_url("https://relay.example/openai", "/v1/responses"),
-            "https://relay.example/openai/v1/responses"
+            "https://relay.example/openai/responses"
         );
     }
 
@@ -5522,7 +5575,7 @@ mod tests {
             gemini_path: None,
             stored,
             request_body: br#"{"model":"gpt-5.5","messages":[{"role":"user","content":"ping"}],"stream":false}"#,
-            expected_endpoint: "https://chatgpt.com/backend-api/codex/v1/responses",
+            expected_endpoint: "https://chatgpt.com/backend-api/codex/responses",
             expected_header: ("authorization", "Bearer secret"),
             expected_model: Some("gpt-5.5"),
             expected_stream: false,

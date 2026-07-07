@@ -434,10 +434,10 @@ pub(in crate::api) async fn test_provider_inner(
     let stream = query.stream.unwrap_or(false);
     let model = provider_test_model(stored.app, &stored, query.model.as_deref(), Some(&defaults));
     let gemini_path = default_gemini_test_path(stored.app, &model, stream);
-    let endpoint = adapter
+    let mut endpoint = adapter
         .resolve_endpoint(route, gemini_path.clone(), &stored)
         .map_err(ApiError::proxy)?;
-    let target_headers = adapter
+    let mut target_headers = adapter
         .build_headers(stored.app, &stored, &accounts)
         .map_err(ApiError::proxy)?;
     let capability = adapter.capability(stored.app, stored.provider_type);
@@ -465,51 +465,73 @@ pub(in crate::api) async fn test_provider_inner(
         let adapter_request = adapter
             .transform_request_for_route(Bytes::from(body), &stored, route, gemini_path.as_deref())
             .map_err(ApiError::proxy)?;
-        let endpoint = adapter
-            .resolve_endpoint_for_request(route, gemini_path, &stored, &adapter_request)
+        let endpoint_for_request = adapter
+            .resolve_endpoint_for_request(route, gemini_path.clone(), &stored, &adapter_request)
             .map_err(ApiError::proxy)?;
-        let mut target_headers = adapter
+        target_headers = adapter
             .build_headers(stored.app, &stored, &accounts)
             .map_err(ApiError::proxy)?;
         target_headers.extend(adapter_request.upstream_headers.iter().cloned());
         let stream = adapter_request.stream_requested || stream;
         let http_client = state.http_client().await;
-        let mut request = http_client
-            .post(&endpoint)
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(adapter_request.body);
-        if stream {
-            request = request.header(axum::http::header::ACCEPT, "text/event-stream");
+        let mut endpoints = vec![endpoint_for_request.clone()];
+        if stored.app == AppKind::Codex {
+            if let Some(fallback) = codex_responses_endpoint_fallback(&endpoint_for_request) {
+                endpoints.push(fallback);
+            }
         }
-        for (name, value) in &target_headers {
-            request = request.header(*name, value);
-        }
-        match request
-            .timeout(provider_test_timeout(query.timeout_ms))
-            .send()
-            .await
-        {
-            Ok(response) => {
-                network_status_code = Some(response.status().as_u16());
-                network_latency_ms = Some(started.elapsed().as_millis());
-                if !response.status().is_success() {
-                    let body = response.text().await.unwrap_or_default();
-                    network_error = Some(redact_provider_test_error(&body));
-                } else if stream {
-                    let body = response.text().await.unwrap_or_default();
-                    let completed = provider_test_stream_completed(stored.app, &body);
-                    network_stream_completed = Some(completed);
-                    if !completed {
-                        network_error = Some(
-                            "stream probe did not observe a provider completion marker".to_string(),
-                        );
+        let mut resolved_endpoint = endpoint_for_request;
+        'probe: for (index, try_endpoint) in endpoints.iter().enumerate() {
+            let mut request = http_client
+                .post(try_endpoint)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(adapter_request.body.clone());
+            if stream {
+                request = request.header(axum::http::header::ACCEPT, "text/event-stream");
+            }
+            if stored.provider_type == ProviderType::CodexOAuth {
+                request = request.header("accept-encoding", "identity");
+            }
+            for (name, value) in &target_headers {
+                request = request.header(*name, value);
+            }
+            match request
+                .timeout(provider_test_timeout(query.timeout_ms))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    network_status_code = Some(status);
+                    network_latency_ms = Some(started.elapsed().as_millis());
+                    if !response.status().is_success() {
+                        let body = response.text().await.unwrap_or_default();
+                        let error_body = redact_provider_test_error(&body);
+                        if status == 404 && index + 1 < endpoints.len() {
+                            continue;
+                        }
+                        network_error = Some(error_body);
+                    } else if stream {
+                        let body = response.text().await.unwrap_or_default();
+                        let completed = provider_test_stream_completed(stored.app, &body);
+                        network_stream_completed = Some(completed);
+                        if !completed {
+                            network_error = Some(
+                                "stream probe did not observe a provider completion marker"
+                                    .to_string(),
+                            );
+                        }
                     }
+                    resolved_endpoint = try_endpoint.clone();
+                    break 'probe;
+                }
+                Err(error) => {
+                    network_error = Some(error.to_string());
+                    break 'probe;
                 }
             }
-            Err(error) => {
-                network_error = Some(error.to_string());
-            }
         }
+        endpoint = resolved_endpoint;
     }
 
     Ok(TestProviderResponse {
@@ -906,7 +928,7 @@ pub(in crate::api) fn provider_test_body(
                 "model": actual_model,
                 "input": [{
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "ping"}]
+                    "content": "ping"
                 }],
                 "stream": stream
             });
@@ -932,6 +954,16 @@ pub(in crate::api) fn provider_test_body(
         }),
     };
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn codex_responses_endpoint_fallback(endpoint: &str) -> Option<String> {
+    if endpoint.contains("/v1/responses") {
+        return Some(endpoint.replacen("/v1/responses", "/responses", 1));
+    }
+    if endpoint.ends_with("/responses") && !endpoint.contains("/v1/responses") {
+        return Some(endpoint.replacen("/responses", "/v1/responses", 1));
+    }
+    None
 }
 
 pub(in crate::api) fn provider_test_stream_completed(app: AppKind, body: &str) -> bool {
@@ -1033,6 +1065,18 @@ mod tests {
                 .get("stream")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_responses_endpoint_fallback_swaps_v1_and_bare_paths() {
+        assert_eq!(
+            codex_responses_endpoint_fallback("https://chatgpt.com/backend-api/codex/v1/responses"),
+            Some("https://chatgpt.com/backend-api/codex/responses".to_string())
+        );
+        assert_eq!(
+            codex_responses_endpoint_fallback("https://chatgpt.com/backend-api/codex/responses"),
+            Some("https://chatgpt.com/backend-api/codex/v1/responses".to_string())
         );
     }
 
