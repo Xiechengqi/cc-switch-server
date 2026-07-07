@@ -16,6 +16,16 @@
 
 ---
 
+## 任务状态（2026-07-07 复核更新）
+
+| 任务 | 状态 | 依据 |
+| --- | --- | --- |
+| X1 typecheck 修复 | **已完成** | 提交 `18cbca5`；typecheck exit 0 复核通过 |
+| X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
+| Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
+| X2 Ollama clamp 吸收 | **待办（P0 唯一剩余）** | `rg 'xhigh' src/proxy` 零命中；desktop 漂移仍停在 `d7d33e51` 单个提交 |
+| X4–X11 | 待办 | 按下方执行顺序推进；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
 ### X1 修复 web typecheck 错误（阻塞前端构建）
@@ -79,7 +89,7 @@
   4. 交换请求走 A10 代理感知 client；失败时返回结构化 `upstream_error` 而非 panic/静默；
   5. fixture：交换请求 shape（URL/header）、缓存命中不重复交换、过期重换、GHES 域名分支、静态 token 旁路。
 - **验收标准**：静态 fixture 全绿；`copilot_model_map` / `copilot_optimizer` 现有测试不回归。**capability 升级 gate**：真实 device flow 账号 non-stream/stream + usage 口径验收后才把 Copilot×3 从 fallback 升级（不在本计划内）。
-- **工作量**：L。**依赖**：无（真实验收依赖外部凭据）。
+- **工作量**：L。**依赖**：**先完成 R4 的 accounts 域收敛**（X5 会给 accounts 新增后台并发写路径，当前 api 层还有 17 处直接写，见 `docs/architecture-refactor-plan.md` 第七节）；真实验收依赖外部凭据。
 
 ### X6 Kiro 转发桥移植
 
@@ -160,15 +170,16 @@
 ## 执行顺序
 
 ```
-X1 → X3 → X2（P0，合计 ≤1 天，先恢复构建与漂移门禁）
-  → Phase R 结构重构（见 docs/architecture-refactor-plan.md，R1–R5，2.5–3.5 天）
+✅ X1 → X3（已完成）
+✅ Phase R 结构重构（R1–R7 已完成并关闭，提交 65721b8）
+  → X2（P0 唯一剩余，半天）
   → X4（owner 验证流，先决策 A/B）‖ X7 第一批（transform 用例）
-  → X5（Copilot token 交换）→ X6（Kiro 桥，复用 X5 基建）
+  → R4-accounts 收敛（X5 硬性前置）→ X5（Copilot token 交换）→ X6（Kiro 桥，复用 X5 基建）
   → X7 第二批（streaming 用例）
   → X8 / X9 / X10 / X11（收尾，可穿插并行）
 ```
 
-> **与 Phase R 的关系**：P0（X1–X3）完成后应先执行 `docs/architecture-refactor-plan.md` 的 R1–R5 结构重构，再做 X4 及之后的功能任务——X5/X6 的新模块直接落入重构后的 `clients/oauth/` 与 `proxy/`，避免搬两次；X4–X11 文中引用的 `src/http.rs`、`src/core/*` 路径在 Phase R 完成后按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`。
+> **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 剩余的存储收敛（59 处直接写）与 `api/types.rs` DTO 就近化随 X 系列功能 PR 摊销，其中 accounts 域是 X5 的硬性前置。
 
 ## 验证基线（每个任务完成前必须通过）
 
@@ -187,3 +198,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 日期 | 变更 |
 | --- | --- |
 | 2026-07-06 | 初版：基于三方代码交叉审计（不采信文档状态）建立 X1–X11 任务与边界 |
+| 2026-07-07 | 状态更新：X1/X3 完成、Phase R 完成并关闭（`65721b8`）；X2 为 P0 唯一剩余；X5 增加 R4-accounts 收敛硬性前置；执行顺序同步 |

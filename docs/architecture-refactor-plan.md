@@ -387,10 +387,24 @@ node scripts/audit/audit-web-runtime-contract.mjs --check
 node scripts/sync/sync-desktop-ui.mjs --check   # 需 X3 先修复；未修复期间记录跳过原因
 ```
 
-## 七、变更记录
+## 七、实施状态与剩余项（2026-07-07 关闭登记）
+
+**Phase R 正式关闭**：R1–R7 已全部实施并经独立复核（提交 `65721b8`）。关闭时验证快照：`cargo test` 503 passed（484 lib + 19 集成）、typecheck 0、`static-checks.sh` 0（含 5 条行内模式方向门禁）、`sync-desktop-ui.mjs --check` 0、`rg 'crate::(api|clients|domain|proxy)' src/infra` 零命中、`rg 'crate::core' src` 零命中。
+
+计划内仍开放的两项（均为设计上的渐进/挂起项，不阻塞关闭）：
+
+| 项 | 状态与后续 |
+| --- | --- |
+| R4 存储收敛 | 已完成 shares/usage/config 三个域（api 层零直接写）；剩余 8 个域共 59 处直接写：accounts 17、ui_settings 14、providers 8、failover 8、oauth_logins 4、sessions 3、universal_providers 3、pricing 2。随功能 PR 摊销，每收敛一域将对应 state 字段降 `pub(crate)`。**硬性顺序约束：X5（Copilot token 交换）会给 accounts 新增后台并发写路径，动 X5 前必须先收敛 accounts 域**。`api/types.rs`（1295 行 / 127 个 DTO）的域专属 DTO 随各域收敛时就近搬到对应 handler 文件，`types.rs` 只保留跨域共享类型 |
+| R6 workspace 化 | 挂起，三个触发条件（增量编译变慢 / 第二交付物 / 多人并行）均未满足；R2/R3 目录边界即未来 crate 边界 |
+
+后续工作回到功能主线 `docs/code-audit-gap-plan.md`：P0 仅剩 X2（Ollama `xhigh` clamp 吸收），随后 X4–X11。
+
+## 八、变更记录
 
 | 日期 | 变更 |
 | --- | --- |
 | 2026-07-06 | 初版：基于同日架构评审建立 R1–R6 分阶段计划、目标架构、文件映射表与红线 |
 | 2026-07-06 | 收紧 R1 依赖方向门禁：`proxy/` 不得直接依赖 `clients/`，出站客户端编排通过状态/控制面封装 |
 | 2026-07-07 | 新增 R7（实施后复核）：修复 infra→domain/clients 方向违例（now_ms 下沉、live_config_import 归 domain、backup 目标清单参数化）；门禁模式从 `use` 语句升级为行内全限定路径，并补 infra/clients 两个方向 |
+| 2026-07-07 | **Phase R 关闭**：R1–R7 全部实施、复核通过并提交（`65721b8`）；新增第七节关闭登记，R4 剩余 59 处直接写与 R6 触发条件转为长期跟踪项 |
