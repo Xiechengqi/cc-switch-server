@@ -11,7 +11,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
 use futures_util::{StreamExt, TryStreamExt};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::domain::failover::{current_time_ms, ProviderOutcome};
 use crate::domain::providers::model::{AppKind, ProviderType};
@@ -25,6 +25,7 @@ use crate::state::{
 
 use super::adapters::{self, ProviderAdapter};
 use super::cursor;
+use super::kiro;
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy, decode_response_body_for_proxy,
 };
@@ -79,6 +80,18 @@ pub async fn forward(
             adapter_request,
             request_context,
             share_invocation_guard,
+        })
+        .await;
+    }
+    if app == AppKind::Claude && stored.provider_type == ProviderType::KiroOAuth {
+        return forward_claude_kiro(ClaudeKiroForwardOptions {
+            state,
+            stored,
+            headers,
+            body,
+            request_context,
+            share_invocation_guard,
+            started,
         })
         .await;
     }
@@ -392,6 +405,376 @@ pub async fn forward(
         }
     }
     Ok(response)
+}
+
+struct ClaudeKiroForwardOptions {
+    state: ServerState,
+    stored: StoredProvider,
+    headers: HeaderMap,
+    body: Bytes,
+    request_context: UsageLogContext,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Response, ProxyError> {
+    let ClaudeKiroForwardOptions {
+        state,
+        stored,
+        headers,
+        body,
+        request_context,
+        share_invocation_guard,
+        started,
+    } = options;
+    let request_body: Value = serde_json::from_slice(&body)
+        .map_err(|error| ProxyError::bad_request(format!("invalid Claude JSON body: {error}")))?;
+    let model = request_body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ProxyError::bad_request("missing model"))?
+        .to_string();
+    let stream_requested = request_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    refresh_managed_account_if_needed(&state, AppKind::Claude, &stored).await?;
+    let account = state
+        .find_account_for_provider(ProviderType::KiroOAuth, managed_account_id(&stored))
+        .await
+        .ok_or_else(|| ProxyError::not_found("kiro_oauth managed account not found"))?;
+    let mut prepared = kiro::prepare_kiro_request(&account, &request_body)?;
+    if let Some(base_url) = kiro_api_base_override(&stored) {
+        prepared.url = super::join_url(&base_url, "/generateAssistantResponse");
+    }
+
+    let http_client = forward_http_client(&state, &stored).await?;
+    let mut request = http_client
+        .post(&prepared.url)
+        .json(&prepared.body)
+        .header(ACCEPT, copy_header(&headers, ACCEPT).unwrap_or("*/*"));
+    for (name, value) in &prepared.headers {
+        request = request.header(*name, value);
+    }
+    if !stream_requested {
+        request = request.timeout(provider_upstream_timeout(&stored));
+    }
+
+    let upstream_result = if stream_requested {
+        match stream_first_byte_timeout(&stored) {
+            Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                    return Err(ProxyError {
+                        status: StatusCode::GATEWAY_TIMEOUT,
+                        message: format!(
+                            "proxy upstream streaming first byte timeout after {}ms",
+                            timeout.as_millis()
+                        ),
+                    });
+                }
+            },
+            None => request.send().await,
+        }
+    } else {
+        request.send().await
+    };
+    let upstream = match upstream_result {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            return Err(ProxyError::bad_gateway(error));
+        }
+    };
+    let status = upstream.status();
+    let status_code = status.as_u16();
+    let mut response_headers = upstream.headers().clone();
+    strip_hop_by_hop_response_headers(&mut response_headers);
+
+    if stream_requested && status.is_success() {
+        return forward_claude_kiro_stream(ClaudeKiroStreamOptions {
+            state,
+            stored,
+            upstream,
+            model,
+            request_body,
+            tool_name_map: prepared.tool_name_map,
+            request_context,
+            share_invocation_guard,
+            started,
+            status,
+            status_code,
+        })
+        .await;
+    }
+
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            return Err(ProxyError::bad_gateway(error));
+        }
+    };
+    let decoded = decode_response_body_for_proxy(&response_headers, bytes);
+    let bytes = decoded.body;
+    if !status.is_success() {
+        log_usage(
+            &state,
+            &stored,
+            status_code,
+            started.elapsed().as_millis(),
+            claude_kiro_model_metadata(&model),
+            TokenUsage::default(),
+            UsageLogContext {
+                is_streaming: stream_requested,
+                ..request_context
+            },
+        )
+        .await;
+        record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
+        let mut response = Response::new(Body::from(bytes));
+        *response.status_mut() = status;
+        return Ok(response);
+    }
+
+    let message = kiro::kiro_event_bytes_to_claude_json(
+        &bytes,
+        &model,
+        &prepared.tool_name_map,
+        &request_body,
+    );
+    let usage = crate::domain::usage::store::usage_from_json(&message);
+    let response_bytes = serde_json::to_vec(&message)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::bad_gateway(error))?;
+    let share_id_for_record = request_context.share_id.clone();
+    log_usage(
+        &state,
+        &stored,
+        status_code,
+        started.elapsed().as_millis(),
+        claude_kiro_model_metadata(&model),
+        usage,
+        UsageLogContext {
+            is_streaming: false,
+            ..request_context
+        },
+    )
+    .await;
+    record_share_invocation_result(&state, share_id_for_record.as_deref(), usage).await;
+    record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
+
+    let mut response = Response::new(Body::from(response_bytes));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    drop(share_invocation_guard);
+    Ok(response)
+}
+
+struct ClaudeKiroStreamOptions {
+    state: ServerState,
+    stored: StoredProvider,
+    upstream: reqwest::Response,
+    model: String,
+    request_body: Value,
+    tool_name_map: std::collections::HashMap<String, String>,
+    request_context: UsageLogContext,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+    status: reqwest::StatusCode,
+    status_code: u16,
+}
+
+async fn forward_claude_kiro_stream(
+    options: ClaudeKiroStreamOptions,
+) -> Result<Response, ProxyError> {
+    let ClaudeKiroStreamOptions {
+        state,
+        stored,
+        upstream,
+        model,
+        request_body,
+        tool_name_map,
+        request_context,
+        share_invocation_guard,
+        started,
+        status,
+        status_code,
+    } = options;
+    let request_id = log_usage(
+        &state,
+        &stored,
+        status_code,
+        started.elapsed().as_millis(),
+        claude_kiro_model_metadata(&model),
+        TokenUsage::default(),
+        UsageLogContext {
+            is_streaming: true,
+            stream_status: Some("pending".to_string()),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    let share_id = request_context.share_id.clone();
+    let stream = kiro::kiro_event_stream_to_claude_sse(
+        upstream.bytes_stream(),
+        model,
+        tool_name_map,
+        &request_body,
+    );
+    let stream = async_stream::stream! {
+        let _share_invocation_guard = share_invocation_guard;
+        let mut interrupt_guard = KiroStreamInterruptGuard {
+            armed: true,
+            state: state.clone(),
+            stored: stored.clone(),
+            request_id: request_id.clone(),
+            status_code,
+            share_id: share_id.clone(),
+            started,
+            first_token_ms: None,
+        };
+        let mut usage = StreamUsageAccumulator::default();
+        let mut first_token_ms = None;
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let usage = usage.finish();
+                    update_stream_usage(
+                        &state,
+                        &stored,
+                        &request_id,
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        started.elapsed().as_millis(),
+                        first_token_ms,
+                        usage,
+                        Some("upstream_error"),
+                    )
+                    .await;
+                    record_share_invocation_result(&state, share_id.as_deref(), usage).await;
+                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                    interrupt_guard.disarm();
+                    yield Err::<Bytes, std::io::Error>(error);
+                    return;
+                }
+            };
+            usage.push(&chunk);
+            if first_token_ms.is_none() && !chunk.is_empty() {
+                let elapsed = started.elapsed().as_millis();
+                first_token_ms = Some(elapsed);
+                interrupt_guard.first_token_ms = first_token_ms;
+                update_stream_usage(
+                    &state,
+                    &stored,
+                    &request_id,
+                    status_code,
+                    elapsed,
+                    first_token_ms,
+                    Default::default(),
+                    Some("streaming"),
+                )
+                .await;
+            }
+            yield Ok::<Bytes, std::io::Error>(chunk);
+        }
+        let usage = usage.finish();
+        update_stream_usage(
+            &state,
+            &stored,
+            &request_id,
+            status_code,
+            started.elapsed().as_millis(),
+            first_token_ms,
+            usage,
+            Some("completed"),
+        )
+        .await;
+        record_share_invocation_result(&state, share_id.as_deref(), usage).await;
+        record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
+        interrupt_guard.disarm();
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    Ok(response)
+}
+
+struct KiroStreamInterruptGuard {
+    armed: bool,
+    state: ServerState,
+    stored: StoredProvider,
+    request_id: String,
+    status_code: u16,
+    share_id: Option<String>,
+    started: Instant,
+    first_token_ms: Option<u128>,
+}
+
+impl KiroStreamInterruptGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KiroStreamInterruptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let stored = self.stored.clone();
+        let request_id = self.request_id.clone();
+        let status_code = self.status_code;
+        let share_id = self.share_id.clone();
+        let duration_ms = self.started.elapsed().as_millis();
+        let first_token_ms = self.first_token_ms;
+        tokio::spawn(async move {
+            update_stream_usage(
+                &state,
+                &stored,
+                &request_id,
+                status_code,
+                duration_ms,
+                first_token_ms,
+                Default::default(),
+                Some("interrupted"),
+            )
+            .await;
+            record_share_invocation_result(&state, share_id.as_deref(), Default::default()).await;
+            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+        });
+    }
+}
+
+fn claude_kiro_model_metadata(model: &str) -> UsageModelMetadata {
+    UsageModelMetadata {
+        model: Some(model.to_string()),
+        requested_model: Some(model.to_string()),
+        actual_model: None,
+        actual_model_source: None,
+        pricing_model: Some(model.to_string()),
+    }
+}
+
+fn kiro_api_base_override(stored: &StoredProvider) -> Option<String> {
+    setting(
+        &stored.provider,
+        &[
+            "KIRO_API_BASE_URL",
+            "KIRO_BASE_URL",
+            "CODEWHISPERER_BASE_URL",
+        ],
+    )
 }
 
 async fn validate_and_acquire_share_invocation(

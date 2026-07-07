@@ -1698,6 +1698,16 @@ impl SseBuilder {
     }
 }
 
+pub(crate) fn kiro_event_stream_to_claude_sse(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    model: String,
+    tool_name_map: HashMap<String, String>,
+    request_body: &Value,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body);
+    kiro_event_stream_to_anthropic_sse(stream, model, tool_name_map, prompt_cache_usage)
+}
+
 fn kiro_event_stream_to_anthropic_sse(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     model: String,
@@ -1773,6 +1783,16 @@ fn process_frame_to_sse(builder: &mut SseBuilder, frame: &KiroFrame) -> Vec<Byte
             _ => Vec::new(),
         },
     }
+}
+
+pub(crate) fn kiro_event_bytes_to_claude_json(
+    bytes: &[u8],
+    model: &str,
+    tool_name_map: &HashMap<String, String>,
+    request_body: &Value,
+) -> Value {
+    let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body);
+    kiro_event_bytes_to_anthropic_json(bytes, model, tool_name_map, prompt_cache_usage)
 }
 
 fn kiro_event_bytes_to_anthropic_json(

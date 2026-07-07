@@ -883,6 +883,289 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
 }
 
 #[tokio::test]
+async fn claude_kiro_managed_account_bridges_non_stream_response() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let upstream = Router::new()
+        .route(
+            "/generateAssistantResponse",
+            post(
+                |State(seen): State<Arc<AtomicUsize>>,
+                 headers: HeaderMap,
+                 axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(
+                        headers.get("authorization").and_then(|v| v.to_str().ok()),
+                        Some("Bearer kiro-access-token")
+                    );
+                    assert_eq!(
+                        headers
+                            .get("x-amzn-kiro-agent-mode")
+                            .and_then(|v| v.to_str().ok()),
+                        Some("vibe")
+                    );
+                    assert_eq!(
+                        body.pointer("/profileArn").and_then(Value::as_str),
+                        Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/profile-id")
+                    );
+                    assert_eq!(
+                        body.pointer("/conversationState/currentMessage/userInputMessage/modelId")
+                            .and_then(Value::as_str),
+                        Some("claude-sonnet-4.8")
+                    );
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/vnd.amazon.eventstream")
+                        .body(Body::from(event_stream_bytes(vec![(
+                            "assistantResponseEvent",
+                            json!({"content": "hello from kiro"}),
+                        )])))
+                        .unwrap()
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "kiro-managed".to_string(),
+            name: "Kiro Managed".to_string(),
+            settings_config: json!({
+                "env": {
+                    "KIRO_API_BASE_URL": format!("http://{upstream_addr}")
+                }
+            }),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("kiro_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("kiro_oauth".to_string()),
+                    account_id: Some("acct-kiro".to_string()),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(UpsertAccountInput {
+                id: Some("acct-kiro".to_string()),
+                provider_type: ProviderType::KiroOAuth,
+                email: Some("kiro@example.com".to_string()),
+                access_token: Some("kiro-access-token".to_string()),
+                refresh_token: Some("kiro-refresh-token".to_string()),
+                id_token: None,
+                token_type: Some("Bearer".to_string()),
+                api_key: None,
+                scopes: Vec::new(),
+                profile: Some(json!({
+                    "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/profile-id",
+                    "authRegion": "us-east-1",
+                    "apiRegion": "us-east-1",
+                    "machineId": "machine-test",
+                    "authMethod": "builder-id",
+                    "provider": "BuilderId"
+                })),
+                raw: Some(json!({
+                    "clientId": "client-id",
+                    "clientSecret": "client-secret",
+                    "clientSecretExpiresAt": 4_102_444_800_000_i64,
+                    "importedAtMs": 1000
+                })),
+                subscription_level: Some("Kiro Pro".to_string()),
+                quota: None,
+                quota_percent: None,
+                quota_refreshed_at: None,
+                quota_next_refresh_at: None,
+                expires_at: Some(4_102_444_800_000),
+                last_refresh_error: None,
+            });
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("x-cc-provider-id", "kiro-managed")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "claude-sonnet-4-8",
+                        "max_tokens": 64,
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["type"].as_str(), Some("message"));
+    assert_eq!(body["content"][0]["text"].as_str(), Some("hello from kiro"));
+    assert_eq!(body["stop_reason"].as_str(), Some("end_turn"));
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn claude_kiro_managed_account_bridges_stream_response() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let upstream = Router::new()
+        .route(
+            "/generateAssistantResponse",
+            post(
+                |State(seen): State<Arc<AtomicUsize>>, headers: HeaderMap| async move {
+                    assert_eq!(
+                        headers.get("authorization").and_then(|v| v.to_str().ok()),
+                        Some("Bearer kiro-access-token")
+                    );
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/vnd.amazon.eventstream")
+                        .body(Body::from(event_stream_bytes(vec![(
+                            "assistantResponseEvent",
+                            json!({"content": "hello streaming kiro"}),
+                        )])))
+                        .unwrap()
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "kiro-managed-stream".to_string(),
+            name: "Kiro Managed Stream".to_string(),
+            settings_config: json!({
+                "env": {
+                    "KIRO_API_BASE_URL": format!("http://{upstream_addr}")
+                }
+            }),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("kiro_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("kiro_oauth".to_string()),
+                    account_id: Some("acct-kiro-stream".to_string()),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(UpsertAccountInput {
+                id: Some("acct-kiro-stream".to_string()),
+                provider_type: ProviderType::KiroOAuth,
+                email: Some("kiro@example.com".to_string()),
+                access_token: Some("kiro-access-token".to_string()),
+                refresh_token: Some("kiro-refresh-token".to_string()),
+                id_token: None,
+                token_type: Some("Bearer".to_string()),
+                api_key: None,
+                scopes: Vec::new(),
+                profile: Some(json!({
+                    "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/profile-id",
+                    "authRegion": "us-east-1",
+                    "apiRegion": "us-east-1",
+                    "machineId": "machine-test",
+                    "authMethod": "builder-id",
+                    "provider": "BuilderId"
+                })),
+                raw: Some(json!({
+                    "clientId": "client-id",
+                    "clientSecret": "client-secret",
+                    "clientSecretExpiresAt": 4_102_444_800_000_i64,
+                    "importedAtMs": 1000
+                })),
+                subscription_level: Some("Kiro Pro".to_string()),
+                quota: None,
+                quota_percent: None,
+                quota_refreshed_at: None,
+                quota_next_refresh_at: None,
+                expires_at: Some(4_102_444_800_000),
+                last_refresh_error: None,
+            });
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("x-cc-provider-id", "kiro-managed-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "claude-sonnet-4-8",
+                        "max_tokens": 64,
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("event: message_start"));
+    assert!(text.contains("event: content_block_delta"));
+    assert!(text.contains("hello streaming kiro"));
+    assert!(text.contains("event: message_stop"));
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+    let usage = state.usage_snapshot().await;
+    let log = usage
+        .logs
+        .iter()
+        .find(|log| log.provider_id == "kiro-managed-stream")
+        .unwrap();
+    assert!(log.is_streaming);
+    assert_eq!(log.stream_status.as_deref(), Some("completed"));
+}
+
+#[tokio::test]
 async fn non_stream_proxy_timeout_records_bad_gateway() {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -2077,6 +2360,36 @@ fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) ->
         runtime_snapshot: None,
         market_grant: None,
     }
+}
+
+fn event_stream_bytes(events: Vec<(&str, Value)>) -> Vec<u8> {
+    events
+        .into_iter()
+        .flat_map(|(event_type, payload)| event_frame(event_type, payload))
+        .collect()
+}
+
+fn event_frame(event_type: &str, payload: Value) -> Vec<u8> {
+    let mut headers = Vec::new();
+    push_event_string_header(&mut headers, ":event-type", event_type);
+    let payload = serde_json::to_vec(&payload).unwrap();
+    let total_len = 12 + headers.len() + payload.len() + 4;
+    let mut frame = Vec::with_capacity(total_len);
+    frame.extend_from_slice(&(total_len as u32).to_be_bytes());
+    frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    frame.extend_from_slice(&headers);
+    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    frame
+}
+
+fn push_event_string_header(out: &mut Vec<u8>, name: &str, value: &str) {
+    out.push(name.len() as u8);
+    out.extend_from_slice(name.as_bytes());
+    out.push(7);
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
 }
 
 async fn json_body(response: Response) -> serde_json::Value {
