@@ -83,13 +83,14 @@ async fn share_router_health_is_hidden_without_probe_header() {
 #[tokio::test]
 async fn control_apply_share_settings_rejects_replayed_nonce() {
     let state = test_state();
-    state.config.write().await.router.identity =
-        Some(cc_switch_server::domain::settings::config::RouterIdentity {
-            installation_id: "inst-ctl".to_string(),
-            public_key: "public-key".to_string(),
-            private_key: "private-key".to_string(),
-            control_secret: Some("control-secret".to_string()),
-        });
+    let mut config = state.config_snapshot().await;
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-ctl".to_string(),
+        public_key: "public-key".to_string(),
+        private_key: "private-key".to_string(),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
     upsert_test_provider(
         &state,
         AppKind::Codex,
@@ -746,7 +747,7 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
     let body = body_text(response).await;
     assert_eq!(body, "quota_exhausted");
 
-    let usage = state.usage.read().await;
+    let usage = state.usage_snapshot().await;
     assert_eq!(usage.logs.len(), 1);
     assert_eq!(usage.logs[0].provider_id, "codex-proxy-error");
     assert_eq!(usage.logs[0].status_code, 429);
@@ -975,7 +976,7 @@ async fn stream_proxy_marks_upstream_chunk_error() {
     assert!(body_text.contains("cc_switch_stream_error"));
 
     for _ in 0..20 {
-        let usage = state.usage.read().await;
+        let usage = state.usage_snapshot().await;
         if usage
             .logs
             .iter()
@@ -1101,7 +1102,7 @@ async fn router_heartbeat_probes_router_before_marking_online() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
-    let mut config = state.config.read().await.clone();
+    let mut config = state.config_snapshot().await;
     config.router.url = Some(format!("http://{router_addr}"));
     config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
         installation_id: "inst-heartbeat".to_string(),
@@ -1129,7 +1130,12 @@ async fn router_heartbeat_probes_router_before_marking_online() {
     assert!(body["lastError"].is_null());
     assert!(body["lastHeartbeatMs"].as_u64().is_some());
     assert_eq!(seen.load(Ordering::SeqCst), 1);
-    assert!(state.config.read().await.client.last_heartbeat_ms.is_some());
+    assert!(state
+        .config_snapshot()
+        .await
+        .client
+        .last_heartbeat_ms
+        .is_some());
 }
 
 #[tokio::test]
@@ -1149,7 +1155,7 @@ async fn router_heartbeat_records_probe_failure_without_marking_online() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
-    let mut config = state.config.read().await.clone();
+    let mut config = state.config_snapshot().await;
     config.router.url = Some(format!("http://{router_addr}"));
     config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
         installation_id: "inst-heartbeat".to_string(),
@@ -1245,7 +1251,7 @@ async fn client_tunnel_status_queries_remote_tunnel_when_registered() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
-    let mut config = state.config.read().await.clone();
+    let mut config = state.config_snapshot().await;
     config.router.url = Some(format!("http://{router_addr}"));
     config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
         installation_id: "inst-tunnel".to_string(),
@@ -1312,7 +1318,7 @@ async fn stop_client_tunnel_releases_remote_tunnel_without_blocking_local_stop()
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
-    let mut config = state.config.read().await.clone();
+    let mut config = state.config_snapshot().await;
     config.router.url = Some(format!("http://{router_addr}"));
     config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
         installation_id: "inst-tunnel".to_string(),
@@ -1394,7 +1400,7 @@ async fn router_batch_sync_notifies_runtime_refresh_after_remote_sync() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
-    let mut config = state.config.read().await.clone();
+    let mut config = state.config_snapshot().await;
     config.router.url = Some(format!("http://{router_addr}"));
     config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
         installation_id: "inst-runtime".to_string(),
@@ -1465,7 +1471,7 @@ async fn router_batch_sync_records_runtime_refresh_failure_without_failing_local
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
-    let mut config = state.config.read().await.clone();
+    let mut config = state.config_snapshot().await;
     config.router.url = Some(format!("http://{router_addr}"));
     config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
         installation_id: "inst-runtime-fail".to_string(),
@@ -1877,7 +1883,7 @@ async fn web_invoke_email_auth_owner_change_updates_config_and_shares() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
-    let mut config = state.config.read().await.clone();
+    let mut config = state.config_snapshot().await;
     config.router.url = Some(format!("http://{router_addr}"));
     config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
         installation_id: "inst-owner-change".to_string(),
@@ -1931,7 +1937,7 @@ async fn web_invoke_email_auth_owner_change_updates_config_and_shares() {
     assert_eq!(verify_seen.load(Ordering::SeqCst), 1);
     assert_eq!(change_seen.load(Ordering::SeqCst), 1);
     assert_eq!(
-        state.config.read().await.owner.email.as_deref(),
+        state.config_snapshot().await.owner.email.as_deref(),
         Some("new-owner@example.com")
     );
     assert_eq!(

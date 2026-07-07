@@ -47,13 +47,13 @@ pub struct ServerStateInner {
     pub config_dir: PathBuf,
     pub web_dist_dir: Option<PathBuf>,
     pub provider_coverage: ProviderCoverage,
-    pub config: RwLock<ServerConfig>,
+    pub(crate) config: RwLock<ServerConfig>,
     pub(crate) providers: RwLock<ProviderStore>,
     pub(crate) universal_providers: RwLock<UniversalProviderStore>,
     pub(crate) accounts: RwLock<AccountStore>,
     pub(crate) failover: RwLock<FailoverStore>,
     pub(crate) pricing: RwLock<ModelPricingStore>,
-    pub usage: RwLock<UsageStore>,
+    pub(crate) usage: RwLock<UsageStore>,
     pub(crate) shares: RwLock<ShareStore>,
     pub(crate) ui_settings: RwLock<UiSettingsStore>,
     pub(crate) sessions: RwLock<Vec<Session>>,
@@ -500,6 +500,10 @@ impl ServerStateInner {
         Ok(())
     }
 
+    pub async fn config_snapshot(&self) -> ServerConfig {
+        self.config.read().await.clone()
+    }
+
     pub async fn reload_persistent_stores(&self) -> anyhow::Result<()> {
         let config = ServerConfig::load_or_default(&self.config_dir)?;
         let http_client = build_http_client(&config, self.bind_addr)?;
@@ -751,6 +755,58 @@ impl ServerStateInner {
 
     pub async fn save_usage(&self) -> anyhow::Result<()> {
         self.usage.read().await.save(&self.config_dir)
+    }
+
+    pub async fn usage_snapshot(&self) -> UsageStore {
+        self.usage.read().await.clone()
+    }
+
+    pub async fn push_usage_log(&self, log: UsageLog) -> anyhow::Result<()> {
+        self.usage
+            .write()
+            .await
+            .push_and_persist(&self.config_dir, log)
+    }
+
+    pub async fn update_usage_log(
+        &self,
+        request_id: &str,
+        update: impl FnOnce(&mut UsageLog),
+    ) -> anyhow::Result<Option<UsageLog>> {
+        self.usage
+            .write()
+            .await
+            .update_log_and_persist(&self.config_dir, request_id, update)
+    }
+
+    pub async fn backfill_usage_costs(
+        &self,
+        providers: &ProviderStore,
+        pricing: &ModelPricingStore,
+    ) -> anyhow::Result<usize> {
+        let updated = { self.usage.write().await.backfill_costs(providers, pricing) };
+        if updated > 0 {
+            self.save_usage().await?;
+        }
+        Ok(updated)
+    }
+
+    pub async fn backfill_usage_costs_for_model(
+        &self,
+        providers: &ProviderStore,
+        pricing: &ModelPricingStore,
+        model_id: &str,
+    ) -> anyhow::Result<usize> {
+        let updated = {
+            self.usage
+                .write()
+                .await
+                .backfill_costs_for_model(providers, pricing, model_id)
+        };
+        if updated > 0 {
+            self.save_usage().await?;
+        }
+        Ok(updated)
     }
 
     async fn save_shares(&self) -> anyhow::Result<()> {

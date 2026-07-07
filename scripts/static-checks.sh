@@ -87,8 +87,12 @@ echo "== diff whitespace =="
 git diff --check
 
 echo "== state write discipline =="
-if rg -n 'accounts\.write\(\)\.await|save_accounts\(\)\.await|save_accounts_debounced\(' src/api src/clients src/domain src/proxy src/infra tests; then
-  echo 'accounts writes must go through ServerStateInner domain methods'; exit 1
+state_write_paths=(src/api src/clients src/domain src/proxy src/infra tests)
+if rg -n -U 'state\s*\.\s*(config|providers|universal_providers|accounts|failover|pricing|usage|shares|ui_settings|sessions|oauth_logins)\s*\.\s*write\s*\(\s*\)\s*\.\s*await' "${state_write_paths[@]}"; then
+  echo 'state store writes must go through ServerStateInner domain methods'; exit 1
+fi
+if rg -n -U 'state\s*\.\s*save_(providers|universal_providers|accounts|failover|pricing|usage|ui_settings)\s*\(\s*\)\s*\.\s*await|save_(accounts|shares)_debounced\s*\(' "${state_write_paths[@]}"; then
+  echo 'state store persistence must stay encapsulated in ServerStateInner domain methods'; exit 1
 fi
 
 echo "== dependency direction =="

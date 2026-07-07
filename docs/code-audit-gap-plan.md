@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X4 静态实现已落地（7 个 `email_auth_*` invoke 命令入契约；owner change 走新邮箱验证码 + router `/v1/installations/change-owner-email`；直接 owner update/transfer 增加 verified target gate）；X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X8 第一批 CSS 过渡层削减已落地（5817→2660 行，新增 3000 行门禁）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | 进行中 | X4 静态实现已落地（7 个 `email_auth_*` invoke 命令入契约；owner change 走新邮箱验证码 + router `/v1/installations/change-owner-email`；直接 owner update/transfer 增加 verified target gate）；X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X8 第一批 CSS 过渡层削减已落地（5817→2660 行，新增 3000 行门禁）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；R4 受管 store 生产写路径已清零并纳入静态门禁；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -183,9 +183,11 @@
 ✅ X4（owner 验证流，按方案 A 对齐 desktop）‖ ✅ X7 第一批（transform 用例，75% 门禁）→ ✅ X7 第二批（streaming 用例，78% 门禁）
 ✅ R4-accounts 收敛（X5 硬性前置已满足）→ ✅ X5（Copilot token 交换静态实现）→ X6（Kiro 桥，复用 X5 基建）
   → X8 第一批 ✅ / ✅ X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
+✅ R4 全受管 store 写路径收敛（config/providers/universal_providers/accounts/failover/pricing/usage/shares/ui_settings/sessions/oauth_logins）
+  → 下一轮：X6（Kiro 桥）→ X8 后续 CSS 收口 → api/types.rs DTO 就近化 → 整体 review
 ```
 
-> **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 剩余的存储收敛（14 处直接写）与 `api/types.rs` DTO 就近化随 X 系列功能 PR 摊销，accounts/failover/providers/pricing/universal_providers/sessions/oauth_logins 域已完成并解除 X5 前置。
+> **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 全受管 store 生产写路径已收敛到 `ServerStateInner` 域方法并纳入静态门禁，X5 accounts 前置已满足且不得回退。剩余结构收口为 `api/types.rs` DTO 就近化，随后续功能/域改动摊销。
 
 ## 验证基线（每个任务完成前必须通过）
 
@@ -221,3 +223,5 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | R4-oauth_logins 完成：OAuth login start/finish/poll/mark 写路径收敛到 state 域方法，字段降 `pub(crate)`；按当前 grep 复核剩余 32 处（ui_settings 14、providers 8、failover 10） |
 | 2026-07-07 | R4-failover 完成：控制面配置/重置写路径和 proxy 熔断热路径写入收敛到 state 域方法，字段降 `pub(crate)`；剩余直接写计数 32→22 |
 | 2026-07-07 | R4-providers 完成：provider CRUD/import/sort/universal sync/fetch-model merge 写路径收敛到 state 域方法，字段降 `pub(crate)`；剩余直接写计数 22→14 |
+| 2026-07-07 | R4-ui_settings 完成：invoke/settings/proxy app config 写路径收敛到 state 域方法并立即保存，字段降 `pub(crate)`；剩余直接写计数 14→0 |
+| 2026-07-07 | R4 完成复核：config/usage 字段降 `pub(crate)`，测试改用 snapshot/replace_config 方法；状态写入静态门禁扩展到全部受管 store 的多行写锁与直接保存调用 |

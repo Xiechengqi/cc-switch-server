@@ -88,11 +88,9 @@ pub(in crate::api) async fn backfill_usage_costs(
     let providers = state.providers.read().await.clone();
     let pricing = state.pricing.read().await.clone();
     let updated = state
-        .usage
-        .write()
+        .backfill_usage_costs(&providers, &pricing)
         .await
-        .backfill_costs(&providers, &pricing);
-    state.save_usage().await.map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)?;
     Ok(Json(UsageBackfillResponse { ok: true, updated }))
 }
 
@@ -143,15 +141,10 @@ pub(in crate::api) async fn update_model_pricing_inner(
 
     let providers = state.providers.read().await.clone();
     let pricing = state.pricing.read().await.clone();
-    let updated =
-        state
-            .usage
-            .write()
-            .await
-            .backfill_costs_for_model(&providers, &pricing, &entry.model_id);
-    if updated > 0 {
-        state.save_usage().await.map_err(ApiError::internal)?;
-    }
+    let updated = state
+        .backfill_usage_costs_for_model(&providers, &pricing, &entry.model_id)
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(Json(ModelPricingUpdateResponse {
         ok: true,
