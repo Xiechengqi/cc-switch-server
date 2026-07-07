@@ -50,6 +50,7 @@ import {
 } from "@/utils/shareUtils";
 import { CreateShareDialog } from "./CreateShareDialog";
 import { ShareList } from "./ShareList";
+import { ShareOwnerChangeEmailDialog } from "./ShareOwnerChangeEmailDialog";
 import { ShareRouterBar } from "./ShareRouterBar";
 import {
   buildProviderOption,
@@ -204,6 +205,7 @@ export function SharePage({
   const stopClientTunnelMutation = useStopClientTunnelMutation();
   const [clientOwnerEmailInput, setClientOwnerEmailInput] = useState("");
   const [clientSubdomainInput, setClientSubdomainInput] = useState("");
+  const [ownerChangeOpen, setOwnerChangeOpen] = useState(false);
   const clientTunnel = clientTunnelQuery.data;
 
   useEffect(() => {
@@ -641,6 +643,16 @@ export function SharePage({
                 <Button
                   variant="outline"
                   size="sm"
+                  disabled={!primaryShare?.ownerEmail || clientTunnelSaving}
+                  onClick={() => setOwnerChangeOpen(true)}
+                >
+                  {t("share.ownerChange.title", {
+                    defaultValue: "Change Owner Email",
+                  })}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
                   disabled={
                     !clientSubdomainInput.trim() ||
                     !normalizedClientOwnerEmail ||
@@ -894,6 +906,19 @@ export function SharePage({
           }
           onRetryMarkets={() => void refetchMarkets()}
           onSubmit={handleCreate}
+        />
+      ) : null}
+
+      {!shareScoped ? (
+        <ShareOwnerChangeEmailDialog
+          open={ownerChangeOpen}
+          tunnelConfig={tunnelConfig}
+          tunnelConfigSaving={configureTunnelMutation.isPending}
+          currentEmail={primaryShare?.ownerEmail ?? null}
+          onOpenChange={setOwnerChangeOpen}
+          onSaveTunnelConfig={(config) =>
+            configureTunnelMutation.mutateAsync(config)
+          }
         />
       ) : null}
 

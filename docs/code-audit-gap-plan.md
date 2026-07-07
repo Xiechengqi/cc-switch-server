@@ -8,7 +8,7 @@
 
 | 维度 | 实测结果 |
 | --- | --- |
-| 命令面 | desktop 338 个注册命令中 227 个进入 server 契约（226 implemented），其余 111 个全部为客户端专属功能，主线零遗漏 |
+| 命令面 | desktop 338 个注册命令中 234 个进入 server 契约（234 implemented；X4 补入 7 个 email_auth 主线命令），其余 104 个为客户端专属功能或显式排除 |
 | router 契约 | router→client 控制面（`/_ctl/*`、`/_share-router/*`）全部实现；client→router 次要端点已补齐 heartbeat 探测、runtime-refresh、client-tunnel 状态/释放（见 X9/X10） |
 | proxy 管线 | 主流组合 native 已落地；Copilot/Kiro/DeepSeekAccount 为 fallback skeleton，Cursor/Bedrock 为 planned；in-module 测试深度约为 desktop 的 1/5（见 X5–X7） |
 | 前端 | desktop 231 个组件文件中 217 个同路径存在、203 个字节级相同；i18n 四语言为 desktop 严格超集；1 个 TS 编译错误（见 X1）；`styles.css` 5817 行过渡层仍被引入（见 X8） |
@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X8 第一批 CSS 过渡层削减已落地（5817→2660 行，新增 3000 行门禁）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | 进行中 | X4 静态实现已落地（7 个 `email_auth_*` invoke 命令入契约；owner change 走新邮箱验证码 + router `/v1/installations/change-owner-email`；直接 owner update/transfer 增加 verified target gate）；X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X8 第一批 CSS 过渡层削减已落地（5817→2660 行，新增 3000 行门禁）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -67,16 +67,17 @@
 
 ### X4 Share owner 变更验证码流对齐 desktop（决策 + 实现）
 
+- **状态（2026-07-07）**：**静态实现已完成**。`src/clients/router/email_auth.rs` 新增 owner-change router client（新邮箱验证码校验后，签名调用 `/v1/installations/change-owner-email`）；`/web-api/invoke` 契约补入 7 个 `email_auth_*` 主线命令；`email_auth_change_owner_email` 成功后同步更新 `server.json` owner email、批量更新本地旧 owner shares 并触发 share sync/event；旧 `update_share_owner_email` / `transfer_share_owner` 兼容入口增加 verified target gate，未验证的新 owner 返回 4xx；Share 页面接入 `ShareOwnerChangeEmailDialog` 两步入口。真实发信、router 线上限流和端到端邮箱收码仍归入真实环境验收。
 - **现状证据**：desktop owner 变更需两步验证（`commands/email_auth.rs` 的 `email_auth_request_owner_change_code` → 向新 owner 发码 → `email_auth_change_owner_email`，经 router `/v1/installations/change-owner-email`）。server 当前 `web_transfer_share_owner` / `web_update_share_owner_email`（`src/http.rs:6378/6399`）只要求 admin 会话 + 目标邮箱已在 ACL（transfer 路径）+ 格式校验——`core/shares.rs:1017` 的 `normalize_verified_email` **只做格式检查，不做任何验证**（测试名 `update_owner_email_renormalizes_acl_without_verification` 亦自证）。这 7 个 `email_auth_*` 命令是 desktop 338 命令中唯一「主线相关但未进 server 契约」的一组。
 - **决策项（先于实现）**：单管理员部署下当前约束是否足够？两个方案：
   - **方案 A（推荐，对齐 desktop）**：owner 变更前必须向新 owner 邮箱发验证码并校验。
   - **方案 B**：维持现状，在契约 notes 与文档中显式记录「server 信任 admin 会话，owner 变更不发码」为有意分歧。
 - **实施细节（方案 A）**：
-  1. `src/core/email_auth.rs` 复用既有 router 签名调用基建，新增 `request_owner_change_code(new_email)` / `verify_owner_change_code(new_email, code)`，对接 router `/v1/auth/email/request-code` 与 `/v1/installations/change-owner-email`（router 侧端点已在线，见 router `api.rs` 路由表）；
-  2. `transfer_owner_email` / `update_owner_email` 增加「验证码通过」前置：新增内存 pending-verification store（复用 `oauth_login.rs` 的 5 分钟过期会话模式）；
-  3. `/web-api/invoke` 契约新增 `email_auth_request_owner_change_code`、`email_auth_change_owner_email` 两个命令（`assets/contract/web-runtime-contract.json` + dispatcher 分支 + 审计脚本双向校验）；
-  4. 前端 `web-src/src/components/share/OwnerChangeModal.tsx`（server-local 组件，已存在）改为两步流：输入新邮箱 → 发码 → 输入验证码 → 提交。
-- **验收标准**：未验证时 transfer/update 返回 4xx 且错误信息可诊断；验证通过后转移成功并触发 share sync；单测覆盖 pending 过期、验证码错误、重复提交；契约审计通过。
+  1. ✅ `src/clients/router/email_auth.rs` 复用既有 router 签名调用基建，新增 `change_owner_email(old_email, new_email, access_token)`，对接 router `/v1/installations/change-owner-email`；发码复用 `/v1/auth/email/request-code`，验证码校验复用 `/v1/client-web/auth/email/verify-code`；
+  2. ✅ `transfer_owner_email` / `update_owner_email` 增加 verified target gate：目标邮箱必须已是当前 configured owner 且本地 `email-auth.json` 登录状态匹配；新 owner 变更必须走 `email_auth_change_owner_email`；
+  3. ✅ `/web-api/invoke` 契约新增 7 个 `email_auth_*` 命令（`assets/contract/web-runtime-contract.json` + dispatcher 分支 + 审计脚本双向校验）；
+  4. ✅ 前端 `ShareOwnerChangeEmailDialog` 已接入 Share 页面，复用 `web-src/src/lib/api/emailAuth.ts` 的发码/验证封装。
+- **验收标准**：未验证时 transfer/update 返回 4xx 且错误信息可诊断；验证通过后转移成功并触发 share sync；契约审计通过。真实验证码错误/过期/重复提交需 router 发信环境，归入真实环境验收。
 - **工作量**：M。**依赖**：无（真实发信路径归入真实环境验收）。
 
 ### X5 Copilot 请求时 internal token 交换与端点发现
@@ -179,7 +180,7 @@
 ✅ X1 → X3（已完成）
 ✅ Phase R 结构重构（R1–R7 已完成并关闭，提交 65721b8）
 ✅ X2（Ollama reasoning effort clamp 已完成）
-  → X4（owner 验证流，按方案 A 对齐 desktop）‖ ✅ X7 第一批（transform 用例，75% 门禁）→ ✅ X7 第二批（streaming 用例，78% 门禁）
+✅ X4（owner 验证流，按方案 A 对齐 desktop）‖ ✅ X7 第一批（transform 用例，75% 门禁）→ ✅ X7 第二批（streaming 用例，78% 门禁）
 ✅ R4-accounts 收敛（X5 硬性前置已满足）→ ✅ X5（Copilot token 交换静态实现）→ X6（Kiro 桥，复用 X5 基建）
   → X8 第一批 ✅ / ✅ X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
 ```
@@ -213,3 +214,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | X9 完成：补齐 router runtime-refresh 通知、client-tunnel 远端状态查询与 stop 释放合同；新增 API 合同测试覆盖请求 shape |
 | 2026-07-07 | X7 第二批完成：补齐 streaming tool-call 双向映射、stream finish_reason 与 SSE CRLF 多帧 fixture，覆盖门禁提升到 78%/198 |
 | 2026-07-07 | X8 第一批完成：机械删除零引用 CSS 过渡层规则，`styles.css` 5817→2660 行，并新增 3000 行静态门禁 |
+| 2026-07-07 | X4 静态实现完成：7 个 `email_auth_*` invoke 命令入契约，owner change 走新邮箱验证码 + router change-owner，直接 owner update/transfer 增加 verified target gate，并在 Share 页面接入 owner-change 两步入口；真实发信验收保留为外部任务 |

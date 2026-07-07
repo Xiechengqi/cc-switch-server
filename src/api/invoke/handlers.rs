@@ -432,6 +432,7 @@ pub(in crate::api) async fn web_update_share_owner_email(
     let value = web_payload(args, &["params", "input"]);
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
     let owner_email = web_arg_string_any(value, &["ownerEmail", "owner_email"])?;
+    ensure_share_owner_target_verified(state, &owner_email).await?;
     let share = state
         .try_mutate_shares_immediate(|store| store.update_owner_email(&share_id, &owner_email))
         .await
@@ -451,6 +452,7 @@ pub(in crate::api) async fn web_transfer_share_owner(
     let value = web_payload(args, &["params", "input"]);
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
     let target_email = web_arg_string_any(value, &["targetEmail", "target_email"])?;
+    ensure_share_owner_target_verified(state, &target_email).await?;
     let share = state
         .try_mutate_shares_immediate(|store| store.transfer_owner_email(&share_id, &target_email))
         .await
@@ -459,6 +461,338 @@ pub(in crate::api) async fn web_transfer_share_owner(
     spawn_share_upsert_sync(state.clone(), share.clone());
     emit_share_event(state, "share.changed", &share, "owner_transferred");
     Ok(share)
+}
+
+pub(in crate::api) async fn web_email_auth_request_code(
+    state: &ServerState,
+    args: &Value,
+) -> Result<crate::clients::router::email_auth::EmailCodeRequestResponse, ApiError> {
+    let router_domain = web_optional_string_any(args, &["routerDomain", "router_domain"]);
+    let email = web_arg_string_any(args, &["email"])?;
+    let config = ensure_email_router_config(state).await?;
+    ensure_router_domain_matches(&config, router_domain.as_deref())?;
+    let email = require_configured_owner_email(&config, &email)?;
+    let http_client = state.http_client().await;
+    crate::clients::router::email_auth::request_code(&http_client, &config, &email)
+        .await
+        .map_err(map_email_auth_error)
+}
+
+pub(in crate::api) async fn web_email_auth_verify_code(
+    state: &ServerState,
+    args: &Value,
+) -> Result<crate::clients::router::email_auth::EmailAuthStatus, ApiError> {
+    let router_domain = web_optional_string_any(args, &["routerDomain", "router_domain"]);
+    let email = web_arg_string_any(args, &["email"])?;
+    let code = web_arg_string_any(args, &["code"])?;
+    let config = ensure_email_router_config(state).await?;
+    ensure_router_domain_matches(&config, router_domain.as_deref())?;
+    let email = require_configured_owner_email(&config, &email)?;
+    let http_client = state.http_client().await;
+    let router_session = crate::clients::router::email_auth::verify_client_web_code(
+        &http_client,
+        &config,
+        &email,
+        &code,
+    )
+    .await
+    .map_err(map_email_auth_error)?;
+    bind_verified_email_session(state, &config, &email, &router_session).await
+}
+
+pub(in crate::api) async fn web_email_auth_request_owner_change_code(
+    state: &ServerState,
+    args: &Value,
+) -> Result<crate::clients::router::email_auth::EmailCodeRequestResponse, ApiError> {
+    let router_domain = web_optional_string_any(args, &["routerDomain", "router_domain"]);
+    let current_email = web_arg_string_any(args, &["currentEmail", "current_email"])?;
+    let new_email = web_arg_string_any(args, &["newEmail", "new_email"])?;
+    let config = ensure_email_router_config(state).await?;
+    ensure_router_domain_matches(&config, router_domain.as_deref())?;
+    let (current_email, new_email) =
+        ensure_owner_change_allowed(state, &config, &current_email, &new_email).await?;
+    let http_client = state.http_client().await;
+    crate::clients::router::email_auth::request_code(&http_client, &config, &new_email)
+        .await
+        .map_err(map_email_auth_error)
+        .map(|response| {
+            tracing::info!(
+                old_owner = %current_email,
+                new_owner = %new_email,
+                "requested share owner change email code"
+            );
+            response
+        })
+}
+
+pub(in crate::api) async fn web_email_auth_change_owner_email(
+    state: &ServerState,
+    args: &Value,
+) -> Result<crate::clients::router::email_auth::EmailAuthStatus, ApiError> {
+    let router_domain = web_optional_string_any(args, &["routerDomain", "router_domain"]);
+    let current_email = web_arg_string_any(args, &["currentEmail", "current_email"])?;
+    let new_email = web_arg_string_any(args, &["newEmail", "new_email"])?;
+    let code = web_arg_string_any(args, &["code"])?;
+    let config = ensure_email_router_config(state).await?;
+    ensure_router_domain_matches(&config, router_domain.as_deref())?;
+    let (current_email, new_email) =
+        ensure_owner_change_allowed(state, &config, &current_email, &new_email).await?;
+    let http_client = state.http_client().await;
+    let router_session = crate::clients::router::email_auth::verify_client_web_code(
+        &http_client,
+        &config,
+        &new_email,
+        &code,
+    )
+    .await
+    .map_err(map_email_auth_error)?;
+    let verified_email =
+        crate::clients::router::email_auth::normalize_email(&router_session.user.email)
+            .map_err(map_email_auth_error)?;
+    if verified_email != new_email {
+        return Err(ApiError::unauthorized(
+            "verified email does not match new owner email",
+        ));
+    }
+    let remote = crate::clients::router::email_auth::change_owner_email(
+        &http_client,
+        &config,
+        &current_email,
+        &new_email,
+        &router_session.access_token,
+    )
+    .await
+    .map_err(map_email_auth_error)?;
+    if !remote.ok
+        || !remote.old_email.eq_ignore_ascii_case(&current_email)
+        || !remote.new_email.eq_ignore_ascii_case(&new_email)
+    {
+        return Err(ApiError::bad_gateway(
+            "router accepted owner change but returned mismatched owner emails",
+        ));
+    }
+
+    let mut next_config = config.clone();
+    next_config.owner.email = Some(new_email.clone());
+    state
+        .replace_config(next_config.clone())
+        .await
+        .map_err(ApiError::internal)?;
+
+    let updated_shares = state
+        .try_mutate_shares_immediate(|store| {
+            store.change_owner_email_for_all(&current_email, &new_email)
+        })
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_share_patch_error)?;
+    for share in &updated_shares {
+        spawn_share_upsert_sync(state.clone(), share.clone());
+        emit_share_event(
+            state,
+            "share.changed",
+            share,
+            "owner_email_verified_changed",
+        );
+    }
+
+    let email_state = crate::clients::router::email_auth::state_from_router_session(
+        &next_config,
+        &router_session,
+    )
+    .map_err(map_email_auth_error)?;
+    crate::clients::router::email_auth::save_state(&state.config_dir, &email_state)
+        .map_err(ApiError::internal)?;
+
+    Ok(crate::clients::router::email_auth::EmailAuthStatus {
+        authenticated: true,
+        email: Some(new_email),
+        expires_at: email_state.expires_at,
+        router_domain: email_state.router_domain,
+    })
+}
+
+pub(in crate::api) fn web_email_auth_get_status(
+    state: &ServerState,
+) -> Result<crate::clients::router::email_auth::EmailAuthStatus, ApiError> {
+    crate::clients::router::email_auth::get_status(&state.config_dir).map_err(ApiError::internal)
+}
+
+pub(in crate::api) async fn web_email_auth_session_me(
+    state: &ServerState,
+) -> Result<crate::clients::router::email_auth::EmailSessionMeResponse, ApiError> {
+    let config = state.config.read().await.clone();
+    crate::clients::router::email_auth::session_me(&state.config_dir, &config)
+        .map_err(ApiError::internal)
+}
+
+pub(in crate::api) async fn web_email_auth_logout(state: &ServerState) -> Result<Value, ApiError> {
+    if state
+        .shares
+        .read()
+        .await
+        .shares
+        .iter()
+        .any(|share| share.owner_email.is_some())
+    {
+        return Err(ApiError::bad_request(
+            "this server has shares; owner email auth cannot be logged out",
+        ));
+    }
+    crate::clients::router::email_auth::clear_state(&state.config_dir)
+        .map_err(ApiError::internal)?;
+    Ok(json!({ "ok": true }))
+}
+
+async fn bind_verified_email_session(
+    state: &ServerState,
+    config: &ServerConfig,
+    email: &str,
+    router_session: &crate::clients::router::email_auth::RouterVerifyEmailCodeResponse,
+) -> Result<crate::clients::router::email_auth::EmailAuthStatus, ApiError> {
+    let verified_email =
+        crate::clients::router::email_auth::normalize_email(&router_session.user.email)
+            .map_err(map_email_auth_error)?;
+    if verified_email != email {
+        return Err(ApiError::unauthorized(
+            "verified email does not match configured owner email",
+        ));
+    }
+    let http_client = state.http_client().await;
+    let owner_binding = crate::clients::router::email_auth::bind_owner_email(
+        &http_client,
+        config,
+        email,
+        &router_session.access_token,
+    )
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            crate::clients::router::email_auth::humanize_remote_owner_binding_error(&error.message),
+        )
+    })?;
+    let bound_email =
+        crate::clients::router::email_auth::normalize_email(&owner_binding.owner_email)
+            .map_err(map_email_auth_error)?;
+    if !owner_binding.ok || bound_email != email {
+        return Err(ApiError::bad_gateway(
+            "router accepted email code but did not bind the configured owner email",
+        ));
+    }
+    let email_state =
+        crate::clients::router::email_auth::state_from_router_session(config, router_session)
+            .map_err(map_email_auth_error)?;
+    crate::clients::router::email_auth::save_state(&state.config_dir, &email_state)
+        .map_err(ApiError::internal)?;
+    Ok(crate::clients::router::email_auth::EmailAuthStatus {
+        authenticated: true,
+        email: Some(email.to_string()),
+        expires_at: email_state.expires_at,
+        router_domain: email_state.router_domain,
+    })
+}
+
+async fn ensure_owner_change_allowed(
+    state: &ServerState,
+    config: &ServerConfig,
+    current_email: &str,
+    new_email: &str,
+) -> Result<(String, String), ApiError> {
+    let current_email = crate::clients::router::email_auth::normalize_email(current_email)
+        .map_err(map_email_auth_error)?;
+    let new_email = crate::clients::router::email_auth::normalize_email(new_email)
+        .map_err(map_email_auth_error)?;
+    if current_email == new_email {
+        return Err(ApiError::bad_request(
+            "new owner email must be different from current owner email",
+        ));
+    }
+    let configured_owner = config
+        .owner
+        .email
+        .as_deref()
+        .ok_or_else(|| ApiError::forbidden("owner email is not configured"))?
+        .trim()
+        .to_ascii_lowercase();
+    if configured_owner != current_email {
+        return Err(ApiError::unauthorized(
+            "current email does not match configured owner email",
+        ));
+    }
+    let email_state = crate::clients::router::email_auth::load_state(&state.config_dir)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::unauthorized("owner change requires current owner email auth login")
+        })?;
+    if email_state.email.trim().to_ascii_lowercase() != current_email {
+        return Err(ApiError::unauthorized(
+            "current email auth state does not match share owner",
+        ));
+    }
+    if !state.shares.read().await.shares.iter().any(|share| {
+        share
+            .owner_email
+            .as_deref()
+            .is_some_and(|email| email.eq_ignore_ascii_case(&current_email))
+    }) {
+        return Err(ApiError::not_found(
+            "this server has no share owned by the current email",
+        ));
+    }
+    Ok((current_email, new_email))
+}
+
+fn ensure_router_domain_matches(
+    config: &ServerConfig,
+    router_domain: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(router_domain) = router_domain
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(configured_domain) = config.router.domain.as_deref() else {
+        return Ok(());
+    };
+    if configured_domain.trim().eq_ignore_ascii_case(router_domain) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "router domain does not match configured router",
+        ))
+    }
+}
+
+async fn ensure_share_owner_target_verified(
+    state: &ServerState,
+    target_email: &str,
+) -> Result<(), ApiError> {
+    let target_email = crate::clients::router::email_auth::normalize_email(target_email)
+        .map_err(map_email_auth_error)?;
+    let config = state.config.read().await;
+    let configured_owner = config
+        .owner
+        .email
+        .as_deref()
+        .ok_or_else(|| ApiError::forbidden("owner email is not configured"))?
+        .trim()
+        .to_ascii_lowercase();
+    if configured_owner != target_email {
+        return Err(ApiError::forbidden(
+            "share owner email change requires email_auth_change_owner_email verification",
+        ));
+    }
+    drop(config);
+    let status = crate::clients::router::email_auth::get_status(&state.config_dir)
+        .map_err(ApiError::internal)?;
+    if !status.authenticated || status.email.as_deref() != Some(target_email.as_str()) {
+        return Err(ApiError::forbidden(
+            "share owner email change requires verified owner email auth",
+        ));
+    }
+    Ok(())
 }
 
 pub(in crate::api) async fn web_update_share_acl(

@@ -35,6 +35,18 @@ pub struct EmailAuthState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EmailAuthStatus {
+    pub authenticated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_domain: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EmailCodeRequestResponse {
     pub ok: bool,
     pub cooldown_secs: i64,
@@ -70,6 +82,27 @@ pub struct BindOwnerEmailResponse {
     pub already_bound: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeOwnerEmailResponse {
+    pub ok: bool,
+    pub old_email: String,
+    pub new_email: String,
+    pub updated_shares: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailSessionMeResponse {
+    pub authenticated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<EmailAuthUser>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_owner_email: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RouterErrorResponse {
     #[serde(default)]
@@ -91,6 +124,13 @@ struct BindOwnerEmailSignaturePayload<'a> {
     email: &'a str,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     verification_token: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeOwnerEmailSignaturePayload<'a> {
+    old_email: &'a str,
+    new_email: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +194,54 @@ pub fn load_state(config_dir: &Path) -> anyhow::Result<Option<EmailAuthState>> {
 
 pub fn save_state(config_dir: &Path, state: &EmailAuthState) -> anyhow::Result<()> {
     crate::infra::storage::write_json_pretty(&email_auth_path(config_dir), state)
+}
+
+pub fn clear_state(config_dir: &Path) -> anyhow::Result<()> {
+    let path = email_auth_path(config_dir);
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))
+}
+
+pub fn get_status(config_dir: &Path) -> anyhow::Result<EmailAuthStatus> {
+    let Some(state) = load_state(config_dir)? else {
+        return Ok(EmailAuthStatus {
+            authenticated: false,
+            email: None,
+            expires_at: None,
+            router_domain: None,
+        });
+    };
+    Ok(EmailAuthStatus {
+        authenticated: !state.email.trim().is_empty(),
+        email: Some(state.email),
+        expires_at: state.expires_at,
+        router_domain: state.router_domain,
+    })
+}
+
+pub fn session_me(
+    config_dir: &Path,
+    config: &ServerConfig,
+) -> anyhow::Result<EmailSessionMeResponse> {
+    let Some(state) = load_state(config_dir)? else {
+        return Ok(EmailSessionMeResponse {
+            authenticated: false,
+            user: None,
+            expires_at: None,
+            installation_owner_email: config.owner.email.clone(),
+        });
+    };
+    Ok(EmailSessionMeResponse {
+        authenticated: !state.email.trim().is_empty(),
+        user: Some(EmailAuthUser {
+            id: state.email.clone(),
+            email: state.email,
+        }),
+        expires_at: state.expires_at.map(|value| value.to_string()),
+        installation_owner_email: config.owner.email.clone(),
+    })
 }
 
 pub async fn request_code(
@@ -290,6 +378,59 @@ pub async fn bind_owner_email(
         .await
         .map_err(|error| {
             EmailAuthError::bad_gateway(format!("bind installation owner email failed: {error}"))
+        })?;
+    handle_json_response(response).await
+}
+
+pub async fn change_owner_email(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    old_email: &str,
+    new_email: &str,
+    access_token: &str,
+) -> Result<ChangeOwnerEmailResponse, EmailAuthError> {
+    let old_email = normalize_email(old_email)?;
+    let new_email = normalize_email(new_email)?;
+    if old_email == new_email {
+        return Err(EmailAuthError::bad_request(
+            "new owner email must be different from current owner email",
+        ));
+    }
+    let access_token = access_token.trim();
+    if access_token.is_empty() {
+        return Err(EmailAuthError::bad_request("access token is required"));
+    }
+    let identity = router_identity(config)?;
+    let payload = ChangeOwnerEmailSignaturePayload {
+        old_email: &old_email,
+        new_email: &new_email,
+    };
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let signature = crate::clients::router::client::sign_payload(
+        identity,
+        "change_installation_owner_email",
+        &payload,
+        timestamp_ms,
+        &nonce,
+    )
+    .map_err(|error| EmailAuthError::internal(error.to_string()))?;
+    let api_base = router_api_base(config)?;
+    let response = http
+        .post(format!("{api_base}/v1/installations/change-owner-email"))
+        .bearer_auth(access_token)
+        .json(&json!({
+            "installationId": identity.installation_id.as_str(),
+            "oldEmail": old_email,
+            "newEmail": new_email,
+            "timestampMs": timestamp_ms,
+            "nonce": nonce,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            EmailAuthError::bad_gateway(format!("change owner email failed: {error}"))
         })?;
     handle_json_response(response).await
 }

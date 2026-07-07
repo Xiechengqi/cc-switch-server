@@ -376,6 +376,31 @@ async fn web_invoke_dispatch(
                 .0;
             Ok(json!(response.share))
         }
+        "email_auth_request_code" => {
+            let response = web_email_auth_request_code(state, &args).await?;
+            Ok(json!(response))
+        }
+        "email_auth_verify_code" => {
+            let response = web_email_auth_verify_code(state, &args).await?;
+            Ok(json!(response))
+        }
+        "email_auth_request_owner_change_code" => {
+            let response = web_email_auth_request_owner_change_code(state, &args).await?;
+            Ok(json!(response))
+        }
+        "email_auth_change_owner_email" => {
+            let response = web_email_auth_change_owner_email(state, &args).await?;
+            Ok(json!(response))
+        }
+        "email_auth_get_status" => {
+            let response = web_email_auth_get_status(state)?;
+            Ok(json!(response))
+        }
+        "email_auth_session_me" => {
+            let response = web_email_auth_session_me(state).await?;
+            Ok(json!(response))
+        }
+        "email_auth_logout" => web_email_auth_logout(state).await,
         "update_share_provider_binding" => {
             let (id, binding) = web_share_binding_input(state, &args).await?;
             let response = update_share_binding(

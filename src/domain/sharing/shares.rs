@@ -582,6 +582,45 @@ impl ShareStore {
         Ok(share.clone())
     }
 
+    pub fn change_owner_email_for_all(
+        &mut self,
+        old_email: &str,
+        new_email: &str,
+    ) -> Result<Vec<Share>, SharePatchError> {
+        let old_email = normalize_verified_email(old_email)?;
+        let new_email = normalize_verified_email(new_email)?;
+        if old_email.eq_ignore_ascii_case(&new_email) {
+            return Err(SharePatchError::Invalid(
+                "new owner email must differ from current owner email".to_string(),
+            ));
+        }
+
+        let mut updated = Vec::new();
+        for share in &mut self.shares {
+            if !share
+                .owner_email
+                .as_deref()
+                .is_some_and(|email| email.eq_ignore_ascii_case(&old_email))
+            {
+                continue;
+            }
+            share.owner_email = Some(new_email.clone());
+            share.acl.shared_with_emails =
+                normalize_email_list(&share.acl.shared_with_emails, Some(&new_email));
+            share.access_by_app =
+                normalize_access_by_app(share.access_by_app.clone(), Some(&new_email));
+            share.app_settings =
+                normalize_app_settings(share.app_settings.clone(), Some(&new_email));
+            Self::sync_owner_email_snapshot(share, &new_email);
+            updated.push(share.clone());
+        }
+
+        if updated.is_empty() {
+            return Err(SharePatchError::NotFound);
+        }
+        Ok(updated)
+    }
+
     fn sync_owner_email_snapshot(share: &mut Share, owner_email: &str) {
         if let Some(snapshot) = share.runtime_snapshot.as_mut() {
             if let Some(object) = snapshot.as_object_mut() {
@@ -2052,6 +2091,60 @@ mod tests {
                 "owner@example.com".to_string(),
                 "buyer@example.com".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn change_owner_email_for_all_updates_matching_owner_shares() {
+        let mut store = ShareStore::default();
+        let mut first = codex_share_input("s1");
+        first.acl = Some(ShareAcl {
+            shared_with_emails: vec![
+                "new-owner@example.com".to_string(),
+                "buyer@example.com".to_string(),
+            ],
+            public_market_email: None,
+            market_access_mode: Some("selected".to_string()),
+        });
+        first.app_settings = codex_app_settings(vec!["new-owner@example.com", "buyer@example.com"]);
+        store.upsert(first);
+        store.upsert(codex_share_input("s2"));
+        let mut other = codex_share_input("s3");
+        other.owner_email = Some("other@example.com".to_string());
+        store.upsert(other);
+
+        let updated = store
+            .change_owner_email_for_all("OWNER@example.com", "New-Owner@Example.com")
+            .unwrap();
+
+        assert_eq!(updated.len(), 2);
+        assert_eq!(
+            store
+                .shares
+                .iter()
+                .filter(|share| share.owner_email.as_deref() == Some("new-owner@example.com"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            store
+                .shares
+                .iter()
+                .find(|share| share.id == "s3")
+                .and_then(|share| share.owner_email.as_deref()),
+            Some("other@example.com")
+        );
+        let first = store.shares.iter().find(|share| share.id == "s1").unwrap();
+        assert_eq!(
+            first.acl.shared_with_emails,
+            vec!["buyer@example.com".to_string()]
+        );
+        assert_eq!(
+            first
+                .app_settings
+                .get("codex")
+                .map(|settings| settings.shared_with_emails.clone()),
+            Some(vec!["buyer@example.com".to_string()])
         );
     }
 

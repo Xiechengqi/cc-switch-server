@@ -503,6 +503,62 @@
       "notes": "Server web runtime shim."
     },
     {
+      "name": "email_auth_change_owner_email",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/email_auth_change_owner_email",
+      "notes": "Verifies the new owner email code, calls router change-owner-email, then updates local owner config and shares."
+    },
+    {
+      "name": "email_auth_get_status",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/email_auth_get_status",
+      "notes": "Returns local router email-auth state for server web UI."
+    },
+    {
+      "name": "email_auth_logout",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/email_auth_logout",
+      "notes": "Clears local router email-auth state when no local shares are owner-bound."
+    },
+    {
+      "name": "email_auth_request_code",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/email_auth_request_code",
+      "notes": "Requests a router email login code for the configured server owner email."
+    },
+    {
+      "name": "email_auth_request_owner_change_code",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/email_auth_request_owner_change_code",
+      "notes": "Requests a verification code for the new share owner email after current owner auth is verified locally."
+    },
+    {
+      "name": "email_auth_session_me",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/email_auth_session_me",
+      "notes": "Returns the local router email-auth user and configured installation owner email."
+    },
+    {
+      "name": "email_auth_verify_code",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/email_auth_verify_code",
+      "notes": "Verifies a router email login code and binds the configured installation owner email."
+    },
+    {
       "name": "ensure_claude_desktop_official_provider",
       "support": "shim",
       "implemented": true,
@@ -1583,7 +1639,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/transfer_share_owner",
-      "notes": "Desktop-aligned direct owner transfer from an existing share ACL email."
+      "notes": "Compatibility shim; target owner must already match verified email-auth owner state. New owner changes use email_auth_change_owner_email."
     },
     {
       "name": "update_circuit_breaker_config",
@@ -1694,7 +1750,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/update_share_owner_email",
-      "notes": "Desktop-aligned direct share owner email update without email verification."
+      "notes": "Compatibility shim; target owner must already match verified email-auth owner state. New owner changes use email_auth_change_owner_email."
     },
     {
       "name": "update_share_parallel_limit",

@@ -1731,6 +1731,191 @@ async fn spawn_broken_chunked_upstream() -> std::net::SocketAddr {
 }
 
 #[tokio::test]
+async fn web_invoke_direct_owner_update_requires_verified_target_owner() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_shares_immediate(|store| {
+            store.upsert(test_share_input(
+                "share-owner-gate",
+                "p-owner",
+                ProviderType::Codex,
+            ));
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/update_share_owner_email",
+            json!({
+                "params": {
+                    "shareId": "share-owner-gate",
+                    "ownerEmail": "new-owner@example.com"
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await;
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("email_auth_change_owner_email"));
+}
+
+#[tokio::test]
+async fn web_invoke_email_auth_owner_change_updates_config_and_shares() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let verify_seen = Arc::new(AtomicUsize::new(0));
+    let change_seen = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route(
+            "/v1/client-web/auth/email/verify-code",
+            post(
+                |State((verify_seen, _change_seen)): State<(
+                    Arc<AtomicUsize>,
+                    Arc<AtomicUsize>,
+                )>,
+                 axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(body["installationId"].as_str(), Some("inst-owner-change"));
+                    assert_eq!(body["email"].as_str(), Some("new-owner@example.com"));
+                    assert_eq!(body["code"].as_str(), Some("123456"));
+                    verify_seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({
+                        "user": {"id": "user-new", "email": "new-owner@example.com"},
+                        "accessToken": "new-owner-access",
+                        "refreshToken": "new-owner-refresh",
+                        "expiresAt": "2099-01-01T00:00:00Z",
+                        "refreshExpiresAt": "2099-02-01T00:00:00Z"
+                    }))
+                },
+            ),
+        )
+        .route(
+            "/v1/installations/change-owner-email",
+            post(
+                |State((_verify_seen, change_seen)): State<(
+                    Arc<AtomicUsize>,
+                    Arc<AtomicUsize>,
+                )>,
+                 headers: HeaderMap,
+                 axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer new-owner-access")
+                    );
+                    assert_eq!(body["installationId"].as_str(), Some("inst-owner-change"));
+                    assert_eq!(body["oldEmail"].as_str(), Some("owner@example.com"));
+                    assert_eq!(body["newEmail"].as_str(), Some("new-owner@example.com"));
+                    assert!(body["timestampMs"].is_number());
+                    assert!(body["nonce"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty()));
+                    assert!(body["signature"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty()));
+                    change_seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({
+                        "ok": true,
+                        "oldEmail": "owner@example.com",
+                        "newEmail": "new-owner@example.com",
+                        "updatedShares": 1
+                    }))
+                },
+            ),
+        )
+        .with_state((verify_seen.clone(), change_seen.clone()));
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config.read().await.clone();
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-owner-change".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+    cc_switch_server::clients::router::email_auth::save_state(
+        &state.config_dir,
+        &cc_switch_server::clients::router::email_auth::EmailAuthState {
+            email: "owner@example.com".to_string(),
+            router_domain: None,
+            access_token: Some("owner-access".to_string()),
+            refresh_token: Some("owner-refresh".to_string()),
+            expires_at: Some(4_102_444_800),
+            refresh_expires_at: Some(4_105_123_200),
+            verified_at: now_ms() as i64 / 1000,
+        },
+    )
+    .unwrap();
+    state
+        .mutate_shares_immediate(|store| {
+            store.upsert(test_share_input(
+                "share-owner-change",
+                "p-owner",
+                ProviderType::Codex,
+            ));
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/email_auth_change_owner_email",
+            json!({
+                "currentEmail": "owner@example.com",
+                "newEmail": "new-owner@example.com",
+                "code": "123456"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["authenticated"].as_bool(), Some(true));
+    assert_eq!(body["email"].as_str(), Some("new-owner@example.com"));
+    assert_eq!(verify_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(change_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.config.read().await.owner.email.as_deref(),
+        Some("new-owner@example.com")
+    );
+    assert_eq!(
+        state
+            .mutate_shares(|store| {
+                store
+                    .shares
+                    .iter()
+                    .find(|share| share.id == "share-owner-change")
+                    .and_then(|share| share.owner_email.clone())
+            })
+            .await
+            .as_deref(),
+        Some("new-owner@example.com")
+    );
+}
+
+#[tokio::test]
 async fn web_password_login_authenticates_invoke() {
     let app = app_router(test_state());
     let _ = setup_and_login(&app).await;
