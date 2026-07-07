@@ -122,6 +122,7 @@ import {
   GEMINI_DEFAULT_CONFIG,
   OPENCODE_DEFAULT_CONFIG,
   OPENCLAW_DEFAULT_CONFIG,
+  hasPricingConfigOverride,
   normalizePricingSource,
 } from "./helpers/opencodeFormUtils";
 import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
@@ -383,11 +384,8 @@ function ProviderFormFull({
     forSaleOfficialPricePercent?: number;
     quotaDispatchLimitPercent?: number;
   }>(() => ({
-    enabled:
-      initialData?.meta?.costMultiplier !== undefined ||
-      initialData?.meta?.pricingModelSource !== undefined ||
-      initialData?.meta?.quotaDispatchLimitPercent !== undefined,
-    costMultiplier: initialData?.meta?.costMultiplier,
+    enabled: hasPricingConfigOverride(initialData?.meta),
+    costMultiplier: initialData?.meta?.costMultiplier ?? undefined,
     forSaleOfficialPricePercent: initialData?.meta?.forSaleOfficialPricePercent,
     quotaDispatchLimitPercent: initialData?.meta?.quotaDispatchLimitPercent,
     pricingModelSource: normalizePricingSource(
@@ -438,11 +436,8 @@ function ProviderFormFull({
     );
     setTestConfig(initialData?.meta?.testConfig ?? { enabled: false });
     setPricingConfig({
-      enabled:
-        initialData?.meta?.costMultiplier !== undefined ||
-        initialData?.meta?.pricingModelSource !== undefined ||
-        initialData?.meta?.quotaDispatchLimitPercent !== undefined,
-      costMultiplier: initialData?.meta?.costMultiplier,
+      enabled: hasPricingConfigOverride(initialData?.meta),
+      costMultiplier: initialData?.meta?.costMultiplier ?? undefined,
       forSaleOfficialPricePercent:
         initialData?.meta?.forSaleOfficialPricePercent,
       quotaDispatchLimitPercent: initialData?.meta?.quotaDispatchLimitPercent,
@@ -2095,6 +2090,12 @@ function ProviderFormFull({
 
     const baseMeta: ProviderMeta | undefined =
       payload.meta ?? (initialData?.meta ? { ...initialData.meta } : undefined);
+    const {
+      costMultiplier: _ignoredCostMultiplier,
+      pricingModelSource: _ignoredPricingModelSource,
+      quotaDispatchLimitPercent: _ignoredQuotaDispatchLimitPercent,
+      ...baseMetaWithoutPricing
+    } = baseMeta ?? {};
     const forSaleOfficialPricePercent =
       pricingConfig.forSaleOfficialPricePercent;
     const validForSaleOfficialPricePercent =
@@ -2118,7 +2119,7 @@ function ProviderFormFull({
       initialData?.meta?.providerType;
 
     const nextMeta: ProviderMeta = {
-      ...(baseMeta ?? {}),
+      ...baseMetaWithoutPricing,
       commonConfigEnabled:
         appId === "claude"
           ? useCommonConfig

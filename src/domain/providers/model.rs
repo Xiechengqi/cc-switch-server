@@ -123,15 +123,15 @@ pub struct ProviderMeta {
     pub is_partner: Option<bool>,
     #[serde(default)]
     pub partner_promotion_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_config: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_multiplier: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_model_source: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale_official_price_percent: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_dispatch_limit_percent: Option<u32>,
     #[serde(default)]
     pub api_format: Option<String>,
@@ -468,6 +468,48 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn provider_meta_omits_pricing_fields_when_none() {
+        let meta = ProviderMeta::default();
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+
+        assert!(value.get("costMultiplier").is_none());
+        assert!(value.get("pricingModelSource").is_none());
+        assert!(value.get("quotaDispatchLimitPercent").is_none());
+        assert!(value.get("forSaleOfficialPricePercent").is_none());
+        assert!(value.get("testConfig").is_none());
+    }
+
+    #[test]
+    fn provider_meta_serializes_pricing_fields_when_set() {
+        let meta = ProviderMeta {
+            cost_multiplier: Some("1.5".to_string()),
+            pricing_model_source: Some("response".to_string()),
+            quota_dispatch_limit_percent: Some(80),
+            ..ProviderMeta::default()
+        };
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+
+        assert_eq!(
+            value
+                .get("costMultiplier")
+                .and_then(|item| item.as_str()),
+            Some("1.5")
+        );
+        assert_eq!(
+            value
+                .get("pricingModelSource")
+                .and_then(|item| item.as_str()),
+            Some("response")
+        );
+        assert_eq!(
+            value
+                .get("quotaDispatchLimitPercent")
+                .and_then(|item| item.as_u64()),
+            Some(80)
+        );
     }
 
     #[test]

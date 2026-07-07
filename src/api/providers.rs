@@ -427,17 +427,15 @@ pub(in crate::api) async fn test_provider_inner(
     stored: StoredProvider,
     query: &TestProviderQuery,
 ) -> Result<TestProviderResponse, ApiError> {
+    let defaults = crate::domain::stream_check::StreamCheckConfig::default();
     let accounts = state.accounts.read().await.clone();
     let adapter = proxy::adapters::adapter_for(stored.app, stored.provider_type);
     let route = default_test_route(stored.app);
     let stream = query.stream.unwrap_or(false);
-    let model = provider_test_model(stored.app, &stored, query.model.as_deref());
+    let model = provider_test_model(stored.app, &stored, query.model.as_deref(), Some(&defaults));
+    let gemini_path = default_gemini_test_path(stored.app, &model, stream);
     let endpoint = adapter
-        .resolve_endpoint(
-            route,
-            default_gemini_test_path(stored.app, &model, stream),
-            &stored,
-        )
+        .resolve_endpoint(route, gemini_path.clone(), &stored)
         .map_err(ApiError::proxy)?;
     let target_headers = adapter
         .build_headers(stored.app, &stored, &accounts)
@@ -448,13 +446,38 @@ pub(in crate::api) async fn test_provider_inner(
     let mut network_error = None;
     let mut network_stream_completed = None;
     if query.network.unwrap_or(false) {
+        if let Err(error) = state
+            .refresh_managed_account_if_needed(stored.provider_type, {
+                stored
+                    .provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.auth_binding.as_ref())
+                    .and_then(|binding| binding.account_id.as_deref())
+            })
+            .await
+        {
+            return Err(map_managed_account_refresh_error(error));
+        }
+        let accounts = state.accounts.read().await.clone();
         let started = std::time::Instant::now();
         let body = provider_test_body(stored.app, &stored, Some(&model), stream);
+        let adapter_request = adapter
+            .transform_request_for_route(Bytes::from(body), &stored, route, gemini_path.as_deref())
+            .map_err(ApiError::proxy)?;
+        let endpoint = adapter
+            .resolve_endpoint_for_request(route, gemini_path, &stored, &adapter_request)
+            .map_err(ApiError::proxy)?;
+        let mut target_headers = adapter
+            .build_headers(stored.app, &stored, &accounts)
+            .map_err(ApiError::proxy)?;
+        target_headers.extend(adapter_request.upstream_headers.iter().cloned());
+        let stream = adapter_request.stream_requested || stream;
         let http_client = state.http_client().await;
         let mut request = http_client
             .post(&endpoint)
             .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(body);
+            .body(adapter_request.body);
         if stream {
             request = request.header(axum::http::header::ACCEPT, "text/event-stream");
         }
@@ -551,7 +574,12 @@ pub(in crate::api) async fn fetch_provider_models_inner(
 ) -> Result<ProviderModelsFetchResult, ApiError> {
     let accounts = state.accounts.read().await.clone();
     let adapter = proxy::adapters::adapter_for(stored.app, stored.provider_type);
-    let model = provider_test_model(stored.app, stored, None);
+    let model = provider_test_model(
+        stored.app,
+        stored,
+        None,
+        Some(&crate::domain::stream_check::StreamCheckConfig::default()),
+    );
     let endpoint = adapter
         .resolve_endpoint(
             default_test_route(stored.app),
@@ -746,16 +774,20 @@ pub(in crate::api) fn provider_test_model(
     app: AppKind,
     stored: &StoredProvider,
     override_model: Option<&str>,
+    defaults: Option<&crate::domain::stream_check::StreamCheckConfig>,
 ) -> String {
-    override_model
+    let defaults = defaults.cloned().unwrap_or_default();
+    let resolved = override_model
         .map(str::trim)
         .filter(|model| !model.is_empty())
+        .map(str::to_string)
         .or_else(|| {
             stored
                 .provider
                 .settings_config
                 .pointer("/testConfig/testModel")
                 .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
         })
         .or_else(|| {
             stored
@@ -763,6 +795,7 @@ pub(in crate::api) fn provider_test_model(
                 .settings_config
                 .pointer("/testConfig/model")
                 .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
         })
         .or_else(|| {
             stored
@@ -772,6 +805,7 @@ pub(in crate::api) fn provider_test_model(
                 .and_then(|meta| meta.test_config.as_ref())
                 .and_then(|value| value.get("testModel").or_else(|| value.get("model")))
                 .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
         })
         .or_else(|| {
             stored
@@ -779,6 +813,7 @@ pub(in crate::api) fn provider_test_model(
                 .settings_config
                 .pointer("/modelMapping/upstreamModel")
                 .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
         })
         .or_else(|| {
             stored
@@ -795,13 +830,60 @@ pub(in crate::api) fn provider_test_model(
                             .or_else(|| value.get("name").and_then(serde_json::Value::as_str))
                     })
                 })
+                .map(str::to_string)
         })
-        .unwrap_or(match app {
-            AppKind::Claude => "claude-3-5-haiku-latest",
-            AppKind::Codex => "gpt-4.1-mini",
-            AppKind::Gemini => "gemini-2.5-flash",
-        })
-        .to_string()
+        .or_else(|| extract_codex_model_from_settings(&stored.provider.settings_config))
+        .unwrap_or_else(|| match app {
+            AppKind::Claude => defaults.claude_model.clone(),
+            AppKind::Codex => defaults.codex_model.clone(),
+            AppKind::Gemini => defaults.gemini_model.clone(),
+        });
+
+    if stored.provider_type == ProviderType::CodexOAuth && app == AppKind::Codex {
+        normalize_codex_oauth_test_model(&resolved)
+    } else {
+        resolved
+    }
+}
+
+fn extract_codex_model_from_settings(settings: &serde_json::Value) -> Option<String> {
+    let config_text = settings.get("config").and_then(serde_json::Value::as_str)?;
+    for line in config_text.lines() {
+        let line = line.split('#').next().unwrap_or(line).trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "model" {
+            continue;
+        }
+        let model = value.trim().trim_matches('"').trim_matches('\'').trim();
+        if !model.is_empty() {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
+fn normalize_codex_oauth_test_model(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return "gpt-5.5@low".to_string();
+    }
+    if trimmed.contains('@') || trimmed.contains('#') {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}@low")
+}
+
+fn parse_model_with_effort(model: &str) -> (String, Option<String>) {
+    if let Some(pos) = model.find('@').or_else(|| model.find('#')) {
+        let actual_model = model[..pos].trim().to_string();
+        let effort = model[pos + 1..].trim().to_string();
+        if !actual_model.is_empty() && !effort.is_empty() {
+            return (actual_model, Some(effort));
+        }
+    }
+    (model.trim().to_string(), None)
 }
 
 pub(in crate::api) fn provider_test_body(
@@ -810,7 +892,7 @@ pub(in crate::api) fn provider_test_body(
     override_model: Option<&str>,
     stream: bool,
 ) -> String {
-    let model = provider_test_model(app, stored, override_model);
+    let model = provider_test_model(app, stored, override_model, None);
     let value = match app {
         AppKind::Claude => serde_json::json!({
             "model": model,
@@ -818,12 +900,32 @@ pub(in crate::api) fn provider_test_body(
             "messages": [{"role": "user", "content": "ping"}],
             "stream": stream
         }),
-        AppKind::Codex => serde_json::json!({
-            "model": model,
-            "input": "ping",
-            "max_output_tokens": 1,
-            "stream": stream
-        }),
+        AppKind::Codex => {
+            let (actual_model, effort) = parse_model_with_effort(&model);
+            let mut body = serde_json::json!({
+                "model": actual_model,
+                "input": [{
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ping"}]
+                }],
+                "stream": stream
+            });
+            if let Some(effort) = effort {
+                body["reasoning"] = serde_json::json!({ "effort": effort });
+            } else if stored.provider_type == ProviderType::CodexOAuth {
+                body["reasoning"] = serde_json::json!({ "effort": "low" });
+            } else {
+                body["max_output_tokens"] = serde_json::json!(1);
+            }
+            if stored.provider_type == ProviderType::CodexOAuth {
+                body["store"] = serde_json::json!(false);
+                body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+                body["instructions"] = serde_json::json!("");
+                body["tools"] = serde_json::json!([]);
+                body["parallel_tool_calls"] = serde_json::json!(false);
+            }
+            body
+        }
         AppKind::Gemini => serde_json::json!({
             "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
             "generationConfig": {"maxOutputTokens": 1}
@@ -856,6 +958,28 @@ pub(in crate::api) fn redact_provider_test_error(value: &str) -> String {
         }
     }
     redacted.chars().take(800).collect()
+}
+
+fn map_managed_account_refresh_error(error: crate::state::ManagedAccountRefreshError) -> ApiError {
+    use crate::state::ManagedAccountRefreshError;
+    use axum::http::StatusCode;
+    match error {
+        ManagedAccountRefreshError::Conflict { provider_type } => ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "{} account refresh is already in progress",
+                provider_type.as_str()
+            ),
+        ),
+        ManagedAccountRefreshError::NotFound => ApiError::not_found("managed account not found"),
+        ManagedAccountRefreshError::Refresh {
+            status_code,
+            message,
+        } => ApiError::new(
+            StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            format!("managed account refresh failed: {message}"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -910,6 +1034,72 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn codex_oauth_test_model_appends_low_effort_suffix() {
+        let stored = StoredProvider {
+            app: AppKind::Codex,
+            provider: Provider {
+                id: "p1".to_string(),
+                name: "OpenAI OAuth".to_string(),
+                settings_config: json!({
+                    "config": "model = \"gpt-5.5\"\n"
+                }),
+                category: Some("official".to_string()),
+                meta: None,
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CodexOAuth,
+            provider_type_id: "codex_oauth".to_string(),
+        };
+
+        assert_eq!(
+            provider_test_model(AppKind::Codex, &stored, None, None),
+            "gpt-5.5@low"
+        );
+    }
+
+    #[test]
+    fn codex_oauth_test_body_includes_required_responses_fields() {
+        let stored = StoredProvider {
+            app: AppKind::Codex,
+            provider: Provider {
+                id: "p1".to_string(),
+                name: "OpenAI OAuth".to_string(),
+                settings_config: json!({
+                    "config": "model = \"gpt-5.5\"\n"
+                }),
+                category: Some("official".to_string()),
+                meta: None,
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CodexOAuth,
+            provider_type_id: "codex_oauth".to_string(),
+        };
+
+        let value: serde_json::Value =
+            serde_json::from_str(&provider_test_body(AppKind::Codex, &stored, None, true)).unwrap();
+
+        assert_eq!(
+            value.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            value
+                .pointer("/reasoning/effort")
+                .and_then(serde_json::Value::as_str),
+            Some("low")
+        );
+        assert_eq!(
+            value.get("store").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(value
+            .get("include")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| !items.is_empty()));
+        assert!(value.get("max_output_tokens").is_none());
     }
 
     #[test]

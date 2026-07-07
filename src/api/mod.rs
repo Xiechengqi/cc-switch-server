@@ -28,8 +28,8 @@ pub(crate) use control::{
 pub use control::{control_signature, refresh_share_usage_items, ControlRefreshShareUsageItem};
 pub use error::ApiError;
 pub(crate) use error::{
-    map_copilot_device_error, map_codex_device_error, map_email_auth_error, map_kiro_device_error, map_share_patch_error,
-    map_web_auth_error, ErrorResponse,
+    map_codex_device_error, map_copilot_device_error, map_email_auth_error, map_kiro_device_error,
+    map_share_patch_error, map_web_auth_error, ErrorResponse,
 };
 pub(in crate::api) use events::*;
 pub(in crate::api) use invoke::dispatch::web_invoke_compat;

@@ -1,4 +1,4 @@
-import type { OpenCodeModel, OpenCodeProviderConfig } from "@/types";
+import type { OpenCodeModel, OpenCodeProviderConfig, ProviderMeta } from "@/types";
 import type { PricingModelSourceOption } from "../ProviderAdvancedConfig";
 
 // ── Default configs ──────────────────────────────────────────────────
@@ -155,6 +155,25 @@ export function toOpencodeExtraOptions(
 export { buildOmoProfilePreview } from "@/types/omo";
 
 export const normalizePricingSource = (
-  value?: string,
+  value?: string | null,
 ): PricingModelSourceOption =>
   value === "request" || value === "response" ? value : "inherit";
+
+/** True when meta carries an explicit pricing override (not absent/null/inherit). */
+export function hasPricingConfigOverride(meta?: ProviderMeta | null): boolean {
+  if (!meta) return false;
+  const costMultiplier = meta.costMultiplier;
+  if (costMultiplier != null && costMultiplier !== "") {
+    return true;
+  }
+  const pricingModelSource = meta.pricingModelSource;
+  if (
+    pricingModelSource != null &&
+    pricingModelSource !== "" &&
+    pricingModelSource !== "inherit"
+  ) {
+    return true;
+  }
+  const quotaDispatchLimitPercent = meta.quotaDispatchLimitPercent;
+  return quotaDispatchLimitPercent != null && quotaDispatchLimitPercent >= 1;
+}

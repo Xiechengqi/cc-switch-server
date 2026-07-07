@@ -229,7 +229,7 @@ impl GenericForwardingAdapter {
         })
     }
 
-    pub fn transform_request_for_route(
+    pub(crate) fn transform_request_for_route(
         &self,
         body: Bytes,
         stored: &StoredProvider,

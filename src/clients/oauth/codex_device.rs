@@ -215,12 +215,8 @@ pub async fn poll_device_flow(
         CodexDeviceError::bad_gateway(format!("codex device poll response parse failed: {error}"))
     })?;
 
-    let tokens = exchange_code_for_tokens(
-        http,
-        &success.authorization_code,
-        &success.code_verifier,
-    )
-    .await?;
+    let tokens =
+        exchange_code_for_tokens(http, &success.authorization_code, &success.code_verifier).await?;
 
     let raw = json!({
         "accessToken": tokens.access_token,
@@ -234,13 +230,9 @@ pub async fn poll_device_flow(
         "loginMethod": "device",
     });
 
-    let account_input = upsert_input_from_token_response(
-        ProviderType::CodexOAuth,
-        &tokens,
-        raw,
-        now_ms,
-    )
-    .map_err(|error| CodexDeviceError::bad_gateway(error.message))?;
+    let account_input =
+        upsert_input_from_token_response(ProviderType::CodexOAuth, &tokens, raw, now_ms)
+            .map_err(|error| CodexDeviceError::bad_gateway(error.message))?;
 
     Ok(CodexDevicePollResult {
         pending: false,
@@ -379,9 +371,7 @@ mod tests {
                         async move {
                             poll_count.fetch_add(1, Ordering::SeqCst);
                             assert_eq!(
-                                headers
-                                    .get("content-type")
-                                    .and_then(|v| v.to_str().ok()),
+                                headers.get("content-type").and_then(|v| v.to_str().ok()),
                                 Some("application/x-www-form-urlencoded")
                             );
                             assert!(body.contains("grant_type=authorization_code"));
@@ -497,7 +487,9 @@ mod tests {
         }
 
         let success: DevicePollSuccess = poll_response.json().await.map_err(|error| {
-            CodexDeviceError::bad_gateway(format!("codex device poll response parse failed: {error}"))
+            CodexDeviceError::bad_gateway(format!(
+                "codex device poll response parse failed: {error}"
+            ))
         })?;
 
         let response = http
@@ -518,7 +510,9 @@ mod tests {
             })?;
 
         let tokens: OAuthTokenResponse = response.json().await.map_err(|error| {
-            CodexDeviceError::bad_gateway(format!("codex oauth token response parse failed: {error}"))
+            CodexDeviceError::bad_gateway(format!(
+                "codex oauth token response parse failed: {error}"
+            ))
         })?;
         let raw = json!({
             "accessToken": tokens.access_token,
@@ -527,13 +521,9 @@ mod tests {
             "importedBy": "codex_oauth_device_flow",
             "importedAtMs": now_ms,
         });
-        let account_input = upsert_input_from_token_response(
-            ProviderType::CodexOAuth,
-            &tokens,
-            raw,
-            now_ms,
-        )
-        .map_err(|error| CodexDeviceError::bad_gateway(error.message))?;
+        let account_input =
+            upsert_input_from_token_response(ProviderType::CodexOAuth, &tokens, raw, now_ms)
+                .map_err(|error| CodexDeviceError::bad_gateway(error.message))?;
 
         Ok(CodexDevicePollResult {
             pending: false,

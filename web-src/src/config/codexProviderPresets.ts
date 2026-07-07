@@ -170,6 +170,10 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     auth: {},
     config: `model = "gpt-5.5"`,
     providerType: "codex_oauth",
+    testConfig: {
+      enabled: true,
+      testModel: "gpt-5.5@low",
+    },
     theme: {
       icon: "codex",
       backgroundColor: "#1F2937", // gray-800
