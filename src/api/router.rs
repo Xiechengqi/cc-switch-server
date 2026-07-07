@@ -242,6 +242,28 @@ pub(in crate::api) async fn router_heartbeat(
 ) -> Result<Json<RouterStatusResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let now = now_ms();
+    let config = state.config.read().await.clone();
+    let http_client = state.http_client().await;
+    if let Err(error) =
+        crate::clients::router::client::pending_share_edits(&http_client, &config, Vec::new()).await
+    {
+        let message = format!("router heartbeat probe failed: {error}");
+        state
+            .mutate_shares_immediate(|shares| {
+                shares.router_registered = false;
+                shares.last_router_error = Some(message.clone());
+            })
+            .await
+            .map_err(ApiError::internal)?;
+        return Err(ApiError::bad_gateway(message));
+    }
+
+    let mut next_config = config;
+    next_config.client.last_heartbeat_ms = Some(now);
+    state
+        .replace_config(next_config)
+        .await
+        .map_err(ApiError::internal)?;
     state
         .mutate_shares_debounced(|shares| {
             shares.last_router_heartbeat_ms = Some(now);
@@ -249,14 +271,6 @@ pub(in crate::api) async fn router_heartbeat(
             shares.last_router_error = None;
         })
         .await;
-    {
-        let mut config = state.config.read().await.clone();
-        config.client.last_heartbeat_ms = Some(now);
-        state
-            .replace_config(config)
-            .await
-            .map_err(ApiError::internal)?;
-    }
     router_status(State(state), headers).await
 }
 

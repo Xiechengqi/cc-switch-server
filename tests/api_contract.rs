@@ -1043,6 +1043,134 @@ fn mock_codex_refresh_lock_allows_one_refresh_per_account() {
 }
 
 #[tokio::test]
+async fn router_heartbeat_probes_router_before_marking_online() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route(
+            "/v1/shares/pending-edits",
+            post(
+                |State(seen): State<Arc<AtomicUsize>>, axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(body["installationId"].as_str(), Some("inst-heartbeat"));
+                    assert_eq!(body["shareIds"].as_array().map(Vec::len), Some(0));
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"edits": []}))
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config.read().await.clone();
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-heartbeat".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/router/heartbeat",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["registered"].as_bool(), Some(true));
+    assert!(body["lastError"].is_null());
+    assert!(body["lastHeartbeatMs"].as_u64().is_some());
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert!(state.config.read().await.client.last_heartbeat_ms.is_some());
+}
+
+#[tokio::test]
+async fn router_heartbeat_records_probe_failure_without_marking_online() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let router = Router::new().route(
+        "/v1/shares/pending-edits",
+        post(|| async { (StatusCode::SERVICE_UNAVAILABLE, "router down") }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config.read().await.clone();
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-heartbeat".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+    state
+        .mutate_shares_immediate(|shares| {
+            shares.router_registered = true;
+            shares.last_router_error = None;
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/router/heartbeat",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = json_body(response).await;
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("router heartbeat probe failed"));
+
+    let status = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/router/status",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let body = json_body(status).await;
+    assert_eq!(body["registered"].as_bool(), Some(false));
+    assert!(body["lastError"]
+        .as_str()
+        .unwrap()
+        .contains("router pending share edits failed"));
+    assert!(body["lastHeartbeatMs"].is_null());
+}
+
+#[tokio::test]
 async fn web_runtime_context_reports_setup_and_authenticated_admin() {
     let app = app_router(test_state());
 

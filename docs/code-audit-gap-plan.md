@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第一批 transform 覆盖已落地，跟踪清单见 `docs/transform-coverage.md`；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X10 方案 A 已落地（heartbeat 真实探测 router）；X7 第一批 transform 覆盖已落地，跟踪清单见 `docs/transform-coverage.md`；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -141,6 +141,7 @@
 
 ### X10 heartbeat 语义决策（记录或接线）
 
+- **状态（2026-07-07）**：**方案 A 已完成**。`/api/router/heartbeat` 现在先对 router 发起已签名的 `v1/shares/pending-edits` 空拉探测；成功后才更新 `last_router_heartbeat_ms` / `client.last_heartbeat_ms` 并清空 `last_router_error`，失败时写入 `last_router_error`、置 `router_registered=false` 并返回 502。合同测试覆盖成功探测与 503 失败降级。
 - **现状证据**：server `/api/router/heartbeat`（`src/http.rs:4004`）只更新本地时间戳并置 `router_registered=true`，**不与 router 通信**；router 侧存在 `POST /v1/shares/heartbeat`（`api.rs:268` → `record_share_heartbeat`），desktop 同样未调用。当前 UI 的「heartbeat」按钮语义与用户预期（探活 router）不符。
 - **决策项**：
   - **方案 A（推荐，最小改动）**：`/api/router/heartbeat` 改为真实探测——对 router 发一次轻量已鉴权请求（如 `v1/shares/pending-edits` 空拉或 `v1/auth/session/me`），成功才更新时间戳，失败写 `last_router_error`；
@@ -204,3 +205,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | X7 第一批完成：新增 5 个 transform 用例、覆盖跟踪清单与 75% `--check` 门禁；X4 复核为下一独立功能切片 |
 | 2026-07-07 | R4-accounts 完成：state 外 accounts 写路径清零并降 `pub(crate)`，X5 的 accounts 前置解除 |
 | 2026-07-07 | X5 静态实现完成：Copilot managed-account 请求时 token 交换、endpoint 发现、per-account 缓存与 forwarder 接线落地；真实 capability 升级仍待外部账号验收 |
+| 2026-07-07 | X10 方案 A 完成：router heartbeat 改为已签名 pending-edits 空拉真实探测，失败不再伪造在线状态 |
