@@ -1,5 +1,7 @@
 //! Kiro OAuth protocol bridge for Claude-compatible proxy requests.
 
+use crate::domain::accounts::store::Account;
+use crate::domain::providers::model::ProviderType;
 use crate::proxy::ProxyError;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
@@ -48,6 +50,152 @@ pub(crate) struct KiroAccountData {
 struct KiroRequestBuild {
     body: Value,
     tool_name_map: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct KiroPreparedRequest {
+    pub url: String,
+    pub host: String,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: Value,
+    pub tool_name_map: HashMap<String, String>,
+}
+
+fn string_at(value: Option<&Value>, pointers: &[&str]) -> Option<String> {
+    let value = value?;
+    pointers.iter().find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn machine_id_from_refresh_token(refresh_token: &str) -> String {
+    sha256_hex(&format!("KotlinNativeAPI/{refresh_token}"))
+}
+
+impl KiroAccountData {
+    pub(crate) fn from_account(account: &Account) -> Result<Self, ProxyError> {
+        if account.provider_type != ProviderType::KiroOAuth {
+            return Err(ProxyError::bad_request(format!(
+                "expected kiro_oauth account, got {}",
+                account.provider_type.as_str()
+            )));
+        }
+        let access_token = account
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ProxyError::bad_request(format!("kiro account {} lacks access token", account.id))
+            })?;
+        let refresh_token = account
+            .refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(access_token)
+            .to_string();
+        let profile = account.profile.as_ref();
+        let raw = account.raw.as_ref();
+        Ok(Self {
+            account_id: account.id.clone(),
+            email: account
+                .email
+                .clone()
+                .or_else(|| string_at(profile, &["/email"])),
+            refresh_token: refresh_token.clone(),
+            profile_arn: string_at(profile, &["/profileArn", "/profile_arn"])
+                .or_else(|| string_at(raw, &["/resolvedProfileArn", "/profileArn"])),
+            auth_region: string_at(profile, &["/authRegion", "/auth_region"])
+                .or_else(|| string_at(raw, &["/authRegion", "/auth_region"]))
+                .unwrap_or_else(|| "us-east-1".to_string()),
+            api_region: string_at(profile, &["/apiRegion", "/api_region"])
+                .or_else(|| string_at(raw, &["/apiRegion", "/api_region"]))
+                .unwrap_or_else(|| "us-east-1".to_string()),
+            machine_id: string_at(profile, &["/machineId", "/machine_id"])
+                .or_else(|| string_at(raw, &["/machineId", "/machine_id"]))
+                .or_else(|| Some(machine_id_from_refresh_token(&refresh_token))),
+            client_id: string_at(raw, &["/clientId", "/client_id"]),
+            client_secret: string_at(raw, &["/clientSecret", "/client_secret"]),
+            client_secret_expires_at: raw
+                .and_then(|value| value.pointer("/clientSecretExpiresAt"))
+                .or_else(|| raw.and_then(|value| value.pointer("/client_secret_expires_at")))
+                .and_then(Value::as_i64),
+            start_url: string_at(profile, &["/startUrl", "/start_url"])
+                .or_else(|| string_at(raw, &["/startUrl", "/start_url"])),
+            auth_method: string_at(profile, &["/authMethod", "/auth_method"])
+                .or_else(|| string_at(raw, &["/authMethod", "/auth_method"])),
+            provider: string_at(profile, &["/provider"]).or_else(|| string_at(raw, &["/provider"])),
+            authenticated_at: raw
+                .and_then(|value| value.pointer("/importedAtMs"))
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+        })
+    }
+
+    fn access_token<'a>(&self, account: &'a Account) -> Result<&'a str, ProxyError> {
+        account
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ProxyError::bad_request(format!("kiro account {} lacks access token", account.id))
+            })
+    }
+}
+
+pub(crate) fn prepare_kiro_request(
+    account: &Account,
+    body: &Value,
+) -> Result<KiroPreparedRequest, ProxyError> {
+    let account_data = KiroAccountData::from_account(account)?;
+    let access_token = account_data.access_token(account)?;
+    let request = anthropic_to_kiro_request(body, &account_data)?;
+    let region = account_data
+        .api_region
+        .trim()
+        .is_empty()
+        .then_some("us-east-1")
+        .unwrap_or(account_data.api_region.as_str());
+    let host = format!("q.{region}.amazonaws.com");
+    let machine_id = account_data
+        .machine_id
+        .clone()
+        .unwrap_or_else(|| machine_id_from_refresh_token(&account_data.refresh_token));
+    let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-2.3.0-{machine_id}");
+    let user_agent = format!(
+        "aws-sdk-js/1.0.34 ua/2.1 os/{DEFAULT_SYSTEM_VERSION} lang/js md/nodejs#22.22.0 api/codewhispererstreaming#1.0.34 m/E KiroIDE-2.3.0-{machine_id}"
+    );
+    Ok(KiroPreparedRequest {
+        url: format!("https://{host}/generateAssistantResponse"),
+        host: host.clone(),
+        headers: vec![
+            ("content-type", "application/json".to_string()),
+            ("connection", "close".to_string()),
+            ("x-amzn-codewhisperer-optout", "true".to_string()),
+            ("x-amzn-kiro-agent-mode", "vibe".to_string()),
+            ("x-amz-user-agent", x_amz_user_agent),
+            ("user-agent", user_agent),
+            ("host", host),
+            ("amz-sdk-invocation-id", next_uuid_like("kiro-invocation")),
+            ("amz-sdk-request", "attempt=1; max=3".to_string()),
+            ("authorization", format!("Bearer {access_token}")),
+        ],
+        body: request.body,
+        tool_name_map: request.tool_name_map,
+    })
 }
 
 fn anthropic_to_kiro_request(
@@ -2397,6 +2545,103 @@ mod tests {
             provider: Some("BuilderId".to_string()),
             authenticated_at: 1,
         }
+    }
+
+    fn server_account() -> Account {
+        Account {
+            id: "kiro_server".to_string(),
+            provider_type: ProviderType::KiroOAuth,
+            email: Some("kiro@example.com".to_string()),
+            access_token: Some("access-token".to_string()),
+            refresh_token: Some("refresh-token".to_string()),
+            id_token: None,
+            token_type: Some("Bearer".to_string()),
+            api_key: None,
+            scopes: vec![],
+            profile: Some(json!({
+                "profileArn": "arn:aws:codewhisperer:us-west-2:123456789012:profile/profile-id",
+                "authRegion": "us-east-1",
+                "apiRegion": "us-west-2",
+                "machineId": "machine-profile",
+                "startUrl": "https://view.awsapps.com/start",
+                "authMethod": "builder-id",
+                "provider": "BuilderId"
+            })),
+            raw: Some(json!({
+                "clientId": "client-id",
+                "clientSecret": "client-secret",
+                "clientSecretExpiresAt": 123456,
+                "resolvedProfileArn": "arn:aws:codewhisperer:us-west-2:123456789012:profile/raw-profile",
+                "machineId": "machine-raw",
+                "importedAtMs": 1000
+            })),
+            subscription_level: Some("Kiro Pro".to_string()),
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at: Some(9_999_999),
+            last_refresh_error: None,
+        }
+    }
+
+    #[test]
+    fn account_data_from_server_account_preserves_kiro_profile() {
+        let account = server_account();
+        let data = KiroAccountData::from_account(&account).unwrap();
+
+        assert_eq!(data.account_id, "kiro_server");
+        assert_eq!(data.email.as_deref(), Some("kiro@example.com"));
+        assert_eq!(data.refresh_token, "refresh-token");
+        assert_eq!(data.api_region, "us-west-2");
+        assert_eq!(data.auth_region, "us-east-1");
+        assert_eq!(data.machine_id.as_deref(), Some("machine-profile"));
+        assert_eq!(data.client_id.as_deref(), Some("client-id"));
+        assert_eq!(data.client_secret.as_deref(), Some("client-secret"));
+        assert_eq!(data.client_secret_expires_at, Some(123456));
+        assert_eq!(data.authenticated_at, 1000);
+        assert_eq!(
+            resolve_profile_arn(&data),
+            "arn:aws:codewhisperer:us-west-2:123456789012:profile/profile-id"
+        );
+    }
+
+    #[test]
+    fn prepared_request_builds_codewhisperer_shape_and_headers() {
+        let account = server_account();
+        let body = json!({
+            "model": "claude-sonnet-4-8",
+            "metadata": {"session_id": "session-a"},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let request = prepare_kiro_request(&account, &body).unwrap();
+
+        assert_eq!(
+            request.url,
+            "https://q.us-west-2.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(request.host, "q.us-west-2.amazonaws.com");
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| { *name == "authorization" && value == "Bearer access-token" }));
+        assert!(request.headers.iter().any(|(name, value)| {
+            *name == "x-amz-user-agent" && value.contains("KiroIDE-2.3.0-machine-profile")
+        }));
+        assert_eq!(
+            request.body.pointer("/profileArn"),
+            Some(&json!(
+                "arn:aws:codewhisperer:us-west-2:123456789012:profile/profile-id"
+            ))
+        );
+        assert_eq!(
+            request
+                .body
+                .pointer("/conversationState/currentMessage/userInputMessage/modelId"),
+            Some(&json!("claude-sonnet-4.8"))
+        );
+        assert!(request.tool_name_map.is_empty());
     }
 
     #[test]
