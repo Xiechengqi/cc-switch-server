@@ -52,7 +52,7 @@ pub struct ServerStateInner {
     pub universal_providers: RwLock<UniversalProviderStore>,
     pub(crate) accounts: RwLock<AccountStore>,
     pub failover: RwLock<FailoverStore>,
-    pub pricing: RwLock<ModelPricingStore>,
+    pub(crate) pricing: RwLock<ModelPricingStore>,
     pub usage: RwLock<UsageStore>,
     pub(crate) shares: RwLock<ShareStore>,
     pub ui_settings: RwLock<UiSettingsStore>,
@@ -616,6 +616,31 @@ impl ServerStateInner {
 
     pub async fn save_pricing(&self) -> anyhow::Result<()> {
         self.pricing.read().await.save(&self.config_dir)
+    }
+
+    pub async fn mutate_pricing<R>(&self, mutate: impl FnOnce(&mut ModelPricingStore) -> R) -> R {
+        let mut pricing = self.pricing.write().await;
+        mutate(&mut pricing)
+    }
+
+    pub async fn mutate_pricing_immediate<R>(
+        &self,
+        mutate: impl FnOnce(&mut ModelPricingStore) -> R,
+    ) -> anyhow::Result<R> {
+        let result = self.mutate_pricing(mutate).await;
+        self.save_pricing().await?;
+        Ok(result)
+    }
+
+    pub async fn try_mutate_pricing_immediate<R, E>(
+        &self,
+        mutate: impl FnOnce(&mut ModelPricingStore) -> Result<R, E>,
+    ) -> anyhow::Result<Result<R, E>> {
+        let result = self.mutate_pricing(mutate).await;
+        if result.is_ok() {
+            self.save_pricing().await?;
+        }
+        Ok(result)
     }
 
     pub async fn save_usage(&self) -> anyhow::Result<()> {

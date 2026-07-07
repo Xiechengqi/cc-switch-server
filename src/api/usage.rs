@@ -135,13 +135,11 @@ pub(in crate::api) async fn update_model_pricing_inner(
     model_id: String,
     input: UpdateModelPricingInput,
 ) -> Result<Json<ModelPricingUpdateResponse>, ApiError> {
-    let entry = {
-        let mut pricing = state.pricing.write().await;
-        pricing
-            .upsert(model_id, input)
-            .map_err(ApiError::bad_request)?
-    };
-    state.save_pricing().await.map_err(ApiError::internal)?;
+    let entry = state
+        .try_mutate_pricing_immediate(|pricing| pricing.upsert(model_id, input))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::bad_request)?;
 
     let providers = state.providers.read().await.clone();
     let pricing = state.pricing.read().await.clone();
@@ -168,11 +166,10 @@ pub(in crate::api) async fn delete_model_pricing(
     Path(model_id): Path<String>,
 ) -> Result<Json<ModelPricingDeleteResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let deleted = {
-        let mut pricing = state.pricing.write().await;
-        pricing.delete(&model_id)
-    };
-    state.save_pricing().await.map_err(ApiError::internal)?;
+    let deleted = state
+        .mutate_pricing_immediate(|pricing| pricing.delete(&model_id))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(ModelPricingDeleteResponse { ok: true, deleted }))
 }
 
