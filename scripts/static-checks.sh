@@ -83,6 +83,11 @@ NODE
 echo "== diff whitespace =="
 git diff --check
 
+echo "== state write discipline =="
+if rg -n 'accounts\.write\(\)\.await|save_accounts\(\)\.await|save_accounts_debounced\(' src/api src/clients src/domain src/proxy src/infra tests; then
+  echo 'accounts writes must go through ServerStateInner domain methods'; exit 1
+fi
+
 echo "== dependency direction =="
 if rg -n 'crate::(http|api)\b' src/proxy; then
   echo 'proxy must not depend on api/http'; exit 1

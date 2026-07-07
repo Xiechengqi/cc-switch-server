@@ -157,38 +157,43 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
             extra: Default::default(),
         },
     );
-    state.accounts.write().await.upsert(UpsertAccountInput {
-        id: Some("acct-cursor".to_string()),
-        provider_type: ProviderType::CursorOAuth,
-        email: Some("cursor@example.com".to_string()),
-        access_token: None,
-        refresh_token: None,
-        id_token: None,
-        token_type: None,
-        api_key: None,
-        scopes: Vec::new(),
-        profile: None,
-        raw: Some(json!({
-            "billingOrQuotaSnapshot": {
-                "stripeStatus": {"membershipType": "pro_plus"},
-                "currentPeriodUsage": {
-                    "billingCycleEnd": 1774000000000i64,
-                    "planUsage": {
-                        "limit": 2000.0,
-                        "used": 500.0,
-                        "totalPercentUsed": 25.0
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(UpsertAccountInput {
+                id: Some("acct-cursor".to_string()),
+                provider_type: ProviderType::CursorOAuth,
+                email: Some("cursor@example.com".to_string()),
+                access_token: None,
+                refresh_token: None,
+                id_token: None,
+                token_type: None,
+                api_key: None,
+                scopes: Vec::new(),
+                profile: None,
+                raw: Some(json!({
+                    "billingOrQuotaSnapshot": {
+                        "stripeStatus": {"membershipType": "pro_plus"},
+                        "currentPeriodUsage": {
+                            "billingCycleEnd": 1774000000000i64,
+                            "planUsage": {
+                                "limit": 2000.0,
+                                "used": 500.0,
+                                "totalPercentUsed": 25.0
+                            }
+                        }
                     }
-                }
-            }
-        })),
-        subscription_level: None,
-        quota_percent: None,
-        quota: None,
-        quota_refreshed_at: None,
-        quota_next_refresh_at: None,
-        expires_at: None,
-        last_refresh_error: None,
-    });
+                })),
+                subscription_level: None,
+                quota_percent: None,
+                quota: None,
+                quota_refreshed_at: None,
+                quota_next_refresh_at: None,
+                expires_at: None,
+                last_refresh_error: None,
+            });
+        })
+        .await
+        .unwrap();
     let share = {
         let mut input = test_share_input("share-refresh", "p-refresh", ProviderType::CursorOAuth);
         input.bindings = vec![ShareBinding {
@@ -211,11 +216,8 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
     assert!(refreshed[0].refreshed);
     assert!(refreshed[0].error.is_none());
     let account = state
-        .accounts
-        .read()
+        .find_account_for_provider(ProviderType::CursorOAuth, Some("acct-cursor"))
         .await
-        .find_for_provider(ProviderType::CursorOAuth, Some("acct-cursor"))
-        .cloned()
         .unwrap();
     assert_eq!(account.quota_percent, Some(25.0));
 }

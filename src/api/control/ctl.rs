@@ -278,12 +278,9 @@ pub(crate) async fn refresh_share_usage_item(
                 message: None,
             };
         };
-        let latest_account = {
-            let accounts = state.accounts.read().await;
-            accounts
-                .find_for_provider(provider.provider_type, Some(&active_account.id))
-                .cloned()
-        };
+        let latest_account = state
+            .find_account_for_provider(provider.provider_type, Some(&active_account.id))
+            .await;
         let Some(latest_account) = latest_account else {
             return ControlRefreshShareUsageItem {
                 app: app.as_str().to_string(),
@@ -301,21 +298,22 @@ pub(crate) async fn refresh_share_usage_item(
             let http_client = state.http_client().await;
             match execute_native_account_refresh(&http_client, &active_account, now).await {
                 Ok(update) => {
-                    let updated = {
-                        let mut accounts = state.accounts.write().await;
-                        accounts.mark_refresh_success(&active_account.id, update)
-                    };
+                    let updated = state
+                        .mutate_accounts_debounced(|accounts| {
+                            accounts.mark_refresh_success(&active_account.id, update)
+                        })
+                        .await;
                     if let Some(updated) = updated {
                         active_account = updated;
                     }
-                    save_accounts_debounced(state);
                 }
                 Err(error) => {
-                    {
-                        let mut accounts = state.accounts.write().await;
-                        accounts.mark_refresh_failure(&active_account.id, error.message.clone());
-                    }
-                    save_accounts_debounced(state);
+                    state
+                        .mutate_accounts_debounced(|accounts| {
+                            accounts
+                                .mark_refresh_failure(&active_account.id, error.message.clone());
+                        })
+                        .await;
                     return ControlRefreshShareUsageItem {
                         app: app.as_str().to_string(),
                         provider_id: Some(provider_id),
@@ -334,11 +332,11 @@ pub(crate) async fn refresh_share_usage_item(
     let http_client = state.http_client().await;
     match refresh_account_quota(&http_client, &active_account, now, true).await {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
-            let updated = {
-                let mut accounts = state.accounts.write().await;
-                accounts.mark_refresh_success(&active_account.id, update)
-            };
-            save_accounts_debounced(state);
+            let updated = state
+                .mutate_accounts_debounced(|accounts| {
+                    accounts.mark_refresh_success(&active_account.id, update)
+                })
+                .await;
             ControlRefreshShareUsageItem {
                 app: app.as_str().to_string(),
                 provider_id: Some(provider_id),
@@ -386,18 +384,18 @@ pub(crate) async fn mark_quota_refresh_error(
     account_id: &str,
     error: &QuotaRefreshFailure,
 ) {
-    {
-        let mut accounts = state.accounts.write().await;
-        accounts.mark_refresh_success(
-            account_id,
-            AccountRefreshUpdate {
-                quota_next_refresh_at: error.next_refresh_at,
-                last_refresh_error: Some(error.message.clone()),
-                ..Default::default()
-            },
-        );
-    }
-    save_accounts_debounced(state);
+    state
+        .mutate_accounts_debounced(|accounts| {
+            accounts.mark_refresh_success(
+                account_id,
+                AccountRefreshUpdate {
+                    quota_next_refresh_at: error.next_refresh_at,
+                    last_refresh_error: Some(error.message.clone()),
+                    ..Default::default()
+                },
+            );
+        })
+        .await;
 }
 
 #[derive(Debug, Deserialize)]

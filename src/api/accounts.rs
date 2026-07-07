@@ -7,7 +7,7 @@ pub(in crate::api) async fn list_accounts(
     require_session(&state, &headers).await?;
     Ok(Json(ListAccountsResponse {
         ok: true,
-        accounts: state.accounts.read().await.accounts.clone(),
+        accounts: state.accounts_snapshot().await.accounts,
     }))
 }
 
@@ -17,14 +17,15 @@ pub(in crate::api) async fn upsert_account(
     Json(input): Json<UpsertAccountInput>,
 ) -> Result<Json<UpsertAccountResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let account = {
-        let mut store = state.accounts.write().await;
-        let manager = manager_for(input.provider_type);
-        manager
-            .finish_login(&mut store, input)
-            .map_err(ApiError::bad_request)?
-    };
-    state.save_accounts().await.map_err(ApiError::internal)?;
+    let account = state
+        .try_mutate_accounts_immediate(|store| {
+            let manager = manager_for(input.provider_type);
+            manager
+                .finish_login(store, input)
+                .map_err(ApiError::bad_request)
+        })
+        .await
+        .map_err(ApiError::internal)??;
     Ok(Json(UpsertAccountResponse { ok: true, account }))
 }
 
@@ -175,12 +176,14 @@ pub(in crate::api) async fn poll_copilot_device_login(
         .account_input
         .ok_or_else(|| ApiError::bad_gateway("copilot device flow completed without account"))?;
     let provider_type = account_input.provider_type;
-    let account_result = {
-        let mut store = state.accounts.write().await;
-        manager_for(provider_type).finish_login(&mut store, account_input)
-    };
-    let account = account_result.map_err(ApiError::bad_request)?;
-    state.save_accounts().await.map_err(ApiError::internal)?;
+    let account = state
+        .try_mutate_accounts_immediate(|store| {
+            manager_for(provider_type)
+                .finish_login(store, account_input)
+                .map_err(ApiError::bad_request)
+        })
+        .await
+        .map_err(ApiError::internal)??;
     Ok(Json(PollCopilotDeviceLoginResponse {
         ok: true,
         pending: false,
@@ -268,12 +271,14 @@ pub(in crate::api) async fn poll_kiro_device_login(
         .account_input
         .ok_or_else(|| ApiError::bad_gateway("kiro device flow completed without account"))?;
     let provider_type = account_input.provider_type;
-    let account_result = {
-        let mut store = state.accounts.write().await;
-        manager_for(provider_type).finish_login(&mut store, account_input)
-    };
-    let account = account_result.map_err(ApiError::bad_request)?;
-    state.save_accounts().await.map_err(ApiError::internal)?;
+    let account = state
+        .try_mutate_accounts_immediate(|store| {
+            manager_for(provider_type)
+                .finish_login(store, account_input)
+                .map_err(ApiError::bad_request)
+        })
+        .await
+        .map_err(ApiError::internal)??;
     Ok(Json(PollKiroDeviceLoginResponse {
         ok: true,
         pending: false,
@@ -334,9 +339,17 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
         }
     };
 
-    let account_result = {
-        let mut store = state.accounts.write().await;
-        manager_for(input.provider_type).finish_login(&mut store, input)
+    let account_result = match state
+        .try_mutate_accounts_immediate(|store| {
+            manager_for(input.provider_type).finish_login(store, input)
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            mark_account_login_exchange_failed(state, &finish.session_id).await;
+            return Err(ApiError::internal(error));
+        }
     };
     let account = match account_result {
         Ok(account) => account,
@@ -345,10 +358,6 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
             return Err(ApiError::bad_request(error));
         }
     };
-    if let Err(error) = state.save_accounts().await {
-        mark_account_login_exchange_failed(state, &finish.session_id).await;
-        return Err(ApiError::internal(error));
-    }
     state
         .oauth_logins
         .write()
@@ -414,21 +423,22 @@ pub(in crate::api) async fn delete_account(
     Path(id): Path<String>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let deleted = {
-        let mut store = state.accounts.write().await;
-        let provider_type = store
-            .accounts
-            .iter()
-            .find(|item| item.id == id)
-            .map(|item| item.provider_type);
-        match provider_type {
-            Some(provider_type) => manager_for(provider_type)
-                .revoke_or_delete(&mut store, &id)
-                .map_err(ApiError::bad_request)?,
-            None => false,
-        }
-    };
-    state.save_accounts().await.map_err(ApiError::internal)?;
+    let deleted = state
+        .try_mutate_accounts_immediate(|store| {
+            let provider_type = store
+                .accounts
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.provider_type);
+            match provider_type {
+                Some(provider_type) => manager_for(provider_type)
+                    .revoke_or_delete(store, &id)
+                    .map_err(ApiError::bad_request),
+                None => Ok(false),
+            }
+        })
+        .await
+        .map_err(ApiError::internal)??;
     Ok(Json(DeleteResponse { ok: true, deleted }))
 }
 
@@ -439,13 +449,8 @@ pub(in crate::api) async fn refresh_account(
 ) -> Result<Json<UpsertAccountResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let existing = state
-        .accounts
-        .read()
+        .find_account_by_id(&id)
         .await
-        .accounts
-        .iter()
-        .find(|item| item.id == id)
-        .cloned()
         .ok_or_else(|| ApiError::not_found("account not found"))?;
 
     if provider_native_refresh_available(existing.provider_type) {
@@ -458,31 +463,34 @@ pub(in crate::api) async fn refresh_account(
         let update = match execute_native_account_refresh(&http_client, &existing, now).await {
             Ok(update) => update,
             Err(error) => {
-                {
-                    let mut store = state.accounts.write().await;
-                    store.mark_refresh_failure(&id, error.message.clone());
-                }
-                state.save_accounts().await.map_err(ApiError::internal)?;
+                state
+                    .mutate_accounts_immediate(|store| {
+                        store.mark_refresh_failure(&id, error.message.clone());
+                    })
+                    .await
+                    .map_err(ApiError::internal)?;
                 return Err(account_refresh_api_error(error));
             }
         };
-        let account = {
-            let mut store = state.accounts.write().await;
-            store
-                .mark_refresh_success(&id, update)
-                .ok_or_else(|| ApiError::not_found("account not found"))?
-        };
-        state.save_accounts().await.map_err(ApiError::internal)?;
+        let account = state
+            .try_mutate_accounts_immediate(|store| {
+                store
+                    .mark_refresh_success(&id, update)
+                    .ok_or_else(|| ApiError::not_found("account not found"))
+            })
+            .await
+            .map_err(ApiError::internal)??;
         return Ok(Json(UpsertAccountResponse { ok: true, account }));
     }
 
-    let account = {
-        let mut store = state.accounts.write().await;
-        manager_for(existing.provider_type)
-            .refresh_token(&mut store, &id, now_ms() as i64)
-            .map_err(ApiError::bad_request)?
-    };
-    state.save_accounts().await.map_err(ApiError::internal)?;
+    let account = state
+        .try_mutate_accounts_immediate(|store| {
+            manager_for(existing.provider_type)
+                .refresh_token(store, &id, now_ms() as i64)
+                .map_err(ApiError::bad_request)
+        })
+        .await
+        .map_err(ApiError::internal)??;
     Ok(Json(UpsertAccountResponse { ok: true, account }))
 }
 
@@ -552,13 +560,8 @@ pub(in crate::api) async fn account_quota(
 ) -> Result<Json<AccountQuotaResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let existing = state
-        .accounts
-        .read()
+        .find_account_by_id(&id)
         .await
-        .accounts
-        .iter()
-        .find(|item| item.id == id)
-        .cloned()
         .ok_or_else(|| ApiError::not_found("account not found"))?;
     if !query.refresh.unwrap_or(false) {
         let store = state.accounts.read().await;
@@ -596,7 +599,6 @@ pub(in crate::api) async fn account_quota(
     }
 
     let mut active_account = existing;
-    let mut account_mutated = false;
     if account_needs_native_refresh(&active_account, now) {
         let _refresh_guard = state
             .account_refresh_locks
@@ -607,33 +609,36 @@ pub(in crate::api) async fn account_quota(
         {
             Ok(update) => update,
             Err(error) => {
-                {
-                    let mut store = state.accounts.write().await;
-                    store.mark_refresh_failure(&id, error.message.clone());
-                }
-                state.save_accounts().await.map_err(ApiError::internal)?;
+                state
+                    .mutate_accounts_immediate(|store| {
+                        store.mark_refresh_failure(&id, error.message.clone());
+                    })
+                    .await
+                    .map_err(ApiError::internal)?;
                 return Err(account_refresh_api_error(error));
             }
         };
-        active_account = {
-            let mut store = state.accounts.write().await;
-            store
-                .mark_refresh_success(&id, update)
-                .ok_or_else(|| ApiError::not_found("account not found"))?
-        };
-        account_mutated = true;
+        active_account = state
+            .try_mutate_accounts_immediate(|store| {
+                store
+                    .mark_refresh_success(&id, update)
+                    .ok_or_else(|| ApiError::not_found("account not found"))
+            })
+            .await
+            .map_err(ApiError::internal)??;
     }
 
     let http_client = state.http_client().await;
     match refresh_account_quota(&http_client, &active_account, now, force).await {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
-            let account = {
-                let mut store = state.accounts.write().await;
-                store
-                    .mark_refresh_success(&id, update)
-                    .ok_or_else(|| ApiError::not_found("account not found"))?
-            };
-            state.save_accounts().await.map_err(ApiError::internal)?;
+            let account = state
+                .try_mutate_accounts_immediate(|store| {
+                    store
+                        .mark_refresh_success(&id, update)
+                        .ok_or_else(|| ApiError::not_found("account not found"))
+                })
+                .await
+                .map_err(ApiError::internal)??;
             Ok(Json(AccountQuotaResponse {
                 ok: true,
                 quota: account.quota.clone(),
@@ -646,32 +651,28 @@ pub(in crate::api) async fn account_quota(
         Ok(QuotaRefreshResult::SkippedCooldown {
             next_refresh_at,
             message,
-        }) => {
-            if account_mutated {
-                state.save_accounts().await.map_err(ApiError::internal)?;
-            }
-            Ok(Json(AccountQuotaResponse {
-                ok: true,
-                quota: active_account.quota.clone(),
-                account: Some(active_account),
-                refreshed: false,
-                message: Some(message),
-                next_refresh_at: Some(next_refresh_at),
-            }))
-        }
+        }) => Ok(Json(AccountQuotaResponse {
+            ok: true,
+            quota: active_account.quota.clone(),
+            account: Some(active_account),
+            refreshed: false,
+            message: Some(message),
+            next_refresh_at: Some(next_refresh_at),
+        })),
         Err(error) => {
-            {
-                let mut store = state.accounts.write().await;
-                store.mark_refresh_success(
-                    &id,
-                    AccountRefreshUpdate {
-                        quota_next_refresh_at: error.next_refresh_at,
-                        last_refresh_error: Some(error.message.clone()),
-                        ..Default::default()
-                    },
-                );
-            }
-            state.save_accounts().await.map_err(ApiError::internal)?;
+            state
+                .mutate_accounts_immediate(|store| {
+                    store.mark_refresh_success(
+                        &id,
+                        AccountRefreshUpdate {
+                            quota_next_refresh_at: error.next_refresh_at,
+                            last_refresh_error: Some(error.message.clone()),
+                            ..Default::default()
+                        },
+                    );
+                })
+                .await
+                .map_err(ApiError::internal)?;
             Err(ApiError::new(
                 StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
                 error.message,

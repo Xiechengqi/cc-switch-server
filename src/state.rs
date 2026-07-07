@@ -48,7 +48,7 @@ pub struct ServerStateInner {
     pub config: RwLock<ServerConfig>,
     pub providers: RwLock<ProviderStore>,
     pub universal_providers: RwLock<UniversalProviderStore>,
-    pub accounts: RwLock<AccountStore>,
+    pub(crate) accounts: RwLock<AccountStore>,
     pub failover: RwLock<FailoverStore>,
     pub pricing: RwLock<ModelPricingStore>,
     pub usage: RwLock<UsageStore>,
@@ -270,7 +270,7 @@ impl DebouncedStoreSaves {
     }
 }
 
-pub fn save_accounts_debounced(state: &ServerState) {
+fn save_accounts_debounced(state: &ServerState) {
     schedule_debounced_save(state.clone(), DebouncedStoreKind::Accounts);
 }
 
@@ -409,6 +409,66 @@ impl ServerStateInner {
 
     pub async fn save_accounts(&self) -> anyhow::Result<()> {
         self.accounts.read().await.save(&self.config_dir)
+    }
+
+    pub async fn accounts_snapshot(&self) -> AccountStore {
+        self.accounts.read().await.clone()
+    }
+
+    pub async fn find_account_by_id(&self, account_id: &str) -> Option<Account> {
+        self.accounts
+            .read()
+            .await
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+    }
+
+    pub async fn find_account_for_provider(
+        &self,
+        provider_type: ProviderType,
+        account_id: Option<&str>,
+    ) -> Option<Account> {
+        self.accounts
+            .read()
+            .await
+            .find_for_provider(provider_type, account_id)
+            .cloned()
+    }
+
+    pub async fn mutate_accounts<R>(&self, mutate: impl FnOnce(&mut AccountStore) -> R) -> R {
+        let mut accounts = self.accounts.write().await;
+        mutate(&mut accounts)
+    }
+
+    pub async fn mutate_accounts_immediate<R>(
+        &self,
+        mutate: impl FnOnce(&mut AccountStore) -> R,
+    ) -> anyhow::Result<R> {
+        let result = self.mutate_accounts(mutate).await;
+        self.save_accounts().await?;
+        Ok(result)
+    }
+
+    pub async fn try_mutate_accounts_immediate<R, E>(
+        &self,
+        mutate: impl FnOnce(&mut AccountStore) -> Result<R, E>,
+    ) -> anyhow::Result<Result<R, E>> {
+        let result = self.mutate_accounts(mutate).await;
+        if result.is_ok() {
+            self.save_accounts().await?;
+        }
+        Ok(result)
+    }
+
+    pub async fn mutate_accounts_debounced<R>(
+        self: &Arc<Self>,
+        mutate: impl FnOnce(&mut AccountStore) -> R,
+    ) -> R {
+        let result = self.mutate_accounts(mutate).await;
+        save_accounts_debounced(self);
+        result
     }
 
     pub async fn save_failover(&self) -> anyhow::Result<()> {

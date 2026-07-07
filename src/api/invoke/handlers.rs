@@ -1445,23 +1445,24 @@ pub(in crate::api) async fn web_managed_auth_set_default_account(
     require_session(&state, &headers).await?;
     let provider_type = web_auth_provider_type(args)?;
     let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
-    let mut store = state.accounts.write().await;
-    let Some(index) = store
-        .accounts
-        .iter()
-        .position(|account| account.id == account_id && account.provider_type == provider_type)
-    else {
-        return Err(ApiError::not_found("account not found"));
-    };
-    let account = store.accounts.remove(index);
-    let insert_at = store
-        .accounts
-        .iter()
-        .position(|item| item.provider_type == provider_type)
-        .unwrap_or(store.accounts.len());
-    store.accounts.insert(insert_at, account);
-    drop(store);
-    state.save_accounts().await.map_err(ApiError::internal)?;
+    state
+        .try_mutate_accounts_immediate(|store| {
+            let Some(index) = store.accounts.iter().position(|account| {
+                account.id == account_id && account.provider_type == provider_type
+            }) else {
+                return Err(ApiError::not_found("account not found"));
+            };
+            let account = store.accounts.remove(index);
+            let insert_at = store
+                .accounts
+                .iter()
+                .position(|item| item.provider_type == provider_type)
+                .unwrap_or(store.accounts.len());
+            store.accounts.insert(insert_at, account);
+            Ok(())
+        })
+        .await
+        .map_err(ApiError::internal)??;
     Ok(Value::Null)
 }
 
