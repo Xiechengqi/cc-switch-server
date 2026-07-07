@@ -2826,6 +2826,129 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_to_chat_preserves_multimodal_request_fields() {
+        let input = json!({
+            "model": "gpt-5.5",
+            "instructions": ["system text", {"type": "message", "content": "developer text"}],
+            "max_output_tokens": 32,
+            "reasoning": {"effort": "high"},
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"format": {"type": "json_object"}},
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                    {"type": "input_file", "file_id": "file_123", "filename": "notes.txt"}
+                ]
+            }]
+        });
+
+        let output = openai_responses_to_chat(&input).unwrap();
+
+        assert_eq!(
+            output.pointer("/messages/0/role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            output
+                .pointer("/messages/1/content/1/type")
+                .and_then(Value::as_str),
+            Some("image_url")
+        );
+        assert_eq!(
+            output
+                .pointer("/messages/1/content/2/file/file_id")
+                .and_then(Value::as_str),
+            Some("file_123")
+        );
+        assert_eq!(
+            output.get("max_completion_tokens").and_then(Value::as_i64),
+            Some(32)
+        );
+        assert_eq!(
+            output.get("reasoning_effort").and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            output
+                .pointer("/response_format/type")
+                .and_then(Value::as_str),
+            Some("json_object")
+        );
+        assert_eq!(
+            output.get("parallel_tool_calls").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn openai_responses_to_chat_maps_function_call_and_output_items() {
+        let input = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{\"q\":\"x\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": {"ok": true}}
+            ]
+        });
+
+        let output = openai_responses_to_chat(&input).unwrap();
+
+        assert_eq!(
+            output
+                .pointer("/messages/0/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("lookup")
+        );
+        assert_eq!(
+            output
+                .pointer("/messages/1/tool_call_id")
+                .and_then(Value::as_str),
+            Some("call_1")
+        );
+        assert_eq!(
+            output
+                .pointer("/messages/1/content/ok")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn openai_responses_to_chat_maps_function_tools_and_tool_choice() {
+        let input = json!({
+            "model": "gpt-5.5",
+            "input": "hello",
+            "tools": [
+                {"type": "function", "name": "lookup", "description": "Lookup", "parameters": {"type": "object"}, "strict": true},
+                {"type": "web_search_preview"}
+            ],
+            "tool_choice": {"type": "function", "name": "lookup"}
+        });
+
+        let output = openai_responses_to_chat(&input).unwrap();
+
+        assert_eq!(
+            output
+                .pointer("/tools/0/function/name")
+                .and_then(Value::as_str),
+            Some("lookup")
+        );
+        assert_eq!(
+            output.get("tools").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            output
+                .pointer("/tool_choice/function/name")
+                .and_then(Value::as_str),
+            Some("lookup")
+        );
+    }
+
+    #[test]
     fn openai_responses_response_to_chat_preserves_tools_and_usage() {
         let input = json!({
             "id": "resp_1",
@@ -2887,6 +3010,63 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(1)
         );
+    }
+
+    #[test]
+    fn openai_responses_response_to_chat_maps_incomplete_status_to_length() {
+        let input = json!({
+            "id": "resp_1",
+            "object": "response",
+            "status": "incomplete",
+            "model": "gpt-5.5",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "partial"}]
+            }]
+        });
+
+        let output = openai_responses_response_to_chat(&input).unwrap();
+
+        assert_eq!(
+            output
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("length")
+        );
+    }
+
+    #[test]
+    fn response_finish_reason_matrix_maps_across_protocols() {
+        for (anthropic, openai, gemini) in [
+            ("end_turn", "stop", "STOP"),
+            ("tool_use", "tool_calls", "STOP"),
+            ("max_tokens", "length", "MAX_TOKENS"),
+        ] {
+            let input = json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4",
+                "content": [{"type": "text", "text": "hello"}],
+                "stop_reason": anthropic
+            });
+
+            let chat = anthropic_response_to_openai_chat(&input).unwrap();
+            assert_eq!(
+                chat.pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str),
+                Some(openai)
+            );
+
+            let gemini_output = anthropic_response_to_gemini(&input).unwrap();
+            assert_eq!(
+                gemini_output
+                    .pointer("/candidates/0/finishReason")
+                    .and_then(Value::as_str),
+                Some(gemini)
+            );
+        }
     }
 
     #[test]
