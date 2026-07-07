@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X10 方案 A 已落地（heartbeat 真实探测 router）；X7 第一批 transform 覆盖已落地，跟踪清单见 `docs/transform-coverage.md`；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；X7 第一批 transform 覆盖已落地，跟踪清单见 `docs/transform-coverage.md`；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -152,6 +152,7 @@
 
 ### X11 品牌图标体积豁免登记
 
+- **状态（2026-07-07）**：**已完成**。`docs/server-desktop-ui-parity-plan.md` 第 8.4 节登记当前实测缺失的 24 个 desktop 图标资产、文件大小和豁免理由；`mcp.svg` 标记为 MCP excluded 功能资产，其他品牌图标维持 `iconInference` 回退并暂不进入 embedded 首包。
 - **现状证据**：desktop `src/icons/extracted/` 96 个文件中 26 个未移植，全部为品牌位图（PNG/JPG/WebP，如 byteplus/huoshan/qiniu 等）+ `mcp.svg`（excluded 功能）。对应 provider preset 卡片在 server 上回退到 `iconInference` 首字母图标。
 - **实施细节**：
   1. 在 `docs/server-desktop-ui-parity-plan.md` 的豁免登记处（或本文档附录）列出 26 个文件与豁免理由（embedded 体积门禁 2MB）；
@@ -178,7 +179,7 @@
   → X4（owner 验证流，按方案 A 对齐 desktop）‖ ✅ X7 第一批（transform 用例，75% 门禁）
 ✅ R4-accounts 收敛（X5 硬性前置已满足）→ ✅ X5（Copilot token 交换静态实现）→ X6（Kiro 桥，复用 X5 基建）
   → X7 第二批（streaming 用例）
-  → X8 / X9 / X10 / X11（收尾，可穿插并行）
+  → X8 / X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
 ```
 
 > **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 剩余的存储收敛（42 处直接写）与 `api/types.rs` DTO 就近化随 X 系列功能 PR 摊销，accounts 域已完成并解除 X5 前置。
@@ -206,3 +207,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | R4-accounts 完成：state 外 accounts 写路径清零并降 `pub(crate)`，X5 的 accounts 前置解除 |
 | 2026-07-07 | X5 静态实现完成：Copilot managed-account 请求时 token 交换、endpoint 发现、per-account 缓存与 forwarder 接线落地；真实 capability 升级仍待外部账号验收 |
 | 2026-07-07 | X10 方案 A 完成：router heartbeat 改为已签名 pending-edits 空拉真实探测，失败不再伪造在线状态 |
+| 2026-07-07 | X11 完成：登记 24 个品牌图标/MCP excluded 图标体积豁免，保留 `iconInference` 回退 |

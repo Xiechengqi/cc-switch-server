@@ -416,6 +416,37 @@ web-src/  --npm run build-->  web-dist/  --build.rs-->  embedded binary
 
 本地调试覆盖：`--web-dist-dir /path/to/web-dist`
 
+### 8.4 品牌图标豁免登记
+
+以下 desktop `src/icons/extracted/` 资产未同步到 server `web-src/src/icons/extracted/`。除 `mcp.svg` 属 excluded MCP 功能资产外，其余均为长尾供应商品牌位图/专属标志；当前由 `iconInference` 回退显示。为维持 embedded web asset 体积门禁，暂不纳入首包。登记基于 2026-07-07 实测，缺失资产合计约 565KB。
+
+| 文件 | 大小 | 处理 |
+| --- | ---: | --- |
+| `ClaudeApi.png` | 17,658 B | 品牌位图，体积豁免 |
+| `TeamoRouter-icon-dark.png` | 1,744 B | 品牌位图，体积豁免 |
+| `amuxapi-icon.svg` | 329 B | 长尾品牌 SVG，随懒加载图标方案再评估 |
+| `apikeyfun.png` | 1,094 B | 品牌位图，体积豁免 |
+| `apinebula_icon.png` | 6,632 B | 品牌位图，体积豁免 |
+| `atlascloud_icon.png` | 9,604 B | 品牌位图，体积豁免 |
+| `byteplus.png` | 27,347 B | 品牌位图，体积豁免 |
+| `cherryin.png` | 11,327 B | 品牌位图，体积豁免 |
+| `claudecn.png` | 47,341 B | 品牌位图，体积豁免 |
+| `code0.png` | 2,323 B | 品牌位图，体积豁免 |
+| `eflowcode.png` | 63,679 B | 品牌位图，体积豁免 |
+| `etok.png` | 42,576 B | 品牌位图，体积豁免 |
+| `fenno-icon.webp` | 33,198 B | 品牌位图，体积豁免 |
+| `huoshan.png` | 35,396 B | 品牌位图，体积豁免 |
+| `mcp.svg` | 978 B | MCP excluded 功能资产，永久跳过 |
+| `nekocode-icon.png` | 2,852 B | 品牌位图，体积豁免 |
+| `pateway.jpg` | 7,283 B | 品牌位图，体积豁免 |
+| `pipellm.png` | 1,969 B | 品牌位图，体积豁免 |
+| `qiniu.png` | 70,218 B | 品牌位图，体积豁免 |
+| `relaxcode.png` | 41,716 B | 品牌位图，体积豁免 |
+| `runapi.jpg` | 9,544 B | 品牌位图，体积豁免 |
+| `shengsuanyun.svg` | 52,411 B | 长尾品牌 SVG，体积豁免 |
+| `sudocode.png` | 37,023 B | 品牌位图，体积豁免 |
+| `zetaapi-icon.png` | 40,569 B | 品牌位图，体积豁免 |
+
 ---
 
 ## 九、同步与漂移控制
@@ -523,3 +554,4 @@ node scripts/sync/sync-desktop-ui.mjs --check
 | 日期 | 变更 |
 | --- | --- |
 | 2026-07-05 | 初版：确认 2MB 体积预算、Settings 收纳 server 能力、定义 Phase U12 完整任务分解；记录 U12.0 已完成项 |
+| 2026-07-07 | 登记 24 个未同步品牌图标/MCP excluded 图标的体积豁免清单，维持 embedded 体积门禁 |
