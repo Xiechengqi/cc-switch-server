@@ -55,6 +55,9 @@ fi
 echo "== transform coverage audit =="
 node scripts/audit/audit-transform-coverage.mjs --check
 
+echo "== css transition layer audit =="
+node scripts/audit/audit-css-transition-layer.mjs --check
+
 echo "== upstream scan =="
 node scripts/sync/scan-upstream-changes.mjs --fail-on-must-review
 

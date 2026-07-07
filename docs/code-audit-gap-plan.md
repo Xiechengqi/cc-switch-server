@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X8 第一批 CSS 过渡层削减已落地（5817→2660 行，新增 3000 行门禁）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -122,11 +122,12 @@
 
 ### X8 `styles.css` 过渡层削减收口
 
+- **状态（2026-07-07）**：**第一批已完成**。新增 `scripts/audit/audit-css-transition-layer.mjs` 并纳入 `scripts/static-checks.sh`；按源码 class 引用面机械删除零引用规则和零引用 selector 分支，`web-src/src/styles.css` 从 5817 行降到 2660 行，构建 CSS 资产约 173KB 降到约 126KB；默认门禁 `CC_SWITCH_STYLES_MAX_LINES=3000` 防止过渡层回涨。剩余 29 个零引用 class 多为状态/派生选择器和混合规则残留，后续需结合页面截图或组件内迁移继续收口，目标 <500 行暂未达到。
 - **现状证据**：`web-src/src/styles.css` 5817 行 server 自建过渡样式仍被 `main.tsx:13` 引入，与 desktop 同源 `index.css` 双设计系统并存。组件已 203/217 字节级同源，过渡 class 的实际引用面应已大幅缩小。
 - **实施细节**：
-  1. 写一次性审计（可并入 `scripts/`）：提取 `styles.css` 全部 class 名，grep `web-src/src` 统计仍被引用的 class 集合；
-  2. 删除零引用 block；仍被引用的按归属页面迁移到组件内 tailwind class 或确认为 login/setup 最小集（`ClientWebLoginPage`/`LoginPanel` 为 server-local 组件，允许保留专属样式）；
-  3. 目标态：`styles.css` 只剩 login/setup 与 server-only 组件的最小集（建议 <500 行），并在 `static-checks.sh` 加行数上限门禁防回涨。
+  1. ✅ 写入审计脚本：提取 `styles.css` 全部 class 名，grep `web-src/src` 统计仍被引用的 class 集合；
+  2. ✅ 第一批删除零引用 block / selector 分支；仍被引用或混合派生的规则保留，避免无截图情况下误删；
+  3. ✅ `static-checks.sh` 增加行数上限门禁防回涨；目标态仍是 `styles.css` 只剩 login/setup 与 server-only 组件的最小集（建议 <500 行），后续需按页面继续迁移。
 - **验收标准**：typecheck/build 通过；人工 checklist 抽查 providers/shares/settings 三页无样式回归；行数门禁生效。
 - **工作量**：M（随页面分批）。**依赖**：无；与 X1 后的任意时间并行。
 
@@ -180,7 +181,7 @@
 ✅ X2（Ollama reasoning effort clamp 已完成）
   → X4（owner 验证流，按方案 A 对齐 desktop）‖ ✅ X7 第一批（transform 用例，75% 门禁）→ ✅ X7 第二批（streaming 用例，78% 门禁）
 ✅ R4-accounts 收敛（X5 硬性前置已满足）→ ✅ X5（Copilot token 交换静态实现）→ X6（Kiro 桥，复用 X5 基建）
-  → X8 / ✅ X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
+  → X8 第一批 ✅ / ✅ X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
 ```
 
 > **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 剩余的存储收敛（42 处直接写）与 `api/types.rs` DTO 就近化随 X 系列功能 PR 摊销，accounts 域已完成并解除 X5 前置。
@@ -211,3 +212,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | X11 完成：登记 24 个品牌图标/MCP excluded 图标体积豁免，保留 `iconInference` 回退 |
 | 2026-07-07 | X9 完成：补齐 router runtime-refresh 通知、client-tunnel 远端状态查询与 stop 释放合同；新增 API 合同测试覆盖请求 shape |
 | 2026-07-07 | X7 第二批完成：补齐 streaming tool-call 双向映射、stream finish_reason 与 SSE CRLF 多帧 fixture，覆盖门禁提升到 78%/198 |
+| 2026-07-07 | X8 第一批完成：机械删除零引用 CSS 过渡层规则，`styles.css` 5817→2660 行，并新增 3000 行静态门禁 |
