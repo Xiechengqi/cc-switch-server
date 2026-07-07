@@ -5639,6 +5639,31 @@ mod tests {
     }
 
     #[test]
+    fn adapter_stream_transform_handles_crlf_multi_frame_sse_chunks() {
+        let adapter = adapter_for(AppKind::Gemini, ProviderType::OpenRouter);
+        let stored = stored_provider(
+            AppKind::Gemini,
+            ProviderType::OpenRouter,
+            json!({"env": {"GOOGLE_GEMINI_BASE_URL": "https://openrouter.ai/api", "GEMINI_API_KEY": "secret"}}),
+        );
+
+        let response = adapter
+            .transform_stream_event(
+                Bytes::from_static(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"he\"},\"finish_reason\":null}]}\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+                ),
+                &stored,
+                ProxyRoute::Gemini,
+            )
+            .unwrap();
+        let text = std::str::from_utf8(&response).unwrap();
+
+        assert!(text.contains(r#""text":"he""#));
+        assert!(text.contains(r#""text":"llo""#));
+        assert!(text.contains(r#""finishReason":"STOP""#));
+    }
+
+    #[test]
     fn adapter_response_transform_preserves_error_shapes() {
         let adapter = adapter_for(AppKind::Claude, ProviderType::Codex);
         let stored = stored_provider(

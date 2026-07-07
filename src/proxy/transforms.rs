@@ -733,15 +733,82 @@ pub fn openai_responses_stream_to_anthropic(input: &Value) -> Vec<StreamFrame> {
                 )]
             })
             .unwrap_or_default(),
+        Some("response.output_item.added") => {
+            let Some(item) = input.get("item") else {
+                return Vec::new();
+            };
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return Vec::new();
+            }
+            let index = input
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            vec![StreamFrame::event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("tool"),
+                        "name": item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                        "input": {}
+                    }
+                }),
+            )]
+        }
+        Some("response.function_call_arguments.delta") => {
+            let index = input
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            input
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(|partial_json| {
+                    vec![StreamFrame::event(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "input_json_delta", "partial_json": partial_json}
+                        }),
+                    )]
+                })
+                .unwrap_or_default()
+        }
+        Some("response.output_item.done") => {
+            let index = input
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            vec![StreamFrame::event(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            )]
+        }
         Some("response.completed") => {
             let mut frames = Vec::new();
+            let response = input.get("response").unwrap_or(input);
             if let Some(usage) = input.pointer("/response/usage") {
                 frames.push(StreamFrame::event(
                     "message_delta",
                     json!({
                         "type": "message_delta",
-                        "delta": {"stop_reason": "end_turn", "stop_sequence": Value::Null},
+                        "delta": {
+                            "stop_reason": openai_status_to_anthropic_stream_stop(response),
+                            "stop_sequence": Value::Null
+                        },
                         "usage": anthropic_usage_from_openai_usage(Some(usage))
+                    }),
+                ));
+            } else if response_output_has_tool_calls(response) {
+                frames.push(StreamFrame::event(
+                    "message_delta",
+                    json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "tool_use", "stop_sequence": Value::Null}
                     }),
                 ));
             }
@@ -945,6 +1012,35 @@ pub fn openai_chat_stream_to_anthropic(input: &Value) -> Vec<StreamFrame> {
             }),
         )];
     }
+    if let Some(tool_calls) = choice
+        .pointer("/delta/tool_calls")
+        .and_then(Value::as_array)
+    {
+        let mut frames = Vec::new();
+        for tool_call in tool_calls {
+            if tool_call.get("id").is_some() || tool_call.pointer("/function/name").is_some() {
+                frames.push(openai_chat_tool_delta_to_anthropic_start(tool_call));
+            }
+            if let Some(arguments) = tool_call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .filter(|arguments| !arguments.is_empty())
+            {
+                let index = tool_call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                frames.push(StreamFrame::event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": arguments}
+                    }),
+                ));
+            }
+        }
+        if !frames.is_empty() {
+            return frames;
+        }
+    }
     if choice.get("finish_reason").is_some() {
         return vec![StreamFrame::event(
             "message_stop",
@@ -960,7 +1056,7 @@ pub fn gemini_stream_to_anthropic(input: &Value) -> Vec<StreamFrame> {
         .pointer("/candidates/0/content/parts")
         .and_then(Value::as_array)
     {
-        for part in parts {
+        for (index, part) in parts.iter().enumerate() {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 frames.push(StreamFrame::event(
                     "content_block_delta",
@@ -969,6 +1065,15 @@ pub fn gemini_stream_to_anthropic(input: &Value) -> Vec<StreamFrame> {
                         "index": 0,
                         "delta": {"type": "text_delta", "text": text}
                     }),
+                ));
+            }
+            if let Some(function_call) = part
+                .get("functionCall")
+                .or_else(|| part.get("function_call"))
+            {
+                frames.extend(gemini_function_call_to_anthropic_frames(
+                    function_call,
+                    index as u64,
                 ));
             }
         }
@@ -988,6 +1093,24 @@ pub fn gemini_stream_to_anthropic(input: &Value) -> Vec<StreamFrame> {
 
 pub fn anthropic_stream_to_openai_responses(input: &Value) -> Vec<StreamFrame> {
     match input.get("type").and_then(Value::as_str) {
+        Some("content_block_start") => {
+            let Some(block) = input.get("content_block") else {
+                return Vec::new();
+            };
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                return Vec::new();
+            }
+            vec![StreamFrame::json(json!({
+                "type": "response.output_item.added",
+                "output_index": input.get("index").cloned().unwrap_or_else(|| json!(0)),
+                "item": {
+                    "type": "function_call",
+                    "call_id": block.get("id").and_then(Value::as_str).unwrap_or("tool"),
+                    "name": block.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                    "arguments": ""
+                }
+            }))]
+        }
         Some("content_block_delta") => input
             .pointer("/delta/text")
             .and_then(Value::as_str)
@@ -997,7 +1120,23 @@ pub fn anthropic_stream_to_openai_responses(input: &Value) -> Vec<StreamFrame> {
                     "delta": text
                 }))]
             })
+            .or_else(|| {
+                input
+                    .pointer("/delta/partial_json")
+                    .and_then(Value::as_str)
+                    .map(|partial_json| {
+                        vec![StreamFrame::json(json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": input.get("index").cloned().unwrap_or_else(|| json!(0)),
+                            "delta": partial_json
+                        }))]
+                    })
+            })
             .unwrap_or_default(),
+        Some("content_block_stop") => vec![StreamFrame::json(json!({
+            "type": "response.output_item.done",
+            "output_index": input.get("index").cloned().unwrap_or_else(|| json!(0))
+        }))],
         Some("message_delta") => {
             let usage = input
                 .get("usage")
@@ -1014,6 +1153,31 @@ pub fn anthropic_stream_to_openai_responses(input: &Value) -> Vec<StreamFrame> {
 
 pub fn anthropic_stream_to_openai_chat(input: &Value) -> Vec<StreamFrame> {
     match input.get("type").and_then(Value::as_str) {
+        Some("content_block_start") => {
+            let Some(block) = input.get("content_block") else {
+                return Vec::new();
+            };
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                return Vec::new();
+            }
+            vec![StreamFrame::json(json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": input.get("index").cloned().unwrap_or_else(|| json!(0)),
+                            "id": block.get("id").and_then(Value::as_str).unwrap_or("tool"),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                                "arguments": ""
+                            }
+                        }]
+                    },
+                    "finish_reason": Value::Null
+                }]
+            }))]
+        }
         Some("content_block_delta") => input
             .pointer("/delta/text")
             .and_then(Value::as_str)
@@ -1022,16 +1186,45 @@ pub fn anthropic_stream_to_openai_chat(input: &Value) -> Vec<StreamFrame> {
                     "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": Value::Null}]
                 }))]
             })
-            .unwrap_or_default(),
-        Some("message_delta") => input
-            .get("usage")
-            .map(|usage| {
-                vec![StreamFrame::json(json!({
-                    "choices": [],
-                    "usage": openai_usage_from_anthropic_usage(Some(usage))
-                }))]
+            .or_else(|| {
+                input
+                    .pointer("/delta/partial_json")
+                    .and_then(Value::as_str)
+                    .map(|partial_json| {
+                        vec![StreamFrame::json(json!({
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": input.get("index").cloned().unwrap_or_else(|| json!(0)),
+                                        "function": {"arguments": partial_json}
+                                    }]
+                                },
+                                "finish_reason": Value::Null
+                            }]
+                        }))]
+                    })
             })
             .unwrap_or_default(),
+        Some("message_delta") => {
+            let mut frames = Vec::new();
+            if let Some(reason) = input.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                frames.push(StreamFrame::json(json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": anthropic_stop_reason_to_openai(Some(reason))
+                    }]
+                })));
+            }
+            if let Some(usage) = input.get("usage") {
+                frames.push(StreamFrame::json(json!({
+                    "choices": [],
+                    "usage": openai_usage_from_anthropic_usage(Some(usage))
+                })));
+            }
+            frames
+        }
         Some("message_stop") => vec![
             StreamFrame::json(json!({
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
@@ -2374,6 +2567,14 @@ fn openai_status_to_anthropic_stop(status: Option<&str>) -> &'static str {
     }
 }
 
+fn openai_status_to_anthropic_stream_stop(response: &Value) -> &'static str {
+    if response_output_has_tool_calls(response) {
+        "tool_use"
+    } else {
+        openai_status_to_anthropic_stop(response.get("status").and_then(Value::as_str))
+    }
+}
+
 fn openai_finish_reason_to_gemini(reason: &str) -> &'static str {
     match reason {
         "length" => "MAX_TOKENS",
@@ -2403,6 +2604,58 @@ fn anthropic_stop_reason_to_gemini(reason: Option<&str>) -> &'static str {
         Some("max_tokens") => "MAX_TOKENS",
         _ => "STOP",
     }
+}
+
+fn openai_chat_tool_delta_to_anthropic_start(tool_call: &Value) -> StreamFrame {
+    let index = tool_call.get("index").and_then(Value::as_u64).unwrap_or(0);
+    StreamFrame::event(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {
+                "type": "tool_use",
+                "id": tool_call.get("id").and_then(Value::as_str).unwrap_or("tool"),
+                "name": tool_call.pointer("/function/name").and_then(Value::as_str).unwrap_or("tool"),
+                "input": {}
+            }
+        }),
+    )
+}
+
+fn gemini_function_call_to_anthropic_frames(function_call: &Value, index: u64) -> Vec<StreamFrame> {
+    let mut frames = vec![StreamFrame::event(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {
+                "type": "tool_use",
+                "id": function_call.get("id").and_then(Value::as_str).unwrap_or("tool"),
+                "name": function_call.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                "input": {}
+            }
+        }),
+    )];
+    if let Some(args) = function_call
+        .get("args")
+        .or_else(|| function_call.get("arguments"))
+    {
+        if !args.is_null() {
+            frames.push(StreamFrame::event(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string())
+                    }
+                }),
+            ));
+        }
+    }
+    frames
 }
 
 fn anthropic_usage_from_openai_usage(usage: Option<&Value>) -> Value {
@@ -3498,6 +3751,353 @@ mod tests {
                     }
                 }))
             ]
+        );
+    }
+
+    #[test]
+    fn streaming_tool_call_deltas_map_to_anthropic_tool_use_events() {
+        let start_frames = openai_chat_stream_to_anthropic(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 1,
+                        "id": "call_weather",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": ""}
+                    }]
+                },
+                "finish_reason": Value::Null
+            }]
+        }));
+        assert_eq!(
+            start_frames,
+            vec![StreamFrame::event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "call_weather",
+                        "name": "get_weather",
+                        "input": {}
+                    }
+                })
+            )]
+        );
+
+        let argument_frames = openai_chat_stream_to_anthropic(&json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 1,
+                        "function": {"arguments": "{\"city\":\"SF\"}"}
+                    }]
+                },
+                "finish_reason": Value::Null
+            }]
+        }));
+        assert_eq!(
+            argument_frames,
+            vec![StreamFrame::event(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": "{\"city\":\"SF\"}"
+                    }
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn responses_streaming_function_call_maps_to_anthropic_tool_events() {
+        let start = openai_responses_stream_to_anthropic(&json!({
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_lookup",
+                "name": "lookup"
+            }
+        }));
+        assert_eq!(
+            start,
+            vec![StreamFrame::event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 2,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "call_lookup",
+                        "name": "lookup",
+                        "input": {}
+                    }
+                })
+            )]
+        );
+
+        let delta = openai_responses_stream_to_anthropic(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 2,
+            "delta": "{\"query\":\"server\"}"
+        }));
+        assert_eq!(
+            delta,
+            vec![StreamFrame::event(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 2,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": "{\"query\":\"server\"}"
+                    }
+                })
+            )]
+        );
+
+        let completed = openai_responses_stream_to_anthropic(&json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_lookup",
+                    "name": "lookup",
+                    "arguments": "{\"query\":\"server\"}"
+                }]
+            }
+        }));
+        assert_eq!(
+            completed,
+            vec![
+                StreamFrame::event(
+                    "message_delta",
+                    json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "tool_use", "stop_sequence": Value::Null}
+                    })
+                ),
+                StreamFrame::event("message_stop", json!({"type": "message_stop"}))
+            ]
+        );
+    }
+
+    #[test]
+    fn gemini_streaming_function_call_maps_to_anthropic_tool_events() {
+        let frames = gemini_stream_to_anthropic(&json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "id": "call_gemini",
+                            "name": "lookup",
+                            "args": {"query": "server"}
+                        }
+                    }]
+                }
+            }]
+        }));
+        assert_eq!(
+            frames,
+            vec![
+                StreamFrame::event(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "call_gemini",
+                            "name": "lookup",
+                            "input": {}
+                        }
+                    })
+                ),
+                StreamFrame::event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": "{\"query\":\"server\"}"
+                        }
+                    })
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn anthropic_streaming_tool_use_maps_to_openai_chat_tool_call_deltas() {
+        let start = anthropic_stream_to_openai_chat(&json!({
+            "type": "content_block_start",
+            "index": 3,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_anthropic",
+                "name": "lookup",
+                "input": {}
+            }
+        }));
+        assert_eq!(
+            start,
+            vec![StreamFrame::json(json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 3,
+                            "id": "call_anthropic",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": ""}
+                        }]
+                    },
+                    "finish_reason": Value::Null
+                }]
+            }))]
+        );
+
+        let delta = anthropic_stream_to_openai_chat(&json!({
+            "type": "content_block_delta",
+            "index": 3,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"query\":\"server\"}"
+            }
+        }));
+        assert_eq!(
+            delta,
+            vec![StreamFrame::json(json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 3,
+                            "function": {"arguments": "{\"query\":\"server\"}"}
+                        }]
+                    },
+                    "finish_reason": Value::Null
+                }]
+            }))]
+        );
+    }
+
+    #[test]
+    fn anthropic_streaming_tool_use_maps_to_openai_responses_events() {
+        let start = anthropic_stream_to_openai_responses(&json!({
+            "type": "content_block_start",
+            "index": 4,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_response",
+                "name": "lookup",
+                "input": {}
+            }
+        }));
+        assert_eq!(
+            start,
+            vec![StreamFrame::json(json!({
+                "type": "response.output_item.added",
+                "output_index": 4,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_response",
+                    "name": "lookup",
+                    "arguments": ""
+                }
+            }))]
+        );
+
+        let delta = anthropic_stream_to_openai_responses(&json!({
+            "type": "content_block_delta",
+            "index": 4,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"query\":\"server\"}"
+            }
+        }));
+        assert_eq!(
+            delta,
+            vec![StreamFrame::json(json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 4,
+                "delta": "{\"query\":\"server\"}"
+            }))]
+        );
+
+        let stop = anthropic_stream_to_openai_responses(&json!({
+            "type": "content_block_stop",
+            "index": 4
+        }));
+        assert_eq!(
+            stop,
+            vec![StreamFrame::json(json!({
+                "type": "response.output_item.done",
+                "output_index": 4
+            }))]
+        );
+    }
+
+    #[test]
+    fn anthropic_streaming_tool_stop_maps_to_openai_finish_reasons() {
+        let chat = anthropic_stream_to_openai_chat(&json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": Value::Null}
+        }));
+        assert_eq!(
+            chat,
+            vec![StreamFrame::json(json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }]
+            }))]
+        );
+    }
+
+    #[test]
+    fn stream_finish_reason_matrix_maps_to_downstream_protocols() {
+        let chat_to_gemini = openai_chat_stream_to_gemini(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+        }));
+        assert_eq!(
+            chat_to_gemini,
+            vec![StreamFrame::json(json!({
+                "candidates": [{"finishReason": "MAX_TOKENS"}]
+            }))]
+        );
+
+        let responses_to_chat = openai_responses_stream_to_chat(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_tool",
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [{"type": "function_call", "call_id": "call_1", "name": "lookup"}]
+            }
+        }));
+        assert_eq!(
+            responses_to_chat[0],
+            StreamFrame::json(json!({
+                "id": "chatcmpl_tool",
+                "object": "chat.completion.chunk",
+                "model": "gpt-5.5",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }]
+            }))
         );
     }
 }

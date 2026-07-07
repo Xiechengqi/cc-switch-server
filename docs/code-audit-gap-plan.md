@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；X7 第一批 transform 覆盖已落地，跟踪清单见 `docs/transform-coverage.md`；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -106,6 +106,7 @@
 
 ### X7 transform/streaming 黄金用例补齐
 
+- **状态（2026-07-07）**：**第二批已完成**。第一批覆盖 request/response transform 与 stop_reason 基础矩阵；第二批补齐 OpenAI Chat/Responses/Gemini/Anthropic streaming tool-call delta 双向映射、关键 stream finish_reason 映射、SSE CRLF 多帧 chunk 解析；`audit-transform-coverage.mjs` 默认门禁从 75%/190 提升到 78%/198。半帧跨 chunk 重组仍需 forwarder/adapter 有状态缓冲设计，继续保留为后续架构项。
 - **现状证据**：desktop transform 系列 203 个测试（`transform.rs` 59 / `transform_codex_chat.rs` 57 / `transform_responses.rs` 61 / `transform_gemini.rs` 26）+ streaming 系列 52 个（12/17/9/14）；server in-module 仅 `transforms.rs` 11 + `streaming.rs` 11 + `adapters.rs` 64（另有 fixture 宏批量用例）。**流式 tool-call 增量重组、parallel tool calls、stop_reason 映射矩阵、图片块、SSE 边界切割**等 desktop 高价值回归用例在 server 侧覆盖明显偏薄——这是转发正确性的主要风险面。
 - **实施细节**：
   1. 以 desktop 四个 transform 文件 + 四个 streaming 文件的 `#[test]` 清单为源，逐个映射到 server `transforms.rs`/`streaming.rs`/`adapters.rs` 的对应入口，输出「已覆盖 / 需移植 / 不适用（desktop-only 语义）」三列清单，落到本文档附录或 `docs/` 下独立清单；
@@ -177,9 +178,8 @@
 ✅ X1 → X3（已完成）
 ✅ Phase R 结构重构（R1–R7 已完成并关闭，提交 65721b8）
 ✅ X2（Ollama reasoning effort clamp 已完成）
-  → X4（owner 验证流，按方案 A 对齐 desktop）‖ ✅ X7 第一批（transform 用例，75% 门禁）
+  → X4（owner 验证流，按方案 A 对齐 desktop）‖ ✅ X7 第一批（transform 用例，75% 门禁）→ ✅ X7 第二批（streaming 用例，78% 门禁）
 ✅ R4-accounts 收敛（X5 硬性前置已满足）→ ✅ X5（Copilot token 交换静态实现）→ X6（Kiro 桥，复用 X5 基建）
-  → X7 第二批（streaming 用例）
   → X8 / ✅ X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
 ```
 
@@ -210,3 +210,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | X10 方案 A 完成：router heartbeat 改为已签名 pending-edits 空拉真实探测，失败不再伪造在线状态 |
 | 2026-07-07 | X11 完成：登记 24 个品牌图标/MCP excluded 图标体积豁免，保留 `iconInference` 回退 |
 | 2026-07-07 | X9 完成：补齐 router runtime-refresh 通知、client-tunnel 远端状态查询与 stop 释放合同；新增 API 合同测试覆盖请求 shape |
+| 2026-07-07 | X7 第二批完成：补齐 streaming tool-call 双向映射、stream finish_reason 与 SSE CRLF 多帧 fixture，覆盖门禁提升到 78%/198 |
