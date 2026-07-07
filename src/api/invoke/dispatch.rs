@@ -876,74 +876,77 @@ async fn web_invoke_dispatch(
             let app = web_arg_app_type(&args)?;
             let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
             let providers = state.providers.read().await.clone();
-            let config = {
-                let mut failover = state.failover.write().await;
-                let mut queue = failover
-                    .apps
-                    .get(&app)
-                    .map(|config| config.provider_queue.clone())
-                    .unwrap_or_default();
-                if !queue.iter().any(|id| id == &provider_id) {
-                    queue.push(provider_id);
-                }
-                failover.update_app_config(
-                    app,
-                    UpdateFailoverAppInput {
-                        provider_queue: Some(queue),
-                        ..Default::default()
-                    },
-                    &providers,
-                )
-            };
-            state.save_failover().await.map_err(ApiError::internal)?;
+            let config = state
+                .mutate_failover_immediate(|failover| {
+                    let mut queue = failover
+                        .apps
+                        .get(&app)
+                        .map(|config| config.provider_queue.clone())
+                        .unwrap_or_default();
+                    if !queue.iter().any(|id| id == &provider_id) {
+                        queue.push(provider_id);
+                    }
+                    failover.update_app_config(
+                        app,
+                        UpdateFailoverAppInput {
+                            provider_queue: Some(queue),
+                            ..Default::default()
+                        },
+                        &providers,
+                    )
+                })
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(config.enabled))
         }
         "remove_from_failover_queue" => {
             let app = web_arg_app_type(&args)?;
             let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
             let providers = state.providers.read().await.clone();
-            let config = {
-                let mut failover = state.failover.write().await;
-                let queue = failover
-                    .apps
-                    .get(&app)
-                    .map(|config| {
-                        config
-                            .provider_queue
-                            .iter()
-                            .filter(|id| **id != provider_id)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                failover.update_app_config(
-                    app,
-                    UpdateFailoverAppInput {
-                        provider_queue: Some(queue),
-                        ..Default::default()
-                    },
-                    &providers,
-                )
-            };
-            state.save_failover().await.map_err(ApiError::internal)?;
+            let config = state
+                .mutate_failover_immediate(|failover| {
+                    let queue = failover
+                        .apps
+                        .get(&app)
+                        .map(|config| {
+                            config
+                                .provider_queue
+                                .iter()
+                                .filter(|id| **id != provider_id)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    failover.update_app_config(
+                        app,
+                        UpdateFailoverAppInput {
+                            provider_queue: Some(queue),
+                            ..Default::default()
+                        },
+                        &providers,
+                    )
+                })
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(config.enabled))
         }
         "set_auto_failover_enabled" => {
             let app = web_arg_app_type(&args)?;
             let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
             let providers = state.providers.read().await.clone();
-            let config = {
-                let mut failover = state.failover.write().await;
-                failover.update_app_config(
-                    app,
-                    UpdateFailoverAppInput {
-                        enabled: Some(enabled),
-                        ..Default::default()
-                    },
-                    &providers,
-                )
-            };
-            state.save_failover().await.map_err(ApiError::internal)?;
+            let config = state
+                .mutate_failover_immediate(|failover| {
+                    failover.update_app_config(
+                        app,
+                        UpdateFailoverAppInput {
+                            enabled: Some(enabled),
+                            ..Default::default()
+                        },
+                        &providers,
+                    )
+                })
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(config.enabled))
         }
         "get_circuit_breaker_config" => {
@@ -967,19 +970,21 @@ async fn web_invoke_dispatch(
                 .and_then(Value::as_u64)
                 .map(|value| value as u32);
             let timeout_seconds = config.get("timeoutSeconds").and_then(Value::as_u64);
-            let updated = {
-                let mut failover = state.failover.write().await;
-                failover.update_app_config(
-                    app,
-                    UpdateFailoverAppInput {
-                        failure_threshold,
-                        open_duration_ms: timeout_seconds.map(|seconds| (seconds * 1000) as u128),
-                        ..Default::default()
-                    },
-                    &providers,
-                )
-            };
-            state.save_failover().await.map_err(ApiError::internal)?;
+            let updated = state
+                .mutate_failover_immediate(|failover| {
+                    failover.update_app_config(
+                        app,
+                        UpdateFailoverAppInput {
+                            failure_threshold,
+                            open_duration_ms: timeout_seconds
+                                .map(|seconds| (seconds * 1000) as u128),
+                            ..Default::default()
+                        },
+                        &providers,
+                    )
+                })
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!({
                 "failureThreshold": updated.failure_threshold,
                 "successThreshold": 2,
@@ -999,11 +1004,10 @@ async fn web_invoke_dispatch(
         "reset_circuit_breaker" => {
             let app = web_arg_app_type(&args)?;
             let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
-            let breaker = {
-                let mut failover = state.failover.write().await;
-                failover.reset_provider(app, &provider_id)
-            };
-            state.save_failover().await.map_err(ApiError::internal)?;
+            let breaker = state
+                .mutate_failover_immediate(|failover| failover.reset_provider(app, &provider_id))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(web_circuit_breaker_stats_json(Some(&breaker))))
         }
         "delete_db_backup" => {

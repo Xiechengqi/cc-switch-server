@@ -280,11 +280,10 @@ pub(in crate::api) async fn update_failover_app(
 ) -> Result<Json<UpdateFailoverAppResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let providers = state.providers.read().await.clone();
-    let config = {
-        let mut failover = state.failover.write().await;
-        failover.update_app_config(app, input, &providers)
-    };
-    state.save_failover().await.map_err(ApiError::internal)?;
+    let config = state
+        .mutate_failover_immediate(|failover| failover.update_app_config(app, input, &providers))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(UpdateFailoverAppResponse {
         ok: true,
         app,
@@ -300,11 +299,10 @@ pub(in crate::api) async fn reset_failover_provider(
 ) -> Result<Json<ResetFailoverProviderResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let app = resolve_failover_provider_app(&state, &provider_id, query.app).await?;
-    let breaker = {
-        let mut failover = state.failover.write().await;
-        failover.reset_provider(app, &provider_id)
-    };
-    state.save_failover().await.map_err(ApiError::internal)?;
+    let breaker = state
+        .mutate_failover_immediate(|failover| failover.reset_provider(app, &provider_id))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(ResetFailoverProviderResponse { ok: true, breaker }))
 }
 

@@ -51,7 +51,7 @@ pub struct ServerStateInner {
     pub providers: RwLock<ProviderStore>,
     pub(crate) universal_providers: RwLock<UniversalProviderStore>,
     pub(crate) accounts: RwLock<AccountStore>,
-    pub failover: RwLock<FailoverStore>,
+    pub(crate) failover: RwLock<FailoverStore>,
     pub(crate) pricing: RwLock<ModelPricingStore>,
     pub usage: RwLock<UsageStore>,
     pub(crate) shares: RwLock<ShareStore>,
@@ -629,6 +629,48 @@ impl ServerStateInner {
 
     pub async fn save_failover(&self) -> anyhow::Result<()> {
         self.failover.read().await.save(&self.config_dir)
+    }
+
+    pub async fn mutate_failover<R>(&self, mutate: impl FnOnce(&mut FailoverStore) -> R) -> R {
+        let mut failover = self.failover.write().await;
+        mutate(&mut failover)
+    }
+
+    pub async fn mutate_failover_immediate<R>(
+        &self,
+        mutate: impl FnOnce(&mut FailoverStore) -> R,
+    ) -> anyhow::Result<R> {
+        let result = self.mutate_failover(mutate).await;
+        self.save_failover().await?;
+        Ok(result)
+    }
+
+    pub async fn mutate_failover_best_effort_if_changed<R>(
+        &self,
+        persist_context: &'static str,
+        mutate: impl FnOnce(&mut FailoverStore) -> (R, bool),
+    ) -> R {
+        let (result, changed) = self.mutate_failover(mutate).await;
+        if changed {
+            if let Err(error) = self.save_failover().await {
+                tracing::warn!("failed to persist {persist_context}: {error}");
+            }
+        }
+        result
+    }
+
+    pub async fn try_mutate_failover_best_effort_if_changed<R, E>(
+        &self,
+        persist_context: &'static str,
+        mutate: impl FnOnce(&mut FailoverStore) -> Result<(R, bool), E>,
+    ) -> Result<R, E> {
+        let result = self.mutate_failover(mutate).await;
+        if result.as_ref().is_ok_and(|(_, changed)| *changed) {
+            if let Err(error) = self.save_failover().await {
+                tracing::warn!("failed to persist {persist_context}: {error}");
+            }
+        }
+        result.map(|(value, _)| value)
     }
 
     pub async fn save_pricing(&self) -> anyhow::Result<()> {

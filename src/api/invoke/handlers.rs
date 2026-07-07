@@ -85,20 +85,21 @@ pub(in crate::api) async fn web_update_proxy_config_for_app(
     let timeout_seconds = config.get("circuitTimeoutSeconds").and_then(Value::as_u64);
     let auto_enabled = config.get("autoFailoverEnabled").and_then(Value::as_bool);
     let providers = state.providers.read().await.clone();
-    {
-        let mut failover = state.failover.write().await;
-        failover.update_app_config(
-            app,
-            UpdateFailoverAppInput {
-                enabled: auto_enabled,
-                failure_threshold,
-                open_duration_ms: timeout_seconds.map(|seconds| (seconds * 1000) as u128),
-                ..Default::default()
-            },
-            &providers,
-        );
-    }
-    state.save_failover().await.map_err(ApiError::internal)?;
+    state
+        .mutate_failover_immediate(|failover| {
+            failover.update_app_config(
+                app,
+                UpdateFailoverAppInput {
+                    enabled: auto_enabled,
+                    failure_threshold,
+                    open_duration_ms: timeout_seconds.map(|seconds| (seconds * 1000) as u128),
+                    ..Default::default()
+                },
+                &providers,
+            );
+        })
+        .await
+        .map_err(ApiError::internal)?;
     Ok(json!(true))
 }
 

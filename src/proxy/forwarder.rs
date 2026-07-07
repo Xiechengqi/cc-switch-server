@@ -57,15 +57,14 @@ pub async fn forward(
         let (stored, _share_name) = select_share_provider(&providers, &shares, app, share_id)?;
         stored
     } else {
-        let mut failover = state.failover.write().await;
-        let selected = select_provider(&providers, &mut failover, app, &headers)?;
-        if selected.failover_state_changed {
-            drop(failover);
-            if let Err(error) = state.save_failover().await {
-                tracing::warn!("failed to persist failover selection state: {error}");
-            }
-        }
-        selected.provider
+        state
+            .try_mutate_failover_best_effort_if_changed("failover selection state", |failover| {
+                select_provider(&providers, failover, app, &headers).map(|selected| {
+                    let changed = selected.failover_state_changed;
+                    (selected.provider, changed)
+                })
+            })
+            .await?
     };
     drop(providers);
     let started = Instant::now();
@@ -457,15 +456,17 @@ pub(super) async fn record_provider_outcome(
     stored: &StoredProvider,
     outcome: ProviderOutcome,
 ) {
-    let updated = {
-        let mut failover = state.failover.write().await;
-        failover.record_outcome(stored.app, &stored.provider.id, outcome, current_time_ms())
-    };
-    if updated {
-        if let Err(error) = state.save_failover().await {
-            tracing::warn!("failed to persist failover breaker state: {error}");
-        }
-    }
+    state
+        .mutate_failover_best_effort_if_changed("failover breaker state", |failover| {
+            let updated = failover.record_outcome(
+                stored.app,
+                &stored.provider.id,
+                outcome,
+                current_time_ms(),
+            );
+            ((), updated)
+        })
+        .await;
 }
 
 fn share_usage_tokens(usage: TokenUsage) -> u64 {
