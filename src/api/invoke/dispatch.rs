@@ -189,11 +189,14 @@ async fn web_invoke_dispatch(
         "import_default_config" => {
             let app = web_arg_app(&args).or_else(|_| web_arg_app_type(&args))?;
             let ui_settings = state.ui_settings.read().await.for_frontend();
-            let imported = {
-                let mut providers = state.providers.write().await;
-                live_import::import_default_config(&mut providers, app, &ui_settings)
-                    .map_err(|error| ApiError::bad_request(error.to_string()))?
-            };
+            let imported = state
+                .try_mutate_providers_immediate_if_changed(|providers| {
+                    let imported = live_import::import_default_config(providers, app, &ui_settings)
+                        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                    Ok((imported, imported))
+                })
+                .await
+                .map_err(ApiError::internal)??;
             if imported {
                 {
                     let mut ui_store = state.ui_settings.write().await;
@@ -212,37 +215,38 @@ async fn web_invoke_dispatch(
             if provider.name.trim().is_empty() {
                 return Err(ApiError::bad_request("provider name is required"));
             }
-            state.providers.write().await.upsert(app, provider);
-            state.save_providers().await.map_err(ApiError::internal)?;
+            state
+                .mutate_providers_immediate(|providers| providers.upsert(app, provider))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(true))
         }
         "update_providers_sort_order" => {
             let app = web_arg_app(&args)?;
             let updates: Vec<ProviderSortUpdate> = web_arg_value(&args, "updates")?;
-            let changed = state
-                .providers
-                .write()
+            let _changed = state
+                .mutate_providers_immediate_if_changed(|providers| {
+                    let changed = providers.update_sort_order(app, updates);
+                    (changed, changed)
+                })
                 .await
-                .update_sort_order(app, updates);
-            if changed {
-                state.save_providers().await.map_err(ApiError::internal)?;
-            }
+                .map_err(ApiError::internal)?;
             Ok(json!(true))
         }
         "delete_provider" => {
             let app = web_arg_app(&args)?;
             let id = web_arg_string(&args, "id")?;
-            let deleted = {
-                let mut providers = state.providers.write().await;
-                let before = providers.providers.len();
-                providers
-                    .providers
-                    .retain(|provider| !(provider.app == app && provider.provider.id == id));
-                providers.providers.len() != before
-            };
-            if deleted {
-                state.save_providers().await.map_err(ApiError::internal)?;
-            }
+            let deleted = state
+                .mutate_providers_immediate_if_changed(|providers| {
+                    let before = providers.providers.len();
+                    providers
+                        .providers
+                        .retain(|provider| !(provider.app == app && provider.provider.id == id));
+                    let deleted = providers.providers.len() != before;
+                    (deleted, deleted)
+                })
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(deleted))
         }
         "switch_provider" => {

@@ -31,6 +31,20 @@ use cc_switch_server::domain::providers::model::{
 use cc_switch_server::domain::sharing::shares::{ShareBinding, UpsertShareInput};
 use cc_switch_server::state::{ServerState, ServerStateInner};
 
+async fn upsert_test_provider(state: &ServerState, app: AppKind, provider: Provider) {
+    state
+        .mutate_providers(|providers| {
+            providers.upsert(app, provider);
+        })
+        .await;
+}
+
+async fn providers_snapshot(
+    state: &ServerState,
+) -> cc_switch_server::domain::providers::store::ProviderStore {
+    state.mutate_providers(|providers| providers.clone()).await
+}
+
 #[tokio::test]
 async fn share_router_health_is_hidden_without_probe_header() {
     let state = test_state();
@@ -76,7 +90,8 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
             private_key: "private-key".to_string(),
             control_secret: Some("control-secret".to_string()),
         });
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "p-ctl".to_string(),
@@ -86,7 +101,8 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
             meta: None,
             extra: Default::default(),
         },
-    );
+    )
+    .await;
     state
         .mutate_shares_immediate(|store| {
             store.upsert(test_share_input("share-ctl", "p-ctl", ProviderType::Codex));
@@ -145,7 +161,8 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
 #[tokio::test]
 async fn control_refresh_share_usage_reports_bound_account_snapshot() {
     let state = test_state();
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "p-refresh".to_string(),
@@ -163,7 +180,8 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
             }),
             extra: Default::default(),
         },
-    );
+    )
+    .await;
     state
         .mutate_accounts_immediate(|accounts| {
             accounts.upsert(UpsertAccountInput {
@@ -214,7 +232,7 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
         .mutate_shares_immediate(|store| store.upsert(share))
         .await
         .unwrap();
-    let providers = state.providers.read().await.clone();
+    let providers = providers_snapshot(&state).await;
 
     let refreshed = refresh_share_usage_items(&state, &share, Some("codex"), &providers).await;
 
@@ -510,7 +528,8 @@ async fn provider_network_test_reports_redacted_upstream_4xx_body() {
         .unwrap()
         .to_string();
 
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "codex-network-test".to_string(),
@@ -528,7 +547,8 @@ async fn provider_network_test_reports_redacted_upstream_4xx_body() {
             meta: None,
             extra: Default::default(),
         },
-    );
+    )
+    .await;
 
     let response = app
         .oneshot(json_request(
@@ -578,7 +598,8 @@ async fn provider_network_test_covers_4xx_5xx_and_empty_bodies() {
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
 
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "codex-provider-test".to_string(),
@@ -593,7 +614,8 @@ async fn provider_network_test_covers_4xx_5xx_and_empty_bodies() {
             meta: None,
             extra: Default::default(),
         },
-    );
+    )
+    .await;
 
     let response = app
         .oneshot(json_request(
@@ -633,7 +655,8 @@ async fn provider_network_test_timeout_is_configurable_and_redacted() {
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
 
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "codex-provider-timeout".to_string(),
@@ -648,7 +671,8 @@ async fn provider_network_test_timeout_is_configurable_and_redacted() {
             meta: None,
             extra: Default::default(),
         },
-    );
+    )
+    .await;
 
     let response = app
         .oneshot(json_request(
@@ -690,7 +714,8 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
 
     let state = test_state();
     let app = app_router(state.clone());
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "codex-proxy-error".to_string(),
@@ -705,7 +730,8 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
             meta: None,
             extra: Default::default(),
         },
-    );
+    )
+    .await;
 
     let response = app
         .oneshot(json_request(
@@ -771,7 +797,8 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
 
     let state = test_state();
     let app = app_router(state.clone());
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "copilot-managed".to_string(),
@@ -789,7 +816,8 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
             }),
             extra: Default::default(),
         },
-    );
+    )
+    .await;
     state
         .mutate_accounts_immediate(|accounts| {
             accounts.upsert(UpsertAccountInput {
@@ -872,7 +900,8 @@ async fn non_stream_proxy_timeout_records_bad_gateway() {
 
     let state = test_state();
     let app = app_router(state.clone());
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "codex-proxy-timeout".to_string(),
@@ -888,7 +917,8 @@ async fn non_stream_proxy_timeout_records_bad_gateway() {
             meta: None,
             extra: Default::default(),
         },
-    );
+    )
+    .await;
 
     let response = app
         .oneshot(json_request(
@@ -910,7 +940,8 @@ async fn stream_proxy_marks_upstream_chunk_error() {
     let upstream_addr = spawn_broken_chunked_upstream().await;
     let state = test_state();
     let app = app_router(state.clone());
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "codex-stream-error".to_string(),
@@ -925,7 +956,8 @@ async fn stream_proxy_marks_upstream_chunk_error() {
             meta: None,
             extra: Default::default(),
         },
-    );
+    )
+    .await;
 
     let response = app
         .oneshot(json_request(
@@ -1617,7 +1649,8 @@ async fn web_invoke_registry_returns_stable_errors() {
 #[tokio::test]
 async fn web_invoke_get_providers_returns_desktop_record_shape() {
     let state = test_state();
-    state.providers.write().await.upsert(
+    upsert_test_provider(
+        &state,
         AppKind::Codex,
         Provider {
             id: "codex-web".to_string(),
@@ -1627,7 +1660,8 @@ async fn web_invoke_get_providers_returns_desktop_record_shape() {
             meta: None,
             extra: Default::default(),
         },
-    );
+    )
+    .await;
     let app = app_router(state);
     let token = setup_and_login(&app).await;
 

@@ -185,7 +185,7 @@
   → X8 第一批 ✅ / ✅ X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
 ```
 
-> **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 剩余的存储收敛（22 处直接写）与 `api/types.rs` DTO 就近化随 X 系列功能 PR 摊销，accounts/failover/pricing/universal_providers/sessions/oauth_logins 域已完成并解除 X5 前置。
+> **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 剩余的存储收敛（14 处直接写）与 `api/types.rs` DTO 就近化随 X 系列功能 PR 摊销，accounts/failover/providers/pricing/universal_providers/sessions/oauth_logins 域已完成并解除 X5 前置。
 
 ## 验证基线（每个任务完成前必须通过）
 
@@ -220,3 +220,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | R4-sessions 完成：legacy bearer session clear/push 写路径收敛到 state 域方法，字段降 `pub(crate)`；剩余直接写计数 37→34 |
 | 2026-07-07 | R4-oauth_logins 完成：OAuth login start/finish/poll/mark 写路径收敛到 state 域方法，字段降 `pub(crate)`；按当前 grep 复核剩余 32 处（ui_settings 14、providers 8、failover 10） |
 | 2026-07-07 | R4-failover 完成：控制面配置/重置写路径和 proxy 熔断热路径写入收敛到 state 域方法，字段降 `pub(crate)`；剩余直接写计数 32→22 |
+| 2026-07-07 | R4-providers 完成：provider CRUD/import/sort/universal sync/fetch-model merge 写路径收敛到 state 域方法，字段降 `pub(crate)`；剩余直接写计数 22→14 |

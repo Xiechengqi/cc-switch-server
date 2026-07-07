@@ -23,11 +23,10 @@ pub(in crate::api) async fn create_provider(
         return Err(ApiError::bad_request("provider name is required"));
     }
 
-    let stored = {
-        let mut store = state.providers.write().await;
-        store.upsert(input.app, input.provider)
-    };
-    state.save_providers().await.map_err(ApiError::internal)?;
+    let stored = state
+        .mutate_providers_immediate(|store| store.upsert(input.app, input.provider))
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(Json(CreateProviderResponse { ok: true, stored }))
 }
@@ -56,18 +55,19 @@ pub(in crate::api) async fn import_providers(
             return Err(ApiError::bad_request("provider name is required"));
         }
     }
-    let imported = {
-        let mut store = state.providers.write().await;
-        input
-            .providers
-            .into_iter()
-            .map(|item| {
-                store.upsert(item.app, item.provider);
-                1usize
-            })
-            .sum()
-    };
-    state.save_providers().await.map_err(ApiError::internal)?;
+    let imported = state
+        .mutate_providers_immediate(|store| {
+            input
+                .providers
+                .into_iter()
+                .map(|item| {
+                    store.upsert(item.app, item.provider);
+                    1usize
+                })
+                .sum()
+        })
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(ImportProvidersResponse { ok: true, imported }))
 }
 
@@ -201,11 +201,11 @@ pub(in crate::api) async fn delete_universal_provider(
         .map_err(ApiError::internal)?;
     if deleted {
         state
-            .providers
-            .write()
+            .mutate_providers_immediate(|providers| {
+                providers.remove_universal_derivatives(&id);
+            })
             .await
-            .remove_universal_derivatives(&id);
-        state.save_providers().await.map_err(ApiError::internal)?;
+            .map_err(ApiError::internal)?;
     }
     Ok(Json(DeleteResponse { ok: true, deleted }))
 }
@@ -225,22 +225,24 @@ pub(in crate::api) async fn sync_universal_provider(
         .cloned()
         .ok_or_else(|| ApiError::not_found("universal provider not found"))?;
 
-    let mut result = UniversalProviderSyncResult::default();
-    {
-        let mut providers = state.providers.write().await;
-        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
-            if let Some(provider) = provider_from_universal(&universal, app) {
-                providers.upsert_merging_settings(app, provider);
-                result.synced.push(app.as_str().to_string());
-            } else {
-                if providers.remove_universal_derivative(&universal.id, app) {
-                    result.removed.push(app.as_str().to_string());
+    let result = state
+        .mutate_providers_immediate(|providers| {
+            let mut result = UniversalProviderSyncResult::default();
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                if let Some(provider) = provider_from_universal(&universal, app) {
+                    providers.upsert_merging_settings(app, provider);
+                    result.synced.push(app.as_str().to_string());
+                } else {
+                    if providers.remove_universal_derivative(&universal.id, app) {
+                        result.removed.push(app.as_str().to_string());
+                    }
+                    result.skipped.push(app.as_str().to_string());
                 }
-                result.skipped.push(app.as_str().to_string());
             }
-        }
-    }
-    state.save_providers().await.map_err(ApiError::internal)?;
+            result
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(Json(SyncUniversalProviderResponse { ok: true, result }))
 }
@@ -361,17 +363,20 @@ pub(in crate::api) async fn fetch_provider_models(
     let mut provider = None;
     let mut merged_count = 0usize;
     if input.merge.unwrap_or(false) {
-        {
-            let mut providers = state.providers.write().await;
-            let item = providers
-                .providers
-                .iter_mut()
-                .find(|item| item.app == stored.app && item.provider.id == stored.provider.id)
-                .ok_or_else(|| ApiError::not_found("provider not found"))?;
-            merged_count = merge_fetched_models_into_provider(item, &fetched.models);
-            provider = Some(item.clone());
-        }
-        state.save_providers().await.map_err(ApiError::internal)?;
+        let (merged_provider, count) = state
+            .try_mutate_providers_immediate(|providers| {
+                let item = providers
+                    .providers
+                    .iter_mut()
+                    .find(|item| item.app == stored.app && item.provider.id == stored.provider.id)
+                    .ok_or_else(|| ApiError::not_found("provider not found"))?;
+                let merged_count = merge_fetched_models_into_provider(item, &fetched.models);
+                Ok((Some(item.clone()), merged_count))
+            })
+            .await
+            .map_err(ApiError::internal)??;
+        provider = merged_provider;
+        merged_count = count;
     }
     Ok(Json(FetchProviderModelsResponse {
         ok: true,
@@ -694,11 +699,10 @@ pub(in crate::api) async fn create_provider_from_preset(
         .into_iter()
         .find(|item| item.name == input.name)
         .ok_or_else(|| ApiError::not_found("provider preset not found"))?;
-    let stored = {
-        let mut store = state.providers.write().await;
-        store.upsert(input.app, fixture.provider.clone())
-    };
-    state.save_providers().await.map_err(ApiError::internal)?;
+    let stored = state
+        .mutate_providers_immediate(|store| store.upsert(input.app, fixture.provider.clone()))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(CreateProviderResponse { ok: true, stored }))
 }
 

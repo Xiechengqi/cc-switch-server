@@ -48,7 +48,7 @@ pub struct ServerStateInner {
     pub web_dist_dir: Option<PathBuf>,
     pub provider_coverage: ProviderCoverage,
     pub config: RwLock<ServerConfig>,
-    pub providers: RwLock<ProviderStore>,
+    pub(crate) providers: RwLock<ProviderStore>,
     pub(crate) universal_providers: RwLock<UniversalProviderStore>,
     pub(crate) accounts: RwLock<AccountStore>,
     pub(crate) failover: RwLock<FailoverStore>,
@@ -540,6 +540,53 @@ impl ServerStateInner {
 
     pub async fn save_providers(&self) -> anyhow::Result<()> {
         self.providers.read().await.save(&self.config_dir)
+    }
+
+    pub async fn mutate_providers<R>(&self, mutate: impl FnOnce(&mut ProviderStore) -> R) -> R {
+        let mut providers = self.providers.write().await;
+        mutate(&mut providers)
+    }
+
+    pub async fn mutate_providers_immediate<R>(
+        &self,
+        mutate: impl FnOnce(&mut ProviderStore) -> R,
+    ) -> anyhow::Result<R> {
+        let result = self.mutate_providers(mutate).await;
+        self.save_providers().await?;
+        Ok(result)
+    }
+
+    pub async fn mutate_providers_immediate_if_changed<R>(
+        &self,
+        mutate: impl FnOnce(&mut ProviderStore) -> (R, bool),
+    ) -> anyhow::Result<R> {
+        let (result, changed) = self.mutate_providers(mutate).await;
+        if changed {
+            self.save_providers().await?;
+        }
+        Ok(result)
+    }
+
+    pub async fn try_mutate_providers_immediate<R, E>(
+        &self,
+        mutate: impl FnOnce(&mut ProviderStore) -> Result<R, E>,
+    ) -> anyhow::Result<Result<R, E>> {
+        let result = self.mutate_providers(mutate).await;
+        if result.is_ok() {
+            self.save_providers().await?;
+        }
+        Ok(result)
+    }
+
+    pub async fn try_mutate_providers_immediate_if_changed<R, E>(
+        &self,
+        mutate: impl FnOnce(&mut ProviderStore) -> Result<(R, bool), E>,
+    ) -> anyhow::Result<Result<R, E>> {
+        let result = self.mutate_providers(mutate).await;
+        if result.as_ref().is_ok_and(|(_, changed)| *changed) {
+            self.save_providers().await?;
+        }
+        Ok(result.map(|(value, _)| value))
     }
 
     pub async fn save_universal_providers(&self) -> anyhow::Result<()> {
