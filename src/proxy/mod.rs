@@ -112,7 +112,10 @@ impl ProxyError {
     }
 }
 
-pub(super) fn setting(provider: &crate::core::provider::Provider, keys: &[&str]) -> Option<String> {
+pub(super) fn setting(
+    provider: &crate::domain::providers::model::Provider,
+    keys: &[&str],
+) -> Option<String> {
     for key in keys {
         if let Some(value) = provider
             .settings_config
@@ -141,9 +144,9 @@ mod tests {
     use bytes::Bytes;
     use serde_json::{json, Value};
 
-    use crate::core::accounts::AccountStore;
-    use crate::core::provider::{AppKind, Provider, ProviderMeta, ProviderType};
-    use crate::core::providers::StoredProvider;
+    use crate::domain::accounts::store::AccountStore;
+    use crate::domain::providers::model::{AppKind, Provider, ProviderMeta, ProviderType};
+    use crate::domain::providers::store::StoredProvider;
     use crate::proxy::adapters::ProviderAdapter;
 
     use super::*;
@@ -178,7 +181,7 @@ mod tests {
                 category: None,
                 meta: Some(ProviderMeta {
                     provider_type: Some("codex_oauth".to_string()),
-                    auth_binding: Some(crate::core::provider::AuthBinding {
+                    auth_binding: Some(crate::domain::providers::model::AuthBinding {
                         source: Some("managed_account".to_string()),
                         auth_provider: Some("codex_oauth".to_string()),
                         account_id: Some("a1".to_string()),
@@ -191,7 +194,7 @@ mod tests {
             provider_type_id: "codex_oauth".to_string(),
         };
         let mut accounts = AccountStore::default();
-        accounts.upsert(crate::core::accounts::UpsertAccountInput {
+        accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
             id: Some("a1".to_string()),
             provider_type: ProviderType::CodexOAuth,
             email: None,

@@ -4,34 +4,32 @@
 //! normal HTTP POST adapter. This module keeps the ported Cursor protocol
 //! pieces isolated while the server forwarder grows a native driver path.
 
-pub mod cursor_agent_driver;
-pub mod cursor_agent_proto;
-pub mod cursor_event_emitter;
-pub mod cursor_h2_client;
-pub mod cursor_identity;
-pub mod cursor_image;
-pub mod cursor_protocol;
-pub mod cursor_request_builder;
-pub mod cursor_session;
-pub mod cursor_tool_bridge;
-pub mod cursor_tool_resolver;
+pub mod agent_driver;
+pub mod agent_proto;
+pub mod event_emitter;
+pub mod h2_client;
+pub mod identity;
+pub mod image;
+pub mod protocol;
+pub mod request_builder;
+pub mod session;
+pub mod tool_bridge;
+pub mod tool_resolver;
 
 use axum::http::StatusCode;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::core::provider::ProviderType;
-use crate::core::providers::StoredProvider;
+use crate::domain::providers::model::ProviderType;
+use crate::domain::providers::store::StoredProvider;
 
 use super::router::ProxyRoute;
 use super::{setting, ProxyError};
 
-use cursor_protocol::CursorResponseFormat;
-use cursor_request_builder::{
-    build_plan, validate_tool_result_context, AgentRunPlan, InboundProtocol,
-};
+use protocol::CursorResponseFormat;
+use request_builder::{build_plan, validate_tool_result_context, AgentRunPlan, InboundProtocol};
 
-pub use cursor_agent_driver::{forward_agentservice, AgentServiceForwardOptions};
+pub use agent_driver::{forward_agentservice, AgentServiceForwardOptions};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -196,7 +194,7 @@ fn truthy(value: &str) -> bool {
 mod tests {
     use serde_json::{json, Value};
 
-    use crate::core::provider::{AppKind, Provider, ProviderMeta};
+    use crate::domain::providers::model::{AppKind, Provider, ProviderMeta};
 
     use super::*;
 

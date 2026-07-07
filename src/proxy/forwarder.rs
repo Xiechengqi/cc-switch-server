@@ -13,17 +13,13 @@ use futures_util::stream::{self, BoxStream};
 use futures_util::{StreamExt, TryStreamExt};
 use serde_json::json;
 
-use crate::core::account_refresh::{
-    account_needs_native_refresh, execute_native_account_refresh, AccountRefreshFailure,
-};
-use crate::core::failover::{current_time_ms, ProviderOutcome};
-use crate::core::provider::{AppKind, ProviderType};
-use crate::core::providers::{ProviderStore, StoredProvider};
-use crate::core::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
-use crate::core::usage::{TokenUsage, UsageLogContext, UsageModelMetadata};
+use crate::domain::failover::{current_time_ms, ProviderOutcome};
+use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::store::{ProviderStore, StoredProvider};
+use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
+use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
 use crate::state::{
-    build_provider_http_client, save_accounts_debounced, save_shares_debounced, ServerState,
-    ShareInFlightGuard,
+    build_provider_http_client, ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
 };
 
 use super::adapters::{self, ProviderAdapter};
@@ -384,19 +380,13 @@ async fn validate_and_acquire_share_invocation(
     state: &ServerState,
     share_id: &str,
 ) -> Result<(String, ShareInFlightGuard), ProxyError> {
-    let validation = {
-        let mut shares = state.shares.write().await;
-        shares.validate_for_invocation(share_id, crate::core::usage::now_ms() as i64)
-    };
+    let validation = state
+        .validate_share_invocation(share_id, crate::infra::time::now_ms() as i64)
+        .await;
 
     let invocation = match validation {
         Ok(invocation) => invocation,
-        Err(rejection) => {
-            if rejection.status_changed {
-                save_shares_debounced(state);
-            }
-            return Err(share_rejection_to_proxy_error(rejection));
-        }
+        Err(rejection) => return Err(share_rejection_to_proxy_error(rejection)),
     };
 
     let guard = state
@@ -436,11 +426,11 @@ pub(super) async fn record_share_invocation_result(
     let Some(share_id) = share_id else {
         return;
     };
-    {
-        let mut shares = state.shares.write().await;
-        shares.record_invocation_result(share_id, share_usage_tokens(usage));
-    }
-    save_shares_debounced(state);
+    state
+        .mutate_shares_debounced(|shares| {
+            shares.record_invocation_result(share_id, share_usage_tokens(usage));
+        })
+        .await;
 }
 
 pub(super) async fn record_provider_outcome(
@@ -480,63 +470,10 @@ async fn refresh_managed_account_if_needed(
         return Ok(());
     }
 
-    let account_id = managed_account_id(stored);
-    let now = crate::core::usage::now_ms() as i64;
-    let account = {
-        let accounts = state.accounts.read().await;
-        accounts
-            .find_for_provider(stored.provider_type, account_id)
-            .cloned()
-    };
-    let Some(account) = account else {
-        return Ok(());
-    };
-    if !account_needs_native_refresh(&account, now) {
-        return Ok(());
-    }
-
-    let _refresh_guard = state
-        .account_refresh_locks
-        .try_lock(account.provider_type, &account.id)
-        .ok_or_else(|| {
-            ProxyError::conflict(format!(
-                "{} account refresh is already in progress",
-                account.provider_type.as_str()
-            ))
-        })?;
-
-    let account = {
-        let accounts = state.accounts.read().await;
-        accounts
-            .find_for_provider(stored.provider_type, account_id)
-            .cloned()
-    }
-    .ok_or_else(|| ProxyError::not_found("managed account not found"))?;
-    if !account_needs_native_refresh(&account, now) {
-        return Ok(());
-    }
-
-    let http_client = state.http_client().await;
-    let update = match execute_native_account_refresh(&http_client, &account, now).await {
-        Ok(update) => update,
-        Err(error) => {
-            {
-                let mut accounts = state.accounts.write().await;
-                accounts.mark_refresh_failure(&account.id, error.message.clone());
-            }
-            save_accounts_debounced(state);
-            return Err(refresh_failure_to_proxy_error(error));
-        }
-    };
-
-    {
-        let mut accounts = state.accounts.write().await;
-        accounts
-            .mark_refresh_success(&account.id, update)
-            .ok_or_else(|| ProxyError::not_found("managed account not found"))?;
-    }
-    save_accounts_debounced(state);
-    Ok(())
+    state
+        .refresh_managed_account_if_needed(stored.provider_type, managed_account_id(stored))
+        .await
+        .map_err(managed_account_refresh_error_to_proxy_error)
 }
 
 fn managed_account_id(stored: &StoredProvider) -> Option<&str> {
@@ -613,10 +550,20 @@ fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
     }
 }
 
-fn refresh_failure_to_proxy_error(error: AccountRefreshFailure) -> ProxyError {
-    ProxyError {
-        status: StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-        message: format!("managed account refresh failed: {}", error.message),
+fn managed_account_refresh_error_to_proxy_error(error: ManagedAccountRefreshError) -> ProxyError {
+    match error {
+        ManagedAccountRefreshError::Conflict { provider_type } => ProxyError::conflict(format!(
+            "{} account refresh is already in progress",
+            provider_type.as_str()
+        )),
+        ManagedAccountRefreshError::NotFound => ProxyError::not_found("managed account not found"),
+        ManagedAccountRefreshError::Refresh {
+            status_code,
+            message,
+        } => ProxyError {
+            status: StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            message: format!("managed account refresh failed: {message}"),
+        },
     }
 }
 
@@ -1114,9 +1061,9 @@ fn stream_terminal_error_frame(
 mod tests {
     use serde_json::{json, Value};
 
-    use crate::core::accounts::Account;
-    use crate::core::oauth_clients::OAuthErrorKind;
-    use crate::core::provider::{AppKind, AuthBinding, Provider, ProviderMeta, ProviderType};
+    use crate::domain::providers::model::{
+        AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
+    };
 
     use super::*;
 
@@ -1146,34 +1093,6 @@ mod tests {
             },
             provider_type,
             provider_type_id: provider_type.as_str().to_string(),
-        }
-    }
-
-    fn account(
-        provider_type: ProviderType,
-        access_token: Option<&str>,
-        refresh_token: Option<&str>,
-        expires_at: Option<i64>,
-    ) -> Account {
-        Account {
-            id: "acct-1".to_string(),
-            provider_type,
-            email: Some("test@example.com".to_string()),
-            access_token: access_token.map(str::to_string),
-            refresh_token: refresh_token.map(str::to_string),
-            id_token: None,
-            token_type: None,
-            api_key: None,
-            scopes: Vec::new(),
-            profile: None,
-            raw: None,
-            subscription_level: None,
-            quota_percent: None,
-            quota: None,
-            quota_refreshed_at: None,
-            quota_next_refresh_at: None,
-            expires_at,
-            last_refresh_error: None,
         }
     }
 
@@ -1228,49 +1147,12 @@ mod tests {
     }
 
     #[test]
-    fn native_refresh_decision_requires_refresh_token_and_expired_or_missing_access() {
-        let now_ms = 1_000_000;
-
-        assert!(account_needs_native_refresh(
-            &account(ProviderType::CodexOAuth, None, Some("refresh"), None),
-            now_ms
-        ));
-        assert!(account_needs_native_refresh(
-            &account(
-                ProviderType::CodexOAuth,
-                Some("access"),
-                Some("refresh"),
-                Some(now_ms + 1_000)
-            ),
-            now_ms
-        ));
-        assert!(!account_needs_native_refresh(
-            &account(
-                ProviderType::CodexOAuth,
-                Some("access"),
-                Some("refresh"),
-                Some(now_ms + 3_600_000)
-            ),
-            now_ms
-        ));
-        assert!(!account_needs_native_refresh(
-            &account(ProviderType::CodexOAuth, None, None, None),
-            now_ms
-        ));
-        assert!(!account_needs_native_refresh(
-            &account(ProviderType::Codex, None, Some("refresh"), None),
-            now_ms
-        ));
-    }
-
-    #[test]
     fn refresh_failures_keep_oauth_status_and_managed_account_context() {
-        let proxy_error = refresh_failure_to_proxy_error(AccountRefreshFailure {
-            status_code: 429,
-            message: "rate limited by provider".to_string(),
-            kind: OAuthErrorKind::RateLimited,
-            retryable: true,
-        });
+        let proxy_error =
+            managed_account_refresh_error_to_proxy_error(ManagedAccountRefreshError::Refresh {
+                status_code: 429,
+                message: "rate limited by provider".to_string(),
+            });
 
         assert_eq!(proxy_error.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(

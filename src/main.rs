@@ -1,17 +1,6 @@
-mod admin;
-mod build_info;
-mod cli;
-mod core;
-mod coverage;
-mod http;
-mod proxy;
-mod state;
-mod web_assets;
-mod web_runtime;
-
 use anyhow::Context;
-use cli::{Cli, Command};
-use state::ServerStateInner;
+use cc_switch_server::cli::{Cli, Command};
+use cc_switch_server::state::ServerStateInner;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -20,20 +9,22 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.effective_command() {
         Command::Serve => serve(cli).await,
-        Command::Config { command } => admin::run_config_command(&cli, command),
-        Command::Doctor { check_port } => admin::run_doctor(&cli, check_port),
+        Command::Config { command } => cc_switch_server::admin::run_config_command(&cli, command),
+        Command::Doctor { check_port } => cc_switch_server::admin::run_doctor(&cli, check_port),
         Command::Version { json } => print_version(json),
-        Command::Password { command } => admin::run_password_command(&cli, command),
+        Command::Password { command } => {
+            cc_switch_server::admin::run_password_command(&cli, command)
+        }
     }
 }
 
 async fn serve(cli: Cli) -> anyhow::Result<()> {
     let state = ServerStateInner::load(cli.clone()).context("initialize server state")?;
-    state::restore_tunnels(state.clone()).await;
-    state::spawn_periodic_backups(state.clone());
-    state::spawn_account_quota_refresh(state.clone());
-    state::spawn_share_edit_event_listener(state.clone());
-    http::serve(state).await
+    cc_switch_server::state::restore_tunnels(state.clone()).await;
+    cc_switch_server::state::spawn_periodic_backups(state.clone());
+    cc_switch_server::state::spawn_account_quota_refresh(state.clone());
+    cc_switch_server::state::spawn_share_edit_event_listener(state.clone());
+    cc_switch_server::api::serve(state).await
 }
 
 fn init_tracing(log_level: &str) {
@@ -48,7 +39,7 @@ fn init_tracing(log_level: &str) {
 }
 
 fn print_version(json: bool) -> anyhow::Result<()> {
-    let info = build_info::build_info();
+    let info = cc_switch_server::build_info::build_info();
     if json {
         println!("{}", serde_json::to_string_pretty(&info)?);
     } else {

@@ -26,8 +26,8 @@ echo "== local release checks =="
 if [[ "$RUN_TESTS" == "1" ]]; then
   cargo fmt --check || FAILURES=$((FAILURES + 1))
   cargo test || FAILURES=$((FAILURES + 1))
-  scripts/validate-local.sh || FAILURES=$((FAILURES + 1))
-  scripts/smoke-local.sh || FAILURES=$((FAILURES + 1))
+  scripts/audit/validate-local.sh || FAILURES=$((FAILURES + 1))
+  scripts/smoke/smoke-local.sh || FAILURES=$((FAILURES + 1))
   pass "local test suite executed"
 else
   warn "RUN_TESTS=0; local test suite skipped"
@@ -50,16 +50,16 @@ need_var SHARE_MARKET_ORDER_ID
 
 if [[ "$RUN_REAL" == "1" && "${#BLOCKERS[@]}" -eq 0 ]]; then
   echo "== real smoke =="
-  scripts/router-market-smoke.sh || FAILURES=$((FAILURES + 1))
-  scripts/code-agent-regression.sh || FAILURES=$((FAILURES + 1))
-  scripts/share-market-grant-smoke.sh || FAILURES=$((FAILURES + 1))
+  scripts/smoke/router-market-smoke.sh || FAILURES=$((FAILURES + 1))
+  scripts/smoke/code-agent-regression.sh || FAILURES=$((FAILURES + 1))
+  scripts/smoke/share-market-grant-smoke.sh || FAILURES=$((FAILURES + 1))
 else
   warn "real smoke skipped; RUN_REAL=${RUN_REAL}, blockers=${#BLOCKERS[@]}"
 fi
 
 echo "== deployment boundary =="
 if [[ "$RUN_DEPLOYMENT_TESTS" == "1" ]]; then
-  scripts/deployment-smoke.sh || FAILURES=$((FAILURES + 1))
+  scripts/smoke/deployment-smoke.sh || FAILURES=$((FAILURES + 1))
   pass "deployment smoke executed"
 else
   DEPLOYMENT_NOT_TESTED=true
@@ -67,11 +67,14 @@ else
 fi
 
 echo "== secret audit =="
-secret_audit_files=(docs/code-agent-regression-matrix.json)
+secret_audit_files=(
+  docs/code-agent-regression-matrix.json
+  assets/contract/provider-fixtures/structures.json
+)
 while IFS= read -r file; do
   secret_audit_files+=("$file")
 done < <(find docs/provider-fixtures -type f -name '*.json' | sort)
-scripts/evidence-redaction-check.sh "${secret_audit_files[@]}" || FAILURES=$((FAILURES + 1))
+scripts/audit/evidence-redaction-check.sh "${secret_audit_files[@]}" || FAILURES=$((FAILURES + 1))
 
 if [[ "$FAILURES" -gt 0 ]]; then
   RELEASE_DECISION="not-ready"
@@ -99,8 +102,8 @@ if [[ -n "$EVIDENCE_FILE" ]]; then
   BLOCKER_GROUP="$([[ "$DEPLOYMENT_NOT_TESTED" == "true" ]] && echo deployment-not-tested || echo external-readonly)" \
   FAILURE_CLASS="$([[ "$FAILURES" -gt 0 ]] && echo release-gate || echo "")" \
   EVIDENCE_NOTES="blockers=${BLOCKERS[*]:-none}" \
-    node scripts/write-acceptance-evidence.mjs --out "$EVIDENCE_FILE"
-  scripts/evidence-redaction-check.sh "$EVIDENCE_FILE"
+    node scripts/smoke/write-acceptance-evidence.mjs --out "$EVIDENCE_FILE"
+  scripts/audit/evidence-redaction-check.sh "$EVIDENCE_FILE"
 fi
 
 if [[ "$RELEASE_DECISION" == "not-ready" ]]; then

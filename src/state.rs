@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -9,28 +9,35 @@ use futures_util::StreamExt;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration};
 
+use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::Cli;
-use crate::core::account_managers::AccountRefreshLocks;
-use crate::core::account_refresh::{account_needs_native_refresh, execute_native_account_refresh};
-use crate::core::accounts::{Account, AccountRefreshUpdate, AccountStore};
-use crate::core::config::{mask_proxy_url, ServerConfig};
-use crate::core::failover::FailoverStore;
-use crate::core::kiro_device::KiroDeviceFlowStore;
-use crate::core::oauth_login::OAuthLoginStore;
-use crate::core::pricing::ModelPricingStore;
-use crate::core::provider::AppKind;
-use crate::core::providers::ProviderStore;
-use crate::core::quota::{refresh_account_quota, QuotaRefreshResult};
-use crate::core::router_client::{
-    self, IssueLeaseResponse, ShareEditAckPayload, ShareEditView, ShareRequestLogEntry,
+use crate::clients::oauth::kiro_device::KiroDeviceFlowStore;
+use crate::clients::oauth::quota::{refresh_account_quota, QuotaRefreshResult};
+use crate::clients::oauth::refresh::{
+    account_needs_native_refresh, execute_native_account_refresh,
 };
-use crate::core::shares::{ShareMarketGrantStatus, ShareStore};
-use crate::core::tunnel::{self, LeaseFn, TunnelSupervisor};
-use crate::core::ui_settings::UiSettingsStore;
-use crate::core::universal_providers::UniversalProviderStore;
-use crate::core::usage::{UsageLog, UsageStore};
-use crate::coverage::ProviderCoverage;
-use crate::proxy::cursor::cursor_session::CursorSessionManager;
+use crate::clients::router::client::{
+    self, IssueLeaseResponse, ShareEditAckPayload, ShareEditView,
+};
+use crate::clients::router::tunnel::{self, LeaseFn, TunnelSupervisor};
+use crate::domain::accounts::login::OAuthLoginStore;
+use crate::domain::accounts::managers::AccountRefreshLocks;
+use crate::domain::accounts::store::{Account, AccountRefreshUpdate, AccountStore};
+use crate::domain::failover::FailoverStore;
+use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::store::ProviderStore;
+use crate::domain::providers::universal::UniversalProviderStore;
+use crate::domain::settings::config::{mask_proxy_url, ServerConfig};
+use crate::domain::settings::ui_settings::UiSettingsStore;
+use crate::domain::sharing::router_contract::{
+    descriptor_for_share_with_accounts_and_usage, ShareRequestLogEntry, ShareSyncOperation,
+};
+use crate::domain::sharing::shares::{
+    Share, ShareInvocation, ShareInvocationRejection, ShareMarketGrantStatus, ShareStore,
+};
+use crate::domain::usage::pricing::ModelPricingStore;
+use crate::domain::usage::store::{UsageLog, UsageStore};
+use crate::proxy::cursor::session::CursorSessionManager;
 
 #[derive(Debug)]
 pub struct ServerStateInner {
@@ -45,7 +52,7 @@ pub struct ServerStateInner {
     pub failover: RwLock<FailoverStore>,
     pub pricing: RwLock<ModelPricingStore>,
     pub usage: RwLock<UsageStore>,
-    pub shares: RwLock<ShareStore>,
+    pub(crate) shares: RwLock<ShareStore>,
     pub ui_settings: RwLock<UiSettingsStore>,
     pub sessions: RwLock<Vec<Session>>,
     pub oauth_logins: RwLock<OAuthLoginStore>,
@@ -57,11 +64,33 @@ pub struct ServerStateInner {
     pub http_client: RwLock<reqwest::Client>,
     pub events: broadcast::Sender<ServerEvent>,
     pub tunnels: Arc<TunnelSupervisor>,
-    pub web_auth: crate::core::web_auth::WebAuthStore,
+    pub web_auth: crate::domain::web_auth::WebAuthStore,
     pub debounced_saves: Arc<DebouncedStoreSaves>,
 }
 
 pub type ServerState = Arc<ServerStateInner>;
+
+#[derive(Debug)]
+pub enum ManagedAccountRefreshError {
+    Conflict { provider_type: ProviderType },
+    NotFound,
+    Refresh { status_code: u16, message: String },
+}
+
+pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        crate::domain::settings::config::config_path(config_dir),
+        crate::clients::router::email_auth::email_auth_path(config_dir),
+        crate::domain::providers::store::providers_path(config_dir),
+        crate::domain::providers::universal::universal_providers_path(config_dir),
+        crate::domain::accounts::store::accounts_path(config_dir),
+        crate::domain::failover::failover_path(config_dir),
+        crate::domain::usage::pricing::model_pricing_path(config_dir),
+        crate::domain::usage::store::usage_path(config_dir),
+        crate::domain::sharing::shares::shares_path(config_dir),
+        crate::clients::router::tunnel::tunnels_path(config_dir),
+    ]
+}
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -90,7 +119,7 @@ impl ServerEvent {
             id: None,
             app: None,
             message: None,
-            created_at_ms: crate::core::usage::now_ms(),
+            created_at_ms: crate::infra::time::now_ms(),
         }
     }
 
@@ -245,7 +274,7 @@ pub fn save_accounts_debounced(state: &ServerState) {
     schedule_debounced_save(state.clone(), DebouncedStoreKind::Accounts);
 }
 
-pub fn save_shares_debounced(state: &ServerState) {
+fn save_shares_debounced(state: &ServerState) {
     schedule_debounced_save(state.clone(), DebouncedStoreKind::Shares);
 }
 
@@ -293,7 +322,7 @@ impl ServerStateInner {
         let (events, _) = broadcast::channel(256);
 
         let tunnels = TunnelSupervisor::load_or_default(&config_dir)?;
-        let web_auth = crate::core::web_auth::WebAuthStore::load(config_dir.clone());
+        let web_auth = crate::domain::web_auth::WebAuthStore::load(config_dir.clone());
 
         Ok(Arc::new(Self {
             bind_addr,
@@ -394,8 +423,145 @@ impl ServerStateInner {
         self.usage.read().await.save(&self.config_dir)
     }
 
-    pub async fn save_shares(&self) -> anyhow::Result<()> {
+    async fn save_shares(&self) -> anyhow::Result<()> {
         self.shares.read().await.save(&self.config_dir)
+    }
+
+    pub async fn refresh_managed_account_if_needed(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: Option<&str>,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        let now = crate::infra::time::now_ms() as i64;
+        let account = {
+            let accounts = self.accounts.read().await;
+            accounts
+                .find_for_provider(provider_type, account_id)
+                .cloned()
+        };
+        let Some(account) = account else {
+            return Ok(());
+        };
+        if !account_needs_native_refresh(&account, now) {
+            return Ok(());
+        }
+
+        let _refresh_guard = self
+            .account_refresh_locks
+            .try_lock(account.provider_type, &account.id)
+            .ok_or(ManagedAccountRefreshError::Conflict {
+                provider_type: account.provider_type,
+            })?;
+
+        let account = {
+            let accounts = self.accounts.read().await;
+            accounts
+                .find_for_provider(provider_type, account_id)
+                .cloned()
+        }
+        .ok_or(ManagedAccountRefreshError::NotFound)?;
+        if !account_needs_native_refresh(&account, now) {
+            return Ok(());
+        }
+
+        let http_client = self.http_client().await;
+        let update = match execute_native_account_refresh(&http_client, &account, now).await {
+            Ok(update) => update,
+            Err(error) => {
+                {
+                    let mut accounts = self.accounts.write().await;
+                    accounts.mark_refresh_failure(&account.id, error.message.clone());
+                }
+                save_accounts_debounced(self);
+                return Err(ManagedAccountRefreshError::Refresh {
+                    status_code: error.status_code,
+                    message: error.message,
+                });
+            }
+        };
+
+        {
+            let mut accounts = self.accounts.write().await;
+            accounts
+                .mark_refresh_success(&account.id, update)
+                .ok_or(ManagedAccountRefreshError::NotFound)?;
+        }
+        save_accounts_debounced(self);
+        Ok(())
+    }
+
+    pub async fn mutate_shares<R>(&self, mutate: impl FnOnce(&mut ShareStore) -> R) -> R {
+        let mut shares = self.shares.write().await;
+        mutate(&mut shares)
+    }
+
+    pub async fn mutate_shares_immediate<R>(
+        &self,
+        mutate: impl FnOnce(&mut ShareStore) -> R,
+    ) -> anyhow::Result<R> {
+        let result = self.mutate_shares(mutate).await;
+        self.save_shares().await?;
+        Ok(result)
+    }
+
+    pub async fn try_mutate_shares_immediate<R, E>(
+        &self,
+        mutate: impl FnOnce(&mut ShareStore) -> Result<R, E>,
+    ) -> anyhow::Result<Result<R, E>> {
+        let result = self.mutate_shares(mutate).await;
+        if result.is_ok() {
+            self.save_shares().await?;
+        }
+        Ok(result)
+    }
+
+    pub async fn mutate_shares_debounced<R>(
+        self: &Arc<Self>,
+        mutate: impl FnOnce(&mut ShareStore) -> R,
+    ) -> R {
+        let result = self.mutate_shares(mutate).await;
+        save_shares_debounced(self);
+        result
+    }
+
+    pub async fn validate_share_invocation(
+        self: &Arc<Self>,
+        share_id: &str,
+        now_ms: i64,
+    ) -> Result<ShareInvocation, ShareInvocationRejection> {
+        let result = self
+            .mutate_shares(|shares| shares.validate_for_invocation(share_id, now_ms))
+            .await;
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|rejection| rejection.status_changed)
+        {
+            save_shares_debounced(self);
+        }
+        result
+    }
+
+    pub async fn mutate_share<R>(
+        &self,
+        share_id: &str,
+        mutate: impl FnOnce(&mut Share) -> R,
+    ) -> Option<R> {
+        self.mutate_shares(|store| {
+            store
+                .shares
+                .iter_mut()
+                .find(|share| share.id == share_id)
+                .map(mutate)
+        })
+        .await
+    }
+
+    pub async fn replace_shares(&self, shares: Vec<Share>) {
+        self.mutate_shares(|store| {
+            store.shares = shares;
+        })
+        .await;
     }
 
     pub async fn save_ui_settings(&self) -> anyhow::Result<()> {
@@ -433,7 +599,7 @@ fn build_http_client_from_proxy(
         .no_gzip();
 
     if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
-        crate::core::config::validate_proxy_url(proxy_url)?;
+        crate::domain::settings::config::validate_proxy_url(proxy_url)?;
         let proxy = reqwest::Proxy::all(proxy_url)
             .with_context(|| format!("configure upstream proxy {}", mask_proxy_url(proxy_url)))?;
         builder = builder.proxy(proxy);
@@ -507,8 +673,9 @@ pub fn spawn_periodic_backups(state: ServerState) {
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(6 * 60 * 60)).await;
-            match crate::core::backup::create_backup(
+            match crate::infra::backup::create_backup(
                 &state.config_dir,
+                &backup_targets(&state.config_dir),
                 Some("periodic".to_string()),
             ) {
                 Ok(manifest) => {
@@ -543,7 +710,7 @@ pub fn spawn_account_quota_refresh(state: ServerState) {
 }
 
 async fn refresh_due_account_quotas(state: &ServerState) {
-    let now = crate::core::usage::now_ms() as i64;
+    let now = crate::infra::time::now_ms() as i64;
     let accounts = state.accounts.read().await.accounts.clone();
     for account in accounts
         .into_iter()
@@ -604,8 +771,9 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
                 ..Default::default()
             };
             if update.quota_next_refresh_at.is_none() {
-                update.quota_next_refresh_at =
-                    Some(now.saturating_add(crate::core::quota::QUOTA_FAILURE_COOLDOWN_MS));
+                update.quota_next_refresh_at = Some(
+                    now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS),
+                );
             }
             {
                 let mut store = state.accounts.write().await;
@@ -628,7 +796,7 @@ async fn mark_account_quota_refresh_error(
             account_id,
             AccountRefreshUpdate {
                 quota_next_refresh_at: Some(
-                    now.saturating_add(crate::core::quota::QUOTA_FAILURE_COOLDOWN_MS),
+                    now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS),
                 ),
                 last_refresh_error: Some(message),
                 ..Default::default()
@@ -646,9 +814,9 @@ fn account_quota_refresh_due(account: &Account, now: i64) -> bool {
         return false;
     }
     match account.provider_type {
-        crate::core::provider::ProviderType::CodexOAuth
-        | crate::core::provider::ProviderType::ClaudeOAuth
-        | crate::core::provider::ProviderType::GeminiCli => {
+        crate::domain::providers::model::ProviderType::CodexOAuth
+        | crate::domain::providers::model::ProviderType::ClaudeOAuth
+        | crate::domain::providers::model::ProviderType::GeminiCli => {
             account
                 .access_token
                 .as_deref()
@@ -658,7 +826,7 @@ fn account_quota_refresh_due(account: &Account, now: i64) -> bool {
                     .as_deref()
                     .is_some_and(|value| !value.trim().is_empty())
         }
-        crate::core::provider::ProviderType::OllamaCloud => {
+        crate::domain::providers::model::ProviderType::OllamaCloud => {
             account
                 .api_key
                 .as_deref()
@@ -672,11 +840,13 @@ fn account_quota_refresh_due(account: &Account, now: i64) -> bool {
     }
 }
 
-fn should_restore_client_tunnel(status: Option<&crate::core::tunnel::TunnelRuntimeStatus>) -> bool {
+fn should_restore_client_tunnel(
+    status: Option<&crate::clients::router::tunnel::TunnelRuntimeStatus>,
+) -> bool {
     status.is_none_or(|status| status.status != "stopped")
 }
 
-fn auto_start_share_ids(shares: &[crate::core::shares::Share]) -> Vec<String> {
+fn auto_start_share_ids(shares: &[crate::domain::sharing::shares::Share]) -> Vec<String> {
     shares
         .iter()
         .filter(|share| share.auto_start && share.enabled && share.status == "active")
@@ -785,10 +955,9 @@ pub async fn sync_pending_direct_share_logs(
             continue;
         };
         let http_client = state.http_client().await;
-        let result =
-            router_client::batch_sync_share_request_logs(&http_client, &config, vec![entry])
-                .await
-                .map_err(|error| error.to_string());
+        let result = client::batch_sync_share_request_logs(&http_client, &config, vec![entry])
+            .await
+            .map_err(|error| error.to_string());
         if result.is_ok() {
             summary.synced += 1;
         } else {
@@ -846,7 +1015,7 @@ pub async fn pull_and_apply_pending_share_edits(state: ServerState) -> ShareEdit
         return ShareEditSyncSummary::default();
     }
     let http_client = state.http_client().await;
-    let edits = match router_client::pending_share_edits(&http_client, &config, share_ids).await {
+    let edits = match client::pending_share_edits(&http_client, &config, share_ids).await {
         Ok(edits) => edits,
         Err(error) => {
             record_share_edit_sync_error(&state, error.to_string()).await;
@@ -901,7 +1070,7 @@ async fn apply_and_ack_share_edit(
                     status: "error".to_string(),
                     grant_id: Some(edit.id.clone()),
                     last_error: Some(message.clone()),
-                    updated_at_ms: Some(crate::core::usage::now_ms()),
+                    updated_at_ms: Some(crate::infra::time::now_ms()),
                 },
             )
             .await;
@@ -915,7 +1084,7 @@ async fn apply_and_ack_share_edit(
         error_message: ack_error,
     };
     let http_client = state.http_client().await;
-    match router_client::ack_share_edit(&http_client, config, ack).await {
+    match client::ack_share_edit(&http_client, config, ack).await {
         Ok(()) => summary.acked += 1,
         Err(error) => {
             summary.ack_failed += 1;
@@ -942,7 +1111,7 @@ async fn apply_share_edit_locally(state: &ServerState, edit: &ShareEditView) -> 
                 status: "applied".to_string(),
                 grant_id: Some(edit.id.clone()),
                 last_error: None,
-                updated_at_ms: Some(crate::core::usage::now_ms()),
+                updated_at_ms: Some(crate::infra::time::now_ms()),
             }),
         );
         shares.refresh_runtime_snapshots(&providers, Some(&accounts), &usage);
@@ -994,19 +1163,19 @@ async fn sync_one_share_to_router(
         .find(|share| share.id == share_id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("share not found"))?;
-    let descriptor = router_client::descriptor_for_share_with_accounts_and_usage(
+    let descriptor = descriptor_for_share_with_accounts_and_usage(
         &share,
         &providers,
         Some(&accounts),
         Some(&usage),
     );
-    let op = router_client::ShareSyncOperation {
+    let op = ShareSyncOperation {
         kind: "upsert".to_string(),
         share_id: None,
         share: Some(descriptor),
     };
     let http_client = state.http_client().await;
-    let result = router_client::batch_sync_shares(&http_client, config, vec![op]).await;
+    let result = client::batch_sync_shares(&http_client, config, vec![op]).await;
     let router_base = config.router_api_base().map(str::to_string);
     {
         let mut store = state.shares.write().await;
@@ -1014,7 +1183,7 @@ async fn sync_one_share_to_router(
             Ok(()) => {
                 store.router_registered = true;
                 store.last_router_error = None;
-                store.mark_router_sync(share_id, router_base, Ok(crate::core::usage::now_ms()));
+                store.mark_router_sync(share_id, router_base, Ok(crate::infra::time::now_ms()));
             }
             Err(error) => {
                 let message = error.to_string();
@@ -1041,7 +1210,7 @@ async fn listen_for_share_edit_events_once(state: ServerState) -> anyhow::Result
     if config.router.identity.is_none() || state.shares.read().await.shares.is_empty() {
         return Ok(());
     }
-    let url = router_client::share_edit_events_url(&config)?;
+    let url = client::share_edit_events_url(&config)?;
     let http_client = state.http_client().await;
     let response = http_client
         .get(url)
@@ -1146,7 +1315,7 @@ async fn mark_usage_router_sync(state: &ServerState, request_id: &str, result: R
                 log.router_sync_attempt_count = log.router_sync_attempt_count.saturating_add(1);
                 match &result {
                     Ok(()) => {
-                        log.router_last_synced_at_ms = Some(crate::core::usage::now_ms());
+                        log.router_last_synced_at_ms = Some(crate::infra::time::now_ms());
                         log.router_last_sync_error = None;
                     }
                     Err(error) => {
@@ -1190,7 +1359,7 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
     }
     if config.router.identity.is_none() {
         let http_client = state.http_client().await;
-        if let Err(error) = router_client::register_installation(&http_client, &mut config).await {
+        if let Err(error) = client::register_installation(&http_client, &mut config).await {
             record_router_error(&state, &config, error.to_string()).await;
             return Err(error);
         }
@@ -1214,10 +1383,10 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
         .clone()
         .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))?;
     let http_client = state.http_client().await;
-    if let Err(error) = router_client::claim_client_tunnel(
+    if let Err(error) = client::claim_client_tunnel(
         &http_client,
         &config,
-        router_client::ClientTunnelConfig {
+        client::ClientTunnelConfig {
             owner_email,
             subdomain: subdomain.clone(),
             enabled: true,
@@ -1228,8 +1397,7 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
         record_router_error(&state, &config, error.to_string()).await;
         return Err(error);
     }
-    let lease = match router_client::issue_client_web_lease(&http_client, &config, subdomain).await
-    {
+    let lease = match client::issue_client_web_lease(&http_client, &config, subdomain).await {
         Ok(lease) => lease,
         Err(error) => {
             record_router_error(&state, &config, error.to_string()).await;
@@ -1282,7 +1450,7 @@ async fn issue_share_tunnel_lease(
     if !share.enabled || share.status != "active" {
         anyhow::bail!("share is not active");
     }
-    let descriptor = router_client::descriptor_for_share_with_accounts_and_usage(
+    let descriptor = descriptor_for_share_with_accounts_and_usage(
         &share,
         &providers,
         Some(&accounts),
@@ -1290,8 +1458,8 @@ async fn issue_share_tunnel_lease(
     );
     let requested_subdomain = descriptor.subdomain.clone();
     let http_client = state.http_client().await;
-    router_client::claim_share_subdomain(&http_client, &config, descriptor.clone()).await?;
-    router_client::issue_share_lease(&http_client, &config, requested_subdomain, descriptor).await
+    client::claim_share_subdomain(&http_client, &config, descriptor.clone()).await?;
+    client::issue_share_lease(&http_client, &config, requested_subdomain, descriptor).await
 }
 
 #[cfg(test)]
@@ -1300,10 +1468,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::cli::Cli;
-    use crate::core::provider::{AppKind, ProviderType};
-    use crate::core::shares::{Share, ShareAcl, UpsertShareInput};
-    use crate::core::tunnel::TunnelRuntimeStatus;
-    use crate::core::usage::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
+    use crate::clients::router::tunnel::TunnelRuntimeStatus;
+    use crate::domain::providers::model::{AppKind, ProviderType};
+    use crate::domain::sharing::shares::{Share, ShareAcl, UpsertShareInput};
+    use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
 
     use super::*;
 

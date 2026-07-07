@@ -11,11 +11,11 @@ use super::copilot_optimizer::{
 use super::request_governance::{govern_request_body, RequestGovernanceConfig};
 use super::thinking::{apply_thinking_pipeline, ThinkingPipelineConfig};
 use super::{join_url, setting, transforms, ProxyError, ProxyRoute};
-use crate::core::account_managers::{manager_for, AccountManager, CredentialKind};
-use crate::core::accounts::AccountStore;
-use crate::core::provider::{AppKind, ProviderType};
-use crate::core::providers::StoredProvider;
-use crate::core::usage::{usage_from_json, TokenUsage};
+use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
+use crate::domain::accounts::store::AccountStore;
+use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::store::StoredProvider;
+use crate::domain::usage::store::{usage_from_json, TokenUsage};
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -1340,7 +1340,7 @@ fn base_without_duplicate_version(base_url: &str, path: &str) -> String {
 }
 
 fn app_configured_base_url(
-    provider: &crate::core::provider::Provider,
+    provider: &crate::domain::providers::model::Provider,
     app: AppKind,
 ) -> Option<String> {
     match app {
@@ -1357,7 +1357,7 @@ fn app_configured_base_url(
     }
 }
 
-fn configured_api_format(provider: &crate::core::provider::Provider) -> Option<&str> {
+fn configured_api_format(provider: &crate::domain::providers::model::Provider) -> Option<&str> {
     provider
         .meta
         .as_ref()
@@ -1936,7 +1936,9 @@ fn apply_auth_headers(
     Ok(())
 }
 
-fn codex_oauth_chatgpt_account_id(account: &crate::core::accounts::Account) -> Option<String> {
+fn codex_oauth_chatgpt_account_id(
+    account: &crate::domain::accounts::store::Account,
+) -> Option<String> {
     account
         .profile
         .as_ref()
@@ -1973,7 +1975,7 @@ fn codex_oauth_chatgpt_account_id_from_value(value: &Value) -> Option<String> {
 
 fn apply_common_provider_headers(
     headers: &mut Vec<(&'static str, String)>,
-    provider: &crate::core::provider::Provider,
+    provider: &crate::domain::providers::model::Provider,
     provider_type: ProviderType,
 ) {
     if provider_type != ProviderType::GitHubCopilot {
@@ -2004,7 +2006,9 @@ fn now_ms_i64() -> i64 {
         .as_millis() as i64
 }
 
-pub(super) fn codex_config_base_url(provider: &crate::core::provider::Provider) -> Option<String> {
+pub(super) fn codex_config_base_url(
+    provider: &crate::domain::providers::model::Provider,
+) -> Option<String> {
     let config = provider
         .settings_config
         .get("config")
@@ -2982,7 +2986,7 @@ mod tests {
     ) -> StoredProvider {
         StoredProvider {
             app,
-            provider: crate::core::provider::Provider {
+            provider: crate::domain::providers::model::Provider {
                 id: format!("{}-fixture", provider_type.as_str()),
                 name: provider_type.as_str().to_string(),
                 settings_config,
@@ -2997,8 +3001,8 @@ mod tests {
 
     fn codex_oauth_stored_provider_with_account_binding(account_id: &str) -> StoredProvider {
         let mut stored = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}));
-        stored.provider.meta = Some(crate::core::provider::ProviderMeta {
-            auth_binding: Some(crate::core::provider::AuthBinding {
+        stored.provider.meta = Some(crate::domain::providers::model::ProviderMeta {
+            auth_binding: Some(crate::domain::providers::model::AuthBinding {
                 source: Some("account".to_string()),
                 auth_provider: Some("codex_oauth".to_string()),
                 account_id: Some(account_id.to_string()),
@@ -3012,8 +3016,8 @@ mod tests {
         account_id: &str,
         access_token: &str,
         profile: Value,
-    ) -> crate::core::accounts::Account {
-        crate::core::accounts::Account {
+    ) -> crate::domain::accounts::store::Account {
+        crate::domain::accounts::store::Account {
             id: account_id.to_string(),
             provider_type: ProviderType::CodexOAuth,
             email: Some("codex@example.test".to_string()),
@@ -3112,7 +3116,7 @@ mod tests {
     fn gemini_api_key_adapter_contract_uses_native_endpoint_and_key_header() {
         let stored = StoredProvider {
             app: AppKind::Gemini,
-            provider: crate::core::provider::Provider {
+            provider: crate::domain::providers::model::Provider {
                 id: "gemini-1".to_string(),
                 name: "Gemini".to_string(),
                 settings_config: json!({
@@ -4193,7 +4197,7 @@ mod tests {
         let adapter = adapter_for(AppKind::Codex, ProviderType::OpenRouter);
         let stored = StoredProvider {
             app: AppKind::Codex,
-            provider: crate::core::provider::Provider {
+            provider: crate::domain::providers::model::Provider {
                 id: "p1".to_string(),
                 name: "openrouter".to_string(),
                 settings_config: json!({
@@ -4204,7 +4208,7 @@ mod tests {
                     }
                 }),
                 category: None,
-                meta: Some(crate::core::provider::ProviderMeta {
+                meta: Some(crate::domain::providers::model::ProviderMeta {
                     custom_user_agent: Some("cc-switch-server-test".to_string()),
                     ..Default::default()
                 }),
@@ -4386,7 +4390,7 @@ mod tests {
         let adapter = adapter_for(AppKind::Claude, ProviderType::ClaudeAuth);
         let stored = StoredProvider {
             app: AppKind::Claude,
-            provider: crate::core::provider::Provider {
+            provider: crate::domain::providers::model::Provider {
                 id: "p1".to_string(),
                 name: "ClaudeAuth Relay".to_string(),
                 settings_config: json!({
@@ -4449,7 +4453,7 @@ mod tests {
     fn codex_responses_contract_uses_openai_compatible_path() {
         let stored = StoredProvider {
             app: AppKind::Codex,
-            provider: crate::core::provider::Provider {
+            provider: crate::domain::providers::model::Provider {
                 id: "codex-1".to_string(),
                 name: "Codex".to_string(),
                 settings_config: json!({

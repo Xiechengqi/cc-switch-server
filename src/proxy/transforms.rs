@@ -2606,7 +2606,7 @@ fn usage_number(usage: Option<&Value>, paths: &[&[&str]]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::usage::usage_from_json;
+    use crate::domain::usage::store::usage_from_json;
 
     #[test]
     fn openai_chat_to_anthropic_preserves_tools_thinking_cache_and_image() {

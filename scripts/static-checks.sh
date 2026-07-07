@@ -11,9 +11,10 @@ echo "== json parse =="
 node - <<'NODE'
 const fs = require('fs');
 for (const file of [
+  'assets/contract/provider-coverage.json',
+  'assets/contract/provider-fixtures/structures.json',
+  'assets/contract/web-runtime-contract.json',
   'docs/code-agent-regression-matrix.json',
-  'docs/provider-coverage.json',
-  'docs/provider-fixtures/structures.json',
 ]) {
   JSON.parse(fs.readFileSync(file, 'utf8'));
 }
@@ -21,29 +22,28 @@ console.log('json ok');
 NODE
 
 echo "== node syntax =="
-node --check scripts/audit-provider-coverage.mjs
-node --check scripts/audit-transform-coverage.mjs
-node --check scripts/audit-ui-provider-matrix.mjs
-node --check scripts/audit-web-i18n-literals.mjs
-node --check scripts/audit-web-runtime-contract.mjs
-node --check scripts/audit-web-dist-size.mjs
-node --check scripts/import-desktop-export.mjs
-node --check scripts/scan-upstream-changes.mjs
-node --check scripts/write-acceptance-evidence.mjs
+mapfile -t node_scripts < <(find scripts -type f -name '*.mjs' | sort)
+for file in "${node_scripts[@]}"; do
+  node --check "$file"
+done
 
 echo "== shell syntax =="
-for file in scripts/*.sh; do
+mapfile -t shell_scripts < <(find scripts -type f -name '*.sh' | sort)
+for file in "${shell_scripts[@]}"; do
   bash -n "$file"
 done
 
 echo "== provider audits =="
-node scripts/audit-provider-coverage.mjs --check
-node scripts/audit-ui-provider-matrix.mjs --check
-node scripts/audit-web-i18n-literals.mjs
-node scripts/audit-web-runtime-contract.mjs
+node scripts/audit/audit-provider-coverage.mjs --check
+node scripts/audit/audit-ui-provider-matrix.mjs --check
+node scripts/audit/audit-web-i18n-literals.mjs
+node scripts/audit/audit-web-runtime-contract.mjs
 
 echo "== web dist size =="
-node scripts/audit-web-dist-size.mjs
+node scripts/audit/audit-web-dist-size.mjs
+
+echo "== desktop ui sync drift =="
+node scripts/sync/sync-desktop-ui.mjs --check
 
 echo "== web source typecheck =="
 if [[ -d web-src && -d web-src/node_modules ]]; then
@@ -53,10 +53,10 @@ else
 fi
 
 echo "== transform coverage audit =="
-node scripts/audit-transform-coverage.mjs
+node scripts/audit/audit-transform-coverage.mjs
 
 echo "== upstream scan =="
-node scripts/scan-upstream-changes.mjs --fail-on-must-review
+node scripts/sync/scan-upstream-changes.mjs --fail-on-must-review
 
 echo "== web dist asset references =="
 node - <<'NODE'
@@ -82,5 +82,22 @@ NODE
 
 echo "== diff whitespace =="
 git diff --check
+
+echo "== dependency direction =="
+if rg -n 'crate::(http|api)\b' src/proxy; then
+  echo 'proxy must not depend on api/http'; exit 1
+fi
+if rg -n 'crate::clients\b' src/proxy; then
+  echo 'proxy must not depend on clients; route outbound client work through state/api orchestration'; exit 1
+fi
+if rg -n 'crate::(api|http|clients|proxy)\b' src/domain; then
+  echo 'domain must stay pure'; exit 1
+fi
+if rg -n 'crate::(api|http|proxy)\b' src/clients; then
+  echo 'clients must not depend on api/proxy'; exit 1
+fi
+if rg -n 'crate::(api|http|clients|domain|proxy)\b' src/infra; then
+  echo 'infra must be the bottom layer'; exit 1
+fi
 
 echo "static checks ok"

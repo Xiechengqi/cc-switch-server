@@ -3181,6 +3181,8 @@
       "action": "Owner メールを変更",
       "title": "Owner メールを変更",
       "description": "先にルーターを選択し、新しい owner メールを入力して、そのメールに届いた確認コードを検証します。",
+      "confirmTitle": "Owner 変更を確認しますか？",
+      "confirmMessage": "以下のメールに server owner を変更しますか？変更後は新しいメールで router にログインする必要があります。",
       "routerStep": "ルーター",
       "emailStep": "新しい owner",
       "codeStep": "コード",
@@ -3195,6 +3197,17 @@
       "submit": "Owner を変更",
       "success": "Share owner を {{email}} に変更しました",
       "failed": "share owner の変更に失敗しました：{{error}}"
+    },
+    "transferOwner": {
+      "action": "Owner に設定",
+      "confirmTitle": "Owner を移譲しますか？",
+      "confirmMessage": "以下のメールを owner に昇格し、現在の owner を shareto に降格します。この操作は router に同期されます。",
+      "confirmAction": "移譲を確認"
+    },
+    "ownerEmailChange": {
+      "confirmTitle": "Owner メールを変更しますか？",
+      "confirmMessage": "share owner を以下のメールに変更しますか？この操作は router に同期されます。",
+      "confirmAction": "変更を確認"
     },
     "validation": {
       "invalidJson": "JSON は有効で、かつオブジェクトである必要があります",

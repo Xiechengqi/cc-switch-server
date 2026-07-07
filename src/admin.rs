@@ -6,15 +6,15 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::api::web::assets as web_assets;
+use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::{Cli, ConfigCommand, PasswordCommand};
-use crate::core::accounts::{accounts_path, AccountStore};
-use crate::core::config::{config_path, RouterIdentity, ServerConfig};
-use crate::core::providers::{providers_path, ProviderStore};
-use crate::core::shares::{shares_path, ShareStore};
-use crate::core::tunnel::{tunnels_path, TunnelRuntimeStatus};
-use crate::core::usage::{usage_path, UsageStore};
-use crate::coverage::ProviderCoverage;
-use crate::web_assets;
+use crate::clients::router::tunnel::{tunnels_path, TunnelRuntimeStatus};
+use crate::domain::accounts::store::{accounts_path, AccountStore};
+use crate::domain::providers::store::{providers_path, ProviderStore};
+use crate::domain::settings::config::{config_path, RouterIdentity, ServerConfig};
+use crate::domain::sharing::shares::{shares_path, ShareStore};
+use crate::domain::usage::store::{usage_path, UsageStore};
 
 pub fn run_config_command(cli: &Cli, command: ConfigCommand) -> anyhow::Result<()> {
     match command {
@@ -64,7 +64,7 @@ fn reset_password(cli: &Cli, password: Option<String>, stdin: bool) -> anyhow::R
     config
         .save(&config_dir)
         .context("save server.json with new password")?;
-    crate::core::web_auth::WebAuthStore::load(config_dir.clone())
+    crate::domain::web_auth::WebAuthStore::load(config_dir.clone())
         .revoke_all_sessions()
         .map_err(|error| anyhow::anyhow!(error.to_string()))
         .context("revoke active web auth sessions")?;
@@ -378,11 +378,11 @@ fn check_share_provider_links(report: &mut DoctorReport, snapshot: &ConfigSnapsh
     }
 }
 
-fn app_label(app: crate::core::provider::AppKind) -> &'static str {
+fn app_label(app: crate::domain::providers::model::AppKind) -> &'static str {
     match app {
-        crate::core::provider::AppKind::Claude => "claude",
-        crate::core::provider::AppKind::Codex => "codex",
-        crate::core::provider::AppKind::Gemini => "gemini",
+        crate::domain::providers::model::AppKind::Claude => "claude",
+        crate::domain::providers::model::AppKind::Codex => "codex",
+        crate::domain::providers::model::AppKind::Gemini => "gemini",
     }
 }
 

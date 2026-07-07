@@ -44,7 +44,7 @@ export STREAM_PROBE=0
 推荐直接运行：
 
 ```bash
-scripts/router-market-smoke.sh
+scripts/smoke/router-market-smoke.sh
 ```
 
 ## 字段对照
@@ -108,7 +108,7 @@ share-market grant 会在 router 中转成 pending share edit。server 侧通过
 真实 add/revoke smoke 使用：
 
 ```bash
-scripts/share-market-grant-smoke.sh
+scripts/smoke/share-market-grant-smoke.sh
 ```
 
 该脚本只调用 router 的 share-market grant API 和 server 的 share edit pull/API，不修改 router、market 或 cc-switch 代码。缺少 `SHARE_MARKET_GRANT_TOKEN`、buyer/listing/order 等真实输入时，它输出 `[BLOCKED]` 并写入脱敏 evidence；不会把 add/revoke 标记为通过。

@@ -16,6 +16,8 @@ interface ConfirmDialogProps {
   isOpen: boolean;
   title: string;
   message: string;
+  /** 完整展示的关键文本（如邮箱），避免在 message 里被截断 */
+  highlight?: string;
   confirmText?: string;
   cancelText?: string;
   variant?: "destructive" | "info";
@@ -31,6 +33,7 @@ export function ConfirmDialog({
   isOpen,
   title,
   message,
+  highlight,
   confirmText,
   cancelText,
   variant = "destructive",
@@ -74,6 +77,11 @@ export function ConfirmDialog({
             {message}
           </DialogDescription>
         </DialogHeader>
+        {highlight ? (
+          <p className="break-all px-6 text-sm font-medium leading-relaxed text-foreground">
+            {highlight}
+          </p>
+        ) : null}
         {checkboxLabel ? (
           <label className="flex cursor-pointer select-none items-start gap-2 px-6 pt-3">
             <Checkbox

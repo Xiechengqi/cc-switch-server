@@ -13,13 +13,13 @@ scripts/static-checks.sh
 完整本地验证：
 
 ```bash
-node scripts/audit-provider-coverage.mjs --check
-node scripts/audit-ui-provider-matrix.mjs --check
+node scripts/audit/audit-provider-coverage.mjs --check
+node scripts/audit/audit-ui-provider-matrix.mjs --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-scripts/validate-local.sh
-scripts/smoke-local.sh
-MODE=binary scripts/deployment-smoke.sh
+scripts/audit/validate-local.sh
+scripts/smoke/smoke-local.sh
+MODE=binary scripts/smoke/deployment-smoke.sh
 RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 ```
 
@@ -28,8 +28,8 @@ RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 ```bash
 cargo fmt --check
 cargo check
-node scripts/audit-provider-coverage.mjs --check
-node scripts/audit-ui-provider-matrix.mjs --check
+node scripts/audit/audit-provider-coverage.mjs --check
+node scripts/audit/audit-ui-provider-matrix.mjs --check
 cargo test
 ```
 
@@ -112,7 +112,7 @@ healthcheck:
 CC_SWITCH_SERVER_TOKEN=... \
 SERVER_URL=http://127.0.0.1:15721 \
 SHARE_ID=share-id \
-scripts/router-market-smoke.sh
+scripts/smoke/router-market-smoke.sh
 ```
 
 脚本只通过 server/market HTTP API 探测，不修改 router、market 或 cc-switch 代码。

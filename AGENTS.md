@@ -34,16 +34,26 @@
 - `UPSTREAM_IMPORT.md`
 - `docs/provider-coverage.md`
 
+## 状态写入
+
+新代码禁止在 `state.rs` 之外直接对 `ServerStateInner` 的存储字段 `.write().await` 后修改数据；必须通过 `ServerStateInner` 的域方法封装读改写和持久化策略。跨存储写操作按字段声明顺序获取锁：config → providers → universal_providers → accounts → failover → pricing → usage → shares → ui_settings → sessions → oauth_logins。
+
+shares 写路径已收敛到 `mutate_shares_immediate` / `try_mutate_shares_immediate` / `mutate_shares_debounced` / `mutate_share` / `replace_shares` / `validate_share_invocation`，调用方不得再直接感知 shares 的立即保存或 debounce 落盘细节。
+
+## 依赖方向
+
+`domain` 不能依赖 `api`、`clients`、`proxy`；`proxy` 不能依赖 `api/http` 或 `clients`。转发热路径需要触发出站 OAuth/router 客户端时，必须通过 `state.rs` 或控制面编排方法封装状态读写、锁和持久化策略。
+
 ## UI 对齐
 
-Server Web UI 必须以 desktop 组件同源移植为准。正式实施计划见 `docs/server-desktop-ui-parity-plan.md`；人工验收见 `docs/manual-ui-checklist.md`。功能边界以 `docs/web-runtime-contract.json` 为准。
+Server Web UI 必须以 desktop 组件同源移植为准。正式实施计划见 `docs/server-desktop-ui-parity-plan.md`；人工验收见 `docs/manual-ui-checklist.md`。功能边界以 `assets/contract/web-runtime-contract.json` 为准。
 
 本地-only 重构笔记（已 gitignore，不提交）：`UI_PARITY_PLAN.md`、`DESKTOP_ALIGNMENT_TASKS.md`、`SERVER_IMPLEMENTATION_PLAN.md`、`MIGRATION_LEDGER.md`、`docs/remaining-work-index.md`。
 
 同步 desktop 组件：
 
 ```bash
-node scripts/sync-desktop-ui.mjs
+node scripts/sync/sync-desktop-ui.mjs
 ```
 
 ## 验证
@@ -53,9 +63,9 @@ node scripts/sync-desktop-ui.mjs
 - `cargo fmt --check`
 - `cargo check`
 - `cargo test`
-- `node scripts/audit-provider-coverage.mjs --check`
-- `node scripts/audit-ui-provider-matrix.mjs --check`
-- `scripts/smoke-local.sh`
+- `node scripts/audit/audit-provider-coverage.mjs --check`
+- `node scripts/audit/audit-ui-provider-matrix.mjs --check`
+- `scripts/smoke/smoke-local.sh`
 - `RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh`
 
 真实 router/market/OAuth/share-market grant 输入齐备前，只能运行本地验证和离线 readiness；不得把缺真实输入的项目标记为真实通过。

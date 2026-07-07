@@ -30,8 +30,8 @@ set +a
 加载后先做脱敏自检：
 
 ```bash
-scripts/real-acceptance-env-check.sh
-STRICT=1 scripts/real-acceptance-env-check.sh
+scripts/smoke/real-acceptance-env-check.sh
+STRICT=1 scripts/smoke/real-acceptance-env-check.sh
 ```
 
 ## 推荐顺序
@@ -45,20 +45,20 @@ scripts/static-checks.sh
 完整本地验证（会运行 `cargo check/test` 并通过 `cargo run` 启动本地 server）：
 
 ```bash
-scripts/validate-local.sh
-scripts/smoke-local.sh
+scripts/audit/validate-local.sh
+scripts/smoke/smoke-local.sh
 RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 ```
 
 真实 router/market/provider 输入齐备后：
 
 ```bash
-STRICT=1 scripts/real-acceptance-env-check.sh
-RUN_PROBES=1 STREAM_PROBE=1 scripts/direct-market-diagnostics.sh
-scripts/router-market-smoke.sh
-RUN_REAL=1 STREAM_PROBE=1 scripts/code-agent-regression.sh
-scripts/oauth-readiness-check.sh
-scripts/share-market-grant-smoke.sh
+STRICT=1 scripts/smoke/real-acceptance-env-check.sh
+RUN_PROBES=1 STREAM_PROBE=1 scripts/smoke/direct-market-diagnostics.sh
+scripts/smoke/router-market-smoke.sh
+RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
+scripts/smoke/oauth-readiness-check.sh
+scripts/smoke/share-market-grant-smoke.sh
 RUN_REAL=1 scripts/release-readiness.sh
 ```
 
@@ -126,7 +126,7 @@ OAuth refresh fixture 的最小验收顺序：
 4. 再跑同一 provider 的 non-stream 和 stream 短请求，记录 requestId、status、actualModel、usage 摘要。
 5. direct/market 入口只记录 URL、状态码、requestId 和脱敏账号，不记录 provider raw response。
 
-Cursor/Copilot/Kiro/Bedrock 的真实验收变量已经接入 `scripts/real-acceptance-env-check.sh` 的 AB7 gate 和 `scripts/oauth-readiness-check.sh` 的脱敏 evidence。变量齐备只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。
+Cursor/Copilot/Kiro/Bedrock 的真实验收变量已经接入 `scripts/smoke/real-acceptance-env-check.sh` 的 AB7 gate 和 `scripts/smoke/oauth-readiness-check.sh` 的脱敏 evidence。变量齐备只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。
 
 ### share-market grant
 
@@ -143,16 +143,16 @@ Cursor/Copilot/Kiro/Bedrock 的真实验收变量已经接入 `scripts/real-acce
 
 以下脚本支持 `EVIDENCE_FILE=/tmp/...json`，只写脱敏摘要：
 
-- `scripts/real-acceptance-env-check.sh`
-- `scripts/router-market-smoke.sh`
-- `scripts/direct-market-diagnostics.sh`
-- `scripts/code-agent-regression.sh`
-- `scripts/oauth-readiness-check.sh`
-- `scripts/share-market-grant-smoke.sh`
+- `scripts/smoke/real-acceptance-env-check.sh`
+- `scripts/smoke/router-market-smoke.sh`
+- `scripts/smoke/direct-market-diagnostics.sh`
+- `scripts/smoke/code-agent-regression.sh`
+- `scripts/smoke/oauth-readiness-check.sh`
+- `scripts/smoke/share-market-grant-smoke.sh`
 - `scripts/release-readiness.sh`
 
 检查 evidence 是否包含密钥形态：
 
 ```bash
-scripts/evidence-redaction-check.sh /tmp/cc-switch-server-evidence/result.json
+scripts/audit/evidence-redaction-check.sh /tmp/cc-switch-server-evidence/result.json
 ```

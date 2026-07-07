@@ -8,6 +8,7 @@ import {
 } from "@/lib/query";
 import { normalizeShareRouterDomain } from "@/utils/shareRouter";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import {
   Dialog,
   DialogContent,
@@ -50,6 +51,7 @@ export function ShareOwnerChangeEmailDialog({
   const [newEmail, setNewEmail] = useState("");
   const [code, setCode] = useState("");
   const [codeSentTo, setCodeSentTo] = useState("");
+  const [changeOwnerConfirmOpen, setChangeOwnerConfirmOpen] = useState(false);
   const wasOpenRef = useRef(false);
 
   useEffect(() => {
@@ -60,6 +62,7 @@ export function ShareOwnerChangeEmailDialog({
       setNewEmail("");
       setCode("");
       setCodeSentTo("");
+      setChangeOwnerConfirmOpen(false);
     }
     wasOpenRef.current = open;
   }, [open, tunnelConfig.domain]);
@@ -134,6 +137,7 @@ export function ShareOwnerChangeEmailDialog({
   };
 
   return (
+    <>
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md">
         <DialogHeader>
@@ -320,7 +324,7 @@ export function ShareOwnerChangeEmailDialog({
           ) : (
             <Button
               type="button"
-              onClick={() => void handleChangeOwner()}
+              onClick={() => setChangeOwnerConfirmOpen(true)}
               disabled={!canSubmitChange || changeOwnerMutation.isPending}
             >
               {t("share.ownerChange.submit", {
@@ -331,5 +335,25 @@ export function ShareOwnerChangeEmailDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+      <ConfirmDialog
+        isOpen={changeOwnerConfirmOpen}
+        title={t("share.ownerChange.confirmTitle", {
+          defaultValue: "确认换绑 Owner?",
+        })}
+        message={t("share.ownerChange.confirmMessage", {
+          defaultValue:
+            "确认将 server owner 换绑为以下邮箱？换绑后需使用新邮箱登录 router。",
+        })}
+        highlight={codeSentTo || normalizedNewEmail}
+        confirmText={t("share.ownerChange.submit", {
+          defaultValue: "确认换绑",
+        })}
+        onConfirm={() => {
+          setChangeOwnerConfirmOpen(false);
+          void handleChangeOwner();
+        }}
+        onCancel={() => setChangeOwnerConfirmOpen(false)}
+      />
+    </>
   );
 }

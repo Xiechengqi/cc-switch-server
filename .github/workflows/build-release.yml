@@ -45,7 +45,7 @@ jobs:
         run: npm ci --prefix web-src --ignore-scripts --no-audit --no-fund
 
       - name: Build embedded web assets
-        run: SKIP_NPM_INSTALL=1 scripts/build-web.sh
+        run: SKIP_NPM_INSTALL=1 scripts/sync/build-web.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

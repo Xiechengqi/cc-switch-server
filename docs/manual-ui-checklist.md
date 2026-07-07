@@ -77,5 +77,5 @@ Record manual findings in the relevant implementation note or PR/commit summary:
 - 2026-07-03 static-only pass: not run in a browser.
 - Reason: current implementation pass prohibits deployment/startup and UI automation.
 - Static gate used: `scripts/static-checks.sh`; native invoke registry audit currently reports no registered-not-implemented command and checks implemented commands against `web_invoke_dispatch`.
-- Phase M/M1+N2 i18n static pass is implemented: language switch is in Settings, the desktop zh/zh-TW/en/ja locale files are copied as the migration baseline, page-level and Dashboard body copy use the lightweight runtime dictionary/`tx()` layer, and `scripts/audit-web-i18n-literals.mjs` currently reports zero JSX English literals. Human reviewers still need to check translated text fit in real viewports.
+- Phase M/M1+N2 i18n static pass is implemented: language switch is in Settings, the desktop zh/zh-TW/en/ja locale files are copied as the migration baseline, page-level and Dashboard body copy use the lightweight runtime dictionary/`tx()` layer, and `scripts/audit/audit-web-i18n-literals.mjs` currently reports zero JSX English literals. Human reviewers still need to check translated text fit in real viewports.
 - Manual desktop and narrow viewport checks remain pending for a human reviewer.

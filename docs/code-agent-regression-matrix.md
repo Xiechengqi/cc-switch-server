@@ -2,7 +2,7 @@
 
 本矩阵对应 Z3/Z8。真实 provider/token 不存在时，只能执行本地 contract 和 mock 回归；真实账号回归不得伪标完成。
 
-AD3 已将本页矩阵固化为 `docs/code-agent-regression-matrix.json`。`scripts/code-agent-regression.sh` 会先运行 `scripts/code-agent-matrix-summary.mjs`，输出：
+AD3 已将本页矩阵固化为 `docs/code-agent-regression-matrix.json`。`scripts/smoke/code-agent-regression.sh` 会先运行 `scripts/smoke/code-agent-matrix-summary.mjs`，输出：
 
 - `matrixTotal`：矩阵组合总数。
 - `matrixRunnable`：当前环境变量齐备、可运行的组合数。
@@ -56,22 +56,22 @@ App-specific 变量优先级：
 ## 推荐命令
 
 ```bash
-scripts/code-agent-regression.sh
-scripts/router-market-smoke.sh
-node scripts/code-agent-matrix-summary.mjs
+scripts/smoke/code-agent-regression.sh
+scripts/smoke/router-market-smoke.sh
+node scripts/smoke/code-agent-matrix-summary.mjs
 ```
 
 真实 stream 回归：
 
 ```bash
-RUN_REAL=1 STREAM_PROBE=1 scripts/code-agent-regression.sh
-STREAM_PROBE=1 scripts/router-market-smoke.sh
-REQUIRE_STREAM_USAGE=1 RUN_REAL=1 STREAM_PROBE=1 scripts/code-agent-regression.sh
+RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
+STREAM_PROBE=1 scripts/smoke/router-market-smoke.sh
+REQUIRE_STREAM_USAGE=1 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 ```
 
-无真实 provider/token 时，`scripts/code-agent-regression.sh` 只跑 proxy/account contract 和可用的本地 server capability 检查；direct/market/real provider 请求会输出 skipped 或 warning，不标记真实成功。
+无真实 provider/token 时，`scripts/smoke/code-agent-regression.sh` 只跑 proxy/account contract 和可用的本地 server capability 检查；direct/market/real provider 请求会输出 skipped 或 warning，不标记真实成功。
 
-stream 分支统一使用 `scripts/stream-probe.mjs`，只保存状态码、首块耗时、chunk/byte 计数、done/usage 标记和最多 2KB preview，不保存完整 stream 响应。默认要求看到结束事件；`REQUIRE_STREAM_USAGE=1` 时才把 usage 标记作为硬通过条件。
+stream 分支统一使用 `scripts/smoke/stream-probe.mjs`，只保存状态码、首块耗时、chunk/byte 计数、done/usage 标记和最多 2KB preview，不保存完整 stream 响应。默认要求看到结束事件；`REQUIRE_STREAM_USAGE=1` 时才把 usage 标记作为硬通过条件。
 
 ## 记录模板
 

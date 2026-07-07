@@ -1,4 +1,4 @@
-use crate::core::usage::{usage_from_json, TokenUsage};
+use crate::domain::usage::store::{usage_from_json, TokenUsage};
 
 #[derive(Debug, Default)]
 pub struct StreamUsageAccumulator {

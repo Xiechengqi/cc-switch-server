@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "policy": {
     "realPrompts": "Use fixed low-cost ping prompts only. Do not run load tests from this matrix.",
-    "streamEvidence": "Store only stream summaries from scripts/stream-probe.mjs, never full provider streams.",
+    "streamEvidence": "Store only stream summaries from scripts/smoke/stream-probe.mjs, never full provider streams.",
     "secretPolicy": "No provider tokens, OAuth raw responses, or response bodies are stored in evidence."
   },
   "requiredFixtureFields": [

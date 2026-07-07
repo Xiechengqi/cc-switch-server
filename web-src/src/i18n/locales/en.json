@@ -3181,6 +3181,8 @@
       "action": "Change Owner Email",
       "title": "Change Owner Email",
       "description": "Choose a router, enter the new owner email, then verify the code sent to that email.",
+      "confirmTitle": "Confirm owner change?",
+      "confirmMessage": "Change the server owner to the email below? You will need to sign in to the router with the new email afterward.",
       "routerStep": "Router",
       "emailStep": "New owner",
       "codeStep": "Code",
@@ -3195,6 +3197,17 @@
       "submit": "Change Owner",
       "success": "Share owner changed to {{email}}",
       "failed": "Failed to change share owner: {{error}}"
+    },
+    "transferOwner": {
+      "action": "Set as Owner",
+      "confirmTitle": "Transfer owner?",
+      "confirmMessage": "Promote the email below to owner and demote the current owner to shareto. This will sync to the router.",
+      "confirmAction": "Confirm transfer"
+    },
+    "ownerEmailChange": {
+      "confirmTitle": "Change owner email?",
+      "confirmMessage": "Change the share owner to the email below? This will sync to the router.",
+      "confirmAction": "Confirm change"
     },
     "validation": {
       "invalidJson": "JSON must be valid and must be an object",

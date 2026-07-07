@@ -63,6 +63,7 @@ fn main() {
 fn configure_reruns() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=assets/contract");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=web-dist");

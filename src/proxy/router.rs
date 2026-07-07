@@ -1,8 +1,8 @@
 use axum::http::HeaderMap;
 
-use crate::core::failover::{current_time_ms, FailoverStore};
-use crate::core::provider::AppKind;
-use crate::core::providers::{ProviderStore, StoredProvider};
+use crate::domain::failover::{current_time_ms, FailoverStore};
+use crate::domain::providers::model::AppKind;
+use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
 use super::ProxyError;
 
@@ -88,8 +88,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::core::failover::{FailoverStore, ProviderOutcome, UpdateFailoverAppInput};
-    use crate::core::provider::{Provider, ProviderType};
+    use crate::domain::failover::{FailoverStore, ProviderOutcome, UpdateFailoverAppInput};
+    use crate::domain::providers::model::{Provider, ProviderType};
 
     fn provider(app: AppKind, id: &str) -> StoredProvider {
         StoredProvider {

@@ -3181,6 +3181,8 @@
       "action": "换绑 Owner 邮箱",
       "title": "换绑 Owner 邮箱",
       "description": "先选择路由节点，再填写新 owner 邮箱并验证该邮箱收到的验证码。",
+      "confirmTitle": "确认换绑 Owner?",
+      "confirmMessage": "确认将 server owner 换绑为以下邮箱？换绑后需使用新邮箱登录 router。",
       "routerStep": "路由",
       "emailStep": "新 owner",
       "codeStep": "验证码",
@@ -3195,6 +3197,17 @@
       "submit": "确认换绑",
       "success": "Share owner 已换绑为 {{email}}",
       "failed": "换绑 share owner 失败：{{error}}"
+    },
+    "transferOwner": {
+      "action": "设为 Owner",
+      "confirmTitle": "转移 Owner?",
+      "confirmMessage": "将以下邮箱升级为 owner，并把当前 owner 降级为 shareto。此操作会同步到 router。",
+      "confirmAction": "确认转移"
+    },
+    "ownerEmailChange": {
+      "confirmTitle": "更换 Owner 邮箱?",
+      "confirmMessage": "确认将 share owner 更换为以下邮箱？此操作会同步到 router。",
+      "confirmAction": "确认更换"
     },
     "validation": {
       "invalidJson": "JSON 格式无效，且必须为对象",

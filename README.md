@@ -117,10 +117,10 @@ scripts/static-checks.sh
 允许编译和启动本地 server 时执行完整本地验收：
 
 ```bash
-node scripts/audit-provider-coverage.mjs --check
-node scripts/audit-ui-provider-matrix.mjs --check
-scripts/validate-local.sh
-scripts/smoke-local.sh
+node scripts/audit/audit-provider-coverage.mjs --check
+node scripts/audit/audit-ui-provider-matrix.mjs --check
+scripts/audit/validate-local.sh
+scripts/smoke/smoke-local.sh
 RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 ```
 
@@ -130,9 +130,9 @@ RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 set -a
 source /tmp/cc-switch-server-real.env
 set +a
-STRICT=1 scripts/real-acceptance-env-check.sh
-RUN_PROBES=1 STREAM_PROBE=1 scripts/direct-market-diagnostics.sh
-RUN_REAL=1 STREAM_PROBE=1 scripts/code-agent-regression.sh
+STRICT=1 scripts/smoke/real-acceptance-env-check.sh
+RUN_PROBES=1 STREAM_PROBE=1 scripts/smoke/direct-market-diagnostics.sh
+RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 RUN_REAL=1 scripts/release-readiness.sh
 ```
 

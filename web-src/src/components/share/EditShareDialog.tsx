@@ -166,6 +166,7 @@ export function EditShareDialog({
   const { t } = useTranslation();
   const [saving, setSaving] = useState(false);
   const [confirmFreeOpen, setConfirmFreeOpen] = useState(false);
+  const [ownerEmailSaveConfirmOpen, setOwnerEmailSaveConfirmOpen] = useState(false);
   const [transferTargetEmail, setTransferTargetEmail] = useState<string | null>(
     null,
   );
@@ -652,6 +653,15 @@ export function EditShareDialog({
     forSaleInput !== "Yes" || saleMarketKindInput !== "token";
 
   const handleSave = async () => {
+    if (!hasChanges || hasInvalidChanges || busy) return;
+    if (ownerEmailDirty) {
+      setOwnerEmailSaveConfirmOpen(true);
+      return;
+    }
+    await executeSave();
+  };
+
+  const executeSave = async () => {
     if (!hasChanges || hasInvalidChanges || busy) return;
     setSaving(true);
     try {
@@ -1583,12 +1593,33 @@ export function EditShareDialog({
         })}
         message={t("share.transferOwner.confirmMessage", {
           defaultValue:
-            "将 {{target}} 升级为 owner，并把当前 owner {{owner}} 降级为 shareto。此操作会同步到 router。",
-          target: transferTargetEmail ?? "",
-          owner: share.ownerEmail,
+            "将以下邮箱升级为 owner，并把当前 owner 降级为 shareto。此操作会同步到 router。",
         })}
-        onConfirm={handleTransferOwner}
+        highlight={transferTargetEmail ?? undefined}
+        confirmText={t("share.transferOwner.confirmAction", {
+          defaultValue: "确认转移",
+        })}
+        onConfirm={() => void handleTransferOwner()}
         onCancel={() => setTransferTargetEmail(null)}
+      />
+      <ConfirmDialog
+        isOpen={ownerEmailSaveConfirmOpen}
+        title={t("share.ownerEmailChange.confirmTitle", {
+          defaultValue: "更换 Owner 邮箱?",
+        })}
+        message={t("share.ownerEmailChange.confirmMessage", {
+          defaultValue:
+            "确认将 share owner 更换为以下邮箱？此操作会同步到 router。",
+        })}
+        highlight={normalizedOwnerEmail}
+        confirmText={t("share.ownerEmailChange.confirmAction", {
+          defaultValue: "确认更换",
+        })}
+        onConfirm={() => {
+          setOwnerEmailSaveConfirmOpen(false);
+          void executeSave();
+        }}
+        onCancel={() => setOwnerEmailSaveConfirmOpen(false)}
       />
     </>
   );
