@@ -13,6 +13,7 @@ use tokio::time::{sleep, Duration};
 use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::Cli;
 use crate::clients::oauth::copilot_device;
+use crate::clients::oauth::codex_device::CodexDeviceFlowStore;
 use crate::clients::oauth::kiro_device::KiroDeviceFlowStore;
 use crate::clients::oauth::quota::{refresh_account_quota, QuotaRefreshResult};
 use crate::clients::oauth::refresh::{
@@ -60,6 +61,7 @@ pub struct ServerStateInner {
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
     pub kiro_device_flows: RwLock<KiroDeviceFlowStore>,
+    pub codex_device_flows: RwLock<CodexDeviceFlowStore>,
     pub cursor_sessions: CursorSessionManager,
     pub account_refresh_locks: AccountRefreshLocks,
     pub share_in_flight: Arc<ShareInFlightTracker>,
@@ -487,6 +489,7 @@ impl ServerStateInner {
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
             copilot_upstream_auth: RwLock::new(BTreeMap::new()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
+            codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             cursor_sessions: CursorSessionManager::default(),
             account_refresh_locks: AccountRefreshLocks::default(),
             share_in_flight: Arc::new(ShareInFlightTracker::default()),

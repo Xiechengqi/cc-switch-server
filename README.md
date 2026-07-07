@@ -51,6 +51,69 @@ market or direct share URL
 - `/api/events` 通过 SSE 推送 usage/share/tunnel 事件，Web 当前页会 debounce 刷新。
 - `cc-switch-server version --json` 和 `/version` 会输出版本、commit id、commit message、build time、target、profile、rustc 和 dirty 状态。
 
+## Code Agent 反代支持
+
+`cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini CLI** 三类官方 CLI 客户端入口，并选择性吸收 desktop `cc-switch` 的 provider 桥接能力。下表评分口径与同生态中 9router、CLIProxyAPI、OmniRoute、sub2api、cockpit-tools、cc-switch、composer-api 的静态分析一致（0–10 分，侧重协议覆盖、格式互译、认证多账号、健壮性与可运维性；对比来源见本地 `proxy/proxy.md`）。
+
+### 支持的客户端入口
+
+| Code Agent | 反代入口 | 状态 | 说明 |
+| --- | --- | --- | --- |
+| **Claude Code** | `POST /v1/messages` | ✅ Native | Anthropic Messages 原生转发；支持 Claude/Codex/Gemini/OpenRouter 等跨协议 adapter |
+| **Codex CLI** | `POST /v1/responses`、`POST /v1/chat/completions` | ✅ Native | Responses 与 Chat Completions 互转；Codex OAuth device flow 已接线 |
+| **Gemini CLI** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 透传；`GET /v1beta/models` 等列表端点已覆盖 |
+| **OpenAI-compatible** | `GET /v1/models`、`GET /models` | ✅ Native | 模型列表与 OpenAI-compatible 探测 |
+| **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | ⚠️ Partial | OAuth/模型列表已接入；无独立 `/antigravity/v1*` 路由组 |
+| **Cursor** | 作为 Claude/Codex 上游桥（非 IDE MITM） | ⚠️ Planned | AgentService h2/protobuf 静态 driver 已接线，需显式 opt-in；待真实验收 |
+| **GitHub Copilot** | 作为 Claude 上游桥 | ⚠️ Fallback | 静态 preflight 与 model map 已接入；token 交换与 live 回归待验收 |
+| **Kiro** | 作为 Claude 上游桥 | ⚠️ Planned | CodeWhisperer 协议桥已静态接线；仅 Claude app，待真实验收 |
+| **DeepSeek Account** | 作为 Claude 上游桥 | ⚠️ Planned | 账密协议桥与 PoW 已接线；Codex/Gemini 路径仍为 skeleton |
+| **Cline / OpenCode / Qoder / Trae / Windsurf / Zed** | — | ❌ 不支持 | server 产品边界不覆盖这些 IDE 专属 MITM 或插件生态 |
+
+能力分级：`✅ Native` = 静态 adapter contract 已覆盖且属主线验收对象；`⚠️ Planned` = 转发/签名已接线但缺真实 non-stream/stream 验收；`⚠️ Fallback` = skeleton 或 manual import 路径；`❌` = 未实现。详见 [`docs/code-agent-regression-matrix.md`](docs/code-agent-regression-matrix.md)。
+
+### 与同类反代项目横向对比（0–10）
+
+| Code Agent | 9router | CLIProxyAPI | OmniRoute | sub2api | cockpit-tools | cc-switch | **cc-switch-server** | composer-api |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Claude Code | 8.5 | **9.5** | 9.0 | 8.0 | 6.5 | 9.0 | **8.5** | 0 |
+| Codex CLI | 7.5 | **9.8** | 8.5 | 9.0 | 7.0 | 9.2 | **9.0** | 0 |
+| Gemini CLI | 7.5 | **9.5** | 8.5 | 8.0 | 6.0 | 8.0 | **7.8** | 0 |
+| Antigravity | 6.5 | **9.5** | 8.5 | 9.0 | 7.5 | 6.0 | **5.5** | 0 |
+| Cursor | 8.0 | 0 | **9.5** | 2.5 | 4.5 | 9.0 | **8.5** | **9.2** |
+| GitHub Copilot | 8.0 | 0 | 8.5 | 0 | 5.0 | **8.5** | **7.5** | 0 |
+| Cline | **8.0** | 0 | 3.0 | 0 | 0 | 0 | **0** | 0 |
+| OpenCode | 8.0 | 0 | **9.5** | 0 | 3.0 | 5.5 | **2.5** | 2.0 |
+| Kiro | **9.0** | 0 | 8.5 | 0 | 5.0 | 8.5 | **7.5** | 0 |
+| Qoder | **8.0** | 0 | 7.5 | 0 | 5.0 | 0 | **0** | 0 |
+| Trae | 0 | 0 | **8.5** | 0 | 5.0 | 0 | **0** | 0 |
+| Windsurf | 0 | 0 | **7.0** | 0 | 5.0 | 0 | **0** | 0 |
+| Zed | 0 | 0 | 5.0 | 0 | 5.0 | 0 | **0** | 0 |
+| **平均（13 agents）** | 6.08 | 2.95 | 7.81 | 2.81 | 4.96 | 4.90 | **4.37** | 0.86 |
+| **核心 4（Claude/Codex/Gemini/Antigravity）均分** | 7.50 | **9.58** | 8.63 | 8.50 | 6.75 | 8.05 | **7.70** | 0 |
+| **IDE 体验类 4（Cursor/Copilot/Kiro/Qoder）均分** | 8.25 | 0 | 8.50 | 0.63 | 4.88 | 6.50 | **5.88** | 2.30 |
+
+> **cc-switch-server 与 desktop cc-switch 的主要差异**：不依赖 Tauri 桌面运行时，**不提供 Claude Code 热切换**（需重启 CLI 使 provider 变更生效）；OAuth 浏览器登录部分能力仍待 server-native 接线；**额外提供** share/router 隧道、Web 管理面、remote usage 同步与多租户 share binding。Cursor/Kiro/Copilot/DeepSeek 等跨厂商后端桥与 desktop 共用 Rust 反代实现，但 capability 升级仍以真实验收为 gate。
+>
+> 其他项目分数摘自本地 `proxy` 目录静态分析（2026-07）；`cockpit-tools` 反代能力继承自内嵌 CLIProxyAPI sidecar，自身侧重账号管理 GUI。
+
+### 供应商 × App 能力矩阵（摘要）
+
+| 供应商类型 | Claude | Codex | Gemini | 能力 |
+| --- | :---: | :---: | :---: | --- |
+| Claude API / Auth / OAuth | ✅ | — | — | Native |
+| Codex / OpenAI OAuth | ✅ | ✅ | — | Native |
+| Gemini / Gemini CLI OAuth | ✅ | ✅ | ✅ | Native |
+| OpenRouter / Ollama / Nvidia / DeepSeek API | ✅ | ✅ | ✅ | Native |
+| Antigravity / Agy OAuth | ✅ | — | ✅ | Native（经预设映射） |
+| Cursor OAuth / API Key | ⚠️ | ⚠️ | ⚠️ | Planned（AgentService opt-in） |
+| AWS Bedrock | ⚠️ | ⚠️ | ⚠️ | Planned（SigV4 合同已生成） |
+| GitHub Copilot | ⚠️ | ⚠️ | ⚠️ | Fallback |
+| Kiro OAuth | ⚠️ | — | — | Planned（仅 Claude） |
+| DeepSeek Account | ⚠️ | — | — | Planned（仅 Claude） |
+
+完整 provider 类型与 preset 覆盖见 [`docs/provider-coverage.md`](docs/provider-coverage.md)；运行时矩阵可通过 `GET /api/provider-matrix` 获取。
+
 ## 快速开始
 
 开发启动：

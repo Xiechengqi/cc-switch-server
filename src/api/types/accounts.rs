@@ -104,6 +104,35 @@ pub(in crate::api) struct PollKiroDeviceLoginRequest {
     pub(in crate::api) device_code: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartCodexDeviceLoginRequest {}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartCodexDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) device: crate::clients::oauth::codex_device::CodexDeviceCodeResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollCodexDeviceLoginRequest {
+    pub(in crate::api) device_code: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollCodexDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) pending: bool,
+    pub(in crate::api) message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) retry_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) account: Option<AccountLoginAccountSummary>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct PollKiroDeviceLoginResponse {

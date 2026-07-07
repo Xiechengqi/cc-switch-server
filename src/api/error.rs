@@ -3,6 +3,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
+use crate::clients::oauth::codex_device::CodexDeviceError;
 use crate::clients::oauth::copilot_device::CopilotDeviceError;
 use crate::clients::oauth::kiro_device::KiroDeviceError;
 use crate::clients::router::email_auth::EmailAuthError;
@@ -181,6 +182,13 @@ pub(crate) fn map_copilot_device_error(error: CopilotDeviceError) -> ApiError {
 }
 
 pub(crate) fn map_kiro_device_error(error: KiroDeviceError) -> ApiError {
+    ApiError::new(
+        StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        error.message,
+    )
+}
+
+pub(crate) fn map_codex_device_error(error: CodexDeviceError) -> ApiError {
     ApiError::new(
         StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
         error.message,

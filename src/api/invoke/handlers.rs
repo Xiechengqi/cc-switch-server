@@ -1602,6 +1602,23 @@ pub(in crate::api) async fn web_managed_auth_start_login(
                 response.device.interval,
             ))
         }
+        ProviderType::CodexOAuth if !managed_auth_is_cli_oauth_flow(oauth_flow_mode_ref) => {
+            let response = start_codex_device_login(
+                State(state),
+                headers,
+                Json(StartCodexDeviceLoginRequest {}),
+            )
+            .await?
+            .0;
+            Ok(map_managed_auth_device_code(
+                provider_label,
+                &response.device.device_code,
+                &response.device.user_code,
+                &response.device.verification_uri,
+                response.device.expires_in,
+                response.device.interval,
+            ))
+        }
         _ => {
             let redirect_uri = Some(web_managed_auth_redirect_uri(
                 &state,
@@ -1691,6 +1708,26 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 .map(|account| account.id.as_str())
                 .ok_or_else(|| {
                     ApiError::bad_gateway("kiro device flow completed without account")
+                })?;
+            web_managed_auth_account_by_id(&state, account_id, provider_label).await
+        }
+        ProviderType::CodexOAuth if !device_code.starts_with("cli:") => {
+            let response = poll_codex_device_login(
+                State(state.clone()),
+                headers,
+                Json(PollCodexDeviceLoginRequest { device_code }),
+            )
+            .await?
+            .0;
+            if response.pending {
+                return Ok(Value::Null);
+            }
+            let account_id = response
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway("codex device flow completed without account")
                 })?;
             web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }

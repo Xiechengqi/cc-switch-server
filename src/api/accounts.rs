@@ -288,6 +288,96 @@ pub(in crate::api) async fn poll_kiro_device_login(
     }))
 }
 
+pub(in crate::api) async fn start_codex_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(_input): Json<StartCodexDeviceLoginRequest>,
+) -> Result<Json<StartCodexDeviceLoginResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let http_client = state.http_client().await;
+    let now = now_ms() as i64;
+    let (device, flow) = crate::clients::oauth::codex_device::start_device_flow(&http_client, now)
+        .await
+        .map_err(map_codex_device_error)?;
+    {
+        let mut store = state.codex_device_flows.write().await;
+        store.insert(device.device_code.clone(), flow, now);
+    }
+    Ok(Json(StartCodexDeviceLoginResponse { ok: true, device }))
+}
+
+pub(in crate::api) async fn poll_codex_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PollCodexDeviceLoginRequest>,
+) -> Result<Json<PollCodexDeviceLoginResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let now = now_ms() as i64;
+    let flow = {
+        let mut store = state.codex_device_flows.write().await;
+        store
+            .get(&input.device_code, now)
+            .ok_or_else(|| ApiError::unauthorized("codex device flow is expired or unknown"))?
+    };
+    let http_client = state.http_client().await;
+    let result = match crate::clients::oauth::codex_device::poll_device_flow(
+        &http_client,
+        &input.device_code,
+        &flow,
+        now,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            if matches!(
+                error.status,
+                StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
+            ) {
+                state
+                    .codex_device_flows
+                    .write()
+                    .await
+                    .remove(&input.device_code);
+            }
+            return Err(map_codex_device_error(error));
+        }
+    };
+    if result.pending {
+        return Ok(Json(PollCodexDeviceLoginResponse {
+            ok: true,
+            pending: true,
+            message: result.message,
+            retry_after_secs: result.retry_after_secs,
+            account: None,
+        }));
+    }
+    state
+        .codex_device_flows
+        .write()
+        .await
+        .remove(&input.device_code);
+    let account_input = result
+        .account_input
+        .ok_or_else(|| ApiError::bad_gateway("codex device flow completed without account"))?;
+    let provider_type = account_input.provider_type;
+    let account = state
+        .try_mutate_accounts_immediate(|store| {
+            manager_for(provider_type)
+                .finish_login(store, account_input)
+                .map_err(ApiError::bad_request)
+        })
+        .await
+        .map_err(ApiError::internal)??;
+    Ok(Json(PollCodexDeviceLoginResponse {
+        ok: true,
+        pending: false,
+        message: result.message,
+        retry_after_secs: None,
+        account: Some(AccountLoginAccountSummary::from_account(&account)),
+    }))
+}
+
 pub(in crate::api) async fn execute_account_login_token_exchange(
     state: &ServerState,
     finish: &mut OAuthLoginFinish,

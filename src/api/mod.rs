@@ -28,7 +28,7 @@ pub(crate) use control::{
 pub use control::{control_signature, refresh_share_usage_items, ControlRefreshShareUsageItem};
 pub use error::ApiError;
 pub(crate) use error::{
-    map_copilot_device_error, map_email_auth_error, map_kiro_device_error, map_share_patch_error,
+    map_copilot_device_error, map_codex_device_error, map_email_auth_error, map_kiro_device_error, map_share_patch_error,
     map_web_auth_error, ErrorResponse,
 };
 pub(in crate::api) use events::*;
@@ -235,6 +235,14 @@ pub fn app_router(state: ServerState) -> Router {
         .route(
             "/api/accounts/kiro/device/poll",
             post(poll_kiro_device_login),
+        )
+        .route(
+            "/api/accounts/codex/device/start",
+            post(start_codex_device_login),
+        )
+        .route(
+            "/api/accounts/codex/device/poll",
+            post(poll_codex_device_login),
         )
         .route("/api/accounts/:id", delete(delete_account))
         .route("/api/accounts/:id/refresh", post(refresh_account))
