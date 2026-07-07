@@ -16,6 +16,7 @@ pub(in crate::api) mod router;
 pub(crate) mod session;
 pub(in crate::api) mod settings;
 pub(in crate::api) mod shares;
+pub(in crate::api) mod subscription_quota;
 pub(in crate::api) mod types;
 pub(in crate::api) mod usage;
 
@@ -43,6 +44,7 @@ pub(crate) use session::{
 };
 pub(in crate::api) use settings::*;
 pub(in crate::api) use shares::*;
+pub(in crate::api) use subscription_quota::*;
 pub(in crate::api) use types::*;
 pub(in crate::api) use usage::*;
 

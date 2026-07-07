@@ -1,4 +1,9 @@
-import type { OpenCodeModel, OpenCodeProviderConfig, ProviderMeta } from "@/types";
+import type {
+  OpenCodeModel,
+  OpenCodeProviderConfig,
+  ProviderMeta,
+  ProviderTestConfig,
+} from "@/types";
 import type { PricingModelSourceOption } from "../ProviderAdvancedConfig";
 
 // ── Default configs ──────────────────────────────────────────────────
@@ -158,6 +163,23 @@ export const normalizePricingSource = (
   value?: string | null,
 ): PricingModelSourceOption =>
   value === "request" || value === "response" ? value : "inherit";
+
+/** Normalize persisted test config: only explicit `enabled: true` turns the switch on. */
+export function normalizeProviderTestConfig(
+  config?: ProviderTestConfig | null,
+): ProviderTestConfig {
+  if (!config) return { enabled: false };
+  return { ...config, enabled: config.enabled === true };
+}
+
+/** Preset test config fields without auto-enabling the separate-config switch. */
+export function presetProviderTestConfig(
+  config?: ProviderTestConfig | null,
+): ProviderTestConfig {
+  if (!config) return { enabled: false };
+  const { enabled: _ignored, ...fields } = config;
+  return { ...fields, enabled: false };
+}
 
 /** True when meta carries an explicit pricing override (not absent/null/inherit). */
 export function hasPricingConfigOverride(meta?: ProviderMeta | null): boolean {

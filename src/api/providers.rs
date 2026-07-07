@@ -250,8 +250,7 @@ pub(in crate::api) async fn delete_universal_provider(
         .map_err(ApiError::internal)?;
     if deleted {
         for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
-            let provider_id =
-                crate::domain::providers::universal::universal_provider_id(&id, app);
+            let provider_id = crate::domain::providers::universal::universal_provider_id(&id, app);
             cascade_delete_shares_for_provider(&state, app, &provider_id).await?;
         }
         state

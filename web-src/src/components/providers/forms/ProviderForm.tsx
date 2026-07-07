@@ -125,6 +125,8 @@ import {
   OPENCLAW_DEFAULT_CONFIG,
   hasPricingConfigOverride,
   normalizePricingSource,
+  normalizeProviderTestConfig,
+  presetProviderTestConfig,
 } from "./helpers/opencodeFormUtils";
 import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
@@ -375,8 +377,8 @@ function ProviderFormFull({
     return initialData?.meta?.isFullUrl ?? false;
   });
 
-  const [testConfig, setTestConfig] = useState<ProviderTestConfig>(
-    () => initialData?.meta?.testConfig ?? { enabled: false },
+  const [testConfig, setTestConfig] = useState<ProviderTestConfig>(() =>
+    normalizeProviderTestConfig(initialData?.meta?.testConfig),
   );
   const [pricingConfig, setPricingConfig] = useState<{
     enabled: boolean;
@@ -435,7 +437,7 @@ function ProviderFormFull({
     setLocalIsFullUrl(
       supportsFullUrl ? (initialData?.meta?.isFullUrl ?? false) : false,
     );
-    setTestConfig(initialData?.meta?.testConfig ?? { enabled: false });
+    setTestConfig(normalizeProviderTestConfig(initialData?.meta?.testConfig));
     setPricingConfig({
       enabled: hasPricingConfigOverride(initialData?.meta),
       costMultiplier: initialData?.meta?.costMultiplier ?? undefined,
@@ -2095,6 +2097,7 @@ function ProviderFormFull({
       costMultiplier: _ignoredCostMultiplier,
       pricingModelSource: _ignoredPricingModelSource,
       quotaDispatchLimitPercent: _ignoredQuotaDispatchLimitPercent,
+      testConfig: _ignoredTestConfig,
       ...baseMetaWithoutPricing
     } = baseMeta ?? {};
     const forSaleOfficialPricePercent =
@@ -2254,6 +2257,10 @@ function ProviderFormFull({
 
     if (!isCodexOfficialPreset && "codexImageGenerationEnabled" in nextMeta) {
       delete nextMeta.codexImageGenerationEnabled;
+    }
+
+    if (!testConfig.enabled) {
+      delete nextMeta.testConfig;
     }
 
     payload.meta = nextMeta;
@@ -2433,7 +2440,7 @@ function ProviderFormFull({
           "openai_responses",
       );
 
-      setTestConfig(preset.testConfig ?? { enabled: false });
+      setTestConfig(presetProviderTestConfig(preset.testConfig));
       form.reset({
         name: preset.nameKey ? t(preset.nameKey) : preset.name,
         websiteUrl: preset.websiteUrl ?? "",
@@ -2548,7 +2555,7 @@ function ProviderFormFull({
     setLocalApiKeyField(preset.apiKeyField ?? "ANTHROPIC_AUTH_TOKEN");
     setLocalIsFullUrl(false);
 
-    setTestConfig(preset.testConfig ?? { enabled: false });
+    setTestConfig(presetProviderTestConfig(preset.testConfig));
     form.reset({
       name: preset.nameKey ? t(preset.nameKey) : preset.name,
       websiteUrl: preset.websiteUrl ?? "",

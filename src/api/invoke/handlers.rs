@@ -258,7 +258,9 @@ pub(in crate::api) async fn web_provider_quota(
         None => {
             let accounts = state.accounts.read().await;
             let Some(account) = accounts.find_for_provider(provider_type, None) else {
-                return Ok(Value::Null);
+                return Ok(subscription_quota_not_found(managed_auth_provider_label(
+                    provider_type,
+                )));
             };
             account.id.clone()
         }
@@ -274,7 +276,95 @@ pub(in crate::api) async fn web_provider_quota(
     )
     .await?
     .0;
-    Ok(json!(response))
+    let Some(account) = response.account.as_ref() else {
+        return Ok(Value::Null);
+    };
+    Ok(subscription_quota_from_response(
+        account,
+        &response,
+        managed_auth_provider_label(provider_type),
+    ))
+}
+
+pub(in crate::api) async fn web_cached_oauth_quota(
+    state: &ServerState,
+    headers: &HeaderMap,
+    args: &Value,
+    refresh: bool,
+    force: Option<bool>,
+) -> Result<Value, ApiError> {
+    let account_id = web_resolve_account_id(state, args).await?;
+    let Some(account_id) = account_id else {
+        return Ok(Value::Null);
+    };
+    let auth_provider = web_optional_string_any(args, &["authProvider", "auth_provider"])
+        .or_else(|| {
+            web_optional_auth_provider_type(args)
+                .ok()
+                .flatten()
+                .map(|provider_type| managed_auth_provider_label(provider_type).to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let provider_id = web_optional_string_any(args, &["providerId", "provider_id"]);
+    let app_type = web_optional_string_any(args, &["appType", "app_type", "app"]);
+    let response = account_quota(
+        State(state.clone()),
+        headers.clone(),
+        Path(account_id),
+        Query(AccountQuotaQuery {
+            refresh: Some(refresh),
+            force,
+        }),
+    )
+    .await?
+    .0;
+    let Some(account) = response.account.as_ref() else {
+        return Ok(Value::Null);
+    };
+    Ok(cached_oauth_quota_from_response(
+        &auth_provider,
+        account,
+        &response,
+        provider_id.as_deref(),
+        app_type.as_deref(),
+        if refresh { "refresh" } else { "cache" },
+    ))
+}
+
+pub(in crate::api) async fn web_subscription_quota(
+    state: &ServerState,
+    headers: &HeaderMap,
+    tool: &str,
+) -> Result<Value, ApiError> {
+    let Some(provider_type) = subscription_tool_provider_type(tool) else {
+        return Err(ApiError::bad_request(format!(
+            "unsupported subscription quota tool: {tool}"
+        )));
+    };
+    let account_id = {
+        let accounts = state.accounts.read().await;
+        accounts
+            .find_for_provider(provider_type, None)
+            .map(|account| account.id.clone())
+    };
+    let Some(account_id) = account_id else {
+        return Ok(subscription_quota_not_found(tool));
+    };
+    let response = account_quota(
+        State(state.clone()),
+        headers.clone(),
+        Path(account_id),
+        Query(AccountQuotaQuery {
+            refresh: Some(true),
+            force: None,
+        }),
+    )
+    .await?
+    .0;
+    let Some(account) = response.account.as_ref() else {
+        return Ok(subscription_quota_not_found(tool));
+    };
+    Ok(subscription_quota_from_response(account, &response, tool))
 }
 
 pub(in crate::api) async fn web_resolve_account_id(
@@ -338,9 +428,7 @@ pub(in crate::api) async fn web_share_upsert_input(
     let binding_map = serde_json::from_value::<BTreeMap<String, String>>(bindings_value.clone())
         .map_err(ApiError::bad_request)?;
     if binding_map.len() > 1 {
-        return Err(ApiError::bad_request(
-            "share must have exactly one binding",
-        ));
+        return Err(ApiError::bad_request("share must have exactly one binding"));
     }
     let app_name = web_optional_string_any(value, &["appType", "app", "app_type"])
         .or_else(|| binding_map.keys().next().cloned())

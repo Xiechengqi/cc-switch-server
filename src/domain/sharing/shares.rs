@@ -218,9 +218,8 @@ impl ShareStore {
     }
 
     pub fn upsert(&mut self, mut input: UpsertShareInput) -> Result<Share, SharePatchError> {
-        let _binding = crate::domain::sharing::invariants::validate_and_normalize_upsert_input(
-            &mut input,
-        )?;
+        let _binding =
+            crate::domain::sharing::invariants::validate_and_normalize_upsert_input(&mut input)?;
         let provider_id = input.provider_id.clone();
         let provider_type = input.provider_type;
         let app = input.app;
@@ -253,8 +252,15 @@ impl ShareStore {
             });
 
         let share_id = existing_id.unwrap_or_else(generate_share_id);
-        let (tokens_used, requests_count, binding_history, router_last_synced_at_ms, router_last_sync_error, router_url, last_error) =
-            preserved.unwrap_or((0, 0, Vec::new(), None, None, None, None));
+        let (
+            tokens_used,
+            requests_count,
+            binding_history,
+            router_last_synced_at_ms,
+            router_last_sync_error,
+            router_url,
+            last_error,
+        ) = preserved.unwrap_or((0, 0, Vec::new(), None, None, None, None));
 
         let share = Share {
             id: share_id,
@@ -988,9 +994,7 @@ impl std::fmt::Display for ShareUpdateError {
             Self::MustBePaused => {
                 formatter.write_str("share must be paused before updating binding")
             }
-            Self::InvalidApp => {
-                formatter.write_str("share binding app must match share.app")
-            }
+            Self::InvalidApp => formatter.write_str("share binding app must match share.app"),
         }
     }
 }

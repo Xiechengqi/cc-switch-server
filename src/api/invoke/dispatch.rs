@@ -731,41 +731,16 @@ async fn web_invoke_dispatch(
                 })?;
             web_managed_auth_account_by_id(state, account_id, provider_label).await
         }
-        "refresh_oauth_quota" => {
-            let account_id = web_resolve_account_id(state, &args).await?;
-            let Some(account_id) = account_id else {
-                return Ok(Value::Null);
-            };
-            let response = account_quota(
-                State(state.clone()),
-                headers.clone(),
-                Path(account_id),
-                Query(AccountQuotaQuery {
-                    refresh: Some(true),
-                    force: web_optional_bool(&args, &["force"]),
-                }),
-            )
-            .await?
-            .0;
-            Ok(json!(response))
-        }
+        "refresh_oauth_quota" => Ok(web_cached_oauth_quota(
+            &state,
+            &headers,
+            &args,
+            true,
+            web_optional_bool(&args, &["force"]),
+        )
+        .await?),
         "get_cached_oauth_quota" => {
-            let account_id = web_resolve_account_id(state, &args).await?;
-            let Some(account_id) = account_id else {
-                return Ok(Value::Null);
-            };
-            let response = account_quota(
-                State(state.clone()),
-                headers.clone(),
-                Path(account_id),
-                Query(AccountQuotaQuery {
-                    refresh: Some(false),
-                    force: None,
-                }),
-            )
-            .await?
-            .0;
-            Ok(json!(response))
+            Ok(web_cached_oauth_quota(&state, &headers, &args, false, None).await?)
         }
         "get_claude_oauth_quota" => {
             let response =
@@ -1584,7 +1559,11 @@ async fn web_invoke_dispatch(
         "queryProviderUsage" => Ok(json!({ "logs": [], "summary": Value::Null })),
         "get_usage_data_sources" => Ok(json!(["server"])),
         "check_provider_limits" => Ok(json!({ "ok": true, "withinLimits": true })),
-        "get_subscription_quota" | "get_coding_plan_quota" | "get_balance" => Ok(Value::Null),
+        "get_subscription_quota" => {
+            let tool = web_arg_string_any(&args, &["tool"])?;
+            Ok(web_subscription_quota(&state, &headers, &tool).await?)
+        }
+        "get_coding_plan_quota" | "get_balance" => Ok(Value::Null),
         "get_default_cost_multiplier" => Ok(json!(1.0)),
         "set_default_cost_multiplier" => Ok(Value::Null),
         "read_live_provider_settings" => Ok(json!({})),
