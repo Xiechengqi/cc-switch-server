@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X4 静态实现已落地（7 个 `email_auth_*` invoke 命令入契约；owner change 走新邮箱验证码 + router `/v1/installations/change-owner-email`；直接 owner update/transfer 增加 verified target gate）；X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X8 第一批 CSS 过渡层削减已落地（5817→2660 行，新增 3000 行门禁）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；R4 受管 store 生产写路径已清零并纳入静态门禁；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | 进行中 | X4 静态实现已落地（7 个 `email_auth_*` invoke 命令入契约；owner change 走新邮箱验证码 + router `/v1/installations/change-owner-email`；直接 owner update/transfer 增加 verified target gate）；X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X6 第一批已落地（server-native `proxy::kiro` 协议桥 + desktop 23 个 fixture，暂不接真实转发）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X8 第一批 CSS 过渡层削减已落地（5817→2660 行，新增 3000 行门禁）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；R4 受管 store 生产写路径已清零并纳入静态门禁；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -95,6 +95,7 @@
 
 ### X6 Kiro 转发桥移植
 
+- **状态（2026-07-07）**：**第一批协议桥已完成**。新增 `src/proxy/kiro.rs`，server-native 移植 desktop `kiro_claude.rs` 的 Claude Messages → Kiro conversation payload、Kiro event stream → Claude SSE/JSON、tool leak rescue、thinking/redacted thinking、usage/prompt-cache 计算等纯协议逻辑；desktop 23 个 fixture 已全部进入 server 并通过。当前尚未接入真实请求路径、账号 token refresh/failover 和 capability 矩阵，Kiro 组合仍保持 fallback skeleton，避免未真实验收前误报 native。
 - **现状证据**：desktop `providers/kiro_claude.rs`（3119 行 / 23 测试）实现 Claude Messages ↔ Kiro（CodeWhisperer conversation API）双向桥。server 三个 app 的 Kiro 组合均为 `fallback("*_kiro_skeleton")`（`src/proxy/adapters.rs:448/494/522`）——账号 device flow 导入已有（`core/kiro_device.rs`），但**转发路径完全没有**，是 15 个非 native 组合中除 Copilot 外唯一「代码确实缺失」的一组。
 - **实施细节**：
   1. 新增 `src/proxy/kiro.rs`：移植 desktop 的请求构造（conversation payload、profile ARN、机器指纹头）、响应/事件流解析、Claude Messages 双向转换；
@@ -184,7 +185,8 @@
 ✅ R4-accounts 收敛（X5 硬性前置已满足）→ ✅ X5（Copilot token 交换静态实现）→ X6（Kiro 桥，复用 X5 基建）
   → X8 第一批 ✅ / ✅ X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
 ✅ R4 全受管 store 写路径收敛（config/providers/universal_providers/accounts/failover/pricing/usage/shares/ui_settings/sessions/oauth_logins）
-  → 下一轮：X6（Kiro 桥）→ X8 后续 CSS 收口 → api/types.rs DTO 就近化 → 整体 review
+✅ X6 第一批（Kiro 协议桥 + 23 个 desktop fixture）
+  → 下一轮：X6 第二批（账号凭据/请求接线，仍保持 capability gate）→ X8 后续 CSS 收口 → api/types.rs DTO 就近化 → 整体 review
 ```
 
 > **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 全受管 store 生产写路径已收敛到 `ServerStateInner` 域方法并纳入静态门禁，X5 accounts 前置已满足且不得回退。剩余结构收口为 `api/types.rs` DTO 就近化，随后续功能/域改动摊销。
@@ -225,3 +227,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | R4-providers 完成：provider CRUD/import/sort/universal sync/fetch-model merge 写路径收敛到 state 域方法，字段降 `pub(crate)`；剩余直接写计数 22→14 |
 | 2026-07-07 | R4-ui_settings 完成：invoke/settings/proxy app config 写路径收敛到 state 域方法并立即保存，字段降 `pub(crate)`；剩余直接写计数 14→0 |
 | 2026-07-07 | R4 完成复核：config/usage 字段降 `pub(crate)`，测试改用 snapshot/replace_config 方法；状态写入静态门禁扩展到全部受管 store 的多行写锁与直接保存调用 |
+| 2026-07-07 | X6 第一批完成：新增 server-native Kiro 协议桥模块，移植 desktop 23 个 Claude↔Kiro payload/SSE/usage/prompt-cache fixture；真实转发接线和 capability 升级继续受外部账号验收 gate 约束 |

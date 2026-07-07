@@ -6,6 +6,7 @@ mod copilot_model_map;
 mod copilot_optimizer;
 pub(crate) mod cursor;
 mod forwarder;
+mod kiro;
 mod request_governance;
 mod router;
 mod streaming;
