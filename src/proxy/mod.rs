@@ -133,6 +133,60 @@ pub(super) fn setting(
     None
 }
 
+/// Resolve Codex provider API key from env, auth.json, and config.toml shapes.
+pub(super) fn codex_provider_api_key(
+    provider: &crate::domain::providers::model::Provider,
+) -> Option<String> {
+    if let Some(key) = setting(
+        provider,
+        &[
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "API_KEY",
+        ],
+    ) {
+        return Some(key);
+    }
+
+    if let Some(auth) = provider.settings_config.get("auth") {
+        if let Some(key) = auth
+            .get("OPENAI_API_KEY")
+            .or_else(|| auth.get("openai_api_key"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(key.to_string());
+        }
+    }
+
+    let config_text = provider
+        .settings_config
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    for line in config_text.lines() {
+        let line = line.split('#').next().unwrap_or(line).trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key != "api_key" && key != "experimental_bearer_token" {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+
+    None
+}
+
 pub(super) fn join_url(base_url: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -169,6 +223,26 @@ mod tests {
         assert_eq!(
             adapters::codex_config_base_url(&provider).as_deref(),
             Some("https://example.com/v1")
+        );
+    }
+
+    #[test]
+    fn extracts_codex_api_key_from_auth_json() {
+        let provider = Provider {
+            id: "p1".to_string(),
+            name: "default".to_string(),
+            settings_config: json!({
+                "auth": { "OPENAI_API_KEY": "sk-custom-key" },
+                "config": "base_url = \"https://relay.example/v1\"\n"
+            }),
+            category: Some("custom".to_string()),
+            meta: None,
+            extra: Default::default(),
+        };
+
+        assert_eq!(
+            codex_provider_api_key(&provider).as_deref(),
+            Some("sk-custom-key")
         );
     }
 

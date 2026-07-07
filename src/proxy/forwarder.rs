@@ -1096,19 +1096,7 @@ fn provider_secret_configured(app: AppKind, stored: &StoredProvider) -> bool {
             &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "API_KEY"],
         )
         .is_some(),
-        AppKind::Codex => setting(
-            provider,
-            &[
-                "OPENAI_API_KEY",
-                "CODEX_API_KEY",
-                "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_API_KEY",
-                "GEMINI_API_KEY",
-                "GOOGLE_API_KEY",
-                "API_KEY",
-            ],
-        )
-        .is_some(),
+        AppKind::Codex => super::codex_provider_api_key(provider).is_some(),
         AppKind::Gemini => {
             setting(provider, &["GEMINI_API_KEY", "GOOGLE_API_KEY", "API_KEY"]).is_some()
         }

@@ -1923,18 +1923,7 @@ fn apply_auth_headers(
             provider,
             &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "API_KEY"],
         ),
-        AppKind::Codex => setting(
-            provider,
-            &[
-                "OPENAI_API_KEY",
-                "CODEX_API_KEY",
-                "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_API_KEY",
-                "GEMINI_API_KEY",
-                "GOOGLE_API_KEY",
-                "API_KEY",
-            ],
-        ),
+        AppKind::Codex => super::codex_provider_api_key(provider),
         AppKind::Gemini => setting(provider, &["GEMINI_API_KEY", "GOOGLE_API_KEY", "API_KEY"]),
     };
     let provider_secret_configured = provider_secret.is_some();
@@ -4687,6 +4676,24 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(4)
         );
+    }
+
+    #[test]
+    fn codex_custom_provider_auth_json_builds_bearer_header() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::Codex,
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-custom-key" },
+                "config": "base_url = \"https://relay.example/v1\"\n"
+            }),
+        );
+        let accounts = AccountStore::default();
+        let headers = adapter_for(AppKind::Codex, ProviderType::Codex)
+            .build_headers(AppKind::Codex, &stored, &accounts)
+            .unwrap();
+
+        assert!(headers.contains(&("authorization", "Bearer sk-custom-key".to_string())));
     }
 
     #[test]
