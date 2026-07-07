@@ -86,6 +86,7 @@ import {
   ProviderAdvancedConfig,
   type PricingModelSourceOption,
 } from "./ProviderAdvancedConfig";
+import { ProviderShareSection } from "@/components/providers/ProviderShareSection";
 import {
   useProviderCategory,
   useApiKeyState,
@@ -3332,6 +3333,14 @@ function ProviderFormFull({
                 showQuotaDispatchLimit={supportsQuotaDispatchLimit}
               />
             )}
+
+          {providerId ? (
+            <ProviderShareSection
+              appId={appId}
+              providerId={providerId}
+              providerName={form.watch("name") || providerId}
+            />
+          ) : null}
 
           {showButtons && (
             <div className="flex justify-end gap-2">

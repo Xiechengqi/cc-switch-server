@@ -189,6 +189,55 @@ pub(in crate::api) async fn upsert_universal_provider(
     Ok(Json(UpsertUniversalProviderResponse { ok: true, provider }))
 }
 
+pub(in crate::api) async fn cascade_delete_shares_for_provider(
+    state: &ServerState,
+    app: AppKind,
+    provider_id: &str,
+) -> Result<(), ApiError> {
+    let share_ids = state
+        .shares
+        .read()
+        .await
+        .share_ids_for_provider(app, provider_id);
+    for share_id in &share_ids {
+        crate::state::stop_share_tunnel(state, share_id).await;
+    }
+    for share_id in share_ids {
+        let removed = state
+            .mutate_shares_immediate(|store| store.delete(&share_id))
+            .await
+            .map_err(ApiError::internal)?;
+        if removed {
+            spawn_share_delete_sync(state.clone(), share_id.clone());
+            state.emit_event(
+                ServerEvent::new("share.deleted", "share")
+                    .id(share_id)
+                    .message("cascade_deleted_with_provider"),
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::api) async fn delete_provider_with_share_cascade(
+    state: &ServerState,
+    app: AppKind,
+    id: &str,
+) -> Result<bool, ApiError> {
+    cascade_delete_shares_for_provider(state, app, id).await?;
+    state
+        .mutate_providers_immediate_if_changed(|providers| {
+            let before = providers.providers.len();
+            providers
+                .providers
+                .retain(|provider| !(provider.app == app && provider.provider.id == id));
+            let deleted = providers.providers.len() != before;
+            (deleted, deleted)
+        })
+        .await
+        .map_err(ApiError::internal)
+}
+
 pub(in crate::api) async fn delete_universal_provider(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -200,6 +249,11 @@ pub(in crate::api) async fn delete_universal_provider(
         .await
         .map_err(ApiError::internal)?;
     if deleted {
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            let provider_id =
+                crate::domain::providers::universal::universal_provider_id(&id, app);
+            cascade_delete_shares_for_provider(&state, app, &provider_id).await?;
+        }
         state
             .mutate_providers_immediate(|providers| {
                 providers.remove_universal_derivatives(&id);

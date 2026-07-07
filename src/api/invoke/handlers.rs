@@ -337,28 +337,30 @@ pub(in crate::api) async fn web_share_upsert_input(
     })?;
     let binding_map = serde_json::from_value::<BTreeMap<String, String>>(bindings_value.clone())
         .map_err(ApiError::bad_request)?;
-    let mut bindings = Vec::new();
-    for app_name in ["claude", "codex", "gemini"] {
-        let Some(provider_id) = binding_map
-            .get(app_name)
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|provider_id| !provider_id.is_empty())
-        else {
-            continue;
-        };
-        let app = parse_app_kind(app_name)?;
-        let provider_type = web_provider_type_for_binding(state, app, provider_id).await?;
-        bindings.push(ShareBinding {
-            app,
-            provider_id: provider_id.to_string(),
-            provider_type,
-        });
+    if binding_map.len() > 1 {
+        return Err(ApiError::bad_request(
+            "share must have exactly one binding",
+        ));
     }
-    let primary = bindings
-        .first()
+    let app_name = web_optional_string_any(value, &["appType", "app", "app_type"])
+        .or_else(|| binding_map.keys().next().cloned())
+        .ok_or_else(|| ApiError::bad_request("share app is required"))?;
+    let app = parse_app_kind(&app_name)?;
+    let provider_id = binding_map
+        .get(app.as_str())
         .cloned()
-        .ok_or_else(|| ApiError::bad_request("at least one share binding is required"))?;
+        .or_else(|| web_optional_string_any(value, &["providerId", "provider_id"]))
+        .ok_or_else(|| ApiError::bad_request("share providerId is required"))?;
+    let provider_id = provider_id.trim().to_string();
+    if provider_id.is_empty() {
+        return Err(ApiError::bad_request("share providerId is required"));
+    }
+    let provider_type = web_provider_type_for_binding(state, app, &provider_id).await?;
+    let bindings = vec![ShareBinding {
+        app,
+        provider_id: provider_id.clone(),
+        provider_type,
+    }];
     let expires_at = web_optional_i64(value, &["expiresAt", "expires_at"]).or_else(|| {
         web_optional_i64(value, &["expiresInSecs", "expires_in_secs"]).and_then(|seconds| {
             (seconds > 0).then(|| (now_ms() as i64).saturating_add(seconds.saturating_mul(1000)))
@@ -368,9 +370,9 @@ pub(in crate::api) async fn web_share_upsert_input(
     Ok(UpsertShareInput {
         id: web_optional_string_any(value, &["id", "shareId", "share_id"]),
         owner_email: web_optional_string_any(value, &["ownerEmail", "owner_email"]),
-        app: primary.app,
-        provider_id: primary.provider_id.clone(),
-        provider_type: primary.provider_type,
+        app,
+        provider_id,
+        provider_type,
         display_name: web_optional_string_any(value, &["displayName", "name"]),
         enabled: web_optional_bool(value, &["enabled"]),
         status: web_optional_string_any(value, &["status"]),

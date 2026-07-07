@@ -40,6 +40,7 @@ import {
 import { useProviderHealth } from "@/lib/query/failover";
 import { useUsageQuery } from "@/lib/query/queries";
 import { resolveManagedAccountId } from "@/lib/authBinding";
+import { isShareableApp, useProviderShare } from "@/hooks/useProviderShare";
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -245,6 +246,8 @@ export function ProviderCard({
   const isAdditiveMode = appId === "opencode" && !isAnyOmo;
 
   const { data: health } = useProviderHealth(provider.id, appId);
+  const { state: shareState } = useProviderShare(appId, provider.id);
+  const canManageShare = isShareableApp(appId);
 
   const fallbackUrlText = t("provider.notConfigured", {
     defaultValue: "未配置接口地址",
@@ -656,6 +659,10 @@ export function ProviderCard({
               // OpenClaw: default model
               isDefaultModel={isDefaultModel}
               onSetAsDefault={onSetAsDefault}
+              shareState={shareState}
+              onOpenShare={
+                canManageShare ? () => onEdit(provider) : undefined
+              }
             />
           </div>
         </div>

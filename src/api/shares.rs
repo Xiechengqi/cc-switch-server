@@ -27,6 +27,10 @@ pub(in crate::api) async fn import_shares(
     Json(input): Json<ImportSharesRequest>,
 ) -> Result<Json<ImportSharesResponse>, ApiError> {
     require_session(&state, &headers).await?;
+    for share in &input.shares {
+        crate::domain::sharing::invariants::validate_share_import(share)
+            .map_err(map_share_patch_error)?;
+    }
     let imported = state
         .mutate_shares_immediate(|store| store.import_shares(input.shares))
         .await
@@ -49,7 +53,8 @@ pub(in crate::api) async fn upsert_share(
     let share = state
         .mutate_shares_immediate(|store| store.upsert(input))
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)?
+        .map_err(map_share_patch_error)?;
     spawn_share_upsert_sync(state.clone(), share.clone());
     emit_share_event(&state, "share.changed", &share, "upserted");
     Ok(Json(UpsertShareResponse { ok: true, share }))
@@ -280,6 +285,7 @@ pub(in crate::api) async fn update_share_binding(
                 .map_err(|error| match error {
                     ShareUpdateError::NotFound => ApiError::not_found("share not found"),
                     ShareUpdateError::MustBePaused => ApiError::conflict(error.to_string()),
+                    ShareUpdateError::InvalidApp => ApiError::bad_request(error.to_string()),
                 })
         })
         .await

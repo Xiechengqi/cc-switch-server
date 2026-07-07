@@ -217,19 +217,50 @@ impl ShareStore {
             .with_context(|| format!("write shares {}", path.display()))
     }
 
-    pub fn upsert(&mut self, input: UpsertShareInput) -> Share {
-        let provider_id = input.provider_id;
+    pub fn upsert(&mut self, mut input: UpsertShareInput) -> Result<Share, SharePatchError> {
+        let _binding = crate::domain::sharing::invariants::validate_and_normalize_upsert_input(
+            &mut input,
+        )?;
+        let provider_id = input.provider_id.clone();
         let provider_type = input.provider_type;
         let app = input.app;
-        let owner_email = input.owner_email;
+        let owner_email = input.owner_email.clone();
         let tunnel_subdomain = input
             .tunnel_subdomain
+            .clone()
             .or_else(|| owner_email.as_deref().map(default_share_subdomain));
+
+        let existing_id = input.id.clone().or_else(|| {
+            self.shares
+                .iter()
+                .find(|item| item.app == app && item.provider_id == provider_id)
+                .map(|item| item.id.clone())
+        });
+
+        let preserved = existing_id
+            .as_deref()
+            .and_then(|id| self.shares.iter().find(|item| item.id == id))
+            .map(|existing| {
+                (
+                    existing.tokens_used,
+                    existing.requests_count,
+                    existing.binding_history.clone(),
+                    existing.router_last_synced_at_ms,
+                    existing.router_last_sync_error.clone(),
+                    existing.router_url.clone(),
+                    existing.last_error.clone(),
+                )
+            });
+
+        let share_id = existing_id.unwrap_or_else(generate_share_id);
+        let (tokens_used, requests_count, binding_history, router_last_synced_at_ms, router_last_sync_error, router_url, last_error) =
+            preserved.unwrap_or((0, 0, Vec::new(), None, None, None, None));
+
         let share = Share {
-            id: input.id.unwrap_or_else(generate_share_id),
+            id: share_id,
             owner_email,
             app,
-            provider_id: provider_id.clone(),
+            provider_id,
             provider_type,
             display_name: input.display_name,
             enabled: input.enabled.unwrap_or(true),
@@ -241,8 +272,8 @@ impl ShareStore {
             acl: input.acl.unwrap_or_default(),
             token_limit: input.token_limit,
             parallel_limit: input.parallel_limit,
-            tokens_used: 0,
-            requests_count: 0,
+            tokens_used,
+            requests_count,
             expires_at: input.expires_at,
             for_sale: input.for_sale.unwrap_or(false),
             sale_market_kind: input
@@ -254,22 +285,14 @@ impl ShareStore {
             official_price_percent: input.official_price_percent,
             auto_start: input.auto_start.unwrap_or(false),
             description: input.description,
-            bindings: if input.bindings.is_empty() {
-                vec![ShareBinding {
-                    app,
-                    provider_id,
-                    provider_type,
-                }]
-            } else {
-                input.bindings
-            },
-            binding_history: Vec::new(),
+            bindings: input.bindings,
+            binding_history,
             runtime_snapshot: input.runtime_snapshot,
             market_grant: input.market_grant,
-            last_error: None,
-            router_last_synced_at_ms: None,
-            router_last_sync_error: None,
-            router_url: None,
+            last_error,
+            router_last_synced_at_ms,
+            router_last_sync_error,
+            router_url,
         };
 
         if let Some(existing) = self.shares.iter_mut().find(|item| item.id == share.id) {
@@ -278,11 +301,19 @@ impl ShareStore {
             self.shares.push(share.clone());
         }
 
-        share
+        Ok(share)
     }
 
     pub fn get(&self, share_id: &str) -> Option<&Share> {
         self.shares.iter().find(|item| item.id == share_id)
+    }
+
+    pub fn share_ids_for_provider(&self, app: AppKind, provider_id: &str) -> Vec<String> {
+        self.shares
+            .iter()
+            .filter(|item| item.app == app && item.provider_id == provider_id)
+            .map(|item| item.id.clone())
+            .collect()
     }
 
     pub fn delete(&mut self, share_id: &str) -> bool {
@@ -423,25 +454,22 @@ impl ShareStore {
             return Err(ShareUpdateError::MustBePaused);
         }
 
-        let previous_provider_id = share
-            .bindings
-            .iter()
-            .find(|item| item.app == binding.app)
-            .map(|item| item.provider_id.clone());
-        if let Some(existing) = share
-            .bindings
-            .iter_mut()
-            .find(|item| item.app == binding.app)
-        {
-            *existing = binding.clone();
-        } else {
-            share.bindings.push(binding.clone());
+        if binding.app != share.app {
+            return Err(ShareUpdateError::InvalidApp);
+        }
+        if share.bindings.len() != 1 {
+            share.bindings = vec![ShareBinding {
+                app: share.app,
+                provider_id: share.provider_id.clone(),
+                provider_type: share.provider_type,
+            }];
         }
 
-        if binding.app == share.app {
-            share.provider_id = binding.provider_id.clone();
-            share.provider_type = binding.provider_type;
-        }
+        let previous_provider_id = share.bindings.first().map(|item| item.provider_id.clone());
+        share.bindings = vec![binding.clone()];
+
+        share.provider_id = binding.provider_id.clone();
+        share.provider_type = binding.provider_type;
 
         share.binding_history.push(ShareBindingHistory {
             app: binding.app,
@@ -909,6 +937,7 @@ fn runtime_snapshot_for_share(
 pub enum ShareUpdateError {
     NotFound,
     MustBePaused,
+    InvalidApp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -958,6 +987,9 @@ impl std::fmt::Display for ShareUpdateError {
             Self::NotFound => formatter.write_str("share not found"),
             Self::MustBePaused => {
                 formatter.write_str("share must be paused before updating binding")
+            }
+            Self::InvalidApp => {
+                formatter.write_str("share binding app must match share.app")
             }
         }
     }

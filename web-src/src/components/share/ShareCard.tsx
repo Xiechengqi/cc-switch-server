@@ -4,7 +4,6 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
-  Edit3,
   Play,
   Power,
   RotateCcw,
@@ -12,8 +11,6 @@ import {
 } from "lucide-react";
 import type {
   PublicMarket,
-  ShareAccessByApp,
-  ShareAppSettingsByApp,
   ShareRecord,
   TunnelConfig,
   TunnelInfo,
@@ -31,8 +28,6 @@ import { useProviderHealth } from "@/lib/query/failover";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 import { formatShareRouterDisplay } from "@/utils/shareRouter";
-import { EditShareDialog } from "./EditShareDialog";
-import type { ProviderOption } from "./CreateShareDialog";
 import { ShareDisplayStatusBadge } from "./ShareDisplayStatusBadge";
 import { ShareRequestLogTable } from "./ShareRequestLogTable";
 import {
@@ -67,85 +62,15 @@ interface ShareCardProps {
   tunnelConfig: TunnelConfig;
   tunnelConfigured: boolean;
   pendingAction?: string | null;
-  markets?: PublicMarket[];
   providerSalePricing?: ShareProviderSalePricing[];
-  marketsLoading?: boolean;
-  marketsError?: string | null;
   readOnly?: boolean;
   hideRuntimeActions?: boolean;
-  subdomainReadOnly?: boolean;
-  onRetryMarkets?: () => void;
   onDelete: (share: ShareRecord) => void;
   onEnable: (share: ShareRecord) => void;
   onDisable: (share: ShareRecord) => void;
   onResetUsage: (share: ShareRecord) => Promise<void> | void;
-  onUpdateTokenLimit: (
-    share: ShareRecord,
-    tokenLimit: number,
-  ) => Promise<void> | void;
-  onUpdateParallelLimit: (
-    share: ShareRecord,
-    parallelLimit: number,
-  ) => Promise<void> | void;
-  onUpdateSubdomain: (
-    share: ShareRecord,
-    subdomain: string,
-  ) => Promise<void> | void;
-  onUpdateDescription: (
-    share: ShareRecord,
-    description: string,
-  ) => Promise<void> | void;
-  onUpdateForSale: (
-    share: ShareRecord,
-    forSale: "Yes" | "No" | "Free",
-  ) => Promise<void> | void;
-  onUpdateShareSalePricing: (
-    share: ShareRecord,
-    pricing: Record<string, number>,
-  ) => Promise<void> | void;
-  onUpdateExpiration: (
-    share: ShareRecord,
-    expiresAt: string,
-  ) => Promise<void> | void;
-  onUpdateOwnerEmail: (
-    share: ShareRecord,
-    ownerEmail: string,
-  ) => Promise<void> | void;
-  onTransferOwner: (
-    share: ShareRecord,
-    targetEmail: string,
-  ) => Promise<void> | void;
-  onUpdateAcl: (
-    share: ShareRecord,
-    sharedWithEmails: string[],
-    marketAccessMode: "selected" | "all",
-    accessByApp?: ShareAccessByApp,
-    saleMarketKind?: "token" | "share",
-    appSettings?: ShareAppSettingsByApp,
-  ) => Promise<void> | void;
-  /**
-   * 当前 app 下可绑定的 provider 列表（同 CreateShareDialog 的形态）。
-   * 由 ShareList 透传，传给 EditShareDialog 的 Provider Select。
-   */
-  providersByAppForEdit?: Record<
-    "claude" | "codex" | "gemini",
-    ProviderOption[]
-  >;
-  onUpdateProviderBinding: (
-    share: ShareRecord,
-    appType: "claude" | "codex" | "gemini",
-    providerId: string | null,
-    options?: { dynamic?: boolean },
-  ) => Promise<void> | void;
-  onRebindAtomic?: (
-    share: ShareRecord,
-    appType: "claude" | "codex" | "gemini",
-    newProviderId: string | null,
-    options?: { dynamic?: boolean },
-  ) => Promise<void> | void;
 }
 
-const EMPTY_MARKETS: PublicMarket[] = [];
 const EMPTY_PROVIDER_SALE_PRICING: ShareProviderSalePricing[] = [];
 
 export function ShareCard({
@@ -156,34 +81,15 @@ export function ShareCard({
   tunnelConfig,
   tunnelConfigured,
   pendingAction,
-  markets = EMPTY_MARKETS,
   providerSalePricing = EMPTY_PROVIDER_SALE_PRICING,
-  marketsLoading = false,
-  marketsError = null,
   readOnly = false,
   hideRuntimeActions = false,
-  subdomainReadOnly = false,
-  onRetryMarkets,
   onDelete,
   onEnable,
   onDisable,
   onResetUsage,
-  onUpdateTokenLimit,
-  onUpdateParallelLimit,
-  onUpdateSubdomain,
-  onUpdateDescription,
-  onUpdateForSale,
-  onUpdateShareSalePricing,
-  onUpdateExpiration,
-  onUpdateOwnerEmail,
-  onTransferOwner,
-  onUpdateAcl,
-  providersByAppForEdit,
-  onUpdateProviderBinding,
-  onRebindAtomic,
 }: ShareCardProps) {
   const { t } = useTranslation();
-  const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [connectionExpanded, setConnectionExpanded] = useState(false);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
   const ratio = getShareUsageRatio(share);
@@ -379,15 +285,6 @@ export function ShareCard({
                 {t("share.resetUsage")}
               </Button>
             ) : null}
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={isBusy}
-              onClick={() => setEditDialogOpen(true)}
-            >
-              <Edit3 className="h-4 w-4" />
-              {t("share.edit")}
-            </Button>
             {!readOnly && !hideRuntimeActions ? (
               <Button
                 variant="outline"
@@ -402,6 +299,14 @@ export function ShareCard({
             ) : null}
           </div>
         </div>
+
+        {readOnly ? (
+          <p className="text-xs text-muted-foreground">
+            {t("share.manageInProviderHint", {
+              defaultValue: "修改分享设置请打开绑定的 Provider 编辑页。",
+            })}
+          </p>
+        ) : null}
 
         <section className="space-y-3 border-t border-border-default/70 pt-4">
           <CollapsibleSectionHeader
@@ -515,36 +420,6 @@ export function ShareCard({
           <ShareRequestLogTable shareId={share.id} />
         ) : null}
       </CardContent>
-
-      <EditShareDialog
-        open={editDialogOpen}
-        onOpenChange={setEditDialogOpen}
-        share={share}
-        markets={markets}
-        providerSalePricing={providerSalePricing}
-        marketsLoading={marketsLoading}
-        marketsError={marketsError}
-        readOnly={readOnly}
-        subdomainReadOnly={subdomainReadOnly}
-        onRetryMarkets={onRetryMarkets}
-        isBusy={isBusy}
-        onUpdateTokenLimit={onUpdateTokenLimit}
-        onUpdateParallelLimit={onUpdateParallelLimit}
-        onUpdateSubdomain={onUpdateSubdomain}
-        onUpdateDescription={onUpdateDescription}
-        onUpdateForSale={onUpdateForSale}
-        onUpdateShareSalePricing={onUpdateShareSalePricing}
-        onUpdateExpiration={onUpdateExpiration}
-        onUpdateOwnerEmail={onUpdateOwnerEmail}
-        onTransferOwner={onTransferOwner}
-        onUpdateAcl={onUpdateAcl}
-        providersByApp={
-          providersByAppForEdit ?? { claude: [], codex: [], gemini: [] }
-        }
-        providerNameByKey={providerNameByKey}
-        onUpdateProviderBinding={onUpdateProviderBinding}
-        onRebindAtomic={onRebindAtomic}
-      />
     </Card>
   );
 }

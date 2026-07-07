@@ -229,17 +229,7 @@ async fn web_invoke_dispatch(
         "delete_provider" => {
             let app = web_arg_app(&args)?;
             let id = web_arg_string(&args, "id")?;
-            let deleted = state
-                .mutate_providers_immediate_if_changed(|providers| {
-                    let before = providers.providers.len();
-                    providers
-                        .providers
-                        .retain(|provider| !(provider.app == app && provider.provider.id == id));
-                    let deleted = providers.providers.len() != before;
-                    (deleted, deleted)
-                })
-                .await
-                .map_err(ApiError::internal)?;
+            let deleted = delete_provider_with_share_cascade(&state, app, &id).await?;
             Ok(json!(deleted))
         }
         "switch_provider" => {
@@ -1517,6 +1507,10 @@ async fn web_invoke_dispatch(
         }
         "import_shares" => {
             let shares: Vec<Share> = web_arg_value_any(&args, &["shares"])?;
+            for share in &shares {
+                crate::domain::sharing::invariants::validate_share_import(share)
+                    .map_err(map_share_patch_error)?;
+            }
             let response = import_shares(
                 State(state.clone()),
                 headers.clone(),

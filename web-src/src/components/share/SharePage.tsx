@@ -7,8 +7,6 @@ import {
   authApi,
   shareApi,
   type AppId,
-  type ShareAccessByApp,
-  type ShareAppSettingsByApp,
   type ShareRecord,
   type ShareTunnelStatus,
 } from "@/lib/api";
@@ -19,25 +17,12 @@ import {
   useConfigureTunnelMutation,
   useClaimClientTunnelMutation,
   useClientTunnelQuery,
-  useCreateShareMutation,
   useDeleteShareMutation,
-  useShareMarketsQuery,
   useDisableShareMutation,
   useEnableShareMutation,
   useProvidersQuery,
   useResetShareUsageMutation,
-  useUpdateShareAclMutation,
   useSharesQuery,
-  useUpdateShareDescriptionMutation,
-  useUpdateShareExpirationMutation,
-  useUpdateShareForSaleMutation,
-  useUpdateShareForSaleOfficialPricePercentMutation,
-  useUpdateShareOwnerEmailMutation,
-  useUpdateShareParallelLimitMutation,
-  useUpdateShareSubdomainMutation,
-  useUpdateShareProviderBindingMutation,
-  useUpdateShareTokenLimitMutation,
-  useTransferShareOwnerMutation,
   useStartClientTunnelMutation,
   useStopClientTunnelMutation,
 } from "@/lib/query";
@@ -48,12 +33,10 @@ import {
   getTunnelConfigFromSettings,
   isTunnelConfigured,
 } from "@/utils/shareUtils";
-import { CreateShareDialog } from "./CreateShareDialog";
 import { ShareList } from "./ShareList";
 import { ShareOwnerChangeEmailDialog } from "./ShareOwnerChangeEmailDialog";
 import { ShareRouterBar } from "./ShareRouterBar";
 import {
-  buildProviderOption,
   getProviderAccountLabel,
   SHARE_PROVIDER_AUTH_PROVIDERS,
   type ManagedAuthStatusByProvider,
@@ -68,10 +51,6 @@ import {
   verifyRouterEmailCode,
   type RouterSessionStatus,
 } from "@/lib/routerAuth";
-import {
-  updateRouterShareSettings,
-  type RouterShareSettingsPatch,
-} from "@/lib/routerShare";
 
 const SHARE_PROVIDER_APPS = [
   { app: "claude", label: "Claude" },
@@ -88,7 +67,7 @@ interface SharePageProps {
 export function SharePage({
   defaultApp,
   shareScoped = false,
-  readOnly = false,
+  readOnly = true,
 }: SharePageProps) {
   const { t } = useTranslation();
   const { data: shares = [], isLoading, error, refetch } = useSharesQuery();
@@ -175,29 +154,15 @@ export function SharePage({
     () => getTunnelConfigFromSettings(settings),
     [settings],
   );
-  const [createOpen, setCreateOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ShareRecord | null>(null);
   const [pendingActionShareId, setPendingActionShareId] = useState<
     string | null
   >(null);
 
-  const createMutation = useCreateShareMutation();
   const deleteMutation = useDeleteShareMutation();
   const enableMutation = useEnableShareMutation();
   const disableMutation = useDisableShareMutation();
   const resetUsageMutation = useResetShareUsageMutation();
-  const updateDescriptionMutation = useUpdateShareDescriptionMutation();
-  const updateForSaleMutation = useUpdateShareForSaleMutation();
-  const updateSharePricingMutation =
-    useUpdateShareForSaleOfficialPricePercentMutation();
-  const updateExpirationMutation = useUpdateShareExpirationMutation();
-  const updateOwnerEmailMutation = useUpdateShareOwnerEmailMutation();
-  const transferOwnerMutation = useTransferShareOwnerMutation();
-  const updateAclMutation = useUpdateShareAclMutation();
-  const updateParallelLimitMutation = useUpdateShareParallelLimitMutation();
-  const updateSubdomainMutation = useUpdateShareSubdomainMutation();
-  const updateProviderBindingMutation = useUpdateShareProviderBindingMutation();
-  const updateTokenLimitMutation = useUpdateShareTokenLimitMutation();
   const configureTunnelMutation = useConfigureTunnelMutation();
   const clientTunnelQuery = useClientTunnelQuery(!shareScoped);
   const claimClientTunnelMutation = useClaimClientTunnelMutation();
@@ -219,12 +184,6 @@ export function SharePage({
       setClientSubdomainInput(clientTunnel.config.subdomain);
     }
   }, [clientTunnel?.config?.subdomain]);
-  const {
-    data: markets = [],
-    isLoading: marketsLoading,
-    error: marketsError,
-    refetch: refetchMarkets,
-  } = useShareMarketsQuery();
   const providerQueries = useMemo(
     () => ({
       claude: claudeProvidersQuery.data,
@@ -319,72 +278,7 @@ export function SharePage({
     routerSessionEmail === primaryShareOwnerEmail;
   const effectiveReadOnly =
     readOnly || (shareScoped && !canManageShareFromRouter);
-  const writeSharePatch = async (
-    share: ShareRecord,
-    patch: RouterShareSettingsPatch,
-  ) => {
-    const result = await updateRouterShareSettings(share.id, patch);
-    toast.success(
-      result.appliedSynchronously
-        ? t("share.routerEdit.applied", {
-            defaultValue: "配置已应用",
-          })
-        : t("share.routerEdit.queued", {
-            defaultValue: "配置修改已提交，等待桌面端同步",
-          }),
-    );
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: shareKeys.list() }),
-      queryClient.invalidateQueries({ queryKey: shareKeys.detail(share.id) }),
-    ]);
-    await refetch();
-  };
 
-  const fixedBoundProviderIds = useMemo(() => {
-    const takenProviderIds = new Set<string>();
-    shares.forEach((share) => {
-      if (share.status === "deleted") return;
-      const dynamicApps = new Set(share.dynamicApps ?? []);
-      (["claude", "codex", "gemini"] as const).forEach((app) => {
-        if (dynamicApps.has(app)) return;
-        const pid = share.bindings?.[app];
-        if (pid) takenProviderIds.add(pid);
-      });
-    });
-    return takenProviderIds;
-  }, [shares]);
-
-  // 构造 CreateShareDialog 用的 provider 选项：按 defaultApp 过滤，
-  // 把"已被其他固定 share slot 绑定"的 provider 标灰禁选。share ↔ fixed provider
-  // P8 多 app share：dialogProviderOptions 现在只用于 CreateShareDialog 默认聚焦的 slot
-  // 兼容路径，真正的"哪些 provider 可选"由下面 providersByApp 全量提供。这里保留是为了
-  // 给老的、按"当前 app 单 slot"语义渲染的入口（例如 ProxyToggle）继续提供候选。
-  // 严格 1:1，需要前端在选择阶段提前阻断冲突。
-  const dialogProviderOptions = useMemo(() => {
-    if (!defaultApp) return [];
-    const queryData =
-      providerQueries[defaultApp as "claude" | "codex" | "gemini"];
-    if (!queryData) return [];
-    return Object.values(queryData.providers ?? {})
-      .filter((provider): provider is Provider => Boolean(provider))
-      .sort((a, b) =>
-        a.id === queryData.currentProviderId
-          ? -1
-          : b.id === queryData.currentProviderId
-            ? 1
-            : 0,
-      )
-      .map((provider) => ({
-        ...buildProviderOption(
-          provider,
-          fixedBoundProviderIds.has(provider.id),
-          managedAuthStatuses,
-        ),
-      }));
-  }, [defaultApp, providerQueries, fixedBoundProviderIds, managedAuthStatuses]);
-
-  // ShareCard 上"绑定 provider"显示名的查找表，key = `{appType}:{providerId}`。
-  // 由 SharePage 在 provider 查询完成后统一计算，避免 Card 自己持有 query 句柄。
   const providerNameByKey = useMemo(() => {
     const map: Record<string, string> = {};
     (["claude", "codex", "gemini"] as const).forEach((app) => {
@@ -414,94 +308,6 @@ export function SharePage({
     });
     return map;
   }, [providerQueries, managedAuthStatuses]);
-
-  // P8 多 app share：每个 app slot 的可绑定 provider 列表。CreateShareDialog 和
-  // EditShareDialog 都按 `providersByApp[app]` 取候选，ShareList 那一层再为每条 share
-  // 当前 slot 已绑定的 provider 取消 disabled（让"保持原 provider"始终可选）。
-  const providersByApp = useMemo(() => {
-    const result: Partial<
-      Record<"claude" | "codex" | "gemini", typeof dialogProviderOptions>
-    > = {};
-    (["claude", "codex", "gemini"] as const).forEach((app) => {
-      const data = providerQueries[app];
-      if (!data) {
-        result[app] = [];
-        return;
-      }
-      result[app] = Object.values(data.providers ?? {})
-        .filter((provider): provider is Provider => Boolean(provider))
-        .sort((a, b) =>
-          a.id === data.currentProviderId
-            ? -1
-            : b.id === data.currentProviderId
-              ? 1
-              : 0,
-        )
-        .map((provider) =>
-          buildProviderOption(
-            provider,
-            fixedBoundProviderIds.has(provider.id),
-            managedAuthStatuses,
-          ),
-        );
-    });
-    return result;
-  }, [
-    providerQueries,
-    fixedBoundProviderIds,
-    dialogProviderOptions,
-    managedAuthStatuses,
-  ]);
-
-  const handleCreate = async (
-    params: Parameters<typeof createMutation.mutateAsync>[0],
-    extras: {
-      sharedWithEmails: string[];
-      marketAccessMode: "selected" | "all";
-      saleMarketKind?: "token" | "share";
-      accessByApp?: ShareAccessByApp;
-      appSettings?: ShareAppSettingsByApp;
-    },
-  ) => {
-    const createParams =
-      extras.saleMarketKind === "share"
-        ? { ...params, saleMarketKind: "token" as const }
-        : params;
-    const created = await createMutation.mutateAsync(createParams);
-    const hasPerAppAccess =
-      !!extras.accessByApp && Object.keys(extras.accessByApp).length > 0;
-    const hasPerAppSettings =
-      !!extras.appSettings && Object.keys(extras.appSettings).length > 0;
-    try {
-      if (
-        extras.saleMarketKind === "share" ||
-        extras.marketAccessMode === "all" ||
-        extras.sharedWithEmails.length > 0 ||
-        hasPerAppAccess ||
-        hasPerAppSettings
-      ) {
-        await updateAclMutation.mutateAsync({
-          shareId: created.id,
-          sharedWithEmails: extras.sharedWithEmails,
-          marketAccessMode: extras.marketAccessMode,
-          accessByApp: extras.accessByApp,
-          appSettings: extras.appSettings,
-          saleMarketKind: extras.saleMarketKind ?? "token",
-        });
-      }
-    } catch (error) {
-      try {
-        await deleteMutation.mutateAsync(created.id);
-      } catch (rollbackError) {
-        throw new Error(
-          `${extractErrorMessage(error)}；回滚删除失败：${extractErrorMessage(rollbackError)}`,
-        );
-      }
-      throw error;
-    }
-    setCreateOpen(false);
-    await runShareAction(created, () => enableMutation.mutateAsync(created.id));
-  };
 
   const runShareAction = async (
     share: ShareRecord,
@@ -577,7 +383,7 @@ export function SharePage({
           proxyPort={proxyStatus?.port ?? null}
           hasShare={shares.length > 0}
           readOnly={effectiveReadOnly || shareScoped}
-          onCreate={() => setCreateOpen(true)}
+          onCreate={() => undefined}
         />
 
         {!shareScoped ? (
@@ -694,19 +500,12 @@ export function SharePage({
           isLoading={isLoading}
           error={error ? extractErrorMessage(error) : null}
           pendingAction={pendingActionShareId}
-          markets={markets}
           providerSalePricing={providerSalePricing}
           providerNameByKey={providerNameByKey}
           providerAccountByKey={providerAccountByKey}
-          providersByApp={providersByApp}
-          marketsLoading={marketsLoading}
-          marketsError={marketsError ? extractErrorMessage(marketsError) : null}
           readOnly={effectiveReadOnly}
-          hideRuntimeActions={shareScoped}
-          subdomainReadOnly={shareScoped}
-          onRetryMarkets={() => void refetchMarkets()}
+          hideRuntimeActions={shareScoped || effectiveReadOnly}
           onRetry={() => void refetch()}
-          onCreate={() => setCreateOpen(true)}
           onDelete={(share) => {
             if (!shareScoped) setDeleteTarget(share);
           }}
@@ -725,189 +524,8 @@ export function SharePage({
               resetUsageMutation.mutateAsync(share.id),
             )
           }
-          onUpdateSubdomain={(share, subdomain) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? Promise.reject(
-                    new Error(
-                      t("share.routerEdit.subdomainReadOnly", {
-                        defaultValue: "Share URL 页面暂不支持修改 subdomain",
-                      }),
-                    ),
-                  )
-                : updateSubdomainMutation.mutateAsync({
-                    shareId: share.id,
-                    subdomain,
-                  }),
-            )
-          }
-          onUpdateDescription={(share, description) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? writeSharePatch(share, { description: description || null })
-                : updateDescriptionMutation.mutateAsync({
-                    shareId: share.id,
-                    description,
-                  }),
-            )
-          }
-          onUpdateForSale={(share, forSale) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? writeSharePatch(share, { forSale })
-                : updateForSaleMutation.mutateAsync({
-                    shareId: share.id,
-                    forSale,
-                  }),
-            )
-          }
-          onUpdateShareSalePricing={(share, pricing) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? writeSharePatch(share, {
-                    forSaleOfficialPricePercentByApp: pricing,
-                  })
-                : updateSharePricingMutation.mutateAsync({
-                    shareId: share.id,
-                    pricing,
-                  }),
-            )
-          }
-          onUpdateExpiration={(share, expiresAt) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? writeSharePatch(share, { expiresAt })
-                : updateExpirationMutation.mutateAsync({
-                    shareId: share.id,
-                    expiresAt,
-                  }),
-            )
-          }
-          onUpdateOwnerEmail={(share, ownerEmail) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? writeSharePatch(share, { ownerEmail })
-                : updateOwnerEmailMutation.mutateAsync({
-                    shareId: share.id,
-                    ownerEmail,
-                  }),
-            )
-          }
-          onTransferOwner={(share, targetEmail) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? writeSharePatch(share, { ownerEmail: targetEmail })
-                : transferOwnerMutation.mutateAsync({
-                    shareId: share.id,
-                    targetEmail,
-                  }),
-            )
-          }
-          onUpdateAcl={(
-            share,
-            sharedWithEmails,
-            marketAccessMode,
-            accessByApp,
-            saleMarketKind,
-            appSettings,
-          ) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? writeSharePatch(share, {
-                    sharedWithEmails,
-                    marketAccessMode,
-                    accessByApp,
-                    appSettings,
-                    saleMarketKind:
-                      saleMarketKind ?? share.saleMarketKind ?? "token",
-                  })
-                : updateAclMutation.mutateAsync({
-                    shareId: share.id,
-                    sharedWithEmails,
-                    marketAccessMode,
-                    accessByApp,
-                    appSettings,
-                    saleMarketKind:
-                      saleMarketKind ?? share.saleMarketKind ?? "token",
-                  }),
-            )
-          }
-          onUpdateProviderBinding={(share, appType, providerId, options) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? Promise.resolve()
-                : updateProviderBindingMutation.mutateAsync({
-                    shareId: share.id,
-                    appType,
-                    providerId,
-                    dynamic: options?.dynamic,
-                  }),
-            )
-          }
-          onRebindAtomic={(share, appType, providerId, options) =>
-            runShareAction(share, async () => {
-              if (shareScoped) return;
-              // A-3：active share 上一键改绑 = disable tunnel → update binding → enable tunnel。
-              // 中间任一步失败会留下 share 在 paused/active 中间态——错误会
-              // 通过 mutation toast 暴露，用户可在 UI 手动恢复。
-              await disableMutation.mutateAsync(share.id);
-              await updateProviderBindingMutation.mutateAsync({
-                shareId: share.id,
-                appType,
-                providerId,
-                dynamic: options?.dynamic,
-              });
-              await enableMutation.mutateAsync(share.id);
-            })
-          }
-          onUpdateTokenLimit={(share, tokenLimit) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? writeSharePatch(share, { tokenLimit })
-                : updateTokenLimitMutation.mutateAsync({
-                    shareId: share.id,
-                    tokenLimit,
-                  }),
-            )
-          }
-          onUpdateParallelLimit={(share, parallelLimit) =>
-            runShareAction(share, () =>
-              shareScoped
-                ? writeSharePatch(share, { parallelLimit })
-                : updateParallelLimitMutation.mutateAsync({
-                    shareId: share.id,
-                    parallelLimit,
-                  }),
-            )
-          }
         />
       </div>
-
-      {!shareScoped ? (
-        <CreateShareDialog
-          open={createOpen}
-          onOpenChange={setCreateOpen}
-          defaultApp={defaultApp}
-          ownerEmail={primaryShare?.ownerEmail ?? null}
-          tunnelConfig={tunnelConfig}
-          tunnelConfigSaving={configureTunnelMutation.isPending}
-          isSubmitting={createMutation.isPending || enableMutation.isPending}
-          markets={markets}
-          marketsLoading={marketsLoading}
-          marketsError={marketsError ? extractErrorMessage(marketsError) : null}
-          providersByApp={
-            providersByApp as Record<
-              "claude" | "codex" | "gemini",
-              typeof dialogProviderOptions
-            >
-          }
-          onSaveTunnelConfig={(config) =>
-            configureTunnelMutation.mutateAsync(config)
-          }
-          onRetryMarkets={() => void refetchMarkets()}
-          onSubmit={handleCreate}
-        />
-      ) : null}
 
       {!shareScoped ? (
         <ShareOwnerChangeEmailDialog

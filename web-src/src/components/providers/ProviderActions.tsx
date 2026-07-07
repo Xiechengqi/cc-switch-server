@@ -9,6 +9,7 @@ import {
   Minus,
   Play,
   Plus,
+  Share2,
   Terminal,
   Trash2,
   Zap,
@@ -17,6 +18,7 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { AppId } from "@/lib/api";
+import type { ProviderShareState } from "@/hooks/useProviderShare";
 
 interface ProviderActionsProps {
   appId?: AppId;
@@ -44,6 +46,8 @@ interface ProviderActionsProps {
   // OpenClaw: default model
   isDefaultModel?: boolean;
   onSetAsDefault?: () => void;
+  shareState?: ProviderShareState;
+  onOpenShare?: () => void;
 }
 
 // 主按钮的呈现状态。title 用于 disabled 态向用户解释为何不可点击；
@@ -83,6 +87,8 @@ export function ProviderActions({
   // OpenClaw: default model
   isDefaultModel = false,
   onSetAsDefault,
+  shareState = "none",
+  onOpenShare,
 }: ProviderActionsProps) {
   const { t } = useTranslation();
   const iconButtonClass = "h-8 w-8 p-1";
@@ -280,6 +286,35 @@ export function ProviderActions({
       </span>
 
       <div className="flex items-center gap-1">
+        <Button
+          size="icon"
+          variant="ghost"
+          onClick={onOpenShare || undefined}
+          disabled={!onOpenShare}
+          title={
+            shareState === "active"
+              ? t("provider.share.stateActive", { defaultValue: "分享已启用" })
+              : shareState === "paused"
+                ? t("provider.share.statePaused", { defaultValue: "分享已暂停" })
+                : shareState === "error"
+                  ? t("provider.share.stateError", { defaultValue: "分享异常" })
+                  : t("provider.share.openSettings", { defaultValue: "配置分享" })
+          }
+          className={cn(
+            iconButtonClass,
+            shareState === "active" &&
+              "text-primary hover:text-primary",
+            shareState === "paused" &&
+              "text-amber-600 hover:text-amber-700 dark:text-amber-400",
+            shareState === "error" &&
+              "text-red-500 hover:text-red-600 dark:text-red-400",
+            !onOpenShare &&
+              "opacity-40 cursor-not-allowed text-muted-foreground",
+          )}
+        >
+          <Share2 className="h-4 w-4" />
+        </Button>
+
         <Button
           size="icon"
           variant="ghost"
