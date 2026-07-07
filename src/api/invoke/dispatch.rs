@@ -58,20 +58,18 @@ async fn web_invoke_dispatch(
         }
         "set_rectifier_config" => {
             let config: Value = web_arg_value(&args, "config")?;
-            {
-                let mut store = state.ui_settings.write().await;
-                store.apply_patch(json!({ "rectifierConfig": config }));
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            state
+                .apply_ui_settings_patch_immediate(json!({ "rectifierConfig": config }))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(true))
         }
         "set_optimizer_config" => {
             let config: Value = web_arg_value(&args, "config")?;
-            {
-                let mut store = state.ui_settings.write().await;
-                store.apply_patch(json!({ "optimizerConfig": config }));
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            state
+                .apply_ui_settings_patch_immediate(json!({ "optimizerConfig": config }))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(true))
         }
         "get_log_config" => {
@@ -80,11 +78,10 @@ async fn web_invoke_dispatch(
         }
         "set_log_config" => {
             let config: Value = web_arg_value(&args, "config")?;
-            {
-                let mut store = state.ui_settings.write().await;
-                store.apply_patch(json!({ "logConfig": config }));
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            state
+                .apply_ui_settings_patch_immediate(json!({ "logConfig": config }))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(true))
         }
         "get_stream_check_config" => {
@@ -93,21 +90,19 @@ async fn web_invoke_dispatch(
         }
         "save_stream_check_config" => {
             let config: Value = web_arg_value(&args, "config")?;
-            {
-                let mut store = state.ui_settings.write().await;
-                store.apply_patch(json!({ "streamCheckConfig": config }));
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            state
+                .apply_ui_settings_patch_immediate(json!({ "streamCheckConfig": config }))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(true))
         }
         "save_settings" => {
             let patch =
                 ui_settings::settings_patch_from_args(&args).map_err(ApiError::bad_request)?;
-            {
-                let mut store = state.ui_settings.write().await;
-                store.apply_patch(patch);
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            state
+                .apply_ui_settings_patch_immediate(patch)
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(true))
         }
         "get_global_proxy_config" => Ok(json!(web_global_proxy_config_json(state))),
@@ -198,14 +193,12 @@ async fn web_invoke_dispatch(
                 .await
                 .map_err(ApiError::internal)??;
             if imported {
-                {
-                    let mut ui_store = state.ui_settings.write().await;
-                    ui_store.apply_patch(json!({
+                state
+                    .apply_ui_settings_patch_immediate(json!({
                         live_import::current_provider_settings_key(app): "default"
-                    }));
-                }
-                state.save_providers().await.map_err(ApiError::internal)?;
-                state.save_ui_settings().await.map_err(ApiError::internal)?;
+                    }))
+                    .await
+                    .map_err(ApiError::internal)?;
             }
             Ok(json!(imported))
         }
@@ -262,13 +255,12 @@ async fn web_invoke_dispatch(
             if !exists {
                 return Err(ApiError::not_found("provider not found"));
             }
-            {
-                let mut ui_store = state.ui_settings.write().await;
-                ui_store.apply_patch(json!({
+            state
+                .apply_ui_settings_patch_immediate(json!({
                     live_import::current_provider_settings_key(app): id
-                }));
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+                }))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!({ "warnings": [] }))
         }
         "get_provider_health" => {
@@ -867,11 +859,10 @@ async fn web_invoke_dispatch(
                     proxy_patch.insert("listenPort".to_string(), json!(port));
                 }
                 patch.insert("proxyRuntimeConfig".to_string(), Value::Object(proxy_patch));
-                {
-                    let mut store = state.ui_settings.write().await;
-                    store.apply_patch(Value::Object(patch));
-                }
-                state.save_ui_settings().await.map_err(ApiError::internal)?;
+                state
+                    .apply_ui_settings_patch_immediate(Value::Object(patch))
+                    .await
+                    .map_err(ApiError::internal)?;
             }
             Ok(json!(true))
         }
@@ -1132,29 +1123,26 @@ async fn web_invoke_dispatch(
         }
         "set_pricing_model_source" => {
             let source: Value = web_arg_value(&args, "source")?;
-            {
-                let mut store = state.ui_settings.write().await;
-                store.apply_patch(json!({ "pricingModelSource": source }));
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            state
+                .apply_ui_settings_patch_immediate(json!({ "pricingModelSource": source }))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!(true))
         }
         "webdav_sync_save_settings" => {
             let settings: Value = web_arg_value(&args, "settings")?;
-            {
-                let mut store = state.ui_settings.write().await;
-                store.apply_patch(json!({ "webdavSync": settings }));
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            state
+                .apply_ui_settings_patch_immediate(json!({ "webdavSync": settings }))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!({ "success": true }))
         }
         "s3_sync_save_settings" => {
             let settings: Value = web_arg_value(&args, "settings")?;
-            {
-                let mut store = state.ui_settings.write().await;
-                store.apply_patch(json!({ "s3Sync": settings }));
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            state
+                .apply_ui_settings_patch_immediate(json!({ "s3Sync": settings }))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!({ "success": true }))
         }
         "webdav_test_connection" | "s3_test_connection" => Ok(json!({
@@ -1225,23 +1213,24 @@ async fn web_invoke_dispatch(
         "set_common_config_snippet" => {
             let app_type = web_arg_common_config_app_type(&args)?;
             let snippet = web_arg_string_any(&args, &["snippet", "value"])?;
-            {
-                let mut store = state.ui_settings.write().await;
-                let mut snippets = store
-                    .value
-                    .get("commonConfigSnippets")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                if let Some(map) = snippets.as_object_mut() {
-                    if snippet.trim().is_empty() {
-                        map.remove(app_type);
-                    } else {
-                        map.insert(app_type.to_string(), json!(snippet));
+            state
+                .mutate_ui_settings_immediate(|store| {
+                    let mut snippets = store
+                        .value
+                        .get("commonConfigSnippets")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    if let Some(map) = snippets.as_object_mut() {
+                        if snippet.trim().is_empty() {
+                            map.remove(app_type);
+                        } else {
+                            map.insert(app_type.to_string(), json!(snippet));
+                        }
                     }
-                }
-                store.apply_patch(json!({ "commonConfigSnippets": snippets }));
-            }
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+                    store.apply_patch(json!({ "commonConfigSnippets": snippets }));
+                })
+                .await
+                .map_err(ApiError::internal)?;
             Ok(Value::Null)
         }
         "extract_common_config_snippet" => {
@@ -1570,21 +1559,24 @@ async fn web_invoke_dispatch(
         }
         "set_claude_common_config_snippet" => {
             let snippet = web_arg_string_any(&args, &["snippet", "value"])?;
-            let mut store = state.ui_settings.write().await;
-            let mut snippets = store
-                .value
-                .get("commonConfigSnippets")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            if let Some(map) = snippets.as_object_mut() {
-                if snippet.trim().is_empty() {
-                    map.remove("claude");
-                } else {
-                    map.insert("claude".to_string(), json!(snippet));
-                }
-            }
-            store.apply_patch(json!({ "commonConfigSnippets": snippets }));
-            state.save_ui_settings().await.map_err(ApiError::internal)?;
+            state
+                .mutate_ui_settings_immediate(|store| {
+                    let mut snippets = store
+                        .value
+                        .get("commonConfigSnippets")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    if let Some(map) = snippets.as_object_mut() {
+                        if snippet.trim().is_empty() {
+                            map.remove("claude");
+                        } else {
+                            map.insert("claude".to_string(), json!(snippet));
+                        }
+                    }
+                    store.apply_patch(json!({ "commonConfigSnippets": snippets }));
+                })
+                .await
+                .map_err(ApiError::internal)?;
             Ok(Value::Null)
         }
         "check_env_conflicts" => Ok(json!([])),

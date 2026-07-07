@@ -64,19 +64,20 @@ pub(in crate::api) async fn web_update_proxy_config_for_app(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("config.appType is required"))?;
     let app = parse_app_kind(app)?;
-    {
-        let mut store = state.ui_settings.write().await;
-        let mut proxy_app_configs = store
-            .value
-            .get("proxyAppConfigs")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        if let Some(map) = proxy_app_configs.as_object_mut() {
-            map.insert(app.as_str().to_string(), config.clone());
-        }
-        store.apply_patch(json!({ "proxyAppConfigs": proxy_app_configs }));
-    }
-    state.save_ui_settings().await.map_err(ApiError::internal)?;
+    state
+        .mutate_ui_settings_immediate(|store| {
+            let mut proxy_app_configs = store
+                .value
+                .get("proxyAppConfigs")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if let Some(map) = proxy_app_configs.as_object_mut() {
+                map.insert(app.as_str().to_string(), config.clone());
+            }
+            store.apply_patch(json!({ "proxyAppConfigs": proxy_app_configs }));
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     let failure_threshold = config
         .get("circuitFailureThreshold")

@@ -55,7 +55,7 @@ pub struct ServerStateInner {
     pub(crate) pricing: RwLock<ModelPricingStore>,
     pub usage: RwLock<UsageStore>,
     pub(crate) shares: RwLock<ShareStore>,
-    pub ui_settings: RwLock<UiSettingsStore>,
+    pub(crate) ui_settings: RwLock<UiSettingsStore>,
     pub(crate) sessions: RwLock<Vec<Session>>,
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
@@ -979,6 +979,27 @@ impl ServerStateInner {
 
     pub async fn save_ui_settings(&self) -> anyhow::Result<()> {
         self.ui_settings.read().await.save(&self.config_dir)
+    }
+
+    pub async fn mutate_ui_settings<R>(&self, mutate: impl FnOnce(&mut UiSettingsStore) -> R) -> R {
+        let mut ui_settings = self.ui_settings.write().await;
+        mutate(&mut ui_settings)
+    }
+
+    pub async fn mutate_ui_settings_immediate<R>(
+        &self,
+        mutate: impl FnOnce(&mut UiSettingsStore) -> R,
+    ) -> anyhow::Result<R> {
+        let result = self.mutate_ui_settings(mutate).await;
+        self.save_ui_settings().await?;
+        Ok(result)
+    }
+
+    pub async fn apply_ui_settings_patch_immediate(&self, patch: Value) -> anyhow::Result<()> {
+        self.mutate_ui_settings_immediate(|ui_settings| {
+            ui_settings.apply_patch(patch);
+        })
+        .await
     }
 
     pub async fn clear_sessions(&self) {
