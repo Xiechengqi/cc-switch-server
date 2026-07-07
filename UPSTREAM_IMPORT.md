@@ -42,6 +42,7 @@
 
 | 日期 | 上游提交/范围 | 分类 | 处理 | 说明 |
 | --- | --- | --- | --- | --- |
+| 2026-07-07 | `d7d33e51` Ollama Codex reasoning effort clamp | Must Review / proxy | 已移植(X2) | Codex Responses→OpenAI Chat 上游归一时，Ollama 目标按 desktop `effort_value_mode="ollama"` 映射 `xhigh→max`、`minimal→low`，并保留显式 `none/off/disabled→none`；非 Ollama 目标继续透传 |
 | 2026-07-02 | `d73527f1` Codex chat completions bridge for OAuth responses | Must Review / proxy | 已移植(A6) | `src/proxy/transforms.rs` 新增 Codex/OpenAI Chat↔Responses 直接请求、响应和 SSE 桥接；Codex OAuth `/chat/completions` 上游归一保留 max/reasoning/response_format/tool/usage 字段 |
 | 2026-07-02 | `273cc48c` Codex CN provider native Responses | Must Review / provider routing | 已移植(A6) | `scripts/audit-provider-coverage.mjs` preset 来源切到 official，上游 `openai_responses` CN preset 进入 `docs/provider-coverage.*`；server 继续由显式 `apiFormat` 驱动 Responses/Chat 路由 |
 | 2026-07-02 | `784d35bd` `62c1d77e` `e1ddd86e` `8e680164` `d79fee5b` Cursor AgentService/SSE fixes | Must Review / Cursor adapter | 部分移植(C1) | server 已有显式 opt-in Claude/Codex/Gemini 文本/图片/声明工具 AgentService h2 driver、Cursor API Key exchange、AgentService endpoint override、stream interrupted usage 更新、MCP/built-in tool bridge 和 tool_result 同 h2 stream park-resume；真实 Cursor 回归仍随 C1 收尾 |

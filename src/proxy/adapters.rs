@@ -774,7 +774,10 @@ fn transform_body_for_upstream(body: Bytes, stored: &StoredProvider) -> Result<B
             if input.get("messages").is_some() {
                 Ok(input)
             } else {
-                transforms::openai_responses_to_chat(&input)
+                transforms::openai_responses_to_chat_with_reasoning_effort(
+                    &input,
+                    chat_reasoning_effort_mode(stored),
+                )
             }
         }
         (AppKind::Codex, UpstreamFormat::OpenAiResponses) => {
@@ -812,6 +815,21 @@ fn transform_body_for_upstream(body: Bytes, stored: &StoredProvider) -> Result<B
         .map_err(|error| {
             ProxyError::bad_request(format!("request transform encode failed: {error}"))
         })
+}
+
+fn chat_reasoning_effort_mode(stored: &StoredProvider) -> transforms::ReasoningEffortMode {
+    if stored.provider_type == ProviderType::OllamaCloud {
+        return transforms::ReasoningEffortMode::Ollama;
+    }
+
+    let base_url = app_configured_base_url(&stored.provider, stored.app)
+        .or_else(|| default_base_url(stored.provider_type))
+        .unwrap_or_default();
+    if base_url.to_ascii_lowercase().contains("ollama") {
+        transforms::ReasoningEffortMode::Ollama
+    } else {
+        transforms::ReasoningEffortMode::Passthrough
+    }
 }
 
 fn transform_response_for_downstream(
@@ -4717,6 +4735,101 @@ mod tests {
             expected_model: Some("gpt-oss:20b"),
             expected_stream: false,
         });
+    }
+
+    #[test]
+    fn codex_responses_to_ollama_maps_xhigh_reasoning_effort_to_max() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::OllamaCloud,
+            json!({
+                "env": {
+                    "OPENAI_BASE_URL": "https://ollama.com",
+                    "OPENAI_API_KEY": "secret"
+                }
+            }),
+        );
+
+        let request = adapter_for(AppKind::Codex, ProviderType::OllamaCloud)
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.5","input":"ping","reasoning":{"effort":"xhigh"},"stream":false}"#,
+                ),
+                &stored,
+                ProxyRoute::CodexResponses,
+                None,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(
+            value.get("reasoning_effort").and_then(Value::as_str),
+            Some("max")
+        );
+        assert!(value.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn codex_responses_to_ollama_passes_explicit_none_reasoning_effort() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::OllamaCloud,
+            json!({
+                "env": {
+                    "OPENAI_BASE_URL": "https://ollama.com",
+                    "OPENAI_API_KEY": "secret"
+                }
+            }),
+        );
+
+        let request = adapter_for(AppKind::Codex, ProviderType::OllamaCloud)
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.5","input":"ping","reasoning":{"effort":"disabled"},"stream":false}"#,
+                ),
+                &stored,
+                ProxyRoute::CodexResponses,
+                None,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(
+            value.get("reasoning_effort").and_then(Value::as_str),
+            Some("none")
+        );
+        assert!(value.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn codex_responses_to_non_ollama_openai_chat_preserves_xhigh_reasoning_effort() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::Nvidia,
+            json!({
+                "env": {
+                    "OPENAI_BASE_URL": "https://api.example",
+                    "OPENAI_API_KEY": "secret"
+                }
+            }),
+        );
+
+        let request = adapter_for(AppKind::Codex, ProviderType::Nvidia)
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.5","input":"ping","reasoning":{"effort":"xhigh"},"stream":false}"#,
+                ),
+                &stored,
+                ProxyRoute::CodexResponses,
+                None,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(
+            value.get("reasoning_effort").and_then(Value::as_str),
+            Some("xhigh")
+        );
     }
 
     #[test]

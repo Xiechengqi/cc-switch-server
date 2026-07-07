@@ -35,6 +35,12 @@ pub struct StreamFrame {
     pub payload: StreamPayload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReasoningEffortMode {
+    Passthrough,
+    Ollama,
+}
+
 impl StreamFrame {
     pub fn json(payload: Value) -> Self {
         Self {
@@ -194,6 +200,13 @@ pub fn openai_chat_to_responses(input: &Value) -> Result<Value, TransformError> 
 }
 
 pub fn openai_responses_to_chat(input: &Value) -> Result<Value, TransformError> {
+    openai_responses_to_chat_with_reasoning_effort(input, ReasoningEffortMode::Passthrough)
+}
+
+pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
+    input: &Value,
+    effort_mode: ReasoningEffortMode,
+) -> Result<Value, TransformError> {
     let mut messages = Vec::new();
     if let Some(instructions) = input.get("instructions") {
         if let Some(text) = response_instruction_text(instructions) {
@@ -242,7 +255,9 @@ pub fn openai_responses_to_chat(input: &Value) -> Result<Value, TransformError> 
         copy_value(input, &mut output, key);
     }
     if let Some(effort) = input.pointer("/reasoning/effort") {
-        output.insert("reasoning_effort".to_string(), effort.clone());
+        if let Some(effort) = map_chat_reasoning_effort(effort, effort_mode) {
+            output.insert("reasoning_effort".to_string(), effort);
+        }
     }
     if let Some(tools) = openai_response_tools_to_chat(input.get("tools")) {
         output.insert("tools".to_string(), tools);
@@ -258,6 +273,23 @@ pub fn openai_responses_to_chat(input: &Value) -> Result<Value, TransformError> 
     }
 
     Ok(Value::Object(output))
+}
+
+fn map_chat_reasoning_effort(effort: &Value, effort_mode: ReasoningEffortMode) -> Option<Value> {
+    let ReasoningEffortMode::Ollama = effort_mode else {
+        return Some(effort.clone());
+    };
+
+    let effort = effort.as_str()?.trim().to_ascii_lowercase();
+    let mapped = match effort.as_str() {
+        "max" | "xhigh" => "max",
+        "high" => "high",
+        "medium" => "medium",
+        "low" | "minimal" => "low",
+        "none" | "off" | "disabled" => "none",
+        _ => return None,
+    };
+    Some(Value::String(mapped.to_string()))
 }
 
 pub fn gemini_native_to_anthropic(input: &Value) -> Result<Value, TransformError> {

@@ -23,7 +23,7 @@
 | X1 typecheck 修复 | **已完成** | 提交 `18cbca5`；typecheck exit 0 复核通过 |
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
-| X2 Ollama clamp 吸收 | **待办（P0 唯一剩余）** | `rg 'xhigh' src/proxy` 零命中；desktop 漂移仍停在 `d7d33e51` 单个提交 |
+| X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
 | X4–X11 | 待办 | 按下方执行顺序推进；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
@@ -172,8 +172,8 @@
 ```
 ✅ X1 → X3（已完成）
 ✅ Phase R 结构重构（R1–R7 已完成并关闭，提交 65721b8）
-  → X2（P0 唯一剩余，半天）
-  → X4（owner 验证流，先决策 A/B）‖ X7 第一批（transform 用例）
+✅ X2（Ollama reasoning effort clamp 已完成）
+  → X4（owner 验证流，按方案 A 对齐 desktop）‖ X7 第一批（transform 用例）
   → R4-accounts 收敛（X5 硬性前置）→ X5（Copilot token 交换）→ X6（Kiro 桥，复用 X5 基建）
   → X7 第二批（streaming 用例）
   → X8 / X9 / X10 / X11（收尾，可穿插并行）
@@ -199,3 +199,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | --- | --- |
 | 2026-07-06 | 初版：基于三方代码交叉审计（不采信文档状态）建立 X1–X11 任务与边界 |
 | 2026-07-07 | 状态更新：X1/X3 完成、Phase R 完成并关闭（`65721b8`）；X2 为 P0 唯一剩余；X5 增加 R4-accounts 收敛硬性前置；执行顺序同步 |
+| 2026-07-07 | X2 完成：吸收 desktop `d7d33e51` 的 Ollama Codex reasoning effort clamp，下一步进入 X4/X7 |
