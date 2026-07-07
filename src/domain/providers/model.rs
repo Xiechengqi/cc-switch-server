@@ -275,10 +275,13 @@ fn classify_codex_provider(provider: &Provider) -> ProviderType {
         Some("cursor_apikey") => ProviderType::CursorApiKey,
         Some("ollama_cloud") => ProviderType::OllamaCloud,
         Some("codex_oauth") => ProviderType::CodexOAuth,
+        Some("github_copilot") => ProviderType::GitHubCopilot,
         Some("nvidia") => ProviderType::Nvidia,
         Some("deepseek_api") => ProviderType::DeepSeekApi,
         _ => {
-            if provider_base_url(provider).is_some_and(|url| url.contains("openrouter.ai")) {
+            if provider_base_url(provider).is_some_and(|url| url.contains("githubcopilot.com")) {
+                ProviderType::GitHubCopilot
+            } else if provider_base_url(provider).is_some_and(|url| url.contains("openrouter.ai")) {
                 ProviderType::OpenRouter
             } else if provider_base_url(provider)
                 .is_some_and(|url| url.contains("integrate.api.nvidia.com"))
@@ -305,6 +308,7 @@ fn classify_gemini_provider(provider: &Provider) -> ProviderType {
         Some("gemini") => return ProviderType::Gemini,
         Some("gemini_cli") => return ProviderType::GeminiCli,
         Some("openrouter") => return ProviderType::OpenRouter,
+        Some("github_copilot") => return ProviderType::GitHubCopilot,
         Some("nvidia") => return ProviderType::Nvidia,
         Some("deepseek_api") => return ProviderType::DeepSeekApi,
         Some("antigravity_oauth") => return ProviderType::AntigravityOAuth,
@@ -313,7 +317,9 @@ fn classify_gemini_provider(provider: &Provider) -> ProviderType {
         _ => {}
     }
 
-    if provider_base_url(provider).is_some_and(|url| url.contains("openrouter.ai")) {
+    if provider_base_url(provider).is_some_and(|url| url.contains("githubcopilot.com")) {
+        ProviderType::GitHubCopilot
+    } else if provider_base_url(provider).is_some_and(|url| url.contains("openrouter.ai")) {
         ProviderType::OpenRouter
     } else if gemini_uses_oauth(provider) {
         ProviderType::GeminiCli
@@ -543,6 +549,7 @@ mod tests {
             ("cursor_apikey", ProviderType::CursorApiKey),
             ("ollama_cloud", ProviderType::OllamaCloud),
             ("codex_oauth", ProviderType::CodexOAuth),
+            ("github_copilot", ProviderType::GitHubCopilot),
             ("nvidia", ProviderType::Nvidia),
             ("deepseek_api", ProviderType::DeepSeekApi),
         ];
@@ -571,6 +578,14 @@ mod tests {
             classify_provider(AppKind::Codex, &deepseek),
             ProviderType::DeepSeekApi
         );
+
+        let mut copilot = provider(None);
+        copilot.settings_config =
+            json!({"env": {"OPENAI_BASE_URL": "https://api.githubcopilot.com"}});
+        assert_eq!(
+            classify_provider(AppKind::Codex, &copilot),
+            ProviderType::GitHubCopilot
+        );
     }
 
     #[test]
@@ -596,6 +611,7 @@ mod tests {
             ("gemini", ProviderType::Gemini),
             ("gemini_cli", ProviderType::GeminiCli),
             ("openrouter", ProviderType::OpenRouter),
+            ("github_copilot", ProviderType::GitHubCopilot),
             ("nvidia", ProviderType::Nvidia),
             ("deepseek_api", ProviderType::DeepSeekApi),
         ];
@@ -619,6 +635,13 @@ mod tests {
         assert_eq!(
             classify_provider(AppKind::Gemini, &openrouter),
             ProviderType::OpenRouter
+        );
+        let mut copilot = provider(None);
+        copilot.settings_config =
+            json!({"env": {"GEMINI_BASE_URL": "https://api.githubcopilot.com"}});
+        assert_eq!(
+            classify_provider(AppKind::Gemini, &copilot),
+            ProviderType::GitHubCopilot
         );
         assert_eq!(
             classify_provider(AppKind::Gemini, &provider(None)),

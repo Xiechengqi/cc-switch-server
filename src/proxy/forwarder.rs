@@ -19,7 +19,8 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
 use crate::state::{
-    build_provider_http_client, ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
+    build_provider_http_client, CopilotUpstreamAuthError, ManagedAccountRefreshError, ServerState,
+    ShareInFlightGuard,
 };
 
 use super::adapters::{self, ProviderAdapter};
@@ -99,14 +100,32 @@ pub async fn forward(
         gemini_path_for_request.as_deref(),
         &copilot_metadata,
     )?;
-    let url =
+    let mut url =
         adapter.resolve_endpoint_for_request(route, gemini_path, &stored, &adapter_request)?;
     refresh_managed_account_if_needed(&state, app, &stored).await?;
-    let accounts = state.accounts.read().await.clone();
+    let copilot_upstream_auth = if copilot_managed_account_auth_required(app, &stored) {
+        Some(
+            state
+                .prepare_copilot_upstream_auth(managed_account_id(&stored))
+                .await
+                .map_err(copilot_upstream_auth_error_to_proxy_error)?,
+        )
+    } else {
+        None
+    };
+    let accounts = state.accounts_snapshot().await;
     let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
     target_headers.extend(adapter_request.upstream_headers.iter().cloned());
     if stored.provider_type == ProviderType::CodexOAuth {
         append_codex_oauth_session_headers(&mut target_headers, codex_oauth_session_id.as_deref());
+    }
+    if let Some(auth) = copilot_upstream_auth {
+        url = super::join_url(&auth.api_endpoint, "/chat/completions");
+        replace_or_push_header(
+            &mut target_headers,
+            "authorization",
+            format!("Bearer {}", auth.token),
+        );
     }
 
     let http_client = forward_http_client(&state, &stored).await?;
@@ -512,6 +531,10 @@ fn provider_secret_configured(app: AppKind, stored: &StoredProvider) -> bool {
     }
 }
 
+fn copilot_managed_account_auth_required(app: AppKind, stored: &StoredProvider) -> bool {
+    stored.provider_type == ProviderType::GitHubCopilot && !provider_secret_configured(app, stored)
+}
+
 fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
     match provider_type {
         ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth => {
@@ -565,6 +588,39 @@ fn managed_account_refresh_error_to_proxy_error(error: ManagedAccountRefreshErro
             message: format!("managed account refresh failed: {message}"),
         },
     }
+}
+
+fn copilot_upstream_auth_error_to_proxy_error(error: CopilotUpstreamAuthError) -> ProxyError {
+    match error {
+        CopilotUpstreamAuthError::NotFound => {
+            ProxyError::not_found("github_copilot managed account not found")
+        }
+        CopilotUpstreamAuthError::MissingGitHubToken { account_id } => ProxyError::bad_request(
+            format!("github_copilot managed account {account_id} lacks a GitHub token"),
+        ),
+        CopilotUpstreamAuthError::TokenExchange {
+            status_code,
+            message,
+        } => ProxyError {
+            status: StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            message: format!("github_copilot token exchange failed: {message}"),
+        },
+    }
+}
+
+fn replace_or_push_header(
+    headers: &mut Vec<(&'static str, String)>,
+    name: &'static str,
+    value: String,
+) {
+    if let Some((_, existing)) = headers
+        .iter_mut()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+    {
+        *existing = value;
+        return;
+    }
+    headers.push((name, value));
 }
 
 fn codex_oauth_session_id_from_request(headers: &HeaderMap, body: &[u8]) -> Option<String> {
@@ -1114,6 +1170,47 @@ mod tests {
         assert_eq!(managed_account_id(&direct), Some("acct-1"));
         assert!(provider_secret_configured(AppKind::Codex, &direct));
         assert!(!provider_secret_configured(AppKind::Codex, &managed));
+    }
+
+    #[test]
+    fn copilot_static_secret_bypasses_request_time_managed_auth() {
+        let direct = stored_provider(
+            AppKind::Claude,
+            ProviderType::GitHubCopilot,
+            json!({"env": {"ANTHROPIC_AUTH_TOKEN": "copilot-static"}}),
+            Some("acct-1"),
+        );
+        let managed = stored_provider(
+            AppKind::Claude,
+            ProviderType::GitHubCopilot,
+            json!({}),
+            Some("acct-1"),
+        );
+
+        assert!(!copilot_managed_account_auth_required(
+            AppKind::Claude,
+            &direct
+        ));
+        assert!(copilot_managed_account_auth_required(
+            AppKind::Claude,
+            &managed
+        ));
+    }
+
+    #[test]
+    fn replace_or_push_header_overwrites_case_insensitively() {
+        let mut headers = vec![("Authorization", "Bearer stale".to_string())];
+        replace_or_push_header(&mut headers, "authorization", "Bearer fresh".to_string());
+        assert_eq!(headers, vec![("Authorization", "Bearer fresh".to_string())]);
+
+        replace_or_push_header(&mut headers, "x-extra", "1".to_string());
+        assert_eq!(
+            headers,
+            vec![
+                ("Authorization", "Bearer fresh".to_string()),
+                ("x-extra", "1".to_string())
+            ]
+        );
     }
 
     #[test]

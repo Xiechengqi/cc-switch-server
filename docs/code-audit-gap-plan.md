@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X7 第一批 transform 覆盖已落地，跟踪清单见 `docs/transform-coverage.md`；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | 进行中 | X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X7 第一批 transform 覆盖已落地，跟踪清单见 `docs/transform-coverage.md`；X4 复核确认需独立功能切片；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -81,13 +81,14 @@
 
 ### X5 Copilot 请求时 internal token 交换与端点发现
 
+- **状态（2026-07-07）**：**静态实现已完成**。`src/clients/oauth/copilot_device.rs` 提供 Copilot internal token 交换与 `/copilot_internal/user` endpoint 发现；`ServerStateInner::prepare_copilot_upstream_auth` 增加 per-account 内存缓存（过期前 60 秒刷新），GHES 分支按 desktop 语义直接使用 GitHub token 并回退 `copilot-api.{domain}`；`forwarder` 在 GitHub Copilot managed-account 路径覆盖 `Authorization` 与 API endpoint，provider 静态 secret 继续旁路。补充测试覆盖交换请求 shape、endpoint 发现/回退、缓存种子、静态 secret 旁路、Codex/Gemini Copilot 分类和 API 合同级 endpoint/header 覆盖。**capability 仍不得升级 native**，需真实 device-flow 账号 non-stream/stream + usage 验收后另行调整。
 - **现状证据**：desktop `providers/copilot_auth.rs`（2105 行）在转发时用 GitHub token 换取短时效 Copilot internal token（`{github_api_base}/copilot_internal/v2/token`），并经 `/copilot_internal/user` 发现每账号 API endpoint（含 GHES 分支），带续期缓存（key = GitHub user id）。server 当前 Copilot 分支（`src/proxy/adapters.rs`，fixture `claude_copilot_static_preflight_uses_chat_endpoint_and_optimizer_headers`）**只把 provider 配置里的静态 bearer 原样转发**——没有请求时交换、没有端点发现、没有续期。静态 token 过期后所有 Copilot 请求都会失败，这是 Copilot 组合停留在 fallback skeleton 的真正代码缺口。
 - **实施细节**：
-  1. 新增 `src/proxy/copilot_auth.rs`（或并入 `src/core/copilot_device.rs` 同族模块）：`exchange_internal_token(github_token, domain) -> {token, expires_at, api_endpoint}`；GHES 域名分支沿 desktop `github_api_base(domain)` 规则；
-  2. `ServerState` 增加 per-account internal token 缓存（`RwLock<HashMap<accountId, CachedCopilotToken>>`，过期前 60s 视为失效并重换）；
-  3. adapter Copilot 分支改为：绑定 managed account（`accounts.json` 中 device flow 导入的 GitHub token）时走交换 + endpoint 发现；provider 配置显式给静态 token 时保留现行为（向后兼容）；
-  4. 交换请求走 A10 代理感知 client；失败时返回结构化 `upstream_error` 而非 panic/静默；
-  5. fixture：交换请求 shape（URL/header）、缓存命中不重复交换、过期重换、GHES 域名分支、静态 token 旁路。
+  1. ✅ 新增 client 侧 `fetch_copilot_internal_token` / `fetch_copilot_api_endpoint`：GHES 域名分支沿 desktop `github_api_base(domain)` / `copilot_api_base(domain)` 规则；
+  2. ✅ `ServerState` 增加 per-account internal token 缓存（过期前 60s 视为失效并重换）；
+  3. ✅ forwarder Copilot 分支改为：绑定 managed account（`accounts.json` 中 device flow 导入的 GitHub token）时走交换 + endpoint 发现；provider 配置显式给静态 token 时保留现行为（向后兼容）；
+  4. ✅ 交换请求走 server 的代理感知 `reqwest::Client`；失败返回结构化 `upstream_error`；
+  5. ✅ fixture：交换请求 shape（URL/header）、缓存种子、endpoint 发现/回退、GHES fallback 规则、静态 token 旁路、API 合同级 endpoint/header 覆盖。
 - **验收标准**：静态 fixture 全绿；`copilot_model_map` / `copilot_optimizer` 现有测试不回归。**capability 升级 gate**：真实 device flow 账号 non-stream/stream + usage 口径验收后才把 Copilot×3 从 fallback 升级（不在本计划内）。
 - **工作量**：L。**依赖**：R4 的 accounts 域收敛已完成（state 外零直接写，字段已降 `pub(crate)`；X5 新增后台并发写路径必须复用 state 域方法）；真实验收依赖外部凭据。
 
@@ -174,7 +175,7 @@
 ✅ Phase R 结构重构（R1–R7 已完成并关闭，提交 65721b8）
 ✅ X2（Ollama reasoning effort clamp 已完成）
   → X4（owner 验证流，按方案 A 对齐 desktop）‖ ✅ X7 第一批（transform 用例，75% 门禁）
-✅ R4-accounts 收敛（X5 硬性前置已满足）→ X5（Copilot token 交换）→ X6（Kiro 桥，复用 X5 基建）
+✅ R4-accounts 收敛（X5 硬性前置已满足）→ ✅ X5（Copilot token 交换静态实现）→ X6（Kiro 桥，复用 X5 基建）
   → X7 第二批（streaming 用例）
   → X8 / X9 / X10 / X11（收尾，可穿插并行）
 ```
@@ -202,3 +203,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | X2 完成：吸收 desktop `d7d33e51` 的 Ollama Codex reasoning effort clamp，下一步进入 X4/X7 |
 | 2026-07-07 | X7 第一批完成：新增 5 个 transform 用例、覆盖跟踪清单与 75% `--check` 门禁；X4 复核为下一独立功能切片 |
 | 2026-07-07 | R4-accounts 完成：state 外 accounts 写路径清零并降 `pub(crate)`，X5 的 accounts 前置解除 |
+| 2026-07-07 | X5 静态实现完成：Copilot managed-account 请求时 token 交换、endpoint 发现、per-account 缓存与 forwarder 接线落地；真实 capability 升级仍待外部账号验收 |

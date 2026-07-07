@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use futures_util::StreamExt;
+use serde_json::Value;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration};
 
 use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::Cli;
+use crate::clients::oauth::copilot_device;
 use crate::clients::oauth::kiro_device::KiroDeviceFlowStore;
 use crate::clients::oauth::quota::{refresh_account_quota, QuotaRefreshResult};
 use crate::clients::oauth::refresh::{
@@ -56,6 +58,7 @@ pub struct ServerStateInner {
     pub ui_settings: RwLock<UiSettingsStore>,
     pub sessions: RwLock<Vec<Session>>,
     pub oauth_logins: RwLock<OAuthLoginStore>,
+    pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
     pub kiro_device_flows: RwLock<KiroDeviceFlowStore>,
     pub cursor_sessions: CursorSessionManager,
     pub account_refresh_locks: AccountRefreshLocks,
@@ -75,6 +78,28 @@ pub enum ManagedAccountRefreshError {
     Conflict { provider_type: ProviderType },
     NotFound,
     Refresh { status_code: u16, message: String },
+}
+
+#[derive(Debug)]
+pub enum CopilotUpstreamAuthError {
+    NotFound,
+    MissingGitHubToken { account_id: String },
+    TokenExchange { status_code: u16, message: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct CopilotUpstreamAuth {
+    pub account_id: String,
+    pub token: String,
+    pub api_endpoint: String,
+    pub expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CachedCopilotUpstreamAuth {
+    token: String,
+    api_endpoint: String,
+    expires_at_ms: Option<i64>,
 }
 
 pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
@@ -211,6 +236,119 @@ impl Drop for ShareInFlightGuard {
     }
 }
 
+impl CachedCopilotUpstreamAuth {
+    fn is_valid(&self, now_ms: i64) -> bool {
+        self.expires_at_ms
+            .map(|expires_at| expires_at.saturating_sub(60_000) > now_ms)
+            .unwrap_or(true)
+            && !self.token.trim().is_empty()
+            && !self.api_endpoint.trim().is_empty()
+    }
+
+    fn into_auth(self, account_id: String) -> CopilotUpstreamAuth {
+        CopilotUpstreamAuth {
+            account_id,
+            token: self.token,
+            api_endpoint: self.api_endpoint,
+            expires_at_ms: self.expires_at_ms,
+        }
+    }
+}
+
+fn cached_copilot_auth_from_account(
+    account: &Account,
+    domain: &str,
+    now_ms: i64,
+) -> Option<CachedCopilotUpstreamAuth> {
+    let token = account
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?;
+    let cached = CachedCopilotUpstreamAuth {
+        token: token.to_string(),
+        api_endpoint: copilot_account_api_endpoint(account, domain),
+        expires_at_ms: account.expires_at,
+    };
+    cached.is_valid(now_ms).then_some(cached)
+}
+
+fn copilot_account_domain(account: &Account) -> Result<String, CopilotUpstreamAuthError> {
+    let domain = account
+        .raw
+        .as_ref()
+        .and_then(|value| json_string(value, &["/githubDomain", "/github_domain"]))
+        .or_else(|| {
+            account
+                .profile
+                .as_ref()
+                .and_then(|value| json_string(value, &["/githubDomain", "/github_domain"]))
+        })
+        .unwrap_or_else(|| "github.com".to_string());
+    copilot_device::normalize_github_domain(&domain).map_err(|error| {
+        CopilotUpstreamAuthError::TokenExchange {
+            status_code: error.status.as_u16(),
+            message: error.message,
+        }
+    })
+}
+
+fn copilot_github_token(account: &Account) -> Option<String> {
+    account
+        .raw
+        .as_ref()
+        .and_then(|value| json_string(value, &["/githubToken", "/github_token"]))
+        .or_else(|| account.refresh_token.clone())
+        .or_else(|| account.api_key.clone())
+        .or_else(|| {
+            account.access_token.clone().filter(|_| {
+                account
+                    .profile
+                    .as_ref()
+                    .and_then(|value| json_bool(value, &["/ghes"]))
+                    .unwrap_or(false)
+            })
+        })
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn copilot_account_api_endpoint(account: &Account, domain: &str) -> String {
+    account
+        .raw
+        .as_ref()
+        .and_then(|value| {
+            json_string(
+                value,
+                &[
+                    "/copilotUsage/endpoints/api",
+                    "/copilot_usage/endpoints/api",
+                    "/copilotApiBase",
+                    "/copilot_api_base",
+                ],
+            )
+        })
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .unwrap_or_else(|| copilot_device::copilot_api_base(domain))
+}
+
+fn json_string(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn json_bool(value: &Value, pointers: &[&str]) -> Option<bool> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_bool))
+}
+
 impl ControlNonceCache {
     pub fn register(&self, installation_id: &str, nonce: &str, now_ms: i64, ttl_ms: i64) -> bool {
         let Ok(mut seen) = self.seen.lock() else {
@@ -340,6 +478,7 @@ impl ServerStateInner {
             ui_settings: RwLock::new(ui_settings),
             sessions: RwLock::new(Vec::new()),
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
+            copilot_upstream_auth: RwLock::new(BTreeMap::new()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
             cursor_sessions: CursorSessionManager::default(),
             account_refresh_locks: AccountRefreshLocks::default(),
@@ -548,6 +687,89 @@ impl ServerStateInner {
         }
         save_accounts_debounced(self);
         Ok(())
+    }
+
+    pub async fn prepare_copilot_upstream_auth(
+        self: &Arc<Self>,
+        account_id: Option<&str>,
+    ) -> Result<CopilotUpstreamAuth, CopilotUpstreamAuthError> {
+        let now_ms = crate::infra::time::now_ms() as i64;
+        let account = self
+            .find_account_for_provider(ProviderType::GitHubCopilot, account_id)
+            .await
+            .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        let account_id = account.id.clone();
+        let domain = copilot_account_domain(&account)?;
+
+        if let Some(cached) = self
+            .copilot_upstream_auth
+            .read()
+            .await
+            .get(&account_id)
+            .filter(|cached| cached.is_valid(now_ms))
+            .cloned()
+        {
+            return Ok(cached.into_auth(account_id));
+        }
+
+        if !copilot_device::is_ghes(&domain) {
+            if let Some(cached) = cached_copilot_auth_from_account(&account, &domain, now_ms) {
+                self.copilot_upstream_auth
+                    .write()
+                    .await
+                    .insert(account_id.clone(), cached.clone());
+                return Ok(cached.into_auth(account_id));
+            }
+        }
+
+        let github_token = copilot_github_token(&account).ok_or_else(|| {
+            CopilotUpstreamAuthError::MissingGitHubToken {
+                account_id: account_id.clone(),
+            }
+        })?;
+        let http_client = self.http_client().await;
+
+        let (token, expires_at_ms) = if copilot_device::is_ghes(&domain) {
+            (github_token.clone(), None)
+        } else {
+            let token =
+                copilot_device::fetch_copilot_internal_token(&http_client, &domain, &github_token)
+                    .await
+                    .map_err(|error| CopilotUpstreamAuthError::TokenExchange {
+                        status_code: error.status.as_u16(),
+                        message: error.message,
+                    })?;
+            (token.token, Some(token.expires_at.saturating_mul(1000)))
+        };
+
+        let api_endpoint = match copilot_device::fetch_copilot_api_endpoint(
+            &http_client,
+            &domain,
+            &github_token,
+        )
+        .await
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tracing::debug!(
+                    "failed to discover GitHub Copilot API endpoint for account {}: {}; falling back",
+                    account_id,
+                    error
+                );
+                copilot_device::copilot_api_base(&domain)
+            }
+        };
+
+        let cached = CachedCopilotUpstreamAuth {
+            token,
+            api_endpoint,
+            expires_at_ms,
+        };
+        self.copilot_upstream_auth
+            .write()
+            .await
+            .insert(account_id.clone(), cached.clone());
+        Ok(cached.into_auth(account_id))
     }
 
     pub async fn mutate_shares<R>(&self, mutate: impl FnOnce(&mut ShareStore) -> R) -> R {
@@ -1529,11 +1751,82 @@ mod tests {
 
     use crate::cli::Cli;
     use crate::clients::router::tunnel::TunnelRuntimeStatus;
+    use crate::domain::accounts::store::Account;
     use crate::domain::providers::model::{AppKind, ProviderType};
     use crate::domain::sharing::shares::{Share, ShareAcl, UpsertShareInput};
     use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
+    use serde_json::json;
 
     use super::*;
+
+    fn copilot_account_fixture(expires_at: Option<i64>) -> Account {
+        Account {
+            id: "acct-copilot".to_string(),
+            provider_type: ProviderType::GitHubCopilot,
+            email: Some("octo@example.com".to_string()),
+            access_token: Some("cached-copilot-token".to_string()),
+            refresh_token: Some("github-refresh-token".to_string()),
+            id_token: None,
+            token_type: Some("Bearer".to_string()),
+            api_key: None,
+            scopes: Vec::new(),
+            profile: Some(json!({
+                "githubDomain": "GitHub.COM",
+                "ghes": false
+            })),
+            raw: Some(json!({
+                "githubDomain": "GitHub.COM",
+                "githubToken": "github-raw-token",
+                "copilotUsage": {
+                    "endpoints": {
+                        "api": "https://copilot-api.enterprise.example.com"
+                    }
+                }
+            })),
+            subscription_level: None,
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at,
+            last_refresh_error: None,
+        }
+    }
+
+    #[test]
+    fn copilot_account_seed_cache_uses_imported_token_until_refresh_buffer() {
+        let now_ms = 10_000;
+        let account = copilot_account_fixture(Some(now_ms + 120_000));
+        let domain = copilot_account_domain(&account).unwrap();
+        let cached = cached_copilot_auth_from_account(&account, &domain, now_ms).unwrap();
+
+        assert_eq!(domain, "github.com");
+        assert_eq!(cached.token, "cached-copilot-token");
+        assert_eq!(
+            cached.api_endpoint,
+            "https://copilot-api.enterprise.example.com"
+        );
+        assert_eq!(cached.expires_at_ms, Some(now_ms + 120_000));
+
+        let expiring = copilot_account_fixture(Some(now_ms + 59_000));
+        assert!(cached_copilot_auth_from_account(&expiring, &domain, now_ms).is_none());
+    }
+
+    #[test]
+    fn copilot_github_token_prefers_raw_token_over_refresh_token() {
+        let account = copilot_account_fixture(Some(120_000));
+        assert_eq!(
+            copilot_github_token(&account).as_deref(),
+            Some("github-raw-token")
+        );
+
+        let mut fallback = account.clone();
+        fallback.raw = None;
+        assert_eq!(
+            copilot_github_token(&fallback).as_deref(),
+            Some("github-refresh-token")
+        );
+    }
 
     #[tokio::test]
     async fn share_request_log_entry_preserves_router_sync_fields() {

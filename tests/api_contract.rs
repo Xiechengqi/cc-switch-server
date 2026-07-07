@@ -3,10 +3,15 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
-use axum::http::{Method, Request, StatusCode};
+use axum::extract::State;
+use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
@@ -20,7 +25,9 @@ use cc_switch_server::api::*;
 use cc_switch_server::api::{control_signature, refresh_share_usage_items};
 use cc_switch_server::cli::Cli;
 use cc_switch_server::domain::accounts::store::{AccountQuota, UpsertAccountInput};
-use cc_switch_server::domain::providers::model::{AppKind, Provider, ProviderType};
+use cc_switch_server::domain::providers::model::{
+    AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
+};
 use cc_switch_server::domain::sharing::shares::{ShareBinding, UpsertShareInput};
 use cc_switch_server::state::{ServerState, ServerStateInner};
 
@@ -718,6 +725,132 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
     assert_eq!(usage.logs[0].provider_id, "codex-proxy-error");
     assert_eq!(usage.logs[0].status_code, 429);
     assert!(!usage.logs[0].is_streaming);
+}
+
+#[tokio::test]
+async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let upstream = Router::new()
+        .route(
+            "/chat/completions",
+            post(
+                |State(seen): State<Arc<AtomicUsize>>, headers: HeaderMap| async move {
+                    assert_eq!(
+                        headers.get("authorization").and_then(|v| v.to_str().ok()),
+                        Some("Bearer cached-copilot-token")
+                    );
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({
+                        "id": "chatcmpl-copilot",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "ok"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 3,
+                            "completion_tokens": 2,
+                            "total_tokens": 5
+                        }
+                    }))
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    state.providers.write().await.upsert(
+        AppKind::Codex,
+        Provider {
+            id: "copilot-managed".to_string(),
+            name: "Copilot Managed".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("github_copilot".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("github_copilot".to_string()),
+                    account_id: Some("acct-copilot".to_string()),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    );
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(UpsertAccountInput {
+                id: Some("acct-copilot".to_string()),
+                provider_type: ProviderType::GitHubCopilot,
+                email: Some("octo@example.com".to_string()),
+                access_token: Some("cached-copilot-token".to_string()),
+                refresh_token: Some("github-token".to_string()),
+                id_token: None,
+                token_type: Some("Bearer".to_string()),
+                api_key: None,
+                scopes: Vec::new(),
+                profile: Some(json!({"githubDomain": "github.com", "ghes": false})),
+                raw: Some(json!({
+                    "githubDomain": "github.com",
+                    "githubToken": "github-token",
+                    "copilotUsage": {
+                        "endpoints": {
+                            "api": format!("http://{upstream_addr}")
+                        }
+                    }
+                })),
+                subscription_level: None,
+                quota: None,
+                quota_percent: None,
+                quota_refreshed_at: None,
+                quota_next_refresh_at: None,
+                expires_at: Some(4_102_444_800_000),
+                last_refresh_error: None,
+            });
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("x-cc-provider-id", "copilot-managed")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "gpt-5",
+                        "messages": [{"role": "user", "content": "hello"}]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["choices"][0]["message"]["content"].as_str(),
+        Some("ok")
+    );
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

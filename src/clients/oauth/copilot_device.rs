@@ -10,10 +10,10 @@ use crate::domain::providers::model::ProviderType;
 const GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const GITHUB_CLIENT_ID_GHES: &str = "Ov23li8tweQw6odWQebz";
 const DEFAULT_GITHUB_DOMAIN: &str = "github.com";
-const COPILOT_EDITOR_VERSION: &str = "vscode/1.110.1";
-const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.38.2";
-const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.38.2";
-const COPILOT_API_VERSION: &str = "2025-10-01";
+pub const COPILOT_EDITOR_VERSION: &str = "vscode/1.110.1";
+pub const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.38.2";
+pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.38.2";
+pub const COPILOT_API_VERSION: &str = "2025-10-01";
 
 fn default_github_domain() -> String {
     DEFAULT_GITHUB_DOMAIN.to_string()
@@ -82,6 +82,19 @@ pub struct CopilotTokenResponse {
     pub expires_at: i64,
     #[serde(default, alias = "refresh_in")]
     pub refresh_in: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopilotEndpoints {
+    pub api: String,
+    #[serde(default)]
+    pub telemetry: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CopilotUserResponse {
+    #[serde(default)]
+    endpoints: Option<CopilotEndpoints>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,8 +339,16 @@ async fn fetch_copilot_token(
     domain: &str,
     github_token: &str,
 ) -> Result<CopilotTokenResponse, CopilotDeviceError> {
+    fetch_copilot_token_from_url(http, &copilot_token_url(domain), github_token).await
+}
+
+async fn fetch_copilot_token_from_url(
+    http: &reqwest::Client,
+    url: &str,
+    github_token: &str,
+) -> Result<CopilotTokenResponse, CopilotDeviceError> {
     let response = http
-        .get(copilot_token_url(domain))
+        .get(url)
         .header("Authorization", format!("token {github_token}"))
         .header("User-Agent", COPILOT_USER_AGENT)
         .header("editor-version", COPILOT_EDITOR_VERSION)
@@ -344,6 +365,52 @@ async fn fetch_copilot_token(
         ));
     }
     handle_json_response(response).await
+}
+
+pub async fn fetch_copilot_internal_token(
+    http: &reqwest::Client,
+    domain: &str,
+    github_token: &str,
+) -> Result<CopilotTokenResponse, CopilotDeviceError> {
+    let domain = normalize_github_domain(domain)?;
+    fetch_copilot_token(http, &domain, github_token).await
+}
+
+pub async fn fetch_copilot_api_endpoint(
+    http: &reqwest::Client,
+    domain: &str,
+    github_token: &str,
+) -> Result<String, CopilotDeviceError> {
+    let domain = normalize_github_domain(domain)?;
+    fetch_copilot_api_endpoint_from_url(http, &copilot_usage_url(&domain), &domain, github_token)
+        .await
+}
+
+async fn fetch_copilot_api_endpoint_from_url(
+    http: &reqwest::Client,
+    url: &str,
+    fallback_domain: &str,
+    github_token: &str,
+) -> Result<String, CopilotDeviceError> {
+    let response = http
+        .get(url)
+        .header("Authorization", format!("token {github_token}"))
+        .header("Content-Type", "application/json")
+        .header("editor-version", COPILOT_EDITOR_VERSION)
+        .header("editor-plugin-version", COPILOT_PLUGIN_VERSION)
+        .header("user-agent", COPILOT_USER_AGENT)
+        .header("x-github-api-version", COPILOT_API_VERSION)
+        .send()
+        .await
+        .map_err(|error| {
+            CopilotDeviceError::bad_gateway(format!("copilot endpoint request failed: {error}"))
+        })?;
+    let user: CopilotUserResponse = handle_json_response(response).await?;
+    Ok(user
+        .endpoints
+        .map(|endpoints| endpoints.api)
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .unwrap_or_else(|| copilot_api_base(fallback_domain)))
 }
 
 async fn fetch_copilot_usage(
@@ -427,7 +494,7 @@ fn github_oauth_token_url(domain: &str) -> String {
     format!("https://{domain}/login/oauth/access_token")
 }
 
-fn github_api_base(domain: &str) -> String {
+pub fn github_api_base(domain: &str) -> String {
     if domain == DEFAULT_GITHUB_DOMAIN {
         "https://api.github.com".to_string()
     } else {
@@ -439,15 +506,15 @@ fn github_user_url(domain: &str) -> String {
     format!("{}/user", github_api_base(domain))
 }
 
-fn copilot_token_url(domain: &str) -> String {
+pub fn copilot_token_url(domain: &str) -> String {
     format!("{}/copilot_internal/v2/token", github_api_base(domain))
 }
 
-fn copilot_usage_url(domain: &str) -> String {
+pub fn copilot_usage_url(domain: &str) -> String {
     format!("{}/copilot_internal/user", github_api_base(domain))
 }
 
-fn copilot_api_base(domain: &str) -> String {
+pub fn copilot_api_base(domain: &str) -> String {
     if domain == DEFAULT_GITHUB_DOMAIN {
         "https://api.githubcopilot.com".to_string()
     } else {
@@ -455,7 +522,7 @@ fn copilot_api_base(domain: &str) -> String {
     }
 }
 
-fn is_ghes(domain: &str) -> bool {
+pub fn is_ghes(domain: &str) -> bool {
     domain != DEFAULT_GITHUB_DOMAIN
 }
 
@@ -470,6 +537,14 @@ fn composite_account_id(domain: &str, user_id: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+    use axum::Router;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[test]
     fn normalizes_github_domain() {
@@ -478,5 +553,143 @@ mod tests {
             "github.com"
         );
         assert!(normalize_github_domain("https://user@example.com").is_err());
+    }
+
+    #[test]
+    fn copilot_urls_follow_public_and_ghes_rules() {
+        assert_eq!(github_api_base("github.com"), "https://api.github.com");
+        assert_eq!(
+            github_api_base("ghe.example.com"),
+            "https://ghe.example.com/api/v3"
+        );
+        assert_eq!(
+            copilot_token_url("github.com"),
+            "https://api.github.com/copilot_internal/v2/token"
+        );
+        assert_eq!(
+            copilot_usage_url("ghe.example.com"),
+            "https://ghe.example.com/api/v3/copilot_internal/user"
+        );
+        assert_eq!(
+            copilot_api_base("ghe.example.com"),
+            "https://copilot-api.ghe.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_copilot_internal_token_sends_expected_headers() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/v3/copilot_internal/v2/token",
+                get(
+                    |State(seen): State<Arc<AtomicUsize>>, headers: HeaderMap| async move {
+                        assert_eq!(
+                            headers.get("authorization").and_then(|v| v.to_str().ok()),
+                            Some("token github-token")
+                        );
+                        assert_eq!(
+                            headers.get("editor-version").and_then(|v| v.to_str().ok()),
+                            Some(COPILOT_EDITOR_VERSION)
+                        );
+                        assert_eq!(
+                            headers
+                                .get("editor-plugin-version")
+                                .and_then(|v| v.to_str().ok()),
+                            Some(COPILOT_PLUGIN_VERSION)
+                        );
+                        assert_eq!(
+                            headers
+                                .get("x-github-api-version")
+                                .and_then(|v| v.to_str().ok()),
+                            Some(COPILOT_API_VERSION)
+                        );
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({
+                            "token": "copilot-internal-token",
+                            "expires_at": 4_102_444_800_i64
+                        }))
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = fetch_copilot_token_from_url(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/api/v3/copilot_internal/v2/token"),
+            "github-token",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.token, "copilot-internal-token");
+        assert_eq!(response.expires_at, 4_102_444_800);
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_copilot_api_endpoint_uses_discovered_endpoint_or_fallback() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v3/copilot_internal/user",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers.get("authorization").and_then(|v| v.to_str().ok()),
+                    Some("token github-token")
+                );
+                axum::Json(json!({
+                    "endpoints": {
+                        "api": "https://copilot-api.enterprise.example.com"
+                    }
+                }))
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let endpoint = fetch_copilot_api_endpoint_from_url(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/api/v3/copilot_internal/user"),
+            &addr.to_string(),
+            "github-token",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(endpoint, "https://copilot-api.enterprise.example.com");
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v3/copilot_internal/user",
+            get(|| async { axum::Json(json!({})) }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let endpoint = fetch_copilot_api_endpoint_from_url(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/api/v3/copilot_internal/user"),
+            &addr.to_string(),
+            "github-token",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(endpoint, copilot_api_base(&addr.to_string()));
     }
 }
