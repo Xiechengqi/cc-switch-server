@@ -7,6 +7,11 @@ pub const VERSION_LINE: &str = concat!(
     ")"
 );
 
+/// Version string sent to router on installation register (build-time commit id).
+pub fn router_registration_version() -> &'static str {
+    env!("CC_SWITCH_BUILD_COMMIT_SHORT")
+}
+
 pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit id: ",
@@ -94,6 +99,15 @@ mod tests {
         assert!(!info.commit_short.is_empty());
         assert!(!info.build_time.is_empty());
         assert!(!info.target.is_empty());
+    }
+
+    #[test]
+    fn router_registration_version_uses_build_commit_short() {
+        assert_eq!(
+            router_registration_version(),
+            env!("CC_SWITCH_BUILD_COMMIT_SHORT")
+        );
+        assert_ne!(router_registration_version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

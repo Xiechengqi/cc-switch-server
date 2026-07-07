@@ -279,7 +279,7 @@ pub async fn register_installation(
     let request = RegisterInstallationRequest {
         public_key: identity.public_key.clone(),
         platform: std::env::consts::OS.to_string(),
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        app_version: crate::build_info::router_registration_version().to_string(),
         instance_nonce: nonce(),
     };
     let response = http
