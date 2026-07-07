@@ -49,7 +49,7 @@ pub struct ServerStateInner {
     pub provider_coverage: ProviderCoverage,
     pub config: RwLock<ServerConfig>,
     pub providers: RwLock<ProviderStore>,
-    pub universal_providers: RwLock<UniversalProviderStore>,
+    pub(crate) universal_providers: RwLock<UniversalProviderStore>,
     pub(crate) accounts: RwLock<AccountStore>,
     pub failover: RwLock<FailoverStore>,
     pub(crate) pricing: RwLock<ModelPricingStore>,
@@ -544,6 +544,23 @@ impl ServerStateInner {
 
     pub async fn save_universal_providers(&self) -> anyhow::Result<()> {
         self.universal_providers.read().await.save(&self.config_dir)
+    }
+
+    pub async fn mutate_universal_providers<R>(
+        &self,
+        mutate: impl FnOnce(&mut UniversalProviderStore) -> R,
+    ) -> R {
+        let mut universal_providers = self.universal_providers.write().await;
+        mutate(&mut universal_providers)
+    }
+
+    pub async fn mutate_universal_providers_immediate<R>(
+        &self,
+        mutate: impl FnOnce(&mut UniversalProviderStore) -> R,
+    ) -> anyhow::Result<R> {
+        let result = self.mutate_universal_providers(mutate).await;
+        self.save_universal_providers().await?;
+        Ok(result)
     }
 
     pub async fn save_accounts(&self) -> anyhow::Result<()> {

@@ -185,7 +185,7 @@
   → X8 第一批 ✅ / ✅ X9 / ✅ X10 / ✅ X11（收尾，可穿插并行）
 ```
 
-> **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 剩余的存储收敛（40 处直接写）与 `api/types.rs` DTO 就近化随 X 系列功能 PR 摊销，accounts/pricing 域已完成并解除 X5 前置。
+> **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 剩余的存储收敛（37 处直接写）与 `api/types.rs` DTO 就近化随 X 系列功能 PR 摊销，accounts/pricing/universal_providers 域已完成并解除 X5 前置。
 
 ## 验证基线（每个任务完成前必须通过）
 
@@ -216,3 +216,4 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | X8 第一批完成：机械删除零引用 CSS 过渡层规则，`styles.css` 5817→2660 行，并新增 3000 行静态门禁 |
 | 2026-07-07 | X4 静态实现完成：7 个 `email_auth_*` invoke 命令入契约，owner change 走新邮箱验证码 + router change-owner，直接 owner update/transfer 增加 verified target gate，并在 Share 页面接入 owner-change 两步入口；真实发信验收保留为外部任务 |
 | 2026-07-07 | R4-pricing 完成：model pricing upsert/delete 写路径收敛到 state 域方法并立即保存，`pricing` 字段降 `pub(crate)`；剩余直接写计数 42→40 |
+| 2026-07-07 | R4-universal_providers 完成：universal provider import/upsert/delete 写路径收敛到 state 域方法并立即保存，字段降 `pub(crate)`；剩余直接写计数 40→37 |

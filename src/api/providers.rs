@@ -129,19 +129,17 @@ pub(in crate::api) async fn import_universal_providers(
             ));
         }
     }
-    let imported = {
-        let mut store = state.universal_providers.write().await;
-        input
-            .providers
-            .into_iter()
-            .map(|provider| {
-                store.upsert(provider);
-                1usize
-            })
-            .sum()
-    };
-    state
-        .save_universal_providers()
+    let imported = state
+        .mutate_universal_providers_immediate(|store| {
+            input
+                .providers
+                .into_iter()
+                .map(|provider| {
+                    store.upsert(provider);
+                    1usize
+                })
+                .sum()
+        })
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(ImportUniversalProvidersResponse {
@@ -184,12 +182,8 @@ pub(in crate::api) async fn upsert_universal_provider(
         ));
     }
 
-    let provider = {
-        let mut store = state.universal_providers.write().await;
-        store.upsert(input.provider)
-    };
-    state
-        .save_universal_providers()
+    let provider = state
+        .mutate_universal_providers_immediate(|store| store.upsert(input.provider))
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(UpsertUniversalProviderResponse { ok: true, provider }))
@@ -201,9 +195,8 @@ pub(in crate::api) async fn delete_universal_provider(
     Path(id): Path<String>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let deleted = state.universal_providers.write().await.delete(&id);
-    state
-        .save_universal_providers()
+    let deleted = state
+        .mutate_universal_providers_immediate(|store| store.delete(&id))
         .await
         .map_err(ApiError::internal)?;
     if deleted {
