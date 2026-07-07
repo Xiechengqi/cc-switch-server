@@ -16,7 +16,7 @@ const serverFiles = [
   "src/proxy/adapters.rs",
 ];
 
-const targetRatio = Number(process.env.CC_SWITCH_TRANSFORM_COVERAGE_TARGET || 0.78);
+const targetRatio = Number(process.env.CC_SWITCH_TRANSFORM_COVERAGE_TARGET || 0.85);
 const desktopTotal = Object.values(desktopBaseline).reduce((sum, value) => sum + value, 0);
 const target = Math.ceil(desktopTotal * targetRatio);
 const serverTotal = serverFiles

@@ -1,0 +1,57 @@
+.settings-card,.auth-panel,.panel,.settings-layout,table,.usage-tabs{
+  color: hsl(var(--foreground));
+}.usage-result{
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: hsl(var(--success));
+  font-size: 0.8rem;
+  font-weight: 650;
+}.usage-range-presets button.active{
+  background: hsl(var(--panel));
+  box-shadow: 0 1px 2px hsl(220 20% 20% / 0.08);
+  color: hsl(var(--foreground));
+}.usage-data-source-chip.active{
+  border-color: hsl(var(--primary) / 0.35);
+  background: hsl(var(--primary) / 0.12);
+  color: hsl(var(--primary));
+}.usage-tabs{
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+}.usage-tabs button{
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  padding: 0 12px;
+  background: hsl(var(--panel));
+  color: hsl(var(--foreground));
+  font-weight: 650;
+}.usage-tabs button.active{
+  border-color: hsl(var(--primary) / 0.35);
+  background: hsl(var(--primary) / 0.12);
+  color: hsl(var(--primary));
+}.usage-mini-metric strong,.usage-mini-metric span,.usage-mini-metric small{
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}.usage-mini-metric{
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  border-radius: 8px;
+  background: hsl(var(--subtle));
+  padding: 8px 10px;
+}.usage-mini-metric span,.usage-mini-metric small{
+  color: hsl(var(--muted-foreground));
+  font-size: 0.7rem;
+}.usage-mini-metric strong{
+  color: hsl(var(--foreground));
+  font-size: 0.84rem;
+}

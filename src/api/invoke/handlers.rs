@@ -517,13 +517,12 @@ pub(in crate::api) async fn web_email_auth_request_owner_change_code(
     crate::clients::router::email_auth::request_code(&http_client, &config, &new_email)
         .await
         .map_err(map_email_auth_error)
-        .map(|response| {
+        .inspect(|_| {
             tracing::info!(
                 old_owner = %current_email,
                 new_owner = %new_email,
                 "requested share owner change email code"
             );
-            response
         })
 }
 

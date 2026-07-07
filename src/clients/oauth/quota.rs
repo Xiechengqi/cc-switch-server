@@ -1516,6 +1516,19 @@ fn normalize_codex_banked_reset(source: Value, now_ms: i64) -> Value {
     })
 }
 
+pub fn codex_banked_reset_status_snapshot(account: &Account, now_ms: i64) -> Value {
+    codex_banked_reset_status_from_account(account, now_ms).unwrap_or_else(|| {
+        json!({
+            "enabled": false,
+            "readOnly": true,
+            "source": "imported_snapshot",
+            "availableCount": 0,
+            "credits": [],
+            "queriedAt": now_ms,
+        })
+    })
+}
+
 fn antigravity_code_assist_metadata() -> Value {
     let platform = if cfg!(target_os = "macos") {
         if cfg!(target_arch = "aarch64") {

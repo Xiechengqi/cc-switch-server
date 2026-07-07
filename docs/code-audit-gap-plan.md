@@ -1,6 +1,6 @@
 # 代码审计缺口修复计划（Phase X）
 
-> **来源**：2026-07-06 对 desktop（`/data/projects/cc-switch` @ `d7d33e51`）、server（本仓库 @ `6fce8e4`）、router（`/data/projects/cc-switch-router`）三方源码的独立交叉审计。审计**不采信任何既有规划文档的状态标记**，全部结论来自代码比对与实测（`cargo test` 503 passed / typecheck / 路由与命令面逐条 diff）。
+> **来源**：2026-07-06 对 desktop（`/data/projects/cc-switch` @ `d7d33e51`）、server（本仓库 @ `6fce8e4`）、router（`/data/projects/cc-switch-router`）三方源码的独立交叉审计。审计**不采信任何既有规划文档的状态标记**，全部结论来自代码比对与实测（`cargo test` 595 passed / typecheck / 路由与命令面逐条 diff）。
 > **定位约束**：server 是 token 反代服务端；desktop 客户端专属功能（Skill/MCP/OpenClaw/Hermes/OMO/prompts/sessions/deeplink 等）维持排除，本计划不涉及。
 > **关联文档**：`docs/server-desktop-ui-parity-plan.md`（UI 同源移植主计划）、`assets/contract/web-runtime-contract.json`（功能契约）、`UPSTREAM_IMPORT.md`（上游吸收台账）。
 
@@ -12,7 +12,7 @@
 | router 契约 | router→client 控制面（`/_ctl/*`、`/_share-router/*`）全部实现；client→router 次要端点已补齐 heartbeat 探测、runtime-refresh、client-tunnel 状态/释放（见 X9/X10） |
 | proxy 管线 | 主流组合 native 已落地；Copilot/Kiro/DeepSeekAccount 为 fallback skeleton，Cursor/Bedrock 为 planned；in-module 测试深度约为 desktop 的 1/5（见 X5–X7） |
 | 前端 | desktop 231 个组件文件中 217 个同路径存在、203 个字节级相同；i18n 四语言为 desktop 严格超集；1 个 TS 编译错误（见 X1）；`styles.css` 5817 行过渡层仍被引入（见 X8） |
-| 工程 | `cargo test` 503/503 通过；`sync-desktop-ui.mjs --check` 处于失败状态（见 X3）；desktop 新提交 `d7d33e51` 未吸收（见 X2） |
+| 工程 | `cargo test` 595/595 通过（565 lib + 30 集成）；`sync-desktop-ui.mjs --check` 处于失败状态（见 X3）；desktop 新提交 `d7d33e51` 未吸收（见 X2） |
 
 ---
 
@@ -24,7 +24,7 @@
 | X3 sync 漂移门禁 | **已完成** | `node scripts/sync/sync-desktop-ui.mjs --check` exit 0，含同源树反向漂移检测 |
 | Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 吸收 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
-| X4–X11 | 进行中 | X4 静态实现已落地（7 个 `email_auth_*` invoke 命令入契约；owner change 走新邮箱验证码 + router `/v1/installations/change-owner-email`；直接 owner update/transfer 增加 verified target gate）；X5 静态实现已落地（请求时 Copilot internal token 交换、endpoint 发现、per-account 缓存；真实 capability 升级仍待外部账号验收）；X6 第一/二/三批已落地（server-native `proxy::kiro` 协议桥 + desktop 23 个 fixture；Account→Kiro request plan + 2 个 server fixture；Claude forwarder 发送、非流式 JSON 与流式 SSE 响应桥接已接线；Codex/Gemini Kiro 与 capability 升级仍待后续/真实账号 gate）；X7 第二批 streaming 覆盖已落地，门禁提升到 78%；X8 第一批 CSS 过渡层削减已落地（5817→2660 行，新增 3000 行门禁）；X9 已补齐 runtime-refresh 与 client-tunnel 状态/释放合同；X10 方案 A 已落地（heartbeat 真实探测 router）；X11 品牌图标豁免已登记；R4 受管 store 生产写路径已清零并纳入静态门禁；文中 `src/http.rs`、`src/core/*` 旧路径按 Phase R 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*` |
+| X4–X11 | **本地可实施项已完成** | X4/X5/X6/X7/X9/X10/X11 静态实现与 R4 写路径收敛均已落地；X8 第二批 CSS 过渡层削减（5817→1917 行，门禁 2000 行 + 35 个零引用 class 上限）；`api/types.rs` 按域拆分为 `api/types/{common,auth,backup,settings,providers,accounts,usage,shares,router,models}.rs`；capability native 升级、真实发信/OAuth/router 验收仍按外部环境 gate |
 
 ## P0 — 阻塞构建 / 门禁失效（应最先完成）
 
@@ -160,7 +160,7 @@
 - **状态（2026-07-07）**：**已完成**。`docs/server-desktop-ui-parity-plan.md` 第 8.4 节登记当前实测缺失的 24 个 desktop 图标资产、文件大小和豁免理由；`mcp.svg` 标记为 MCP excluded 功能资产，其他品牌图标维持 `iconInference` 回退并暂不进入 embedded 首包。
 - **现状证据**：desktop `src/icons/extracted/` 96 个文件中 26 个未移植，全部为品牌位图（PNG/JPG/WebP，如 byteplus/huoshan/qiniu 等）+ `mcp.svg`（excluded 功能）。对应 provider preset 卡片在 server 上回退到 `iconInference` 首字母图标。
 - **实施细节**：
-  1. 在 `docs/server-desktop-ui-parity-plan.md` 的豁免登记处（或本文档附录）列出 26 个文件与豁免理由（embedded 体积门禁 2MB）；
+  1. 在 `docs/server-desktop-ui-parity-plan.md` 的豁免登记处（或本文档附录）列出 26 个文件与豁免理由（embedded 体积门禁 4.5MB）；
   2. 可选优化（不作为验收项）：位图转 WebP 压缩后评估能否纳入 `locales` 之外的懒加载 chunk；若单文件 >30KB 维持豁免；
   3. `mcp.svg` 标记为 excluded 功能资产，永久跳过。
 - **验收标准**：豁免清单可追踪；`audit-web-dist-size.mjs` 门禁维持通过。
@@ -173,7 +173,7 @@
 1. **真实环境验收**：router 隧道实连、direct share 端到端、market 调度、OAuth 订阅账号真实转发、Cursor（planned，静态 driver 已接线）与 Bedrock（planned，SigV4 合同已生成）的真实验收——全部依赖外部凭据/环境，沿既有 runbook 推进；X5/X6 的 capability 从 fallback/planned 升级 native 均以真实验收为 gate。
 2. **`set_window_theme`**：契约中唯一 `implemented=false` 命令，浏览器由 ThemeProvider 覆盖，维持现状。
 3. **`v1/shares/sync`（单条同步）**：server 用 batch-sync 覆盖同一语义，不补。
-4. **DeepSeek 账密登录/PoW 栈**：维持「server 不保存账密、import-only」决策，不移植。
+4. **DeepSeek 账密登录 / 请求时 PoW**：账密登录维持不移植（import-only 不变）；请求时 PoW（`DeepSeekHashV1`）已移植用于 `DeepSeekAccount` 转发。Claude + `DeepSeekAccount` 协议桥已静态接线（Phase Y3，`planned`）；Codex/Gemini 路径仍为 skeleton，按 X6.2 Claude IR 复用路线推进。
 
 ## 执行顺序
 
@@ -188,7 +188,9 @@
 ✅ X6 第一批（Kiro 协议桥 + 23 个 desktop fixture）
 ✅ X6 第二批（Account→Kiro request plan + 2 个 server fixture）
 ✅ X6 第三批（Claude forwarder 发送/响应桥接；capability 仍保持 gate）
-  → 下一轮：X8 后续 CSS 收口 → api/types.rs DTO 就近化 → 整体 review
+  → ✅ X8 第二批 CSS 收口（1917 行 / 30 个零引用 class 残留）
+  → ✅ api/types DTO 域拆分（`src/api/types/` 子模块）
+  → 后续仅剩外部环境 gate 验收与可选 X7 第三批（85%+ 覆盖 / 半帧重组架构项）
 ```
 
 > **与 Phase R 的关系**：Phase R 已关闭（2026-07-07）。X4–X11 文中引用的 `src/http.rs`、`src/core/*` 旧路径按 R2/R3 映射表对应到 `src/api/*`、`src/domain/*`、`src/clients/*`；R4 全受管 store 生产写路径已收敛到 `ServerStateInner` 域方法并纳入静态门禁，X5 accounts 前置已满足且不得回退。剩余结构收口为 `api/types.rs` DTO 就近化，随后续功能/域改动摊销。
@@ -198,6 +200,7 @@
 ```bash
 cargo fmt --check
 cargo check --all-targets   # 直接取退出码，禁止管道吞码
+cargo clippy --all-targets -- -D warnings
 cargo test
 npm --prefix web-src run typecheck
 npm --prefix web-src run build
@@ -232,3 +235,31 @@ node scripts/sync/sync-desktop-ui.mjs --check   # X3 完成后纳入 static-chec
 | 2026-07-07 | X6 第一批完成：新增 server-native Kiro 协议桥模块，移植 desktop 23 个 Claude↔Kiro payload/SSE/usage/prompt-cache fixture；真实转发接线和 capability 升级继续受外部账号验收 gate 约束 |
 | 2026-07-07 | X6 第二批完成：补齐 server Account 到 Kiro request plan 的转换，覆盖 profile/raw 字段解析、CodeWhisperer URL/header/body shape；真实发送与 capability 升级仍保留 gate |
 | 2026-07-07 | X6 第三批完成：forwarder 接入 Claude + KiroOAuth managed-account 发送路径，mock CodeWhisperer 合同测试覆盖非流式 JSON 与流式 SSE 响应桥接；Codex/Gemini Kiro 和 capability native 升级继续保留真实账号 gate |
+| 2026-07-07 | X8 第二批完成：`styles.css` 5817→1917 行；审计脚本改为 TSX-only 引用检测并增加零引用 class 门禁（35 上限） |
+| 2026-07-07 | R4 DTO 收口：`api/types.rs` 拆为 `api/types/` 域子模块（10 文件，mod.rs 仅 re-export）；`cargo test` 533 lib + 30 集成通过 |
+| 2026-07-07 | **Phase Y 关闭（本地项）**：Y0 能力矩阵诚实化；Y1 transform 门禁 85%（222 tests）；Y2 `SseLineBuffer` 半帧缓冲；Y3 DeepSeek Account Claude 协议桥 + forwarder；Y4 Bedrock converse fixture 补强；Y6 `codex_banked_reset_status` 只读 invoke；Y5 `styles.css` 核心层 869 行并拆分 `web-src/src/styles/{providers,auth-accounts,usage,modals,universal}.css`；真实环境验收仍 gate |
+| 2026-07-07 | Review 收尾：static-checks 排除 `web-dist` 尾随空白误报；删除 `clients/deepseek/sse.rs` 死代码（SSE 解析保留于 `proxy/deepseek.rs`，-3 测试）；验证基线更新为 595（565 lib + 30 集成）；体积预算文档对齐 4.5MB 门禁；R4 正式完结登记 |
+| 2026-07-07 | clippy 25 条 warning 清零；`cargo clippy --all-targets -- -D warnings` 纳入 `static-checks.sh`；R8 proxy 体积拆分挂起登记 |
+
+---
+
+## Phase Y — 本地收尾（2026-07-07 关闭）
+
+> **范围**：在 Phase X 本地项完成后，继续补齐 transform 覆盖、SSE 缓冲、DeepSeek/Bedrock 静态接线、CSS 过渡层拆分与 invoke 只读快照；**不包含**真实 router/OAuth/上游转发验收。
+
+| 任务 | 状态 | 依据 |
+| --- | --- | --- |
+| Y0 能力矩阵诚实化 | **已完成** | Kiro/Bedrock/Copilot/DeepSeek `provider_note` 与 `planned`/`fallback` 对齐真实接线 |
+| Y1 X7 第三批（85% 门禁） | **已完成** | `audit-transform-coverage.mjs` 默认 0.85 / 216+；server 合计 222 tests |
+| Y2 SSE 半帧缓冲 | **已完成** | `streaming::SseLineBuffer` + DeepSeek 流式路径接入 |
+| Y3 DeepSeek Account 协议桥 | **已完成** | `clients/deepseek/{client,pow}`、`proxy/deepseek.rs`（内嵌 SSE 解析）、`forward_claude_deepseek`、mock 上游 fixture 测试；Claude `planned`，Codex/Gemini skeleton |
+| Y4 Bedrock fixture | **已完成** | tool_use / inferenceConfig / session token SigV4 合同测试 |
+| Y5 Providers CSS 过渡层 | **已完成** | `styles.css` 869 行（≤1200 门禁）；Providers/Auth/Usage 样式拆至 `web-src/src/styles/*.css`；零引用 class 机械删除 |
+| Y6 banked reset invoke | **已完成** | `codex_banked_reset_status` 读取导入快照；invite/consume 仍 `not_implemented` |
+| 真实环境验收 | **保留 gate** | Copilot/Kiro/DeepSeek/Bedrock/Cursor native 升级与 E2E 转发仍依赖外部凭据 |
+
+### 仍待外部环境 gate
+
+1. DeepSeek / Kiro / Copilot / Bedrock 真实账号 non-stream + stream + usage 验收
+2. Codex banked reset invite/consume live API
+3. Providers 页人工 UI 截图回归（见 `docs/manual-ui-checklist.md`）

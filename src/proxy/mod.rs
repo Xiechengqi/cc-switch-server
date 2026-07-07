@@ -5,6 +5,7 @@ mod cache_injector;
 mod copilot_model_map;
 mod copilot_optimizer;
 pub(crate) mod cursor;
+mod deepseek;
 mod forwarder;
 mod kiro;
 mod request_governance;

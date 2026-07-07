@@ -539,12 +539,20 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
     }
     match (app, provider_type) {
         (_, ProviderType::AwsBedrock) => {
-            "SigV4 signed request parts exist; real forwarding remains planned"
+            "SigV4 converse request generation is wired; real AWS Bedrock forwarding remains unvalidated"
         }
-        (
-            _,
-            ProviderType::GitHubCopilot | ProviderType::DeepSeekAccount | ProviderType::KiroOAuth,
-        ) => "manual token import is available; native account manager is not enabled",
+        (_, ProviderType::GitHubCopilot) => {
+            "managed-account token exchange and endpoint discovery are wired; capability remains fallback until real Copilot non-stream/stream validation"
+        }
+        (AppKind::Claude, ProviderType::KiroOAuth) => {
+            "managed-account CodeWhisperer forwarder is wired for Claude; capability remains planned until real Kiro account validation"
+        }
+        (_, ProviderType::DeepSeekAccount) => {
+            "Claude forwarder protocol bridge is wired; real upstream validation remains pending"
+        }
+        (AppKind::Codex | AppKind::Gemini, ProviderType::KiroOAuth) => {
+            "diagnostic capability only; Kiro forwarding is Claude-only on server"
+        }
         (_, ProviderType::CursorOAuth | ProviderType::CursorApiKey) => {
             "Cursor AgentService h2/protobuf static driver is available behind explicit opt-in; capability remains planned until real Cursor non-stream/stream validation"
         }

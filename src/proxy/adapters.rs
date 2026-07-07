@@ -444,8 +444,10 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
             ("claude_openrouter_compatible", AdapterSupport::Native)
         }
         (AppKind::Claude, ProviderType::GitHubCopilot) => fallback("claude_copilot_skeleton"),
-        (AppKind::Claude, ProviderType::DeepSeekAccount) => fallback("claude_deepseek_skeleton"),
-        (AppKind::Claude, ProviderType::KiroOAuth) => fallback("claude_kiro_skeleton"),
+        (AppKind::Claude, ProviderType::DeepSeekAccount) => {
+            planned("claude_deepseek_account_planned")
+        }
+        (AppKind::Claude, ProviderType::KiroOAuth) => planned("claude_kiro_codewhisperer_planned"),
         (AppKind::Claude, ProviderType::CursorOAuth) => {
             planned("claude_cursor_agentservice_planned")
         }
@@ -564,6 +566,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::GeminiCli
                 | ProviderType::GitHubCopilot
                 | ProviderType::KiroOAuth
+                | ProviderType::DeepSeekAccount
                 | ProviderType::CursorOAuth
                 | ProviderType::CursorApiKey
                 | ProviderType::AntigravityOAuth
@@ -623,6 +626,8 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::AgyOAuth
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
+                | ProviderType::KiroOAuth
+                | ProviderType::DeepSeekAccount
         ) | (
             AppKind::Codex,
             ProviderType::Claude
@@ -3228,22 +3233,30 @@ mod tests {
     }
 
     #[test]
+    fn claude_kiro_capability_is_planned_with_stream_usage() {
+        let capability = capability_for(AppKind::Claude, ProviderType::KiroOAuth);
+        assert_eq!(capability.adapter, "claude_kiro_codewhisperer_planned");
+        assert_eq!(capability.support, AdapterSupport::Planned);
+        assert!(capability.requires_transform);
+        assert!(capability.supports_stream_usage);
+    }
+
+    #[test]
+    fn claude_deepseek_account_capability_is_planned_with_stream_usage() {
+        let capability = capability_for(AppKind::Claude, ProviderType::DeepSeekAccount);
+        assert_eq!(capability.adapter, "claude_deepseek_account_planned");
+        assert_eq!(capability.support, AdapterSupport::Planned);
+        assert!(capability.requires_transform);
+        assert!(capability.supports_stream_usage);
+    }
+
+    #[test]
     fn account_and_cross_protocol_skeletons_remain_explicit_generic_fallbacks() {
         let cases = [
             (
                 AppKind::Claude,
                 ProviderType::GitHubCopilot,
                 "claude_copilot_skeleton",
-            ),
-            (
-                AppKind::Claude,
-                ProviderType::DeepSeekAccount,
-                "claude_deepseek_skeleton",
-            ),
-            (
-                AppKind::Claude,
-                ProviderType::KiroOAuth,
-                "claude_kiro_skeleton",
             ),
             (
                 AppKind::Codex,
@@ -5245,6 +5258,64 @@ mod tests {
         assert_eq!(
             signed.plan.redacted_session_token.as_deref(),
             Some("<redacted>")
+        );
+    }
+
+    #[test]
+    fn bedrock_converse_body_maps_tool_use_and_inference_config_from_anthropic() {
+        let stored = stored_provider(
+            AppKind::Claude,
+            ProviderType::AwsBedrock,
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://bedrock-runtime.us-west-2.amazonaws.com",
+                    "AWS_REGION": "us-west-2",
+                    "AWS_ACCESS_KEY_ID": "AKIA1234567890ABCD",
+                    "AWS_SECRET_ACCESS_KEY": "secret",
+                    "AWS_SESSION_TOKEN": "session-token"
+                }
+            }),
+        );
+        let request = AdapterRequest {
+            body: Bytes::from_static(
+                br#"{"model":"anthropic.claude-sonnet-4-6:0","max_tokens":512,"temperature":0.2,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"ping"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"pong"}]}]}"#,
+            ),
+            upstream_endpoint: None,
+            upstream_headers: Vec::new(),
+            model: Some("anthropic.claude-sonnet-4-6:0".to_string()),
+            requested_model: Some("anthropic.claude-sonnet-4-6:0".to_string()),
+            actual_model: None,
+            actual_model_source: None,
+            pricing_model: None,
+            stream_requested: false,
+        };
+        let signed =
+            bedrock_sigv4_signed_request_parts(&stored, &request, "20260701", "20260701T000000Z")
+                .unwrap();
+        let body = serde_json::from_slice::<Value>(&signed.body).unwrap();
+
+        assert_eq!(
+            body.pointer("/messages/0/content/0/toolUse/name")
+                .and_then(Value::as_str),
+            Some("lookup")
+        );
+        assert_eq!(
+            body.pointer("/messages/1/content/0/toolResult/toolUseId")
+                .and_then(Value::as_str),
+            Some("toolu_1")
+        );
+        assert_eq!(
+            body.pointer("/inferenceConfig/maxTokens")
+                .and_then(Value::as_u64),
+            Some(512)
+        );
+        assert_eq!(
+            signed
+                .headers
+                .iter()
+                .find(|(name, _)| *name == "x-amz-security-token")
+                .map(|(_, value)| value.as_str()),
+            Some("session-token")
         );
     }
 

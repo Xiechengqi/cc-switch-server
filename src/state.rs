@@ -87,6 +87,13 @@ pub enum CopilotUpstreamAuthError {
     TokenExchange { status_code: u16, message: String },
 }
 
+#[derive(Debug)]
+pub enum DeepSeekUpstreamError {
+    NotFound,
+    MissingToken,
+    Client(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct CopilotUpstreamAuth {
     pub account_id: String,
@@ -957,6 +964,27 @@ impl ServerStateInner {
             .await
             .insert(account_id.clone(), cached.clone());
         Ok(cached.into_auth(account_id))
+    }
+
+    pub async fn start_deepseek_chat_completion(
+        self: &Arc<Self>,
+        account_id: Option<&str>,
+        model: &str,
+        prompt: &str,
+    ) -> Result<reqwest::Response, DeepSeekUpstreamError> {
+        let account = self
+            .find_account_for_provider(ProviderType::DeepSeekAccount, account_id)
+            .await
+            .ok_or(DeepSeekUpstreamError::NotFound)?;
+        let token = account
+            .access_token
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(DeepSeekUpstreamError::MissingToken)?;
+        let client = crate::clients::deepseek::DeepSeekWebClient::new();
+        client
+            .start_completion(&token, model, prompt)
+            .await
+            .map_err(|error| DeepSeekUpstreamError::Client(error.to_string()))
     }
 
     pub async fn mutate_shares<R>(&self, mutate: impl FnOnce(&mut ShareStore) -> R) -> R {

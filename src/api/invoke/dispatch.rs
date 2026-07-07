@@ -1615,7 +1615,15 @@ async fn web_invoke_dispatch(
         "apply_claude_plugin_config"
         | "apply_claude_onboarding_skip"
         | "clear_claude_onboarding_skip" => Ok(Value::Null),
-        "codex_banked_reset_status" => Ok(json!({ "enabled": false })),
+        "codex_banked_reset_status" => {
+            let account_id = web_optional_string_any(&args, &["accountId", "account_id"]);
+            let now_ms = crate::infra::time::now_ms() as i64;
+            let accounts = state.accounts_snapshot().await;
+            let account = accounts
+                .find_for_provider(ProviderType::CodexOAuth, account_id.as_deref())
+                .ok_or_else(|| ApiError::not_found("codex oauth account not found"))?;
+            Ok(crate::clients::oauth::quota::codex_banked_reset_status_snapshot(account, now_ms))
+        }
         "codex_banked_reset_invite" | "codex_banked_reset_consume" => Err(
             ApiError::not_implemented("codex banked reset is not available on cc-switch-server"),
         ),

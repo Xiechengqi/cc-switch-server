@@ -1,0 +1,23 @@
+.simple-modal{
+  width: min(680px, 100%);
+}.simple-modal-body,.modal-form-stack{
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}.simple-modal-body{
+  padding: 16px;
+}.modal-inline-footer{
+  display: flex;
+  min-width: 0;
+  justify-content: flex-end;
+  gap: 10px;
+  border-top: 1px solid hsl(var(--border));
+  padding-top: 12px;
+}.modal-inline-footer.compact-footer{
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  border-top: 0;
+  padding-top: 0;
+}.modal-form-stack textarea{
+  min-height: 260px;
+}

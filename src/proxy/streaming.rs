@@ -1,6 +1,39 @@
 use crate::domain::usage::store::{usage_from_json, TokenUsage};
 
 #[derive(Debug, Default)]
+pub struct SseLineBuffer {
+    buffer: String,
+}
+
+impl SseLineBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        let mut lines = Vec::new();
+        while let Some(pos) = self.buffer.find('\n') {
+            let line = self.buffer[..pos].trim_end_matches('\r').to_string();
+            self.buffer.drain(..=pos);
+            if !line.is_empty() {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    pub fn finish(self) -> Option<String> {
+        let tail = self.buffer.trim_end_matches('\r').trim().to_string();
+        if tail.is_empty() {
+            None
+        } else {
+            Some(tail)
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct StreamUsageAccumulator {
     buffer: String,
     usage: TokenUsage,
@@ -84,6 +117,58 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_line_buffer_splits_lines_across_chunks() {
+        let mut buffer = SseLineBuffer::new();
+        let first = buffer.push_chunk(b"data: {\"choices\":");
+        assert!(first.is_empty());
+        let second = buffer.push_chunk(b"[{\"delta\":{\"content\":\"hi\"}}]}\n");
+        assert_eq!(second.len(), 1);
+        assert!(second[0].starts_with("data:"));
+    }
+
+    #[test]
+    fn sse_line_buffer_handles_crlf_line_endings() {
+        let mut buffer = SseLineBuffer::new();
+        let lines = buffer.push_chunk(b"event: ping\r\ndata: {}\r\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "event: ping");
+        assert_eq!(lines[1], "data: {}");
+    }
+
+    #[test]
+    fn sse_line_buffer_finish_returns_trailing_partial_line() {
+        let mut buffer = SseLineBuffer::new();
+        buffer.push_chunk(b"data: partial");
+        assert_eq!(buffer.finish().as_deref(), Some("data: partial"));
+    }
+
+    #[test]
+    fn sse_line_buffer_ignores_empty_tail() {
+        let buffer = SseLineBuffer::new();
+        assert!(buffer.finish().is_none());
+    }
+
+    #[test]
+    fn sse_line_buffer_preserves_multiple_complete_lines_in_one_chunk() {
+        let mut buffer = SseLineBuffer::new();
+        let lines = buffer.push_chunk(b"line1\nline2\nline3\n");
+        assert_eq!(lines, vec!["line1", "line2", "line3"]);
+        assert!(buffer.finish().is_none());
+    }
+
+    #[test]
+    fn sse_line_buffer_splits_mid_utf8_character_safely_via_lossy_decode() {
+        let mut buffer = SseLineBuffer::new();
+        let emoji = "data: 你好\n";
+        let bytes = emoji.as_bytes();
+        let split = bytes.len() - 2;
+        buffer.push_chunk(&bytes[..split]);
+        let lines = buffer.push_chunk(&bytes[split..]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("data:"));
+    }
 
     #[test]
     fn parses_openai_stream_usage_line() {

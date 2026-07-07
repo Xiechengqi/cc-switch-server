@@ -163,12 +163,11 @@ pub(crate) fn prepare_kiro_request(
     let account_data = KiroAccountData::from_account(account)?;
     let access_token = account_data.access_token(account)?;
     let request = anthropic_to_kiro_request(body, &account_data)?;
-    let region = account_data
-        .api_region
-        .trim()
-        .is_empty()
-        .then_some("us-east-1")
-        .unwrap_or(account_data.api_region.as_str());
+    let region = if account_data.api_region.trim().is_empty() {
+        "us-east-1"
+    } else {
+        account_data.api_region.as_str()
+    };
     let host = format!("q.{region}.amazonaws.com");
     let machine_id = account_data
         .machine_id
@@ -345,8 +344,6 @@ fn map_model(model: &str) -> Option<&'static str> {
             Some("claude-sonnet-4.8")
         } else if m.contains("4-6") || m.contains("4.6") {
             Some("claude-sonnet-4.6")
-        } else if m.contains("4-5") || m.contains("4.5") {
-            Some("claude-sonnet-4.5")
         } else {
             Some("claude-sonnet-4.5")
         }
@@ -357,8 +354,6 @@ fn map_model(model: &str) -> Option<&'static str> {
             Some("claude-opus-4.7")
         } else if m.contains("4-6") || m.contains("4.6") {
             Some("claude-opus-4.6")
-        } else if m.contains("4-5") || m.contains("4.5") {
-            Some("claude-opus-4.5")
         } else {
             Some("claude-opus-4.5")
         }
@@ -508,10 +503,10 @@ fn normalize_schema(schema: Value) -> Value {
     };
 
     obj.remove("$schema");
-    if !obj
+    if obj
         .get("type")
         .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
+        .is_none_or(|s| s.is_empty())
     {
         obj.insert("type".to_string(), json!("object"));
     }
@@ -1085,7 +1080,7 @@ fn parse_frames(buffer: &mut BytesMut) -> Vec<KiroFrame> {
             u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
         let header_length =
             u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
-        if total_length < 16 || total_length > 16 * 1024 * 1024 {
+        if !(16..=16 * 1024 * 1024).contains(&total_length) {
             buffer.advance(1);
             continue;
         }

@@ -7,6 +7,9 @@ if [[ "${#rust_files[@]}" -gt 0 ]]; then
   rustfmt --edition 2021 --check "${rust_files[@]}"
 fi
 
+echo "== clippy =="
+cargo clippy --all-targets -- -D warnings
+
 echo "== json parse =="
 node - <<'NODE'
 const fs = require('fs');
@@ -84,7 +87,7 @@ console.log(`inlineScripts=${scripts.length} assetRefs=${refs.length}`);
 NODE
 
 echo "== diff whitespace =="
-git diff --check
+git diff --check -- ':(exclude)web-dist'
 
 echo "== state write discipline =="
 state_write_paths=(src/api src/clients src/domain src/proxy src/infra tests)

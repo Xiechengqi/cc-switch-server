@@ -19,12 +19,13 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
 use crate::state::{
-    build_provider_http_client, CopilotUpstreamAuthError, ManagedAccountRefreshError, ServerState,
-    ShareInFlightGuard,
+    build_provider_http_client, CopilotUpstreamAuthError, DeepSeekUpstreamError,
+    ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
 };
 
 use super::adapters::{self, ProviderAdapter};
 use super::cursor;
+use super::deepseek;
 use super::kiro;
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy, decode_response_body_for_proxy,
@@ -88,6 +89,17 @@ pub async fn forward(
             state,
             stored,
             headers,
+            body,
+            request_context,
+            share_invocation_guard,
+            started,
+        })
+        .await;
+    }
+    if app == AppKind::Claude && stored.provider_type == ProviderType::DeepSeekAccount {
+        return forward_claude_deepseek(ClaudeDeepSeekForwardOptions {
+            state,
+            stored,
             body,
             request_context,
             share_invocation_guard,
@@ -417,6 +429,194 @@ struct ClaudeKiroForwardOptions {
     started: Instant,
 }
 
+struct ClaudeDeepSeekForwardOptions {
+    state: ServerState,
+    stored: StoredProvider,
+    body: Bytes,
+    request_context: UsageLogContext,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+async fn forward_claude_deepseek(
+    options: ClaudeDeepSeekForwardOptions,
+) -> Result<Response, ProxyError> {
+    let ClaudeDeepSeekForwardOptions {
+        state,
+        stored,
+        body,
+        request_context,
+        share_invocation_guard,
+        started,
+    } = options;
+    let request_body: Value = serde_json::from_slice(&body)
+        .map_err(|error| ProxyError::bad_request(format!("invalid Claude JSON body: {error}")))?;
+    let response_model = request_body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ProxyError::bad_request("missing model"))?
+        .to_string();
+    let stream_requested = request_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let prompt = deepseek::build_prompt(&request_body)?;
+    let input_tokens = deepseek::estimate_billable_user_input_tokens(&request_body);
+    let deepseek_model = deepseek::map_model(&response_model);
+
+    refresh_managed_account_if_needed(&state, AppKind::Claude, &stored).await?;
+    let upstream = state
+        .start_deepseek_chat_completion(managed_account_id(&stored), &deepseek_model, &prompt)
+        .await
+        .map_err(deepseek_upstream_error_to_proxy_error)?;
+    let status = upstream.status();
+    let status_code = status.as_u16();
+
+    if !status.is_success() {
+        let body = upstream.text().await.unwrap_or_default();
+        record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
+        return Err(ProxyError {
+            status: StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            message: format!("DeepSeek upstream returned HTTP {status_code}: {body}"),
+        });
+    }
+
+    if stream_requested {
+        let request_id = log_usage(
+            &state,
+            &stored,
+            status_code,
+            started.elapsed().as_millis(),
+            UsageModelMetadata {
+                model: Some(response_model.clone()),
+                requested_model: Some(response_model.clone()),
+                actual_model: Some(deepseek_model.clone()),
+                ..Default::default()
+            },
+            TokenUsage {
+                input_tokens: Some(u64::from(input_tokens)),
+                ..Default::default()
+            },
+            UsageLogContext {
+                is_streaming: true,
+                stream_status: Some("pending".to_string()),
+                ..request_context.clone()
+            },
+        )
+        .await;
+        let share_id = request_context.share_id.clone();
+        let sse_stream = deepseek::deepseek_bytes_stream_to_claude_sse(
+            upstream.bytes_stream(),
+            response_model,
+            input_tokens,
+        );
+        let stream = async_stream::stream! {
+            let _share_invocation_guard = share_invocation_guard;
+            let mut usage = StreamUsageAccumulator::default();
+            let mut first_token_ms = None;
+            tokio::pin!(sse_stream);
+            while let Some(chunk) = sse_stream.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let usage = usage.finish();
+                        update_stream_usage(
+                            &state,
+                            &stored,
+                            &request_id,
+                            StatusCode::BAD_GATEWAY.as_u16(),
+                            started.elapsed().as_millis(),
+                            first_token_ms,
+                            usage,
+                            Some("upstream_error"),
+                        )
+                        .await;
+                        record_share_invocation_result(&state, share_id.as_deref(), usage).await;
+                        record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                        yield Err::<Bytes, std::io::Error>(error);
+                        return;
+                    }
+                };
+                usage.push(&chunk);
+                if first_token_ms.is_none() && !chunk.is_empty() {
+                    first_token_ms = Some(started.elapsed().as_millis());
+                }
+                yield Ok::<Bytes, std::io::Error>(chunk);
+            }
+            let usage = usage.finish();
+            update_stream_usage(
+                &state,
+                &stored,
+                &request_id,
+                status_code,
+                started.elapsed().as_millis(),
+                first_token_ms,
+                usage,
+                Some("completed"),
+            )
+            .await;
+            record_share_invocation_result(&state, share_id.as_deref(), usage).await;
+            record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
+        };
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        return Ok(response);
+    }
+
+    let body_text = upstream.text().await.unwrap_or_default();
+    let text = deepseek::collect_text_from_sse_body(&body_text);
+    let output_tokens = deepseek::estimate_tokens(&text);
+    let message =
+        deepseek::claude_message_json(&text, &response_model, input_tokens, output_tokens);
+    let bytes =
+        serde_json::to_vec(&message).map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+    log_usage(
+        &state,
+        &stored,
+        status_code,
+        started.elapsed().as_millis(),
+        UsageModelMetadata {
+            model: Some(response_model.clone()),
+            requested_model: Some(response_model),
+            actual_model: Some(deepseek_model),
+            ..Default::default()
+        },
+        TokenUsage {
+            input_tokens: Some(u64::from(input_tokens)),
+            output_tokens: Some(u64::from(output_tokens)),
+            ..Default::default()
+        },
+        request_context,
+    )
+    .await;
+    record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
+    drop(share_invocation_guard);
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(response)
+}
+
+fn deepseek_upstream_error_to_proxy_error(error: DeepSeekUpstreamError) -> ProxyError {
+    match error {
+        DeepSeekUpstreamError::NotFound => {
+            ProxyError::not_found("deepseek_account managed account not found")
+        }
+        DeepSeekUpstreamError::MissingToken => ProxyError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "deepseek account access token is missing".to_string(),
+        },
+        DeepSeekUpstreamError::Client(message) => ProxyError::bad_gateway(message),
+    }
+}
+
 async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Response, ProxyError> {
     let ClaudeKiroForwardOptions {
         state,
@@ -550,7 +750,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     let usage = crate::domain::usage::store::usage_from_json(&message);
     let response_bytes = serde_json::to_vec(&message)
         .map(Bytes::from)
-        .map_err(|error| ProxyError::bad_gateway(error))?;
+        .map_err(ProxyError::bad_gateway)?;
     let share_id_for_record = request_context.share_id.clone();
     log_usage(
         &state,
@@ -1534,6 +1734,25 @@ mod tests {
             provider_type,
             provider_type_id: provider_type.as_str().to_string(),
         }
+    }
+
+    #[test]
+    fn deepseek_upstream_errors_map_to_proxy_status_codes() {
+        assert_eq!(
+            deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::NotFound).status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::MissingToken).status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::Client(
+                "upstream failed".to_string()
+            ))
+            .status,
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     #[test]

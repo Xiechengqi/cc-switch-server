@@ -2893,6 +2893,13 @@ mod tests {
     use super::*;
     use crate::domain::usage::store::usage_from_json;
 
+    fn frame_json(frame: &StreamFrame) -> &Value {
+        match &frame.payload {
+            StreamPayload::Json(value) => value,
+            other => panic!("expected json payload: {other:?}"),
+        }
+    }
+
     #[test]
     fn openai_chat_to_anthropic_preserves_tools_thinking_cache_and_image() {
         let input = json!({
@@ -4062,6 +4069,264 @@ mod tests {
                     "finish_reason": "tool_calls"
                 }]
             }))]
+        );
+    }
+
+    #[test]
+    fn anthropic_response_maps_max_tokens_stop_reason_to_openai_length() {
+        let input = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "model": "claude-sonnet-4",
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let output = anthropic_response_to_openai_chat(&input).unwrap();
+        assert_eq!(
+            output
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("length")
+        );
+    }
+
+    #[test]
+    fn anthropic_response_maps_tool_use_stop_reason_to_openai_tool_calls() {
+        let input = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+            "model": "claude-sonnet-4",
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let output = anthropic_response_to_openai_chat(&input).unwrap();
+        assert_eq!(
+            output
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+    }
+
+    #[test]
+    fn anthropic_response_maps_end_turn_to_gemini_stop() {
+        let input = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": "claude-sonnet-4",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let output = anthropic_response_to_gemini(&input).unwrap();
+        assert_eq!(
+            output
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str),
+            Some("STOP")
+        );
+    }
+
+    #[test]
+    fn anthropic_response_maps_max_tokens_to_gemini_max_tokens() {
+        let input = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": "claude-sonnet-4",
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let output = anthropic_response_to_gemini(&input).unwrap();
+        assert_eq!(
+            output
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str),
+            Some("MAX_TOKENS")
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_stop_sequence_maps_to_openai_stop() {
+        let frames = anthropic_stream_to_openai_chat(&json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "stop_sequence", "stop_sequence": "END"}
+        }));
+        assert_eq!(
+            frame_json(&frames[0])
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_max_tokens_maps_to_openai_length() {
+        let frames = anthropic_stream_to_openai_chat(&json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "max_tokens", "stop_sequence": null}
+        }));
+        assert_eq!(
+            frame_json(&frames[0])
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("length")
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_text_delta_emits_openai_chat_chunk() {
+        let frames = anthropic_stream_to_openai_chat(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"text": "hello"}
+        }));
+        assert_eq!(
+            frame_json(&frames[0])
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_text_delta_emits_gemini_text_part() {
+        let frames = anthropic_stream_to_gemini(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"text": "hello"}
+        }));
+        assert_eq!(
+            frame_json(&frames[0])
+                .pointer("/candidates/0/content/parts/0/text")
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn openai_chat_stream_length_maps_to_gemini_max_tokens() {
+        let frames = openai_chat_stream_to_gemini(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+        }));
+        assert_eq!(
+            frame_json(&frames[0])
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str),
+            Some("MAX_TOKENS")
+        );
+    }
+
+    #[test]
+    fn openai_chat_stream_stop_maps_to_gemini_stop() {
+        let frames = openai_chat_stream_to_gemini(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }));
+        assert_eq!(
+            frame_json(&frames[0])
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str),
+            Some("STOP")
+        );
+    }
+
+    #[test]
+    fn openai_responses_completed_maps_tool_output_to_chat_tool_calls_finish() {
+        let frames = openai_responses_stream_to_chat(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [{"type": "function_call", "call_id": "call_1", "name": "lookup"}]
+            }
+        }));
+        assert_eq!(
+            frame_json(&frames[0])
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_chat_maps_tools_array() {
+        let input = json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "name": "lookup",
+                "description": "search",
+                "input_schema": {"type": "object", "properties": {}}
+            }]
+        });
+        let output = anthropic_to_openai_chat(&input).unwrap();
+        assert_eq!(
+            output
+                .pointer("/tools/0/function/name")
+                .and_then(Value::as_str),
+            Some("lookup")
+        );
+    }
+
+    #[test]
+    fn anthropic_to_gemini_native_maps_system_instruction() {
+        let input = json!({
+            "model": "claude-sonnet-4",
+            "system": "be helpful",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let output = anthropic_to_gemini_native(&input).unwrap();
+        assert_eq!(
+            output
+                .pointer("/systemInstruction/parts/0/text")
+                .and_then(Value::as_str),
+            Some("be helpful")
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_maps_user_message() {
+        let input = json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}]
+        });
+        let output = anthropic_to_openai_responses(&input).unwrap();
+        assert_eq!(
+            output.pointer("/input/0/role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            output
+                .pointer("/input/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("ping")
+        );
+    }
+
+    #[test]
+    fn anthropic_response_to_openai_responses_maps_text_blocks() {
+        let input = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "model": "claude-sonnet-4",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let output = anthropic_response_to_openai_responses(&input).unwrap();
+        assert_eq!(
+            output
+                .pointer("/output/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("hello")
         );
     }
 
