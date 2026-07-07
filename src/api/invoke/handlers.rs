@@ -1697,10 +1697,11 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
             let poll_state = device_code
                 .strip_prefix("cli:")
                 .unwrap_or(device_code.as_str());
-            let poll_status = {
-                let mut store = state.oauth_logins.write().await;
-                store.poll_state_by_oauth_state(poll_state, now_ms() as i64)
-            };
+            let poll_status = state
+                .mutate_oauth_logins(|store| {
+                    store.poll_state_by_oauth_state(poll_state, now_ms() as i64)
+                })
+                .await;
             match poll_status {
                 Ok(OAuthSessionPollState::Pending) => return Ok(Value::Null),
                 Err(OAuthLoginError::NotFound) => {

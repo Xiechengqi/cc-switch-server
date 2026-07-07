@@ -57,7 +57,7 @@ pub struct ServerStateInner {
     pub(crate) shares: RwLock<ShareStore>,
     pub ui_settings: RwLock<UiSettingsStore>,
     pub(crate) sessions: RwLock<Vec<Session>>,
-    pub oauth_logins: RwLock<OAuthLoginStore>,
+    pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
     pub kiro_device_flows: RwLock<KiroDeviceFlowStore>,
     pub cursor_sessions: CursorSessionManager,
@@ -898,6 +898,14 @@ impl ServerStateInner {
 
     pub async fn push_session(&self, session: Session) {
         self.sessions.write().await.push(session);
+    }
+
+    pub async fn mutate_oauth_logins<R>(
+        &self,
+        mutate: impl FnOnce(&mut OAuthLoginStore) -> R,
+    ) -> R {
+        let mut oauth_logins = self.oauth_logins.write().await;
+        mutate(&mut oauth_logins)
     }
 }
 

@@ -56,12 +56,12 @@ pub(in crate::api) async fn start_account_login(
     let redirect_uri = input
         .redirect_uri
         .or_else(|| Some(default_account_login_redirect_uri(&state)));
-    let login = {
-        let mut store = state.oauth_logins.write().await;
-        store
-            .start(input.provider_type, redirect_uri, now_ms() as i64)
-            .map_err(oauth_login_api_error)?
-    };
+    let login = state
+        .mutate_oauth_logins(|store| {
+            store.start(input.provider_type, redirect_uri, now_ms() as i64)
+        })
+        .await
+        .map_err(oauth_login_api_error)?;
     Ok(Json(StartAccountLoginResponse { ok: true, login }))
 }
 
@@ -83,18 +83,18 @@ pub(in crate::api) async fn account_login_callback(
             .unwrap_or(error);
         return Err(ApiError::bad_request(message));
     }
-    let finish = {
-        let mut store = state.oauth_logins.write().await;
-        store
-            .finish(
+    let finish = state
+        .mutate_oauth_logins(|store| {
+            store.finish(
                 session_id.as_deref(),
                 oauth_state.as_deref(),
                 code.as_deref(),
                 false,
                 now_ms() as i64,
             )
-            .map_err(oauth_login_api_error)?
-    };
+        })
+        .await
+        .map_err(oauth_login_api_error)?;
     Ok(Json(FinishAccountLoginResponse {
         ok: true,
         login: redact_oauth_login_finish(finish),
@@ -108,18 +108,18 @@ pub(in crate::api) async fn finish_account_login(
     Json(input): Json<FinishAccountLoginRequest>,
 ) -> Result<Json<FinishAccountLoginResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let mut finish = {
-        let mut store = state.oauth_logins.write().await;
-        store
-            .finish(
+    let mut finish = state
+        .mutate_oauth_logins(|store| {
+            store.finish(
                 input.session_id.as_deref(),
                 input.state.as_deref(),
                 input.code.as_deref(),
                 input.execute_token_exchange.unwrap_or(false),
                 now_ms() as i64,
             )
-            .map_err(oauth_login_api_error)?
-    };
+        })
+        .await
+        .map_err(oauth_login_api_error)?;
     let account = if input.execute_token_exchange.unwrap_or(false) {
         Some(execute_account_login_token_exchange(&state, &mut finish).await?)
     } else {
@@ -359,10 +359,8 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
         }
     };
     state
-        .oauth_logins
-        .write()
+        .mutate_oauth_logins(|store| store.mark_exchanged(&finish.session_id))
         .await
-        .mark_exchanged(&finish.session_id)
         .map_err(oauth_login_api_error)?;
 
     finish.status = OAuthLoginStatus::TokenExchanged;
@@ -411,10 +409,8 @@ pub(in crate::api) async fn mark_account_login_exchange_failed(
     session_id: &str,
 ) {
     state
-        .oauth_logins
-        .write()
-        .await
-        .mark_exchange_failed(session_id);
+        .mutate_oauth_logins(|store| store.mark_exchange_failed(session_id))
+        .await;
 }
 
 pub(in crate::api) async fn delete_account(
