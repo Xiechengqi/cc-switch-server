@@ -56,7 +56,7 @@ pub struct ServerStateInner {
     pub usage: RwLock<UsageStore>,
     pub(crate) shares: RwLock<ShareStore>,
     pub ui_settings: RwLock<UiSettingsStore>,
-    pub sessions: RwLock<Vec<Session>>,
+    pub(crate) sessions: RwLock<Vec<Session>>,
     pub oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
     pub kiro_device_flows: RwLock<KiroDeviceFlowStore>,
@@ -890,6 +890,14 @@ impl ServerStateInner {
 
     pub async fn save_ui_settings(&self) -> anyhow::Result<()> {
         self.ui_settings.read().await.save(&self.config_dir)
+    }
+
+    pub async fn clear_sessions(&self) {
+        self.sessions.write().await.clear();
+    }
+
+    pub async fn push_session(&self, session: Session) {
+        self.sessions.write().await.push(session);
     }
 }
 

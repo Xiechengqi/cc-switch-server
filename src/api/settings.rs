@@ -238,7 +238,7 @@ pub(in crate::api) async fn web_password_change(
         .replace_config(config)
         .await
         .map_err(ApiError::internal)?;
-    state.sessions.write().await.clear();
+    state.clear_sessions().await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -364,9 +364,11 @@ pub(in crate::api) fn require_configured_owner_email(
 
 pub(in crate::api) async fn issue_login_response(state: &ServerState) -> LoginResponse {
     let token = generate_session_token();
-    state.sessions.write().await.push(Session {
-        token: token.clone(),
-    });
+    state
+        .push_session(Session {
+            token: token.clone(),
+        })
+        .await;
     LoginResponse {
         ok: true,
         token,
@@ -388,7 +390,7 @@ pub(in crate::api) async fn change_password(
         .replace_config(config)
         .await
         .map_err(ApiError::internal)?;
-    state.sessions.write().await.clear();
+    state.clear_sessions().await;
     state
         .web_auth
         .revoke_all_sessions()
