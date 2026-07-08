@@ -3,6 +3,7 @@ import { Share2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import { ShareRouterAdminPanel } from "@/components/settings/ShareRouterAdminPanel";
 import { ShareEmailLoginCard } from "@/components/settings/ShareEmailLoginCard";
 import { ClientTunnelSettingsPanel } from "@/components/settings/ClientTunnelSettingsPanel";
 import { ShareRouterBar } from "@/components/share/ShareRouterBar";
@@ -66,6 +67,8 @@ export function ShareSettingsTab() {
 
   return (
     <div className="space-y-6">
+      <ShareRouterAdminPanel />
+
       <section className="rounded-xl border border-border/60 bg-card/60 p-6 space-y-4">
         <div className="flex items-start gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">

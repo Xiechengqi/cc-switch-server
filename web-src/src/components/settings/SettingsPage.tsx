@@ -134,8 +134,9 @@ export function SettingsPage({
   useEffect(() => {
     if (open) {
       const normalizedTab =
-        defaultTab === "router" ||
-        defaultTab === "tunnel" ||
+        defaultTab === "router"
+          ? "share"
+          : defaultTab === "tunnel" ||
         defaultTab === "failover" ||
         defaultTab === "diagnostics" ||
         defaultTab === "backup" ||

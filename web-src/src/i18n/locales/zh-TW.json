@@ -327,12 +327,29 @@
     "tabAdvanced": "進階",
     "tabProxy": "路由",
     "tabShare": "分享",
+    "tabRouter": "Router",
     "share": {
       "defaultRouter": {
         "title": "預設 Router 節點",
         "description": "新建 share 時預設使用此路由節點。已建立的 share 仍綁定建立時的節點。",
         "current": "目前：{{value}}",
         "save": "儲存預設節點"
+      },
+      "routerConnection": {
+        "title": "Router 連線",
+        "description": "註冊 installation 並將 share 中繼資料同步到遠端 Router。",
+        "registered": "Router installation 已註冊"
+      },
+      "advanced": {
+        "title": "進階 Router 設定",
+        "hint": "節點網域請在下方「預設 Router 節點」中選擇；此處僅設定 API Base、SSH 等進階項目。",
+        "save": "儲存進階設定",
+        "saved": "進階 Router 設定已儲存"
+      },
+      "batchSyncConfirm": {
+        "title": "批量同步 share 到 Router？",
+        "message": "將把本地 share 中繼資料同步到遠端 Router，符合的 share 記錄可能被更新。",
+        "confirm": "同步"
       }
     },
     "authCenter": {

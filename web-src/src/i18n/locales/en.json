@@ -330,12 +330,29 @@
     "tabAdvanced": "Advanced",
     "tabProxy": "Routing",
     "tabShare": "Share",
+    "tabRouter": "Router",
     "share": {
       "defaultRouter": {
         "title": "Default Router Node",
         "description": "New shares use this router by default. Existing shares stay bound to the router used at creation.",
         "current": "Current: {{value}}",
         "save": "Save default node"
+      },
+      "routerConnection": {
+        "title": "Router Connection",
+        "description": "Register the installation and sync share metadata to the remote router.",
+        "registered": "Router installation registered"
+      },
+      "advanced": {
+        "title": "Advanced Router Settings",
+        "hint": "Choose the router node below under Default Router Node. Use this section for API Base, SSH, and other advanced options.",
+        "save": "Save advanced settings",
+        "saved": "Advanced router settings saved"
+      },
+      "batchSyncConfirm": {
+        "title": "Batch sync shares to router?",
+        "message": "This syncs local share metadata to the remote router. Matching share records may be updated.",
+        "confirm": "Sync"
       }
     },
     "authCenter": {

@@ -330,12 +330,29 @@
     "tabAdvanced": "高级",
     "tabProxy": "路由",
     "tabShare": "分享",
+    "tabRouter": "Router",
     "share": {
       "defaultRouter": {
         "title": "默认 Router 节点",
         "description": "新建 share 时默认使用此路由节点。已创建的 share 仍绑定创建时的节点。",
         "current": "当前：{{value}}",
         "save": "保存默认节点"
+      },
+      "routerConnection": {
+        "title": "Router 连接",
+        "description": "注册 installation 并将 share 元数据同步到远程 Router。",
+        "registered": "Router installation 已注册"
+      },
+      "advanced": {
+        "title": "高级 Router 配置",
+        "hint": "节点域名请在下方「默认 Router 节点」中选择；此处仅配置 API Base、SSH 等高级项。",
+        "save": "保存高级配置",
+        "saved": "高级 Router 配置已保存"
+      },
+      "batchSyncConfirm": {
+        "title": "批量同步 share 到 Router？",
+        "message": "将把本地 share 元数据同步到远程 Router，匹配的 share 记录可能被更新。",
+        "confirm": "同步"
       }
     },
     "authCenter": {

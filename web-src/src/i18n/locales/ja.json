@@ -315,12 +315,29 @@
     "tabAdvanced": "詳細",
     "tabProxy": "ルーティング",
     "tabShare": "共有",
+    "tabRouter": "Router",
     "share": {
       "defaultRouter": {
         "title": "デフォルト Router ノード",
         "description": "新規 share はこのルーターをデフォルトで使用します。既存の share は作成時のルーターに紐づいたままです。",
         "current": "現在：{{value}}",
         "save": "デフォルトノードを保存"
+      },
+      "routerConnection": {
+        "title": "Router 接続",
+        "description": "installation を登録し、share メタデータをリモート Router に同期します。",
+        "registered": "Router installation を登録しました"
+      },
+      "advanced": {
+        "title": "高度な Router 設定",
+        "hint": "ノードのドメインは下の「デフォルト Router ノード」で選択してください。ここでは API Base や SSH などの高度な項目のみ設定します。",
+        "save": "高度な設定を保存",
+        "saved": "高度な Router 設定を保存しました"
+      },
+      "batchSyncConfirm": {
+        "title": "share を Router に一括同期しますか？",
+        "message": "ローカルの share メタデータをリモート Router に同期します。一致する share レコードが更新される場合があります。",
+        "confirm": "同期"
       }
     },
     "authCenter": {

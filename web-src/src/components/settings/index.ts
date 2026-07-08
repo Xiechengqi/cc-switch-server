@@ -43,6 +43,7 @@ export {
 } from "./SettingsStatusPanels";
 export { SettingsPage } from "./SettingsPage";
 export { ShareSettingsTab } from "./ShareSettingsTab";
+export { ShareRouterAdminPanel } from "./ShareRouterAdminPanel";
 export type { SettingsTab } from "./SettingsPage";
 export { ServerSettingsExtensions } from "./ServerSettingsExtensions";
 export type { ServerSettingsTab } from "./ServerSettingsExtensions";
