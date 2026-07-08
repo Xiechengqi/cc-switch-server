@@ -382,9 +382,24 @@ pub(in crate::api) async fn change_password(
     Json(input): Json<ChangePasswordRequest>,
 ) -> Result<Json<ChangePasswordResponse>, ApiError> {
     require_session(&state, &headers).await?;
+    set_admin_password(&state, &input.new_password).await?;
+    Ok(Json(ChangePasswordResponse { ok: true }))
+}
+
+pub(in crate::api) async fn web_password_set(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ChangePasswordRequest>,
+) -> Result<Json<ChangePasswordResponse>, ApiError> {
+    require_web_admin_session(&state, &headers).await?;
+    set_admin_password(&state, &input.new_password).await?;
+    Ok(Json(ChangePasswordResponse { ok: true }))
+}
+
+async fn set_admin_password(state: &ServerState, new_password: &str) -> Result<(), ApiError> {
     let mut config = state.config.read().await.clone();
     config
-        .set_password(&input.new_password)
+        .set_password(new_password)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     state
         .replace_config(config)
@@ -395,7 +410,7 @@ pub(in crate::api) async fn change_password(
         .web_auth
         .revoke_all_sessions()
         .map_err(ApiError::internal)?;
-    Ok(Json(ChangePasswordResponse { ok: true }))
+    Ok(())
 }
 
 pub(in crate::api) async fn rotate_api_token(

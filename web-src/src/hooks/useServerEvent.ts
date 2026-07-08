@@ -11,7 +11,7 @@ type ServerEventPayload = {
  * Subscribe to server SSE (`/api/events`). EventSource cannot send Authorization
  * headers, so the session token is passed via query string (same as API contract).
  */
-export function useServerEvent<P extends ServerEventPayload>(
+export function useServerEvent<P = ServerEventPayload>(
   eventName: string,
   handler: (payload: P) => void | Promise<void>,
 ): void {

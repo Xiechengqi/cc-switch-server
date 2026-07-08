@@ -1497,8 +1497,8 @@ export async function restoreBackup(id: string): Promise<BackupRestoreResult> {
 }
 
 export async function changeServerPassword(newPassword: string): Promise<void> {
-  await jsonFetch<{ ok: boolean }>("/api/auth/password", {
-    method: "PUT",
+  await jsonFetch<{ ok: boolean }>("/web-api/auth/password/set", {
+    method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ newPassword }),
   });

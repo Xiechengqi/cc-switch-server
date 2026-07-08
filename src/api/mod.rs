@@ -344,6 +344,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/web-api/auth/password/refresh", post(web_password_refresh))
         .route("/web-api/auth/password/logout", post(web_password_logout))
         .route("/web-api/auth/password/change", post(web_password_change))
+        .route("/web-api/auth/password/set", post(web_password_set))
         .route("/web-api/auth/session/refresh", post(web_session_refresh))
         .route("/web-api/context", get(web_runtime_context))
         .route("/web-api/invoke/*command", post(web_invoke_compat))

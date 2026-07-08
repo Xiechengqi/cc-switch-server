@@ -346,15 +346,26 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                 </Button>
                 <UpdateBadge onClick={() => openSettings("about")} />
                 {isProviderHome && (
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => openSettings("usage")}
-                    title={t("usage.title", { defaultValue: "使用统计" })}
-                    className="hover:bg-black/5 dark:hover:bg-white/5"
-                  >
-                    <BarChart2 className="w-4 h-4" />
-                  </Button>
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => openSettings("usage")}
+                      title={t("usage.title", { defaultValue: "使用统计" })}
+                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                    >
+                      <BarChart2 className="w-4 h-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setCurrentView("shares")}
+                      title={t("share.title")}
+                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                    >
+                      <Share2 className="w-4 h-4" />
+                    </Button>
+                  </>
                 )}
               </div>
             )}
@@ -374,17 +385,6 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                     onSwitch={setActiveApp}
                     visibleApps={visibleApps}
                   />
-                  <div className="flex items-center gap-1 rounded-xl bg-muted p-1">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setCurrentView("shares")}
-                      className="text-muted-foreground hover:bg-black/5 hover:text-foreground dark:hover:bg-white/5"
-                      title={t("share.title")}
-                    >
-                      <Share2 className="h-4 w-4" />
-                    </Button>
-                  </div>
                   <Button
                     onClick={() => setIsAddOpen(true)}
                     size="icon"
