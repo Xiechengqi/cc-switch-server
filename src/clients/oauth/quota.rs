@@ -539,24 +539,15 @@ fn sort_codex_quota_tiers(tiers: &mut [AccountQuotaTier]) {
     });
 }
 
-fn codex_used_percent_on_percent_scale(used_percent: f64) -> f64 {
-    if used_percent > 1.0 || used_percent == 0.0 {
-        used_percent
-    } else {
-        used_percent * 100.0
-    }
-}
-
-/// `/wham/usage` usually reports consumed quota in `used_percent`, but a freshly reset
-/// window can temporarily surface remaining quota in that field while `reset_after_seconds`
-/// is still close to `limit_window_seconds`.
+/// `/wham/usage` reports consumed quota on a 0..100 percent scale (desktop keeps the
+/// raw value). Do not treat `(0, 1]` as a 0..1 fraction or `1.0` becomes 100%.
 fn codex_window_used_fraction(window: &CodexRateLimitWindow) -> Option<f64> {
     let used_percent = window.used_percent?;
     if !used_percent.is_finite() {
         return Some(0.0);
     }
 
-    let mut normalized = codex_used_percent_on_percent_scale(used_percent);
+    let mut normalized = used_percent.clamp(0.0, 100.0);
     if let (Some(reset_after), Some(limit_secs)) =
         (window.reset_after_seconds, window.limit_window_seconds)
     {
@@ -572,7 +563,7 @@ fn codex_window_used_fraction(window: &CodexRateLimitWindow) -> Option<f64> {
         }
     }
 
-    Some(percent_to_fraction(normalized))
+    Some((normalized / 100.0).clamp(0.0, 1.0))
 }
 
 fn parse_claude_quota(body: &Value, plan_label: Option<String>, now_ms: i64) -> AccountQuota {
@@ -1806,6 +1797,22 @@ mod tests {
                 .and_then(Value::as_str),
             Some("2026-07-25T04:49:24+00:00")
         );
+    }
+
+    #[test]
+    fn codex_usage_maps_one_percent_window_without_scaling_bug() {
+        let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
+            primary_window: Some(CodexRateLimitWindow {
+                used_percent: Some(1.0),
+                limit_window_seconds: Some(18_000),
+                reset_after_seconds: Some(9_000),
+                reset_at: Some(1),
+            }),
+            secondary_window: None,
+        }));
+
+        assert_eq!(tiers[0].name, "five_hour");
+        assert_eq!(tiers[0].utilization, Some(0.01));
     }
 
     #[test]

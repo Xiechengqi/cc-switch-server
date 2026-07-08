@@ -68,6 +68,8 @@ pub struct Share {
     #[serde(default)]
     pub expires_at: Option<i64>,
     #[serde(default)]
+    pub created_at_ms: u128,
+    #[serde(default)]
     pub for_sale: bool,
     #[serde(default = "default_sale_market_kind")]
     pub sale_market_kind: String,
@@ -244,6 +246,7 @@ impl ShareStore {
                     existing.tokens_used,
                     existing.requests_count,
                     existing.binding_history.clone(),
+                    existing.created_at_ms,
                     existing.router_last_synced_at_ms,
                     existing.router_last_sync_error.clone(),
                     existing.router_url.clone(),
@@ -256,11 +259,17 @@ impl ShareStore {
             tokens_used,
             requests_count,
             binding_history,
+            created_at_ms,
             router_last_synced_at_ms,
             router_last_sync_error,
             router_url,
             last_error,
-        ) = preserved.unwrap_or((0, 0, Vec::new(), None, None, None, None));
+        ) = preserved.unwrap_or((0, 0, Vec::new(), 0, None, None, None, None));
+        let created_at_ms = if created_at_ms > 0 {
+            created_at_ms
+        } else {
+            crate::infra::time::now_ms()
+        };
 
         let share = Share {
             id: share_id,
@@ -281,6 +290,7 @@ impl ShareStore {
             tokens_used,
             requests_count,
             expires_at: input.expires_at,
+            created_at_ms,
             for_sale: input.for_sale.unwrap_or(false),
             sale_market_kind: input
                 .sale_market_kind

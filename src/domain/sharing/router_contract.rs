@@ -1,16 +1,16 @@
 use std::collections::BTreeMap;
 
+use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::accounts::store::{Account, AccountStore};
+use crate::domain::accounts::store::{Account, AccountQuotaTier, AccountStore};
 use crate::domain::health;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::{Share, ShareMarketGrantStatus};
 use crate::domain::usage::store::UsageStore;
-use crate::infra::time::now_ms;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -156,6 +156,50 @@ pub struct ShareSupport {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShareUpstreamQuotaTier {
+    #[serde(alias = "name")]
+    pub label: String,
+    pub utilization: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUpstreamQuota {
+    pub status: String,
+    #[serde(
+        default,
+        alias = "credentialMessage",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queried_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_period_end: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_limit_percent: Option<f64>,
+    #[serde(default)]
+    pub tiers: Vec<ShareUpstreamQuotaTier>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareUpstreamProvider {
     pub kind: String,
     pub app: String,
@@ -175,6 +219,8 @@ pub struct ShareUpstreamProvider {
     pub quota_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<ShareUpstreamQuota>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -218,6 +264,8 @@ pub struct ShareAppProvider {
     pub quota_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<ShareUpstreamQuota>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -420,10 +468,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
                     shared_with_emails: shared_with_emails.clone(),
                     token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
                     parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(3),
-                    expires_at: share
-                        .expires_at
-                        .map(|value| value.to_string())
-                        .unwrap_or_default(),
+                    expires_at: share_expires_at_rfc3339(share.expires_at),
                 });
         app_settings.insert(app.clone(), app_setting);
     }
@@ -502,11 +547,8 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         tokens_used: share.tokens_used as i64,
         requests_count: share.requests_count as i64,
         share_status: share.status.clone(),
-        created_at: now_ms().to_string(),
-        expires_at: share
-            .expires_at
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
+        created_at: share_created_at_rfc3339(share),
+        expires_at: share_expires_at_rfc3339(share.expires_at),
         support,
         upstream_provider: primary_upstream,
         app_runtimes,
@@ -532,6 +574,7 @@ fn upstream_provider(
     usage: Option<&UsageStore>,
 ) -> ShareUpstreamProvider {
     let health = usage.map(|usage| provider_health(provider, usage));
+    let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let account_context = account_context_for_share(provider, share, accounts);
     let quota_blocked = quota_blocked_percent(account_context.quota_percent);
     let available = health
@@ -548,6 +591,7 @@ fn upstream_provider(
         subscription_remaining_ms: account_context.subscription_remaining_ms,
         quota_percent: account_context.quota_percent,
         quota_blocked,
+        quota: account.and_then(upstream_quota_from_account),
         api_url: provider_api_url(provider),
         models: provider_models(provider),
         health,
@@ -564,6 +608,7 @@ fn app_provider(
     is_current: bool,
 ) -> ShareAppProvider {
     let health = usage.map(|usage| provider_health(provider, usage));
+    let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let account_context = account_context_for_share(provider, share, accounts);
     let quota_blocked = quota_blocked_percent(account_context.quota_percent);
     let available = health
@@ -583,6 +628,7 @@ fn app_provider(
         subscription_remaining_ms: account_context.subscription_remaining_ms,
         quota_percent: account_context.quota_percent,
         quota_blocked,
+        quota: account.and_then(upstream_quota_from_account),
         api_url: provider_api_url(provider),
         models: provider_models(provider),
         health,
@@ -722,6 +768,116 @@ fn subscription_remaining_ms_from_extra(value: &Value) -> Option<i64> {
         .and_then(Value::as_i64)
 }
 
+fn upstream_quota_from_account(account: &Account) -> Option<ShareUpstreamQuota> {
+    let quota = account.quota.as_ref()?;
+    if quota.tiers.is_empty() && !quota.success {
+        return None;
+    }
+    let plan = quota
+        .credential_message
+        .clone()
+        .or_else(|| account.subscription_level.clone());
+    Some(ShareUpstreamQuota {
+        status: if quota.success {
+            "ok".to_string()
+        } else {
+            "failed".to_string()
+        },
+        plan,
+        queried_at: account.quota_refreshed_at,
+        subscription_period_end: account_subscription_expires_at(account),
+        availability: Some("available".to_string()),
+        blocked_until: None,
+        blocked_reason: None,
+        blocked_scope: None,
+        dispatch_limit_percent: None,
+        tiers: quota
+            .tiers
+            .iter()
+            .map(share_upstream_quota_tier_from_account)
+            .collect(),
+    })
+}
+
+fn share_upstream_quota_tier_from_account(tier: &AccountQuotaTier) -> ShareUpstreamQuotaTier {
+    ShareUpstreamQuotaTier {
+        label: share_quota_tier_label(&tier.name),
+        utilization: utilization_percent_for_router_share(tier.utilization),
+        resets_at: tier.resets_at.and_then(unix_ms_to_rfc3339),
+        used: tier.used,
+        limit: tier.limit,
+        unit: tier.unit.clone(),
+    }
+}
+
+fn share_quota_tier_label(name: &str) -> String {
+    match name {
+        "five_hour" => "5h".to_string(),
+        "seven_day" => "1w".to_string(),
+        "30_day" => "30d".to_string(),
+        "seven_day_opus" => "7d Opus".to_string(),
+        "seven_day_omelette" => "7d Opus".to_string(),
+        "seven_day_sonnet" => "7d Sonnet".to_string(),
+        "premium" => "premium".to_string(),
+        "kiro_agentic_requests" => "Kiro".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+fn utilization_percent_for_router_share(value: Option<f64>) -> f64 {
+    let Some(value) = value else {
+        return 0.0;
+    };
+    if !value.is_finite() {
+        return 0.0;
+    }
+    if value <= 1.0 {
+        (value * 100.0).clamp(0.0, 100.0)
+    } else {
+        value.clamp(0.0, 100.0)
+    }
+}
+
+fn unix_ms_to_rfc3339(ms: i64) -> Option<String> {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .map(|value| value.to_rfc3339())
+}
+
+const UNLIMITED_SHARE_EXPIRES_AT: &str = "2100-01-01T00:00:00Z";
+
+fn share_timestamp_to_rfc3339(value: i64) -> Option<String> {
+    if value <= 0 {
+        return None;
+    }
+    let ms = if value < 10_000_000_000 {
+        value.saturating_mul(1000)
+    } else {
+        value
+    };
+    unix_ms_to_rfc3339(ms)
+}
+
+fn share_expires_at_rfc3339(expires_at: Option<i64>) -> String {
+    expires_at
+        .and_then(share_timestamp_to_rfc3339)
+        .unwrap_or_else(|| UNLIMITED_SHARE_EXPIRES_AT.to_string())
+}
+
+fn share_created_at_rfc3339(share: &Share) -> String {
+    if share.created_at_ms > 0 {
+        return unix_ms_to_rfc3339(share.created_at_ms as i64)
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+    }
+    share
+        .binding_history
+        .iter()
+        .map(|entry| entry.changed_at_ms)
+        .min()
+        .and_then(|value| unix_ms_to_rfc3339(value as i64))
+        .unwrap_or_else(|| Utc::now().to_rfc3339())
+}
+
 fn provider_models(provider: &StoredProvider) -> Vec<ShareUpstreamModel> {
     let mut models = Vec::new();
     if let Some(upstream_model) = provider
@@ -827,7 +983,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::domain::accounts::store::{AccountQuota, AccountStore};
+    use crate::domain::accounts::store::{AccountQuota, AccountQuotaTier, AccountStore};
     use crate::domain::providers::model::{Provider, ProviderType};
     use crate::domain::sharing::shares::{ShareAcl, ShareBinding};
     use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
@@ -878,6 +1034,37 @@ mod tests {
         );
         assert_eq!(provider.quota_percent, Some(42.0));
         assert_eq!(provider.quota_blocked, Some(false));
+    }
+
+    #[test]
+    fn descriptor_maps_codex_quota_tiers_for_router_share_card() {
+        let share = test_share(ProviderType::CodexOAuth, Some(1.0));
+        let providers = ProviderStore {
+            providers: vec![test_provider(ProviderType::CodexOAuth)],
+        };
+        let mut account = test_account(ProviderType::CodexOAuth);
+        account.quota = Some(AccountQuota {
+            success: true,
+            credential_message: Some("ChatGPT Plus".to_string()),
+            tiers: vec![AccountQuotaTier {
+                name: "five_hour".to_string(),
+                utilization: Some(0.01),
+                resets_at: Some(1_700_000_000_000),
+                ..Default::default()
+            }],
+            extra_usage: None,
+        });
+        let accounts = AccountStore {
+            accounts: vec![account],
+        };
+
+        let descriptor =
+            descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
+        let runtime = descriptor.app_runtimes.codex.expect("codex runtime");
+        let quota = runtime.quota.expect("quota payload");
+
+        assert_eq!(quota.tiers[0].label, "5h");
+        assert_eq!(quota.tiers[0].utilization, 1.0);
     }
 
     #[test]
