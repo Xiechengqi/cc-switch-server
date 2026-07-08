@@ -1,4 +1,4 @@
-import { invokeCommand, jsonFetch } from "@/lib/runtime";
+import { invokeCommand, jsonFetch, readCachedPassword } from "@/lib/runtime";
 
 export type AppKind = "claude" | "codex" | "gemini";
 
@@ -1497,10 +1497,16 @@ export async function restoreBackup(id: string): Promise<BackupRestoreResult> {
 }
 
 export async function changeServerPassword(newPassword: string): Promise<void> {
-  await jsonFetch<{ ok: boolean }>("/web-api/auth/password/set", {
+  const currentPassword = readCachedPassword()?.trim();
+  if (!currentPassword) {
+    throw new Error(
+      "无法验证当前密码，请先退出后使用原密码重新登录再修改。",
+    );
+  }
+  await jsonFetch<{ ok: boolean }>("/web-api/auth/password/change", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ newPassword }),
+    body: JSON.stringify({ currentPassword, newPassword }),
   });
 }
 
