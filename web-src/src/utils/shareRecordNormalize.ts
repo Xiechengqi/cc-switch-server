@@ -166,10 +166,7 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
       (record.forSaleOfficialPricePercentByApp as ShareRecord["forSaleOfficialPricePercentByApp"]) ??
       (record.for_sale_official_price_percent_by_app as ShareRecord["forSaleOfficialPricePercentByApp"]) ??
       {},
-    description:
-      readString(record, "description") ??
-      (record.description === null ? null : undefined) ??
-      null,
+    description: readString(record, "description") ?? null,
     forSale: normalizeForSale(record),
     saleMarketKind: normalizeSaleMarketKind(record),
     bindings,

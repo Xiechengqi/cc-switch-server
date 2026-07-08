@@ -382,10 +382,10 @@ export function useEnableShareMutation() {
   return useMutation({
     mutationFn: (shareId: string) => shareApi.enable(shareId),
     onSuccess: async (enabledShare, shareId) => {
-      const applyEnabledShare = <T extends ShareRecord | null | undefined>(
-        current: T,
-      ): T => {
-        if (!current) return enabledShare as T;
+      const applyEnabledShare = (
+        current: ShareRecord | null | undefined,
+      ): ShareRecord | null | undefined => {
+        if (!current) return enabledShare;
         return current.id === shareId ? enabledShare : current;
       };
 

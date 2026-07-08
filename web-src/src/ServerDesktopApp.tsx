@@ -33,7 +33,6 @@ import {
   type SettingsTab,
 } from "@/components/settings/SettingsPage";
 import { SharePage } from "@/components/share/SharePage";
-import { ProxyToggle } from "@/components/proxy/ProxyToggle";
 import { FailoverToggle } from "@/components/proxy/FailoverToggle";
 import { Button } from "@/components/ui/button";
 import type { VisibleApps } from "@/types";
@@ -353,12 +352,11 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
 
           {isProviderHome && (
             <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
-              <div className="flex shrink-0 items-center gap-1.5">
-                <ProxyToggle activeApp={activeApp} />
-                {settingsData?.enableFailoverToggle !== false && (
+              {settingsData?.enableFailoverToggle !== false && (
+                <div className="flex shrink-0 items-center gap-1.5">
                   <FailoverToggle activeApp={activeApp} />
-                )}
-              </div>
+                </div>
+              )}
               <div className="flex min-w-0 flex-1 items-center">
                 <div className="ml-auto flex shrink-0 items-center gap-1.5">
                   <AppSwitcher
