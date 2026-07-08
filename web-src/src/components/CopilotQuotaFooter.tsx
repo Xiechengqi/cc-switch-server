@@ -15,6 +15,7 @@ import {
   PROVIDER_REFRESH_TITLE_KEY,
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
+import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 
 interface CopilotQuotaFooterProps {
   meta?: ProviderMeta;
@@ -23,6 +24,7 @@ interface CopilotQuotaFooterProps {
   inline?: boolean;
   /** 是否为当前激活的供应商 */
   isCurrent?: boolean;
+  showInUse?: boolean;
 }
 
 /** 格式化相对时间 */
@@ -43,6 +45,7 @@ function formatRelativeTime(
 const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
   meta,
   inline = false,
+  showInUse = false,
 }) => {
   const { t } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -120,33 +123,27 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
   if (inline) {
     return (
       <div className="flex flex-col items-end gap-1 text-xs whitespace-nowrap flex-shrink-0">
-        <div className="flex items-center gap-2 justify-end">
-          {quota.plan && (
-            <span className="text-[10px] text-muted-foreground/70">
-              {quota.plan}
-            </span>
-          )}
-          <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
-            <Clock size={10} />
-            {displayQueriedAt
+        <ProviderQuotaMetaRow
+          showInUse={showInUse}
+          timeLabel={
+            displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)
-              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
-          </span>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              handleRefresh();
-            }}
-            disabled={effectiveLoading}
-            className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={refreshTitle}
-          >
-            <RefreshCw
-              size={12}
-              className={effectiveLoading ? "animate-spin" : ""}
-            />
-          </button>
-        </div>
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
+          }
+          loading={effectiveLoading}
+          onRefresh={(event) => {
+            event.stopPropagation();
+            void handleRefresh();
+          }}
+          refreshTitle={refreshTitle}
+          leading={
+            quota.plan ? (
+              <span className="text-[10px] text-muted-foreground/70">
+                {quota.plan}
+              </span>
+            ) : undefined
+          }
+        />
 
         <div className="flex items-center gap-2">
           {tiers.map((tier) => (

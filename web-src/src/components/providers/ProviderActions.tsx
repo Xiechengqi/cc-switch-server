@@ -18,7 +18,6 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { AppId } from "@/lib/api";
-import type { ProviderShareState } from "@/hooks/useProviderShare";
 
 interface ProviderActionsProps {
   appId?: AppId;
@@ -46,8 +45,9 @@ interface ProviderActionsProps {
   // OpenClaw: default model
   isDefaultModel?: boolean;
   onSetAsDefault?: () => void;
-  shareState?: ProviderShareState;
-  onOpenShare?: () => void;
+  isSharing?: boolean;
+  isSharePending?: boolean;
+  onToggleShare?: () => void;
 }
 
 // 主按钮的呈现状态。title 用于 disabled 态向用户解释为何不可点击；
@@ -87,8 +87,9 @@ export function ProviderActions({
   // OpenClaw: default model
   isDefaultModel = false,
   onSetAsDefault,
-  shareState = "none",
-  onOpenShare,
+  isSharing = false,
+  isSharePending = false,
+  onToggleShare,
 }: ProviderActionsProps) {
   const { t } = useTranslation();
   const iconButtonClass = "h-8 w-8 p-1";
@@ -285,36 +286,36 @@ export function ProviderActions({
         </Button>
       </span>
 
-      <div className="flex items-center gap-1">
+      {onToggleShare ? (
         <Button
-          size="icon"
-          variant="ghost"
-          onClick={onOpenShare || undefined}
-          disabled={!onOpenShare}
-          title={
-            shareState === "active"
-              ? t("provider.share.stateActive", { defaultValue: "分享已启用" })
-              : shareState === "paused"
-                ? t("provider.share.statePaused", { defaultValue: "分享已暂停" })
-                : shareState === "error"
-                  ? t("provider.share.stateError", { defaultValue: "分享异常" })
-                  : t("provider.share.openSettings", { defaultValue: "配置分享" })
-          }
+          size="sm"
+          variant={isSharing ? "secondary" : "default"}
+          onClick={() => void onToggleShare()}
+          disabled={isSharePending}
           className={cn(
-            iconButtonClass,
-            shareState === "active" &&
-              "text-primary hover:text-primary",
-            shareState === "paused" &&
-              "text-amber-600 hover:text-amber-700 dark:text-amber-400",
-            shareState === "error" &&
-              "text-red-500 hover:text-red-600 dark:text-red-400",
-            !onOpenShare &&
-              "opacity-40 cursor-not-allowed text-muted-foreground",
+            "w-[4.5rem] px-2.5",
+            isSharing
+              ? "bg-violet-100 text-violet-600 hover:bg-violet-200 dark:bg-violet-900/50 dark:text-violet-400 dark:hover:bg-violet-900/70"
+              : "bg-violet-500 hover:bg-violet-600 dark:bg-violet-600 dark:hover:bg-violet-700",
           )}
+          title={
+            isSharing
+              ? t("provider.share.stateActive", { defaultValue: "分享已启用" })
+              : t("provider.share.enable", { defaultValue: "分享" })
+          }
         >
-          <Share2 className="h-4 w-4" />
+          {isSharePending ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Share2 className="h-4 w-4" />
+          )}
+          {isSharing
+            ? t("provider.share.sharing", { defaultValue: "分享中" })
+            : t("provider.share.enable", { defaultValue: "分享" })}
         </Button>
+      ) : null}
 
+      <div className="flex items-center gap-1">
         <Button
           size="icon"
           variant="ghost"

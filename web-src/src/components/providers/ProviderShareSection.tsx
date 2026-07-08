@@ -153,7 +153,6 @@ export function ProviderShareSection({
   const updateAclMutation = useUpdateShareAclMutation();
   const configureTunnelMutation = useConfigureTunnelMutation();
 
-  const [shareEnabled, setShareEnabled] = useState(false);
   const [isShareOpen, setIsShareOpen] = useState(false);
   const [confirmFreeOpen, setConfirmFreeOpen] = useState(false);
 
@@ -180,7 +179,8 @@ export function ProviderShareSection({
   const shareInitRef = useRef<string | null>(null);
 
   const shareableApp = isShareableApp(appId) ? appId : null;
-  const marketsQueryEnabled = shareEnabled && isShareOpen;
+  const shareConfigured = Boolean(share);
+  const marketsQueryEnabled = shareConfigured && isShareOpen;
   const { data: markets = [], isLoading: marketsLoading, error: marketsError, refetch: refetchMarkets } =
     useShareMarketsQuery(marketsQueryEnabled);
 
@@ -229,9 +229,9 @@ export function ProviderShareSection({
     if (shareInitRef.current === initKey) return;
     shareInitRef.current = initKey;
 
-    const enabled = Boolean(share);
-    setShareEnabled(enabled);
-    setIsShareOpen(enabled);
+    if (share) {
+      setIsShareOpen(true);
+    }
 
     const resolvedOwner = share?.ownerEmail?.trim() || ownerEmail;
     setOwnerEmailInput(resolvedOwner);
@@ -289,13 +289,9 @@ export function ProviderShareSection({
   ]);
 
   useEffect(() => {
-    if (!shareEnabled || subdomainManualRef.current || share) return;
+    if (!shareConfigured || subdomainManualRef.current || share) return;
     setSubdomainInput(deriveSubdomainFromEmail(ownerEmailInput));
-  }, [shareEnabled, ownerEmailInput, share]);
-
-  useEffect(() => {
-    setIsShareOpen(shareEnabled);
-  }, [shareEnabled]);
+  }, [shareConfigured, ownerEmailInput, share]);
 
   const busy =
     createMutation.isPending ||
@@ -393,7 +389,6 @@ export function ProviderShareSection({
     });
 
   const handleCreate = async () => {
-    if (!shareEnabled) return;
     if (ownerEmailInvalid) {
       toast.error(
         t("share.validation.invalidEmail", { defaultValue: "邮箱格式无效" }),
@@ -505,6 +500,21 @@ export function ProviderShareSection({
     });
   };
 
+  const handleShareToggle = async (checked: boolean) => {
+    if (busy) return;
+    if (checked) {
+      setIsShareOpen(true);
+      if (!share) {
+        await handleCreate();
+      }
+      return;
+    }
+    if (share) {
+      await deleteMutation.mutateAsync(share.id);
+      setIsShareOpen(false);
+    }
+  };
+
   const tunnelLabel = share?.tunnelUrl || share?.subdomain
     ? formatShareRouterDisplay(share.tunnelUrl || share.subdomain || "")
     : null;
@@ -543,11 +553,9 @@ export function ProviderShareSection({
             </Label>
             <Switch
               id="provider-share-enabled"
-              checked={shareEnabled}
-              onCheckedChange={(checked) => {
-                setShareEnabled(checked);
-                if (checked) setIsShareOpen(true);
-              }}
+              checked={shareConfigured}
+              disabled={busy}
+              onCheckedChange={(checked) => void handleShareToggle(checked)}
             />
           </div>
           {busy ? (
@@ -587,7 +595,7 @@ export function ProviderShareSection({
             </a>
           ) : null}
 
-          {!shareEnabled ? (
+          {!shareConfigured ? (
             <p className="text-sm text-muted-foreground">
               {t("provider.share.disabledHint", {
                 defaultValue: "开启后可配置远程分享参数并创建 Share。",
@@ -943,7 +951,7 @@ export function ProviderShareSection({
                 {!share ? (
                   <Button
                     type="button"
-                    disabled={busy || !shareEnabled}
+                    disabled={busy}
                     onClick={() => void handleCreate()}
                   >
                     <Play className="mr-2 h-4 w-4" />

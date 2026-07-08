@@ -8,12 +8,14 @@ import {
   PROVIDER_REFRESH_TITLE_KEY,
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
+import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 
 interface SubscriptionQuotaFooterProps {
   appId: AppId;
   inline?: boolean;
   isCurrent?: boolean;
   autoQueryInterval?: number;
+  showInUse?: boolean;
 }
 
 interface SubscriptionQuotaViewProps {
@@ -24,6 +26,7 @@ interface SubscriptionQuotaViewProps {
   appIdForExpiredHint: string;
   inline?: boolean;
   visibleTierNames?: string[];
+  showInUse?: boolean;
 }
 
 /** 已知 tier 名称的显示映射（官方订阅 + Token Plan 共用） */
@@ -228,6 +231,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   appIdForExpiredHint,
   inline = false,
   visibleTierNames,
+  showInUse = false,
 }) => {
   const { t } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -380,25 +384,20 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     return (
       <div className="flex min-w-0 max-w-full flex-col items-end gap-1 text-xs">
         {/* 第一行：查询时间 + 刷新 */}
-        <div className="flex items-center gap-2 justify-end">
-          <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
-            <Clock size={10} />
-            {displayQueriedAt
+        <ProviderQuotaMetaRow
+          showInUse={showInUse}
+          timeLabel={
+            displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)
-              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
-          </span>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              void handleRefresh();
-            }}
-            disabled={loading}
-            className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={refreshTitle}
-          >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-          </button>
-        </div>
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
+          }
+          loading={loading}
+          onRefresh={(event) => {
+            event.stopPropagation();
+            void handleRefresh();
+          }}
+          refreshTitle={refreshTitle}
+        />
 
         {/* 第二行：plan · expire · tiers */}
         <div className="min-w-0 max-w-full text-right text-[10px] font-medium text-gray-700 dark:text-gray-200 break-words">
@@ -569,6 +568,7 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
   inline = false,
   isCurrent = false,
   autoQueryInterval = 5,
+  showInUse = false,
 }) => {
   const {
     data: quota,
@@ -590,6 +590,7 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
       refetch={refetch}
       appIdForExpiredHint={appId}
       inline={inline}
+      showInUse={showInUse}
     />
   );
 };

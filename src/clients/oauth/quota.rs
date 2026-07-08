@@ -459,26 +459,120 @@ fn quota_percent_from_tiers(tiers: &[AccountQuotaTier]) -> Option<f64> {
 fn codex_tiers_from_rate_limit(rate_limit: Option<CodexRateLimit>) -> Vec<AccountQuotaTier> {
     let mut tiers = Vec::new();
     if let Some(rate_limit) = rate_limit {
-        for window in [rate_limit.primary_window, rate_limit.secondary_window]
-            .into_iter()
-            .flatten()
+        for window in normalize_codex_rate_windows(
+            rate_limit.primary_window,
+            rate_limit.secondary_window,
+        ) {
+            let Some(utilization) = codex_window_used_fraction(&window) else {
+                continue;
+            };
+            tiers.push(AccountQuotaTier {
+                name: window
+                    .limit_window_seconds
+                    .map(window_seconds_to_tier_name)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                utilization: Some(utilization),
+                used: None,
+                limit: None,
+                unit: Some("percent".to_string()),
+                resets_at: window.reset_at.map(|value| value.saturating_mul(1000)),
+            });
+        }
+    }
+    sort_codex_quota_tiers(&mut tiers);
+    tiers
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexWindowRole {
+    Session,
+    Weekly,
+    Monthly,
+    Unknown,
+}
+
+fn codex_window_role(limit_window_seconds: Option<i64>) -> CodexWindowRole {
+    match limit_window_seconds {
+        Some(18_000) => CodexWindowRole::Session,
+        Some(604_800) => CodexWindowRole::Weekly,
+        Some(2_592_000) => CodexWindowRole::Monthly,
+        Some(secs) if secs.div_euclid(60) == 300 => CodexWindowRole::Session,
+        Some(secs) if secs.div_euclid(60) == 10_080 => CodexWindowRole::Weekly,
+        _ => CodexWindowRole::Unknown,
+    }
+}
+
+/// Align with desktop `CodexRateWindowNormalizer`: session (5h) first, weekly (7d) second.
+fn normalize_codex_rate_windows(
+    primary: Option<CodexRateLimitWindow>,
+    secondary: Option<CodexRateLimitWindow>,
+) -> Vec<CodexRateLimitWindow> {
+    match (primary, secondary) {
+        (Some(primary_window), Some(secondary_window)) => {
+            let primary_role = codex_window_role(primary_window.limit_window_seconds);
+            let secondary_role = codex_window_role(secondary_window.limit_window_seconds);
+            match (primary_role, secondary_role) {
+                (CodexWindowRole::Weekly, CodexWindowRole::Session)
+                | (CodexWindowRole::Weekly, CodexWindowRole::Unknown) => {
+                    vec![secondary_window, primary_window]
+                }
+                _ => vec![primary_window, secondary_window],
+            }
+        }
+        (Some(primary_window), None) => match codex_window_role(primary_window.limit_window_seconds)
         {
-            if let Some(used_percent) = window.used_percent {
-                tiers.push(AccountQuotaTier {
-                    name: window
-                        .limit_window_seconds
-                        .map(window_seconds_to_tier_name)
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    utilization: Some(percent_to_fraction(used_percent)),
-                    used: None,
-                    limit: None,
-                    unit: Some("percent".to_string()),
-                    resets_at: window.reset_at.map(|value| value.saturating_mul(1000)),
-                });
+            CodexWindowRole::Weekly => vec![primary_window],
+            _ => vec![primary_window],
+        },
+        (None, Some(secondary_window)) => vec![secondary_window],
+        (None, None) => Vec::new(),
+    }
+}
+
+fn sort_codex_quota_tiers(tiers: &mut [AccountQuotaTier]) {
+    const ORDER: &[&str] = &["five_hour", "seven_day", "30_day"];
+    tiers.sort_by_key(|tier| {
+        ORDER
+            .iter()
+            .position(|name| *name == tier.name)
+            .unwrap_or(ORDER.len())
+    });
+}
+
+fn codex_used_percent_on_percent_scale(used_percent: f64) -> f64 {
+    if used_percent > 1.0 || used_percent == 0.0 {
+        used_percent
+    } else {
+        used_percent * 100.0
+    }
+}
+
+/// `/wham/usage` usually reports consumed quota in `used_percent`, but a freshly reset
+/// window can temporarily surface remaining quota in that field while `reset_after_seconds`
+/// is still close to `limit_window_seconds`.
+fn codex_window_used_fraction(window: &CodexRateLimitWindow) -> Option<f64> {
+    let used_percent = window.used_percent?;
+    if !used_percent.is_finite() {
+        return Some(0.0);
+    }
+
+    let mut normalized = codex_used_percent_on_percent_scale(used_percent);
+    if let (Some(reset_after), Some(limit_secs)) =
+        (window.reset_after_seconds, window.limit_window_seconds)
+    {
+        if limit_secs > 0 && reset_after >= 0 {
+            let remaining_ratio = (reset_after as f64 / limit_secs as f64).clamp(0.0, 1.0);
+            let remaining_percent = remaining_ratio * 100.0;
+            if remaining_ratio > 0.85
+                && normalized > 50.0
+                && (remaining_percent - normalized).abs() < 25.0
+            {
+                normalized = (100.0 - normalized).clamp(0.0, 100.0);
             }
         }
     }
-    tiers
+
+    Some(percent_to_fraction(normalized))
 }
 
 fn parse_claude_quota(body: &Value, plan_label: Option<String>, now_ms: i64) -> AccountQuota {
@@ -1130,6 +1224,7 @@ struct CodexRateLimit {
 struct CodexRateLimitWindow {
     used_percent: Option<f64>,
     limit_window_seconds: Option<i64>,
+    reset_after_seconds: Option<i64>,
     reset_at: Option<i64>,
 }
 
@@ -1719,6 +1814,7 @@ mod tests {
             primary_window: Some(CodexRateLimitWindow {
                 used_percent: Some(42.0),
                 limit_window_seconds: Some(18_000),
+                reset_after_seconds: Some(9_000),
                 reset_at: Some(1),
             }),
             secondary_window: None,
@@ -1738,6 +1834,62 @@ mod tests {
             update.quota_next_refresh_at,
             Some(10_000 + QUOTA_SUCCESS_COOLDOWN_MS)
         );
+    }
+
+    #[test]
+    fn codex_usage_corrects_remaining_percent_when_window_was_just_reset() {
+        let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
+            primary_window: Some(CodexRateLimitWindow {
+                used_percent: Some(100.0),
+                limit_window_seconds: Some(18_000),
+                reset_after_seconds: Some(17_940),
+                reset_at: Some(1_700_000_000),
+            }),
+            secondary_window: Some(CodexRateLimitWindow {
+                used_percent: Some(36.0),
+                limit_window_seconds: Some(604_800),
+                reset_after_seconds: Some(518_400),
+                reset_at: Some(1_700_500_000),
+            }),
+        }));
+
+        assert_eq!(
+            tiers
+                .iter()
+                .find(|tier| tier.name == "five_hour")
+                .and_then(|tier| tier.utilization),
+            Some(0.0)
+        );
+        assert_eq!(
+            tiers
+                .iter()
+                .find(|tier| tier.name == "seven_day")
+                .and_then(|tier| tier.utilization),
+            Some(0.36)
+        );
+    }
+
+    #[test]
+    fn codex_usage_swaps_reversed_weekly_primary_window() {
+        let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
+            primary_window: Some(CodexRateLimitWindow {
+                used_percent: Some(36.0),
+                limit_window_seconds: Some(604_800),
+                reset_after_seconds: Some(518_400),
+                reset_at: Some(1_700_500_000),
+            }),
+            secondary_window: Some(CodexRateLimitWindow {
+                used_percent: Some(4.0),
+                limit_window_seconds: Some(18_000),
+                reset_after_seconds: Some(8_657),
+                reset_at: Some(1_700_000_000),
+            }),
+        }));
+
+        assert_eq!(tiers[0].name, "five_hour");
+        assert_eq!(tiers[0].utilization, Some(0.04));
+        assert_eq!(tiers[1].name, "seven_day");
+        assert_eq!(tiers[1].utilization, Some(0.36));
     }
 
     #[test]

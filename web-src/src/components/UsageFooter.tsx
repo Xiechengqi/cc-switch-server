@@ -10,6 +10,7 @@ import {
   PROVIDER_REFRESH_TITLE_KEY,
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
+import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 
 interface UsageFooterProps {
   provider: Provider;
@@ -18,6 +19,7 @@ interface UsageFooterProps {
   usageEnabled: boolean; // 是否启用了用量查询
   isCurrent: boolean; // 是否为当前激活的供应商
   isInConfig?: boolean; // OpenCode: 是否已添加到配置
+  showInUse?: boolean;
   inline?: boolean; // 是否内联显示（在按钮左侧）
 }
 
@@ -53,6 +55,7 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
   usageEnabled,
   isCurrent,
   isInConfig = false,
+  showInUse = false,
   inline = false,
 }) => {
   const { t } = useTranslation();
@@ -168,25 +171,20 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
     return (
       <div className="flex min-w-0 max-w-full flex-col items-end gap-1 text-xs">
         {/* 第一行：查询时间 + 刷新 */}
-        <div className="flex items-center gap-2 justify-end">
-          <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
-            <Clock size={10} />
-            {displayQueriedAt
+        <ProviderQuotaMetaRow
+          showInUse={showInUse}
+          timeLabel={
+            displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)
-              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
-          </span>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              void handleRefresh();
-            }}
-            disabled={loading}
-            className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={refreshTitle}
-          >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-          </button>
-        </div>
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
+          }
+          loading={loading}
+          onRefresh={(event) => {
+            event.stopPropagation();
+            void handleRefresh();
+          }}
+          refreshTitle={refreshTitle}
+        />
         {/* 第二行：tier 徽章（复用官方订阅的 TierBadge） */}
         <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-x-2 gap-y-1">
           {(() => {
@@ -218,28 +216,20 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
     return (
       <div className="flex min-w-0 max-w-full flex-col items-end gap-1 text-xs">
         {/* 第一行：更新时间和刷新按钮 */}
-        <div className="flex items-center gap-2 justify-end">
-          {/* 上次查询时间 */}
-          <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
-            <Clock size={10} />
-            {displayQueriedAt
+        <ProviderQuotaMetaRow
+          showInUse={showInUse}
+          timeLabel={
+            displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)
-              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
-          </span>
-
-          {/* 刷新按钮 */}
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              void handleRefresh();
-            }}
-            disabled={loading}
-            className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={refreshTitle}
-          >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-          </button>
-        </div>
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
+          }
+          loading={loading}
+          onRefresh={(event) => {
+            event.stopPropagation();
+            void handleRefresh();
+          }}
+          refreshTitle={refreshTitle}
+        />
 
         {/* 第二行：用量和剩余 */}
         <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-x-2 gap-y-1">

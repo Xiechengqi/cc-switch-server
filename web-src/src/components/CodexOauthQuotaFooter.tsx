@@ -16,6 +16,7 @@ interface CodexOauthQuotaFooterProps {
   inline?: boolean;
   /** 是否为当前激活的供应商 */
   isCurrent?: boolean;
+  showInUse?: boolean;
 }
 
 /**
@@ -27,6 +28,7 @@ interface CodexOauthQuotaFooterProps {
 const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
   meta,
   inline = false,
+  showInUse = false,
 }) => {
   const {
     data: quota,
@@ -51,6 +53,7 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
       refetch={handleRefresh}
       appIdForExpiredHint={authProvider}
       inline={inline}
+      showInUse={showInUse}
     />
   );
 };

@@ -17,6 +17,7 @@ import {
   PROVIDER_REFRESH_TITLE_KEY,
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
+import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 
 interface KiroOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -24,11 +25,13 @@ interface KiroOauthQuotaFooterProps {
   providerId?: string;
   inline?: boolean;
   isCurrent?: boolean;
+  showInUse?: boolean;
 }
 
 const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
   meta,
   inline = false,
+  showInUse = false,
 }) => {
   const { t, i18n } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -86,6 +89,7 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
         refetch={handleRefresh}
         appIdForExpiredHint="kiro_oauth"
         inline={inline}
+        showInUse={showInUse}
         visibleTierNames={["kiro_agentic_requests"]}
       />
     );
@@ -109,25 +113,20 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
   if (inline) {
     return (
       <div className="flex flex-col items-end gap-1 text-xs whitespace-nowrap flex-shrink-0">
-        <div className="flex items-center gap-2 justify-end">
-          <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
-            <Clock size={10} />
-            {displayQueriedAt
+        <ProviderQuotaMetaRow
+          showInUse={showInUse}
+          timeLabel={
+            displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)
-              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
-          </span>
-          <button
-            onClick={(event) => {
-              event.stopPropagation();
-              handleRefresh();
-            }}
-            disabled={loading}
-            className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={refreshTitle}
-          >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-          </button>
-        </div>
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
+          }
+          loading={loading}
+          onRefresh={(event) => {
+            event.stopPropagation();
+            void handleRefresh();
+          }}
+          refreshTitle={refreshTitle}
+        />
         <div className="flex items-center gap-1.5">
           {planTitle && (
             <KiroPlanBadge title={credentialMessage ?? planTitle} label={planTitle} />

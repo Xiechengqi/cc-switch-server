@@ -17,6 +17,7 @@ import {
   PROVIDER_REFRESH_TITLE_KEY,
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
+import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 
 interface CursorOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -24,6 +25,7 @@ interface CursorOauthQuotaFooterProps {
   providerId?: string;
   inline?: boolean;
   isCurrent?: boolean;
+  showInUse?: boolean;
 }
 
 const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
@@ -31,6 +33,7 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
   appId,
   providerId,
   inline = false,
+  showInUse = false,
 }) => {
   const { t, i18n } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -109,6 +112,7 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
         refetch={handleRefresh}
         appIdForExpiredHint="cursor_oauth"
         inline={inline}
+        showInUse={showInUse}
       />
     );
   }
@@ -128,30 +132,27 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
   if (inline) {
     return (
       <div className="flex flex-col items-end gap-1 text-xs whitespace-nowrap flex-shrink-0">
-        <div className="flex items-center gap-2 justify-end">
-          {membership && (
-            <span className="text-[10px] font-medium text-foreground">
-              {membership}
-            </span>
-          )}
-          <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
-            <Clock size={10} />
-            {displayQueriedAt
+        <ProviderQuotaMetaRow
+          showInUse={showInUse}
+          timeLabel={
+            displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)
-              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })}
-          </span>
-          <button
-            onClick={(event) => {
-              event.stopPropagation();
-              handleRefresh();
-            }}
-            disabled={loading}
-            className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0 text-muted-foreground"
-            title={refreshTitle}
-          >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-          </button>
-        </div>
+              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
+          }
+          loading={loading}
+          onRefresh={(event) => {
+            event.stopPropagation();
+            void handleRefresh();
+          }}
+          refreshTitle={refreshTitle}
+          leading={
+            membership ? (
+              <span className="text-[10px] font-medium text-foreground">
+                {membership}
+              </span>
+            ) : undefined
+          }
+        />
         <div className="min-w-0 max-w-full text-right text-[10px] font-medium text-foreground break-words">
           {summaryText}
         </div>

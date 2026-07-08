@@ -13,11 +13,13 @@ interface GeminiOauthQuotaFooterProps {
   providerId?: string;
   inline?: boolean;
   isCurrent?: boolean;
+  showInUse?: boolean;
 }
 
 const GeminiOauthQuotaFooter: React.FC<GeminiOauthQuotaFooterProps> = ({
   meta,
   inline = false,
+  showInUse = false,
 }) => {
   const {
     data: quota,
@@ -40,6 +42,7 @@ const GeminiOauthQuotaFooter: React.FC<GeminiOauthQuotaFooterProps> = ({
       refetch={handleRefresh}
       appIdForExpiredHint="google_gemini_oauth"
       inline={inline}
+      showInUse={showInUse}
     />
   );
 };
