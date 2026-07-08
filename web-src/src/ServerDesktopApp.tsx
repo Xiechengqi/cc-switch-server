@@ -22,6 +22,7 @@ import { cn } from "@/lib/utils";
 import { isRemoteWebMode } from "@/lib/api/auth";
 import { clearRouterSessionTokens } from "@/lib/routerAuth";
 import { writeCachedPassword, writeToken } from "@/lib/runtime";
+import { PAGE_SHELL_CLASS } from "@/lib/layout";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
@@ -39,8 +40,6 @@ import { Button } from "@/components/ui/button";
 import type { VisibleApps } from "@/types";
 
 type View = "providers" | "shares" | "settings";
-
-const PAGE_SHELL_CLASS = "mx-auto w-full max-w-7xl";
 
 const VIEW_STORAGE_KEY = "cc-switch-server-view";
 const APP_STORAGE_KEY = "cc-switch-active-app";

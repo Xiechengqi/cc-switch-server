@@ -10,6 +10,7 @@ import {
   DRAG_REGION_STYLE,
 } from "@/lib/platform";
 import { isTextEditableTarget } from "@/utils/domUtils";
+import { PAGE_SHELL_CLASS } from "@/lib/layout";
 import { cn } from "@/lib/utils";
 
 interface FullScreenPanelProps {
@@ -121,7 +122,10 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
             }
           >
             <div
-              className="px-6 w-full flex items-center gap-4"
+              className={cn(
+                PAGE_SHELL_CLASS,
+                "flex items-center gap-4 px-6",
+              )}
               {...DRAG_REGION_ATTR}
               style={{ ...DRAG_REGION_STYLE } as React.CSSProperties}
             >
@@ -143,7 +147,13 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
 
           {/* Content */}
           <div className="flex-1 overflow-y-auto scroll-overlay">
-            <div className={cn("px-6 py-6 space-y-6 w-full", contentClassName)}>
+            <div
+              className={cn(
+                PAGE_SHELL_CLASS,
+                "space-y-6 px-6 py-6",
+                contentClassName,
+              )}
+            >
               {children}
             </div>
           </div>
@@ -154,7 +164,12 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
               className="flex-shrink-0 py-4 border-t border-border-default"
               style={{ backgroundColor: "hsl(var(--background))" }}
             >
-              <div className="px-6 flex items-center justify-end gap-3">
+              <div
+                className={cn(
+                  PAGE_SHELL_CLASS,
+                  "flex items-center justify-end gap-3 px-6",
+                )}
+              >
                 {footer}
               </div>
             </div>

@@ -74,6 +74,7 @@ export const serverLocalOverrides = [
   "components/providers/forms/KiroOAuthSection.tsx",
   "components/providers/forms/hooks/useManagedAuth.ts",
   "components/ConfirmDialog.tsx",
+  "components/common/FullScreenPanel.tsx",
   "components/settings/SettingsPage.tsx",
   "components/settings/ShareSettingsTab.tsx",
   "components/settings/ClientTunnelSettingsPanel.tsx",
