@@ -279,7 +279,7 @@ export function SharePage({
 
   return (
     <div className="px-6 py-4">
-      <div className="mx-auto flex max-w-7xl flex-col gap-5 pb-10">
+      <div className="flex flex-col gap-5 pb-10">
         {shareScoped ? (
           <ShareOwnerAuthBar
             share={primaryShare}

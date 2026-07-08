@@ -12,11 +12,11 @@ import {
 import { copyText } from "@/lib/clipboard";
 
 interface ClientTunnelSettingsPanelProps {
-  onChangeOwnerEmail?: () => void;
+  embedded?: boolean;
 }
 
 export function ClientTunnelSettingsPanel({
-  onChangeOwnerEmail,
+  embedded = false,
 }: ClientTunnelSettingsPanelProps) {
   const { t } = useTranslation();
   const { data: clientTunnel, isLoading } = useClientTunnelQuery();
@@ -61,22 +61,8 @@ export function ClientTunnelSettingsPanel({
         })
       : t("settings.share.clientTunnel.stopped", { defaultValue: "未运行" });
 
-  return (
-    <section className="rounded-xl border border-border/60 bg-card/60 p-6 space-y-4">
-      <div>
-        <h4 className="font-medium">
-          {t("settings.share.clientTunnel.title", {
-            defaultValue: "Client Tunnel",
-          })}
-        </h4>
-        <p className="text-sm text-muted-foreground">
-          {t("settings.share.clientTunnel.description", {
-            defaultValue:
-              "配置本机 Client Tunnel 的 Owner 邮箱、子域名与启停状态。",
-          })}
-        </p>
-      </div>
-
+  const body = (
+    <>
       <div className="grid gap-4 md:grid-cols-3">
         <div className="space-y-2">
           <div className="text-xs font-medium text-muted-foreground">
@@ -132,18 +118,6 @@ export function ClientTunnelSettingsPanel({
 
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-muted-foreground">{statusLabel}</span>
-        {onChangeOwnerEmail ? (
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!clientTunnel?.config?.ownerEmail || isSaving}
-            onClick={onChangeOwnerEmail}
-          >
-            {t("share.ownerChange.title", {
-              defaultValue: "Change Owner Email",
-            })}
-          </Button>
-        ) : null}
         <Button
           variant="outline"
           size="sm"
@@ -171,6 +145,29 @@ export function ClientTunnelSettingsPanel({
           {t("settings.share.clientTunnel.stop", { defaultValue: "停止" })}
         </Button>
       </div>
+    </>
+  );
+
+  if (embedded) {
+    return <div className="space-y-4">{body}</div>;
+  }
+
+  return (
+    <section className="rounded-xl border border-border/60 bg-card/60 p-6 space-y-4">
+      <div>
+        <h4 className="font-medium">
+          {t("settings.share.clientTunnel.title", {
+            defaultValue: "Client Tunnel",
+          })}
+        </h4>
+        <p className="text-sm text-muted-foreground">
+          {t("settings.share.clientTunnel.description", {
+            defaultValue:
+              "配置本机 Client Tunnel 的 Owner 邮箱、子域名与启停状态。",
+          })}
+        </p>
+      </div>
+      {body}
     </section>
   );
 }

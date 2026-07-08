@@ -464,10 +464,41 @@ async fn web_invoke_dispatch(
                 let subdomain = web_optional_string_any(value, &["tunnelSubdomain", "subdomain"]);
                 if owner_email.is_some() || subdomain.is_some() {
                     let mut config = state.config.read().await.clone();
+                    let previous_owner_email = config.owner.email.clone();
                     if let Some(email) = owner_email {
                         let email = crate::domain::settings::config::normalize_email(&email)
                             .map_err(ApiError::bad_request)?;
-                        config.owner.email = Some(email);
+                        config.owner.email = Some(email.clone());
+                        if let Some(previous_owner_email) = previous_owner_email {
+                            if !previous_owner_email.eq_ignore_ascii_case(&email) {
+                                match state
+                                    .try_mutate_shares_immediate(|store| {
+                                        store.change_owner_email_for_all(
+                                            &previous_owner_email,
+                                            &email,
+                                        )
+                                    })
+                                    .await
+                                    .map_err(ApiError::internal)?
+                                {
+                                    Ok(updated_shares) => {
+                                        for share in updated_shares {
+                                            spawn_share_upsert_sync(state.clone(), share.clone());
+                                            emit_share_event(
+                                                &state,
+                                                "share.changed",
+                                                &share,
+                                                "owner_email_updated",
+                                            );
+                                        }
+                                    }
+                                    Err(
+                                        crate::domain::sharing::shares::SharePatchError::NotFound,
+                                    ) => {}
+                                    Err(error) => return Err(map_share_patch_error(error)),
+                                }
+                            }
+                        }
                     }
                     if let Some(subdomain) = subdomain {
                         config

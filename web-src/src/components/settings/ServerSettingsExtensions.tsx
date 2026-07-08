@@ -33,9 +33,9 @@ import { useI18n } from "@/lib/i18n";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LoadingBlock } from "@/components/LoadingBlock";
 import {
-  ServerAdminAuthPanel,
   BackupSettingsPanel,
   DiagnosticsSettingsPanel,
+  ServerAdminAuthPanel,
 } from "@/components/settings/SettingsAccountPanels";
 import { FailoverSettingsPanel } from "@/components/settings/FailoverSettingsPanel";
 import {
@@ -43,7 +43,6 @@ import {
   RouterSettingsPanel,
   TunnelSettingsPanel,
 } from "@/components/settings/SettingsConnectionPanels";
-import { ImportExportPanel } from "@/components/settings/ImportExportPanel";
 import {
   appLabel,
   emptyFailoverDrafts,
@@ -71,13 +70,14 @@ export type ServerSettingsTab =
   | "tunnel"
   | "auth"
   | "backup"
-  | "importExport"
   | "diagnostics";
 
 interface ServerSettingsExtensionsProps {
   activeTab?: ServerSettingsTab;
   /** Render multiple server panels stacked (used inside desktop advanced tab). */
   sections?: ServerSettingsTab[];
+  /** Hide toolbar/layout chrome when nested inside another settings surface. */
+  embedded?: boolean;
 }
 
 /**
@@ -88,6 +88,7 @@ interface ServerSettingsExtensionsProps {
 export function ServerSettingsExtensions({
   activeTab,
   sections,
+  embedded = false,
 }: ServerSettingsExtensionsProps) {
   const { t, tx } = useI18n();
   const [data, setData] = useState<SettingsPageData | null>(null);
@@ -338,11 +339,11 @@ export function ServerSettingsExtensions({
   );
   const visibleTabs = sections ?? (activeTab ? [activeTab] : []);
   const shows = (tab: ServerSettingsTab) => visibleTabs.includes(tab);
-  const stacked = visibleTabs.length > 1;
+  const stacked = visibleTabs.length > 1 || embedded;
 
   return (
-    <div className={stacked ? "space-y-8" : "settings-layout"}>
-      {!stacked && (
+    <div className={stacked ? "space-y-6" : "settings-layout"}>
+      {!stacked && !embedded && (
       <div className="provider-toolbar">
         <div className="provider-toolbar-status">
           <span>
@@ -459,12 +460,9 @@ export function ServerSettingsExtensions({
         />
       )}
 
-      {shows("importExport") && (
-        <ImportExportPanel busy={busy} runAction={runAction} />
-      )}
-
       {shows("diagnostics") && (
         <DiagnosticsSettingsPanel
+          embedded={embedded}
           diagnostics={
             data?.diagnostics as RouterDiagnosticsResponse | undefined
           }

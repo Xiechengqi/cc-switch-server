@@ -1,17 +1,19 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import {
-  ExternalLink,
-  Github,
-  ShieldCheck,
-  Sparkles as SparklesIcon,
-} from "lucide-react";
+import { Github, ShieldCheck, Sparkles as SparklesIcon } from "lucide-react";
+import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
 import {
   ClaudeIcon,
   CodexIcon,
@@ -33,6 +35,46 @@ import {
   DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES,
   getOauthQuotaRefreshIntervalMinutes,
 } from "@/lib/query/oauthQuotaRefresh";
+
+interface AuthProviderAccordionItemProps {
+  value: string;
+  icon: ReactNode;
+  title: string;
+  description: string;
+  children: ReactNode;
+}
+
+function AuthProviderAccordionItem({
+  value,
+  icon,
+  title,
+  description,
+  children,
+}: AuthProviderAccordionItemProps) {
+  return (
+    <AccordionItem
+      value={value}
+      className="rounded-xl glass-card overflow-hidden"
+    >
+      <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+        <div className="flex items-center gap-3">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
+            {icon}
+          </div>
+          <div className="text-left">
+            <h3 className="text-base font-semibold">{title}</h3>
+            <p className="text-sm font-normal text-muted-foreground">
+              {description}
+            </p>
+          </div>
+        </div>
+      </AccordionTrigger>
+      <AccordionContent className="border-t border-border/50 px-6 pb-6 pt-4">
+        {children}
+      </AccordionContent>
+    </AccordionItem>
+  );
+}
 
 export function AuthCenterPanel() {
   const { t } = useTranslation();
@@ -93,7 +135,12 @@ export function AuthCenterPanel() {
   };
 
   return (
-    <div className="space-y-6">
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3 }}
+      className="space-y-4"
+    >
       <section className="rounded-xl border border-border/60 bg-card/60 p-6">
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-2">
@@ -165,160 +212,95 @@ export function AuthCenterPanel() {
         </div>
       </section>
 
-      <section className="rounded-xl border border-border/60 bg-card/60 p-6">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">
-            <ClaudeIcon size={20} />
-          </div>
-          <div className="min-w-0 flex-1">
-            <h4 className="font-medium">Claude Official</h4>
-            <p className="text-sm text-muted-foreground">
-              {t("settings.authCenter.claudeOauthDescription", {
-                defaultValue: "管理 Claude 官方订阅账号",
-              })}
-            </p>
-          </div>
-          <a
-            href="https://claude.ai"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-sm text-blue-500 hover:underline"
-          >
-            {t("settings.authCenter.claudeLink", {
-              defaultValue: "Claude 订阅链接",
-            })}
-            <ExternalLink className="h-3.5 w-3.5" />
-          </a>
-        </div>
+      <Accordion type="multiple" defaultValue={[]} className="w-full space-y-4">
+        <AuthProviderAccordionItem
+          value="claude"
+          icon={<ClaudeIcon size={20} />}
+          title="Claude Official"
+          description={t("settings.authCenter.claudeOauthDescription", {
+            defaultValue: "管理 Claude 官方订阅账号",
+          })}
+        >
+          <ClaudeOAuthSection showLoggedInAccounts />
+        </AuthProviderAccordionItem>
 
-        <ClaudeOAuthSection showLoggedInAccounts />
-      </section>
+        <AuthProviderAccordionItem
+          value="copilot"
+          icon={<Github className="h-5 w-5" />}
+          title="GitHub Copilot"
+          description={t("settings.authCenter.copilotDescription", {
+            defaultValue: "管理 GitHub Copilot 账号",
+          })}
+        >
+          <CopilotAuthSection showLoggedInAccounts />
+        </AuthProviderAccordionItem>
 
-      <section className="rounded-xl border border-border/60 bg-card/60 p-6">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">
-            <Github className="h-5 w-5" />
-          </div>
-          <div>
-            <h4 className="font-medium">GitHub Copilot</h4>
-            <p className="text-sm text-muted-foreground">
-              {t("settings.authCenter.copilotDescription", {
-                defaultValue: "管理 GitHub Copilot 账号",
-              })}
-            </p>
-          </div>
-        </div>
+        <AuthProviderAccordionItem
+          value="codex"
+          icon={<CodexIcon size={20} />}
+          title="OpenAI OAuth"
+          description={t("settings.authCenter.codexOauthDescription", {
+            defaultValue: "管理 ChatGPT 账号",
+          })}
+        >
+          <CodexOAuthSection showLoggedInAccounts />
+        </AuthProviderAccordionItem>
 
-        <CopilotAuthSection showLoggedInAccounts />
-      </section>
+        <AuthProviderAccordionItem
+          value="kiro"
+          icon={<ProviderIcon icon="kiro" name="Kiro" size={24} />}
+          title="Kiro OAuth"
+          description={t("settings.authCenter.kiroOauthDescription", {
+            defaultValue: "管理 Kiro AWS Builder ID 账号",
+          })}
+        >
+          <KiroOAuthSection showLoggedInAccounts />
+        </AuthProviderAccordionItem>
 
-      <section className="rounded-xl border border-border/60 bg-card/60 p-6">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">
-            <CodexIcon size={20} />
-          </div>
-          <div>
-            <h4 className="font-medium">OpenAI OAuth</h4>
-            <p className="text-sm text-muted-foreground">
-              {t("settings.authCenter.codexOauthDescription", {
-                defaultValue: "管理 ChatGPT 账号",
-              })}
-            </p>
-          </div>
-        </div>
+        <AuthProviderAccordionItem
+          value="cursor"
+          icon={<ProviderIcon icon="cursor" name="Cursor" size={24} />}
+          title="Cursor OAuth"
+          description={t("settings.authCenter.cursorOauthDescription", {
+            defaultValue: "管理 Cursor 订阅账号",
+          })}
+        >
+          <CursorOAuthSection showLoggedInAccounts />
+        </AuthProviderAccordionItem>
 
-        <CodexOAuthSection showLoggedInAccounts />
-      </section>
+        <AuthProviderAccordionItem
+          value="gemini"
+          icon={<GeminiIcon size={20} />}
+          title="Google Gemini"
+          description={t("settings.authCenter.geminiOauthDescription", {
+            defaultValue: "管理 Google Gemini 账号",
+          })}
+        >
+          <GeminiOAuthSection showLoggedInAccounts />
+        </AuthProviderAccordionItem>
 
-      <section className="rounded-xl border border-border/60 bg-card/60 p-6">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">
-            <ProviderIcon icon="kiro" name="Kiro" size={24} />
-          </div>
-          <div>
-            <h4 className="font-medium">Kiro OAuth</h4>
-            <p className="text-sm text-muted-foreground">
-              {t("settings.authCenter.kiroOauthDescription", {
-                defaultValue: "管理 Kiro AWS Builder ID 账号",
-              })}
-            </p>
-          </div>
-        </div>
+        <AuthProviderAccordionItem
+          value="antigravity"
+          icon={<SparklesIcon className="h-5 w-5" />}
+          title="Antigravity OAuth"
+          description={t("settings.authCenter.antigravityOauthDescription", {
+            defaultValue: "管理 Antigravity 订阅账号",
+          })}
+        >
+          <AntigravityOAuthSection showLoggedInAccounts />
+        </AuthProviderAccordionItem>
 
-        <KiroOAuthSection showLoggedInAccounts />
-      </section>
-
-      <section className="rounded-xl border border-border/60 bg-card/60 p-6">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">
-            <ProviderIcon icon="cursor" name="Cursor" size={24} />
-          </div>
-          <div>
-            <h4 className="font-medium">Cursor OAuth</h4>
-            <p className="text-sm text-muted-foreground">
-              {t("settings.authCenter.cursorOauthDescription", {
-                defaultValue: "管理 Cursor 订阅账号",
-              })}
-            </p>
-          </div>
-        </div>
-
-        <CursorOAuthSection showLoggedInAccounts />
-      </section>
-
-      <section className="rounded-xl border border-border/60 bg-card/60 p-6">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">
-            <GeminiIcon size={20} />
-          </div>
-          <div>
-            <h4 className="font-medium">Google Gemini</h4>
-            <p className="text-sm text-muted-foreground">
-              {t("settings.authCenter.geminiOauthDescription", {
-                defaultValue: "管理 Google Gemini 账号",
-              })}
-            </p>
-          </div>
-        </div>
-
-        <GeminiOAuthSection showLoggedInAccounts />
-      </section>
-
-      <section className="rounded-xl border border-border/60 bg-card/60 p-6">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">
-            <SparklesIcon />
-          </div>
-          <div>
-            <h4 className="font-medium">Antigravity OAuth</h4>
-            <p className="text-sm text-muted-foreground">
-              {t("settings.authCenter.antigravityOauthDescription", {
-                defaultValue: "管理 Antigravity 订阅账号",
-              })}
-            </p>
-          </div>
-        </div>
-
-        <AntigravityOAuthSection showLoggedInAccounts />
-      </section>
-
-      <section className="rounded-xl border border-border/60 bg-card/60 p-6">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted">
-            <DeepSeekIcon size={20} />
-          </div>
-          <div>
-            <h4 className="font-medium">DeepSeek(Account)</h4>
-            <p className="text-sm text-muted-foreground">
-              {t("settings.authCenter.deepseekAccountDescription", {
-                defaultValue: "管理 DeepSeek 账号",
-              })}
-            </p>
-          </div>
-        </div>
-
-        <DeepSeekAccountSection showLoggedInAccounts />
-      </section>
-    </div>
+        <AuthProviderAccordionItem
+          value="deepseek"
+          icon={<DeepSeekIcon size={20} />}
+          title="DeepSeek(Account)"
+          description={t("settings.authCenter.deepseekAccountDescription", {
+            defaultValue: "管理 DeepSeek 账号",
+          })}
+        >
+          <DeepSeekAccountSection showLoggedInAccounts />
+        </AuthProviderAccordionItem>
+      </Accordion>
+    </motion.div>
   );
 }

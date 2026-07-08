@@ -525,7 +525,6 @@ pub(in crate::api) async fn web_update_share_owner_email(
     let value = web_payload(args, &["params", "input"]);
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
     let owner_email = web_arg_string_any(value, &["ownerEmail", "owner_email"])?;
-    ensure_share_owner_target_verified(state, &owner_email).await?;
     let share = state
         .try_mutate_shares_immediate(|store| store.update_owner_email(&share_id, &owner_email))
         .await
@@ -545,7 +544,6 @@ pub(in crate::api) async fn web_transfer_share_owner(
     let value = web_payload(args, &["params", "input"]);
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
     let target_email = web_arg_string_any(value, &["targetEmail", "target_email"])?;
-    ensure_share_owner_target_verified(state, &target_email).await?;
     let share = state
         .try_mutate_shares_immediate(|store| store.transfer_owner_email(&share_id, &target_email))
         .await
@@ -855,36 +853,6 @@ fn ensure_router_domain_matches(
             "router domain does not match configured router",
         ))
     }
-}
-
-async fn ensure_share_owner_target_verified(
-    state: &ServerState,
-    target_email: &str,
-) -> Result<(), ApiError> {
-    let target_email = crate::clients::router::email_auth::normalize_email(target_email)
-        .map_err(map_email_auth_error)?;
-    let config = state.config.read().await;
-    let configured_owner = config
-        .owner
-        .email
-        .as_deref()
-        .ok_or_else(|| ApiError::forbidden("owner email is not configured"))?
-        .trim()
-        .to_ascii_lowercase();
-    if configured_owner != target_email {
-        return Err(ApiError::forbidden(
-            "share owner email change requires email_auth_change_owner_email verification",
-        ));
-    }
-    drop(config);
-    let status = crate::clients::router::email_auth::get_status(&state.config_dir)
-        .map_err(ApiError::internal)?;
-    if !status.authenticated || status.email.as_deref() != Some(target_email.as_str()) {
-        return Err(ApiError::forbidden(
-            "share owner email change requires verified owner email auth",
-        ));
-    }
-    Ok(())
 }
 
 pub(in crate::api) async fn web_update_share_acl(

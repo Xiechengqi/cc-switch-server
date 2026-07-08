@@ -369,7 +369,7 @@
     },
     "serverSecurity": {
       "changePasswordTitle": "密码修改",
-      "changePasswordDescription": "修改管理员登录密码。",
+      "changePasswordDescription": "修改管理员登录密码",
       "currentPassword": "当前密码",
       "newPassword": "新密码",
       "confirmPassword": "确认新密码",

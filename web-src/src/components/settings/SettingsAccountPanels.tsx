@@ -129,18 +129,26 @@ export function BackupSettingsPanel({
   );
 }
 
-export function DiagnosticsSettingsPanel({ diagnostics }: { diagnostics?: RouterDiagnosticsResponse }) {
+export function DiagnosticsSettingsPanel({
+  diagnostics,
+  embedded = false,
+}: {
+  diagnostics?: RouterDiagnosticsResponse;
+  embedded?: boolean;
+}) {
   const { t } = useI18n();
   return (
-    <section className="settings-card wide">
-      <SectionHeader
-        icon={<Network size={17} />}
-        title={t("server.settings.diagnostics")}
-        subtitle={t("server.settings.diagnosticsSubtitle", {
-          tunnels: diagnostics?.tunnels.length || 0,
-          shares: diagnostics?.shareSync.length || 0,
-        })}
-      />
+    <section className={embedded ? "space-y-4" : "settings-card wide"}>
+      {!embedded ? (
+        <SectionHeader
+          icon={<Network size={17} />}
+          title={t("server.settings.diagnostics")}
+          subtitle={t("server.settings.diagnosticsSubtitle", {
+            tunnels: diagnostics?.tunnels.length || 0,
+            shares: diagnostics?.shareSync.length || 0,
+          })}
+        />
+      ) : null}
       <DiagnosticsSummary diagnostics={diagnostics} />
       <Diagnostics diagnostics={diagnostics} />
     </section>

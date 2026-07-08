@@ -2054,7 +2054,7 @@ async fn spawn_broken_chunked_upstream() -> std::net::SocketAddr {
 }
 
 #[tokio::test]
-async fn web_invoke_direct_owner_update_requires_verified_target_owner() {
+async fn web_invoke_direct_owner_update_succeeds_with_admin_session() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
@@ -2084,12 +2084,9 @@ async fn web_invoke_direct_owner_update_requires_verified_target_owner() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("email_auth_change_owner_email"));
+    assert_eq!(body["ownerEmail"].as_str(), Some("new-owner@example.com"));
 }
 
 #[tokio::test]

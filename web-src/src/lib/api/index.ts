@@ -14,7 +14,6 @@ export { openclawApi } from "./openclaw";
 export { sessionsApi } from "./sessions";
 export { workspaceApi } from "./workspace";
 export { shareApi } from "./share";
-export { emailAuthApi } from "./emailAuth";
 export * as configApi from "./config";
 export * as authApi from "./auth";
 export * as copilotApi from "./copilot";
@@ -51,11 +50,6 @@ export {
   sharePrimaryApp,
   sharePrimaryProviderId,
 } from "./share";
-export type {
-  EmailAuthStatus,
-  EmailCodeRequestResponse,
-  EmailSessionMeResponse,
-} from "./emailAuth";
 export type {
   CopilotDeviceCodeResponse,
   CopilotAuthStatus,

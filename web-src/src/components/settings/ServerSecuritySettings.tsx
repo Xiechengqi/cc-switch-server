@@ -1,11 +1,10 @@
 import { FormEvent, useState } from "react";
-import { KeyRound, Loader2, LogOut, Shield } from "lucide-react";
+import { Loader2, LogOut, Shield } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { changeServerPassword } from "@/lib/server-legacy-api";
 import { writeCachedPassword, writeToken } from "@/lib/runtime";
 
@@ -17,15 +16,13 @@ export function ServerSecuritySettings({ onSignOut }: ServerSecuritySettingsProp
   const { t } = useTranslation();
   const [newPassword, setNewPassword] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   async function handleChangePassword(event: FormEvent) {
     event.preventDefault();
-    setError(null);
 
     const trimmed = newPassword.trim();
     if (trimmed.length < 8) {
-      setError(
+      toast.error(
         t("settings.serverSecurity.passwordMinLength", {
           defaultValue: "新密码至少 8 位",
         }),
@@ -50,58 +47,62 @@ export function ServerSecuritySettings({ onSignOut }: ServerSecuritySettingsProp
         window.location.reload();
       }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      toast.error(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <section className="rounded-xl border border-border/60 bg-card/60 p-6 space-y-6">
-      <header className="space-y-1">
-        <div className="flex items-center gap-2">
-          <Shield className="h-4 w-4 text-primary" />
-          <h3 className="text-sm font-medium">
-            {t("settings.serverSecurity.changePasswordTitle", {
-              defaultValue: "密码修改",
-            })}
-          </h3>
-        </div>
-        <p className="text-xs text-muted-foreground">
-          {t("settings.serverSecurity.changePasswordDescription", {
-            defaultValue: "修改管理员登录密码。",
-          })}
-        </p>
-      </header>
-
-      <form className="space-y-4" onSubmit={handleChangePassword}>
-          <div className="space-y-2">
-            <Label htmlFor="server-new-password">
-              {t("settings.serverSecurity.newPassword", {
-                defaultValue: "新密码",
-              })}
-            </Label>
-            <Input
-              id="server-new-password"
-              type="text"
-              autoComplete="off"
-              value={newPassword}
-              onChange={(event) => setNewPassword(event.target.value)}
-            />
+    <section className="space-y-4">
+      <form
+        className="flex items-center justify-between gap-4 rounded-xl border border-border bg-card/50 p-4 transition-colors hover:bg-muted/50"
+        onSubmit={handleChangePassword}
+      >
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
+            <Shield className="h-4 w-4 text-amber-500" />
           </div>
-          {error ? <p className="text-sm text-destructive">{error}</p> : null}
-          <Button type="submit" disabled={busy || !newPassword.trim()}>
-            {busy ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            ) : (
-              <KeyRound className="mr-2 h-4 w-4" />
-            )}
+          <div className="space-y-1">
+            <p className="text-sm font-medium leading-none">
+              {t("settings.serverSecurity.changePasswordTitle", {
+                defaultValue: "密码修改",
+              })}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {t("settings.serverSecurity.changePasswordDescription", {
+                defaultValue: "修改管理员登录密码",
+              })}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-2">
+          <Input
+            id="server-new-password"
+            type="password"
+            autoComplete="new-password"
+            className="h-9 w-44 sm:w-52"
+            placeholder={t("settings.serverSecurity.newPassword", {
+              defaultValue: "新密码",
+            })}
+            value={newPassword}
+            onChange={(event) => setNewPassword(event.target.value)}
+          />
+          <Button
+            type="submit"
+            size="sm"
+            className="h-9 shrink-0"
+            disabled={busy || !newPassword.trim()}
+          >
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
             {t("common.save", { defaultValue: "保存" })}
           </Button>
-        </form>
+        </div>
+      </form>
 
       {onSignOut ? (
-        <div className="flex justify-end border-t border-border/60 pt-4">
+        <div className="flex justify-end">
           <Button
             type="button"
             className="bg-red-600 text-white hover:bg-red-700"

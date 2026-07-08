@@ -13,7 +13,6 @@ export type { AccountAction, AccountDetail } from "./AuthCenterAccounts";
 export { AuthCenterPanel } from "./AuthCenterPanel";
 export { CapabilityPanel, CodexBankedResetPanel } from "./AuthCenterSidePanels";
 export { FailoverSettingsPanel } from "./FailoverSettingsPanel";
-export { ImportExportPanel } from "./ImportExportPanel";
 export {
   ServerAdminAuthPanel,
   AuthSettingsPanel,
@@ -43,7 +42,6 @@ export {
 } from "./SettingsStatusPanels";
 export { SettingsPage } from "./SettingsPage";
 export { ShareSettingsTab } from "./ShareSettingsTab";
-export { ShareRouterAdminPanel } from "./ShareRouterAdminPanel";
 export type { SettingsTab } from "./SettingsPage";
 export { ServerSettingsExtensions } from "./ServerSettingsExtensions";
 export type { ServerSettingsTab } from "./ServerSettingsExtensions";

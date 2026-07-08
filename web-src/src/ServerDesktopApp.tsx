@@ -333,7 +333,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                       : "text-blue-500 hover:text-blue-600",
                   )}
                 >
-                  CC Switch
+                  CC Switch Server
                 </a>
                 <Button
                   variant="ghost"
@@ -406,7 +406,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
         <AnimatePresence mode="wait">
           <motion.div
             key={currentView}
-            className="h-full"
+            className="mx-auto h-full w-full max-w-7xl"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}

@@ -30,7 +30,7 @@ try {
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <ThemeProvider defaultTheme="system" storageKey="cc-switch-theme">
+      <ThemeProvider defaultTheme="light" storageKey="cc-switch-theme">
         <I18nProvider>
           <UpdateProvider>
             <App />

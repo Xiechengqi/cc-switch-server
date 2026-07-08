@@ -948,25 +948,6 @@ export async function saveProvider(app: AppKind, provider: Provider): Promise<St
   return result.stored;
 }
 
-export async function exportProviders(): Promise<StoredProvider[]> {
-  const result = await jsonFetch<{ providers: StoredProvider[] }>("/api/providers/export");
-  return result.providers || [];
-}
-
-export async function importProviders(providers: StoredProvider[]): Promise<number> {
-  const result = await jsonFetch<{ imported: number }>("/api/providers/import", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      providers: providers.map((item) => ({
-        app: item.app,
-        provider: item.provider,
-      })),
-    }),
-  });
-  return result.imported;
-}
-
 export async function deleteProvider(app: AppKind, id: string): Promise<boolean> {
   return invokeCommand<boolean>("delete_provider", { app, id });
 }
@@ -1180,20 +1161,6 @@ export async function saveShare(input: UpsertShareInput): Promise<ShareRecord> {
     body: JSON.stringify(input),
   });
   return result.share;
-}
-
-export async function exportShares(): Promise<ShareRecord[]> {
-  const result = await jsonFetch<{ shares: ShareRecord[] }>("/api/shares/export");
-  return result.shares || [];
-}
-
-export async function importShares(shares: ShareRecord[]): Promise<number> {
-  const result = await jsonFetch<{ imported: number }>("/api/shares/import", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ shares }),
-  });
-  return result.imported;
 }
 
 export async function deleteShare(id: string): Promise<boolean> {
@@ -1573,22 +1540,6 @@ export async function syncUniversalProvider(id: string): Promise<UniversalProvid
     { method: "POST" },
   );
   return result.result;
-}
-
-export async function exportUniversalProviders(): Promise<UniversalProvider[]> {
-  const result = await jsonFetch<{ providers: UniversalProvider[] }>(
-    "/api/universal-providers/export",
-  );
-  return result.providers || [];
-}
-
-export async function importUniversalProviders(providers: UniversalProvider[]): Promise<number> {
-  const result = await jsonFetch<{ imported: number }>("/api/universal-providers/import", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ providers }),
-  });
-  return result.imported;
 }
 
 async function sharePost(id: string, action: string): Promise<ShareRecord> {

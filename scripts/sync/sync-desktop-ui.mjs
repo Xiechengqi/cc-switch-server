@@ -75,12 +75,13 @@ export const serverLocalOverrides = [
   "components/providers/forms/hooks/useManagedAuth.ts",
   "components/ConfirmDialog.tsx",
   "components/settings/SettingsPage.tsx",
+  "components/settings/ShareSettingsTab.tsx",
+  "components/settings/ClientTunnelSettingsPanel.tsx",
   "components/share/EditShareDialog.tsx",
   "components/share/ImportSharesModal.tsx",
   "components/share/OwnerChangeModal.tsx",
   "components/share/ShareEmptyState.tsx",
   "components/share/ShareExportModal.tsx",
-  "components/share/ShareOwnerChangeEmailDialog.tsx",
   "components/share/SharePage.tsx",
   "components/universal/UniversalEmptyState.tsx",
   "components/universal/UniversalListToolbar.tsx",
@@ -89,7 +90,16 @@ export const serverLocalOverrides = [
   "components/usage/index.ts",
 ];
 
+export const serverExcludedFromSync = [
+  "components/share/ShareOwnerChangeEmailDialog.tsx",
+  "components/share/ShareOwnerLoginDialog.tsx",
+  "components/share/ShareRouterBar.tsx",
+  "components/settings/ShareEmailLoginCard.tsx",
+  "components/settings/ImportExportPanel.tsx",
+];
+
 const serverLocalOverrideSet = new Set(serverLocalOverrides);
+const serverExcludedFromSyncSet = new Set(serverExcludedFromSync);
 
 function copyFile(src, dest, checkOnly) {
   if (!fs.existsSync(src)) {
@@ -98,11 +108,17 @@ function copyFile(src, dest, checkOnly) {
   if (shouldSkipSync(src)) {
     return;
   }
+  const relativeDest = toWebSrcRelative(dest);
+  if (serverExcludedFromSyncSet.has(relativeDest)) {
+    return;
+  }
+  if (!checkOnly && serverLocalOverrideSet.has(relativeDest)) {
+    return;
+  }
   if (checkOnly) {
     if (!fs.existsSync(dest)) {
       throw new Error(`missing server target: ${dest}`);
     }
-    const relativeDest = toWebSrcRelative(dest);
     if (
       !serverLocalOverrideSet.has(relativeDest) &&
       !fs.readFileSync(src).equals(fs.readFileSync(dest))
