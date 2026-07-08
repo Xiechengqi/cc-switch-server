@@ -40,6 +40,8 @@ import type { VisibleApps } from "@/types";
 
 type View = "providers" | "shares" | "settings";
 
+const PAGE_SHELL_CLASS = "mx-auto w-full max-w-7xl";
+
 const VIEW_STORAGE_KEY = "cc-switch-server-view";
 const APP_STORAGE_KEY = "cc-switch-active-app";
 
@@ -303,7 +305,12 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-background text-foreground selection:bg-primary/30 pb-4">
       <header className="sticky top-0 z-50 w-full bg-background/80 backdrop-blur-md">
-        <div className="flex h-14 items-center justify-between gap-2 px-6">
+        <div
+          className={cn(
+            PAGE_SHELL_CLASS,
+            "flex h-14 items-center justify-between gap-2 px-6",
+          )}
+        >
           <div className="flex min-w-0 items-center gap-2">
             {currentView !== "providers" ? (
               <div className="flex items-center gap-2">
@@ -406,7 +413,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
         <AnimatePresence mode="wait">
           <motion.div
             key={currentView}
-            className="mx-auto h-full w-full max-w-7xl"
+            className={cn(PAGE_SHELL_CLASS, "h-full")}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
