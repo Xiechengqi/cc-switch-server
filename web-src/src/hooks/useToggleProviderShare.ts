@@ -22,9 +22,10 @@ import {
 } from "@/utils/shareUtils";
 
 export function isShareRunning(
-  share: { status: string; tunnelUrl?: string | null },
+  share: { status: string; tunnelUrl?: string | null; subdomain?: string | null },
 ): boolean {
-  return share.status === "active" && Boolean(share.tunnelUrl);
+  if (share.status !== "active") return false;
+  return Boolean(share.tunnelUrl?.trim() || share.subdomain?.trim());
 }
 
 export function useToggleProviderShare(

@@ -381,33 +381,44 @@ export function useEnableShareMutation() {
 
   return useMutation({
     mutationFn: (shareId: string) => shareApi.enable(shareId),
-    onSuccess: async (tunnelInfo, shareId) => {
-      const applyTunnelInfo = <T extends ShareRecord | null | undefined>(
+    onSuccess: async (enabledShare, shareId) => {
+      const applyEnabledShare = <T extends ShareRecord | null | undefined>(
         current: T,
       ): T => {
-        if (!current) return current;
-        return {
-          ...current,
-          status: "active",
-          tunnelUrl: tunnelInfo.tunnelUrl,
-          subdomain: tunnelInfo.subdomain || current.subdomain,
-        } as T;
+        if (!current) return enabledShare as T;
+        return current.id === shareId ? enabledShare : current;
       };
 
       queryClient.setQueryData<ShareTunnelStatus | null>(
         shareKeys.tunnelStatus(shareId),
-        () => ({ info: tunnelInfo, lastError: null, requiresOwnerLogin: false }),
+        () => ({
+          info: enabledShare.tunnelUrl
+            ? {
+                tunnelUrl: enabledShare.tunnelUrl,
+                subdomain: enabledShare.subdomain ?? "",
+                remotePort: 0,
+                healthy: true,
+              }
+            : null,
+          lastError: null,
+          requiresOwnerLogin: false,
+        }),
       );
       queryClient.setQueryData<ShareRecord[] | undefined>(
         shareKeys.list(),
-        (current) =>
-          current?.map((share) =>
-            share.id === shareId ? applyTunnelInfo(share) : share,
-          ),
+        (current) => {
+          const next = current?.map((share) =>
+            share.id === shareId ? enabledShare : share,
+          );
+          if (next?.some((share) => share.id === shareId)) {
+            return next;
+          }
+          return [...(current ?? []), enabledShare];
+        },
       );
       queryClient.setQueryData<ShareRecord | null | undefined>(
         shareKeys.detail(shareId),
-        applyTunnelInfo,
+        applyEnabledShare,
       );
 
       await queryClient.invalidateQueries({ queryKey: shareKeys.list() });

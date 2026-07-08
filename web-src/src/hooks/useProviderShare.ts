@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import type { AppId, ShareBindings, ShareRecord } from "@/lib/api";
 import { useSharesQuery } from "@/lib/query";
+import { getShareProviderId } from "@/utils/shareRecordNormalize";
 
 const SHAREABLE_APPS = new Set<string>(["claude", "codex", "gemini"]);
 
@@ -18,8 +19,8 @@ export function findShareForProvider(
   return (
     shares.find((share) => {
       if (share.status === "deleted") return false;
-      const boundProviderId = share.bindings?.[appId];
-      return typeof boundProviderId === "string" && boundProviderId === providerId;
+      const boundProviderId = getShareProviderId(share, appId);
+      return boundProviderId === providerId;
     }) ?? null
   );
 }

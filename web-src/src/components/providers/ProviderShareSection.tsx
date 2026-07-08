@@ -60,6 +60,7 @@ import {
   useProviderShare,
   type ProviderShareState,
 } from "@/hooks/useProviderShare";
+import { isShareRunning } from "@/hooks/useToggleProviderShare";
 import {
   DEFAULT_PARALLEL_LIMIT,
   isPermanentExpiry,
@@ -506,6 +507,10 @@ export function ProviderShareSection({
       setIsShareOpen(true);
       if (!share) {
         await handleCreate();
+        return;
+      }
+      if (!isShareRunning(share)) {
+        await enableMutation.mutateAsync(share.id);
       }
       return;
     }
