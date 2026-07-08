@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { ShareRouterAdminPanel } from "@/components/settings/ShareRouterAdminPanel";
+import { ServerSettingsExtensions } from "@/components/settings/ServerSettingsExtensions";
 import { ShareEmailLoginCard } from "@/components/settings/ShareEmailLoginCard";
 import { ClientTunnelSettingsPanel } from "@/components/settings/ClientTunnelSettingsPanel";
 import { ShareRouterBar } from "@/components/share/ShareRouterBar";
@@ -138,6 +139,10 @@ export function ShareSettingsTab() {
       />
 
       <ShareEmailLoginCard />
+
+      <ServerSettingsExtensions
+        sections={["diagnostics", "importExport", "auth"]}
+      />
 
       <ShareOwnerChangeEmailDialog
         open={ownerChangeOpen}
