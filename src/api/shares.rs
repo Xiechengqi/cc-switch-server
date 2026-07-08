@@ -56,6 +56,7 @@ pub(in crate::api) async fn upsert_share(
         .map_err(ApiError::internal)?
         .map_err(map_share_patch_error)?;
     spawn_share_upsert_sync(state.clone(), share.clone());
+    crate::state::ensure_share_tunnel_running(state.clone(), &share.id).await;
     emit_share_event(&state, "share.changed", &share, "upserted");
     Ok(Json(UpsertShareResponse { ok: true, share }))
 }
@@ -185,6 +186,7 @@ pub(in crate::api) async fn resume_share(
         .await
         .map_err(ApiError::internal)??;
     spawn_share_upsert_sync(state.clone(), share.clone());
+    crate::state::ensure_share_tunnel_running(state.clone(), &share.id).await;
     emit_share_event(&state, "share.changed", &share, "resumed");
     Ok(Json(UpsertShareResponse { ok: true, share }))
 }
@@ -242,7 +244,7 @@ pub(in crate::api) async fn restore_share_tunnels(
         .map_err(ApiError::internal)?;
     for share in shares
         .iter()
-        .filter(|share| share.auto_start && share.enabled)
+        .filter(|share| crate::state::should_restore_share_tunnel(share))
     {
         crate::state::start_share_tunnel(state.clone(), share.id.clone()).await;
         spawn_share_upsert_sync(state.clone(), share.clone());

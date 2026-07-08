@@ -125,6 +125,12 @@ pub async fn forward(
         &copilot_metadata,
     )?;
     let mut adapter_request = adapter_request;
+    if stored.provider_type == ProviderType::CodexOAuth && route == ProxyRoute::CodexResponses {
+        adapter_request.body = normalize_codex_oauth_responses_body_bytes(
+            &adapter_request.body,
+            codex_oauth_session_id.as_deref(),
+        )?;
+    }
     let mut url =
         adapter.resolve_endpoint_for_request(route, gemini_path, &stored, &adapter_request)?;
     refresh_managed_account_if_needed(&state, app, &stored).await?;
@@ -1262,6 +1268,86 @@ fn append_codex_oauth_session_headers(
     headers.push(("x-codex-window-id", format!("{session_id}:0")));
 }
 
+const CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS: &[&str] = &[
+    "max_output_tokens",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "n",
+    "stop",
+    "response_format",
+    "seed",
+    "stream_options",
+    "user",
+];
+
+fn normalize_codex_oauth_responses_body_bytes(
+    body: &Bytes,
+    prompt_cache_key: Option<&str>,
+) -> Result<Bytes, ProxyError> {
+    let mut value = serde_json::from_slice::<Value>(body).map_err(|error| ProxyError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid codex oauth responses body: {error}"),
+    })?;
+    value = normalize_codex_oauth_responses_body(value, prompt_cache_key);
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("encode codex oauth responses body failed: {error}"),
+        })
+}
+
+fn normalize_codex_oauth_responses_body(mut body: Value, prompt_cache_key: Option<&str>) -> Value {
+    body["store"] = Value::Bool(false);
+    body["stream"] = Value::Bool(true);
+
+    if body.get("prompt_cache_key").is_none() {
+        if let Some(key) = prompt_cache_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            body["prompt_cache_key"] = Value::String(key.to_string());
+        }
+    }
+
+    match body.get_mut("include") {
+        Some(Value::Array(include)) => {
+            let required = Value::String("reasoning.encrypted_content".to_string());
+            if !include.iter().any(|item| item == &required) {
+                include.push(required);
+            }
+        }
+        _ => {
+            body["include"] = Value::Array(vec![Value::String(
+                "reasoning.encrypted_content".to_string(),
+            )]);
+        }
+    }
+
+    if body.get("instructions").is_none() {
+        body["instructions"] = Value::String(String::new());
+    }
+    if body.get("tools").is_none() {
+        body["tools"] = Value::Array(Vec::new());
+    }
+    if body.get("parallel_tool_calls").is_none() {
+        body["parallel_tool_calls"] = Value::Bool(false);
+    }
+
+    if let Some(obj) = body.as_object_mut() {
+        for field in CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS {
+            obj.remove(*field);
+        }
+    }
+
+    body
+}
+
 struct StreamForwardState {
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     adapter: adapters::GenericForwardingAdapter,
@@ -1899,6 +1985,48 @@ mod tests {
             }),
             7
         );
+    }
+
+    #[test]
+    fn normalize_codex_oauth_responses_body_adds_required_chatgpt_fields() {
+        let body = json!({
+            "model": "gpt-5",
+            "input": [{"role": "user", "content": "hi"}]
+        });
+        let normalized = normalize_codex_oauth_responses_body(body, None);
+        assert_eq!(normalized["store"], json!(false));
+        assert_eq!(normalized["stream"], json!(true));
+        assert_eq!(normalized["instructions"], json!(""));
+        assert_eq!(normalized["tools"], json!([]));
+        assert_eq!(normalized["parallel_tool_calls"], json!(false));
+        assert!(normalized["include"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "reasoning.encrypted_content"));
+    }
+
+    #[test]
+    fn normalize_codex_oauth_responses_body_strips_unsupported_fields() {
+        let body = json!({
+            "model": "gpt-5",
+            "input": [],
+            "max_output_tokens": 128,
+            "temperature": 0.2
+        });
+        let normalized = normalize_codex_oauth_responses_body(body, None);
+        assert!(normalized.get("max_output_tokens").is_none());
+        assert!(normalized.get("temperature").is_none());
+    }
+
+    #[test]
+    fn normalize_codex_oauth_responses_body_injects_prompt_cache_key() {
+        let body = json!({
+            "model": "gpt-5",
+            "input": []
+        });
+        let normalized = normalize_codex_oauth_responses_body(body, Some("session-123"));
+        assert_eq!(normalized["prompt_cache_key"], json!("session-123"));
     }
 
     #[test]

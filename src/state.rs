@@ -1200,7 +1200,7 @@ pub async fn restore_tunnels(state: ServerState) {
         start_client_tunnel(state.clone()).await;
     }
 
-    let auto_start_share_ids = auto_start_share_ids(&state.shares.read().await.shares);
+    let auto_start_share_ids = share_tunnel_restore_ids(&state.shares.read().await.shares);
     for share_id in auto_start_share_ids {
         start_share_tunnel(state.clone(), share_id).await;
     }
@@ -1383,12 +1383,37 @@ fn should_restore_client_tunnel(
     status.is_none_or(|status| status.status != "stopped")
 }
 
-fn auto_start_share_ids(shares: &[crate::domain::sharing::shares::Share]) -> Vec<String> {
+pub(crate) fn should_restore_share_tunnel(share: &crate::domain::sharing::shares::Share) -> bool {
+    share.enabled && share.status == "active"
+}
+
+fn share_tunnel_restore_ids(shares: &[crate::domain::sharing::shares::Share]) -> Vec<String> {
     shares
         .iter()
-        .filter(|share| share.auto_start && share.enabled && share.status == "active")
+        .filter(|share| should_restore_share_tunnel(share))
         .map(|share| share.id.clone())
         .collect()
+}
+
+pub async fn ensure_share_tunnel_running(state: ServerState, share_id: &str) {
+    let share = {
+        let shares = state.shares.read().await;
+        shares.get(share_id).cloned()
+    };
+    let Some(share) = share else {
+        return;
+    };
+    if !should_restore_share_tunnel(&share) {
+        return;
+    }
+    let share = match state
+        .mutate_shares_immediate(|store| store.set_share_tunnel_status(share_id, "active", None))
+        .await
+    {
+        Ok(Some(share)) => share,
+        _ => return,
+    };
+    start_share_tunnel(state, share.id).await;
 }
 
 pub async fn start_client_tunnel(state: ServerState) {
@@ -2223,7 +2248,30 @@ mod tests {
     }
 
     #[test]
-    fn restore_tunnel_logic_selects_only_active_auto_start_shares() {
+    fn restore_tunnel_logic_selects_active_enabled_shares() {
+        let shares = vec![
+            share("s1", true, true, "active"),
+            share("s2", true, false, "active"),
+            share("s3", true, true, "paused"),
+            share("s4", false, true, "active"),
+        ];
+
+        assert_eq!(
+            share_tunnel_restore_ids(&shares),
+            vec!["s1".to_string(), "s4".to_string()]
+        );
+    }
+
+    #[test]
+    fn auto_start_share_ids_still_require_auto_start_flag() {
+        fn auto_start_share_ids(shares: &[Share]) -> Vec<String> {
+            shares
+                .iter()
+                .filter(|share| share.auto_start && share.enabled && share.status == "active")
+                .map(|share| share.id.clone())
+                .collect()
+        }
+
         let shares = vec![
             share("s1", true, true, "active"),
             share("s2", true, false, "active"),

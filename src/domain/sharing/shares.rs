@@ -289,7 +289,7 @@ impl ShareStore {
             app_settings: input.app_settings,
             for_sale_official_price_percent_by_app: input.for_sale_official_price_percent_by_app,
             official_price_percent: input.official_price_percent,
-            auto_start: input.auto_start.unwrap_or(false),
+            auto_start: input.auto_start.unwrap_or(true),
             description: input.description,
             bindings: input.bindings,
             binding_history,
