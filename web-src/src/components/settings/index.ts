@@ -42,6 +42,7 @@ export {
   TunnelStatus,
 } from "./SettingsStatusPanels";
 export { SettingsPage } from "./SettingsPage";
+export { ShareSettingsTab } from "./ShareSettingsTab";
 export type { SettingsTab } from "./SettingsPage";
 export { ServerSettingsExtensions } from "./ServerSettingsExtensions";
 export type { ServerSettingsTab } from "./ServerSettingsExtensions";

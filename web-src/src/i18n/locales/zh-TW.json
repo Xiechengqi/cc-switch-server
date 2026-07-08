@@ -326,6 +326,15 @@
     "tabAuth": "驗證",
     "tabAdvanced": "進階",
     "tabProxy": "路由",
+    "tabShare": "分享",
+    "share": {
+      "defaultRouter": {
+        "title": "預設 Router 節點",
+        "description": "新建 share 時預設使用此路由節點。已建立的 share 仍綁定建立時的節點。",
+        "current": "目前：{{value}}",
+        "save": "儲存預設節點"
+      }
+    },
     "authCenter": {
       "title": "OAuth 驗證中心",
       "description": "在 Claude Code 中使用您的其他訂閱，請注意合規風險。",

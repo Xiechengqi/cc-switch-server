@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/accordion";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { settingsApi } from "@/lib/api";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
@@ -54,6 +55,7 @@ import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import type { ServerSettingsTab } from "@/components/settings/ServerSettingsExtensions";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySettings";
+import { ShareSettingsTab } from "@/components/settings/ShareSettingsTab";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useImportExport } from "@/hooks/useImportExport";
@@ -65,6 +67,7 @@ export type SettingsTab =
   | "general"
   | "proxy"
   | "auth"
+  | "share"
   | "advanced"
   | "usage"
   | "about"
@@ -250,7 +253,12 @@ export function SettingsPage({
           onValueChange={setActiveTab}
           className="flex flex-col h-full"
         >
-          <TabsList className="grid w-full grid-cols-6 mb-6 glass rounded-lg">
+          <TabsList
+            className={cn(
+              "grid w-full mb-6 glass rounded-lg",
+              serverMode ? "grid-cols-7" : "grid-cols-6",
+            )}
+          >
             <TabsTrigger value="general">
               {t("settings.tabGeneral")}
             </TabsTrigger>
@@ -258,6 +266,11 @@ export function SettingsPage({
             <TabsTrigger value="auth">
               {t("settings.tabAuth", { defaultValue: "认证" })}
             </TabsTrigger>
+            {serverMode ? (
+              <TabsTrigger value="share">
+                {t("settings.tabShare", { defaultValue: "分享" })}
+              </TabsTrigger>
+            ) : null}
             <TabsTrigger value="advanced">
               {t("settings.tabAdvanced")}
             </TabsTrigger>
@@ -350,6 +363,18 @@ export function SettingsPage({
                   <AuthCenterPanel />
                 </motion.div>
               </TabsContent>
+
+              {serverMode ? (
+                <TabsContent value="share" className="space-y-6 mt-0 pb-4">
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.3 }}
+                  >
+                    <ShareSettingsTab />
+                  </motion.div>
+                </TabsContent>
+              ) : null}
 
               <TabsContent value="advanced" className="space-y-6 mt-0 pb-4">
                 {settings ? (

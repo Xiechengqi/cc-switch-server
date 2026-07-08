@@ -126,7 +126,9 @@
       "deleteFailed": "Failed to delete share: {{error}}",
       "deleteConfirmTitle": "Delete share",
       "deleteConfirmMessage": "This share will be removed from the Share page and cannot be restored.",
-      "deleteRemember": "Remember my choice and do not ask again"
+      "deleteRemember": "Remember my choice and do not ask again",
+      "openShareSettings": "Open share settings",
+      "routerFromSettingsHint": "New shares use the default router from Settings → Share."
     },
     "inUse": "In Use",
     "editProvider": "Edit Provider",
@@ -327,6 +329,15 @@
     "tabAuth": "Auth",
     "tabAdvanced": "Advanced",
     "tabProxy": "Routing",
+    "tabShare": "Share",
+    "share": {
+      "defaultRouter": {
+        "title": "Default Router Node",
+        "description": "New shares use this router by default. Existing shares stay bound to the router used at creation.",
+        "current": "Current: {{value}}",
+        "save": "Save default node"
+      }
+    },
     "authCenter": {
       "title": "OAuth Authentication Center",
       "description": "Use your other subscriptions in Claude Code — please be mindful of compliance risks.",
@@ -3081,6 +3092,8 @@
     "ownerEmailCreateHint": "This email is reported to the router as the share owner. Signing in to the router with the same email can view the API key and edit settings.",
     "ownerEmailReloginHint": "This email is reported to the router as the share owner.",
     "createRouterHint": "Choose the router before creating. The share will be bound to this router after creation.",
+    "settingsSetupHint": "Configure the default router node and Client Tunnel in Settings → Share first.",
+    "openShareSettings": "Open share settings",
     "routerLockedAfterCreate": "Router node is configured.",
     "description": "Description",
     "descriptionHint": "Optional. Shown in the cc-switch-router sidebar. Maximum 200 characters.",

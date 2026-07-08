@@ -300,6 +300,7 @@ export interface ProviderFormProps {
   };
   showButtons?: boolean;
   isProxyTakeover?: boolean;
+  onOpenShareSettings?: () => void;
 }
 
 export function ProviderForm(props: ProviderFormProps) {
@@ -322,6 +323,7 @@ function ProviderFormFull({
   initialData,
   showButtons = true,
   isProxyTakeover = false,
+  onOpenShareSettings,
 }: ProviderFormProps) {
   if (appId === "claude-desktop") {
     throw new Error("ProviderFormFull should not receive claude-desktop");
@@ -3346,6 +3348,7 @@ function ProviderFormFull({
               appId={appId}
               providerId={providerId}
               providerName={form.watch("name") || providerId}
+              onOpenShareSettings={onOpenShareSettings}
             />
           ) : null}
 

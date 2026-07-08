@@ -952,6 +952,45 @@ pub(in crate::api) fn web_client_tunnel_share_status(
     })
 }
 
+pub(in crate::api) async fn web_configure_share_tunnel(
+    state: &ServerState,
+    args: &Value,
+) -> Result<(), ApiError> {
+    let value = web_payload(args, &["config", "params", "input"]);
+    let domain = web_optional_string_any(value, &["domain"])
+        .ok_or_else(|| ApiError::bad_request("domain is required"))?;
+    let domain =
+        crate::domain::sharing::share_router_domain::normalize_share_router_domain(&domain)
+            .map_err(ApiError::bad_request)?;
+
+    state
+        .apply_ui_settings_patch_immediate(json!({ "shareRouterDomain": domain }))
+        .await
+        .map_err(ApiError::internal)?;
+
+    let region =
+        crate::domain::sharing::share_router_domain::share_router_region_for_domain(&domain);
+    let mut config = state.config.read().await.clone();
+    config.router.domain = Some(domain.clone());
+    if let Some(region) = region {
+        config.router.region = Some(region.to_string());
+    }
+    if config
+        .router
+        .url
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        config.router.url = Some(format!("https://{domain}"));
+    }
+    state
+        .replace_config(config)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
+}
+
 pub(in crate::api) async fn web_client_tunnel_state(state: &ServerState) -> Value {
     let config = state.config.read().await;
     let runtime = state

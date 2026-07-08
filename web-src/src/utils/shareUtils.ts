@@ -1,5 +1,6 @@
 import type { ShareRecord, TunnelConfig, TunnelInfo } from "@/lib/api";
 import type { Settings } from "@/types";
+import { DEFAULT_SHARE_ROUTER_DOMAIN } from "@/config/shareRegions";
 export type ShareAction = "enable" | "disable" | "delete" | "connectInfo";
 
 export type ShareTunnelRuntimeStatus =
@@ -126,7 +127,7 @@ export function getTunnelConfigFromSettings(
   settings?: Settings | null,
 ): TunnelConfig {
   return {
-    domain: settings?.shareRouterDomain ?? "jptokenswitch.cc",
+    domain: settings?.shareRouterDomain?.trim() || DEFAULT_SHARE_ROUTER_DOMAIN,
   };
 }
 

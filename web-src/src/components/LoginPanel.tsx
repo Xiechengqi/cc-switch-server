@@ -5,6 +5,7 @@ import {
   requestEmailLoginCode,
   verifyEmailLoginCode,
 } from "@/lib/server-legacy-api";
+import { DEFAULT_SHARE_ROUTER_DOMAIN } from "@/config/shareRegions";
 import { useI18n } from "@/lib/i18n";
 import { jsonFetch, loginWithPassword, readCachedPassword, WebRuntimeContext, writeToken } from "@/lib/runtime";
 
@@ -42,7 +43,9 @@ export function LoginPanel({
   );
   const [password, setPassword] = useState(() => readCachedPassword() ?? "");
   const [ownerEmail, setOwnerEmail] = useState(context.auth?.ownerEmail ?? "");
-  const [routerUrl, setRouterUrl] = useState("https://jptokenswitch.cc");
+  const [routerUrl, setRouterUrl] = useState(
+    () => `https://${DEFAULT_SHARE_ROUTER_DOMAIN}`,
+  );
   const [clientTunnelSubdomain, setClientTunnelSubdomain] = useState("");
   const [email, setEmail] = useState(context.auth?.ownerEmail ?? "");
   const [verificationCode, setVerificationCode] = useState("");

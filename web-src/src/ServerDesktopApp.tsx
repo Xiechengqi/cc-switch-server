@@ -248,7 +248,15 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
             </div>
           );
         }
-        return <SharePage defaultApp={activeApp} />;
+        return (
+          <SharePage
+            defaultApp={activeApp}
+            onOpenShareSettings={() => {
+              setSettingsDefaultTab("share");
+              setCurrentView("settings");
+            }}
+          />
+        );
       default:
         return (
           <div className="px-6 flex flex-col flex-1 min-h-0 overflow-hidden">
@@ -438,6 +446,11 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
           if (!open) setEditingProvider(null);
         }}
         onSubmit={handleEditProvider}
+        onOpenShareSettings={() => {
+          setEditingProvider(null);
+          setSettingsDefaultTab("share");
+          setCurrentView("settings");
+        }}
       />
 
       <ConfirmDialog

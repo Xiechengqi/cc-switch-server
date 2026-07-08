@@ -126,7 +126,9 @@
       "deleteFailed": "删除分享失败：{{error}}",
       "deleteConfirmTitle": "删除分享",
       "deleteConfirmMessage": "删除后该分享将从 Share 页移除，且无法恢复。",
-      "deleteRemember": "记住选择，之后不再询问"
+      "deleteRemember": "记住选择，之后不再询问",
+      "openShareSettings": "前往设置修改",
+      "routerFromSettingsHint": "使用设置 → 分享中的默认 Router 节点创建 share。"
     },
     "inUse": "使用中",
     "editProvider": "编辑供应商",
@@ -327,6 +329,15 @@
     "tabAuth": "认证",
     "tabAdvanced": "高级",
     "tabProxy": "路由",
+    "tabShare": "分享",
+    "share": {
+      "defaultRouter": {
+        "title": "默认 Router 节点",
+        "description": "新建 share 时默认使用此路由节点。已创建的 share 仍绑定创建时的节点。",
+        "current": "当前：{{value}}",
+        "save": "保存默认节点"
+      }
+    },
     "authCenter": {
       "title": "OAuth 认证中心",
       "description": "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
@@ -3081,6 +3092,8 @@
     "ownerEmailCreateHint": "该邮箱会作为 share owner 上报到 router。router 页面使用相同邮箱登录后可查看 API Key 和编辑设置。",
     "ownerEmailReloginHint": "该邮箱会作为 share owner 上报到 router。",
     "createRouterHint": "创建前选择路由节点。创建完成后当前 share 会绑定到该节点。",
+    "settingsSetupHint": "请先在设置 → 分享中配置默认 Router 节点与 Client Tunnel。",
+    "openShareSettings": "前往分享设置",
     "routerLockedAfterCreate": "路由节点已绑定。",
     "description": "文字说明",
     "descriptionHint": "可选，会显示在 cc-switch-router 侧边栏，最多 200 个字符。",

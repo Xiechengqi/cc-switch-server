@@ -12,30 +12,22 @@ import {
 } from "@/lib/api";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useSettingsQuery } from "@/lib/query";
-import { useProxyStatus } from "@/lib/query/proxy";
 import {
-  useConfigureTunnelMutation,
-  useClaimClientTunnelMutation,
-  useClientTunnelQuery,
   useDeleteShareMutation,
   useDisableShareMutation,
   useEnableShareMutation,
+  useClientTunnelQuery,
   useProvidersQuery,
   useResetShareUsageMutation,
   useSharesQuery,
-  useStartClientTunnelMutation,
-  useStopClientTunnelMutation,
 } from "@/lib/query";
 import { shareKeys } from "@/lib/query/share";
 import { extractErrorMessage } from "@/utils/errorUtils";
-import { copyText } from "@/lib/clipboard";
 import {
   getTunnelConfigFromSettings,
   isTunnelConfigured,
 } from "@/utils/shareUtils";
 import { ShareList } from "./ShareList";
-import { ShareOwnerChangeEmailDialog } from "./ShareOwnerChangeEmailDialog";
-import { ShareRouterBar } from "./ShareRouterBar";
 import {
   getProviderAccountLabel,
   SHARE_PROVIDER_AUTH_PROVIDERS,
@@ -62,17 +54,18 @@ interface SharePageProps {
   defaultApp?: AppId;
   shareScoped?: boolean;
   readOnly?: boolean;
+  onOpenShareSettings?: () => void;
 }
 
 export function SharePage({
   defaultApp,
   shareScoped = false,
   readOnly = true,
+  onOpenShareSettings,
 }: SharePageProps) {
   const { t } = useTranslation();
   const { data: shares = [], isLoading, error, refetch } = useSharesQuery();
   const { data: settings } = useSettingsQuery();
-  const { data: proxyStatus } = useProxyStatus();
   const queryClient = useQueryClient();
   const {
     session: routerSession,
@@ -163,27 +156,8 @@ export function SharePage({
   const enableMutation = useEnableShareMutation();
   const disableMutation = useDisableShareMutation();
   const resetUsageMutation = useResetShareUsageMutation();
-  const configureTunnelMutation = useConfigureTunnelMutation();
   const clientTunnelQuery = useClientTunnelQuery(!shareScoped);
-  const claimClientTunnelMutation = useClaimClientTunnelMutation();
-  const startClientTunnelMutation = useStartClientTunnelMutation();
-  const stopClientTunnelMutation = useStopClientTunnelMutation();
-  const [clientOwnerEmailInput, setClientOwnerEmailInput] = useState("");
-  const [clientSubdomainInput, setClientSubdomainInput] = useState("");
-  const [ownerChangeOpen, setOwnerChangeOpen] = useState(false);
   const clientTunnel = clientTunnelQuery.data;
-
-  useEffect(() => {
-    if (clientTunnel?.config?.ownerEmail) {
-      setClientOwnerEmailInput(clientTunnel.config.ownerEmail);
-    }
-  }, [clientTunnel?.config?.ownerEmail]);
-
-  useEffect(() => {
-    if (clientTunnel?.config?.subdomain) {
-      setClientSubdomainInput(clientTunnel.config.subdomain);
-    }
-  }, [clientTunnel?.config?.subdomain]);
   const providerQueries = useMemo(
     () => ({
       claude: claudeProvidersQuery.data,
@@ -249,28 +223,10 @@ export function SharePage({
   const primaryShare = shares[0] ?? null;
   const routerSessionEmail = routerSession?.user?.email?.trim().toLowerCase();
   const primaryShareOwnerEmail = primaryShare?.ownerEmail?.trim().toLowerCase();
-  const normalizedClientOwnerEmail = clientOwnerEmailInput.trim().toLowerCase();
-  const clientTunnelSaving = claimClientTunnelMutation.isPending;
-
-  const saveClientTunnel = useCallback(
-    (ownerEmail: string = normalizedClientOwnerEmail) =>
-      claimClientTunnelMutation.mutateAsync({
-        ownerEmail,
-        subdomain: clientSubdomainInput.trim(),
-        enabled: true,
-        autoStart: true,
-      }),
-    [
-      claimClientTunnelMutation,
-      clientSubdomainInput,
-      normalizedClientOwnerEmail,
-    ],
+  const clientTunnelConfigured = Boolean(
+    clientTunnel?.config?.ownerEmail?.trim() &&
+      clientTunnel?.config?.subdomain?.trim(),
   );
-
-  const handleSaveClientTunnel = useCallback(() => {
-    if (!clientSubdomainInput.trim() || !normalizedClientOwnerEmail) return;
-    void saveClientTunnel();
-  }, [clientSubdomainInput, normalizedClientOwnerEmail, saveClientTunnel]);
   const canManageShareFromRouter =
     shareScoped &&
     Boolean(routerSession?.authenticated) &&
@@ -377,117 +333,25 @@ export function SharePage({
           </div>
         ) : null}
 
-        <ShareRouterBar
-          proxyRunning={proxyStatus?.running ?? false}
-          proxyAddress={proxyStatus?.address ?? null}
-          proxyPort={proxyStatus?.port ?? null}
-          hasShare={shares.length > 0}
-          readOnly={effectiveReadOnly || shareScoped}
-          onCreate={() => undefined}
-        />
-
-        {!shareScoped ? (
-          <div className="rounded-lg border bg-card px-4 py-3">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-              <div className="grid flex-1 gap-3 md:grid-cols-[minmax(180px,1fr)_minmax(180px,1fr)_minmax(220px,1.4fr)]">
-                <div>
-                  <div className="text-xs font-medium text-muted-foreground">
-                    Client Tunnel Owner
-                  </div>
-                  <Input
-                    className="mt-1 h-8"
-                    type="email"
-                    value={clientOwnerEmailInput}
-                    placeholder="owner@example.com"
-                    disabled={clientTunnelQuery.isLoading || clientTunnelSaving}
-                    onChange={(event) =>
-                      setClientOwnerEmailInput(event.target.value)
-                    }
-                  />
-                </div>
-                <div>
-                  <div className="text-xs font-medium text-muted-foreground">
-                    Client Subdomain
-                  </div>
-                  <Input
-                    className="mt-1 h-8"
-                    value={clientSubdomainInput}
-                    disabled={clientTunnelQuery.isLoading || clientTunnelSaving}
-                    onChange={(event) =>
-                      setClientSubdomainInput(event.target.value)
-                    }
-                  />
-                </div>
-                <div>
-                  <div className="text-xs font-medium text-muted-foreground">
-                    Client URL
-                  </div>
-                  <button
-                    type="button"
-                    className="mt-2 block max-w-full truncate text-left text-sm underline-offset-4 hover:underline"
-                    disabled={!clientTunnel?.config?.tunnelUrl}
-                    onClick={() => {
-                      if (clientTunnel?.config?.tunnelUrl) {
-                        void copyText(clientTunnel.config.tunnelUrl).then(() =>
-                          toast.success("URL 已复制"),
-                        );
-                      }
-                    }}
-                  >
-                    {clientTunnel?.config?.tunnelUrl ?? "-"}
-                  </button>
-                </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs text-muted-foreground">
-                  {clientTunnel?.status?.info
-                    ? "运行中"
-                    : clientTunnel?.status?.lastError
-                      ? `失败: ${clientTunnel.status.lastError}`
-                      : "未运行"}
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!primaryShare?.ownerEmail || clientTunnelSaving}
-                  onClick={() => setOwnerChangeOpen(true)}
-                >
-                  {t("share.ownerChange.title", {
-                    defaultValue: "Change Owner Email",
-                  })}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={
-                    !clientSubdomainInput.trim() ||
-                    !normalizedClientOwnerEmail ||
-                    clientTunnelSaving
-                  }
-                  onClick={handleSaveClientTunnel}
-                >
-                  保存
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={startClientTunnelMutation.isPending}
-                  onClick={() => startClientTunnelMutation.mutate()}
-                >
-                  启动
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={
-                    !clientTunnel?.status?.info ||
-                    stopClientTunnelMutation.isPending
-                  }
-                  onClick={() => stopClientTunnelMutation.mutate()}
-                >
-                  停止
-                </Button>
-              </div>
+        {!shareScoped && !clientTunnelConfigured && onOpenShareSettings ? (
+          <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-amber-800 dark:text-amber-200">
+                {t("share.settingsSetupHint", {
+                  defaultValue:
+                    "请先在设置 → 分享中配置默认 Router 节点与 Client Tunnel。",
+                })}
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                className="shrink-0"
+                onClick={onOpenShareSettings}
+              >
+                {t("share.openShareSettings", {
+                  defaultValue: "前往分享设置",
+                })}
+              </Button>
             </div>
           </div>
         ) : null}
@@ -526,19 +390,6 @@ export function SharePage({
           }
         />
       </div>
-
-      {!shareScoped ? (
-        <ShareOwnerChangeEmailDialog
-          open={ownerChangeOpen}
-          tunnelConfig={tunnelConfig}
-          tunnelConfigSaving={configureTunnelMutation.isPending}
-          currentEmail={primaryShare?.ownerEmail ?? null}
-          onOpenChange={setOwnerChangeOpen}
-          onSaveTunnelConfig={(config) =>
-            configureTunnelMutation.mutateAsync(config)
-          }
-        />
-      ) : null}
 
       <ConfirmDialog
         isOpen={Boolean(deleteTarget)}

@@ -4,6 +4,11 @@ use std::path::Path;
 use anyhow::Context;
 use serde_json::{json, Value};
 
+use crate::domain::settings::config::ServerConfig;
+use crate::domain::sharing::share_router_domain::{
+    router_domain_from_url, DEFAULT_SHARE_ROUTER_DOMAIN,
+};
+
 const UI_SETTINGS_FILE_NAME: &str = "ui-settings.json";
 
 #[derive(Debug, Clone, Default)]
@@ -35,6 +40,25 @@ impl UiSettingsStore {
 
     pub fn for_frontend(&self) -> Value {
         merge_json_values(default_ui_settings(), self.value.clone())
+    }
+
+    pub fn settings_for_frontend(&self, server_config: &ServerConfig) -> Value {
+        let mut settings = self.for_frontend();
+        let stored_domain = self
+            .value
+            .get("shareRouterDomain")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let resolved_domain = stored_domain
+            .or_else(|| server_config.router.domain.clone())
+            .or_else(|| router_domain_from_url(server_config.router.url.as_deref()))
+            .unwrap_or_else(|| DEFAULT_SHARE_ROUTER_DOMAIN.to_string());
+        if let Value::Object(ref mut map) = settings {
+            map.insert("shareRouterDomain".into(), json!(resolved_domain));
+        }
+        settings
     }
 
     pub fn apply_patch(&mut self, patch: Value) {

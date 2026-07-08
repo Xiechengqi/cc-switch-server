@@ -314,6 +314,15 @@
     "tabAuth": "認証",
     "tabAdvanced": "詳細",
     "tabProxy": "ルーティング",
+    "tabShare": "共有",
+    "share": {
+      "defaultRouter": {
+        "title": "デフォルト Router ノード",
+        "description": "新規 share はこのルーターをデフォルトで使用します。既存の share は作成時のルーターに紐づいたままです。",
+        "current": "現在：{{value}}",
+        "save": "デフォルトノードを保存"
+      }
+    },
     "authCenter": {
       "title": "OAuth 認証センター",
       "description": "Claude Code で他のサブスクリプションをご利用いただけます。コンプライアンスリスクにご注意ください。",
@@ -3068,6 +3077,8 @@
     "ownerEmailCreateHint": "このメールは share owner として router に送信されます。同じメールで router にログインすると API Key の表示と設定編集ができます。",
     "ownerEmailReloginHint": "このメールは share owner として router に送信されます。",
     "createRouterHint": "作成前にルーターを選択します。作成後、この share はそのルーターに紐づきます。",
+    "settingsSetupHint": "先に設定 → 共有でデフォルト Router ノードと Client Tunnel を設定してください。",
+    "openShareSettings": "共有設定を開く",
     "routerLockedAfterCreate": "ルーターノードは設定済みです。",
     "description": "説明",
     "descriptionHint": "任意。cc-switch-router のサイドバーに表示されます。最大 200 文字。",

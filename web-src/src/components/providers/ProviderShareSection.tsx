@@ -29,13 +29,11 @@ import {
 } from "@/components/ui/select";
 import { EmailTagsInput } from "@/components/ui/tags-input";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { ShareRouterSelector } from "@/components/share/ShareRouterSelector";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import {
   useClientTunnelQuery,
-  useConfigureTunnelMutation,
   useCreateShareMutation,
   useDeleteShareMutation,
   useDisableShareMutation,
@@ -75,7 +73,7 @@ import {
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
 } from "@/utils/shareUtils";
-import { formatShareRouterDisplay, normalizeShareRouterDomain } from "@/utils/shareRouter";
+import { formatShareRouterDisplay } from "@/utils/shareRouter";
 import {
   buildShareAclPayload,
   deriveSubdomainFromEmail,
@@ -92,6 +90,7 @@ interface ProviderShareSectionProps {
   appId: AppId;
   providerId: string;
   providerName: string;
+  onOpenShareSettings?: () => void;
 }
 
 function shareStateLabel(
@@ -130,6 +129,7 @@ export function ProviderShareSection({
   appId,
   providerId,
   providerName,
+  onOpenShareSettings,
 }: ProviderShareSectionProps) {
   const { t } = useTranslation();
   const { share, state, data: shares = [] } = useProviderShare(appId, providerId);
@@ -154,14 +154,11 @@ export function ProviderShareSection({
   const updateExpirationMutation = useUpdateShareExpirationMutation();
   const updateOwnerEmailMutation = useUpdateShareOwnerEmailMutation();
   const updateAclMutation = useUpdateShareAclMutation();
-  const configureTunnelMutation = useConfigureTunnelMutation();
 
   const [isShareOpen, setIsShareOpen] = useState(false);
   const [confirmFreeOpen, setConfirmFreeOpen] = useState(false);
 
   const [ownerEmailInput, setOwnerEmailInput] = useState("");
-  const [routerDomain, setRouterDomain] = useState("");
-  const [routerDomainError, setRouterDomainError] = useState<string | null>(null);
   const [subdomainInput, setSubdomainInput] = useState("");
   const [descriptionInput, setDescriptionInput] = useState("");
   const [forSaleValue, setForSaleValue] = useState<"Yes" | "No" | "Free">("Yes");
@@ -224,10 +221,6 @@ export function ProviderShareSection({
     const isLocal =
       host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0";
     return `${isLocal ? "http" : "https"}://${domain}`;
-  }, [tunnelConfig.domain]);
-
-  useEffect(() => {
-    setRouterDomain(tunnelConfig.domain);
   }, [tunnelConfig.domain]);
 
   useEffect(() => {
@@ -305,8 +298,7 @@ export function ProviderShareSection({
     updateForSaleMutation.isPending ||
     updateExpirationMutation.isPending ||
     updateOwnerEmailMutation.isPending ||
-    updateAclMutation.isPending ||
-    configureTunnelMutation.isPending;
+    updateAclMutation.isPending;
 
   if (!shareableApp) {
     return null;
@@ -380,26 +372,6 @@ export function ProviderShareSection({
     return new Date(Date.now() + seconds * 1000).toISOString();
   };
 
-  const saveRouterDomainIfNeeded = async () => {
-    let nextRouterDomain: string;
-    try {
-      nextRouterDomain = normalizeShareRouterDomain(routerDomain);
-      setRouterDomainError(null);
-    } catch (error) {
-      const key =
-        error instanceof Error
-          ? error.message
-          : "share.validation.invalidRouterDomain";
-      setRouterDomainError(
-        t(key, { defaultValue: "Router domain is invalid" }),
-      );
-      throw error;
-    }
-    if (nextRouterDomain && nextRouterDomain !== tunnelConfig.domain) {
-      await configureTunnelMutation.mutateAsync({ domain: nextRouterDomain });
-    }
-  };
-
   const buildAclPayload = () =>
     buildShareAclPayload({
       app: shareableApp,
@@ -432,7 +404,6 @@ export function ProviderShareSection({
       return;
     }
 
-    await saveRouterDomainIfNeeded();
     const aclPayload = buildAclPayload();
     const created = await createMutation.mutateAsync({
       ownerEmail: normalizedOwnerEmail,
@@ -470,8 +441,6 @@ export function ProviderShareSection({
       );
       return;
     }
-
-    await saveRouterDomainIfNeeded();
 
     if (normalizedOwnerEmail !== share.ownerEmail.trim().toLowerCase()) {
       await updateOwnerEmailMutation.mutateAsync({
@@ -636,17 +605,37 @@ export function ProviderShareSection({
                   <Label htmlFor="provider-share-router">
                     {t("share.tunnel.region", { defaultValue: "路由节点" })}
                   </Label>
-                  <ShareRouterSelector
-                    value={routerDomain}
-                    onChange={(value) => {
-                      setRouterDomain(value);
-                      setRouterDomainError(null);
-                    }}
-                    selectId="provider-share-router"
-                    customInputId="provider-share-router-custom"
-                    disabled={busy}
-                    error={routerDomainError}
-                  />
+                  <div className="flex flex-col gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                    <p
+                      id="provider-share-router"
+                      className="text-sm font-medium"
+                    >
+                      {formatShareRouterDisplay(tunnelConfig.domain)}
+                    </p>
+                    {onOpenShareSettings ? (
+                      <Button
+                        type="button"
+                        variant="link"
+                        size="sm"
+                        className="h-auto shrink-0 px-0"
+                        onClick={onOpenShareSettings}
+                      >
+                        {t("provider.share.openShareSettings", {
+                          defaultValue: "前往设置修改",
+                        })}
+                      </Button>
+                    ) : null}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {shareExists
+                      ? t("share.routerLockedAfterCreate", {
+                          defaultValue: "路由节点已绑定。",
+                        })
+                      : t("provider.share.routerFromSettingsHint", {
+                          defaultValue:
+                            "使用设置 → 分享中的默认 Router 节点创建 share。",
+                        })}
+                  </p>
                 </div>
 
                 <div className="space-y-2">

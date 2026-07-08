@@ -45,8 +45,9 @@ async fn web_invoke_dispatch(
     match command {
         "get_build_info" => Ok(json!(build_info())),
         "get_settings" => {
-            let settings = state.ui_settings.read().await.for_frontend();
-            Ok(settings)
+            let store = state.ui_settings.read().await;
+            let config = state.config.read().await;
+            Ok(store.settings_for_frontend(&config))
         }
         "get_rectifier_config" => {
             let store = state.ui_settings.read().await;
@@ -458,9 +459,29 @@ async fn web_invoke_dispatch(
         }
         "claim_client_tunnel" => {
             if web_has_payload(&args) {
-                let input = web_client_tunnel_input(&args)?;
-                let _ = update_client_tunnel(State(state.clone()), headers.clone(), Json(input))
-                    .await?;
+                let value = web_payload(&args, &["params", "input", "config"]);
+                let owner_email = web_optional_string_any(value, &["ownerEmail", "owner_email"]);
+                let subdomain = web_optional_string_any(value, &["tunnelSubdomain", "subdomain"]);
+                if owner_email.is_some() || subdomain.is_some() {
+                    let mut config = state.config.read().await.clone();
+                    if let Some(email) = owner_email {
+                        let email = crate::domain::settings::config::normalize_email(&email)
+                            .map_err(ApiError::bad_request)?;
+                        config.owner.email = Some(email);
+                    }
+                    if let Some(subdomain) = subdomain {
+                        config
+                            .update_client_tunnel(UpdateClientTunnelInput {
+                                tunnel_subdomain: Some(subdomain),
+                                tunnel_status: None,
+                            })
+                            .map_err(ApiError::bad_request)?;
+                    }
+                    state
+                        .replace_config(config)
+                        .await
+                        .map_err(ApiError::internal)?;
+                }
             }
             let _ = claim_client_tunnel(State(state.clone()), headers.clone()).await?;
             Ok(web_client_tunnel_state(state).await)
@@ -1515,9 +1536,7 @@ async fn web_invoke_dispatch(
             Ok(json!(history))
         }
         "configure_tunnel" => {
-            let config: UpdateClientTunnelInput = web_arg_value(&args, "config")?;
-            let _ =
-                update_client_tunnel(State(state.clone()), headers.clone(), Json(config)).await?;
+            web_configure_share_tunnel(state, &args).await?;
             Ok(Value::Null)
         }
         "get_claude_common_config_snippet" => {

@@ -459,10 +459,9 @@ fn quota_percent_from_tiers(tiers: &[AccountQuotaTier]) -> Option<f64> {
 fn codex_tiers_from_rate_limit(rate_limit: Option<CodexRateLimit>) -> Vec<AccountQuotaTier> {
     let mut tiers = Vec::new();
     if let Some(rate_limit) = rate_limit {
-        for window in normalize_codex_rate_windows(
-            rate_limit.primary_window,
-            rate_limit.secondary_window,
-        ) {
+        for window in
+            normalize_codex_rate_windows(rate_limit.primary_window, rate_limit.secondary_window)
+        {
             let Some(utilization) = codex_window_used_fraction(&window) else {
                 continue;
             };
@@ -519,11 +518,12 @@ fn normalize_codex_rate_windows(
                 _ => vec![primary_window, secondary_window],
             }
         }
-        (Some(primary_window), None) => match codex_window_role(primary_window.limit_window_seconds)
-        {
-            CodexWindowRole::Weekly => vec![primary_window],
-            _ => vec![primary_window],
-        },
+        (Some(primary_window), None) => {
+            match codex_window_role(primary_window.limit_window_seconds) {
+                CodexWindowRole::Weekly => vec![primary_window],
+                _ => vec![primary_window],
+            }
+        }
         (None, Some(secondary_window)) => vec![secondary_window],
         (None, None) => Vec::new(),
     }
