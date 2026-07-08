@@ -18,6 +18,7 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { AppId } from "@/lib/api";
+import type { ProviderSharePhase } from "@/utils/shareUtils";
 
 interface ProviderActionsProps {
   appId?: AppId;
@@ -45,9 +46,11 @@ interface ProviderActionsProps {
   // OpenClaw: default model
   isDefaultModel?: boolean;
   onSetAsDefault?: () => void;
-  isSharing?: boolean;
+  sharePhase?: ProviderSharePhase;
   isSharePending?: boolean;
-  onToggleShare?: () => void;
+  onSharePrimaryAction?: () => void;
+  onShareResume?: () => void;
+  onShareDelete?: () => void;
 }
 
 // 主按钮的呈现状态。title 用于 disabled 态向用户解释为何不可点击；
@@ -87,9 +90,11 @@ export function ProviderActions({
   // OpenClaw: default model
   isDefaultModel = false,
   onSetAsDefault,
-  isSharing = false,
+  sharePhase,
   isSharePending = false,
-  onToggleShare,
+  onSharePrimaryAction,
+  onShareResume,
+  onShareDelete,
 }: ProviderActionsProps) {
   const { t } = useTranslation();
   const iconButtonClass = "h-8 w-8 p-1";
@@ -286,21 +291,56 @@ export function ProviderActions({
         </Button>
       </span>
 
-      {onToggleShare ? (
+      {sharePhase === "stopped" && onShareResume && onShareDelete ? (
+        <>
+          <Button
+            size="sm"
+            variant="default"
+            onClick={() => void onShareResume()}
+            disabled={isSharePending}
+            className="w-[4.5rem] px-2.5 bg-violet-500 hover:bg-violet-600 dark:bg-violet-600 dark:hover:bg-violet-700"
+            title={t("provider.share.resume", {
+              defaultValue: "重新开启分享",
+            })}
+          >
+            {isSharePending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Share2 className="h-4 w-4" />
+            )}
+            {t("provider.share.resumeShort", { defaultValue: "开启分享" })}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void onShareDelete()}
+            disabled={isSharePending}
+            className="w-[4.5rem] px-2.5 text-destructive hover:text-destructive"
+            title={t("provider.share.delete", { defaultValue: "删除分享" })}
+          >
+            {isSharePending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Trash2 className="h-4 w-4" />
+            )}
+            {t("provider.share.deleteShort", { defaultValue: "删除分享" })}
+          </Button>
+        </>
+      ) : sharePhase && onSharePrimaryAction ? (
         <Button
           size="sm"
-          variant={isSharing ? "secondary" : "default"}
-          onClick={() => void onToggleShare()}
+          variant={sharePhase === "sharing" ? "secondary" : "default"}
+          onClick={() => void onSharePrimaryAction()}
           disabled={isSharePending}
           className={cn(
             "w-[4.5rem] px-2.5",
-            isSharing
+            sharePhase === "sharing"
               ? "bg-violet-100 text-violet-600 hover:bg-violet-200 dark:bg-violet-900/50 dark:text-violet-400 dark:hover:bg-violet-900/70"
               : "bg-violet-500 hover:bg-violet-600 dark:bg-violet-600 dark:hover:bg-violet-700",
           )}
           title={
-            isSharing
-              ? t("provider.share.stateActive", { defaultValue: "分享已启用" })
+            sharePhase === "sharing"
+              ? t("provider.share.stop", { defaultValue: "点击停止分享" })
               : t("provider.share.enable", { defaultValue: "分享" })
           }
         >
@@ -309,7 +349,7 @@ export function ProviderActions({
           ) : (
             <Share2 className="h-4 w-4" />
           )}
-          {isSharing
+          {sharePhase === "sharing"
             ? t("provider.share.sharing", { defaultValue: "分享中" })
             : t("provider.share.enable", { defaultValue: "分享" })}
         </Button>

@@ -60,20 +60,22 @@ import {
   useProviderShare,
   type ProviderShareState,
 } from "@/hooks/useProviderShare";
-import { isShareRunning } from "@/hooks/useToggleProviderShare";
+import { isShareRunning } from "@/utils/shareUtils";
 import {
   DEFAULT_PARALLEL_LIMIT,
+  formatShareLimitInput,
+  getTunnelConfigFromSettings,
   isPermanentExpiry,
   isUnlimitedParallelLimit,
   isUnlimitedTokenLimit,
   MIN_PARALLEL_LIMIT,
+  normalizeShareLimitValue,
   PERMANENT_EXPIRES_AT,
   permanentExpiresInSecs,
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
 } from "@/utils/shareUtils";
 import { formatShareRouterDisplay, normalizeShareRouterDomain } from "@/utils/shareRouter";
-import { getTunnelConfigFromSettings } from "@/utils/shareUtils";
 import {
   buildShareAclPayload,
   deriveSubdomainFromEmail,
@@ -162,7 +164,7 @@ export function ProviderShareSection({
   const [routerDomainError, setRouterDomainError] = useState<string | null>(null);
   const [subdomainInput, setSubdomainInput] = useState("");
   const [descriptionInput, setDescriptionInput] = useState("");
-  const [forSaleValue, setForSaleValue] = useState<"Yes" | "No" | "Free">("No");
+  const [forSaleValue, setForSaleValue] = useState<"Yes" | "No" | "Free">("Yes");
   const [saleMarketKind, setSaleMarketKind] = useState<ShareSaleMarketKind>("token");
   const [marketAccessMode, setMarketAccessMode] = useState<"selected" | "all">("all");
   const [selectedMarketEmails, setSelectedMarketEmails] = useState<string[]>([]);
@@ -178,10 +180,14 @@ export function ProviderShareSection({
 
   const subdomainManualRef = useRef(false);
   const shareInitRef = useRef<string | null>(null);
+  const tokenLimitTouchedRef = useRef(false);
+  const parallelLimitTouchedRef = useRef(false);
+  const expiresTouchedRef = useRef(false);
 
   const shareableApp = isShareableApp(appId) ? appId : null;
-  const shareConfigured = Boolean(share);
-  const marketsQueryEnabled = shareConfigured && isShareOpen;
+  const shareExists = Boolean(share);
+  const shareRunning = share ? isShareRunning(share) : false;
+  const marketsQueryEnabled = shareExists && isShareOpen;
   const { data: markets = [], isLoading: marketsLoading, error: marketsError, refetch: refetchMarkets } =
     useShareMarketsQuery(marketsQueryEnabled);
 
@@ -229,15 +235,14 @@ export function ProviderShareSection({
     const initKey = share?.id ?? "new";
     if (shareInitRef.current === initKey) return;
     shareInitRef.current = initKey;
-
-    if (share) {
-      setIsShareOpen(true);
-    }
+    tokenLimitTouchedRef.current = false;
+    parallelLimitTouchedRef.current = false;
+    expiresTouchedRef.current = false;
 
     const resolvedOwner = share?.ownerEmail?.trim() || ownerEmail;
     setOwnerEmailInput(resolvedOwner);
     setDescriptionInput(share?.description?.trim() ?? "");
-    setForSaleValue(share?.forSale ?? "No");
+    setForSaleValue(share?.forSale ?? "Yes");
     setSaleMarketKind(share?.saleMarketKind ?? "token");
     setMarketAccessMode(share?.marketAccessMode ?? "all");
     setSubdomainInput(share?.subdomain?.trim() ?? "");
@@ -258,16 +263,8 @@ export function ProviderShareSection({
     );
     setSelectedShareMarketEmail(shareMarketEmail ?? "");
 
-    setTokenLimitInput(
-      share && !isUnlimitedTokenLimit(share.tokenLimit)
-        ? String(share.tokenLimit)
-        : "",
-    );
-    setParallelLimitInput(
-      share && !isUnlimitedParallelLimit(share.parallelLimit)
-        ? String(share.parallelLimit)
-        : "",
-    );
+    setTokenLimitInput(formatShareLimitInput(share?.tokenLimit));
+    setParallelLimitInput(formatShareLimitInput(share?.parallelLimit));
 
     const permanent = share ? isPermanentExpiry(share.expiresAt) : true;
     setIsPermanent(permanent);
@@ -290,9 +287,9 @@ export function ProviderShareSection({
   ]);
 
   useEffect(() => {
-    if (!shareConfigured || subdomainManualRef.current || share) return;
+    if (!shareExists || subdomainManualRef.current || share) return;
     setSubdomainInput(deriveSubdomainFromEmail(ownerEmailInput));
-  }, [shareConfigured, ownerEmailInput, share]);
+  }, [shareExists, ownerEmailInput, share]);
 
   const busy =
     createMutation.isPending ||
@@ -346,6 +343,34 @@ export function ProviderShareSection({
       ? Number(parallelLimitInput)
       : UNLIMITED_PARALLEL_LIMIT;
 
+  const resolveTokenLimitForSave = () => {
+    if (!tokenLimitTouchedRef.current && share) {
+      return normalizeShareLimitValue(share.tokenLimit);
+    }
+    return resolveTokenLimit();
+  };
+
+  const resolveParallelLimitForSave = () => {
+    if (!parallelLimitTouchedRef.current && share) {
+      return normalizeShareLimitValue(share.parallelLimit);
+    }
+    return resolveParallelLimit();
+  };
+
+  const resolveExpiresAtForSave = () => {
+    if (!expiresTouchedRef.current && share?.expiresAt) return share.expiresAt;
+    return resolveExpiresAt();
+  };
+
+  const limitsEqual = (
+    left: number | undefined,
+    right: number | undefined,
+    isUnlimited: (value?: number | null) => boolean,
+  ) => {
+    if (isUnlimited(left) && isUnlimited(right)) return true;
+    return left === right;
+  };
+
   const resolveExpiresAt = () => {
     if (isPermanent) return PERMANENT_EXPIRES_AT;
     const seconds = Number(expiresInSecsInput);
@@ -398,8 +423,8 @@ export function ProviderShareSection({
     }
     if (shareToInvalid || marketInvalid) return;
 
-    const tokenLimit = resolveTokenLimit();
-    const parallelLimit = resolveParallelLimit();
+    const tokenLimit = resolveTokenLimitForSave();
+    const parallelLimit = resolveParallelLimitForSave();
     if (Number.isNaN(tokenLimit) || Number.isNaN(parallelLimit)) {
       toast.error(
         t("provider.share.invalidNumber", { defaultValue: "请输入有效数字" }),
@@ -437,8 +462,8 @@ export function ProviderShareSection({
     if (!share) return;
     if (ownerEmailInvalid || shareToInvalid || marketInvalid) return;
 
-    const tokenLimit = resolveTokenLimit();
-    const parallelLimit = resolveParallelLimit();
+    const tokenLimit = resolveTokenLimitForSave();
+    const parallelLimit = resolveParallelLimitForSave();
     if (Number.isNaN(tokenLimit) || Number.isNaN(parallelLimit)) {
       toast.error(
         t("provider.share.invalidNumber", { defaultValue: "请输入有效数字" }),
@@ -472,17 +497,17 @@ export function ProviderShareSection({
         forSale: forSaleValue,
       });
     }
-    if (share.tokenLimit !== tokenLimit) {
+    if (!limitsEqual(share.tokenLimit, tokenLimit, isUnlimitedTokenLimit)) {
       await updateTokenLimitMutation.mutateAsync({ shareId: share.id, tokenLimit });
     }
-    if (share.parallelLimit !== parallelLimit) {
+    if (!limitsEqual(share.parallelLimit, parallelLimit, isUnlimitedParallelLimit)) {
       await updateParallelLimitMutation.mutateAsync({
         shareId: share.id,
         parallelLimit,
       });
     }
 
-    const nextExpiresAt = resolveExpiresAt();
+    const nextExpiresAt = resolveExpiresAtForSave();
     if (share.expiresAt !== nextExpiresAt) {
       await updateExpirationMutation.mutateAsync({
         shareId: share.id,
@@ -504,7 +529,6 @@ export function ProviderShareSection({
   const handleShareToggle = async (checked: boolean) => {
     if (busy) return;
     if (checked) {
-      setIsShareOpen(true);
       if (!share) {
         await handleCreate();
         return;
@@ -514,9 +538,8 @@ export function ProviderShareSection({
       }
       return;
     }
-    if (share) {
-      await deleteMutation.mutateAsync(share.id);
-      setIsShareOpen(false);
+    if (share && isShareRunning(share)) {
+      await disableMutation.mutateAsync(share.id);
     }
   };
 
@@ -558,7 +581,7 @@ export function ProviderShareSection({
             </Label>
             <Switch
               id="provider-share-enabled"
-              checked={shareConfigured}
+              checked={shareRunning}
               disabled={busy}
               onCheckedChange={(checked) => void handleShareToggle(checked)}
             />
@@ -600,7 +623,7 @@ export function ProviderShareSection({
             </a>
           ) : null}
 
-          {!shareConfigured ? (
+          {!shareExists ? (
             <p className="text-sm text-muted-foreground">
               {t("provider.share.disabledHint", {
                 defaultValue: "开启后可配置远程分享参数并创建 Share。",
@@ -817,9 +840,12 @@ export function ProviderShareSection({
                     type="number"
                     min={0}
                     disabled={busy}
-                    placeholder={t("share.unlimited", { defaultValue: "不限" })}
+                    placeholder={t("share.unlimited", { defaultValue: "无上限" })}
                     value={tokenLimitInput}
-                    onChange={(event) => setTokenLimitInput(event.target.value)}
+                    onChange={(event) => {
+                      tokenLimitTouchedRef.current = true;
+                      setTokenLimitInput(event.target.value);
+                    }}
                   />
                   <div className="flex flex-wrap gap-1.5">
                     <Button
@@ -828,9 +854,12 @@ export function ProviderShareSection({
                       size="sm"
                       className="h-7 px-2 text-xs"
                       disabled={busy}
-                      onClick={() => setTokenLimitInput("")}
+                      onClick={() => {
+                        tokenLimitTouchedRef.current = true;
+                        setTokenLimitInput("");
+                      }}
                     >
-                      {t("share.unlimited", { defaultValue: "不限" })}
+                      {t("share.unlimited", { defaultValue: "无上限" })}
                     </Button>
                     {SHARE_TOKEN_PRESETS.map((preset) => (
                       <Button
@@ -840,7 +869,10 @@ export function ProviderShareSection({
                         size="sm"
                         className="h-7 px-2 text-xs"
                         disabled={busy}
-                        onClick={() => setTokenLimitInput(String(preset))}
+                        onClick={() => {
+                          tokenLimitTouchedRef.current = true;
+                          setTokenLimitInput(String(preset));
+                        }}
                       >
                         {preset.toLocaleString()}
                       </Button>
@@ -857,9 +889,12 @@ export function ProviderShareSection({
                     type="number"
                     min={MIN_PARALLEL_LIMIT}
                     disabled={busy}
-                    placeholder={t("share.unlimited", { defaultValue: "不限" })}
+                    placeholder={t("share.unlimited", { defaultValue: "无上限" })}
                     value={parallelLimitInput}
-                    onChange={(event) => setParallelLimitInput(event.target.value)}
+                    onChange={(event) => {
+                      parallelLimitTouchedRef.current = true;
+                      setParallelLimitInput(event.target.value);
+                    }}
                   />
                   <div className="flex flex-wrap gap-1.5">
                     <Button
@@ -868,9 +903,12 @@ export function ProviderShareSection({
                       size="sm"
                       className="h-7 px-2 text-xs"
                       disabled={busy}
-                      onClick={() => setParallelLimitInput("")}
+                      onClick={() => {
+                        parallelLimitTouchedRef.current = true;
+                        setParallelLimitInput("");
+                      }}
                     >
-                      {t("share.unlimited", { defaultValue: "不限" })}
+                      {t("share.unlimited", { defaultValue: "无上限" })}
                     </Button>
                     <Button
                       type="button"
@@ -878,9 +916,10 @@ export function ProviderShareSection({
                       size="sm"
                       className="h-7 px-2 text-xs"
                       disabled={busy}
-                      onClick={() =>
-                        setParallelLimitInput(String(DEFAULT_PARALLEL_LIMIT))
-                      }
+                      onClick={() => {
+                        parallelLimitTouchedRef.current = true;
+                        setParallelLimitInput(String(DEFAULT_PARALLEL_LIMIT));
+                      }}
                     >
                       {DEFAULT_PARALLEL_LIMIT}
                     </Button>
@@ -896,7 +935,10 @@ export function ProviderShareSection({
                     type="number"
                     disabled={busy || isPermanent}
                     value={expiresInSecsInput}
-                    onChange={(event) => setExpiresInSecsInput(event.target.value)}
+                    onChange={(event) => {
+                      expiresTouchedRef.current = true;
+                      setExpiresInSecsInput(event.target.value);
+                    }}
                   />
                   <div className="flex flex-wrap gap-1.5">
                     {SHARE_EXPIRY_PRESETS.map((preset) => (
@@ -907,7 +949,10 @@ export function ProviderShareSection({
                         size="sm"
                         className="h-7 px-2 text-xs"
                         disabled={busy || isPermanent}
-                        onClick={() => setExpiresInSecsInput(String(preset.value))}
+                        onClick={() => {
+                          expiresTouchedRef.current = true;
+                          setExpiresInSecsInput(String(preset.value));
+                        }}
                       >
                         {t(preset.labelKey)}
                       </Button>
@@ -919,6 +964,7 @@ export function ProviderShareSection({
                       checked={isPermanent}
                       disabled={busy}
                       onCheckedChange={(checked) => {
+                        expiresTouchedRef.current = true;
                         const next = checked === true;
                         setIsPermanent(next);
                         if (next) {

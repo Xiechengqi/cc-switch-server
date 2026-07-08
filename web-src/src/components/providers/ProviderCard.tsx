@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { GripVertical, ChevronDown, ChevronUp } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -42,6 +42,11 @@ import { useUsageQuery } from "@/lib/query/queries";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { isShareableApp } from "@/hooks/useProviderShare";
 import { useToggleProviderShare } from "@/hooks/useToggleProviderShare";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import {
+  isProviderShareDeleteConfirmSkipped,
+  setProviderShareDeleteConfirmSkipped,
+} from "@/utils/providerShareDeleteConfirm";
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -247,11 +252,34 @@ export function ProviderCard({
 
   const { data: health } = useProviderHealth(provider.id, appId);
   const canManageShare = isShareableApp(appId);
+  const [shareDeleteConfirmOpen, setShareDeleteConfirmOpen] = useState(false);
   const {
+    sharePhase,
     isSharing,
     isPending: isSharePending,
-    toggleShare,
+    handleSharePrimaryAction,
+    handleShareResume,
+    deleteShare,
   } = useToggleProviderShare(appId, provider.id);
+
+  const handleShareDeleteRequest = useCallback(() => {
+    if (isProviderShareDeleteConfirmSkipped()) {
+      void deleteShare();
+      return;
+    }
+    setShareDeleteConfirmOpen(true);
+  }, [deleteShare]);
+
+  const handleShareDeleteConfirm = useCallback(
+    (remember: boolean) => {
+      if (remember) {
+        setProviderShareDeleteConfirmSkipped(true);
+      }
+      setShareDeleteConfirmOpen(false);
+      void deleteShare();
+    },
+    [deleteShare],
+  );
 
   const fallbackUrlText = t("provider.notConfigured", {
     defaultValue: "未配置接口地址",
@@ -667,9 +695,23 @@ export function ProviderCard({
               // OpenClaw: default model
               isDefaultModel={isDefaultModel}
               onSetAsDefault={onSetAsDefault}
-              isSharing={isSharing}
+              sharePhase={canManageShare ? sharePhase : undefined}
               isSharePending={isSharePending}
-              onToggleShare={canManageShare ? () => void toggleShare() : undefined}
+              onSharePrimaryAction={
+                canManageShare && sharePhase !== "stopped"
+                  ? () => void handleSharePrimaryAction()
+                  : undefined
+              }
+              onShareResume={
+                canManageShare && sharePhase === "stopped"
+                  ? () => void handleShareResume()
+                  : undefined
+              }
+              onShareDelete={
+                canManageShare && sharePhase === "stopped"
+                  ? handleShareDeleteRequest
+                  : undefined
+              }
             />
           </div>
         </div>
@@ -688,6 +730,24 @@ export function ProviderCard({
           />
         </div>
       )}
+
+      <ConfirmDialog
+        isOpen={shareDeleteConfirmOpen}
+        title={t("provider.share.deleteConfirmTitle", {
+          defaultValue: "删除分享",
+        })}
+        message={t("provider.share.deleteConfirmMessage", {
+          defaultValue: "删除后该分享将从 Share 页移除，且无法恢复。",
+        })}
+        confirmText={t("provider.share.deleteShort", {
+          defaultValue: "删除分享",
+        })}
+        checkboxLabel={t("provider.share.deleteRemember", {
+          defaultValue: "记住选择，之后不再询问",
+        })}
+        onConfirm={handleShareDeleteConfirm}
+        onCancel={() => setShareDeleteConfirmOpen(false)}
+      />
     </div>
   );
 }

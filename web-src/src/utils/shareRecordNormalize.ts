@@ -1,5 +1,9 @@
 import type { ShareBindings, ShareRecord, ShareSaleMarketKind } from "@/lib/api";
 import { SHARE_APP_TYPES } from "@/lib/api/share";
+import {
+  normalizeShareLimitValue,
+  UNLIMITED_TOKEN_LIMIT,
+} from "@/utils/shareUtils";
 
 type RawRecord = Record<string, unknown>;
 
@@ -20,9 +24,25 @@ function readString(
 function readNumber(raw: RawRecord, ...keys: string[]): number | undefined {
   for (const key of keys) {
     const value = raw[key];
-    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value.trim());
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
   }
   return undefined;
+}
+
+function readShareLimit(raw: RawRecord, ...keys: string[]): number {
+  const value = readNumber(raw, ...keys);
+  if (value == null) {
+    return UNLIMITED_TOKEN_LIMIT;
+  }
+  return normalizeShareLimitValue(value);
 }
 
 function readBool(raw: RawRecord, ...keys: string[]): boolean | undefined {
@@ -173,11 +193,8 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
     apiKey: readString(record, "apiKey", "api_key") ?? "",
     settingsConfig:
       readString(record, "settingsConfig", "settings_config") ?? null,
-    tokenLimit:
-      readNumber(record, "tokenLimit", "token_limit") ?? Number.MAX_SAFE_INTEGER,
-    parallelLimit:
-      readNumber(record, "parallelLimit", "parallel_limit") ??
-      Number.MAX_SAFE_INTEGER,
+    tokenLimit: readShareLimit(record, "tokenLimit", "token_limit"),
+    parallelLimit: readShareLimit(record, "parallelLimit", "parallel_limit"),
     tokensUsed: readNumber(record, "tokensUsed", "tokens_used") ?? 0,
     requestsCount: readNumber(record, "requestsCount", "requests_count") ?? 0,
     expiresAt: normalizeExpiresAt(record),

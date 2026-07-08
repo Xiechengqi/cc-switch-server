@@ -5,6 +5,7 @@ import type { AppId } from "@/lib/api";
 import {
   useClientTunnelQuery,
   useCreateShareMutation,
+  useDeleteShareMutation,
   useDisableShareMutation,
   useEnableShareMutation,
   useSharesQuery,
@@ -16,17 +17,15 @@ import {
 } from "@/hooks/useProviderShare";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import {
+  getProviderSharePhase,
+  isShareRunning,
   permanentExpiresInSecs,
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
+  type ProviderSharePhase,
 } from "@/utils/shareUtils";
 
-export function isShareRunning(
-  share: { status: string; tunnelUrl?: string | null; subdomain?: string | null },
-): boolean {
-  if (share.status !== "active") return false;
-  return Boolean(share.tunnelUrl?.trim() || share.subdomain?.trim());
-}
+export { isShareRunning, type ProviderSharePhase };
 
 export function useToggleProviderShare(
   appId: AppId,
@@ -40,15 +39,18 @@ export function useToggleProviderShare(
   const createMutation = useCreateShareMutation();
   const enableMutation = useEnableShareMutation();
   const disableMutation = useDisableShareMutation();
+  const deleteMutation = useDeleteShareMutation();
 
   const shareable = isShareableApp(appId) && Boolean(providerId);
+  const sharePhase = getProviderSharePhase(share);
   const hasShare = Boolean(share);
-  const isSharing = share ? isShareRunning(share) : false;
+  const isSharing = sharePhase === "sharing";
 
   const isPending =
     createMutation.isPending ||
     enableMutation.isPending ||
-    disableMutation.isPending;
+    disableMutation.isPending ||
+    deleteMutation.isPending;
 
   const ownerEmail = useMemo(
     () => resolveShareOwnerEmail(clientTunnel?.config?.ownerEmail, shares),
@@ -77,7 +79,8 @@ export function useToggleProviderShare(
       const created = await createMutation.mutateAsync({
         ownerEmail,
         bindings: { [appId]: providerId },
-        forSale: "No",
+        forSale: "Yes",
+        saleMarketKind: "token",
         tokenLimit: UNLIMITED_TOKEN_LIMIT,
         parallelLimit: UNLIMITED_PARALLEL_LIMIT,
         expiresInSecs: permanentExpiresInSecs(),
@@ -111,24 +114,49 @@ export function useToggleProviderShare(
     }
   };
 
-  const toggleShare = async () => {
+  const deleteShare = async () => {
+    if (!share) return;
+    try {
+      await deleteMutation.mutateAsync(share.id);
+    } catch (error) {
+      toast.error(
+        t("provider.share.deleteFailed", {
+          defaultValue: "删除分享失败：{{error}}",
+          error: extractErrorMessage(error),
+        }),
+      );
+      throw error;
+    }
+  };
+
+  const handleSharePrimaryAction = async () => {
     if (!shareable || isPending) return;
-    if (isSharing) {
+    if (sharePhase === "sharing") {
       await disableShare();
-    } else {
+      return;
+    }
+    if (sharePhase === "not_created") {
       await enableShare();
     }
+  };
+
+  const handleShareResume = async () => {
+    if (!shareable || isPending || sharePhase !== "stopped") return;
+    await enableShare();
   };
 
   return {
     ...providerShare,
     shareable,
+    sharePhase,
     hasShare,
     isSharing,
     isPending,
     enableShare,
     disableShare,
-    toggleShare,
+    deleteShare,
+    handleSharePrimaryAction,
+    handleShareResume,
     state,
     share,
   };

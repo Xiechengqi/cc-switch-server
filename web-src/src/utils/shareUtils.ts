@@ -23,19 +23,65 @@ export function formatShareStatus(status: string): string {
   return status.replace(/_/g, " ");
 }
 
+export type ProviderSharePhase = "not_created" | "sharing" | "stopped";
+
+export function isShareRunning(
+  share: {
+    status: string;
+    tunnelUrl?: string | null;
+    subdomain?: string | null;
+  },
+): boolean {
+  if (share.status !== "active") return false;
+  return Boolean(share.tunnelUrl?.trim() || share.subdomain?.trim());
+}
+
+export function getProviderSharePhase(
+  share: ShareRecord | null | undefined,
+): ProviderSharePhase {
+  if (!share) return "not_created";
+  if (isShareRunning(share)) return "sharing";
+  return "stopped";
+}
+
 export const UNLIMITED_TOKEN_LIMIT = -1;
 export const UNLIMITED_PARALLEL_LIMIT = -1;
 export const DEFAULT_PARALLEL_LIMIT = 3;
 export const MIN_PARALLEL_LIMIT = 3;
 
+/** Legacy/client sentinel for "no limit" besides `-1`. */
+export const UNLIMITED_LIMIT_SENTINEL = Number.MAX_SAFE_INTEGER;
+
+export function normalizeShareLimitValue(value: number): number {
+  if (value === UNLIMITED_TOKEN_LIMIT || value >= UNLIMITED_LIMIT_SENTINEL) {
+    return UNLIMITED_TOKEN_LIMIT;
+  }
+  return value;
+}
+
+export function isUnlimitedShareLimit(value?: number | null): boolean {
+  if (value == null) {
+    return true;
+  }
+  return normalizeShareLimitValue(value) === UNLIMITED_TOKEN_LIMIT;
+}
+
 export function isUnlimitedTokenLimit(tokenLimit?: number | null): boolean {
-  return tokenLimit === UNLIMITED_TOKEN_LIMIT;
+  return isUnlimitedShareLimit(tokenLimit);
 }
 
 export function isUnlimitedParallelLimit(
   parallelLimit?: number | null,
 ): boolean {
-  return parallelLimit === UNLIMITED_PARALLEL_LIMIT;
+  return isUnlimitedShareLimit(parallelLimit);
+}
+
+/** Empty input = unlimited; finite limits render as decimal strings. */
+export function formatShareLimitInput(value?: number | null): string {
+  if (isUnlimitedShareLimit(value)) {
+    return "";
+  }
+  return String(value);
 }
 
 export function formatCompactTokenCount(value?: number | null): string {
