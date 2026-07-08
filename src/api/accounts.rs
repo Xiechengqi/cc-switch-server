@@ -415,12 +415,14 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
             return Err(account_refresh_api_error(error));
         }
     };
+    let interval_ms = state.oauth_quota_refresh_interval_ms().await;
     let input = match upsert_input_from_login_response(
         finish.provider_type,
         &token_response,
         raw,
         profile_raw,
         now_ms() as i64,
+        interval_ms,
     ) {
         Ok(input) => input,
         Err(error) => {
@@ -546,18 +548,20 @@ pub(in crate::api) async fn refresh_account(
             .try_lock(existing.provider_type, &existing.id)
             .ok_or_else(|| ApiError::conflict("account refresh is already in progress"))?;
         let http_client = state.http_client().await;
-        let update = match execute_native_account_refresh(&http_client, &existing, now).await {
-            Ok(update) => update,
-            Err(error) => {
-                state
-                    .mutate_accounts_immediate(|store| {
-                        store.mark_refresh_failure(&id, error.message.clone());
-                    })
-                    .await
-                    .map_err(ApiError::internal)?;
-                return Err(account_refresh_api_error(error));
-            }
-        };
+        let interval_ms = state.oauth_quota_refresh_interval_ms().await;
+        let update =
+            match execute_native_account_refresh(&http_client, &existing, now, interval_ms).await {
+                Ok(update) => update,
+                Err(error) => {
+                    state
+                        .mutate_accounts_immediate(|store| {
+                            store.mark_refresh_failure(&id, error.message.clone());
+                        })
+                        .await
+                        .map_err(ApiError::internal)?;
+                    return Err(account_refresh_api_error(error));
+                }
+            };
         let account = state
             .try_mutate_accounts_immediate(|store| {
                 store
@@ -684,6 +688,7 @@ pub(in crate::api) async fn account_quota(
         }
     }
 
+    let interval_ms = state.oauth_quota_refresh_interval_ms().await;
     let mut active_account = existing;
     if account_needs_native_refresh(&active_account, now) {
         let _refresh_guard = state
@@ -691,19 +696,21 @@ pub(in crate::api) async fn account_quota(
             .try_lock(active_account.provider_type, &active_account.id)
             .ok_or_else(|| ApiError::conflict("account refresh is already in progress"))?;
         let http_client = state.http_client().await;
-        let update = match execute_native_account_refresh(&http_client, &active_account, now).await
-        {
-            Ok(update) => update,
-            Err(error) => {
-                state
-                    .mutate_accounts_immediate(|store| {
-                        store.mark_refresh_failure(&id, error.message.clone());
-                    })
-                    .await
-                    .map_err(ApiError::internal)?;
-                return Err(account_refresh_api_error(error));
-            }
-        };
+        let update =
+            match execute_native_account_refresh(&http_client, &active_account, now, interval_ms)
+                .await
+            {
+                Ok(update) => update,
+                Err(error) => {
+                    state
+                        .mutate_accounts_immediate(|store| {
+                            store.mark_refresh_failure(&id, error.message.clone());
+                        })
+                        .await
+                        .map_err(ApiError::internal)?;
+                    return Err(account_refresh_api_error(error));
+                }
+            };
         active_account = state
             .try_mutate_accounts_immediate(|store| {
                 store
@@ -715,7 +722,7 @@ pub(in crate::api) async fn account_quota(
     }
 
     let http_client = state.http_client().await;
-    match refresh_account_quota(&http_client, &active_account, now, force).await {
+    match refresh_account_quota(&http_client, &active_account, now, force, interval_ms).await {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
             let account = state
                 .try_mutate_accounts_immediate(|store| {
@@ -725,6 +732,7 @@ pub(in crate::api) async fn account_quota(
                 })
                 .await
                 .map_err(ApiError::internal)??;
+            state.emit_oauth_quota_updated_event(&account, true);
             Ok(Json(AccountQuotaResponse {
                 ok: true,
                 quota: account.quota.clone(),

@@ -10,6 +10,7 @@ use crate::domain::sharing::share_router_domain::{
 };
 
 const UI_SETTINGS_FILE_NAME: &str = "ui-settings.json";
+pub const DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES: u64 = 30;
 
 #[derive(Debug, Clone, Default)]
 pub struct UiSettingsStore {
@@ -68,6 +69,26 @@ impl UiSettingsStore {
 
 pub fn ui_settings_path(config_dir: &Path) -> std::path::PathBuf {
     config_dir.join(UI_SETTINGS_FILE_NAME)
+}
+
+pub fn oauth_quota_refresh_interval_minutes_from_value(value: &Value) -> u64 {
+    value
+        .get("oauthQuotaRefreshIntervalMinutes")
+        .and_then(Value::as_u64)
+        .filter(|minutes| *minutes >= 1)
+        .unwrap_or(DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES)
+}
+
+pub fn oauth_quota_refresh_interval_minutes(store: &UiSettingsStore) -> u64 {
+    oauth_quota_refresh_interval_minutes_from_value(&store.for_frontend())
+}
+
+pub fn oauth_quota_refresh_interval_ms(store: &UiSettingsStore) -> i64 {
+    oauth_quota_refresh_interval_minutes(store) as i64 * 60 * 1000
+}
+
+pub fn default_oauth_quota_refresh_interval_ms() -> i64 {
+    DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES as i64 * 60 * 1000
 }
 
 pub fn default_ui_settings() -> Value {
@@ -256,6 +277,25 @@ mod tests {
         assert_eq!(merged["visibleApps"]["claude"], json!(true));
         assert_eq!(merged["visibleApps"]["codex"], json!(true));
         assert_eq!(merged["visibleApps"]["gemini"], json!(true));
+    }
+
+    #[test]
+    fn oauth_quota_refresh_interval_reads_settings_or_default() {
+        let store = UiSettingsStore {
+            value: json!({ "oauthQuotaRefreshIntervalMinutes": 15 }),
+        };
+        assert_eq!(oauth_quota_refresh_interval_minutes(&store), 15);
+        assert_eq!(oauth_quota_refresh_interval_ms(&store), 15 * 60 * 1000);
+
+        let store = UiSettingsStore::default();
+        assert_eq!(
+            oauth_quota_refresh_interval_minutes(&store),
+            DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES
+        );
+        assert_eq!(
+            oauth_quota_refresh_interval_minutes_from_value(&json!(0)),
+            DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES
+        );
     }
 
     #[test]

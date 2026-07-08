@@ -496,7 +496,9 @@ async fn account_input_from_token(
         quota_percent: None,
         quota,
         quota_refreshed_at: usage_fetched.then_some(now_ms),
-        quota_next_refresh_at: usage_fetched.then_some(now_ms.saturating_add(30 * 60 * 1000)),
+        quota_next_refresh_at: usage_fetched.then_some(now_ms.saturating_add(
+            crate::domain::settings::ui_settings::default_oauth_quota_refresh_interval_ms(),
+        )),
         expires_at,
         last_refresh_error: None,
     })

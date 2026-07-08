@@ -25,13 +25,14 @@ use crate::clients::router::client::{
 use crate::clients::router::tunnel::{self, LeaseFn, TunnelSupervisor};
 use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::AccountRefreshLocks;
+use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{Account, AccountRefreshUpdate, AccountStore};
 use crate::domain::failover::FailoverStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::providers::universal::UniversalProviderStore;
 use crate::domain::settings::config::{mask_proxy_url, ServerConfig};
-use crate::domain::settings::ui_settings::UiSettingsStore;
+use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, ShareRequestLogEntry, ShareSyncOperation,
 };
@@ -142,6 +143,12 @@ pub struct ServerEvent {
     pub app: Option<AppKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
     pub created_at_ms: u128,
 }
 
@@ -153,8 +160,26 @@ impl ServerEvent {
             id: None,
             app: None,
             message: None,
+            auth_provider: None,
+            account_id: None,
+            success: None,
             created_at_ms: crate::infra::time::now_ms(),
         }
+    }
+
+    pub fn auth_provider(mut self, auth_provider: impl Into<String>) -> Self {
+        self.auth_provider = Some(auth_provider.into());
+        self
+    }
+
+    pub fn account_id(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
+    }
+
+    pub fn success(mut self, success: bool) -> Self {
+        self.success = Some(success);
+        self
     }
 
     pub fn id(mut self, id: impl Into<String>) -> Self {
@@ -548,6 +573,20 @@ impl ServerStateInner {
         let _ = self.events.send(event);
     }
 
+    pub(crate) async fn oauth_quota_refresh_interval_ms(&self) -> i64 {
+        let store = self.ui_settings.read().await;
+        ui_settings::oauth_quota_refresh_interval_ms(&store)
+    }
+
+    pub(crate) fn emit_oauth_quota_updated_event(&self, account: &Account, success: bool) {
+        self.emit_event(
+            ServerEvent::new("oauth-quota-updated", "quota")
+                .auth_provider(oauth_quota_auth_provider_label(account.provider_type))
+                .account_id(account.id.clone())
+                .success(success),
+        );
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<ServerEvent> {
         self.events.subscribe()
     }
@@ -861,20 +900,22 @@ impl ServerStateInner {
         }
 
         let http_client = self.http_client().await;
-        let update = match execute_native_account_refresh(&http_client, &account, now).await {
-            Ok(update) => update,
-            Err(error) => {
-                {
-                    let mut accounts = self.accounts.write().await;
-                    accounts.mark_refresh_failure(&account.id, error.message.clone());
+        let interval_ms = self.oauth_quota_refresh_interval_ms().await;
+        let update =
+            match execute_native_account_refresh(&http_client, &account, now, interval_ms).await {
+                Ok(update) => update,
+                Err(error) => {
+                    {
+                        let mut accounts = self.accounts.write().await;
+                        accounts.mark_refresh_failure(&account.id, error.message.clone());
+                    }
+                    save_accounts_debounced(self);
+                    return Err(ManagedAccountRefreshError::Refresh {
+                        status_code: error.status_code,
+                        message: error.message,
+                    });
                 }
-                save_accounts_debounced(self);
-                return Err(ManagedAccountRefreshError::Refresh {
-                    status_code: error.status_code,
-                    message: error.message,
-                });
-            }
-        };
+            };
 
         {
             let mut accounts = self.accounts.write().await;
@@ -1241,9 +1282,58 @@ pub fn spawn_account_quota_refresh(state: ServerState) {
         sleep(Duration::from_secs(60)).await;
         loop {
             refresh_due_account_quotas(&state).await;
-            sleep(Duration::from_secs(5 * 60)).await;
+            let delay = next_account_quota_refresh_delay(&state).await;
+            sleep(delay).await;
         }
     });
+}
+
+async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
+    let now = crate::infra::time::now_ms() as i64;
+    let interval_ms = state.oauth_quota_refresh_interval_ms().await;
+    let accounts = state.accounts.read().await.accounts.clone();
+    let next_due = accounts
+        .iter()
+        .filter(|account| account_quota_refresh_candidate(account))
+        .filter_map(|account| account.quota_next_refresh_at)
+        .min();
+    let delay_ms = next_due
+        .map(|due| due.saturating_sub(now).max(0) as u64)
+        .unwrap_or(interval_ms as u64);
+    Duration::from_millis(delay_ms.clamp(1_000, interval_ms as u64))
+}
+
+fn account_quota_refresh_candidate(account: &Account) -> bool {
+    match account.provider_type {
+        ProviderType::CodexOAuth
+        | ProviderType::ClaudeOAuth
+        | ProviderType::GeminiCli
+        | ProviderType::AntigravityOAuth
+        | ProviderType::AgyOAuth
+        | ProviderType::GitHubCopilot
+        | ProviderType::KiroOAuth
+        | ProviderType::CursorOAuth
+        | ProviderType::CursorApiKey
+        | ProviderType::OllamaCloud => {
+            account
+                .access_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || account
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                || account
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        }
+        _ => false,
+    }
+}
+
+fn emit_oauth_quota_updated(state: &ServerState, account: &Account, success: bool) {
+    state.emit_oauth_quota_updated_event(account, success);
 }
 
 async fn refresh_due_account_quotas(state: &ServerState) {
@@ -1264,11 +1354,18 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
     else {
         return;
     };
+    let success_cooldown_ms = state.oauth_quota_refresh_interval_ms().await;
     let mut active_account = account;
     let mut account_mutated = false;
     if account_needs_native_refresh(&active_account, now) {
         let http_client = state.http_client().await;
-        let update = match execute_native_account_refresh(&http_client, &active_account, now).await
+        let update = match execute_native_account_refresh(
+            &http_client,
+            &active_account,
+            now,
+            success_cooldown_ms,
+        )
+        .await
         {
             Ok(update) => update,
             Err(error) => {
@@ -1288,12 +1385,23 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
     }
 
     let http_client = state.http_client().await;
-    match refresh_account_quota(&http_client, &active_account, now, false).await {
+    match refresh_account_quota(
+        &http_client,
+        &active_account,
+        now,
+        false,
+        success_cooldown_ms,
+    )
+    .await
+    {
         Ok(QuotaRefreshResult::Updated { update, .. }) => {
-            {
+            let account = {
                 let mut store = state.accounts.write().await;
-                store.mark_refresh_success(&active_account.id, update);
-            }
+                store
+                    .mark_refresh_success(&active_account.id, update)
+                    .unwrap_or(active_account)
+            };
+            emit_oauth_quota_updated(state, &account, true);
             save_accounts_debounced(state);
         }
         Ok(QuotaRefreshResult::SkippedCooldown { .. }) => {
@@ -1350,31 +1458,7 @@ fn account_quota_refresh_due(account: &Account, now: i64) -> bool {
     {
         return false;
     }
-    match account.provider_type {
-        crate::domain::providers::model::ProviderType::CodexOAuth
-        | crate::domain::providers::model::ProviderType::ClaudeOAuth
-        | crate::domain::providers::model::ProviderType::GeminiCli => {
-            account
-                .access_token
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                || account
-                    .refresh_token
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
-        }
-        crate::domain::providers::model::ProviderType::OllamaCloud => {
-            account
-                .api_key
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                || account
-                    .access_token
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
-        }
-        _ => false,
-    }
+    account_quota_refresh_candidate(account)
 }
 
 fn should_restore_client_tunnel(
@@ -2302,6 +2386,7 @@ mod tests {
             tokens_used: 0,
             requests_count: 0,
             expires_at: None,
+            created_at_ms: 0,
             for_sale: false,
             sale_market_kind: "token".to_string(),
             access_by_app: std::collections::BTreeMap::new(),

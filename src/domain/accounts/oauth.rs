@@ -256,6 +256,22 @@ fn set_oauth_user_agent(
     }
 }
 
+/// OAuth quota UI hooks key accounts by this label (see `managed_auth_provider_label`).
+pub fn oauth_quota_auth_provider_label(provider_type: ProviderType) -> &'static str {
+    match provider_type {
+        ProviderType::GeminiCli => "google_gemini_oauth",
+        ProviderType::GitHubCopilot => "github_copilot",
+        ProviderType::CodexOAuth => "codex_oauth",
+        ProviderType::ClaudeOAuth => "claude_oauth",
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => "antigravity_oauth",
+        ProviderType::CursorOAuth => "cursor_oauth",
+        ProviderType::CursorApiKey => "cursor_apikey",
+        ProviderType::KiroOAuth => "kiro_oauth",
+        ProviderType::OllamaCloud => "ollama_cloud",
+        other => other.as_str(),
+    }
+}
+
 pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderSpec> {
     match provider_type {
         ProviderType::CodexOAuth => Some(OAuthProviderSpec {
@@ -697,6 +713,7 @@ pub fn refresh_update_from_token_response(
     response: &OAuthTokenResponse,
     raw: Value,
     now_ms: i64,
+    quota_refresh_interval_ms: i64,
 ) -> AccountRefreshUpdate {
     let mut identity = identity_from_token_response(response);
     if identity == OAuthIdentity::default() {
@@ -721,7 +738,8 @@ pub fn refresh_update_from_token_response(
         quota_percent,
         quota,
         quota_refreshed_at: quota_percent.map(|_| now_ms),
-        quota_next_refresh_at: quota_percent.map(|_| now_ms.saturating_add(5 * 60 * 1000)),
+        quota_next_refresh_at: quota_percent
+            .map(|_| now_ms.saturating_add(quota_refresh_interval_ms)),
         expires_at: response
             .expires_in
             .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000))),
@@ -733,6 +751,7 @@ pub fn refresh_update_from_profile_response(
     provider_type: ProviderType,
     raw: Value,
     now_ms: i64,
+    quota_refresh_interval_ms: i64,
 ) -> AccountRefreshUpdate {
     let identity = identity_from_provider_value(&raw).unwrap_or_default();
     let quota = quota_from_provider_snapshot(provider_type, &raw);
@@ -756,7 +775,8 @@ pub fn refresh_update_from_profile_response(
         quota_percent,
         quota,
         quota_refreshed_at: quota_percent.map(|_| now_ms),
-        quota_next_refresh_at: quota_percent.map(|_| now_ms.saturating_add(5 * 60 * 1000)),
+        quota_next_refresh_at: quota_percent
+            .map(|_| now_ms.saturating_add(quota_refresh_interval_ms)),
         ..Default::default()
     }
 }
@@ -767,7 +787,14 @@ pub fn upsert_input_from_token_response(
     raw: Value,
     now_ms: i64,
 ) -> Result<UpsertAccountInput, OAuthErrorClassification> {
-    upsert_input_from_login_response(provider_type, response, raw, None, now_ms)
+    upsert_input_from_login_response(
+        provider_type,
+        response,
+        raw,
+        None,
+        now_ms,
+        crate::domain::settings::ui_settings::default_oauth_quota_refresh_interval_ms(),
+    )
 }
 
 pub fn upsert_input_from_login_response(
@@ -776,6 +803,7 @@ pub fn upsert_input_from_login_response(
     token_raw: Value,
     profile_raw: Option<Value>,
     now_ms: i64,
+    quota_refresh_interval_ms: i64,
 ) -> Result<UpsertAccountInput, OAuthErrorClassification> {
     let identity = login_identity(provider_type, response, &token_raw, profile_raw.as_ref());
     let account_id = identity.account_id.clone().ok_or_else(|| {
@@ -796,12 +824,22 @@ pub fn upsert_input_from_login_response(
         )));
     }
 
-    let mut update =
-        refresh_update_from_token_response(provider_type, response, token_raw.clone(), now_ms);
+    let mut update = refresh_update_from_token_response(
+        provider_type,
+        response,
+        token_raw.clone(),
+        now_ms,
+        quota_refresh_interval_ms,
+    );
     if let Some(profile_raw) = profile_raw.clone() {
         update = merge_refresh_updates(
             update,
-            refresh_update_from_profile_response(provider_type, profile_raw, now_ms),
+            refresh_update_from_profile_response(
+                provider_type,
+                profile_raw,
+                now_ms,
+                quota_refresh_interval_ms,
+            ),
         );
     }
     if update.email.is_none() {
@@ -1499,8 +1537,13 @@ mod tests {
         assert_eq!(identity.email.as_deref(), Some("owner@example.com"));
         assert_eq!(identity.plan_type.as_deref(), Some("plus"));
 
-        let update =
-            refresh_update_from_token_response(ProviderType::CodexOAuth, &response, raw, 1_000);
+        let update = refresh_update_from_token_response(
+            ProviderType::CodexOAuth,
+            &response,
+            raw,
+            1_000,
+            30 * 60 * 1000,
+        );
         assert_eq!(update.access_token.as_deref(), Some("access-new"));
         assert_eq!(update.refresh_token.as_deref(), Some("refresh-new"));
         assert_eq!(update.scopes.unwrap(), vec!["openid", "profile", "email"]);
@@ -1576,6 +1619,7 @@ mod tests {
             raw,
             None,
             1_000,
+            30 * 60 * 1000,
         )
         .expect("account input");
 
@@ -1611,6 +1655,7 @@ mod tests {
             raw,
             Some(profile.clone()),
             1_000,
+            30 * 60 * 1000,
         )
         .expect("account input");
 
@@ -1647,6 +1692,7 @@ mod tests {
             raw,
             Some(profile),
             1_000,
+            30 * 60 * 1000,
         )
         .expect("account input");
 
@@ -1676,6 +1722,7 @@ mod tests {
             raw,
             None,
             1_000,
+            30 * 60 * 1000,
         )
         .expect("account input");
 
@@ -1708,8 +1755,13 @@ mod tests {
         assert_eq!(identity.email.as_deref(), Some("owner@example.com"));
         assert_eq!(identity.plan_type.as_deref(), Some("team"));
 
-        let update =
-            refresh_update_from_token_response(ProviderType::CodexOAuth, &response, raw, 10);
+        let update = refresh_update_from_token_response(
+            ProviderType::CodexOAuth,
+            &response,
+            raw,
+            10,
+            30 * 60 * 1000,
+        );
         assert_eq!(update.token_type.as_deref(), Some("Bearer"));
         assert_eq!(update.expires_at, Some(120_010));
         assert_eq!(update.subscription_level.as_deref(), Some("team"));

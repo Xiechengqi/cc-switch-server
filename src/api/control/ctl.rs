@@ -261,6 +261,7 @@ pub(crate) async fn refresh_share_usage_item(
     };
     let account_id = active_account.id.clone();
     let now = now_ms() as i64;
+    let interval_ms = state.oauth_quota_refresh_interval_ms().await;
 
     if account_needs_native_refresh(&active_account, now) {
         let Some(_refresh_guard) = state
@@ -296,7 +297,9 @@ pub(crate) async fn refresh_share_usage_item(
         active_account = latest_account;
         if account_needs_native_refresh(&active_account, now) {
             let http_client = state.http_client().await;
-            match execute_native_account_refresh(&http_client, &active_account, now).await {
+            match execute_native_account_refresh(&http_client, &active_account, now, interval_ms)
+                .await
+            {
                 Ok(update) => {
                     let updated = state
                         .mutate_accounts_debounced(|accounts| {
@@ -330,13 +333,16 @@ pub(crate) async fn refresh_share_usage_item(
     }
 
     let http_client = state.http_client().await;
-    match refresh_account_quota(&http_client, &active_account, now, true).await {
+    match refresh_account_quota(&http_client, &active_account, now, true, interval_ms).await {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
             let updated = state
                 .mutate_accounts_debounced(|accounts| {
                     accounts.mark_refresh_success(&active_account.id, update)
                 })
                 .await;
+            if let Some(ref account) = updated {
+                state.emit_oauth_quota_updated_event(account, true);
+            }
             ControlRefreshShareUsageItem {
                 app: app.as_str().to_string(),
                 provider_id: Some(provider_id),

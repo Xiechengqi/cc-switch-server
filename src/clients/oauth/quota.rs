@@ -10,7 +10,6 @@ use crate::domain::accounts::store::{
 };
 use crate::domain::providers::model::ProviderType;
 
-pub const QUOTA_SUCCESS_COOLDOWN_MS: i64 = 10 * 60 * 1000;
 pub const QUOTA_FAILURE_COOLDOWN_MS: i64 = 2 * 60 * 1000;
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -114,6 +113,7 @@ pub async fn refresh_account_quota(
     account: &Account,
     now_ms: i64,
     force: bool,
+    success_cooldown_ms: i64,
 ) -> Result<QuotaRefreshResult, QuotaRefreshFailure> {
     if !force {
         if let Some(next_refresh_at) = account.quota_next_refresh_at {
@@ -127,17 +127,27 @@ pub async fn refresh_account_quota(
     }
 
     let update = match account.provider_type {
-        ProviderType::CodexOAuth => refresh_codex_quota(http, account, now_ms).await?,
-        ProviderType::ClaudeOAuth => refresh_claude_quota(http, account, now_ms).await?,
-        ProviderType::GeminiCli => refresh_gemini_quota(http, account, now_ms).await?,
+        ProviderType::CodexOAuth => {
+            refresh_codex_quota(http, account, now_ms, success_cooldown_ms).await?
+        }
+        ProviderType::ClaudeOAuth => {
+            refresh_claude_quota(http, account, now_ms, success_cooldown_ms).await?
+        }
+        ProviderType::GeminiCli => {
+            refresh_gemini_quota(http, account, now_ms, success_cooldown_ms).await?
+        }
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
-            refresh_antigravity_quota(http, account, now_ms).await?
+            refresh_antigravity_quota(http, account, now_ms, success_cooldown_ms).await?
         }
         ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
         | ProviderType::CursorOAuth
-        | ProviderType::CursorApiKey => refresh_imported_snapshot_quota(account, now_ms)?,
-        ProviderType::OllamaCloud => refresh_ollama_cloud_quota(http, account, now_ms).await?,
+        | ProviderType::CursorApiKey => {
+            refresh_imported_snapshot_quota(account, now_ms, success_cooldown_ms)?
+        }
+        ProviderType::OllamaCloud => {
+            refresh_ollama_cloud_quota(http, account, now_ms, success_cooldown_ms).await?
+        }
         provider_type => {
             return Err(QuotaRefreshFailure::bad_request(format!(
                 "{} real quota refresh is not implemented",
@@ -156,6 +166,7 @@ async fn refresh_codex_quota(
     http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
+    success_cooldown_ms: i64,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let account_id = codex_account_id(account);
@@ -210,13 +221,20 @@ async fn refresh_codex_quota(
             "queriedAt": now_ms,
         })),
     };
-    Ok(update_from_quota(quota, subscription_level, None, now_ms))
+    Ok(update_from_quota(
+        quota,
+        subscription_level,
+        None,
+        now_ms,
+        success_cooldown_ms,
+    ))
 }
 
 async fn refresh_claude_quota(
     http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
+    success_cooldown_ms: i64,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let usage_request = http
@@ -235,13 +253,20 @@ async fn refresh_claude_quota(
     let body = body?;
     let quota = parse_claude_quota(&body, plan_label, now_ms);
     let subscription_level = quota.credential_message.clone();
-    Ok(update_from_quota(quota, subscription_level, None, now_ms))
+    Ok(update_from_quota(
+        quota,
+        subscription_level,
+        None,
+        now_ms,
+        success_cooldown_ms,
+    ))
 }
 
 async fn refresh_gemini_quota(
     http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
+    success_cooldown_ms: i64,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let load_request = http
@@ -284,13 +309,20 @@ async fn refresh_gemini_quota(
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
     let quota = parse_gemini_quota(&quota_response, plan_label, load_body, body, now_ms);
     let subscription_level = quota.credential_message.clone();
-    Ok(update_from_quota(quota, subscription_level, None, now_ms))
+    Ok(update_from_quota(
+        quota,
+        subscription_level,
+        None,
+        now_ms,
+        success_cooldown_ms,
+    ))
 }
 
 async fn refresh_antigravity_quota(
     http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
+    success_cooldown_ms: i64,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let metadata = antigravity_code_assist_metadata();
@@ -336,12 +368,19 @@ async fn refresh_antigravity_quota(
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
     let quota = parse_gemini_quota(&quota_response, plan_label, load_body, body, now_ms);
     let subscription_level = quota.credential_message.clone();
-    Ok(update_from_quota(quota, subscription_level, None, now_ms))
+    Ok(update_from_quota(
+        quota,
+        subscription_level,
+        None,
+        now_ms,
+        success_cooldown_ms,
+    ))
 }
 
 fn refresh_imported_snapshot_quota(
     account: &Account,
     now_ms: i64,
+    success_cooldown_ms: i64,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let quota = match account.provider_type {
         ProviderType::GitHubCopilot => parse_copilot_imported_quota(account, now_ms),
@@ -357,13 +396,20 @@ fn refresh_imported_snapshot_quota(
         }
     }?;
     let subscription_level = quota.credential_message.clone();
-    Ok(update_from_quota(quota, subscription_level, None, now_ms))
+    Ok(update_from_quota(
+        quota,
+        subscription_level,
+        None,
+        now_ms,
+        success_cooldown_ms,
+    ))
 }
 
 async fn refresh_ollama_cloud_quota(
     http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
+    success_cooldown_ms: i64,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let token = account
         .api_key
@@ -380,7 +426,7 @@ async fn refresh_ollama_cloud_quota(
         .header(CONTENT_TYPE, "application/json")
         .timeout(Duration::from_secs(15));
     let body = request_json(account.provider_type, request, now_ms).await?;
-    Ok(parse_ollama_me_update(&body, now_ms))
+    Ok(parse_ollama_me_update(&body, now_ms, success_cooldown_ms))
 }
 
 async fn request_json(
@@ -434,6 +480,7 @@ fn update_from_quota(
     subscription_level: Option<String>,
     profile: Option<Value>,
     now_ms: i64,
+    success_cooldown_ms: i64,
 ) -> AccountRefreshUpdate {
     let quota_percent = quota_percent_from_tiers(&quota.tiers);
     AccountRefreshUpdate {
@@ -441,7 +488,7 @@ fn update_from_quota(
         quota_percent,
         quota: Some(quota),
         quota_refreshed_at: Some(now_ms),
-        quota_next_refresh_at: Some(now_ms.saturating_add(QUOTA_SUCCESS_COOLDOWN_MS)),
+        quota_next_refresh_at: Some(now_ms.saturating_add(success_cooldown_ms)),
         profile,
         ..Default::default()
     }
@@ -665,7 +712,11 @@ fn parse_gemini_quota(
     }
 }
 
-fn parse_ollama_me_update(body: &Value, now_ms: i64) -> AccountRefreshUpdate {
+fn parse_ollama_me_update(
+    body: &Value,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+) -> AccountRefreshUpdate {
     let email = string_at(body, &["/Email", "/email"]);
     let name = string_at(body, &["/Name", "/name"]);
     let plan = string_at(body, &["/Plan", "/plan"]);
@@ -703,7 +754,7 @@ fn parse_ollama_me_update(body: &Value, now_ms: i64) -> AccountRefreshUpdate {
         quota_percent: None,
         quota: Some(quota),
         quota_refreshed_at: Some(now_ms),
-        quota_next_refresh_at: Some(now_ms.saturating_add(QUOTA_SUCCESS_COOLDOWN_MS)),
+        quota_next_refresh_at: Some(now_ms.saturating_add(success_cooldown_ms)),
         profile: Some(json!({
             "providerType": ProviderType::OllamaCloud.as_str(),
             "email": email,
@@ -1782,7 +1833,11 @@ mod tests {
             }
         });
 
-        let update = parse_ollama_me_update(&body, 1_000);
+        let update = parse_ollama_me_update(
+            &body,
+            1_000,
+            crate::domain::settings::ui_settings::default_oauth_quota_refresh_interval_ms(),
+        );
         assert_eq!(update.email.as_deref(), Some("xiechengqi01@gmail.com"));
         assert_eq!(update.subscription_level.as_deref(), Some("ollama pro"));
         assert_eq!(update.quota_percent, None);
@@ -1835,11 +1890,21 @@ mod tests {
             tiers,
             extra_usage: None,
         };
-        let update = update_from_quota(quota, Some("ChatGPT Pro 20x".to_string()), None, 10_000);
+        let update = update_from_quota(
+            quota,
+            Some("ChatGPT Pro 20x".to_string()),
+            None,
+            10_000,
+            crate::domain::settings::ui_settings::default_oauth_quota_refresh_interval_ms(),
+        );
         assert_eq!(update.quota_percent, Some(42.0));
         assert_eq!(
             update.quota_next_refresh_at,
-            Some(10_000 + QUOTA_SUCCESS_COOLDOWN_MS)
+            Some(
+                10_000
+                    + crate::domain::settings::ui_settings::default_oauth_quota_refresh_interval_ms(
+                    )
+            )
         );
     }
 

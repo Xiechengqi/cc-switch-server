@@ -98,6 +98,7 @@ pub async fn execute_native_account_refresh(
     http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
+    quota_refresh_interval_ms: i64,
 ) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
     let spec = oauth_provider_spec(account.provider_type).ok_or_else(|| {
         AccountRefreshFailure::bad_request(format!(
@@ -149,8 +150,13 @@ pub async fn execute_native_account_refresh(
                     "OAuth refresh response is missing token fields: {error}"
                 ))
             })?;
-        let mut update =
-            refresh_update_from_token_response(account.provider_type, &token_response, raw, now_ms);
+        let mut update = refresh_update_from_token_response(
+            account.provider_type,
+            &token_response,
+            raw,
+            now_ms,
+            quota_refresh_interval_ms,
+        );
 
         if let Some(profile_request) =
             build_profile_request(account.provider_type, &token_response.access_token)
@@ -162,6 +168,7 @@ pub async fn execute_native_account_refresh(
                     account.provider_type,
                     &profile_request,
                     now_ms,
+                    quota_refresh_interval_ms,
                 )
                 .await,
             );
@@ -345,13 +352,17 @@ async fn execute_optional_profile_refresh(
     provider_type: ProviderType,
     request: &OAuthHttpRequest,
     now_ms: i64,
+    quota_refresh_interval_ms: i64,
 ) -> AccountRefreshUpdate {
     match execute_oauth_request(http, request).await {
         Ok((status, body)) if status.is_success() => {
             match serde_json::from_str::<serde_json::Value>(&body) {
-                Ok(profile_raw) => {
-                    refresh_update_from_profile_response(provider_type, profile_raw, now_ms)
-                }
+                Ok(profile_raw) => refresh_update_from_profile_response(
+                    provider_type,
+                    profile_raw,
+                    now_ms,
+                    quota_refresh_interval_ms,
+                ),
                 Err(error) => AccountRefreshUpdate {
                     last_refresh_error: Some(format!(
                         "profile refresh warning: response is not valid JSON: {error}"

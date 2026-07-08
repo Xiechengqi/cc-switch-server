@@ -125,7 +125,12 @@ pub async fn forward(
         &copilot_metadata,
     )?;
     let mut adapter_request = adapter_request;
-    if stored.provider_type == ProviderType::CodexOAuth && route == ProxyRoute::CodexResponses {
+    if stored.provider_type == ProviderType::CodexOAuth
+        && matches!(
+            route,
+            ProxyRoute::CodexResponses | ProxyRoute::CodexChatCompletions
+        )
+    {
         adapter_request.body = normalize_codex_oauth_responses_body_bytes(
             &adapter_request.body,
             codex_oauth_session_id.as_deref(),
@@ -2004,6 +2009,39 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item == "reasoning.encrypted_content"));
+    }
+
+    #[test]
+    fn codex_oauth_chat_completions_body_gets_store_false_after_normalize() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({
+                "env": {
+                    "OPENAI_API_KEY": "oauth-token"
+                }
+            }),
+            None,
+        );
+        let adapter = adapters::adapter_for(AppKind::Codex, ProviderType::CodexOAuth);
+        let request = adapter
+            .transform_request_for_route_with_metadata(
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.5","messages":[{"role":"user","content":"who are you"}],"max_completion_tokens":16}"#,
+                ),
+                &stored,
+                ProxyRoute::CodexChatCompletions,
+                None,
+                &adapters::CopilotRequestMetadata {
+                    has_anthropic_beta: false,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        let normalized =
+            normalize_codex_oauth_responses_body_bytes(&request.body, None).expect("normalize");
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        assert_eq!(value["store"], json!(false));
     }
 
     #[test]

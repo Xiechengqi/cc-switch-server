@@ -14,6 +14,7 @@ import type { AppId } from "@/lib/api";
 import { useProvidersQuery, useSettingsQuery } from "@/lib/query";
 import { useProxyStatus, useProxyTakeoverStatus } from "@/lib/query/proxy";
 import { useProviderActions } from "@/hooks/useProviderActions";
+import { useOauthQuotaRefreshBridge } from "@/hooks/useOauthQuotaRefreshBridge";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { deepClone } from "@/utils/deepClone";
@@ -68,6 +69,7 @@ interface ServerDesktopAppProps {
 
 export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = {}) {
   const { t } = useTranslation();
+  useOauthQuotaRefreshBridge();
   const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
   const [currentView, setCurrentView] = useState<View>(getInitialView);
   const [settingsDefaultTab, setSettingsDefaultTab] =
