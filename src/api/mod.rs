@@ -159,6 +159,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/auth/api-token", post(rotate_api_token))
         .route("/api/admin/version", get(admin_version))
         .route("/api/admin/restart", post(admin_restart))
+        .route("/api/admin/rollback", post(admin_rollback))
         .route("/api/admin/upgrade", post(admin_upgrade_start))
         .route("/api/admin/upgrade/stream", get(admin_upgrade_stream))
         .route("/api/events", get(events))

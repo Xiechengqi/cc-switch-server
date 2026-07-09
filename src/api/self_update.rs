@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use super::error::ApiError;
 use crate::api::session::{require_event_session, require_session};
 use crate::build_info::{build_info, BuildInfo};
-use crate::self_update::restart::restart_from_detected_service;
+use crate::self_update::restart::{
+    restart_from_detected_service, rollback_from_backup_and_restart,
+};
 use crate::self_update::upgrade::{UpgradeLogEntry, UpgradeStatus};
 use crate::self_update::version::{
     ensure_binary_writable, fetch_latest_release_meta, rollback_available, BINARY_INSTALL_PATH,
@@ -90,6 +92,19 @@ pub(in crate::api) async fn admin_restart(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_session(&state, &headers).await?;
     let script = map_self_update_error(restart_from_detected_service())?;
+    state.upgrade.clear_restart_pending().await;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "script": script,
+    })))
+}
+
+pub(in crate::api) async fn admin_rollback(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_session(&state, &headers).await?;
+    let script = map_self_update_error(rollback_from_backup_and_restart())?;
     state.upgrade.clear_restart_pending().await;
     Ok(Json(serde_json::json!({
         "ok": true,

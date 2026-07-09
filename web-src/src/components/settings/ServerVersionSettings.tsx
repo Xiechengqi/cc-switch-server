@@ -33,8 +33,11 @@ import { getWebRuntimeContext, readWebSessionToken } from "@/lib/runtime";
 import {
   loadAdminVersionInfo,
   loadBuildInfo,
+  readAdminVersionInfoCache,
   restartServerService,
+  rollbackServerService,
   startServerUpgrade,
+  writeAdminVersionInfoCache,
   type AdminVersionInfo,
 } from "@/lib/server-legacy-api";
 
@@ -151,6 +154,7 @@ export function ServerVersionSettings() {
   const [busy, setBusy] = useState<string | null>(null);
   const [upgradeConfirmOpen, setUpgradeConfirmOpen] = useState(false);
   const [restartConfirmOpen, setRestartConfirmOpen] = useState(false);
+  const [rollbackConfirmOpen, setRollbackConfirmOpen] = useState(false);
   const [upgradeLogOpen, setUpgradeLogOpen] = useState(false);
   const [upgradeLogs, setUpgradeLogs] = useState<UpgradeLogEntry[]>([]);
   const [upgradeOutcome, setUpgradeOutcome] = useState<UpgradeOutcome>(null);
@@ -166,6 +170,7 @@ export function ServerVersionSettings() {
       const adminInfo = await loadAdminVersionInfo();
       setInfo(adminInfo);
       setUsingBuildInfoFallback(false);
+      writeAdminVersionInfoCache(adminInfo);
     } catch {
       try {
         const build = await loadBuildInfo();
@@ -184,6 +189,9 @@ export function ServerVersionSettings() {
           latest: {
             binaryUrl: "",
             available: false,
+            commitId: "",
+            commitShort: "",
+            updateAvailable: false,
           },
         });
         setUsingBuildInfoFallback(true);
@@ -198,7 +206,13 @@ export function ServerVersionSettings() {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    const cached = readAdminVersionInfoCache();
+    if (cached) {
+      setInfo(cached);
+      setLoading(false);
+    } else {
+      void refresh();
+    }
     return () => {
       streamRef.current?.close();
       streamRef.current = null;
@@ -308,9 +322,6 @@ export function ServerVersionSettings() {
       try {
         const { taskId } = await startServerUpgrade({ restartAfter });
         streamUpgrade(taskId);
-        if (restartAfter) {
-          void pollHealthAndReload();
-        }
       } catch (reason) {
         toast.error(reason instanceof Error ? reason.message : String(reason));
         setBusy(null);
@@ -333,11 +344,62 @@ export function ServerVersionSettings() {
     }
   }, [t]);
 
+  const handleRollback = useCallback(async () => {
+    setRollbackConfirmOpen(false);
+    setBusy("rollback");
+    try {
+      await rollbackServerService();
+      toast.success(t("settings.serverVersion.rollbackScheduled"));
+      void pollHealthAndReload();
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : String(reason));
+      setBusy(null);
+    }
+  }, [t]);
+
   const restartPending = info?.restartPending ?? false;
+  const rollbackAvailable = info?.rollbackAvailable ?? false;
   const upgradeDisabled =
     busy !== null || loading || info?.upgradeCapable === false;
-  const updatePackageAvailable =
-    Boolean(info?.latest?.available) && Boolean(info?.upgradeCapable);
+
+  const formatCommitLabel = (commitId?: string | null, commitShort?: string | null) =>
+    commitShort?.trim() || commitId?.trim() || "--";
+
+  const currentCommitLabel = formatCommitLabel(info?.commitId, info?.commitShort);
+  const latestCommitLabel = formatCommitLabel(
+    info?.latest?.commitId,
+    info?.latest?.commitShort,
+  );
+  const showUpdateCompareSubtitle =
+    updateChecked && Boolean(info?.latest?.updateAvailable);
+
+  const cardSubtitle = useMemo(() => {
+    if (loading) {
+      return t("common.loading");
+    }
+    if (showUpdateCompareSubtitle) {
+      return t("settings.serverVersion.checkUpdateAvailableShort", {
+        current: currentCommitLabel,
+        latest: latestCommitLabel,
+      });
+    }
+    if (updateChecked) {
+      return t("settings.serverVersion.currentVersionOnly", {
+        current: currentCommitLabel,
+        defaultValue: "当前 {{current}}",
+      });
+    }
+    return info?.versionLine || info?.version || "--";
+  }, [
+    currentCommitLabel,
+    info?.version,
+    info?.versionLine,
+    latestCommitLabel,
+    loading,
+    showUpdateCompareSubtitle,
+    t,
+    updateChecked,
+  ]);
 
   const handleCheckUpdate = useCallback(async () => {
     if (busy || checkingUpdate) return;
@@ -346,9 +408,19 @@ export function ServerVersionSettings() {
       const adminInfo = await loadAdminVersionInfo();
       setInfo(adminInfo);
       setUsingBuildInfoFallback(false);
+      writeAdminVersionInfoCache(adminInfo);
       setUpdateChecked(true);
 
       const { latest } = adminInfo;
+      const currentCommit = formatCommitLabel(
+        adminInfo.commitId,
+        adminInfo.commitShort,
+      );
+      const latestCommit = formatCommitLabel(
+        latest.commitId,
+        latest.commitShort,
+      );
+
       if (latest.error) {
         toast.error(
           t("settings.serverVersion.checkUpdateFailed", {
@@ -358,18 +430,41 @@ export function ServerVersionSettings() {
         );
         return;
       }
+      if (!latest.commitId) {
+        toast.error(t("settings.checkUpdateFailed"));
+        return;
+      }
+      if (!latest.updateAvailable) {
+        toast.success(
+          t("settings.serverVersion.checkUpdateUpToDate", {
+            current: currentCommit,
+            defaultValue: "当前已是最新版本（{{current}}）",
+          }),
+        );
+        return;
+      }
       if (!latest.available) {
         toast.error(t("settings.checkUpdateFailed"));
         return;
       }
       if (!adminInfo.upgradeCapable) {
-        toast.info(t("settings.serverVersion.checkUpdateReachableButUnavailable"));
+        toast.info(
+          t("settings.serverVersion.checkUpdateReachableButUnavailable", {
+            current: currentCommit,
+            latest: latestCommit,
+            defaultValue:
+              "检测到新版本（当前 {{current}}，最新 {{latest}}），但当前环境无法就地升级",
+          }),
+        );
         return;
       }
       toast.success(
         t("settings.serverVersion.checkUpdateAvailable", {
+          current: currentCommit,
+          latest: latestCommit,
           size: formatBytes(latest.contentLength),
-          defaultValue: "检测到在线升级包（{{size}}），可点击「升级」安装",
+          defaultValue:
+            "当前版本是 {{current}}，最新版本是 {{latest}}，可点击「升级」安装",
         }),
       );
     } catch (reason) {
@@ -400,10 +495,15 @@ export function ServerVersionSettings() {
                   <p className="text-sm font-medium leading-none">
                     {t("settings.serverVersion.title")}
                   </p>
-                  <p className="truncate text-xs text-muted-foreground">
-                    {loading
-                      ? t("common.loading")
-                      : info?.versionLine || info?.version || "--"}
+                  <p
+                    className={cn(
+                      "truncate text-xs",
+                      showUpdateCompareSubtitle
+                        ? "font-medium text-primary"
+                        : "text-muted-foreground",
+                    )}
+                  >
+                    {cardSubtitle}
                   </p>
                 </div>
                 <ChevronDown
@@ -453,6 +553,23 @@ export function ServerVersionSettings() {
                   ? t("settings.checking")
                   : t("settings.checkForUpdates")}
               </Button>
+              {rollbackAvailable ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-9"
+                  disabled={busy !== null}
+                  onClick={() => setRollbackConfirmOpen(true)}
+                >
+                  {busy === "rollback" ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <RotateCcw className="mr-2 h-4 w-4" />
+                  )}
+                  {t("settings.serverVersion.rollback")}
+                </Button>
+              ) : null}
               {restartPending ? (
                 <Button
                   type="button"
@@ -489,18 +606,6 @@ export function ServerVersionSettings() {
 
           <CollapsibleContent>
             <div className="border-t border-border/50 px-4 pb-4 pt-3 space-y-3">
-              {updateChecked && updatePackageAvailable ? (
-                <div className="rounded-lg border border-primary/20 bg-primary/10 px-4 py-3 text-sm">
-                  <p className="font-medium text-primary">
-                    {t("settings.serverVersion.checkUpdateAvailableShort")}
-                  </p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {t("settings.serverVersion.checkUpdateAvailableHint", {
-                      size: formatBytes(info?.latest?.contentLength),
-                    })}
-                  </p>
-                </div>
-              ) : null}
               <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground">
                 {versionDetails || t("settings.serverVersion.empty")}
               </pre>
@@ -536,6 +641,16 @@ export function ServerVersionSettings() {
         confirmText={t("settings.serverVersion.restart")}
         onConfirm={() => void handleRestart()}
         onCancel={() => setRestartConfirmOpen(false)}
+      />
+
+      <ConfirmDialog
+        isOpen={rollbackConfirmOpen}
+        variant="destructive"
+        title={t("settings.serverVersion.rollbackConfirmTitle")}
+        message={t("settings.serverVersion.rollbackConfirmMessage")}
+        confirmText={t("settings.serverVersion.rollback")}
+        onConfirm={() => void handleRollback()}
+        onCancel={() => setRollbackConfirmOpen(false)}
       />
 
       <Dialog

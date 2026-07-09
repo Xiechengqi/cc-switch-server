@@ -13,10 +13,10 @@ use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex};
 use tracing::warn;
 
-use crate::self_update::restart::{schedule_restart, RestartStrategy};
+use crate::self_update::restart::{detect_restart_strategy, schedule_restart};
 use crate::self_update::version::{
-    detect_service_status, release_binary_url, SelfUpdateError, BINARY_INSTALL_PATH,
-    BINARY_ROLLBACK_PATH,
+    backup_installed_binary, release_binary_url, SelfUpdateError, BINARY_INSTALL_PATH,
+    BINARY_ROLLBACK_PATH, BINARY_STAGING_PATH,
 };
 
 const LOG_CHANNEL_CAPACITY: usize = 256;
@@ -181,32 +181,12 @@ async fn run_upgrade(
     )
     .await;
 
-    let target = Path::new(BINARY_INSTALL_PATH);
-    let target_parent = target.parent().ok_or_else(|| {
-        SelfUpdateError::Internal(format!(
-            "install target has no parent: {}",
-            target.display()
-        ))
-    })?;
-    if let Err(err) = std::fs::create_dir_all(target_parent) {
-        emit(
-            handle,
-            1,
-            UpgradeLogLevel::Error,
-            format!("ensure install dir failed: {err}"),
-            None,
-        )
-        .await;
-        return Err(SelfUpdateError::Internal(format!(
-            "ensure install dir failed: {err}"
-        )));
-    }
-    let tmp_path = target_parent.join(format!("cc-switch-server.upgrade-{}", handle.task_id));
+    let target = Path::new(BINARY_STAGING_PATH);
     emit(
         handle,
         1,
         UpgradeLogLevel::Info,
-        format!("staging tmp file at {}", tmp_path.display()),
+        format!("staging download at {}", target.display()),
         Some(progress_pct(1, 100)),
     )
     .await;
@@ -220,8 +200,8 @@ async fn run_upgrade(
         Some(progress_pct(2, 0)),
     )
     .await;
-    if let Err(err) = download_with_progress(&client, release_url, &tmp_path, handle).await {
-        cleanup_tmp(&tmp_path);
+    if let Err(err) = download_with_progress(&client, release_url, target, handle).await {
+        cleanup_tmp(target);
         emit(
             handle,
             2,
@@ -241,8 +221,8 @@ async fn run_upgrade(
         Some(progress_pct(3, 0)),
     )
     .await;
-    if let Err(err) = chmod_exec(&tmp_path) {
-        cleanup_tmp(&tmp_path);
+    if let Err(err) = chmod_exec(target) {
+        cleanup_tmp(target);
         emit(
             handle,
             3,
@@ -262,8 +242,8 @@ async fn run_upgrade(
         Some(progress_pct(3, 50)),
     )
     .await;
-    if let Err(err) = sanity_exec(&tmp_path).await {
-        cleanup_tmp(&tmp_path);
+    if let Err(err) = sanity_exec(target).await {
+        cleanup_tmp(target);
         emit(
             handle,
             3,
@@ -275,10 +255,10 @@ async fn run_upgrade(
         return Err(err);
     }
 
-    let new_sha = match sha256_of_file(&tmp_path) {
+    let new_sha = match sha256_of_file(target) {
         Ok(value) => value,
         Err(err) => {
-            cleanup_tmp(&tmp_path);
+            cleanup_tmp(target);
             emit(
                 handle,
                 4,
@@ -313,32 +293,33 @@ async fn run_upgrade(
         .await;
     }
 
-    let bak_path = BINARY_ROLLBACK_PATH.to_string();
-    if let Err(err) = swap_binary(&tmp_path, target, Path::new(&bak_path)) {
-        cleanup_tmp(&tmp_path);
+    let bak_path = BINARY_ROLLBACK_PATH;
+    if let Err(err) = backup_installed_binary() {
+        cleanup_tmp(target);
         emit(
             handle,
             5,
             UpgradeLogLevel::Error,
-            format!("swap failed: {err}"),
+            format!("backup failed: {err}"),
             None,
         )
         .await;
         return Err(err);
     }
-    cleanup_tmp(&tmp_path);
     emit(
         handle,
         5,
         UpgradeLogLevel::Success,
-        format!("installed new binary at {BINARY_INSTALL_PATH} (backup at {bak_path})"),
+        format!(
+            "downloaded to {staging}; backup at {bak_path}",
+            staging = BINARY_STAGING_PATH
+        ),
         Some(progress_pct(5, 100)),
     )
     .await;
 
     if restart_after {
-        let manager = detect_service_status().manager;
-        let strategy = RestartStrategy::from_manager(manager);
+        let strategy = detect_restart_strategy();
         emit(
             handle,
             6,
@@ -374,7 +355,7 @@ async fn run_upgrade(
             handle,
             7,
             UpgradeLogLevel::Success,
-            "process will exit shortly; reload once /health succeeds",
+            "process will restart shortly; reload once /health succeeds",
             Some(progress_pct(7, 100)),
         )
         .await;
@@ -384,7 +365,10 @@ async fn run_upgrade(
             handle,
             6,
             UpgradeLogLevel::Success,
-            "upgrade complete; restart is required to run the new binary",
+            format!(
+                "upgrade package ready at {staging}; restart to install",
+                staging = BINARY_STAGING_PATH
+            ),
             Some(progress_pct(6, 100)),
         )
         .await;
@@ -491,26 +475,6 @@ fn sha256_of_file(path: &Path) -> Result<String, SelfUpdateError> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
-}
-
-fn swap_binary(new_path: &Path, target: &Path, bak: &Path) -> Result<(), SelfUpdateError> {
-    if target.exists() {
-        if bak.exists() {
-            let _ = std::fs::remove_file(bak);
-        }
-        std::fs::rename(target, bak).map_err(|err| {
-            SelfUpdateError::Internal(format!("backup current binary failed: {err}"))
-        })?;
-    }
-    if let Err(err) = std::fs::rename(new_path, target) {
-        if bak.exists() {
-            let _ = std::fs::rename(bak, target);
-        }
-        return Err(SelfUpdateError::Internal(format!(
-            "install new binary failed: {err}"
-        )));
-    }
-    Ok(())
 }
 
 fn cleanup_tmp(file: &Path) {

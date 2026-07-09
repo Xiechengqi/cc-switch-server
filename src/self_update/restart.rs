@@ -1,29 +1,31 @@
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::self_update::version::{
-    detect_service_status, SelfUpdateError, ServiceManager, BINARY_INSTALL_PATH, SERVICE_LOG_PATH,
-    SERVICE_UNIT,
+    service_cc_switch_started, SelfUpdateError, BINARY_INSTALL_PATH, BINARY_ROLLBACK_PATH,
+    BINARY_STAGING_PATH, SERVICE_NAME,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartStrategy {
-    Systemd,
+    Service,
     Nohup,
 }
 
 impl RestartStrategy {
-    pub fn from_manager(manager: ServiceManager) -> Self {
-        match manager {
-            ServiceManager::Systemd => RestartStrategy::Systemd,
-            ServiceManager::Nohup => RestartStrategy::Nohup,
-        }
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
-            RestartStrategy::Systemd => "systemd",
+            RestartStrategy::Service => "service",
             RestartStrategy::Nohup => "nohup",
         }
+    }
+}
+
+pub fn detect_restart_strategy() -> RestartStrategy {
+    if service_cc_switch_started() {
+        RestartStrategy::Service
+    } else {
+        RestartStrategy::Nohup
     }
 }
 
@@ -33,33 +35,69 @@ pub fn schedule_restart(strategy: RestartStrategy) -> Result<String, SelfUpdateE
     Ok(script)
 }
 
+pub fn restart_from_detected_service() -> Result<String, SelfUpdateError> {
+    schedule_restart(detect_restart_strategy())
+}
+
+pub fn rollback_from_backup_and_restart() -> Result<String, SelfUpdateError> {
+    if !Path::new(BINARY_ROLLBACK_PATH).exists() {
+        return Err(SelfUpdateError::Forbidden(
+            "rollback backup not found at /tmp/cc-switch-server.bak".into(),
+        ));
+    }
+    std::fs::copy(BINARY_ROLLBACK_PATH, BINARY_INSTALL_PATH).map_err(|err| {
+        SelfUpdateError::Internal(format!(
+            "restore rollback backup to {BINARY_INSTALL_PATH} failed: {err}"
+        ))
+    })?;
+    chmod_install_binary()?;
+    let strategy = detect_restart_strategy();
+    let script = render_rollback_restart_script(strategy);
+    spawn_detached(&script)?;
+    Ok(script)
+}
+
 fn render_restart_script(strategy: RestartStrategy) -> String {
-    let pid = std::process::id();
     match strategy {
-        RestartStrategy::Systemd => format!(
-            "sleep 1; \
-             mkdir -p $(dirname {log}) 2>/dev/null || true; \
-             : > {log} 2>/dev/null || true; \
-             /bin/systemctl restart {unit}",
-            unit = SERVICE_UNIT,
-            log = SERVICE_LOG_PATH,
+        RestartStrategy::Service => format!(
+            "if [ -f {staging} ]; then mv -f {staging} {bin}; fi; \
+             service {service} restart",
+            staging = BINARY_STAGING_PATH,
+            bin = BINARY_INSTALL_PATH,
+            service = SERVICE_NAME,
         ),
         RestartStrategy::Nohup => format!(
-            "sleep 1; \
-             mkdir -p $(dirname {log}) 2>/dev/null || true; \
-             : > {log} 2>/dev/null || true; \
-             kill -TERM {pid} 2>/dev/null; \
-             for i in $(seq 1 60); do \
-                 if ! kill -0 {pid} 2>/dev/null; then break; fi; \
-                 sleep 0.2; \
-             done; \
-             touch {log} 2>/dev/null || true; \
-             nohup {bin} >> {log} 2>&1 &",
-            pid = pid,
-            log = SERVICE_LOG_PATH,
+            "pkill -9 cc-switch-server 2>/dev/null || true; \
+             if [ -f {staging} ]; then mv -f {staging} {bin}; fi; \
+             chmod +x {bin} 2>/dev/null || true; \
+             nohup {bin} >/dev/null 2>&1 &",
+            staging = BINARY_STAGING_PATH,
             bin = BINARY_INSTALL_PATH,
         ),
     }
+}
+
+fn render_rollback_restart_script(strategy: RestartStrategy) -> String {
+    match strategy {
+        RestartStrategy::Service => format!("service {service} restart", service = SERVICE_NAME),
+        RestartStrategy::Nohup => format!(
+            "pkill -9 cc-switch-server 2>/dev/null || true; \
+             nohup {bin} >/dev/null 2>&1 &",
+            bin = BINARY_INSTALL_PATH,
+        ),
+    }
+}
+
+fn chmod_install_binary() -> Result<(), SelfUpdateError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(BINARY_INSTALL_PATH).map_err(|err| {
+        SelfUpdateError::Internal(format!("stat {BINARY_INSTALL_PATH} failed: {err}"))
+    })?;
+    let mut perms = metadata.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(BINARY_INSTALL_PATH, perms).map_err(|err| {
+        SelfUpdateError::Internal(format!("chmod {BINARY_INSTALL_PATH} failed: {err}"))
+    })
 }
 
 fn spawn_detached(script: &str) -> Result<(), SelfUpdateError> {
@@ -89,26 +127,29 @@ fn spawn_detached(script: &str) -> Result<(), SelfUpdateError> {
     }
 }
 
-pub fn restart_from_detected_service() -> Result<String, SelfUpdateError> {
-    let strategy = RestartStrategy::from_manager(detect_service_status().manager);
-    schedule_restart(strategy)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn systemd_script_references_unit() {
-        let script = render_restart_script(RestartStrategy::Systemd);
-        assert!(script.contains("systemctl restart cc-switch-server.service"));
-        assert!(script.contains(": > /var/log/cc-switch-server.log"));
+    fn service_restart_script_moves_staging_and_restarts_service() {
+        let script = render_restart_script(RestartStrategy::Service);
+        assert!(script.contains("/tmp/cc-switch-server"));
+        assert!(script.contains("service cc-switch-server restart"));
     }
 
     #[test]
-    fn nohup_script_kills_and_reexecs() {
+    fn nohup_restart_script_matches_manual_ops_flow() {
         let script = render_restart_script(RestartStrategy::Nohup);
-        assert!(script.contains("kill -TERM"));
-        assert!(script.contains("/usr/local/bin/cc-switch-server"));
+        assert!(script.contains("pkill -9 cc-switch-server"));
+        assert!(script.contains("mv -f /tmp/cc-switch-server /usr/local/bin/cc-switch-server"));
+        assert!(script.contains("nohup /usr/local/bin/cc-switch-server"));
+    }
+
+    #[test]
+    fn rollback_nohup_script_restarts_installed_binary() {
+        let script = render_rollback_restart_script(RestartStrategy::Nohup);
+        assert!(script.contains("pkill -9 cc-switch-server"));
+        assert!(script.contains("nohup /usr/local/bin/cc-switch-server"));
     }
 }

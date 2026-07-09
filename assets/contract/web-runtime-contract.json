@@ -663,6 +663,14 @@
       "notes": "Web invoke bridge for admin restart; works on client tunnel where /api/admin/restart may be unavailable."
     },
     {
+      "name": "rollback_server_service",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /api/admin/rollback",
+      "notes": "Web invoke bridge for admin rollback to /tmp/cc-switch-server.bak and restart."
+    },
+    {
       "name": "start_admin_upgrade",
       "support": "native",
       "implemented": true,

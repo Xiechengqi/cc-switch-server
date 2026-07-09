@@ -821,7 +821,7 @@ export interface AdminVersionInfo extends BuildInfo {
   restartPending: boolean;
   upgradeCapable: boolean;
   service: {
-    manager: "systemd" | "nohup";
+    manager: "service" | "nohup";
     active: boolean;
     unitName?: string | null;
     activeState?: string | null;
@@ -830,10 +830,65 @@ export interface AdminVersionInfo extends BuildInfo {
   latest: {
     binaryUrl: string;
     available: boolean;
+    commitId?: string | null;
+    commitShort?: string | null;
+    updateAvailable?: boolean;
     etag?: string | null;
     contentLength?: number | null;
     error?: string | null;
   };
+}
+
+const ADMIN_VERSION_CACHE_KEY = "cc_switch_admin_version_info_v1";
+
+interface AdminVersionInfoCacheEntry {
+  cachedAt: number;
+  info: AdminVersionInfo;
+}
+
+export function readAdminVersionInfoCache(): AdminVersionInfo | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const raw = window.localStorage.getItem(ADMIN_VERSION_CACHE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as AdminVersionInfoCacheEntry;
+    if (!parsed?.info?.commitId) {
+      return null;
+    }
+    return parsed.info;
+  } catch {
+    return null;
+  }
+}
+
+export function writeAdminVersionInfoCache(info: AdminVersionInfo): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    const entry: AdminVersionInfoCacheEntry = {
+      cachedAt: Date.now(),
+      info,
+    };
+    window.localStorage.setItem(ADMIN_VERSION_CACHE_KEY, JSON.stringify(entry));
+  } catch {
+    // ignore quota / private mode errors
+  }
+}
+
+export function clearAdminVersionInfoCache(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.removeItem(ADMIN_VERSION_CACHE_KEY);
+  } catch {
+    // ignore
+  }
 }
 
 export interface ProviderTestResult {
@@ -877,6 +932,10 @@ export async function loadAdminVersionInfo(): Promise<AdminVersionInfo> {
 
 export async function restartServerService(): Promise<void> {
   await invokeCommand<{ ok: boolean }>("restart_server_service");
+}
+
+export async function rollbackServerService(): Promise<void> {
+  await invokeCommand<{ ok: boolean }>("rollback_server_service");
 }
 
 export async function startServerUpgrade(input: {

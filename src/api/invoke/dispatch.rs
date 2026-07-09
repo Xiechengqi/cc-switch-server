@@ -53,6 +53,12 @@ async fn web_invoke_dispatch(
                     .await?;
             Ok(json!(response.0))
         }
+        "rollback_server_service" => {
+            let response =
+                crate::api::self_update::admin_rollback(State(state.clone()), headers.clone())
+                    .await?;
+            Ok(json!(response.0))
+        }
         "start_admin_upgrade" => {
             let restart_after = args
                 .get("restartAfter")
