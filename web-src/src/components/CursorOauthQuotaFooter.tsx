@@ -25,7 +25,6 @@ interface CursorOauthQuotaFooterProps {
   providerId?: string;
   inline?: boolean;
   isCurrent?: boolean;
-  showInUse?: boolean;
 }
 
 const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
@@ -33,7 +32,6 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
   appId,
   providerId,
   inline = false,
-  showInUse = false,
 }) => {
   const { t, i18n } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -112,7 +110,6 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
         refetch={handleRefresh}
         appIdForExpiredHint="cursor_oauth"
         inline={inline}
-        showInUse={showInUse}
       />
     );
   }
@@ -133,7 +130,6 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     return (
       <div className="flex flex-col items-end gap-1 text-xs whitespace-nowrap flex-shrink-0">
         <ProviderQuotaMetaRow
-          showInUse={showInUse}
           timeLabel={
             displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)

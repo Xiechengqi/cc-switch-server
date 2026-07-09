@@ -15,7 +15,6 @@ interface SubscriptionQuotaFooterProps {
   inline?: boolean;
   isCurrent?: boolean;
   autoQueryInterval?: number;
-  showInUse?: boolean;
 }
 
 interface SubscriptionQuotaViewProps {
@@ -26,7 +25,6 @@ interface SubscriptionQuotaViewProps {
   appIdForExpiredHint: string;
   inline?: boolean;
   visibleTierNames?: string[];
-  showInUse?: boolean;
 }
 
 /** 已知 tier 名称的显示映射（官方订阅 + Token Plan 共用） */
@@ -231,7 +229,6 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   appIdForExpiredHint,
   inline = false,
   visibleTierNames,
-  showInUse = false,
 }) => {
   const { t } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -385,7 +382,6 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
       <div className="flex min-w-0 max-w-full flex-col items-end gap-1 text-xs">
         {/* 第一行：查询时间 + 刷新 */}
         <ProviderQuotaMetaRow
-          showInUse={showInUse}
           timeLabel={
             displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)
@@ -568,7 +564,6 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
   inline = false,
   isCurrent = false,
   autoQueryInterval = 5,
-  showInUse = false,
 }) => {
   const {
     data: quota,
@@ -590,7 +585,6 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
       refetch={refetch}
       appIdForExpiredHint={appId}
       inline={inline}
-      showInUse={showInUse}
     />
   );
 };

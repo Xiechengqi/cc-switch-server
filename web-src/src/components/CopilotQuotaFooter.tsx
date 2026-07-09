@@ -24,7 +24,6 @@ interface CopilotQuotaFooterProps {
   inline?: boolean;
   /** 是否为当前激活的供应商 */
   isCurrent?: boolean;
-  showInUse?: boolean;
 }
 
 /** 格式化相对时间 */
@@ -45,7 +44,6 @@ function formatRelativeTime(
 const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
   meta,
   inline = false,
-  showInUse = false,
 }) => {
   const { t } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -124,7 +122,6 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
     return (
       <div className="flex flex-col items-end gap-1 text-xs whitespace-nowrap flex-shrink-0">
         <ProviderQuotaMetaRow
-          showInUse={showInUse}
           timeLabel={
             displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)

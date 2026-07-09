@@ -24,6 +24,8 @@ import CursorOauthQuotaFooter from "@/components/CursorOauthQuotaFooter";
 import OllamaQuotaFooter from "@/components/OllamaQuotaFooter";
 import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
+import { ProviderInUseTag } from "@/components/providers/ProviderQuotaMetaRow";
+import { ProviderShareStatusTag } from "@/components/providers/ProviderShareStatusTag";
 import { FailoverPriorityBadge } from "@/components/providers/FailoverPriorityBadge";
 import {
   extractCodexBaseUrl,
@@ -253,6 +255,7 @@ export function ProviderCard({
   const canManageShare = isShareableApp(appId);
   const [shareDeleteConfirmOpen, setShareDeleteConfirmOpen] = useState(false);
   const {
+    share,
     sharePhase,
     isSharing,
     isPending: isSharePending,
@@ -416,6 +419,12 @@ export function ProviderCard({
                 {provider.name}
               </h3>
 
+              {showInUseTag ? <ProviderInUseTag /> : null}
+
+              {canManageShare && share ? (
+                <ProviderShareStatusTag share={share} />
+              ) : null}
+
               {isOmo && (
                 <span className="inline-flex items-center rounded-md bg-violet-100 px-1.5 py-0.5 text-[10px] font-semibold text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
                   OMO
@@ -495,7 +504,6 @@ export function ProviderCard({
                 providerId={provider.id}
                 inline={true}
                 isCurrent={isCurrent}
-                showInUse={showInUseTag}
               />
             ) : quotaSource === "codex_oauth" ? (
               <CodexOauthQuotaFooter
@@ -504,7 +512,6 @@ export function ProviderCard({
                 providerId={provider.id}
                 inline={true}
                 isCurrent={isCurrent}
-                showInUse={showInUseTag}
               />
             ) : quotaSource === "claude_oauth" ? (
               <ClaudeOauthQuotaFooter
@@ -513,7 +520,6 @@ export function ProviderCard({
                 providerId={provider.id}
                 inline={true}
                 isCurrent={isCurrent}
-                showInUse={showInUseTag}
               />
             ) : quotaSource === "google_gemini_oauth" ? (
               <GeminiOauthQuotaFooter
@@ -522,7 +528,6 @@ export function ProviderCard({
                 appId={appId}
                 providerId={provider.id}
                 isCurrent={isCurrent}
-                showInUse={showInUseTag}
               />
             ) : quotaSource === "antigravity_oauth" ? (
               <AntigravityOauthQuotaFooter
@@ -531,7 +536,6 @@ export function ProviderCard({
                 appId={appId}
                 providerId={provider.id}
                 isCurrent={isCurrent}
-                showInUse={showInUseTag}
               />
             ) : quotaSource === "cursor_oauth" ||
               quotaSource === "cursor_apikey" ? (
@@ -541,7 +545,6 @@ export function ProviderCard({
                 appId={appId}
                 providerId={provider.id}
                 isCurrent={isCurrent}
-                showInUse={showInUseTag}
               />
             ) : quotaSource === "kiro_oauth" ? (
               <KiroOauthQuotaFooter
@@ -550,7 +553,6 @@ export function ProviderCard({
                 appId={appId}
                 providerId={provider.id}
                 isCurrent={isCurrent}
-                showInUse={showInUseTag}
               />
             ) : quotaSource === "ollama_cloud" ? (
               <OllamaQuotaFooter
@@ -559,14 +561,12 @@ export function ProviderCard({
                 appId={appId}
                 inline={true}
                 isCurrent={isCurrent}
-                showInUse={showInUseTag}
               />
             ) : isOfficial && supportsOfficialSubscription && !isManagedOauth ? (
               <SubscriptionQuotaFooter
                 appId={appId}
                 inline={true}
                 isCurrent={isCurrent}
-                showInUse={showInUseTag}
                 autoQueryInterval={accountQuotaRefreshIntervalMinutes}
               />
             ) : null}

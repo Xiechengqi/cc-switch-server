@@ -25,13 +25,11 @@ interface KiroOauthQuotaFooterProps {
   providerId?: string;
   inline?: boolean;
   isCurrent?: boolean;
-  showInUse?: boolean;
 }
 
 const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
   meta,
   inline = false,
-  showInUse = false,
 }) => {
   const { t, i18n } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -89,7 +87,6 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
         refetch={handleRefresh}
         appIdForExpiredHint="kiro_oauth"
         inline={inline}
-        showInUse={showInUse}
         visibleTierNames={["kiro_agentic_requests"]}
       />
     );
@@ -114,7 +111,6 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
     return (
       <div className="flex flex-col items-end gap-1 text-xs whitespace-nowrap flex-shrink-0">
         <ProviderQuotaMetaRow
-          showInUse={showInUse}
           timeLabel={
             displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)

@@ -13,12 +13,11 @@ interface AntigravityOauthQuotaFooterProps {
   providerId?: string;
   inline?: boolean;
   isCurrent?: boolean;
-  showInUse?: boolean;
 }
 
 const AntigravityOauthQuotaFooter: React.FC<
   AntigravityOauthQuotaFooterProps
-> = ({ meta, inline = false, showInUse = false }) => {
+> = ({ meta, inline = false }) => {
   const {
     data: quota,
     isFetching: loading,
@@ -44,7 +43,6 @@ const AntigravityOauthQuotaFooter: React.FC<
       refetch={handleRefresh}
       appIdForExpiredHint="antigravity_oauth"
       inline={inline}
-      showInUse={showInUse}
     />
   );
 };

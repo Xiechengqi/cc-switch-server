@@ -14,13 +14,11 @@ interface ClaudeOauthQuotaFooterProps {
   inline?: boolean;
   /** 是否为当前激活的供应商 */
   isCurrent?: boolean;
-  showInUse?: boolean;
 }
 
 const ClaudeOauthQuotaFooter: React.FC<ClaudeOauthQuotaFooterProps> = ({
   meta,
   inline = false,
-  showInUse = false,
 }) => {
   const {
     data: quota,
@@ -40,7 +38,6 @@ const ClaudeOauthQuotaFooter: React.FC<ClaudeOauthQuotaFooterProps> = ({
       refetch={handleRefresh}
       appIdForExpiredHint="claude_oauth"
       inline={inline}
-      showInUse={showInUse}
     />
   );
 };

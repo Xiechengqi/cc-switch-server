@@ -19,7 +19,6 @@ interface OllamaQuotaFooterProps {
   appId: AppId;
   inline?: boolean;
   isCurrent?: boolean;
-  showInUse?: boolean;
 }
 
 function formatRelativeTime(
@@ -40,7 +39,6 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
   providerId,
   appId,
   inline = false,
-  showInUse = false,
 }) => {
   const { t } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -139,7 +137,6 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
     return (
       <div className="flex flex-col items-end gap-1 text-xs whitespace-nowrap flex-shrink-0">
         <ProviderQuotaMetaRow
-          showInUse={showInUse}
           timeLabel={
             displayQueriedAt
               ? formatRelativeTime(displayQueriedAt, now, t)

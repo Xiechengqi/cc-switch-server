@@ -215,6 +215,25 @@ export function getShareDisplayStatus(
   return "connecting";
 }
 
+/** Provider card tag: share record only, no per-share tunnel polling. */
+export function getProviderCardShareDisplayStatus(
+  share: Pick<ShareRecord, "status" | "tunnelUrl" | "subdomain">,
+): ShareDisplayStatus {
+  if (share.status === "paused") {
+    return "closed";
+  }
+  if (share.status === "expired") {
+    return "expired";
+  }
+  if (share.status === "exhausted") {
+    return "exhausted";
+  }
+  if (share.status === "active") {
+    return isShareRunning(share) ? "sharing" : "closed";
+  }
+  return "connection_error";
+}
+
 export const PERMANENT_EXPIRES_AT = "2099-12-31T23:59:59Z";
 
 export function isPermanentExpiry(value?: string | null): boolean {

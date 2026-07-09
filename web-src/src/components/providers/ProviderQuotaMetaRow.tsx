@@ -14,7 +14,6 @@ export function ProviderInUseTag() {
 }
 
 interface ProviderQuotaMetaRowProps {
-  showInUse?: boolean;
   timeLabel: string;
   loading?: boolean;
   onRefresh: (event: MouseEvent<HTMLButtonElement>) => void;
@@ -24,7 +23,6 @@ interface ProviderQuotaMetaRowProps {
 }
 
 export function ProviderQuotaMetaRow({
-  showInUse = false,
   timeLabel,
   loading = false,
   onRefresh,
@@ -35,7 +33,6 @@ export function ProviderQuotaMetaRow({
   return (
     <div className={cn("flex items-center gap-2 justify-end", className)}>
       {leading}
-      {showInUse ? <ProviderInUseTag /> : null}
       <span className="flex items-center gap-1 text-[10px] text-muted-foreground/70">
         <Clock size={10} />
         {timeLabel}
