@@ -92,7 +92,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           transition={{ duration: 0.2 }}
-          className="fixed inset-0 z-[60] flex flex-col"
+          className="fixed inset-0 z-[60] flex min-h-0 flex-col overflow-hidden"
           style={{ backgroundColor: "hsl(var(--background))" }}
         >
           {/* Drag region - match App.tsx. Linux 上 DRAG_BAR_HEIGHT=0，
@@ -146,11 +146,12 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
           </div>
 
           {/* Content */}
-          <div className="flex-1 overflow-y-auto scroll-overlay">
+          <div className="min-h-0 flex-1 overflow-y-auto scroll-overlay">
             <div
               className={cn(
                 PAGE_SHELL_CLASS,
                 "space-y-6 px-6 py-6",
+                footer && "pb-8",
                 contentClassName,
               )}
             >

@@ -73,6 +73,8 @@ export const serverLocalOverrides = [
   "components/providers/forms/GeminiOAuthSection.tsx",
   "components/providers/forms/KiroOAuthSection.tsx",
   "components/providers/forms/hooks/useManagedAuth.ts",
+  "components/providers/forms/ProviderForm.tsx",
+  "components/providers/ProviderShareSection.tsx",
   "components/ConfirmDialog.tsx",
   "components/common/FullScreenPanel.tsx",
   "components/settings/SettingsPage.tsx",

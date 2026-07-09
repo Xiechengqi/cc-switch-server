@@ -3343,15 +3343,6 @@ function ProviderFormFull({
               />
             )}
 
-          {providerId ? (
-            <ProviderShareSection
-              appId={appId}
-              providerId={providerId}
-              providerName={form.watch("name") || providerId}
-              onOpenShareSettings={onOpenShareSettings}
-            />
-          ) : null}
-
           {showButtons && (
             <div className="flex justify-end gap-2">
               <Button variant="outline" type="button" onClick={onCancel}>
@@ -3366,6 +3357,15 @@ function ProviderFormFull({
             </div>
           )}
         </form>
+
+        {providerId ? (
+          <ProviderShareSection
+            appId={appId}
+            providerId={providerId}
+            providerName={form.watch("name") || providerId}
+            onOpenShareSettings={onOpenShareSettings}
+          />
+        ) : null}
       </Form>
 
       <ConfirmDialog
