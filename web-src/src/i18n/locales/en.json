@@ -461,7 +461,12 @@
       "streamDisconnected": "Upgrade log stream disconnected",
       "upgradePendingRestart": "Upgrade complete. Click \"Restart Pending\" to apply the new version.",
       "upgradeFailed": "Upgrade failed. Check the upgrade logs.",
-      "restartScheduled": "Restart scheduled. Waiting for the service to come back…"
+      "restartScheduled": "Restart scheduled. Waiting for the service to come back…",
+      "checkUpdateAvailable": "Online upgrade package detected ({{size}}). Click Upgrade to install.",
+      "checkUpdateAvailableShort": "Online upgrade package available",
+      "checkUpdateAvailableHint": "Latest package size is about {{size}}. The server compares checksums during upgrade and will warn if it matches the running binary.",
+      "checkUpdateReachableButUnavailable": "The online upgrade source is reachable, but this environment cannot upgrade in place (common in dev mode).",
+      "checkUpdateFailed": "Failed to check for updates: {{error}}"
     },
     "advanced": {
       "configDir": {

@@ -465,7 +465,12 @@
       "streamDisconnected": "升级日志流已断开",
       "upgradePendingRestart": "升级完成，请点击「待重启」应用新版本",
       "upgradeFailed": "升级失败，请查看升级日志",
-      "restartScheduled": "已安排重启，正在等待服务恢复…"
+      "restartScheduled": "已安排重启，正在等待服务恢复…",
+      "checkUpdateAvailable": "检测到在线升级包（{{size}}），可点击「升级」安装",
+      "checkUpdateAvailableShort": "检测到在线升级包",
+      "checkUpdateAvailableHint": "最新安装包大小约 {{size}}。Server 会在升级时比对二进制校验和，若与当前版本相同会提示无需重复安装。",
+      "checkUpdateReachableButUnavailable": "已连接到在线升级源，但当前环境无法就地升级（常见于开发模式）。",
+      "checkUpdateFailed": "检查更新失败：{{error}}"
     },
     "advanced": {
       "configDir": {

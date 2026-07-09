@@ -122,6 +122,12 @@ function computeUpgradeProgress(
   return 0;
 }
 
+function formatBytes(bytes?: number | null): string {
+  if (!bytes) return "--";
+  const mib = bytes / 1024 / 1024;
+  return mib >= 1 ? `${mib.toFixed(1)} MiB` : `${(bytes / 1024).toFixed(1)} KiB`;
+}
+
 async function pollHealthAndReload(maxAttempts = 60) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
@@ -149,6 +155,8 @@ export function ServerVersionSettings() {
   const [upgradeLogs, setUpgradeLogs] = useState<UpgradeLogEntry[]>([]);
   const [upgradeOutcome, setUpgradeOutcome] = useState<UpgradeOutcome>(null);
   const [usingBuildInfoFallback, setUsingBuildInfoFallback] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateChecked, setUpdateChecked] = useState(false);
   const streamRef = useRef<EventSource | null>(null);
   const logEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -328,6 +336,52 @@ export function ServerVersionSettings() {
   const restartPending = info?.restartPending ?? false;
   const upgradeDisabled =
     busy !== null || loading || info?.upgradeCapable === false;
+  const updatePackageAvailable =
+    Boolean(info?.latest?.available) && Boolean(info?.upgradeCapable);
+
+  const handleCheckUpdate = useCallback(async () => {
+    if (busy || checkingUpdate) return;
+    setCheckingUpdate(true);
+    try {
+      const adminInfo = await loadAdminVersionInfo();
+      setInfo(adminInfo);
+      setUsingBuildInfoFallback(false);
+      setUpdateChecked(true);
+
+      const { latest } = adminInfo;
+      if (latest.error) {
+        toast.error(
+          t("settings.serverVersion.checkUpdateFailed", {
+            error: latest.error,
+            defaultValue: "检查更新失败：{{error}}",
+          }),
+        );
+        return;
+      }
+      if (!latest.available) {
+        toast.error(t("settings.checkUpdateFailed"));
+        return;
+      }
+      if (!adminInfo.upgradeCapable) {
+        toast.info(t("settings.serverVersion.checkUpdateReachableButUnavailable"));
+        return;
+      }
+      toast.success(
+        t("settings.serverVersion.checkUpdateAvailable", {
+          size: formatBytes(latest.contentLength),
+          defaultValue: "检测到在线升级包（{{size}}），可点击「升级」安装",
+        }),
+      );
+    } catch (reason) {
+      toast.error(
+        reason instanceof Error
+          ? reason.message
+          : t("settings.checkUpdateFailed"),
+      );
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }, [busy, checkingUpdate, t]);
 
   return (
     <>
@@ -385,13 +439,19 @@ export function ServerVersionSettings() {
               <Button
                 type="button"
                 variant="outline"
-                size="icon"
-                className="h-9 w-9"
-                disabled={loading || busy !== null}
-                onClick={() => void refresh()}
-                title={t("common.refresh")}
+                size="sm"
+                className="h-9 gap-1.5 text-xs"
+                disabled={loading || busy !== null || checkingUpdate}
+                onClick={() => void handleCheckUpdate()}
               >
-                <RefreshCw className="h-4 w-4" />
+                {checkingUpdate ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}
+                {checkingUpdate
+                  ? t("settings.checking")
+                  : t("settings.checkForUpdates")}
               </Button>
               {restartPending ? (
                 <Button
@@ -428,7 +488,19 @@ export function ServerVersionSettings() {
           </div>
 
           <CollapsibleContent>
-            <div className="border-t border-border/50 px-4 pb-4 pt-3">
+            <div className="border-t border-border/50 px-4 pb-4 pt-3 space-y-3">
+              {updateChecked && updatePackageAvailable ? (
+                <div className="rounded-lg border border-primary/20 bg-primary/10 px-4 py-3 text-sm">
+                  <p className="font-medium text-primary">
+                    {t("settings.serverVersion.checkUpdateAvailableShort")}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {t("settings.serverVersion.checkUpdateAvailableHint", {
+                      size: formatBytes(info?.latest?.contentLength),
+                    })}
+                  </p>
+                </div>
+              ) : null}
               <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground">
                 {versionDetails || t("settings.serverVersion.empty")}
               </pre>
