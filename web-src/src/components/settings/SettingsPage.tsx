@@ -52,7 +52,6 @@ import { ModelTestConfigPanel } from "@/components/usage/ModelTestConfigPanel";
 import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
-import type { ServerSettingsTab } from "@/components/settings/ServerSettingsExtensions";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySettings";
 import { ServerVersionSettings } from "@/components/settings/ServerVersionSettings";
@@ -71,14 +70,13 @@ export type SettingsTab =
   | "auth"
   | "share"
   | "advanced"
-  | "usage"
-  | ServerSettingsTab;
+  | "usage";
 
 interface SettingsDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onImportSuccess?: () => void | Promise<void>;
-  defaultTab?: SettingsTab;
+  defaultTab?: SettingsTab | "router" | "diagnostics" | "tunnel" | "failover" | "backup";
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
 }
 

@@ -655,6 +655,54 @@
       "notes": "Web invoke bridge for admin version/upgrade metadata; works on client tunnel where /api/admin/version may be unavailable."
     },
     {
+      "name": "restart_server_service",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /api/admin/restart",
+      "notes": "Web invoke bridge for admin restart; works on client tunnel where /api/admin/restart may be unavailable."
+    },
+    {
+      "name": "start_admin_upgrade",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /api/admin/upgrade",
+      "notes": "Web invoke bridge for admin upgrade start; works on client tunnel where /api/admin/upgrade may be unavailable."
+    },
+    {
+      "name": "complete_server_setup",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /api/setup",
+      "notes": "Web invoke bridge for first-time server setup."
+    },
+    {
+      "name": "login_with_api_token",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /api/auth/login",
+      "notes": "Web invoke bridge for API token admin login."
+    },
+    {
+      "name": "request_admin_email_login_code",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /api/auth/email/request-code",
+      "notes": "Web invoke bridge for admin email login code request."
+    },
+    {
+      "name": "verify_admin_email_login_code",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /api/auth/email/verify-code",
+      "notes": "Web invoke bridge for admin email login verification."
+    },
+    {
       "name": "get_build_info",
       "support": "native",
       "implemented": true,
@@ -989,6 +1037,13 @@
       "feature": "shares",
       "endpoint": "GET /api/shares",
       "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "get_share_health_status",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Aggregated Router / Client Tunnel / Share link health for settings UI."
     },
     {
       "name": "get_stream_check_config",

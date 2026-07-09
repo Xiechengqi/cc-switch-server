@@ -354,6 +354,11 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/web-api/auth/session/refresh", post(web_session_refresh))
         .route("/web-api/context", get(web_runtime_context))
         .route("/web-api/invoke/*command", post(web_invoke_compat))
+        .route("/web-api/events", get(events))
+        .route(
+            "/web-api/admin/upgrade/stream",
+            get(crate::api::self_update::admin_upgrade_stream),
+        )
         .route("/v1/models", get(proxy_models))
         .route("/models", get(proxy_models))
         .route("/v1/messages", post(proxy_claude_messages))

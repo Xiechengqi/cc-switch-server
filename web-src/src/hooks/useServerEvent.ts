@@ -8,7 +8,7 @@ type ServerEventPayload = {
 };
 
 /**
- * Subscribe to server SSE (`/api/events`). EventSource cannot send Authorization
+ * Subscribe to server SSE (`/web-api/events`). EventSource cannot send Authorization
  * headers, so the session token is passed via query string (same as API contract).
  */
 export function useServerEvent<P = ServerEventPayload>(
@@ -24,7 +24,7 @@ export function useServerEvent<P = ServerEventPayload>(
       return;
     }
 
-    const url = `/api/events?token=${encodeURIComponent(token)}`;
+    const url = `/web-api/events?token=${encodeURIComponent(token)}`;
     const source = new EventSource(url);
 
     const onEvent = (event: MessageEvent<string>) => {

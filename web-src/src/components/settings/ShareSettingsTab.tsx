@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Laptop, MoreHorizontal, Network } from "lucide-react";
+import { Activity, Laptop, Network } from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -10,10 +10,13 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { ServerSettingsExtensions } from "@/components/settings/ServerSettingsExtensions";
 import { ClientTunnelSettingsPanel } from "@/components/settings/ClientTunnelSettingsPanel";
+import {
+  formatShareHealthOverview,
+  ShareHealthStatusPanel,
+} from "@/components/settings/ShareHealthStatusPanel";
 import { ShareRouterSelector } from "@/components/share/ShareRouterSelector";
-import { useConfigureTunnelMutation, useClientTunnelQuery, useSettingsQuery } from "@/lib/query";
+import { useConfigureTunnelMutation, useClientTunnelQuery, useSettingsQuery, useShareHealthQuery } from "@/lib/query";
 import {
   formatShareRouterDisplay,
   normalizeShareRouterDomain,
@@ -64,6 +67,7 @@ export function ShareSettingsTab() {
   const { t } = useTranslation();
   const { data: settings } = useSettingsQuery();
   const { data: clientTunnel } = useClientTunnelQuery();
+  const { data: health } = useShareHealthQuery();
   const configureTunnelMutation = useConfigureTunnelMutation();
 
   const tunnelConfig = useMemo(
@@ -82,6 +86,10 @@ export function ShareSettingsTab() {
 
   const routerDisplay = formatShareRouterDisplay(tunnelConfig.domain);
   const routerDirty = routerDomain.trim() !== tunnelConfig.domain.trim();
+  const healthOverview = useMemo(
+    () => formatShareHealthOverview(health, t),
+    [health, t],
+  );
 
   const clientStatusLabel = clientTunnel?.status?.info
     ? t("settings.share.clientTunnel.running", { defaultValue: "运行中" })
@@ -184,16 +192,14 @@ export function ShareSettingsTab() {
         </ShareSettingsAccordionItem>
 
         <ShareSettingsAccordionItem
-          value="other"
-          icon={<MoreHorizontal className="h-5 w-5 text-muted-foreground" />}
-          title={t("settings.share.sections.other.title", {
-            defaultValue: "其他",
+          value="health"
+          icon={<Activity className="h-5 w-5 text-violet-500" />}
+          title={t("settings.share.sections.health.title", {
+            defaultValue: "健康状态",
           })}
-          description={t("settings.share.sections.other.description", {
-            defaultValue: "Router 诊断信息与服务端运维工具。",
-          })}
+          description={healthOverview}
         >
-          <ServerSettingsExtensions sections={["diagnostics"]} embedded />
+          <ShareHealthStatusPanel />
         </ShareSettingsAccordionItem>
       </Accordion>
     </motion.div>

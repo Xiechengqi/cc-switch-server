@@ -5,6 +5,38 @@ import {
   routerAuthFetch,
 } from "@/lib/routerAuth";
 
+function resolveRequestPath(input: RequestInfo | URL): string {
+  if (typeof input === "string") {
+    return input.startsWith("http") ? new URL(input).pathname : input;
+  }
+  if (input instanceof URL) {
+    return input.pathname;
+  }
+  if (typeof input === "object" && input !== null && "url" in input) {
+    const url = (input as Request).url;
+    if (typeof url === "string") {
+      try {
+        return new URL(url, window.location.origin).pathname;
+      } catch {
+        return url;
+      }
+    }
+  }
+  return "";
+}
+
+function assertClientTunnelCompatiblePath(input: RequestInfo | URL): void {
+  if (!isRemoteWebMode()) {
+    return;
+  }
+  const path = resolveRequestPath(input);
+  if (path.startsWith("/api/")) {
+    throw new Error(
+      `Legacy admin API ${path} is unavailable on client tunnel URLs. Use /web-api/invoke or /web-api/* instead.`,
+    );
+  }
+}
+
 export interface WebRuntimeFeature {
   id: string;
   label: string;
@@ -83,7 +115,7 @@ export function writeCachedPassword(password: string | null): void {
 }
 
 export async function loginWithPassword(password: string): Promise<string> {
-  const response = await fetch("/api/auth/login", {
+  const response = await apiFetch("/api/auth/login", {
     method: "POST",
     headers: {
       accept: "application/json",
@@ -142,6 +174,7 @@ export async function apiFetch(
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<Response> {
+  assertClientTunnelCompatiblePath(input);
   if (isRemoteWebMode()) {
     return routerAuthFetch(input, init);
   }

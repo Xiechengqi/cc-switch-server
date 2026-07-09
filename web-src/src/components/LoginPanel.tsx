@@ -2,12 +2,14 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { KeyRound, Loader2, Mail, Shield } from "lucide-react";
 
 import {
+  completeServerSetup,
+  loginWithApiToken,
   requestEmailLoginCode,
   verifyEmailLoginCode,
 } from "@/lib/server-legacy-api";
 import { DEFAULT_SHARE_ROUTER_DOMAIN } from "@/config/shareRegions";
 import { useI18n } from "@/lib/i18n";
-import { jsonFetch, loginWithPassword, readCachedPassword, WebRuntimeContext, writeToken } from "@/lib/runtime";
+import { loginWithPassword, readCachedPassword, WebRuntimeContext, writeToken } from "@/lib/runtime";
 
 type LoginMethod = "password" | "email" | "apiToken";
 
@@ -87,15 +89,11 @@ export function LoginPanel({
     setBusy("password");
     try {
       if (setupRequired) {
-        await jsonFetch("/api/setup", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            password,
-            ownerEmail,
-            routerUrl,
-            clientTunnelSubdomain,
-          }),
+        await completeServerSetup({
+          password,
+          ownerEmail,
+          routerUrl,
+          clientTunnelSubdomain: clientTunnelSubdomain.trim() || undefined,
         });
       }
       await loginWithPassword(password);
@@ -112,11 +110,7 @@ export function LoginPanel({
     setError(null);
     setBusy("apiToken");
     try {
-      const login = await jsonFetch<{ token: string }>("/api/auth/login", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ method: "api_token", apiToken: apiToken.trim() }),
-      });
+      const login = await loginWithApiToken(apiToken.trim());
       await completeLogin(login.token);
     } catch (reason) {
       setError(errorMessage(reason));

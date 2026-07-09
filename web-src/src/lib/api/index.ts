@@ -43,6 +43,9 @@ export type {
   ClientTunnelConfig,
   ClientTunnelState,
   ClientTunnelUpdateParams,
+  ShareHealthStatus,
+  ShareHealthItem,
+  ShareHealthLevel,
 } from "./share";
 export {
   SHARE_APP_TYPES,
@@ -101,4 +104,3 @@ export type {
   UniversalProviderPreset,
   UniversalProviderSyncResult,
 } from "@/lib/server-legacy-api";
-export { loadUsageLogDetail } from "@/lib/server-legacy-api";

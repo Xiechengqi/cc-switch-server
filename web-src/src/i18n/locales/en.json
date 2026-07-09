@@ -327,6 +327,68 @@
     "tabShare": "Share",
     "tabRouter": "Router",
     "share": {
+      "sections": {
+        "client": {
+          "title": "Client",
+          "description": "Configure Client Tunnel owner email, subdomain, and runtime status. Current: {{status}}"
+        },
+        "router": {
+          "title": "Router",
+          "description": "Default router node for new shares. Current: {{value}}"
+        },
+        "health": {
+          "title": "Health",
+          "descriptionLoading": "Router, Client Tunnel, and Share link health"
+        }
+      },
+      "health": {
+        "overallTitle": "Link overview",
+        "chainTitle": "Link nodes",
+        "loading": "Checking link health…",
+        "loadFailed": "Failed to load health status. Please try again.",
+        "notConfigured": "Not configured",
+        "justNow": "Just now",
+        "minutesAgo": "{{count}} min ago",
+        "noShares": "No shares yet",
+        "shareDisabled": "Disabled",
+        "tunnel": "Tunnel",
+        "overall": {
+          "healthy": "All healthy",
+          "warning": "{{count}} item(s) need attention",
+          "unhealthy": "{{count}} issue(s)"
+        },
+        "status": {
+          "healthy": "Healthy",
+          "warning": "Attention",
+          "unhealthy": "Unhealthy"
+        },
+        "router": {
+          "title": "Router",
+          "registered": "Registered",
+          "notRegistered": "Not registered"
+        },
+        "clientTunnel": {
+          "title": "Client Tunnel",
+          "running": "Tunnel connected",
+          "stopped": "Configured but not connected"
+        },
+        "shares": {
+          "title": "Share",
+          "summary": "{{healthy}}/{{total}} healthy"
+        }
+      },
+      "clientTunnel": {
+        "title": "Client Tunnel",
+        "description": "Expose the local admin UI through a Client Tunnel.",
+        "ownerEmail": "Owner email",
+        "subdomain": "Subdomain",
+        "url": "URL",
+        "start": "Start",
+        "stop": "Stop",
+        "running": "Running",
+        "stopped": "Stopped",
+        "failed": "Failed: {{error}}"
+      },
       "defaultRouter": {
         "title": "Default Router Node",
         "description": "New shares use this router by default. Existing shares stay bound to the router used at creation.",

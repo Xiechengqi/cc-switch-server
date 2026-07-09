@@ -27,7 +27,7 @@ import {
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { settingsApi } from "@/lib/api";
-import { readToken } from "@/lib/runtime";
+import { readToken, getWebRuntimeContext } from "@/lib/runtime";
 import {
   loadAdminVersionInfo,
   loadBuildInfo,
@@ -36,7 +36,7 @@ import {
   type AdminVersionInfo,
 } from "@/lib/server-legacy-api";
 
-const SERVER_OFFICIAL_WEBSITE = "https://tokenswitch.cc";
+const SERVER_OFFICIAL_WEBSITE = "https://tokenswitch.org";
 const SERVER_GITHUB_URL = "https://github.com/Xiechengqi/cc-switch-server";
 
 function formatVersionDetails(info: AdminVersionInfo): string {
@@ -58,8 +58,8 @@ async function pollHealthAndReload(maxAttempts = 60) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
     try {
-      const response = await fetch("/health", { cache: "no-store" });
-      if (response.ok) {
+      const context = await getWebRuntimeContext(false);
+      if (context.mode === "local-admin") {
         window.location.reload();
         return;
       }
@@ -143,7 +143,9 @@ export function ServerVersionSettings() {
       const token = readToken();
       const params = new URLSearchParams({ taskId });
       if (token) params.set("accessToken", token);
-      const source = new EventSource(`/api/admin/upgrade/stream?${params}`);
+      const source = new EventSource(
+        `/web-api/admin/upgrade/stream?${params}`,
+      );
       streamRef.current = source;
 
       source.addEventListener("log", (event) => {

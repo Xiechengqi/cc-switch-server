@@ -245,6 +245,43 @@ export interface ClientTunnelUpdateParams {
   autoStart: boolean;
 }
 
+export type ShareHealthLevel = "healthy" | "warning" | "unhealthy";
+
+export interface ShareHealthLink {
+  status: ShareHealthLevel;
+  domain?: string;
+  registered?: boolean;
+  lastHeartbeatMs?: number | null;
+  lastError?: string | null;
+  subdomain?: string;
+  tunnelUrl?: string | null;
+}
+
+export interface ShareHealthItem {
+  id: string;
+  name: string;
+  status: ShareHealthLevel;
+  shareStatus: string;
+  enabled: boolean;
+  routerLastSyncError?: string | null;
+  routerLastSyncedAtMs?: number | null;
+  tunnelStatus?: string | null;
+  tunnelError?: string | null;
+}
+
+export interface ShareHealthStatus {
+  overall: ShareHealthLevel;
+  issueCount: number;
+  shareIssueCount: number;
+  router: ShareHealthLink;
+  clientTunnel: ShareHealthLink;
+  shares: ShareHealthItem[];
+}
+
+async function getShareHealthStatus(): Promise<ShareHealthStatus> {
+  return invokeCommand<ShareHealthStatus>("get_share_health_status");
+}
+
 async function invokeShareRecord(
   command: string,
   args: Record<string, unknown>,
@@ -485,6 +522,7 @@ export const shareApi = {
   startClientTunnel,
   stopClientTunnel,
   getClientTunnelStatus,
+  getShareHealthStatus,
 };
 
 export const createShare = create;

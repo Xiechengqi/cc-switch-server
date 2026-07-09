@@ -9,6 +9,7 @@ import {
   type CreateShareParams,
   type PublicMarket,
   type ShareRecord,
+  type ShareHealthStatus,
   type ShareTunnelStatus,
   type TunnelConfig,
 } from "@/lib/api";
@@ -33,6 +34,7 @@ export const shareKeys = {
   markets: () => [...shareKeys.all, "markets"] as const,
   clientTunnel: () => [...shareKeys.all, "client-tunnel"] as const,
   clientTunnelStatus: () => [...shareKeys.all, "client-tunnel-status"] as const,
+  health: () => [...shareKeys.all, "health"] as const,
 };
 
 type ShareMutationMessages = {
@@ -143,6 +145,16 @@ export function useClientTunnelQuery(enabled = true) {
     queryFn: shareApi.getClientTunnel,
     enabled,
     refetchInterval: enabled ? TUNNEL_POLL_INTERVAL_MS : false,
+    refetchIntervalInBackground: true,
+  });
+}
+
+export function useShareHealthQuery(enabled = true) {
+  return useQuery<ShareHealthStatus>({
+    queryKey: shareKeys.health(),
+    queryFn: shareApi.getShareHealthStatus,
+    enabled,
+    refetchInterval: enabled ? SHARE_POLL_INTERVAL_MS : false,
     refetchIntervalInBackground: true,
   });
 }

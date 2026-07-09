@@ -44,8 +44,83 @@ async fn web_invoke_dispatch(
 ) -> Result<Value, ApiError> {
     match command {
         "get_build_info" => Ok(json!(build_info())),
-        "get_admin_version_info" => {
-            Ok(json!(crate::api::self_update::build_admin_version_response(state).await))
+        "get_admin_version_info" => Ok(json!(
+            crate::api::self_update::build_admin_version_response(state).await
+        )),
+        "restart_server_service" => {
+            let response =
+                crate::api::self_update::admin_restart(State(state.clone()), headers.clone())
+                    .await?;
+            Ok(json!(response.0))
+        }
+        "start_admin_upgrade" => {
+            let restart_after = args
+                .get("restartAfter")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let response = crate::api::self_update::admin_upgrade_start(
+                State(state.clone()),
+                headers.clone(),
+                Json(crate::api::self_update::start_upgrade_request(
+                    restart_after,
+                )),
+            )
+            .await?;
+            Ok(json!(response.0))
+        }
+        "complete_server_setup" => {
+            let password = web_arg_string_any(&args, &["password"])?;
+            let owner_email = web_arg_string_any(&args, &["ownerEmail", "owner_email"])?;
+            let router_url = web_arg_string_any(&args, &["routerUrl", "router_url"])?;
+            let client_tunnel_subdomain = web_optional_string_any(
+                &args,
+                &["clientTunnelSubdomain", "client_tunnel_subdomain"],
+            );
+            let response = crate::api::settings::setup(
+                State(state.clone()),
+                Json(crate::domain::settings::config::SetupInput {
+                    password,
+                    owner_email,
+                    router_url,
+                    client_tunnel_subdomain,
+                }),
+            )
+            .await?;
+            Ok(json!(response.0))
+        }
+        "login_with_api_token" => {
+            let api_token = web_arg_string_any(&args, &["apiToken", "api_token"])?;
+            let response = crate::api::settings::login(
+                State(state.clone()),
+                Json(LoginRequest {
+                    method: "api_token".to_string(),
+                    password: String::new(),
+                    api_token: Some(api_token),
+                    email: None,
+                    code: None,
+                }),
+            )
+            .await?;
+            Ok(json!(response.0))
+        }
+        "request_admin_email_login_code" => {
+            let email = web_arg_string_any(&args, &["email"])?;
+            let response = crate::api::settings::request_email_login_code(
+                State(state.clone()),
+                Json(EmailLoginCodeRequest { email }),
+            )
+            .await?;
+            Ok(json!(response.0))
+        }
+        "verify_admin_email_login_code" => {
+            let email = web_arg_string_any(&args, &["email"])?;
+            let code = web_arg_string_any(&args, &["code"])?;
+            let response = crate::api::settings::verify_email_login_code(
+                State(state.clone()),
+                Json(EmailLoginVerifyCodeRequest { email, code }),
+            )
+            .await?;
+            Ok(json!(response.0))
         }
         "get_settings" => {
             let store = state.ui_settings.read().await;
@@ -477,6 +552,7 @@ async fn web_invoke_dispatch(
                 .await;
             Ok(web_client_tunnel_share_status(runtime))
         }
+        "get_share_health_status" => Ok(web_share_health_status(state).await),
         "claim_client_tunnel" => {
             if web_has_payload(&args) {
                 let value = web_payload(&args, &["params", "input", "config"]);

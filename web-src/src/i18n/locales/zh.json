@@ -331,6 +331,68 @@
     "tabShare": "分享",
     "tabRouter": "Router",
     "share": {
+      "sections": {
+        "client": {
+          "title": "Client",
+          "description": "配置 Client Tunnel 的 Owner 邮箱、子域名与启停状态。当前：{{status}}"
+        },
+        "router": {
+          "title": "Router",
+          "description": "配置新建 share 时使用的默认路由节点。当前：{{value}}"
+        },
+        "health": {
+          "title": "健康状态",
+          "descriptionLoading": "查看 Router、Client Tunnel 与 Share 链路健康状态"
+        }
+      },
+      "health": {
+        "overallTitle": "链路总览",
+        "chainTitle": "链路节点",
+        "loading": "正在检查链路状态…",
+        "loadFailed": "无法加载健康状态，请稍后重试。",
+        "notConfigured": "未配置",
+        "justNow": "刚刚",
+        "minutesAgo": "{{count}} 分钟前",
+        "noShares": "暂无 Share",
+        "shareDisabled": "已停用",
+        "tunnel": "隧道",
+        "overall": {
+          "healthy": "全部正常",
+          "warning": "{{count}} 项需关注",
+          "unhealthy": "{{count}} 项异常"
+        },
+        "status": {
+          "healthy": "正常",
+          "warning": "需关注",
+          "unhealthy": "异常"
+        },
+        "router": {
+          "title": "Router",
+          "registered": "已注册",
+          "notRegistered": "未注册"
+        },
+        "clientTunnel": {
+          "title": "Client Tunnel",
+          "running": "隧道已连接",
+          "stopped": "已配置但未连接"
+        },
+        "shares": {
+          "title": "Share",
+          "summary": "{{healthy}}/{{total}} 正常"
+        }
+      },
+      "clientTunnel": {
+        "title": "Client Tunnel",
+        "description": "配置远程访问本机管理界面的 Client Tunnel。",
+        "ownerEmail": "Owner 邮箱",
+        "subdomain": "子域名",
+        "url": "访问地址",
+        "start": "启动",
+        "stop": "停止",
+        "running": "运行中",
+        "stopped": "未运行",
+        "failed": "失败: {{error}}"
+      },
       "defaultRouter": {
         "title": "默认 Router 节点",
         "description": "新建 share 时默认使用此路由节点。已创建的 share 仍绑定创建时的节点。",

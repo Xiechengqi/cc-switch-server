@@ -992,6 +992,178 @@ pub(in crate::api) async fn web_client_tunnel_state(state: &ServerState) -> Valu
     response
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ShareHealthLevel {
+    Healthy,
+    Warning,
+    Unhealthy,
+}
+
+impl ShareHealthLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Warning => "warning",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+}
+
+fn tunnel_runtime_is_healthy(status: &str) -> bool {
+    matches!(status, "connected" | "running" | "active")
+}
+
+fn share_health_level(
+    enabled: bool,
+    share_status: &str,
+    router_sync_error: Option<&str>,
+    tunnel_error: Option<&str>,
+) -> ShareHealthLevel {
+    if router_sync_error.is_some() || (enabled && tunnel_error.is_some()) {
+        return ShareHealthLevel::Unhealthy;
+    }
+    if !enabled {
+        return ShareHealthLevel::Warning;
+    }
+    if share_status != "active" {
+        return ShareHealthLevel::Warning;
+    }
+    ShareHealthLevel::Healthy
+}
+
+pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Value {
+    let config = state.config.read().await;
+    let shares_store = state.shares.read().await;
+    let ui_settings = state.ui_settings.read().await;
+    let router_domain = ui_settings
+        .settings_for_frontend(&config)
+        .get("shareRouterDomain")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let client_runtime = state
+        .tunnels
+        .status(&crate::clients::router::tunnel::client_tunnel_key())
+        .await;
+    let tunnel_statuses = state.tunnels.statuses().await;
+    let tunnel_by_key: BTreeMap<String, crate::clients::router::tunnel::TunnelRuntimeStatus> =
+        tunnel_statuses
+            .into_iter()
+            .map(|status| (status.key.clone(), status))
+            .collect();
+
+    let router_level = if shares_store.last_router_error.is_some() {
+        ShareHealthLevel::Unhealthy
+    } else if shares_store.router_registered {
+        ShareHealthLevel::Healthy
+    } else if router_domain.is_empty() {
+        ShareHealthLevel::Warning
+    } else {
+        ShareHealthLevel::Warning
+    };
+
+    let client_subdomain = config.client.tunnel_subdomain.clone().unwrap_or_default();
+    let client_tunnel_url = client_runtime
+        .as_ref()
+        .and_then(|status| status.tunnel_url.clone())
+        .or_else(|| {
+            if client_subdomain.is_empty() || router_domain.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "https://{}.{}",
+                    client_subdomain.trim(),
+                    router_domain.trim()
+                ))
+            }
+        });
+    let client_last_error = client_runtime
+        .as_ref()
+        .and_then(|status| status.last_error.clone());
+    let client_tunnel_level = if client_last_error.is_some() {
+        ShareHealthLevel::Unhealthy
+    } else if client_runtime
+        .as_ref()
+        .is_some_and(|status| tunnel_runtime_is_healthy(status.status.as_str()))
+    {
+        ShareHealthLevel::Healthy
+    } else if client_subdomain.trim().is_empty() {
+        ShareHealthLevel::Warning
+    } else {
+        ShareHealthLevel::Warning
+    };
+
+    let mut share_items = Vec::new();
+    let mut share_aggregate_level = ShareHealthLevel::Healthy;
+    for share in &shares_store.shares {
+        let runtime =
+            tunnel_by_key.get(&crate::clients::router::tunnel::share_tunnel_key(&share.id));
+        let tunnel_status = runtime.map(|status| status.status.as_str()).unwrap_or("");
+        let tunnel_error = runtime
+            .and_then(|status| status.last_error.clone())
+            .or_else(|| share.last_error.clone());
+        let level = share_health_level(
+            share.enabled,
+            share.status.as_str(),
+            share.router_last_sync_error.as_deref(),
+            tunnel_error.as_deref(),
+        );
+        share_aggregate_level = share_aggregate_level.max(level);
+        share_items.push(json!({
+            "id": share.id,
+            "name": share
+                .display_name
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| share.id.clone()),
+            "status": level.as_str(),
+            "shareStatus": share.status,
+            "enabled": share.enabled,
+            "routerLastSyncError": share.router_last_sync_error,
+            "routerLastSyncedAtMs": share.router_last_synced_at_ms,
+            "tunnelStatus": if tunnel_status.is_empty() { Value::Null } else { json!(tunnel_status) },
+            "tunnelError": tunnel_error,
+        }));
+    }
+
+    let overall = [router_level, client_tunnel_level, share_aggregate_level]
+        .into_iter()
+        .max()
+        .unwrap_or(ShareHealthLevel::Healthy);
+    let issue_count = [router_level, client_tunnel_level, share_aggregate_level]
+        .into_iter()
+        .filter(|level| *level != ShareHealthLevel::Healthy)
+        .count();
+
+    json!({
+        "overall": overall.as_str(),
+        "issueCount": issue_count,
+        "shareIssueCount": share_items
+            .iter()
+            .filter(|item| {
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status != "healthy")
+            })
+            .count(),
+        "router": {
+            "status": router_level.as_str(),
+            "domain": router_domain,
+            "registered": shares_store.router_registered,
+            "lastHeartbeatMs": shares_store.last_router_heartbeat_ms,
+            "lastError": shares_store.last_router_error,
+        },
+        "clientTunnel": {
+            "status": client_tunnel_level.as_str(),
+            "subdomain": client_subdomain,
+            "tunnelUrl": client_tunnel_url,
+            "lastError": client_last_error,
+        },
+        "shares": share_items,
+    })
+}
+
 pub(in crate::api) async fn web_share_tunnel_status(
     state: &ServerState,
     share_id: &str,

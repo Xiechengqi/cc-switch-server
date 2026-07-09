@@ -44,6 +44,10 @@ fn default_restart_after() -> bool {
     true
 }
 
+pub(in crate::api) fn start_upgrade_request(restart_after: bool) -> StartUpgradeRequest {
+    StartUpgradeRequest { restart_after }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct UpgradeStreamQuery {

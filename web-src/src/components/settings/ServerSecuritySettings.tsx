@@ -82,10 +82,8 @@ export function ServerSecuritySettings({ onSignOut }: ServerSecuritySettingsProp
             id="server-new-password"
             type="password"
             autoComplete="new-password"
-            className="h-9 w-44 sm:w-52"
-            placeholder={t("settings.serverSecurity.newPassword", {
-              defaultValue: "新密码",
-            })}
+            className="h-9 w-44 sm:w-52 placeholder:text-muted-foreground/50"
+            placeholder={t("settings.serverSecurity.newPassword")}
             value={newPassword}
             onChange={(event) => setNewPassword(event.target.value)}
           />
