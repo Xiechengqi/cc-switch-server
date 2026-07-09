@@ -249,28 +249,8 @@ async fn web_invoke_dispatch(
             };
             let providers = state.providers.read().await;
             let ui_settings = state.ui_settings.read().await.for_frontend();
-            let provider_exists = |id: &str| {
-                providers
-                    .providers
-                    .iter()
-                    .any(|provider| provider.app == app && provider.provider.id == id)
-            };
-            let current = if live_import::has_current_provider_setting(&ui_settings, app) {
-                live_import::read_current_provider_id(&ui_settings, app)
-                    .filter(|id| provider_exists(id))
-                    .unwrap_or_default()
-            } else {
-                live_import::read_current_provider_id(&ui_settings, app)
-                    .filter(|id| provider_exists(id))
-                    .or_else(|| {
-                        providers
-                            .list(Some(app))
-                            .into_iter()
-                            .next()
-                            .map(|provider| provider.provider.id)
-                    })
-                    .unwrap_or_default()
-            };
+            let current = live_import::resolve_current_provider_id(&providers, &ui_settings, app)
+                .unwrap_or_default();
             Ok(json!(current))
         }
         "import_default_config" => {
@@ -687,14 +667,10 @@ async fn web_invoke_dispatch(
                 web_available_providers_for_failover(state, app).await
             ))
         }
-        "get_proxy_status" => Ok(json!(web_proxy_status_json(state))),
-        "get_proxy_takeover_status" => Ok(json!({
-            "claude": false,
-            "codex": false,
-            "gemini": false
-        })),
+        "get_proxy_status" => Ok(json!(web_proxy_status_json(&state).await)),
+        "get_proxy_takeover_status" => Ok(json!(web_proxy_takeover_status_json(&state).await)),
         "is_proxy_running" => Ok(json!(true)),
-        "is_live_takeover_active" => Ok(json!(false)),
+        "is_live_takeover_active" => Ok(json!(web_is_live_takeover_active(&state).await)),
         "update_global_proxy_config" => {
             let input = web_upstream_proxy_input(&args)?;
             let response =

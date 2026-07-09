@@ -334,6 +334,8 @@ export interface Settings {
   commonConfigConfirmed?: boolean;
   // OAuth 额度自动刷新间隔（分钟，默认 30）
   oauthQuotaRefreshIntervalMinutes?: number;
+  // OAuth 额度刷新请求超时（秒，默认 10）
+  oauthQuotaRefreshTimeoutSeconds?: number;
   // 首选语言（可选，默认中文）
   language?: "en" | "zh" | "zh-TW" | "ja";
 

@@ -582,6 +582,11 @@ impl ServerStateInner {
         ui_settings::oauth_quota_refresh_interval_ms(&store)
     }
 
+    pub(crate) async fn oauth_quota_refresh_timeout_ms(&self) -> i64 {
+        let store = self.ui_settings.read().await;
+        ui_settings::oauth_quota_refresh_timeout_ms(&store)
+    }
+
     pub(crate) fn emit_oauth_quota_updated_event(&self, account: &Account, success: bool) {
         self.emit_event(
             ServerEvent::new("oauth-quota-updated", "quota")
@@ -1389,12 +1394,14 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
     }
 
     let http_client = state.http_client().await;
+    let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
     match refresh_account_quota(
         &http_client,
         &active_account,
         now,
         false,
         success_cooldown_ms,
+        timeout_ms,
     )
     .await
     {

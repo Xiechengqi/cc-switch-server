@@ -22,6 +22,7 @@ export const SERVER_DEFAULT_SETTINGS: Settings = {
   autoSyncConfirmed: true,
   commonConfigConfirmed: false,
   oauthQuotaRefreshIntervalMinutes: 30,
+  oauthQuotaRefreshTimeoutSeconds: 10,
   language: "zh",
   visibleApps: {
     claude: true,

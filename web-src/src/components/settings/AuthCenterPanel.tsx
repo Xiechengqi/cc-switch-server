@@ -1,10 +1,9 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Github, ShieldCheck, Sparkles as SparklesIcon } from "lucide-react";
+import { ChevronDown, Github, ShieldCheck, Sparkles as SparklesIcon } from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -14,6 +13,11 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   ClaudeIcon,
   CodexIcon,
@@ -31,9 +35,12 @@ import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection"
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { settingsApi } from "@/lib/api";
 import { useSettingsQuery } from "@/lib/query";
+import { cn } from "@/lib/utils";
 import {
   DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES,
+  DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS,
   getOauthQuotaRefreshIntervalMinutes,
+  getOauthQuotaRefreshTimeoutSeconds,
 } from "@/lib/query/oauthQuotaRefresh";
 
 interface AuthProviderAccordionItemProps {
@@ -80,14 +87,23 @@ export function AuthCenterPanel() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { data: settings } = useSettingsQuery();
+  const [centerOpen, setCenterOpen] = useState(false);
   const currentRefreshInterval = getOauthQuotaRefreshIntervalMinutes(settings);
+  const currentRefreshTimeout = getOauthQuotaRefreshTimeoutSeconds(settings);
   const [refreshIntervalInput, setRefreshIntervalInput] = useState(
     String(DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES),
+  );
+  const [refreshTimeoutInput, setRefreshTimeoutInput] = useState(
+    String(DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS),
   );
 
   useEffect(() => {
     setRefreshIntervalInput(String(currentRefreshInterval));
   }, [currentRefreshInterval]);
+
+  useEffect(() => {
+    setRefreshTimeoutInput(String(currentRefreshTimeout));
+  }, [currentRefreshTimeout]);
 
   const parsedRefreshIntervalValue = Number(refreshIntervalInput);
   const parsedRefreshInterval =
@@ -97,7 +113,52 @@ export function AuthCenterPanel() {
       ? parsedRefreshIntervalValue
       : null;
 
-  const handleSaveRefreshInterval = async () => {
+  const parsedRefreshTimeoutValue = Number(refreshTimeoutInput);
+  const parsedRefreshTimeout =
+    Number.isFinite(parsedRefreshTimeoutValue) &&
+    Number.isInteger(parsedRefreshTimeoutValue) &&
+    parsedRefreshTimeoutValue >= 1 &&
+    parsedRefreshTimeoutValue <= 120
+      ? parsedRefreshTimeoutValue
+      : null;
+
+  const hasQuotaSettingChanges = useMemo(
+    () =>
+      parsedRefreshInterval !== currentRefreshInterval ||
+      parsedRefreshTimeout !== currentRefreshTimeout,
+    [
+      currentRefreshInterval,
+      currentRefreshTimeout,
+      parsedRefreshInterval,
+      parsedRefreshTimeout,
+    ],
+  );
+
+  const centerSubtitle = useMemo(
+    () =>
+      t("settings.authCenter.quotaSettingsSummary", {
+        interval: currentRefreshInterval,
+        timeout: currentRefreshTimeout,
+        defaultValue: "间隔 {{interval}} 分钟 · 超时 {{timeout}} 秒",
+      }),
+    [currentRefreshInterval, currentRefreshTimeout, t],
+  );
+
+  const invalidateQuotaQueries = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["settings"] }),
+      queryClient.invalidateQueries({ queryKey: ["subscription", "quota"] }),
+      queryClient.invalidateQueries({ queryKey: ["claude_oauth", "quota"] }),
+      queryClient.invalidateQueries({ queryKey: ["codex_oauth", "quota"] }),
+      queryClient.invalidateQueries({
+        queryKey: ["google_gemini_oauth", "quota"],
+      }),
+      queryClient.invalidateQueries({ queryKey: ["kiro_oauth", "quota"] }),
+      queryClient.invalidateQueries({ queryKey: ["copilot", "quota"] }),
+    ]);
+  };
+
+  const handleSaveQuotaSettings = async () => {
     if (!settings) {
       return;
     }
@@ -110,26 +171,26 @@ export function AuthCenterPanel() {
       setRefreshIntervalInput(String(currentRefreshInterval));
       return;
     }
+    if (parsedRefreshTimeout == null) {
+      toast.error(
+        t("settings.authCenter.quotaRefreshTimeoutInvalid", {
+          defaultValue: "刷新超时必须是 1-120 之间的整数秒",
+        }),
+      );
+      setRefreshTimeoutInput(String(currentRefreshTimeout));
+      return;
+    }
 
     const { webdavSync: _, ...rest } = settings;
     await settingsApi.save({
       ...rest,
       oauthQuotaRefreshIntervalMinutes: parsedRefreshInterval,
+      oauthQuotaRefreshTimeoutSeconds: parsedRefreshTimeout,
     });
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["settings"] }),
-      queryClient.invalidateQueries({ queryKey: ["subscription", "quota"] }),
-      queryClient.invalidateQueries({ queryKey: ["claude_oauth", "quota"] }),
-      queryClient.invalidateQueries({ queryKey: ["codex_oauth", "quota"] }),
-      queryClient.invalidateQueries({
-        queryKey: ["google_gemini_oauth", "quota"],
-      }),
-      queryClient.invalidateQueries({ queryKey: ["kiro_oauth", "quota"] }),
-      queryClient.invalidateQueries({ queryKey: ["copilot", "quota"] }),
-    ]);
+    await invalidateQuotaQueries();
     toast.success(
-      t("settings.authCenter.quotaRefreshIntervalSaved", {
-        defaultValue: "用量刷新间隔已保存",
+      t("settings.authCenter.quotaSettingsSaved", {
+        defaultValue: "OAuth 用量刷新设置已保存",
       }),
     );
   };
@@ -141,76 +202,128 @@ export function AuthCenterPanel() {
       transition={{ duration: 0.3 }}
       className="space-y-4"
     >
-      <section className="rounded-xl border border-border/60 bg-card/60 p-6">
-        <div className="flex items-start justify-between gap-4">
-          <div className="space-y-2">
-            <div className="flex items-center gap-2">
-              <ShieldCheck className="h-5 w-5 text-primary" />
-              <h3 className="text-base font-semibold">
-                {t("settings.authCenter.title", {
-                  defaultValue: "OAuth 认证中心",
-                })}
-              </h3>
-            </div>
-            <p className="text-sm text-muted-foreground">
-              {t("settings.authCenter.description", {
-                defaultValue:
-                  "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
-              })}
-            </p>
+      <Collapsible open={centerOpen} onOpenChange={setCenterOpen}>
+        <div className="rounded-xl border border-border bg-card/50 transition-colors hover:bg-muted/50">
+          <div className="flex items-center justify-between gap-4 p-4">
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 items-center gap-3 text-left"
+              >
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
+                  <ShieldCheck className="h-4 w-4 text-primary" />
+                </div>
+                <div className="min-w-0 space-y-1">
+                  <p className="text-sm font-medium leading-none">
+                    {t("settings.authCenter.title", {
+                      defaultValue: "OAuth 认证中心",
+                    })}
+                  </p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {centerSubtitle}
+                  </p>
+                </div>
+                <ChevronDown
+                  className={cn(
+                    "h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+                    centerOpen && "rotate-180",
+                  )}
+                />
+              </button>
+            </CollapsibleTrigger>
           </div>
-          <Badge variant="secondary">
-            {t("settings.authCenter.beta", { defaultValue: "Beta" })}
-          </Badge>
-        </div>
 
-        <div className="mt-5 rounded-lg border border-border/50 bg-background/60 p-4">
-          <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-            <div className="space-y-2">
-              <Label htmlFor="oauth-quota-refresh-interval">
-                {t("settings.authCenter.quotaRefreshIntervalTitle", {
-                  defaultValue: "用量刷新间隔",
-                })}
-              </Label>
-              <p className="max-w-2xl text-sm text-muted-foreground">
-                {t("settings.authCenter.quotaRefreshIntervalDescription", {
+          <CollapsibleContent>
+            <div className="space-y-5 border-t border-border/50 px-4 pb-4 pt-4">
+              <p className="text-sm text-muted-foreground">
+                {t("settings.authCenter.description", {
                   defaultValue:
-                    "控制 OAuth 账号 5h / 7day 用量进度条的自动刷新频率，仅当前激活供应商会自动轮询。",
+                    "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
                 })}
               </p>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2 rounded-lg border border-border/50 bg-background/60 p-4">
+                  <Label htmlFor="oauth-quota-refresh-interval">
+                    {t("settings.authCenter.quotaRefreshIntervalTitle", {
+                      defaultValue: "用量刷新间隔",
+                    })}
+                  </Label>
+                  <p className="text-sm text-muted-foreground">
+                    {t("settings.authCenter.quotaRefreshIntervalDescription", {
+                      defaultValue:
+                        "控制 OAuth 账号 5h / 7day 用量进度条的自动刷新频率，仅当前激活供应商会自动轮询。",
+                    })}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      id="oauth-quota-refresh-interval"
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={refreshIntervalInput}
+                      onChange={(event) =>
+                        setRefreshIntervalInput(event.currentTarget.value)
+                      }
+                      className="w-24"
+                      disabled={!settings}
+                    />
+                    <span className="text-sm text-muted-foreground">
+                      {t("settings.authCenter.quotaRefreshIntervalMinutes", {
+                        defaultValue: "分钟",
+                      })}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="space-y-2 rounded-lg border border-border/50 bg-background/60 p-4">
+                  <Label htmlFor="oauth-quota-refresh-timeout">
+                    {t("settings.authCenter.quotaRefreshTimeoutTitle", {
+                      defaultValue: "用量刷新超时",
+                    })}
+                  </Label>
+                  <p className="text-sm text-muted-foreground">
+                    {t("settings.authCenter.quotaRefreshTimeoutDescription", {
+                      defaultValue:
+                        "单次 OAuth 用量刷新请求的最大等待时间，超时后会按失败冷却策略重试。",
+                    })}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      id="oauth-quota-refresh-timeout"
+                      type="number"
+                      min={1}
+                      max={120}
+                      step={1}
+                      value={refreshTimeoutInput}
+                      onChange={(event) =>
+                        setRefreshTimeoutInput(event.currentTarget.value)
+                      }
+                      className="w-24"
+                      disabled={!settings}
+                    />
+                    <span className="text-sm text-muted-foreground">
+                      {t("settings.authCenter.quotaRefreshTimeoutSeconds", {
+                        defaultValue: "秒",
+                      })}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex justify-end border-t border-border/50 pt-4">
+                <Button
+                  type="button"
+                  onClick={() => void handleSaveQuotaSettings()}
+                  disabled={!settings || !hasQuotaSettingChanges}
+                >
+                  {t("common.save", { defaultValue: "保存" })}
+                </Button>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <Input
-                id="oauth-quota-refresh-interval"
-                type="number"
-                min={1}
-                step={1}
-                value={refreshIntervalInput}
-                onChange={(event) =>
-                  setRefreshIntervalInput(event.currentTarget.value)
-                }
-                className="w-24"
-                disabled={!settings}
-              />
-              <span className="text-sm text-muted-foreground">
-                {t("settings.authCenter.quotaRefreshIntervalMinutes", {
-                  defaultValue: "分钟",
-                })}
-              </span>
-              <Button
-                type="button"
-                size="sm"
-                onClick={handleSaveRefreshInterval}
-                disabled={
-                  !settings || parsedRefreshInterval === currentRefreshInterval
-                }
-              >
-                {t("common.save", { defaultValue: "保存" })}
-              </Button>
-            </div>
-          </div>
+          </CollapsibleContent>
         </div>
-      </section>
+      </Collapsible>
 
       <Accordion type="multiple" defaultValue={[]} className="w-full space-y-4">
         <AuthProviderAccordionItem

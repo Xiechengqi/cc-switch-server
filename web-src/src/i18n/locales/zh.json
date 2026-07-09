@@ -425,6 +425,12 @@
       "quotaRefreshIntervalMinutes": "分钟",
       "quotaRefreshIntervalInvalid": "刷新间隔必须是大于等于 1 的整数分钟",
       "quotaRefreshIntervalSaved": "用量刷新间隔已保存",
+      "quotaRefreshTimeoutTitle": "用量刷新超时",
+      "quotaRefreshTimeoutDescription": "单次 OAuth 用量刷新请求的最大等待时间，超时后会按失败冷却策略重试。",
+      "quotaRefreshTimeoutSeconds": "秒",
+      "quotaRefreshTimeoutInvalid": "刷新超时必须是 1-120 之间的整数秒",
+      "quotaSettingsSummary": "间隔 {{interval}} 分钟 · 超时 {{timeout}} 秒",
+      "quotaSettingsSaved": "OAuth 用量刷新设置已保存",
       "copilotDescription": "管理 GitHub Copilot 账号",
       "codexOauthDescription": "管理 ChatGPT 账号"
     },
@@ -2603,6 +2609,8 @@
       "disabled": "{{app}} 路由已关闭",
       "failed": "切换路由状态失败: {{detail}}",
       "alwaysEnabled": "已启用",
+      "pendingProvider": "待 provider",
+      "pendingHint": "路由已就绪，但部分应用还没有 provider。添加 provider 后会自动启用路由。",
       "recovering": "恢复中",
       "tooltip": {
         "active": "{{appLabel}} 路由中 - {{address}}:{{port}}\n切换该应用供应商为热切换",

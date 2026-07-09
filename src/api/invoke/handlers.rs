@@ -1311,7 +1311,69 @@ pub(in crate::api) fn web_global_proxy_config_json(state: &ServerState) -> Value
     })
 }
 
-pub(in crate::api) fn web_proxy_status_json(state: &ServerState) -> Value {
+pub(in crate::api) async fn web_proxy_takeover_status_json(state: &ServerState) -> Value {
+    let providers = state.providers.read().await;
+    let ui_settings = state.ui_settings.read().await.for_frontend();
+
+    fn app_takeover(
+        providers: &crate::domain::providers::store::ProviderStore,
+        ui_settings: &Value,
+        app: AppKind,
+    ) -> (bool, bool) {
+        let has_provider =
+            live_import::resolve_current_provider_id(providers, ui_settings, app).is_some();
+        // Server-native routing is always on for the three core apps.
+        (has_provider, !has_provider)
+    }
+
+    let (claude, claude_pending) = app_takeover(&providers, &ui_settings, AppKind::Claude);
+    let (codex, codex_pending) = app_takeover(&providers, &ui_settings, AppKind::Codex);
+    let (gemini, gemini_pending) = app_takeover(&providers, &ui_settings, AppKind::Gemini);
+
+    json!({
+        "claude": claude,
+        "codex": codex,
+        "gemini": gemini,
+        "opencode": false,
+        "openclaw": false,
+        "hermes": false,
+        "claude_pending": claude_pending,
+        "codex_pending": codex_pending,
+        "gemini_pending": gemini_pending,
+    })
+}
+
+pub(in crate::api) async fn web_is_live_takeover_active(state: &ServerState) -> bool {
+    let status = web_proxy_takeover_status_json(state).await;
+    ["claude", "codex", "gemini"]
+        .into_iter()
+        .any(|app| status.get(app).and_then(Value::as_bool).unwrap_or(false))
+}
+
+pub(in crate::api) async fn web_proxy_status_json(state: &ServerState) -> Value {
+    let providers = state.providers.read().await;
+    let ui_settings = state.ui_settings.read().await.for_frontend();
+    let mut active_targets = Vec::new();
+    for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+        let Some(provider_id) =
+            live_import::resolve_current_provider_id(&providers, &ui_settings, app)
+        else {
+            continue;
+        };
+        let Some(stored) = providers
+            .providers
+            .iter()
+            .find(|provider| provider.app == app && provider.provider.id == provider_id)
+        else {
+            continue;
+        };
+        active_targets.push(json!({
+            "app_type": app.as_str(),
+            "provider_id": provider_id,
+            "provider_name": stored.provider.name,
+        }));
+    }
+
     json!({
         "running": true,
         "address": state.bind_addr.ip().to_string(),
@@ -1321,13 +1383,13 @@ pub(in crate::api) fn web_proxy_status_json(state: &ServerState) -> Value {
         "success_requests": 0,
         "failed_requests": 0,
         "success_rate": 100.0,
-        "uptime_seconds": 0,
-        "current_provider": Value::Null,
-        "current_provider_id": Value::Null,
+        "uptime_seconds": state.started_at.elapsed().as_secs(),
+        "current_provider": active_targets.first().and_then(|target| target.get("provider_name")).cloned().unwrap_or(Value::Null),
+        "current_provider_id": active_targets.first().and_then(|target| target.get("provider_id")).cloned().unwrap_or(Value::Null),
         "last_request_at": Value::Null,
         "last_error": Value::Null,
         "failover_count": 0,
-        "active_targets": [],
+        "active_targets": active_targets,
     })
 }
 

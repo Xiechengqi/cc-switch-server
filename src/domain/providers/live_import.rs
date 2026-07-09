@@ -43,6 +43,34 @@ pub fn has_current_provider_setting(ui_settings: &Value, app: AppKind) -> bool {
         .is_some()
 }
 
+/// Resolve the effective current provider id for routing UI, matching
+/// `get_current_provider` invoke semantics.
+pub fn resolve_current_provider_id(
+    store: &ProviderStore,
+    ui_settings: &Value,
+    app: AppKind,
+) -> Option<String> {
+    let provider_exists = |id: &str| {
+        store
+            .providers
+            .iter()
+            .any(|provider| provider.app == app && provider.provider.id == id)
+    };
+    if has_current_provider_setting(ui_settings, app) {
+        read_current_provider_id(ui_settings, app).filter(|id| provider_exists(id))
+    } else {
+        read_current_provider_id(ui_settings, app)
+            .filter(|id| provider_exists(id))
+            .or_else(|| {
+                store
+                    .list(Some(app))
+                    .into_iter()
+                    .next()
+                    .map(|provider| provider.provider.id)
+            })
+    }
+}
+
 pub fn has_non_official_seed_provider(store: &ProviderStore, app: AppKind) -> bool {
     store
         .list(Some(app))
@@ -391,5 +419,47 @@ mod tests {
         assert!(config.contains("model = \"gpt-5.5\""));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_current_provider_id_falls_back_to_first_sorted_provider() {
+        let ui_settings = json!({});
+        let mut store = ProviderStore::default();
+        store.upsert(
+            AppKind::Claude,
+            Provider {
+                id: "p1".to_string(),
+                name: "first".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+        );
+        assert_eq!(
+            resolve_current_provider_id(&store, &ui_settings, AppKind::Claude).as_deref(),
+            Some("p1")
+        );
+    }
+
+    #[test]
+    fn resolve_current_provider_id_respects_explicit_clear_without_fallback() {
+        let ui_settings = json!({ "currentProviderClaude": "" });
+        let mut store = ProviderStore::default();
+        store.upsert(
+            AppKind::Claude,
+            Provider {
+                id: "p1".to_string(),
+                name: "first".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+        );
+        assert_eq!(
+            resolve_current_provider_id(&store, &ui_settings, AppKind::Claude),
+            None
+        );
     }
 }

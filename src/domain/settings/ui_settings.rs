@@ -11,6 +11,7 @@ use crate::domain::sharing::share_router_domain::{
 
 const UI_SETTINGS_FILE_NAME: &str = "ui-settings.json";
 pub const DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES: u64 = 30;
+pub const DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct UiSettingsStore {
@@ -91,6 +92,26 @@ pub fn default_oauth_quota_refresh_interval_ms() -> i64 {
     DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES as i64 * 60 * 1000
 }
 
+pub fn oauth_quota_refresh_timeout_seconds_from_value(value: &Value) -> u64 {
+    value
+        .get("oauthQuotaRefreshTimeoutSeconds")
+        .and_then(Value::as_u64)
+        .filter(|seconds| (1..=120).contains(seconds))
+        .unwrap_or(DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS)
+}
+
+pub fn oauth_quota_refresh_timeout_seconds(store: &UiSettingsStore) -> u64 {
+    oauth_quota_refresh_timeout_seconds_from_value(&store.for_frontend())
+}
+
+pub fn oauth_quota_refresh_timeout_ms(store: &UiSettingsStore) -> i64 {
+    oauth_quota_refresh_timeout_seconds(store) as i64 * 1000
+}
+
+pub fn default_oauth_quota_refresh_timeout_ms() -> i64 {
+    DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS as i64 * 1000
+}
+
 pub fn default_ui_settings() -> Value {
     json!({
         "showInTray": false,
@@ -113,6 +134,7 @@ pub fn default_ui_settings() -> Value {
         "autoSyncConfirmed": true,
         "commonConfigConfirmed": false,
         "oauthQuotaRefreshIntervalMinutes": 30,
+        "oauthQuotaRefreshTimeoutSeconds": 10,
         "language": "zh",
         "visibleApps": {
             "claude": true,
@@ -295,6 +317,25 @@ mod tests {
         assert_eq!(
             oauth_quota_refresh_interval_minutes_from_value(&json!(0)),
             DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES
+        );
+    }
+
+    #[test]
+    fn oauth_quota_refresh_timeout_reads_settings_or_default() {
+        let store = UiSettingsStore {
+            value: json!({ "oauthQuotaRefreshTimeoutSeconds": 20 }),
+        };
+        assert_eq!(oauth_quota_refresh_timeout_seconds(&store), 20);
+        assert_eq!(oauth_quota_refresh_timeout_ms(&store), 20_000);
+
+        let store = UiSettingsStore::default();
+        assert_eq!(
+            oauth_quota_refresh_timeout_seconds(&store),
+            DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            oauth_quota_refresh_timeout_seconds_from_value(&json!(0)),
+            DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS
         );
     }
 

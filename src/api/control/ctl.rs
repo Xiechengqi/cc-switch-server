@@ -333,7 +333,17 @@ pub(crate) async fn refresh_share_usage_item(
     }
 
     let http_client = state.http_client().await;
-    match refresh_account_quota(&http_client, &active_account, now, true, interval_ms).await {
+    let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
+    match refresh_account_quota(
+        &http_client,
+        &active_account,
+        now,
+        true,
+        interval_ms,
+        timeout_ms,
+    )
+    .await
+    {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
             let updated = state
                 .mutate_accounts_debounced(|accounts| {

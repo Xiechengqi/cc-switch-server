@@ -421,6 +421,12 @@
       "quotaRefreshIntervalMinutes": "min",
       "quotaRefreshIntervalInvalid": "Refresh interval must be an integer greater than or equal to 1 minute",
       "quotaRefreshIntervalSaved": "Usage refresh interval saved",
+      "quotaRefreshTimeoutTitle": "Usage Refresh Timeout",
+      "quotaRefreshTimeoutDescription": "Maximum wait time for a single OAuth usage refresh request. After a timeout, the server retries using the failure cooldown policy.",
+      "quotaRefreshTimeoutSeconds": "sec",
+      "quotaRefreshTimeoutInvalid": "Refresh timeout must be an integer between 1 and 120 seconds",
+      "quotaSettingsSummary": "Interval {{interval}} min · timeout {{timeout}} sec",
+      "quotaSettingsSaved": "OAuth usage refresh settings saved",
       "copilotDescription": "Manage GitHub Copilot accounts",
       "codexOauthDescription": "Manage ChatGPT accounts"
     },
@@ -2599,6 +2605,8 @@
       "disabled": "{{app}} routing disabled",
       "failed": "Failed to toggle routing: {{detail}}",
       "alwaysEnabled": "Enabled",
+      "pendingProvider": "Awaiting provider",
+      "pendingHint": "Routing is ready, but some apps do not have a provider yet. Routing activates automatically after you add one.",
       "recovering": "Recovering",
       "tooltip": {
         "active": "{{appLabel}} is routing - {{address}}:{{port}}\nSwitch provider for hot switching",

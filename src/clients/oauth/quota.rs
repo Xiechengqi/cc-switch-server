@@ -12,6 +12,10 @@ use crate::domain::providers::model::ProviderType;
 
 pub const QUOTA_FAILURE_COOLDOWN_MS: i64 = 2 * 60 * 1000;
 
+fn quota_request_timeout(timeout_ms: i64) -> Duration {
+    Duration::from_millis(timeout_ms.clamp(1_000, 120_000) as u64)
+}
+
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -114,6 +118,7 @@ pub async fn refresh_account_quota(
     now_ms: i64,
     force: bool,
     success_cooldown_ms: i64,
+    request_timeout_ms: i64,
 ) -> Result<QuotaRefreshResult, QuotaRefreshFailure> {
     if !force {
         if let Some(next_refresh_at) = account.quota_next_refresh_at {
@@ -126,18 +131,22 @@ pub async fn refresh_account_quota(
         }
     }
 
+    let request_timeout = quota_request_timeout(request_timeout_ms);
     let update = match account.provider_type {
         ProviderType::CodexOAuth => {
-            refresh_codex_quota(http, account, now_ms, success_cooldown_ms).await?
+            refresh_codex_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
         }
         ProviderType::ClaudeOAuth => {
-            refresh_claude_quota(http, account, now_ms, success_cooldown_ms).await?
+            refresh_claude_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
+                .await?
         }
         ProviderType::GeminiCli => {
-            refresh_gemini_quota(http, account, now_ms, success_cooldown_ms).await?
+            refresh_gemini_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
+                .await?
         }
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
-            refresh_antigravity_quota(http, account, now_ms, success_cooldown_ms).await?
+            refresh_antigravity_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
+                .await?
         }
         ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
@@ -146,7 +155,8 @@ pub async fn refresh_account_quota(
             refresh_imported_snapshot_quota(account, now_ms, success_cooldown_ms)?
         }
         ProviderType::OllamaCloud => {
-            refresh_ollama_cloud_quota(http, account, now_ms, success_cooldown_ms).await?
+            refresh_ollama_cloud_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
+                .await?
         }
         provider_type => {
             return Err(QuotaRefreshFailure::bad_request(format!(
@@ -167,6 +177,7 @@ async fn refresh_codex_quota(
     account: &Account,
     now_ms: i64,
     success_cooldown_ms: i64,
+    request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let account_id = codex_account_id(account);
@@ -175,7 +186,7 @@ async fn refresh_codex_quota(
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(USER_AGENT, "codex-cli")
         .header(ACCEPT, "application/json")
-        .timeout(Duration::from_secs(15));
+        .timeout(request_timeout);
     if let Some(account_id) = account_id.as_deref() {
         request = request.header("ChatGPT-Account-Id", account_id);
     }
@@ -190,9 +201,15 @@ async fn refresh_codex_quota(
         .filter(|value| !value.is_empty());
     let usage_plan_label = usage_plan_type.as_deref().map(format_chatgpt_plan_label);
     let account_lookup =
-        fetch_chatgpt_account_lookup(http, access_token, account_id.as_deref()).await;
-    let subscription_lookup =
-        fetch_chatgpt_subscription_lookup(http, access_token, account_id.as_deref()).await;
+        fetch_chatgpt_account_lookup(http, access_token, account_id.as_deref(), request_timeout)
+            .await;
+    let subscription_lookup = fetch_chatgpt_subscription_lookup(
+        http,
+        access_token,
+        account_id.as_deref(),
+        request_timeout,
+    )
+    .await;
     let subscription = merge_subscription_lookup(account_lookup, subscription_lookup);
     let subscription_level = subscription
         .as_ref()
@@ -235,6 +252,7 @@ async fn refresh_claude_quota(
     account: &Account,
     now_ms: i64,
     success_cooldown_ms: i64,
+    request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let usage_request = http
@@ -245,10 +263,10 @@ async fn refresh_claude_quota(
         .header("accept-language", "*")
         .header(USER_AGENT, "claude-cli/2.1.2 (external, cli)")
         .header("x-app", "cli")
-        .timeout(Duration::from_secs(10));
+        .timeout(request_timeout);
     let (body, plan_label) = tokio::join!(
         request_json(account.provider_type, usage_request, now_ms),
-        fetch_claude_plan_label(http, access_token),
+        fetch_claude_plan_label(http, access_token, request_timeout),
     );
     let body = body?;
     let quota = parse_claude_quota(&body, plan_label, now_ms);
@@ -267,6 +285,7 @@ async fn refresh_gemini_quota(
     account: &Account,
     now_ms: i64,
     success_cooldown_ms: i64,
+    request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let load_request = http
@@ -279,7 +298,7 @@ async fn refresh_gemini_quota(
                 "pluginType": "GEMINI"
             }
         }))
-        .timeout(Duration::from_secs(15));
+        .timeout(request_timeout);
     let load_body = request_json(account.provider_type, load_request, now_ms).await?;
     let load: GeminiLoadCodeAssistResponse = serde_json::from_value(load_body.clone())
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
@@ -303,7 +322,7 @@ async fn refresh_gemini_quota(
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/json")
         .json(&quota_body)
-        .timeout(Duration::from_secs(15));
+        .timeout(request_timeout);
     let body = request_json(account.provider_type, quota_request, now_ms).await?;
     let quota_response: GeminiQuotaResponse = serde_json::from_value(body.clone())
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
@@ -323,6 +342,7 @@ async fn refresh_antigravity_quota(
     account: &Account,
     now_ms: i64,
     success_cooldown_ms: i64,
+    request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let metadata = antigravity_code_assist_metadata();
@@ -332,7 +352,7 @@ async fn refresh_antigravity_quota(
         .header(CONTENT_TYPE, "application/json")
         .header("client-metadata", metadata.to_string())
         .json(&json!({ "metadata": metadata }))
-        .timeout(Duration::from_secs(15));
+        .timeout(request_timeout);
     let load_body = request_json(account.provider_type, load_request, now_ms).await?;
     let load: GeminiLoadCodeAssistResponse = serde_json::from_value(load_body.clone())
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
@@ -362,7 +382,7 @@ async fn refresh_antigravity_quota(
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/json")
         .json(&quota_body)
-        .timeout(Duration::from_secs(15));
+        .timeout(request_timeout);
     let body = request_json(account.provider_type, quota_request, now_ms).await?;
     let quota_response: GeminiQuotaResponse = serde_json::from_value(body.clone())
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
@@ -410,6 +430,7 @@ async fn refresh_ollama_cloud_quota(
     account: &Account,
     now_ms: i64,
     success_cooldown_ms: i64,
+    request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let token = account
         .api_key
@@ -424,7 +445,7 @@ async fn refresh_ollama_cloud_quota(
         .post(OLLAMA_ME_URL)
         .header(AUTHORIZATION, format!("Bearer {token}"))
         .header(CONTENT_TYPE, "application/json")
-        .timeout(Duration::from_secs(15));
+        .timeout(request_timeout);
     let body = request_json(account.provider_type, request, now_ms).await?;
     Ok(parse_ollama_me_update(&body, now_ms, success_cooldown_ms))
 }
@@ -1005,7 +1026,11 @@ fn parse_cursor_imported_quota(
     })
 }
 
-async fn fetch_claude_plan_label(http: &reqwest::Client, access_token: &str) -> Option<String> {
+async fn fetch_claude_plan_label(
+    http: &reqwest::Client,
+    access_token: &str,
+    request_timeout: Duration,
+) -> Option<String> {
     let response = http
         .get(CLAUDE_PROFILE_URL)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
@@ -1014,7 +1039,7 @@ async fn fetch_claude_plan_label(http: &reqwest::Client, access_token: &str) -> 
         .header("accept-language", "*")
         .header(USER_AGENT, "claude-cli/2.1.2 (external, cli)")
         .header("x-app", "cli")
-        .timeout(Duration::from_secs(10))
+        .timeout(request_timeout)
         .send()
         .await
         .ok()?;
@@ -1031,6 +1056,7 @@ async fn fetch_chatgpt_account_lookup(
     http: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
+    request_timeout: Duration,
 ) -> Option<ChatGptSubscriptionLookup> {
     let response = http
         .get(CHATGPT_ACCOUNTS_CHECK_URL)
@@ -1038,7 +1064,7 @@ async fn fetch_chatgpt_account_lookup(
         .header("Origin", "https://chatgpt.com")
         .header("Referer", "https://chatgpt.com/")
         .header(ACCEPT, "application/json")
-        .timeout(Duration::from_secs(15))
+        .timeout(request_timeout)
         .send()
         .await
         .ok()?;
@@ -1053,6 +1079,7 @@ async fn fetch_chatgpt_subscription_lookup(
     http: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
+    request_timeout: Duration,
 ) -> Option<ChatGptSubscriptionLookup> {
     let account_id = account_id
         .map(str::trim)
@@ -1064,7 +1091,7 @@ async fn fetch_chatgpt_subscription_lookup(
         .header("Origin", "https://chatgpt.com")
         .header("Referer", "https://chatgpt.com/")
         .header(ACCEPT, "application/json")
-        .timeout(Duration::from_secs(15))
+        .timeout(request_timeout)
         .send()
         .await
         .ok()?;

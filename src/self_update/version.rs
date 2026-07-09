@@ -21,10 +21,29 @@ pub const BINARY_ROLLBACK_PATH: &str = "/tmp/cc-switch-server.bak";
 pub const SERVICE_LOG_PATH: &str = "/var/log/cc-switch-server.log";
 const GITHUB_LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/Xiechengqi/cc-switch-server/releases/tags/latest";
+const GITHUB_REPO_API: &str = "https://api.github.com/repos/Xiechengqi/cc-switch-server";
 
 #[derive(Debug, Deserialize)]
 struct GithubLatestRelease {
+    tag_name: String,
     target_commitish: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubGitRef {
+    object: GithubGitObject,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubGitObject {
+    sha: String,
+    #[serde(rename = "type")]
+    object_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubAnnotatedTag {
+    object: GithubGitObject,
 }
 
 pub fn release_binary_url() -> &'static str {
@@ -54,7 +73,10 @@ pub struct ServiceStatus {
 }
 
 pub fn service_cc_switch_started() -> bool {
-    let output = match Command::new("service").args([SERVICE_NAME, "status"]).output() {
+    let output = match Command::new("service")
+        .args([SERVICE_NAME, "status"])
+        .output()
+    {
         Ok(output) => output,
         Err(_) => return false,
     };
@@ -160,6 +182,19 @@ pub async fn fetch_latest_release_meta(client: &reqwest::Client) -> LatestReleas
 }
 
 async fn fetch_latest_release_commit(client: &reqwest::Client) -> Result<String, String> {
+    let release = fetch_latest_release(client).await?;
+    if is_commit_sha(&release.target_commitish) {
+        return Ok(normalize_commit_id(&release.target_commitish));
+    }
+    match resolve_release_tag_commit(client, &release.tag_name).await {
+        Ok(commit_id) => Ok(commit_id),
+        Err(tag_err) => resolve_branch_head_commit(client, &release.target_commitish)
+            .await
+            .map_err(|branch_err| format!("{tag_err}; {branch_err}")),
+    }
+}
+
+async fn fetch_latest_release(client: &reqwest::Client) -> Result<GithubLatestRelease, String> {
     let response = client
         .get(GITHUB_LATEST_RELEASE_API)
         .header("User-Agent", "cc-switch-server/0.1 release-check")
@@ -171,15 +206,110 @@ async fn fetch_latest_release_commit(client: &reqwest::Client) -> Result<String,
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    let release = response
+    response
         .json::<GithubLatestRelease>()
         .await
+        .map_err(|err| err.to_string())
+}
+
+async fn resolve_release_tag_commit(
+    client: &reqwest::Client,
+    tag_name: &str,
+) -> Result<String, String> {
+    let tag_name = tag_name.trim();
+    if tag_name.is_empty() {
+        return Err("latest release is missing tag name".into());
+    }
+    let url = format!("{GITHUB_REPO_API}/git/ref/tags/{tag_name}");
+    let response = client
+        .get(url)
+        .header("User-Agent", "cc-switch-server/0.1 release-check")
+        .header("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
         .map_err(|err| err.to_string())?;
-    let commit_id = release.target_commitish.trim().to_string();
-    if commit_id.is_empty() {
+    if !response.status().is_success() {
+        return Err(format!("resolve release tag HTTP {}", response.status()));
+    }
+    let git_ref = response
+        .json::<GithubGitRef>()
+        .await
+        .map_err(|err| err.to_string())?;
+    match git_ref.object.object_type.as_str() {
+        "commit" => Ok(normalize_commit_id(&git_ref.object.sha)),
+        "tag" => resolve_annotated_tag_commit(client, &git_ref.object.sha).await,
+        other => Err(format!("unsupported git ref object type: {other}")),
+    }
+}
+
+async fn resolve_annotated_tag_commit(
+    client: &reqwest::Client,
+    tag_object_sha: &str,
+) -> Result<String, String> {
+    let url = format!("{GITHUB_REPO_API}/git/tags/{tag_object_sha}");
+    let response = client
+        .get(url)
+        .header("User-Agent", "cc-switch-server/0.1 release-check")
+        .header("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("resolve annotated tag HTTP {}", response.status()));
+    }
+    let tag = response
+        .json::<GithubAnnotatedTag>()
+        .await
+        .map_err(|err| err.to_string())?;
+    if tag.object.object_type != "commit" {
+        return Err(format!(
+            "annotated tag does not point to commit: {}",
+            tag.object.object_type
+        ));
+    }
+    Ok(normalize_commit_id(&tag.object.sha))
+}
+
+async fn resolve_branch_head_commit(
+    client: &reqwest::Client,
+    branch: &str,
+) -> Result<String, String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
         return Err("latest release is missing target commit".into());
     }
-    Ok(commit_id)
+    let url = format!("{GITHUB_REPO_API}/commits/{branch}");
+    let response = client
+        .get(url)
+        .header("User-Agent", "cc-switch-server/0.1 release-check")
+        .header("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("resolve branch head HTTP {}", response.status()));
+    }
+    #[derive(Debug, Deserialize)]
+    struct GithubCommitHead {
+        sha: String,
+    }
+    let commit = response
+        .json::<GithubCommitHead>()
+        .await
+        .map_err(|err| err.to_string())?;
+    if commit.sha.trim().is_empty() {
+        return Err("resolved branch head is empty".into());
+    }
+    Ok(normalize_commit_id(&commit.sha))
+}
+
+fn is_commit_sha(value: &str) -> bool {
+    let trimmed = value.trim();
+    let len = trimmed.len();
+    (7..=40).contains(&len) && trimmed.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn normalize_commit_id(value: &str) -> String {
@@ -294,5 +424,13 @@ mod tests {
             commit_short_from_id("AABBCCDDEEFF001122334455"),
             "aabbccddeeff"
         );
+    }
+
+    #[test]
+    fn is_commit_sha_accepts_hex_and_rejects_branch_names() {
+        assert!(is_commit_sha("1584084a73cf3cc4c8ffec9260ac9a2e2e4f1419"));
+        assert!(is_commit_sha("1584084"));
+        assert!(!is_commit_sha("main"));
+        assert!(!is_commit_sha("latest"));
     }
 }

@@ -722,7 +722,17 @@ pub(in crate::api) async fn account_quota(
     }
 
     let http_client = state.http_client().await;
-    match refresh_account_quota(&http_client, &active_account, now, force, interval_ms).await {
+    let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
+    match refresh_account_quota(
+        &http_client,
+        &active_account,
+        now,
+        force,
+        interval_ms,
+        timeout_ms,
+    )
+    .await
+    {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
             let account = state
                 .try_mutate_accounts_immediate(|store| {
