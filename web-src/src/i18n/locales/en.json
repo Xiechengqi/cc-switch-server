@@ -473,6 +473,8 @@
       "upgradeFailed": "Upgrade failed. Check the upgrade logs.",
       "restartScheduled": "Restart scheduled. Waiting for the service to come back…",
       "checkUpdateAvailable": "Current version is {{current}}, latest version is {{latest}}. Click Upgrade to install ({{size}}).",
+      "versionCardUpToDate": "Already on the latest version {{current}}",
+      "versionCardUpdateAvailable": "Current version {{current}} -> latest version {{latest}}",
       "checkUpdateAvailableShort": "Current {{current}} → latest {{latest}}",
       "checkUpdateAvailableHint": "Current version is {{current}}, latest version is {{latest}}. Package size is about {{size}}.",
       "checkUpdateUpToDate": "Already on the latest version ({{current}}).",

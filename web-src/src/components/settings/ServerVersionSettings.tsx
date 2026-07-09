@@ -131,6 +131,39 @@ function formatBytes(bytes?: number | null): string {
   return mib >= 1 ? `${mib.toFixed(1)} MiB` : `${(bytes / 1024).toFixed(1)} KiB`;
 }
 
+function formatCommitLabel(
+  commitId?: string | null,
+  commitShort?: string | null,
+): string {
+  return commitShort?.trim() || commitId?.trim() || "--";
+}
+
+function buildVersionCardSubtitle(
+  info: AdminVersionInfo | null,
+  t: (key: string, options?: Record<string, string>) => string,
+): string {
+  if (!info?.commitId) {
+    return "--";
+  }
+  const current = formatCommitLabel(info.commitId, info.commitShort);
+  const latest = formatCommitLabel(
+    info.latest?.commitId,
+    info.latest?.commitShort,
+  );
+
+  if (info.latest?.commitId && info.latest.updateAvailable && latest !== "--") {
+    return t("settings.serverVersion.versionCardUpdateAvailable", {
+      current,
+      latest,
+      defaultValue: "当前版本 {{current}} -> 最新版本 {{latest}}",
+    });
+  }
+  return t("settings.serverVersion.versionCardUpToDate", {
+    current,
+    defaultValue: "已是最新版本 {{current}}",
+  });
+}
+
 async function pollHealthAndReload(maxAttempts = 60) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
@@ -160,7 +193,6 @@ export function ServerVersionSettings() {
   const [upgradeOutcome, setUpgradeOutcome] = useState<UpgradeOutcome>(null);
   const [usingBuildInfoFallback, setUsingBuildInfoFallback] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [updateChecked, setUpdateChecked] = useState(false);
   const streamRef = useRef<EventSource | null>(null);
   const logEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -362,44 +394,16 @@ export function ServerVersionSettings() {
   const upgradeDisabled =
     busy !== null || loading || info?.upgradeCapable === false;
 
-  const formatCommitLabel = (commitId?: string | null, commitShort?: string | null) =>
-    commitShort?.trim() || commitId?.trim() || "--";
-
-  const currentCommitLabel = formatCommitLabel(info?.commitId, info?.commitShort);
-  const latestCommitLabel = formatCommitLabel(
-    info?.latest?.commitId,
-    info?.latest?.commitShort,
+  const showUpdateCompareSubtitle = Boolean(
+    info?.latest?.commitId && info?.latest?.updateAvailable,
   );
-  const showUpdateCompareSubtitle =
-    updateChecked && Boolean(info?.latest?.updateAvailable);
 
   const cardSubtitle = useMemo(() => {
-    if (loading) {
+    if (loading && !info) {
       return t("common.loading");
     }
-    if (showUpdateCompareSubtitle) {
-      return t("settings.serverVersion.checkUpdateAvailableShort", {
-        current: currentCommitLabel,
-        latest: latestCommitLabel,
-      });
-    }
-    if (updateChecked) {
-      return t("settings.serverVersion.currentVersionOnly", {
-        current: currentCommitLabel,
-        defaultValue: "当前 {{current}}",
-      });
-    }
-    return info?.versionLine || info?.version || "--";
-  }, [
-    currentCommitLabel,
-    info?.version,
-    info?.versionLine,
-    latestCommitLabel,
-    loading,
-    showUpdateCompareSubtitle,
-    t,
-    updateChecked,
-  ]);
+    return buildVersionCardSubtitle(info, t);
+  }, [info, loading, t]);
 
   const handleCheckUpdate = useCallback(async () => {
     if (busy || checkingUpdate) return;
@@ -409,7 +413,6 @@ export function ServerVersionSettings() {
       setInfo(adminInfo);
       setUsingBuildInfoFallback(false);
       writeAdminVersionInfoCache(adminInfo);
-      setUpdateChecked(true);
 
       const { latest } = adminInfo;
       const currentCommit = formatCommitLabel(

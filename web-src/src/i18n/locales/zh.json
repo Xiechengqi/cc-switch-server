@@ -477,6 +477,8 @@
       "upgradeFailed": "升级失败，请查看升级日志",
       "restartScheduled": "已安排重启，正在等待服务恢复…",
       "checkUpdateAvailable": "当前版本是 {{current}}，最新版本是 {{latest}}，可点击「升级」安装（{{size}}）",
+      "versionCardUpToDate": "已是最新版本 {{current}}",
+      "versionCardUpdateAvailable": "当前版本 {{current}} -> 最新版本 {{latest}}",
       "checkUpdateAvailableShort": "当前 {{current}} → 最新 {{latest}}",
       "checkUpdateAvailableHint": "当前版本是 {{current}}，最新版本是 {{latest}}。安装包大小约 {{size}}。",
       "checkUpdateUpToDate": "当前已是最新版本（{{current}}）",
