@@ -388,6 +388,7 @@
       "pendingRestart": "待重启",
       "restart": "重启",
       "empty": "暂无版本信息",
+      "adminFallbackHint": "当前仅显示基础版本信息；在线升级需服务端支持 /api/admin/version。",
       "upgradeUnavailable": "当前进程无法写入安装路径，升级功能不可用（常见于开发模式或未以安装用户运行）。",
       "upgradeConfirmTitle": "确认升级",
       "upgradeConfirmMessage": "将从 GitHub Release 下载最新 cc-switch-server 二进制并替换当前安装。",

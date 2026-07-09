@@ -9,6 +9,7 @@ import {
 import { motion } from "framer-motion";
 import {
   Loader2,
+  LogOut,
   Save,
   FolderSearch,
   Database,
@@ -335,6 +336,20 @@ export function SettingsPage({
                       <>
                         <ServerSecuritySettings onSignOut={onSignOut} />
                         <ServerVersionSettings />
+                        {onSignOut ? (
+                          <div className="flex justify-end">
+                            <Button
+                              type="button"
+                              className="bg-red-600 text-white hover:bg-red-700"
+                              onClick={() => onSignOut()}
+                            >
+                              <LogOut className="mr-2 h-4 w-4" />
+                              {t("settings.serverSecurity.signOut", {
+                                defaultValue: "登出",
+                              })}
+                            </Button>
+                          </div>
+                        ) : null}
                       </>
                     )}
                   </motion.div>

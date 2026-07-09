@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import { readToken } from "@/lib/runtime";
 import {
   loadAdminVersionInfo,
+  loadBuildInfo,
   restartServerService,
   startServerUpgrade,
   type AdminVersionInfo,
@@ -69,14 +70,41 @@ export function ServerVersionSettings() {
   const [restartConfirmOpen, setRestartConfirmOpen] = useState(false);
   const [upgradeLogOpen, setUpgradeLogOpen] = useState(false);
   const [upgradeLogs, setUpgradeLogs] = useState<string[]>([]);
+  const [usingBuildInfoFallback, setUsingBuildInfoFallback] = useState(false);
   const streamRef = useRef<EventSource | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      setInfo(await loadAdminVersionInfo());
-    } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : String(reason));
+      const adminInfo = await loadAdminVersionInfo();
+      setInfo(adminInfo);
+      setUsingBuildInfoFallback(false);
+    } catch {
+      try {
+        const build = await loadBuildInfo();
+        setInfo({
+          ...build,
+          binaryPath: "",
+          rollbackPath: "",
+          rollbackAvailable: false,
+          uptimeSecs: 0,
+          restartPending: false,
+          upgradeCapable: false,
+          service: {
+            manager: "nohup",
+            active: true,
+          },
+          latest: {
+            binaryUrl: "",
+            available: false,
+          },
+        });
+        setUsingBuildInfoFallback(true);
+      } catch (reason) {
+        setInfo(null);
+        setUsingBuildInfoFallback(false);
+        toast.error(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
       setLoading(false);
     }
@@ -300,10 +328,15 @@ export function ServerVersionSettings() {
               </pre>
               {info && !info.upgradeCapable ? (
                 <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
-                  {t("settings.serverVersion.upgradeUnavailable", {
-                    defaultValue:
-                      "当前进程无法写入安装路径，升级功能不可用（常见于开发模式或未以安装用户运行）。",
-                  })}
+                  {usingBuildInfoFallback
+                    ? t("settings.serverVersion.adminFallbackHint", {
+                        defaultValue:
+                          "当前仅显示基础版本信息；在线升级需服务端支持 /api/admin/version。",
+                      })
+                    : t("settings.serverVersion.upgradeUnavailable", {
+                        defaultValue:
+                          "当前进程无法写入安装路径，升级功能不可用（常见于开发模式或未以安装用户运行）。",
+                      })}
                 </p>
               ) : null}
             </div>

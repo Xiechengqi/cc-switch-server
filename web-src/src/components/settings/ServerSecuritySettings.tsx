@@ -1,5 +1,5 @@
 import { FormEvent, useState } from "react";
-import { Loader2, LogOut, Shield } from "lucide-react";
+import { Loader2, Shield } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -100,21 +100,6 @@ export function ServerSecuritySettings({ onSignOut }: ServerSecuritySettingsProp
           </Button>
         </div>
       </form>
-
-      {onSignOut ? (
-        <div className="flex justify-end">
-          <Button
-            type="button"
-            className="bg-red-600 text-white hover:bg-red-700"
-            onClick={() => onSignOut()}
-          >
-            <LogOut className="mr-2 h-4 w-4" />
-            {t("settings.serverSecurity.signOut", {
-              defaultValue: "登出",
-            })}
-          </Button>
-        </div>
-      ) : null}
     </section>
   );
 }
