@@ -1,7 +1,7 @@
 use std::process::{Command, Stdio};
 
 use crate::self_update::version::{
-    detect_service_status, ServiceManager, SelfUpdateError, BINARY_INSTALL_PATH, SERVICE_LOG_PATH,
+    detect_service_status, SelfUpdateError, ServiceManager, BINARY_INSTALL_PATH, SERVICE_LOG_PATH,
     SERVICE_UNIT,
 };
 

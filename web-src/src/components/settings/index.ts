@@ -25,7 +25,6 @@ export {
   TunnelSettingsPanel,
 } from "./SettingsConnectionPanels";
 export {
-  AboutPanel,
   DirectoryPanel,
   SettingsOverviewStrip,
   SettingsReadinessPanel,

@@ -1,6 +1,5 @@
 import {
   Activity,
-  BarChart3,
   Check,
   Copy,
   Edit,
@@ -29,11 +28,11 @@ interface ProviderActionsProps {
   isProxyTakeover?: boolean;
   isOmo?: boolean;
   onSwitch: () => void;
+  onClearCurrent?: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
   onTestLink?: () => void;
   onTestModel?: () => void;
-  onConfigureUsage?: () => void;
   onDelete: () => void;
   onRemoveFromConfig?: () => void;
   onDisableOmo?: () => void;
@@ -74,11 +73,11 @@ export function ProviderActions({
   isProxyTakeover = false,
   isOmo = false,
   onSwitch,
+  onClearCurrent,
   onEdit,
   onDuplicate,
   onTestLink,
   onTestModel,
-  onConfigureUsage,
   onDelete,
   onRemoveFromConfig,
   onDisableOmo,
@@ -129,6 +128,8 @@ export function ProviderActions({
       }
     } else if (isFailoverMode) {
       onToggleFailover(!isInFailoverQueue);
+    } else if (isCurrent) {
+      onClearCurrent?.();
     } else {
       onSwitch();
     }
@@ -202,12 +203,17 @@ export function ProviderActions({
 
     if (isCurrent) {
       return {
-        disabled: true,
+        disabled: !onClearCurrent,
         variant: "secondary" as const,
         className:
           "bg-gray-200 text-muted-foreground hover:bg-gray-200 hover:text-muted-foreground dark:bg-gray-700 dark:hover:bg-gray-700",
         icon: <Check className="h-4 w-4" />,
         text: t("provider.inUse"),
+        title: onClearCurrent
+          ? t("provider.clickToClearCurrent", {
+              defaultValue: "点击取消启用",
+            })
+          : undefined,
       };
     }
 
@@ -423,20 +429,6 @@ export function ProviderActions({
           ) : (
             <Activity className="h-4 w-4" />
           )}
-        </Button>
-
-        <Button
-          size="icon"
-          variant="ghost"
-          onClick={onConfigureUsage || undefined}
-          title={t("provider.configureUsage")}
-          className={cn(
-            iconButtonClass,
-            !onConfigureUsage &&
-              "opacity-40 cursor-not-allowed text-muted-foreground",
-          )}
-        >
-          <BarChart3 className="h-4 w-4" />
         </Button>
 
         {onOpenTerminal && (

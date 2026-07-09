@@ -86,7 +86,11 @@ import {
   ProviderAdvancedConfig,
   type PricingModelSourceOption,
 } from "./ProviderAdvancedConfig";
-import { ProviderShareSection } from "@/components/providers/ProviderShareSection";
+import {
+  ProviderSharePlaceholder,
+  ProviderShareSection,
+} from "@/components/providers/ProviderShareSection";
+import { isShareableApp } from "@/hooks/useProviderShare";
 import {
   useProviderCategory,
   useApiKeyState,
@@ -131,7 +135,8 @@ import {
 import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
-import { PROVIDER_TYPES, TEMPLATE_TYPES } from "@/config/constants";
+import { PROVIDER_TYPES } from "@/config/constants";
+import { detectCodingPlanProvider } from "@/config/codingPlanProviders";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
 
 const isAntigravityFamilyType = (providerType?: string | null) =>
@@ -1012,8 +1017,7 @@ function ProviderFormFull({
       currentProviderType === PROVIDER_TYPES.CLAUDE_OAUTH ||
       currentProviderType === PROVIDER_TYPES.CURSOR_OAUTH ||
       currentProviderType === PROVIDER_TYPES.KIRO_OAUTH ||
-      initialData?.meta?.usage_script?.templateType ===
-        TEMPLATE_TYPES.TOKEN_PLAN);
+      detectCodingPlanProvider(baseUrl) !== null);
   const isManagedOauthNameReadOnly =
     currentProviderType === PROVIDER_TYPES.GITHUB_COPILOT ||
     isOpenAIOAuthProviderType(currentProviderType) ||
@@ -3350,6 +3354,8 @@ function ProviderFormFull({
               providerName={form.watch("name") || providerId}
               onOpenShareSettings={onOpenShareSettings}
             />
+          ) : isShareableApp(appId) ? (
+            <ProviderSharePlaceholder />
           ) : null}
 
           {showButtons && (

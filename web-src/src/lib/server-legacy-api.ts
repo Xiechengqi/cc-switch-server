@@ -979,6 +979,10 @@ export async function switchProvider(app: AppKind, id: string): Promise<void> {
   await invokeCommand("switch_provider", { app, id });
 }
 
+export async function clearCurrentProvider(app: AppKind): Promise<void> {
+  await invokeCommand("clear_current_provider", { app });
+}
+
 export async function updateProvidersSortOrder(
   app: AppKind,
   updates: ProviderSortUpdate[],
@@ -1403,11 +1407,15 @@ export async function loadSettingsPageData(): Promise<SettingsPageData> {
 }
 
 export async function loadBuildInfo(): Promise<BuildInfo> {
-  return jsonFetch<BuildInfo>("/version");
+  return invokeCommand<BuildInfo>("get_build_info");
 }
 
 export async function loadAdminVersionInfo(): Promise<AdminVersionInfo> {
-  return jsonFetch<AdminVersionInfo>("/api/admin/version");
+  try {
+    return await invokeCommand<AdminVersionInfo>("get_admin_version_info");
+  } catch {
+    return jsonFetch<AdminVersionInfo>("/api/admin/version");
+  }
 }
 
 export async function restartServerService(): Promise<void> {

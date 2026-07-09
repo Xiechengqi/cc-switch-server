@@ -5,19 +5,17 @@ import { useTranslation } from "react-i18next";
 import { providersApi, settingsApi, openclawApi, type AppId } from "@/lib/api";
 import type {
   Provider,
-  UsageScript,
   OpenClawProviderConfig,
   OpenClawDefaultModel,
 } from "@/types";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
-import { injectCodingPlanUsageScript } from "@/config/codingPlanProviders";
 import {
   useAddProviderMutation,
   useUpdateProviderMutation,
   useDeleteProviderMutation,
   useSwitchProviderMutation,
+  useClearCurrentProviderMutation,
 } from "@/lib/query";
-import { usageKeys } from "@/lib/query/usage";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { openclawKeys } from "@/hooks/useOpenClaw";
 
@@ -37,6 +35,7 @@ export function useProviderActions(
   const updateProviderMutation = useUpdateProviderMutation(activeApp);
   const deleteProviderMutation = useDeleteProviderMutation(activeApp);
   const switchProviderMutation = useSwitchProviderMutation(activeApp);
+  const clearCurrentProviderMutation = useClearCurrentProviderMutation(activeApp);
 
   // Claude 插件同步逻辑
   const syncClaudePlugin = useCallback(
@@ -75,8 +74,7 @@ export function useProviderActions(
         ensureClaudeDesktopOfficialSeed?: boolean;
       },
     ) => {
-      const enhanced = injectCodingPlanUsageScript(activeApp, provider);
-      await addProviderMutation.mutateAsync(enhanced);
+      await addProviderMutation.mutateAsync(provider);
 
       // OpenClaw: register models to allowlist after adding provider
       if (activeApp === "openclaw" && provider.suggestedDefaults) {
@@ -191,54 +189,27 @@ export function useProviderActions(
     [switchProviderMutation, syncClaudePlugin, activeApp, t],
   );
 
+  // 取消当前供应商（Claude/Codex/Gemini 互斥模式）
+  const clearCurrentProvider = useCallback(async () => {
+    try {
+      await clearCurrentProviderMutation.mutateAsync();
+      toast.success(
+        t("notifications.clearCurrentSuccess", {
+          defaultValue: "已取消启用",
+        }),
+        { closeButton: true },
+      );
+    } catch {
+      // 错误提示由 mutation 处理
+    }
+  }, [clearCurrentProviderMutation, t]);
+
   // 删除供应商
   const deleteProvider = useCallback(
     async (id: string) => {
       await deleteProviderMutation.mutateAsync(id);
     },
     [deleteProviderMutation],
-  );
-
-  // 保存用量脚本
-  const saveUsageScript = useCallback(
-    async (provider: Provider, script: UsageScript) => {
-      try {
-        const updatedProvider: Provider = {
-          ...provider,
-          meta: {
-            ...provider.meta,
-            usage_script: script,
-          },
-        };
-
-        await providersApi.update(updatedProvider, activeApp);
-        await queryClient.invalidateQueries({
-          queryKey: ["providers", activeApp],
-        });
-        // 🔧 保存用量脚本后，也应该失效该 provider 的用量查询缓存
-        // 这样主页列表会使用新配置重新查询，而不是使用测试时的缓存
-        await queryClient.invalidateQueries({
-          queryKey: usageKeys.script(provider.id, activeApp),
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["subscription", "quota", activeApp],
-        });
-        toast.success(
-          t("provider.usageSaved", {
-            defaultValue: "用量查询配置已保存",
-          }),
-          { closeButton: true },
-        );
-      } catch (error) {
-        const detail =
-          extractErrorMessage(error) ||
-          t("provider.usageSaveFailed", {
-            defaultValue: "用量查询配置保存失败",
-          });
-        toast.error(detail);
-      }
-    },
-    [activeApp, queryClient, t],
   );
 
   // Set provider as default model (OpenClaw only)
@@ -289,13 +260,14 @@ export function useProviderActions(
     addProvider,
     updateProvider,
     switchProvider,
+    clearCurrentProvider,
     deleteProvider,
-    saveUsageScript,
     setAsDefaultModel,
     isLoading:
       addProviderMutation.isPending ||
       updateProviderMutation.isPending ||
       deleteProviderMutation.isPending ||
-      switchProviderMutation.isPending,
+      switchProviderMutation.isPending ||
+      clearCurrentProviderMutation.isPending,
   };
 }

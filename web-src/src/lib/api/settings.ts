@@ -69,7 +69,35 @@ export const settingsApi = {
     packageVersion: string;
     releaseVersion: string;
   }> {
-    return await invokeCommand("get_build_info");
+    const info = await invokeCommand<{
+      version?: string;
+      versionLine?: string;
+      commitId?: string;
+      buildTime?: string;
+      commit?: string;
+      displayVersion?: string;
+      packageVersion?: string;
+      releaseVersion?: string;
+      channel?: string;
+    }>("get_build_info");
+    if (info.versionLine || info.commitId) {
+      return {
+        commit: info.commitId || "unknown",
+        buildTime: info.buildTime || "unknown",
+        channel: "server",
+        displayVersion: info.versionLine || info.version || "unknown",
+        packageVersion: info.version || "unknown",
+        releaseVersion: info.version || "unknown",
+      };
+    }
+    return {
+      commit: info.commit || "unknown",
+      buildTime: info.buildTime || "unknown",
+      channel: info.channel || "unknown",
+      displayVersion: info.displayVersion || info.packageVersion || "unknown",
+      packageVersion: info.packageVersion || "unknown",
+      releaseVersion: info.releaseVersion || info.packageVersion || "unknown",
+    };
   },
 
   async isPortable(): Promise<boolean> {

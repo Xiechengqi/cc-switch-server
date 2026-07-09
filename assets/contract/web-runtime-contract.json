@@ -641,10 +641,18 @@
     },
     {
       "name": "get_balance",
-      "support": "shim",
+      "support": "excluded",
+      "implemented": false,
+      "feature": "providers",
+      "notes": "Custom usage script removed from server; account quota uses refresh_oauth_quota."
+    },
+    {
+      "name": "get_admin_version_info",
+      "support": "native",
       "implemented": true,
       "feature": "settings",
-      "notes": "Server web runtime shim."
+      "endpoint": "GET /api/admin/version",
+      "notes": "Web invoke bridge for admin version/upgrade metadata; works on client tunnel where /api/admin/version may be unavailable."
     },
     {
       "name": "get_build_info",
@@ -745,10 +753,10 @@
     },
     {
       "name": "get_coding_plan_quota",
-      "support": "shim",
-      "implemented": true,
-      "feature": "settings",
-      "notes": "Server web runtime shim."
+      "support": "excluded",
+      "implemented": false,
+      "feature": "providers",
+      "notes": "Custom usage script removed from server; coding plan quota via account refresh."
     },
     {
       "name": "get_common_config_snippet",
@@ -771,7 +779,7 @@
       "implemented": true,
       "feature": "providers",
       "endpoint": "GET /api/providers?app=",
-      "notes": "Server has no live desktop config; first provider for app is exposed as the current provider shim."
+      "notes": "Returns stored current provider when ui_settings has currentProvider*; falls back to first provider only when the key is absent."
     },
     {
       "name": "get_custom_endpoints",
@@ -1246,10 +1254,10 @@
     },
     {
       "name": "queryProviderUsage",
-      "support": "shim",
-      "implemented": true,
+      "support": "excluded",
+      "implemented": false,
       "feature": "providers",
-      "notes": "Server web runtime shim."
+      "notes": "Custom usage script removed from server."
     },
     {
       "name": "read_live_provider_settings",
@@ -1576,6 +1584,13 @@
       "notes": "Server web runtime shim."
     },
     {
+      "name": "clear_current_provider",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Clears currentProvider* in ui_settings so no provider is active for the app."
+    },
+    {
       "name": "switch_provider",
       "support": "shim",
       "implemented": true,
@@ -1628,10 +1643,10 @@
     },
     {
       "name": "testUsageScript",
-      "support": "shim",
-      "implemented": true,
-      "feature": "localCliSessions",
-      "notes": "Server web runtime shim for desktop-synced UI."
+      "support": "excluded",
+      "implemented": false,
+      "feature": "providers",
+      "notes": "Custom usage script removed from server."
     },
     {
       "name": "transfer_share_owner",

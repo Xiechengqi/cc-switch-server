@@ -53,15 +53,13 @@ pub(in crate::api) struct UpgradeStreamQuery {
     access_token: Option<String>,
 }
 
-pub(in crate::api) async fn admin_version(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<AdminVersionResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+pub(in crate::api) async fn build_admin_version_response(
+    state: &ServerState,
+) -> AdminVersionResponse {
     let client = state.http_client().await;
     let latest = fetch_latest_release_meta(&client).await;
     let upgrade_capable = ensure_binary_writable().is_ok();
-    Ok(Json(AdminVersionResponse {
+    AdminVersionResponse {
         build: build_info(),
         binary_path: BINARY_INSTALL_PATH,
         rollback_path: BINARY_ROLLBACK_PATH,
@@ -71,7 +69,15 @@ pub(in crate::api) async fn admin_version(
         upgrade_capable,
         service: crate::self_update::version::detect_service_status(),
         latest,
-    }))
+    }
+}
+
+pub(in crate::api) async fn admin_version(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminVersionResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    Ok(Json(build_admin_version_response(&state).await))
 }
 
 pub(in crate::api) async fn admin_restart(
@@ -115,12 +121,7 @@ pub(in crate::api) async fn admin_upgrade_stream(
     headers: HeaderMap,
     Query(query): Query<UpgradeStreamQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    require_event_session(
-        &state,
-        &headers,
-        query.access_token.as_deref(),
-    )
-    .await?;
+    require_event_session(&state, &headers, query.access_token.as_deref()).await?;
 
     let handle = state
         .upgrade
@@ -209,9 +210,5 @@ async fn emit_done_if_finished(
         },
         "restartPending": *restart_pending.lock().await,
     });
-    Some(
-        Event::default()
-            .event("done")
-            .data(payload.to_string()),
-    )
+    Some(Event::default().event("done").data(payload.to_string()))
 }

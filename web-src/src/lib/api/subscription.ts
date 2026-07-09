@@ -46,22 +46,4 @@ export const subscriptionApi = {
       appType: appType || null,
       providerId: providerId || null,
     }),
-  getCodingPlanQuota: (
-    baseUrl: string,
-    apiKey: string,
-    // 火山方舟用账号 AK/SK 签名查询用量；其他供应商不传。
-    accessKeyId?: string,
-    secretAccessKey?: string,
-  ): Promise<SubscriptionQuota> =>
-    invokeCommand("get_coding_plan_quota", {
-      baseUrl,
-      apiKey,
-      accessKeyId,
-      secretAccessKey,
-    }),
-  getBalance: (
-    baseUrl: string,
-    apiKey: string,
-  ): Promise<import("@/types").UsageResult> =>
-    invokeCommand("get_balance", { baseUrl, apiKey }),
 };

@@ -1,6 +1,6 @@
-import { useMemo, useState, useEffect, useCallback } from "react";
+import { useMemo, useState, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { GripVertical, ChevronDown, ChevronUp } from "lucide-react";
+import { GripVertical } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type {
   DraggableAttributes,
@@ -13,7 +13,6 @@ import { PROVIDER_TYPES } from "@/config/constants";
 import { cn } from "@/lib/utils";
 import { ProviderActions } from "@/components/providers/ProviderActions";
 import { ProviderIcon } from "@/components/ProviderIcon";
-import UsageFooter from "@/components/UsageFooter";
 import SubscriptionQuotaFooter from "@/components/SubscriptionQuotaFooter";
 import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
@@ -23,7 +22,6 @@ import KiroOauthQuotaFooter from "@/components/KiroOauthQuotaFooter";
 import AntigravityOauthQuotaFooter from "@/components/AntigravityOauthQuotaFooter";
 import CursorOauthQuotaFooter from "@/components/CursorOauthQuotaFooter";
 import OllamaQuotaFooter from "@/components/OllamaQuotaFooter";
-import { TEMPLATE_TYPES } from "@/config/constants";
 import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
 import { FailoverPriorityBadge } from "@/components/providers/FailoverPriorityBadge";
@@ -38,7 +36,8 @@ import {
   isManagedOauthProvider,
 } from "@/utils/providerMetaUtils";
 import { useProviderHealth } from "@/lib/query/failover";
-import { useUsageQuery } from "@/lib/query/queries";
+import { useSettingsQuery } from "@/lib/query/queries";
+import { getOauthQuotaRefreshIntervalMinutes } from "@/lib/query/oauthQuotaRefresh";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { isShareableApp } from "@/hooks/useProviderShare";
 import { useToggleProviderShare } from "@/hooks/useToggleProviderShare";
@@ -62,12 +61,12 @@ interface ProviderCardProps {
   isOmo?: boolean;
   isOmoSlim?: boolean;
   onSwitch: (provider: Provider) => void;
+  onClearCurrent?: () => void;
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
   onRemoveFromConfig?: (provider: Provider) => void;
   onDisableOmo?: () => void;
   onDisableOmoSlim?: () => void;
-  onConfigureUsage: (provider: Provider) => void;
   onOpenWebsite: (url: string) => void;
   onDuplicate: (provider: Provider) => void;
   onTestLink?: (provider: Provider) => void;
@@ -219,12 +218,12 @@ export function ProviderCard({
   isOmo = false,
   isOmoSlim = false,
   onSwitch,
+  onClearCurrent,
   onEdit,
   onDelete,
   onRemoveFromConfig,
   onDisableOmo,
   onDisableOmoSlim,
-  onConfigureUsage,
   onOpenWebsite,
   onDuplicate,
   onTestLink,
@@ -318,48 +317,16 @@ export function ProviderCard({
     return true;
   }, [appId, provider, displayUrl, fallbackUrlText]);
 
-  const usageEnabled = provider.meta?.usage_script?.enabled ?? false;
   const isOfficial = isOfficialProvider(provider, appId);
   const isManagedOauth = isManagedOauthProvider(provider, appId);
   const supportsOfficialSubscription =
     isOfficial && ["claude", "codex", "gemini"].includes(appId);
-  const isOfficialSubscriptionUsage =
-    provider.meta?.usage_script?.templateType ===
-    TEMPLATE_TYPES.OFFICIAL_SUBSCRIPTION;
-  const officialSubscriptionEnabled =
-    supportsOfficialSubscription && usageEnabled && isOfficialSubscriptionUsage;
-  // Hermes v12+ overlay entries live under the `providers:` dict and are
-  // read-only here — writes have to go through Hermes Web UI.
+  const { data: settingsData } = useSettingsQuery();
+  const accountQuotaRefreshIntervalMinutes = getOauthQuotaRefreshIntervalMinutes(
+    settingsData,
+  );
   const isHermesReadOnly =
     appId === "hermes" && isHermesReadOnlyProvider(provider.settingsConfig);
-
-  // 获取用量数据以判断是否有多套餐
-  // 累加模式应用（OpenCode/OpenClaw/Hermes）：使用 isInConfig 代替 isCurrent
-  const shouldAutoQuery =
-    appId === "opencode" || appId === "openclaw" || appId === "hermes"
-      ? isInConfig
-      : isCurrent;
-  const autoQueryInterval = shouldAutoQuery
-    ? provider.meta?.usage_script?.autoQueryInterval || 0
-    : 0;
-
-  const { data: usage } = useUsageQuery(provider.id, appId, {
-    enabled: usageEnabled && !isOfficial && !isOfficialSubscriptionUsage,
-    autoQueryInterval,
-  });
-
-  const isTokenPlan =
-    provider.meta?.usage_script?.templateType === "token_plan";
-  const hasMultiplePlans =
-    usage?.success && usage.data && usage.data.length > 1 && !isTokenPlan;
-
-  const [isExpanded, setIsExpanded] = useState(false);
-
-  useEffect(() => {
-    if (hasMultiplePlans) {
-      setIsExpanded(true);
-    }
-  }, [hasMultiplePlans]);
 
   const handleOpenWebsite = () => {
     if (!isClickableUrl) {
@@ -594,59 +561,15 @@ export function ProviderCard({
                 isCurrent={isCurrent}
                 showInUse={showInUseTag}
               />
-            ) : isOfficial ? (
-              officialSubscriptionEnabled ? (
-                <SubscriptionQuotaFooter
-                  appId={appId}
-                  inline={true}
-                  isCurrent={isCurrent}
-                  showInUse={showInUseTag}
-                  autoQueryInterval={
-                    provider.meta?.usage_script?.autoQueryInterval ?? 0
-                  }
-                />
-              ) : null
-            ) : hasMultiplePlans ? (
-              <div className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
-                <span className="font-medium">
-                  {t("usage.multiplePlans", {
-                    count: usage?.data?.length || 0,
-                    defaultValue: `${usage?.data?.length || 0} 个套餐`,
-                  })}
-                </span>
-              </div>
-            ) : (
-              <UsageFooter
-                provider={provider}
-                providerId={provider.id}
+            ) : isOfficial && supportsOfficialSubscription && !isManagedOauth ? (
+              <SubscriptionQuotaFooter
                 appId={appId}
-                usageEnabled={usageEnabled}
+                inline={true}
                 isCurrent={isCurrent}
                 showInUse={showInUseTag}
-                isInConfig={isInConfig}
-                inline={true}
+                autoQueryInterval={accountQuotaRefreshIntervalMinutes}
               />
-            )}
-            {hasMultiplePlans && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setIsExpanded(!isExpanded);
-                }}
-                className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-gray-500 dark:text-gray-400 flex-shrink-0"
-                title={
-                  isExpanded
-                    ? t("usage.collapse", { defaultValue: "收起" })
-                    : t("usage.expand", { defaultValue: "展开" })
-                }
-              >
-                {isExpanded ? (
-                  <ChevronUp size={14} />
-                ) : (
-                  <ChevronDown size={14} />
-                )}
-              </button>
-            )}
+            ) : null}
           </div>
 
           <div className="flex justify-end opacity-0 pointer-events-none group-hover:opacity-100 group-focus-within:opacity-100 group-hover:pointer-events-auto group-focus-within:pointer-events-auto max-sm:opacity-100 max-sm:pointer-events-auto transition-opacity duration-200">
@@ -660,6 +583,7 @@ export function ProviderCard({
               isReadOnly={isHermesReadOnly}
               isOmo={isAnyOmo}
               onSwitch={() => onSwitch(provider)}
+              onClearCurrent={isCurrent ? onClearCurrent : undefined}
               onEdit={() => onEdit(provider)}
               onDuplicate={() => onDuplicate(provider)}
               onTestLink={
@@ -671,13 +595,6 @@ export function ProviderCard({
                 onTestModel && canTestModelProvider(provider, appId)
                   ? () => onTestModel(provider)
                   : undefined
-              }
-              onConfigureUsage={
-                (isOfficial && !supportsOfficialSubscription) ||
-                isManagedOauth ||
-                provider.meta?.providerType === PROVIDER_TYPES.OLLAMA_CLOUD
-                  ? undefined
-                  : () => onConfigureUsage(provider)
               }
               onDelete={() => onDelete(provider)}
               onRemoveFromConfig={
@@ -716,20 +633,6 @@ export function ProviderCard({
           </div>
         </div>
       </div>
-
-      {isExpanded && hasMultiplePlans && (
-        <div className="mt-4 pt-4 border-t border-border-default">
-          <UsageFooter
-            provider={provider}
-            providerId={provider.id}
-            appId={appId}
-            usageEnabled={usageEnabled}
-            isCurrent={isCurrent}
-            isInConfig={isInConfig}
-            inline={false}
-          />
-        </div>
-      )}
 
       <ConfirmDialog
         isOpen={shareDeleteConfirmOpen}

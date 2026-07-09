@@ -13,19 +13,6 @@ export const PROVIDER_TYPES = {
   OLLAMA_CLOUD: "ollama_cloud",
 } as const;
 
-// 用量脚本模板类型常量
-export const TEMPLATE_TYPES = {
-  CUSTOM: "custom",
-  GENERAL: "general",
-  NEW_API: "newapi",
-  GITHUB_COPILOT: "github_copilot",
-  TOKEN_PLAN: "token_plan",
-  BALANCE: "balance",
-  OFFICIAL_SUBSCRIPTION: "official_subscription",
-} as const;
-
-export type TemplateType = (typeof TEMPLATE_TYPES)[keyof typeof TEMPLATE_TYPES];
-
 // Temporary Codex Banked Reset campaign entry. Keep all UI gated by this flag so
 // the limited-time feature can be hidden before the isolated implementation is removed.
 export const ENABLE_CODEX_BANKED_RESET = true;

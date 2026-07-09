@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
+  Github,
+  Globe,
   Loader2,
   Package,
   RefreshCw,
@@ -24,6 +26,7 @@ import {
 } from "@/components/ui/dialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
+import { settingsApi } from "@/lib/api";
 import { readToken } from "@/lib/runtime";
 import {
   loadAdminVersionInfo,
@@ -33,15 +36,21 @@ import {
   type AdminVersionInfo,
 } from "@/lib/server-legacy-api";
 
+const SERVER_OFFICIAL_WEBSITE = "https://tokenswitch.cc";
+const SERVER_GITHUB_URL = "https://github.com/Xiechengqi/cc-switch-server";
+
 function formatVersionDetails(info: AdminVersionInfo): string {
   return [
     `${info.name} ${info.version}`,
     `commit id: ${info.commitId}`,
+    `commit short: ${info.commitShort}`,
     `commit message: ${info.commitMessage}`,
     `commit time: ${info.commitTime}`,
     `build time: ${info.buildTime}`,
     `target: ${info.target}`,
+    `profile: ${info.profile}`,
     `rustc: ${info.rustcVersion}`,
+    `dirty: ${info.dirty}`,
   ].join("\n");
 }
 
@@ -161,18 +170,10 @@ export function ServerVersionSettings() {
             restartPending?: boolean;
           };
           if (payload.status === "success" && payload.restartPending) {
-            toast.success(
-              t("settings.serverVersion.upgradePendingRestart", {
-                defaultValue: "升级完成，请点击「待重启」应用新版本",
-              }),
-            );
+            toast.success(t("settings.serverVersion.upgradePendingRestart"));
             void refresh();
           } else if (payload.status === "failed") {
-            toast.error(
-              t("settings.serverVersion.upgradeFailed", {
-                defaultValue: "升级失败，请查看升级日志",
-              }),
-            );
+            toast.error(t("settings.serverVersion.upgradeFailed"));
           }
         } catch {
           void refresh();
@@ -182,9 +183,7 @@ export function ServerVersionSettings() {
       source.onerror = () => {
         setUpgradeLogs((prev) => [
           ...prev,
-          t("settings.serverVersion.streamDisconnected", {
-            defaultValue: "升级日志流已断开",
-          }),
+          t("settings.serverVersion.streamDisconnected"),
         ]);
         closeUpgradeStream();
         setBusy(null);
@@ -218,11 +217,7 @@ export function ServerVersionSettings() {
     setBusy("restart");
     try {
       await restartServerService();
-      toast.success(
-        t("settings.serverVersion.restartScheduled", {
-          defaultValue: "已安排重启，正在等待服务恢复…",
-        }),
-      );
+      toast.success(t("settings.serverVersion.restartScheduled"));
       void pollHealthAndReload();
     } catch (reason) {
       toast.error(reason instanceof Error ? reason.message : String(reason));
@@ -249,13 +244,11 @@ export function ServerVersionSettings() {
                 </div>
                 <div className="min-w-0 space-y-1">
                   <p className="text-sm font-medium leading-none">
-                    {t("settings.serverVersion.title", {
-                      defaultValue: "当前版本",
-                    })}
+                    {t("settings.serverVersion.title")}
                   </p>
                   <p className="truncate text-xs text-muted-foreground">
                     {loading
-                      ? t("common.loading", { defaultValue: "加载中..." })
+                      ? t("common.loading")
                       : info?.versionLine || info?.version || "--"}
                   </p>
                 </div>
@@ -268,7 +261,27 @@ export function ServerVersionSettings() {
               </button>
             </CollapsibleTrigger>
 
-            <div className="flex shrink-0 items-center gap-2">
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-9 gap-1.5 text-xs"
+                onClick={() => void settingsApi.openExternal(SERVER_OFFICIAL_WEBSITE)}
+              >
+                <Globe className="h-3.5 w-3.5" />
+                {t("settings.officialWebsite")}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-9 gap-1.5 text-xs"
+                onClick={() => void settingsApi.openExternal(SERVER_GITHUB_URL)}
+              >
+                <Github className="h-3.5 w-3.5" />
+                {t("settings.github")}
+              </Button>
               <Button
                 type="button"
                 variant="outline"
@@ -276,7 +289,7 @@ export function ServerVersionSettings() {
                 className="h-9 w-9"
                 disabled={loading || busy !== null}
                 onClick={() => void refresh()}
-                title={t("common.refresh", { defaultValue: "刷新" })}
+                title={t("common.refresh")}
               >
                 <RefreshCw className="h-4 w-4" />
               </Button>
@@ -293,9 +306,7 @@ export function ServerVersionSettings() {
                   ) : (
                     <RotateCcw className="mr-2 h-4 w-4" />
                   )}
-                  {t("settings.serverVersion.pendingRestart", {
-                    defaultValue: "待重启",
-                  })}
+                  {t("settings.serverVersion.pendingRestart")}
                 </Button>
               ) : (
                 <Button
@@ -310,9 +321,7 @@ export function ServerVersionSettings() {
                   ) : (
                     <Rocket className="mr-2 h-4 w-4" />
                   )}
-                  {t("settings.serverVersion.upgrade", {
-                    defaultValue: "升级",
-                  })}
+                  {t("settings.serverVersion.upgrade")}
                 </Button>
               )}
             </div>
@@ -321,22 +330,13 @@ export function ServerVersionSettings() {
           <CollapsibleContent>
             <div className="border-t border-border/50 px-4 pb-4 pt-3">
               <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground">
-                {versionDetails ||
-                  t("settings.serverVersion.empty", {
-                    defaultValue: "暂无版本信息",
-                  })}
+                {versionDetails || t("settings.serverVersion.empty")}
               </pre>
               {info && !info.upgradeCapable ? (
                 <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
                   {usingBuildInfoFallback
-                    ? t("settings.serverVersion.adminFallbackHint", {
-                        defaultValue:
-                          "当前仅显示基础版本信息；在线升级需服务端支持 /api/admin/version。",
-                      })
-                    : t("settings.serverVersion.upgradeUnavailable", {
-                        defaultValue:
-                          "当前进程无法写入安装路径，升级功能不可用（常见于开发模式或未以安装用户运行）。",
-                      })}
+                    ? t("settings.serverVersion.adminFallbackHint")
+                    : t("settings.serverVersion.upgradeUnavailable")}
                 </p>
               ) : null}
             </div>
@@ -347,19 +347,10 @@ export function ServerVersionSettings() {
       <ConfirmDialog
         isOpen={upgradeConfirmOpen}
         variant="info"
-        title={t("settings.serverVersion.upgradeConfirmTitle", {
-          defaultValue: "确认升级",
-        })}
-        message={t("settings.serverVersion.upgradeConfirmMessage", {
-          defaultValue:
-            "将从 GitHub Release 下载最新 cc-switch-server 二进制并替换当前安装。",
-        })}
-        confirmText={t("settings.serverVersion.upgrade", {
-          defaultValue: "升级",
-        })}
-        checkboxLabel={t("settings.serverVersion.restartAfterUpgrade", {
-          defaultValue: "升级后立即重启",
-        })}
+        title={t("settings.serverVersion.upgradeConfirmTitle")}
+        message={t("settings.serverVersion.upgradeConfirmMessage")}
+        confirmText={t("settings.serverVersion.upgrade")}
+        checkboxLabel={t("settings.serverVersion.restartAfterUpgrade")}
         checkboxDefaultChecked
         onConfirm={(restartAfter) => void handleUpgrade(restartAfter)}
         onCancel={() => setUpgradeConfirmOpen(false)}
@@ -368,15 +359,9 @@ export function ServerVersionSettings() {
       <ConfirmDialog
         isOpen={restartConfirmOpen}
         variant="info"
-        title={t("settings.serverVersion.restartConfirmTitle", {
-          defaultValue: "确认重启",
-        })}
-        message={t("settings.serverVersion.restartConfirmMessage", {
-          defaultValue: "将重启 cc-switch-server 以应用已安装的新版本。",
-        })}
-        confirmText={t("settings.serverVersion.restart", {
-          defaultValue: "重启",
-        })}
+        title={t("settings.serverVersion.restartConfirmTitle")}
+        message={t("settings.serverVersion.restartConfirmMessage")}
+        confirmText={t("settings.serverVersion.restart")}
         onConfirm={() => void handleRestart()}
         onCancel={() => setRestartConfirmOpen(false)}
       />
@@ -385,9 +370,7 @@ export function ServerVersionSettings() {
         <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle>
-              {t("settings.serverVersion.upgradeLogTitle", {
-                defaultValue: "升级过程",
-              })}
+              {t("settings.serverVersion.upgradeLogTitle")}
             </DialogTitle>
           </DialogHeader>
           <div className="max-h-96 overflow-y-auto rounded-lg border bg-slate-950 p-4 font-mono text-xs text-slate-100">
@@ -399,9 +382,7 @@ export function ServerVersionSettings() {
               </div>
             ) : (
               <div className="text-slate-400">
-                {t("settings.serverVersion.waitingLogs", {
-                  defaultValue: "等待升级日志…",
-                })}
+                {t("settings.serverVersion.waitingLogs")}
               </div>
             )}
           </div>

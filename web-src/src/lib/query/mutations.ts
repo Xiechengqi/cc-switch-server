@@ -15,8 +15,6 @@ import { generateUUID } from "@/utils/uuid";
 import { openclawKeys } from "@/hooks/useOpenClaw";
 import { invalidateHermesProviderCaches } from "@/hooks/useHermes";
 import { PROVIDER_TYPES } from "@/config/constants";
-import { usageKeys } from "@/lib/query/usage";
-
 const isCursorApiKeyProvider = (
   provider: Provider | undefined,
 ): provider is Provider =>
@@ -200,14 +198,6 @@ export const useUpdateProviderMutation = (appId: AppId) => {
         appId,
         queryClient,
       );
-      await queryClient.invalidateQueries({
-        queryKey: usageKeys.script(provider.id, appId),
-      });
-      if (variables.originalId && variables.originalId !== provider.id) {
-        await queryClient.invalidateQueries({
-          queryKey: usageKeys.script(variables.originalId, appId),
-        });
-      }
       if (appId === "openclaw") {
         await queryClient.invalidateQueries({
           queryKey: openclawKeys.health,
@@ -373,6 +363,51 @@ export const useSwitchProviderMutation = (appId: AppId) => {
               navigator.clipboard?.writeText(detail).catch(() => undefined);
             },
           },
+        },
+      );
+    },
+  });
+};
+
+export const useClearCurrentProviderMutation = (appId: AppId) => {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: async (): Promise<SwitchResult> => {
+      return await providersApi.clearCurrent(appId);
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+      if (appId === "claude-desktop") {
+        await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
+        await queryClient.invalidateQueries({
+          queryKey: ["claudeDesktopStatus"],
+        });
+      }
+
+      try {
+        await providersApi.updateTrayMenu();
+      } catch (trayError) {
+        console.error(
+          "Failed to update tray menu after clearing current provider",
+          trayError,
+        );
+      }
+    },
+    onError: (error: Error) => {
+      const detail = extractErrorMessage(error) || t("common.unknown");
+
+      toast.error(
+        t("notifications.clearCurrentFailedTitle", {
+          defaultValue: "取消启用失败",
+        }),
+        {
+          description: t("notifications.clearCurrentFailed", {
+            defaultValue: "取消启用失败：{{error}}",
+            error: detail,
+          }),
+          duration: 6000,
         },
       );
     },

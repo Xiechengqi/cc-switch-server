@@ -37,6 +37,12 @@ pub fn read_current_provider_id(ui_settings: &Value, app: AppKind) -> Option<Str
         .map(str::to_string)
 }
 
+pub fn has_current_provider_setting(ui_settings: &Value, app: AppKind) -> bool {
+    ui_settings
+        .get(current_provider_settings_key(app))
+        .is_some()
+}
+
 pub fn has_non_official_seed_provider(store: &ProviderStore, app: AppKind) -> bool {
     store
         .list(Some(app))
@@ -297,6 +303,18 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::*;
     use crate::domain::providers::store::ProviderStore;
+
+    #[test]
+    fn has_current_provider_setting_detects_explicit_clear() {
+        let ui_settings = json!({ "currentProviderClaude": "" });
+        assert!(has_current_provider_setting(&ui_settings, AppKind::Claude));
+        assert_eq!(
+            read_current_provider_id(&ui_settings, AppKind::Claude),
+            None
+        );
+        let unset = json!({});
+        assert!(!has_current_provider_setting(&unset, AppKind::Claude));
+    }
 
     #[test]
     fn skips_import_when_non_seed_provider_exists() {

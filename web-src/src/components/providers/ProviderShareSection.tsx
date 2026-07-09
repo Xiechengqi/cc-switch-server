@@ -86,6 +86,45 @@ import {
   uniqueSortedEmails,
 } from "@/utils/shareFormUtils";
 
+/** Shown on the add-provider form before a provider id exists. */
+export function ProviderSharePlaceholder() {
+  const { t } = useTranslation();
+
+  return (
+    <div className="rounded-lg border border-dashed border-border/50 bg-muted/10">
+      <div className="flex items-center justify-between gap-4 p-4">
+        <div className="flex min-w-0 items-center gap-3">
+          <Share2 className="h-4 w-4 shrink-0 text-muted-foreground/70" />
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <span className="font-medium text-muted-foreground">
+              {t("provider.share.sectionTitle", { defaultValue: "远程分享" })}
+            </span>
+            <Badge variant="outline" className="text-muted-foreground">
+              {t("provider.share.addPageBadge", { defaultValue: "保存后可用" })}
+            </Badge>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2 opacity-50">
+          <Label
+            htmlFor="provider-share-placeholder"
+            className="text-sm text-muted-foreground"
+          >
+            {t("provider.share.enableShare", { defaultValue: "启用远程分享" })}
+          </Label>
+          <Switch id="provider-share-placeholder" checked={false} disabled />
+        </div>
+      </div>
+      <div className="border-t border-border/40 px-4 pb-4 pt-3">
+        <p className="text-sm text-muted-foreground">
+          {t("provider.share.addPagePlaceholder", {
+            defaultValue: "请先保存供应商；保存后重新打开编辑页即可配置远程分享。",
+          })}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 interface ProviderShareSectionProps {
   appId: AppId;
   providerId: string;

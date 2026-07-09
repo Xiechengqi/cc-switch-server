@@ -1,7 +1,7 @@
-import { FolderOpen, GitCommit, Info, Monitor, Moon, Palette, ShieldCheck, Sun } from "lucide-react";
+import { FolderOpen, Monitor, Moon, Palette, ShieldCheck, Sun } from "lucide-react";
 import type { ReactNode } from "react";
 
-import type { BuildInfo, SettingsPageData } from "@/lib/server-legacy-api";
+import type { SettingsPageData } from "@/lib/server-legacy-api";
 import type { WebRuntimeContext } from "@/lib/runtime";
 import { useI18n } from "@/lib/i18n";
 import { KeyValue } from "@/components/KeyValue";
@@ -83,52 +83,6 @@ export function DirectoryPanel({ runtimeContext }: { runtimeContext: WebRuntimeC
             <code>{joinPath(configDir, file)}</code>
           </div>
         ))}
-      </div>
-    </section>
-  );
-}
-
-export function AboutPanel({ buildInfo }: { buildInfo: BuildInfo }) {
-  const { tx } = useI18n();
-  const sourceUrl = buildInfo.commitId
-    ? `https://github.com/Xiechengqi/cc-switch-server/commit/${buildInfo.commitId}`
-    : "https://github.com/Xiechengqi/cc-switch-server";
-  return (
-    <section className="settings-card wide settings-about-card">
-      <SectionHeader
-        icon={<Info size={17} />}
-        title={tx("About")}
-        subtitle={buildInfo.versionLine || `${buildInfo.name} ${buildInfo.version}`}
-      />
-      <div className="settings-about-hero">
-        <div>
-          <strong>{tx("CC Switch Server")}</strong>
-          <span>{buildInfo.name}</span>
-        </div>
-        <StatusPill tone={buildInfo.dirty ? "warning" : "success"}>
-          {buildInfo.dirty ? tx("dirty build") : tx("clean build")}
-        </StatusPill>
-      </div>
-      <div className="settings-policy-grid">
-        <KeyValue label="version" value={buildInfo.version} />
-        <KeyValue label="commit" value={buildInfo.commitShort || "-"} />
-        <KeyValue label="commit time" value={buildInfo.commitTime || "-"} />
-        <KeyValue label="build time" value={buildInfo.buildTime || "-"} />
-        <KeyValue label="target" value={buildInfo.target || "-"} />
-        <KeyValue label="profile" value={buildInfo.profile || "-"} />
-        <KeyValue label="rustc" value={buildInfo.rustcVersion || "-"} />
-        <KeyValue label="dirty" value={buildInfo.dirty ? "yes" : "no"} />
-      </div>
-      <div className="settings-commit-card">
-        <div className="section-title-row compact-title">
-          <GitCommit size={16} />
-          <h3>{tx("Commit message")}</h3>
-        </div>
-        <p>{buildInfo.commitMessage || "-"}</p>
-        <a className="inline-link" href={sourceUrl} target="_blank" rel="noreferrer">
-          <GitCommit size={14} />
-          <span>{tx("Open source commit")}</span>
-        </a>
       </div>
     </section>
   );

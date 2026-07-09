@@ -147,8 +147,6 @@ export const usageKeys = {
   pricing: () => [...usageKeys.all, "pricing"] as const,
   limits: (providerId: string, appType: string) =>
     [...usageKeys.all, "limits", providerId, appType] as const,
-  script: (providerId: string, appType: string) =>
-    [...usageKeys.all, providerId, appType] as const,
 };
 
 /** 把 UI 侧的 "all" 哨兵归一成 undefined（后端语义：不过滤）。 */

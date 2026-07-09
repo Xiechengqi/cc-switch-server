@@ -44,6 +44,9 @@ async fn web_invoke_dispatch(
 ) -> Result<Value, ApiError> {
     match command {
         "get_build_info" => Ok(json!(build_info())),
+        "get_admin_version_info" => {
+            Ok(json!(crate::api::self_update::build_admin_version_response(state).await))
+        }
         "get_settings" => {
             let store = state.ui_settings.read().await;
             let config = state.config.read().await;
@@ -165,21 +168,28 @@ async fn web_invoke_dispatch(
             };
             let providers = state.providers.read().await;
             let ui_settings = state.ui_settings.read().await.for_frontend();
-            let current = live_import::read_current_provider_id(&ui_settings, app)
-                .filter(|id| {
-                    providers
-                        .providers
-                        .iter()
-                        .any(|provider| provider.app == app && provider.provider.id == *id)
-                })
-                .or_else(|| {
-                    providers
-                        .list(Some(app))
-                        .into_iter()
-                        .next()
-                        .map(|provider| provider.provider.id)
-                })
-                .unwrap_or_default();
+            let provider_exists = |id: &str| {
+                providers
+                    .providers
+                    .iter()
+                    .any(|provider| provider.app == app && provider.provider.id == id)
+            };
+            let current = if live_import::has_current_provider_setting(&ui_settings, app) {
+                live_import::read_current_provider_id(&ui_settings, app)
+                    .filter(|id| provider_exists(id))
+                    .unwrap_or_default()
+            } else {
+                live_import::read_current_provider_id(&ui_settings, app)
+                    .filter(|id| provider_exists(id))
+                    .or_else(|| {
+                        providers
+                            .list(Some(app))
+                            .into_iter()
+                            .next()
+                            .map(|provider| provider.provider.id)
+                    })
+                    .unwrap_or_default()
+            };
             Ok(json!(current))
         }
         "import_default_config" => {
@@ -249,6 +259,16 @@ async fn web_invoke_dispatch(
             state
                 .apply_ui_settings_patch_immediate(json!({
                     live_import::current_provider_settings_key(app): id
+                }))
+                .await
+                .map_err(ApiError::internal)?;
+            Ok(json!({ "warnings": [] }))
+        }
+        "clear_current_provider" => {
+            let app = web_arg_app(&args)?;
+            state
+                .apply_ui_settings_patch_immediate(json!({
+                    live_import::current_provider_settings_key(app): ""
                 }))
                 .await
                 .map_err(ApiError::internal)?;
@@ -1605,15 +1625,12 @@ async fn web_invoke_dispatch(
         "set_auto_launch" => Ok(Value::Null),
         "sync_current_providers_live" => Ok(json!({ "imported": 0, "warnings": [] })),
         "sync_session_usage" => Ok(Value::Null),
-        "testUsageScript" => Ok(json!({ "ok": true, "output": "" })),
-        "queryProviderUsage" => Ok(json!({ "logs": [], "summary": Value::Null })),
         "get_usage_data_sources" => Ok(json!(["server"])),
         "check_provider_limits" => Ok(json!({ "ok": true, "withinLimits": true })),
         "get_subscription_quota" => {
             let tool = web_arg_string_any(&args, &["tool"])?;
             Ok(web_subscription_quota(&state, &headers, &tool).await?)
         }
-        "get_coding_plan_quota" | "get_balance" => Ok(Value::Null),
         "get_default_cost_multiplier" => Ok(json!(1.0)),
         "set_default_cost_multiplier" => Ok(Value::Null),
         "read_live_provider_settings" => Ok(json!({})),

@@ -28,8 +28,6 @@ import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { AppSwitcher } from "@/components/AppSwitcher";
-import { UpdateBadge } from "@/components/UpdateBadge";
-import UsageScriptModal from "@/components/UsageScriptModal";
 import {
   SettingsPage,
   type SettingsTab,
@@ -77,14 +75,12 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
     useState<SettingsTab>("general");
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
-  const [usageProvider, setUsageProvider] = useState<Provider | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     provider: Provider;
     action: "delete";
   } | null>(null);
 
   const effectiveEditingProvider = useLastValidValue(editingProvider);
-  const effectiveUsageProvider = useLastValidValue(usageProvider);
 
   useEffect(() => {
     localStorage.setItem(VIEW_STORAGE_KEY, currentView);
@@ -126,8 +122,8 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
     addProvider,
     updateProvider,
     switchProvider,
+    clearCurrentProvider,
     deleteProvider,
-    saveUsageScript,
   } = useProviderActions(
     activeApp,
     isProxyRunning,
@@ -221,8 +217,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
   const isProviderHome =
     currentView === "providers" &&
     editingProvider === null &&
-    !isAddOpen &&
-    usageProvider === null;
+    !isAddOpen;
 
   const content = (() => {
     switch (currentView) {
@@ -284,12 +279,12 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                     }
                     activeProviderId={activeProviderId}
                     onSwitch={switchProvider}
+                    onClearCurrent={clearCurrentProvider}
                     onEdit={(provider) => setEditingProvider(provider)}
                     onDelete={(provider) =>
                       setConfirmAction({ provider, action: "delete" })
                     }
                     onDuplicate={handleDuplicateProvider}
-                    onConfigureUsage={setUsageProvider}
                     onOpenWebsite={handleOpenWebsite}
                     onCreate={() => setIsAddOpen(true)}
                   />
@@ -350,7 +345,6 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                 >
                   <Settings className="w-4 h-4" />
                 </Button>
-                <UpdateBadge onClick={() => openSettings("about")} />
                 {isProviderHome && (
                   <>
                     <Button
@@ -429,21 +423,6 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
         appId={activeApp}
         onSubmit={addProvider}
       />
-
-      {effectiveUsageProvider && (
-        <UsageScriptModal
-          key={effectiveUsageProvider.id}
-          provider={effectiveUsageProvider}
-          appId={activeApp}
-          isOpen={Boolean(usageProvider)}
-          onClose={() => setUsageProvider(null)}
-          onSave={(script) => {
-            if (usageProvider) {
-              void saveUsageScript(usageProvider, script);
-            }
-          }}
-        />
-      )}
 
       <EditProviderDialog
         open={Boolean(editingProvider)}

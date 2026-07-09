@@ -119,7 +119,12 @@ pub async fn fetch_latest_release_meta(client: &reqwest::Client) -> LatestReleas
         content_length: None,
         error: None,
     };
-    match client.head(url).timeout(Duration::from_secs(8)).send().await {
+    match client
+        .head(url)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+    {
         Ok(resp) => {
             if resp.status().is_success() || resp.status().is_redirection() {
                 meta.available = true;

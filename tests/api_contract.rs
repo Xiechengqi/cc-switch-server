@@ -1969,6 +1969,7 @@ async fn web_invoke_get_providers_returns_desktop_record_shape() {
     assert_eq!(body["codex-web"]["name"].as_str(), Some("Codex Web"));
 
     let response = app
+        .clone()
         .oneshot(json_request(
             Method::POST,
             "/web-api/invoke/get_current_provider",
@@ -1979,6 +1980,42 @@ async fn web_invoke_get_providers_returns_desktop_record_shape() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await.as_str(), Some("codex-web"));
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/switch_provider",
+            json!({"app": "codex", "id": "codex-web"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/clear_current_provider",
+            json!({"app": "codex"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/get_current_provider",
+            json!({"app": "codex"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await.as_str(), Some(""));
 }
 
 fn test_state() -> ServerState {

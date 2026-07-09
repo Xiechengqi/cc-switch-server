@@ -49,66 +49,6 @@ export interface EndpointCandidate {
   isCustom?: boolean;
 }
 
-import type { TemplateType } from "./config/constants";
-
-// 用量查询脚本配置
-export interface UsageScript {
-  enabled: boolean; // 是否启用用量查询
-  language: "javascript"; // 脚本语言
-  code: string; // 脚本代码（JSON 格式配置）
-  timeout?: number; // 超时时间（秒，默认 10）
-  templateType?: TemplateType; // 模板类型（用于后端判断验证规则）
-  apiKey?: string; // 用量查询专用的 API Key（通用模板使用）
-  baseUrl?: string; // 用量查询专用的 Base URL（通用和 NewAPI 模板使用）
-  accessToken?: string; // 访问令牌（NewAPI 模板使用）
-  userId?: string; // 用户ID（NewAPI 模板使用）
-  accessKeyId?: string; // 火山方舟 AccessKey ID（用量查询签名用，与推理 Key 分离）
-  secretAccessKey?: string; // 火山方舟 SecretAccessKey
-  codingPlanProvider?: string; // Coding Plan 供应商标识（如 "kimi", "zhipu", "minimax"）
-  autoQueryInterval?: number; // 自动查询间隔（单位：分钟，0 表示禁用）
-  autoIntervalMinutes?: number; // 自动查询间隔（分钟）- 别名字段
-  request?: {
-    // 请求配置
-    url?: string; // 请求 URL
-    method?: string; // HTTP 方法
-    headers?: Record<string, string>; // 请求头
-    body?: any; // 请求体
-  };
-}
-
-const DEFAULT_USAGE_SCRIPT: UsageScript = {
-  enabled: false,
-  language: "javascript",
-  code: "",
-  timeout: 10,
-  autoQueryInterval: 5,
-};
-
-export function createUsageScript(
-  overrides?: Partial<UsageScript>,
-): UsageScript {
-  return { ...DEFAULT_USAGE_SCRIPT, ...overrides };
-}
-
-// 单个套餐用量数据
-export interface UsageData {
-  planName?: string; // 套餐名称（可选）
-  extra?: string; // 扩展字段，可自由补充需要展示的文本（可选）
-  isValid?: boolean; // 套餐是否有效（可选）
-  invalidMessage?: string; // 失效原因说明（可选，当 isValid 为 false 时显示）
-  total?: number; // 总额度（可选）
-  used?: number; // 已用额度（可选）
-  remaining?: number; // 剩余额度（可选）
-  unit?: string; // 单位（可选）
-}
-
-// 用量查询结果（支持多套餐）
-export interface UsageResult {
-  success: boolean;
-  data?: UsageData[]; // 改为数组，支持返回多个套餐
-  error?: string;
-}
-
 // 供应商单独的模型测试配置（覆盖全局配置）
 export interface ProviderTestConfig {
   // 是否启用单独配置（false 时使用全局配置）
@@ -190,8 +130,6 @@ export interface ProviderMeta {
   claudeDesktopMode?: "direct" | "proxy";
   // Claude Desktop 本地路由模式：Claude-safe route -> upstream model
   claudeDesktopModelRoutes?: Record<string, ClaudeDesktopModelRoute>;
-  // 用量查询脚本配置
-  usage_script?: UsageScript;
   // 请求地址管理：测速后自动选择最佳端点
   endpointAutoSelect?: boolean;
   // 是否为官方合作伙伴

@@ -53,13 +53,13 @@ interface ProviderListProps {
   currentProviderId: string;
   appId: AppId;
   onSwitch: (provider: Provider) => void;
+  onClearCurrent?: () => void;
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
   onRemoveFromConfig?: (provider: Provider) => void;
   onDisableOmo?: () => void;
   onDisableOmoSlim?: () => void;
   onDuplicate: (provider: Provider) => void;
-  onConfigureUsage?: (provider: Provider) => void;
   onOpenWebsite: (url: string) => void;
   onOpenTerminal?: (provider: Provider) => void;
   onCreate?: () => void;
@@ -75,13 +75,13 @@ export function ProviderList({
   currentProviderId,
   appId,
   onSwitch,
+  onClearCurrent,
   onEdit,
   onDelete,
   onRemoveFromConfig,
   onDisableOmo,
   onDisableOmoSlim,
   onDuplicate,
-  onConfigureUsage,
   onOpenWebsite,
   onOpenTerminal,
   onCreate,
@@ -413,13 +413,13 @@ export function ProviderList({
                 isOmo={isOmo}
                 isOmoSlim={isOmoSlim}
                 onSwitch={onSwitch}
+                onClearCurrent={onClearCurrent}
                 onEdit={onEdit}
                 onDelete={onDelete}
                 onRemoveFromConfig={onRemoveFromConfig}
                 onDisableOmo={onDisableOmo}
                 onDisableOmoSlim={onDisableOmoSlim}
                 onDuplicate={onDuplicate}
-                onConfigureUsage={onConfigureUsage}
                 onOpenWebsite={onOpenWebsite}
                 onOpenTerminal={onOpenTerminal}
                 onTestLink={handleTestLink}
@@ -554,13 +554,13 @@ interface SortableProviderCardProps {
   isOmo: boolean;
   isOmoSlim: boolean;
   onSwitch: (provider: Provider) => void;
+  onClearCurrent?: () => void;
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
   onRemoveFromConfig?: (provider: Provider) => void;
   onDisableOmo?: () => void;
   onDisableOmoSlim?: () => void;
   onDuplicate: (provider: Provider) => void;
-  onConfigureUsage?: (provider: Provider) => void;
   onOpenWebsite: (url: string) => void;
   onOpenTerminal?: (provider: Provider) => void;
   onTestLink?: (provider: Provider) => void;
@@ -587,13 +587,13 @@ function SortableProviderCard({
   isOmo,
   isOmoSlim,
   onSwitch,
+  onClearCurrent,
   onEdit,
   onDelete,
   onRemoveFromConfig,
   onDisableOmo,
   onDisableOmoSlim,
   onDuplicate,
-  onConfigureUsage,
   onOpenWebsite,
   onOpenTerminal,
   onTestLink,
@@ -634,15 +634,13 @@ function SortableProviderCard({
         isOmo={isOmo}
         isOmoSlim={isOmoSlim}
         onSwitch={onSwitch}
+        onClearCurrent={onClearCurrent}
         onEdit={onEdit}
         onDelete={onDelete}
         onRemoveFromConfig={onRemoveFromConfig}
         onDisableOmo={onDisableOmo}
         onDisableOmoSlim={onDisableOmoSlim}
         onDuplicate={onDuplicate}
-        onConfigureUsage={
-          onConfigureUsage ? (item) => onConfigureUsage(item) : () => undefined
-        }
         onOpenWebsite={onOpenWebsite}
         onOpenTerminal={onOpenTerminal}
         onTestLink={onTestLink}

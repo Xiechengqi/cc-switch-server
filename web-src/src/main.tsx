@@ -5,7 +5,6 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import { ThemeProvider } from "./components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
-import { UpdateProvider } from "@/contexts/UpdateContext";
 import { I18nProvider } from "./lib/i18n";
 import { queryClient } from "@/lib/query/queryClient";
 import "./i18n";
@@ -32,10 +31,8 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <QueryClientProvider client={queryClient}>
       <ThemeProvider defaultTheme="light" storageKey="cc-switch-theme">
         <I18nProvider>
-          <UpdateProvider>
             <App />
             <Toaster />
-          </UpdateProvider>
         </I18nProvider>
       </ThemeProvider>
     </QueryClientProvider>

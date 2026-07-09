@@ -220,9 +220,7 @@ async fn run_upgrade(
         Some(progress_pct(2, 0)),
     )
     .await;
-    if let Err(err) =
-        download_with_progress(&client, release_url, &tmp_path, handle).await
-    {
+    if let Err(err) = download_with_progress(&client, release_url, &tmp_path, handle).await {
         cleanup_tmp(&tmp_path);
         emit(
             handle,
@@ -437,9 +435,9 @@ async fn download_with_progress(
         if downloaded >= next_tick {
             next_tick = downloaded + DOWNLOAD_BUFFER_TICK_BYTES;
             let pct = match total {
-                Some(total_bytes) if total_bytes > 0 => Some(
-                    ((downloaded as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0) as u8,
-                ),
+                Some(total_bytes) if total_bytes > 0 => {
+                    Some(((downloaded as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0) as u8)
+                }
                 _ => None,
             };
             let msg = match total {
