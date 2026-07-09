@@ -21,13 +21,15 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { settingsApi } from "@/lib/api";
-import { readToken, getWebRuntimeContext } from "@/lib/runtime";
+import { getWebRuntimeContext, readWebSessionToken } from "@/lib/runtime";
 import {
   loadAdminVersionInfo,
   loadBuildInfo,
@@ -38,6 +40,20 @@ import {
 
 const SERVER_OFFICIAL_WEBSITE = "https://tokenswitch.org";
 const SERVER_GITHUB_URL = "https://github.com/Xiechengqi/cc-switch-server";
+
+type UpgradeLogLevel = "info" | "success" | "warn" | "error" | string;
+
+interface UpgradeLogEntry {
+  taskId?: string;
+  step?: number;
+  totalSteps?: number;
+  level?: UpgradeLogLevel;
+  message?: string;
+  progress?: number | null;
+  at?: string;
+}
+
+type UpgradeOutcome = "running" | "success" | "failed" | null;
 
 function formatVersionDetails(info: AdminVersionInfo): string {
   return [
@@ -52,6 +68,58 @@ function formatVersionDetails(info: AdminVersionInfo): string {
     `rustc: ${info.rustcVersion}`,
     `dirty: ${info.dirty}`,
   ].join("\n");
+}
+
+function parseUpgradeLogEntry(raw: string): UpgradeLogEntry {
+  try {
+    return JSON.parse(raw) as UpgradeLogEntry;
+  } catch {
+    return { message: raw };
+  }
+}
+
+function formatUpgradeLogLine(entry: UpgradeLogEntry): string {
+  const stepLabel =
+    entry.step && entry.totalSteps
+      ? `[${entry.step}/${entry.totalSteps}]`
+      : "";
+  const progressLabel =
+    typeof entry.progress === "number" ? `${entry.progress}%` : "";
+  const prefix = [stepLabel, progressLabel].filter(Boolean).join(" ");
+  const time = entry.at
+    ? new Date(entry.at).toLocaleTimeString()
+    : "";
+  const level = (entry.level || "info").toUpperCase();
+  return [time, level, prefix, entry.message || ""].filter(Boolean).join(" ");
+}
+
+function upgradeLogLevelClass(level?: UpgradeLogLevel): string {
+  switch ((level || "info").toLowerCase()) {
+    case "success":
+      return "text-emerald-300";
+    case "warn":
+      return "text-amber-300";
+    case "error":
+      return "text-red-300";
+    default:
+      return "text-slate-100";
+  }
+}
+
+function computeUpgradeProgress(
+  logs: UpgradeLogEntry[],
+  outcome: UpgradeOutcome,
+): number {
+  if (outcome === "success") return 100;
+  if (logs.length === 0) return 0;
+  const latest = logs[logs.length - 1];
+  if (typeof latest.progress === "number") {
+    return Math.max(0, Math.min(100, latest.progress));
+  }
+  if (latest.step && latest.totalSteps) {
+    return Math.round((latest.step / latest.totalSteps) * 100);
+  }
+  return 0;
 }
 
 async function pollHealthAndReload(maxAttempts = 60) {
@@ -78,9 +146,11 @@ export function ServerVersionSettings() {
   const [upgradeConfirmOpen, setUpgradeConfirmOpen] = useState(false);
   const [restartConfirmOpen, setRestartConfirmOpen] = useState(false);
   const [upgradeLogOpen, setUpgradeLogOpen] = useState(false);
-  const [upgradeLogs, setUpgradeLogs] = useState<string[]>([]);
+  const [upgradeLogs, setUpgradeLogs] = useState<UpgradeLogEntry[]>([]);
+  const [upgradeOutcome, setUpgradeOutcome] = useState<UpgradeOutcome>(null);
   const [usingBuildInfoFallback, setUsingBuildInfoFallback] = useState(false);
   const streamRef = useRef<EventSource | null>(null);
+  const logEndRef = useRef<HTMLDivElement | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -127,20 +197,43 @@ export function ServerVersionSettings() {
     };
   }, [refresh]);
 
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [upgradeLogs, upgradeOutcome]);
+
   const versionDetails = useMemo(
     () => (info ? formatVersionDetails(info) : ""),
     [info],
   );
+
+  const upgradeProgress = useMemo(
+    () => computeUpgradeProgress(upgradeLogs, upgradeOutcome),
+    [upgradeLogs, upgradeOutcome],
+  );
+
+  const latestStepLabel = useMemo(() => {
+    const latest = upgradeLogs[upgradeLogs.length - 1];
+    if (!latest?.step || !latest.totalSteps) return null;
+    return t("settings.serverVersion.upgradeStep", {
+      step: latest.step,
+      total: latest.totalSteps,
+      defaultValue: "步骤 {{step}} / {{total}}",
+    });
+  }, [upgradeLogs, t]);
 
   const closeUpgradeStream = useCallback(() => {
     streamRef.current?.close();
     streamRef.current = null;
   }, []);
 
+  const appendUpgradeLog = useCallback((entry: UpgradeLogEntry) => {
+    setUpgradeLogs((prev) => [...prev, entry]);
+  }, []);
+
   const streamUpgrade = useCallback(
     (taskId: string) => {
       closeUpgradeStream();
-      const token = readToken();
+      const token = readWebSessionToken();
       const params = new URLSearchParams({ taskId });
       if (token) params.set("accessToken", token);
       const source = new EventSource(
@@ -149,21 +242,14 @@ export function ServerVersionSettings() {
       streamRef.current = source;
 
       source.addEventListener("log", (event) => {
-        try {
-          const data = JSON.parse((event as MessageEvent).data) as {
-            at?: string;
-            level?: string;
-            message?: string;
-          };
-          const line = `${data.at || ""} ${data.level || "info"} ${data.message || ""}`.trim();
-          setUpgradeLogs((prev) => [...prev, line]);
-        } catch {
-          setUpgradeLogs((prev) => [...prev, (event as MessageEvent).data]);
-        }
+        appendUpgradeLog(parseUpgradeLogEntry((event as MessageEvent).data));
       });
 
       source.addEventListener("done", (event) => {
-        setUpgradeLogs((prev) => [...prev, `done ${(event as MessageEvent).data}`]);
+        appendUpgradeLog({
+          level: "info",
+          message: `done ${(event as MessageEvent).data}`,
+        });
         closeUpgradeStream();
         setBusy(null);
         try {
@@ -171,11 +257,20 @@ export function ServerVersionSettings() {
             status?: string;
             restartPending?: boolean;
           };
-          if (payload.status === "success" && payload.restartPending) {
-            toast.success(t("settings.serverVersion.upgradePendingRestart"));
-            void refresh();
+          if (payload.status === "success") {
+            setUpgradeOutcome("success");
+            if (payload.restartPending) {
+              toast.success(t("settings.serverVersion.upgradePendingRestart"));
+              void refresh();
+            } else {
+              toast.success(t("settings.serverVersion.upgradeSucceeded"));
+              void pollHealthAndReload();
+            }
           } else if (payload.status === "failed") {
+            setUpgradeOutcome("failed");
             toast.error(t("settings.serverVersion.upgradeFailed"));
+          } else {
+            void refresh();
           }
         } catch {
           void refresh();
@@ -183,15 +278,16 @@ export function ServerVersionSettings() {
       });
 
       source.onerror = () => {
-        setUpgradeLogs((prev) => [
-          ...prev,
-          t("settings.serverVersion.streamDisconnected"),
-        ]);
+        appendUpgradeLog({
+          level: "error",
+          message: t("settings.serverVersion.streamDisconnected"),
+        });
         closeUpgradeStream();
         setBusy(null);
+        setUpgradeOutcome("failed");
       };
     },
-    [closeUpgradeStream, refresh, t],
+    [appendUpgradeLog, closeUpgradeStream, refresh, t],
   );
 
   const handleUpgrade = useCallback(
@@ -199,6 +295,7 @@ export function ServerVersionSettings() {
       setUpgradeConfirmOpen(false);
       setBusy("upgrade");
       setUpgradeLogs([]);
+      setUpgradeOutcome("running");
       setUpgradeLogOpen(true);
       try {
         const { taskId } = await startServerUpgrade({ restartAfter });
@@ -209,6 +306,7 @@ export function ServerVersionSettings() {
       } catch (reason) {
         toast.error(reason instanceof Error ? reason.message : String(reason));
         setBusy(null);
+        setUpgradeOutcome("failed");
       }
     },
     [streamUpgrade],
@@ -368,25 +466,79 @@ export function ServerVersionSettings() {
         onCancel={() => setRestartConfirmOpen(false)}
       />
 
-      <Dialog open={upgradeLogOpen} onOpenChange={setUpgradeLogOpen}>
+      <Dialog
+        open={upgradeLogOpen}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen && busy === "upgrade") return;
+          setUpgradeLogOpen(nextOpen);
+        }}
+      >
         <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle>
               {t("settings.serverVersion.upgradeLogTitle")}
             </DialogTitle>
+            <DialogDescription>
+              {t("settings.serverVersion.upgradeLogDesc")}
+            </DialogDescription>
           </DialogHeader>
-          <div className="max-h-96 overflow-y-auto rounded-lg border bg-slate-950 p-4 font-mono text-xs text-slate-100">
-            {upgradeLogs.length > 0 ? (
-              <div className="space-y-2">
-                {upgradeLogs.map((line, index) => (
-                  <div key={`${index}-${line}`}>{line}</div>
-                ))}
+
+          <div className="space-y-3">
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                <span>
+                  {latestStepLabel ||
+                    (busy === "upgrade"
+                      ? t("settings.serverVersion.upgradeRunning")
+                      : upgradeOutcome === "success"
+                        ? t("settings.serverVersion.upgradeSucceeded")
+                        : upgradeOutcome === "failed"
+                          ? t("settings.serverVersion.upgradeFailed")
+                          : t("settings.serverVersion.waitingLogs"))}
+                </span>
+                <span className="font-mono tabular-nums">{upgradeProgress}%</span>
               </div>
-            ) : (
-              <div className="text-slate-400">
-                {t("settings.serverVersion.waitingLogs")}
+              <div className="h-2 overflow-hidden rounded-full bg-muted">
+                <div
+                  className={cn(
+                    "h-full rounded-full transition-all duration-300",
+                    upgradeOutcome === "failed"
+                      ? "bg-red-500"
+                      : upgradeOutcome === "success"
+                        ? "bg-emerald-500"
+                        : "bg-sky-500",
+                  )}
+                  style={{ width: `${upgradeProgress}%` }}
+                />
               </div>
-            )}
+            </div>
+
+            <ScrollArea className="h-96 rounded-lg border bg-slate-950">
+              <div className="space-y-2 p-4 font-mono text-xs">
+                {upgradeLogs.length > 0 ? (
+                  upgradeLogs.map((entry, index) => (
+                    <div
+                      key={`${index}-${entry.at || entry.message || index}`}
+                      className={upgradeLogLevelClass(entry.level)}
+                    >
+                      {formatUpgradeLogLine(entry)}
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-slate-400">
+                    {busy === "upgrade" ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        {t("settings.serverVersion.waitingLogs")}
+                      </span>
+                    ) : (
+                      t("settings.serverVersion.waitingLogs")
+                    )}
+                  </div>
+                )}
+                <div ref={logEndRef} />
+              </div>
+            </ScrollArea>
           </div>
         </DialogContent>
       </Dialog>

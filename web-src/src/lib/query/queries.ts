@@ -48,20 +48,23 @@ export interface ProvidersQueryData {
 
 export interface UseProvidersQueryOptions {
   isProxyRunning?: boolean; // 代理服务是否运行中
+  enabled?: boolean;
 }
 
 export const useProvidersQuery = (
   appId: AppId,
   options?: UseProvidersQueryOptions,
 ): UseQueryResult<ProvidersQueryData> => {
-  const { isProxyRunning = false } = options || {};
+  const { isProxyRunning = false, enabled = true } = options || {};
 
   return useQuery({
     queryKey: ["providers", appId],
+    enabled,
     placeholderData: keepPreviousData,
     // 当代理服务运行时，每 10 秒刷新一次供应商列表
     // 这样可以自动反映后端熔断器自动禁用代理目标的变更
-    refetchInterval: isProxyRunning ? 10000 : false,
+    refetchInterval: enabled && isProxyRunning ? 10000 : false,
+    refetchIntervalInBackground: false,
     queryFn: async () => {
       let providers: Record<string, Provider> = {};
       let currentProviderId = "";
@@ -69,13 +72,17 @@ export const useProvidersQuery = (
       try {
         providers = await providersApi.getAll(appId);
       } catch (error) {
-        console.error("获取供应商列表失败:", error);
+        if (import.meta.env.DEV) {
+          console.warn("获取供应商列表失败:", error);
+        }
       }
 
       try {
         currentProviderId = await providersApi.getCurrent(appId);
       } catch (error) {
-        console.error("获取当前供应商失败:", error);
+        if (import.meta.env.DEV) {
+          console.warn("获取当前供应商失败:", error);
+        }
       }
 
       return {

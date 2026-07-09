@@ -110,6 +110,19 @@ pub(crate) async fn require_event_session(
         return Ok(());
     }
     if let Some(token) = bearer_token(headers).or(query_token) {
+        if state
+            .web_auth
+            .authenticate_access_token(token)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Ok(());
+        }
+        let config = state.config.read().await;
+        if config.verify_api_token(token) {
+            return Ok(());
+        }
         return require_session_token(state, token).await;
     }
     Err(ApiError::unauthorized("missing bearer token"))

@@ -9,11 +9,14 @@ import type { GlobalProxyConfig, AppProxyConfig } from "@/types/proxy";
 /**
  * 获取代理服务器状态
  */
-export function useProxyStatus() {
+export function useProxyStatus(options?: { enabled?: boolean }) {
+  const enabled = options?.enabled ?? true;
   return useQuery({
     queryKey: ["proxyStatus"],
     queryFn: () => proxyApi.getProxyStatus(),
-    refetchInterval: 5000, // 每 5 秒刷新一次
+    enabled,
+    refetchInterval: enabled ? 5000 : false,
+    refetchIntervalInBackground: false,
   });
 }
 
@@ -42,11 +45,14 @@ export function useIsLiveTakeoverActive() {
 /**
  * 获取各应用接管状态
  */
-export function useProxyTakeoverStatus() {
+export function useProxyTakeoverStatus(options?: { enabled?: boolean }) {
+  const enabled = options?.enabled ?? true;
   return useQuery({
     queryKey: ["proxyTakeoverStatus"],
     queryFn: () => proxyApi.getProxyTakeoverStatus(),
-    refetchInterval: 2000,
+    enabled,
+    refetchInterval: enabled ? 2000 : false,
+    refetchIntervalInBackground: false,
   });
 }
 

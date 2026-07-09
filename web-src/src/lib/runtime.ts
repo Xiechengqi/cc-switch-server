@@ -2,6 +2,7 @@ import { isRemoteWebMode } from "@/lib/api/auth";
 import {
   clearRouterSessionTokens,
   loginWithWebPassword,
+  readRouterAccessToken,
   routerAuthFetch,
 } from "@/lib/routerAuth";
 
@@ -92,6 +93,11 @@ const PASSWORD_KEY = "cc_switch_server_password";
 
 export function readToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
+}
+
+/** Session token for EventSource/SSE: local admin token or remote web JWT. */
+export function readWebSessionToken(): string | null {
+  return readToken() || readRouterAccessToken();
 }
 
 export function writeToken(token: string | null): void {

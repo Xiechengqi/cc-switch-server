@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 
-import { readToken } from "@/lib/runtime";
+import { readWebSessionToken } from "@/lib/runtime";
 
 type ServerEventPayload = {
   eventType?: string;
@@ -19,7 +19,7 @@ export function useServerEvent<P = ServerEventPayload>(
   handlerRef.current = handler;
 
   useEffect(() => {
-    const token = readToken();
+    const token = readWebSessionToken();
     if (!token) {
       return;
     }

@@ -312,6 +312,14 @@ function authBearerHeaders(): Record<string, string> {
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 
+export function readRouterAccessToken(): string | null {
+  const state = readAuthState();
+  if (state.authProvider === "apiToken") {
+    return state.apiToken?.trim() || null;
+  }
+  return state.accessToken?.trim() || state.apiToken?.trim() || null;
+}
+
 function fetchWithAuth(
   input: RequestInfo | URL,
   init: RequestInit = {},

@@ -59,6 +59,16 @@ export function ServerSecuritySettings({ onSignOut }: ServerSecuritySettingsProp
         className="flex items-center justify-between gap-4 rounded-xl border border-border bg-card/50 p-4 transition-colors hover:bg-muted/50"
         onSubmit={handleChangePassword}
       >
+        <input
+          type="text"
+          name="username"
+          autoComplete="username"
+          defaultValue="admin"
+          tabIndex={-1}
+          aria-hidden="true"
+          className="sr-only"
+          readOnly
+        />
         <div className="flex min-w-0 items-center gap-3">
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
             <Shield className="h-4 w-4 text-amber-500" />

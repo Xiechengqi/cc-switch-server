@@ -100,8 +100,14 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
     hermes: false,
   };
 
-  const { data: proxyStatus } = useProxyStatus();
-  const { data: takeoverStatus } = useProxyTakeoverStatus();
+  const needsProviderData =
+    currentView === "providers" || currentView === "shares";
+  const needsProxyPolling = currentView === "providers";
+
+  const { data: proxyStatus } = useProxyStatus({ enabled: needsProxyPolling });
+  const { data: takeoverStatus } = useProxyTakeoverStatus({
+    enabled: needsProxyPolling,
+  });
   const isProxyRunning = proxyStatus?.running ?? false;
 
   const isCurrentAppTakeoverActive = takeoverStatus?.[activeApp] ?? false;
@@ -112,7 +118,10 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
     return target?.provider_id;
   }, [proxyStatus?.active_targets, activeApp]);
 
-  const { data, isLoading } = useProvidersQuery(activeApp, { isProxyRunning });
+  const { data, isLoading } = useProvidersQuery(activeApp, {
+    isProxyRunning,
+    enabled: needsProviderData,
+  });
   const providers = useMemo(() => data?.providers ?? {}, [data]);
   const currentProviderId = data?.currentProviderId ?? "";
 

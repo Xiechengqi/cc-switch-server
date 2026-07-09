@@ -85,6 +85,8 @@ i18n.use(initReactI18next).init({
     escapeValue: false, // React 已经默认转义
   },
 
+  showSupportNotice: false,
+
   // 开发模式下显示调试信息
   debug: false,
 });
