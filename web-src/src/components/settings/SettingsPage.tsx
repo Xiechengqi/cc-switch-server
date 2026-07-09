@@ -55,6 +55,7 @@ import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import type { ServerSettingsTab } from "@/components/settings/ServerSettingsExtensions";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySettings";
+import { ServerVersionSettings } from "@/components/settings/ServerVersionSettings";
 import { ShareSettingsTab } from "@/components/settings/ShareSettingsTab";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
@@ -331,7 +332,10 @@ export function SettingsPage({
                       onChange={handleAutoSave}
                     />
                     {serverMode && (
-                      <ServerSecuritySettings onSignOut={onSignOut} />
+                      <>
+                        <ServerSecuritySettings onSignOut={onSignOut} />
+                        <ServerVersionSettings />
+                      </>
                     )}
                   </motion.div>
                 ) : (

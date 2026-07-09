@@ -6,4 +6,5 @@ pub mod clients;
 pub mod domain;
 pub mod infra;
 pub mod proxy;
+pub mod self_update;
 pub mod state;

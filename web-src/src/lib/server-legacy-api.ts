@@ -813,6 +813,29 @@ export interface BuildInfo {
   dirty: boolean;
 }
 
+export interface AdminVersionInfo extends BuildInfo {
+  binaryPath: string;
+  rollbackPath: string;
+  rollbackAvailable: boolean;
+  uptimeSecs: number;
+  restartPending: boolean;
+  upgradeCapable: boolean;
+  service: {
+    manager: "systemd" | "nohup";
+    active: boolean;
+    unitName?: string | null;
+    activeState?: string | null;
+    unitFileState?: string | null;
+  };
+  latest: {
+    binaryUrl: string;
+    available: boolean;
+    etag?: string | null;
+    contentLength?: number | null;
+    error?: string | null;
+  };
+}
+
 export interface ProviderTestResult {
   ok: boolean;
   providerId: string;
@@ -1381,6 +1404,28 @@ export async function loadSettingsPageData(): Promise<SettingsPageData> {
 
 export async function loadBuildInfo(): Promise<BuildInfo> {
   return jsonFetch<BuildInfo>("/version");
+}
+
+export async function loadAdminVersionInfo(): Promise<AdminVersionInfo> {
+  return jsonFetch<AdminVersionInfo>("/api/admin/version");
+}
+
+export async function restartServerService(): Promise<void> {
+  await jsonFetch<{ ok: boolean }>("/api/admin/restart", { method: "POST" });
+}
+
+export async function startServerUpgrade(input: {
+  restartAfter: boolean;
+}): Promise<{ taskId: string }> {
+  const result = await jsonFetch<{ ok: boolean; taskId: string }>(
+    "/api/admin/upgrade",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ restartAfter: input.restartAfter }),
+    },
+  );
+  return { taskId: result.taskId };
 }
 
 export async function updateUpstreamProxy(

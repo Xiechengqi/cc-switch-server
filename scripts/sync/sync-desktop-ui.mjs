@@ -79,6 +79,7 @@ export const serverLocalOverrides = [
   "components/common/FullScreenPanel.tsx",
   "components/settings/SettingsPage.tsx",
   "components/settings/ShareSettingsTab.tsx",
+  "components/settings/ServerVersionSettings.tsx",
   "components/settings/ClientTunnelSettingsPanel.tsx",
   "components/share/EditShareDialog.tsx",
   "components/share/ImportSharesModal.tsx",

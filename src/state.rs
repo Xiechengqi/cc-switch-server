@@ -72,6 +72,8 @@ pub struct ServerStateInner {
     pub tunnels: Arc<TunnelSupervisor>,
     pub web_auth: crate::domain::web_auth::WebAuthStore,
     pub debounced_saves: Arc<DebouncedStoreSaves>,
+    pub started_at: std::time::Instant,
+    pub upgrade: crate::self_update::upgrade::SharedUpgradeRegistry,
 }
 
 pub type ServerState = Arc<ServerStateInner>;
@@ -524,6 +526,8 @@ impl ServerStateInner {
             tunnels,
             web_auth,
             debounced_saves: Arc::new(DebouncedStoreSaves::default()),
+            started_at: std::time::Instant::now(),
+            upgrade: Arc::new(crate::self_update::upgrade::UpgradeRegistry::new()),
         }))
     }
 

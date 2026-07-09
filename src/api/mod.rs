@@ -13,6 +13,7 @@ pub(crate) mod invoke;
 pub(in crate::api) mod models;
 pub(in crate::api) mod providers;
 pub(in crate::api) mod router;
+pub(in crate::api) mod self_update;
 pub(crate) mod session;
 pub(in crate::api) mod settings;
 pub(in crate::api) mod shares;
@@ -38,6 +39,7 @@ pub(in crate::api) use invoke::handlers::*;
 pub(in crate::api) use models::*;
 pub(in crate::api) use providers::*;
 pub(in crate::api) use router::*;
+pub(in crate::api) use self_update::*;
 pub(crate) use session::{
     bearer_token, generate_session_token, require_event_session, require_session,
     require_web_admin_session, resolve_web_admin_principal,
@@ -155,6 +157,10 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/auth/email/verify-code", post(verify_email_login_code))
         .route("/api/auth/me", get(auth_me))
         .route("/api/auth/api-token", post(rotate_api_token))
+        .route("/api/admin/version", get(admin_version))
+        .route("/api/admin/restart", post(admin_restart))
+        .route("/api/admin/upgrade", post(admin_upgrade_start))
+        .route("/api/admin/upgrade/stream", get(admin_upgrade_stream))
         .route("/api/events", get(events))
         .route("/api/backup", get(list_backups).post(create_backup))
         .route("/api/backups", get(list_backups).post(create_backup))
