@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
   ChevronDown,
+  Clock3,
+  Cpu,
   Github,
   Globe,
   Loader2,
@@ -125,6 +127,16 @@ function formatVersionDetails(info: AdminVersionInfo): string {
     `rustc: ${info.rustcVersion}`,
     `dirty: ${info.dirty}`,
   ].join("\n");
+}
+
+function formatProcessUptime(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(seconds / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  const remainingSeconds = seconds % 60;
+  return [hours, minutes, remainingSeconds]
+    .map((value) => value.toString().padStart(2, "0"))
+    .join(":");
 }
 
 function parseUpgradeLogEntry(raw: string): UpgradeLogEntry {
@@ -320,6 +332,7 @@ export function ServerVersionSettings() {
   const [upgradeOutcome, setUpgradeOutcome] = useState<UpgradeOutcome>(null);
   const [usingBuildInfoFallback, setUsingBuildInfoFallback] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [runtimeTickMs, setRuntimeTickMs] = useState(() => Date.now());
   const streamRef = useRef<AbortController | null>(null);
   const streamFinishedRef = useRef(false);
   const streamReconnectAttemptsRef = useRef(0);
@@ -327,22 +340,34 @@ export function ServerVersionSettings() {
   const upgradeLogsRef = useRef<UpgradeLogEntry[]>([]);
   const upgradeLogKeysRef = useRef(new Set<string>());
   const logEndRef = useRef<HTMLDivElement | null>(null);
+  const uptimeAnchorRef = useRef({ uptimeSecs: 0, capturedAtMs: Date.now() });
+
+  const applyVersionInfo = useCallback((next: AdminVersionInfo) => {
+    const capturedAtMs = Date.now();
+    uptimeAnchorRef.current = {
+      uptimeSecs: next.uptimeSecs,
+      capturedAtMs,
+    };
+    setRuntimeTickMs(capturedAtMs);
+    setInfo(next);
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
       const adminInfo = await loadAdminVersionInfo();
-      setInfo(adminInfo);
+      applyVersionInfo(adminInfo);
       setUsingBuildInfoFallback(false);
       writeAdminVersionInfoCache(adminInfo);
     } catch {
       try {
         const build = await loadBuildInfo();
-        setInfo({
+        applyVersionInfo({
           ...build,
           binaryPath: "",
           rollbackPath: "",
           rollbackAvailable: false,
+          processId: 0,
           uptimeSecs: 0,
           restartPending: false,
           upgradeCapable: false,
@@ -367,13 +392,14 @@ export function ServerVersionSettings() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyVersionInfo]);
 
   useEffect(() => {
     const cached = readAdminVersionInfoCache();
     if (cached) {
-      setInfo(cached);
+      applyVersionInfo(cached);
       setLoading(false);
+      void refresh();
     } else {
       void refresh();
     }
@@ -381,7 +407,13 @@ export function ServerVersionSettings() {
       streamRef.current?.abort();
       streamRef.current = null;
     };
-  }, [refresh]);
+  }, [applyVersionInfo, refresh]);
+
+  useEffect(() => {
+    if (!info) return;
+    const timer = window.setInterval(() => setRuntimeTickMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [info]);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -391,6 +423,14 @@ export function ServerVersionSettings() {
     () => (info ? formatVersionDetails(info) : ""),
     [info],
   );
+
+  const processUptimeSecs = info
+    ? uptimeAnchorRef.current.uptimeSecs +
+      Math.max(
+        0,
+        Math.floor((runtimeTickMs - uptimeAnchorRef.current.capturedAtMs) / 1000),
+      )
+    : 0;
 
   const upgradeActive =
     busy === "upgrade" ||
@@ -646,7 +686,7 @@ export function ServerVersionSettings() {
   const restartPending = info?.restartPending ?? false;
   const rollbackAvailable = info?.rollbackAvailable ?? false;
   const upgradeDisabled =
-    busy !== null || loading || info?.upgradeCapable === false;
+    busy !== null || loading || restartPending || info?.upgradeCapable === false;
 
   const showUpdateCompareSubtitle = Boolean(
     info?.latest?.commitId && info?.latest?.updateAvailable,
@@ -707,7 +747,7 @@ export function ServerVersionSettings() {
     setCheckingUpdate(true);
     try {
       const adminInfo = await loadAdminVersionInfo();
-      setInfo(adminInfo);
+      applyVersionInfo(adminInfo);
       setUsingBuildInfoFallback(false);
       writeAdminVersionInfoCache(adminInfo);
 
@@ -776,13 +816,13 @@ export function ServerVersionSettings() {
     } finally {
       setCheckingUpdate(false);
     }
-  }, [busy, checkingUpdate, t]);
+  }, [applyVersionInfo, busy, checkingUpdate, t]);
 
   return (
     <>
       <Collapsible open={open} onOpenChange={setOpen}>
         <div className="rounded-xl border border-border bg-card/50 transition-colors hover:bg-muted/50">
-          <div className="flex items-center justify-between gap-4 p-4">
+          <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <CollapsibleTrigger asChild>
               <button
                 type="button"
@@ -815,7 +855,7 @@ export function ServerVersionSettings() {
               </button>
             </CollapsibleTrigger>
 
-            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:shrink-0 sm:flex-wrap sm:items-center sm:justify-end">
               <Button
                 type="button"
                 variant="outline"
@@ -872,42 +912,58 @@ export function ServerVersionSettings() {
                   {t("settings.serverVersion.rollback")}
                 </Button>
               ) : null}
-              {restartPending ? (
-                <Button
-                  type="button"
-                  size="sm"
-                  className="h-9"
-                  disabled={busy !== null}
-                  onClick={() => setRestartConfirmOpen(true)}
-                >
-                  {busy === "restart" ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <RotateCcw className="mr-2 h-4 w-4" />
-                  )}
-                  {t("settings.serverVersion.pendingRestart")}
-                </Button>
-              ) : (
-                <Button
-                  type="button"
-                  size="sm"
-                  className="h-9"
-                  disabled={upgradeDisabled}
-                  onClick={() => setUpgradeConfirmOpen(true)}
-                >
-                  {busy === "upgrade" ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <Rocket className="mr-2 h-4 w-4" />
-                  )}
-                  {t("settings.serverVersion.upgrade")}
-                </Button>
-              )}
+              <Button
+                type="button"
+                size="sm"
+                className="h-9"
+                disabled={upgradeDisabled}
+                onClick={() => setUpgradeConfirmOpen(true)}
+              >
+                {busy === "upgrade" ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Rocket className="mr-2 h-4 w-4" />
+                )}
+                {t("settings.serverVersion.upgrade")}
+              </Button>
+              <Button
+                type="button"
+                variant={restartPending ? "default" : "outline"}
+                size="sm"
+                className="h-9"
+                disabled={busy !== null}
+                onClick={() => setRestartConfirmOpen(true)}
+              >
+                {busy === "restart" ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <RotateCcw className="mr-2 h-4 w-4" />
+                )}
+                {restartPending
+                  ? t("settings.serverVersion.pendingRestart")
+                  : t("settings.serverVersion.restart")}
+              </Button>
             </div>
           </div>
 
           <CollapsibleContent>
             <div className="border-t border-border/50 px-4 pb-4 pt-3 space-y-3">
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-muted-foreground">
+                <span className="inline-flex items-center gap-1.5">
+                  <Cpu className="h-3.5 w-3.5" />
+                  {t("settings.serverVersion.processId")}
+                  <code className="font-mono text-foreground">
+                    {info?.processId || "--"}
+                  </code>
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <Clock3 className="h-3.5 w-3.5" />
+                  {t("settings.serverVersion.processUptime")}
+                  <code className="font-mono tabular-nums text-foreground">
+                    {info ? formatProcessUptime(processUptimeSecs) : "--"}
+                  </code>
+                </span>
+              </div>
               <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground">
                 {versionDetails || t("settings.serverVersion.empty")}
               </pre>

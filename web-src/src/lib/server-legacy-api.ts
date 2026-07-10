@@ -742,6 +742,7 @@ export interface AdminVersionInfo extends BuildInfo {
   binaryPath: string;
   rollbackPath: string;
   rollbackAvailable: boolean;
+  processId: number;
   uptimeSecs: number;
   restartPending: boolean;
   upgradeCapable: boolean;
