@@ -33,7 +33,7 @@ export STREAM_PROBE=0
 2. `GET /api/router/status` 和 `GET /api/router/diagnostics`。
 3. `POST /api/router/register`。
 4. `POST /api/router/client-tunnel/lease`。
-5. `POST /api/router/batch-sync`。
+5. 等待启动/注册后的自动 share reconcile，并通过 `GET /api/router/diagnostics` 验证同步状态。
 6. `POST /api/router/share-edits/pull`，拉取并应用 pending share edits。
 7. `POST /api/shares/runtime-snapshot`。
 8. direct share URL 调 `/v1/responses`。

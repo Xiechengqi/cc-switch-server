@@ -327,11 +327,6 @@
         "hint": "ノードのドメインは下の「デフォルト Router ノード」で選択してください。ここでは API Base や SSH などの高度な項目のみ設定します。",
         "save": "高度な設定を保存",
         "saved": "高度な Router 設定を保存しました"
-      },
-      "batchSyncConfirm": {
-        "title": "share を Router に一括同期しますか？",
-        "message": "ローカルの share メタデータをリモート Router に同期します。一致する share レコードが更新される場合があります。",
-        "confirm": "同期"
       }
     },
     "authCenter": {

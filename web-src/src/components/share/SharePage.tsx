@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { toast } from "sonner";
-import { useTauriEvent } from "@/hooks/useTauriEvent";
 import {
   authApi,
   shareApi,
@@ -66,7 +64,6 @@ export function SharePage({
   const { t } = useTranslation();
   const { data: shares = [], isLoading, error, refetch } = useSharesQuery();
   const { data: settings } = useSettingsQuery();
-  const queryClient = useQueryClient();
   const {
     session: routerSession,
     loading: routerSessionLoading,
@@ -104,41 +101,6 @@ export function SharePage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [managedAuthStatusVersion]);
 
-  // C-1：保留近期 share-needs-rebind 事件以便在页面顶部常驻红条提示。
-  // toast 弹一下就消失，对于"已经发生且未解决"的状态需要更显著的存在感。
-  const [needsRebindMap, setNeedsRebindMap] = useState<
-    Record<string, { reason: string; at: number }>
-  >({});
-
-  // share 路径在请求阶段发现绑定 provider 缺失 / app_type 不匹配时，后端会 emit
-  // `share-needs-rebind`。前端 toast 提示用户去改绑，并 invalidate shares 查询
-  // 让状态条立刻刷新（后端已把该 share 改成 paused）。
-  useTauriEvent<{
-    shareId: string;
-    appType: string;
-    reason: string;
-    detail?: string | null;
-  }>("share-needs-rebind", (payload) => {
-    setNeedsRebindMap((prev) => ({
-      ...prev,
-      [payload.shareId]: { reason: payload.reason, at: Date.now() },
-    }));
-    toast.error(
-      t("share.needsRebindTitle", {
-        defaultValue: "Share 绑定的 provider 已失效",
-      }),
-      {
-        description: t("share.needsRebindBody", {
-          defaultValue:
-            "share_id={{shareId}} app={{appType}} 原因={{reason}}。请在 Share 页面改绑或删除该 share。",
-          shareId: payload.shareId,
-          appType: payload.appType,
-          reason: payload.reason,
-        }),
-      },
-    );
-    void queryClient.invalidateQueries({ queryKey: shareKeys.lists() });
-  });
   const tunnelConfigured = useMemo(
     () => isTunnelConfigured(settings),
     [settings],
@@ -288,49 +250,6 @@ export function SharePage({
             canManageShare={canManageShareFromRouter}
             onRefresh={refreshRouterSession}
           />
-        ) : null}
-
-        {/* C-1：share-needs-rebind 常驻横幅。任意 share 进入 needs-rebind 状态都
-            列在这里，点击可定位到该 share 的卡片。 */}
-        {Object.keys(needsRebindMap).length > 0 ? (
-          <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3">
-            <div className="text-sm font-medium text-destructive">
-              {t("share.needsRebindBannerTitle", {
-                defaultValue:
-                  "以下 share 的绑定 provider 已失效，请改绑或删除：",
-              })}
-            </div>
-            <ul className="mt-2 space-y-1 text-xs">
-              {Object.entries(needsRebindMap).map(([id, info]) => {
-                const share = shares.find((s) => s.id === id);
-                return (
-                  <li key={id} className="flex items-center justify-between">
-                    <span>
-                      <span className="font-mono">{share?.name ?? id}</span>
-                      <span className="ml-2 text-muted-foreground">
-                        {info.reason}
-                      </span>
-                    </span>
-                    <button
-                      type="button"
-                      className="text-xs underline"
-                      onClick={() =>
-                        setNeedsRebindMap((prev) => {
-                          const next = { ...prev };
-                          delete next[id];
-                          return next;
-                        })
-                      }
-                    >
-                      {t("share.needsRebindDismiss", {
-                        defaultValue: "忽略",
-                      })}
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
         ) : null}
 
         {!shareScoped && !clientTunnelConfigured && onOpenShareSettings ? (

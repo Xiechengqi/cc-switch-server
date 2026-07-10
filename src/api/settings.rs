@@ -324,6 +324,9 @@ pub(in crate::api) async fn ensure_email_router_config(
                 })
                 .await
                 .map_err(ApiError::internal)?;
+            if let Err(error) = crate::state::reconcile_all_shares_to_router(state.clone()).await {
+                tracing::warn!(error = %error, "automatic router share reconcile after registration failed");
+            }
             Ok(config)
         }
         Err(error) => {

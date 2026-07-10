@@ -111,8 +111,7 @@ use crate::domain::settings::config::{
 };
 use crate::domain::settings::ui_settings;
 use crate::domain::sharing::shares::{
-    Share, ShareAcl, ShareBinding, ShareMarketGrantStatus, ShareStore, ShareUpdateError,
-    UpsertShareInput,
+    Share, ShareAcl, ShareBinding, ShareMarketGrantStatus, ShareStore, UpsertShareInput,
 };
 use crate::domain::usage::pricing::UpdateModelPricingInput;
 use crate::domain::usage::store::{UsageLogFilter, UsageStatsFilter, UsageStore};
@@ -331,7 +330,6 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/shares/:id/tunnel/stop", post(stop_share_tunnel))
         .route("/api/shares/tunnels/restore", post(restore_share_tunnels))
         .route("/api/shares/:id/reset-usage", post(reset_share_usage))
-        .route("/api/shares/:id/binding", post(update_share_binding))
         .route("/api/shares/:id/acl", post(replace_share_acl))
         .route(
             "/api/shares/:id/market-grant",
@@ -365,14 +363,9 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/router/status", get(router_status))
         .route("/api/router/diagnostics", get(router_diagnostics))
         .route("/api/router/register", post(router_register))
-        .route("/api/router/batch-sync", post(router_batch_sync))
         .route(
             "/api/router/share-edits/pull",
             post(router_pull_share_edits),
-        )
-        .route(
-            "/api/router/shares/delete-all",
-            post(router_delete_all_shares),
         )
         .route("/api/proxy/capabilities", get(proxy_capabilities))
         .route(

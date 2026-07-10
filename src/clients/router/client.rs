@@ -543,7 +543,7 @@ pub async fn claim_share_subdomain(
     bail!("router share subdomain claim failed: {status}: {body}");
 }
 
-pub async fn batch_sync_shares(
+pub async fn push_share_ops(
     http: &reqwest::Client,
     config: &ServerConfig,
     ops: Vec<ShareSyncOperation>,
@@ -630,22 +630,6 @@ pub async fn notify_runtime_refresh(
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     bail!("router share runtime refresh failed: {status}: {body}");
-}
-
-pub async fn delete_all_shares(
-    http: &reqwest::Client,
-    config: &ServerConfig,
-) -> anyhow::Result<()> {
-    batch_sync_shares(
-        http,
-        config,
-        vec![ShareSyncOperation {
-            kind: "delete_all".to_string(),
-            share_id: None,
-            share: None,
-        }],
-    )
-    .await
 }
 
 pub async fn batch_sync_share_request_logs(

@@ -47,25 +47,20 @@ pub fn validate_and_normalize_upsert_input(
 }
 
 pub fn validate_share_import(share: &Share) -> Result<(), SharePatchError> {
-    if share.bindings.len() > 1 {
+    if share.bindings.len() != 1 {
         return Err(SharePatchError::Invalid(
-            "share must have at most one binding".into(),
+            "share must have exactly one binding".into(),
         ));
     }
-    if let Some(binding) = share.bindings.first() {
-        if binding.app != share.app {
-            return Err(SharePatchError::Invalid(
-                "share binding app must match share.app".into(),
-            ));
-        }
-        if binding.provider_id != share.provider_id {
-            return Err(SharePatchError::Invalid(
-                "share binding provider_id must match share.provider_id".into(),
-            ));
-        }
-    } else if share.provider_id.trim().is_empty() {
+    let binding = &share.bindings[0];
+    if binding.app != share.app {
         return Err(SharePatchError::Invalid(
-            "share provider_id is required".into(),
+            "share binding app must match share.app".into(),
+        ));
+    }
+    if binding.provider_id != share.provider_id {
+        return Err(SharePatchError::Invalid(
+            "share binding provider_id must match share.provider_id".into(),
         ));
     }
 

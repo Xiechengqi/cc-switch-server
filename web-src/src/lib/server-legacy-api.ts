@@ -682,14 +682,6 @@ export interface RouterDiagnosticsResponse extends RouterStatusResponse {
   shareSync: ShareSyncDiagnostic[];
 }
 
-export interface RouterBatchSyncResponse {
-  ok: boolean;
-  synced: number;
-  remoteSynced: boolean;
-  message: string;
-  shares: ShareRecord[];
-}
-
 export interface BackupFile {
   fileName: string;
   sizeBytes: number;

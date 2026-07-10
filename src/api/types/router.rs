@@ -1,5 +1,4 @@
 use crate::clients::router::client::RouterRegisterResult;
-use crate::domain::sharing::shares::Share;
 use crate::proxy::adapters::AdapterCapability;
 use serde::Serialize;
 
@@ -86,26 +85,9 @@ pub(in crate::api) struct ShareSyncDiagnostic {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct RouterBatchSyncResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) synced: usize,
-    pub(in crate::api) remote_synced: bool,
-    pub(in crate::api) message: String,
-    pub(in crate::api) shares: Vec<Share>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(in crate::api) struct RouterShareEditPullResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) summary: crate::state::ShareEditSyncSummary,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct RouterDeleteAllSharesResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) message: String,
 }
 
 #[derive(Debug, Serialize)]

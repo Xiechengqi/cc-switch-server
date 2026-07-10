@@ -1423,6 +1423,10 @@ pub async fn restore_tunnels(state: ServerState) {
     for share_id in auto_start_share_ids {
         start_share_tunnel(state.clone(), share_id).await;
     }
+
+    if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
+        tracing::warn!(error = %error, "automatic router share reconcile failed");
+    }
 }
 
 pub fn spawn_periodic_backups(state: ServerState) {
@@ -2058,7 +2062,7 @@ async fn sync_one_share_to_router(
         share: Some(descriptor),
     };
     let http_client = state.http_client().await;
-    let result = client::batch_sync_shares(&http_client, config, vec![op]).await;
+    let result = client::push_share_ops(&http_client, config, vec![op]).await;
     let router_base = config.router_api_base().map(str::to_string);
     {
         let mut store = state.shares.write().await;
@@ -2077,6 +2081,61 @@ async fn sync_one_share_to_router(
     }
     save_shares_debounced(state);
     result
+}
+
+/// Reconcile the router's installation-scoped share set with the current local
+/// store. This is an internal recovery path used after startup/registration;
+/// it is intentionally not exposed as a manual Web API action.
+pub async fn reconcile_all_shares_to_router(state: ServerState) -> anyhow::Result<usize> {
+    let config = state.config.read().await.clone();
+    if config.router.identity.is_none() {
+        return Ok(0);
+    }
+
+    let providers = state.providers.read().await.clone();
+    let accounts = state.accounts.read().await.clone();
+    let usage = state.usage.read().await.clone();
+    let shares = state.shares.read().await.shares.clone();
+    let mut ops = Vec::with_capacity(shares.len() + 1);
+    ops.push(ShareSyncOperation {
+        kind: "delete_all".to_string(),
+        share_id: None,
+        share: None,
+    });
+    ops.extend(shares.iter().map(|share| ShareSyncOperation {
+        kind: "upsert".to_string(),
+        share_id: None,
+        share: Some(descriptor_for_share_with_accounts_and_usage(
+            share,
+            &providers,
+            Some(&accounts),
+            Some(&usage),
+        )),
+    }));
+
+    let http_client = state.http_client().await;
+    let result = client::push_share_ops(&http_client, &config, ops).await;
+    let router_base = config.router_api_base().map(str::to_string);
+    let now = crate::infra::time::now_ms();
+    state
+        .mutate_shares_debounced(|store| match &result {
+            Ok(()) => {
+                store.router_registered = true;
+                store.last_router_error = None;
+                for share in &shares {
+                    store.mark_router_sync(&share.id, router_base.clone(), Ok(now));
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                store.last_router_error = Some(message.clone());
+                for share in &shares {
+                    store.mark_router_sync(&share.id, router_base.clone(), Err(message.clone()));
+                }
+            }
+        })
+        .await;
+    result.map(|()| shares.len())
 }
 
 async fn share_edit_event_loop(state: ServerState) {
@@ -2253,6 +2312,7 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
             shares.last_router_error = None;
         }
         state.save_shares().await?;
+        reconcile_all_shares_to_router(state.clone()).await?;
     }
 
     let owner_email = config

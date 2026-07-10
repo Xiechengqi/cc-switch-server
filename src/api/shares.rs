@@ -273,30 +273,6 @@ pub(in crate::api) async fn reset_share_usage(
     Ok(Json(UpsertShareResponse { ok: true, share }))
 }
 
-pub(in crate::api) async fn update_share_binding(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(input): Json<UpdateShareBindingRequest>,
-) -> Result<Json<UpsertShareResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let share = state
-        .mutate_shares_immediate(|store| {
-            store
-                .update_binding(&id, input.binding)
-                .map_err(|error| match error {
-                    ShareUpdateError::NotFound => ApiError::not_found("share not found"),
-                    ShareUpdateError::MustBePaused => ApiError::conflict(error.to_string()),
-                    ShareUpdateError::InvalidApp => ApiError::bad_request(error.to_string()),
-                })
-        })
-        .await
-        .map_err(ApiError::internal)??;
-    spawn_share_upsert_sync(state.clone(), share.clone());
-    emit_share_event(&state, "share.changed", &share, "binding_updated");
-    Ok(Json(UpsertShareResponse { ok: true, share }))
-}
-
 pub(in crate::api) async fn replace_share_acl(
     State(state): State<ServerState>,
     headers: HeaderMap,

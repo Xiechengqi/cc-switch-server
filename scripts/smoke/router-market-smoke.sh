@@ -242,9 +242,6 @@ post_optional "router register" "$SERVER_URL/api/router/register" "${auth_header
 echo "== client tunnel start =="
 post_optional "client tunnel start" "$SERVER_URL/api/router/client-tunnel/lease" "${auth_header[@]}"
 
-echo "== router batch sync =="
-post_optional "router batch sync" "$SERVER_URL/api/router/batch-sync" "${auth_header[@]}"
-
 echo "== router pending share edits pull =="
 post_optional "router pending share edits pull" "$SERVER_URL/api/router/share-edits/pull" "${auth_header[@]}"
 

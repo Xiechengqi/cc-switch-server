@@ -1642,27 +1642,24 @@ async fn stop_client_tunnel_releases_remote_tunnel_without_blocking_local_stop()
 }
 
 #[tokio::test]
-async fn router_batch_sync_notifies_runtime_refresh_after_remote_sync() {
+async fn automatic_router_reconcile_replaces_installation_shares() {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let router_addr = listener.local_addr().unwrap();
     let batch_seen = Arc::new(AtomicUsize::new(0));
-    let refresh_seen = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
         .route(
             "/v1/shares/batch-sync",
             post(
-                |State((batch_seen, _refresh_seen)): State<(
-                    Arc<AtomicUsize>,
-                    Arc<AtomicUsize>,
-                )>,
+                |State(batch_seen): State<Arc<AtomicUsize>>,
                  axum::Json(body): axum::Json<Value>| async move {
                     assert_eq!(body["installationId"].as_str(), Some("inst-runtime"));
-                    assert_eq!(body["ops"].as_array().map(Vec::len), Some(1));
-                    assert_eq!(body["ops"][0]["kind"].as_str(), Some("upsert"));
+                    assert_eq!(body["ops"].as_array().map(Vec::len), Some(2));
+                    assert_eq!(body["ops"][0]["kind"].as_str(), Some("delete_all"));
+                    assert_eq!(body["ops"][1]["kind"].as_str(), Some("upsert"));
                     assert_eq!(
-                        body["ops"][0]["share"]["shareId"].as_str(),
+                        body["ops"][1]["share"]["shareId"].as_str(),
                         Some("share-runtime")
                     );
                     batch_seen.fetch_add(1, Ordering::SeqCst);
@@ -1670,30 +1667,12 @@ async fn router_batch_sync_notifies_runtime_refresh_after_remote_sync() {
                 },
             ),
         )
-        .route(
-            "/v1/shares/runtime-refresh",
-            post(
-                |State((_batch_seen, refresh_seen)): State<(
-                    Arc<AtomicUsize>,
-                    Arc<AtomicUsize>,
-                )>,
-                 axum::Json(body): axum::Json<Value>| async move {
-                    assert_eq!(body["installationId"].as_str(), Some("inst-runtime"));
-                    assert_eq!(body["refresh"]["shareId"].as_str(), Some("share-runtime"));
-                    assert_eq!(body["refresh"]["subdomain"].as_str(), Some("runtime-sub"));
-                    refresh_seen.fetch_add(1, Ordering::SeqCst);
-                    axum::Json(json!({"ok": true}))
-                },
-            ),
-        )
-        .with_state((batch_seen.clone(), refresh_seen.clone()));
+        .with_state(batch_seen.clone());
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
 
     let state = test_state();
-    let app = app_router(state.clone());
-    let token = setup_and_login(&app).await;
     let mut config = state.config_snapshot().await;
     config.router.url = Some(format!("http://{router_addr}"));
     config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
@@ -1712,116 +1691,88 @@ async fn router_batch_sync_notifies_runtime_refresh_after_remote_sync() {
         .await
         .unwrap();
 
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/router/batch-sync",
-            json!(null),
-            Some(&token),
-        ))
+    let reconciled = cc_switch_server::state::reconcile_all_shares_to_router(state)
         .await
         .unwrap();
-
-    let status = response.status();
-    let body = json_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["remoteSynced"].as_bool(), Some(true));
+    assert_eq!(reconciled, 1);
     assert_eq!(batch_seen.load(Ordering::SeqCst), 1);
-    assert_eq!(refresh_seen.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn router_batch_sync_records_runtime_refresh_failure_without_failing_local_response() {
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let router_addr = listener.local_addr().unwrap();
-    let refresh_seen = Arc::new(AtomicUsize::new(0));
-    let router = Router::new()
-        .route(
-            "/v1/shares/batch-sync",
-            post(|| async { axum::Json(json!({"ok": true})) }),
-        )
-        .route(
-            "/v1/shares/runtime-refresh",
-            post(
-                |State(refresh_seen): State<Arc<AtomicUsize>>,
-                 axum::Json(body): axum::Json<Value>| async move {
-                    assert_eq!(
-                        body["refresh"]["shareId"].as_str(),
-                        Some("share-runtime-fail")
-                    );
-                    refresh_seen.fetch_add(1, Ordering::SeqCst);
-                    (StatusCode::SERVICE_UNAVAILABLE, "refresh unavailable")
-                },
-            ),
-        )
-        .with_state(refresh_seen.clone());
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-
+async fn provider_share_settings_are_saved_atomically() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
-    let mut config = state.config_snapshot().await;
-    config.router.url = Some(format!("http://{router_addr}"));
-    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
-        installation_id: "inst-runtime-fail".to_string(),
-        public_key: BASE64_STANDARD.encode([8_u8; 32]),
-        private_key: BASE64_STANDARD.encode([7_u8; 32]),
-        control_secret: Some("control-secret".to_string()),
-    });
-    state.replace_config(config).await.unwrap();
-    let mut share = test_share_input(
-        "share-runtime-fail",
-        "provider-runtime",
-        ProviderType::Codex,
-    );
-    share.tunnel_subdomain = Some("runtime-fail".to_string());
+
+    let mut input = test_share_input("share-provider-save", "provider-save", ProviderType::Codex);
+    input.tunnel_subdomain = Some("before-save".to_string());
     state
-        .mutate_shares_immediate(|store| {
-            let _ = store.upsert(share);
-        })
+        .mutate_shares_immediate(|store| store.upsert(input).unwrap())
         .await
         .unwrap();
 
     let response = app
-        .clone()
         .oneshot(json_request(
             Method::POST,
-            "/api/router/batch-sync",
-            json!(null),
+            "/web-api/invoke/save_provider_share",
+            json!({
+                "params": {
+                    "shareId": "share-provider-save",
+                    "ownerEmail": "owner@example.com",
+                    "subdomain": "after-save",
+                    "description": "Provider-scoped share",
+                    "forSale": "Yes",
+                    "saleMarketKind": "token",
+                    "marketAccessMode": "selected",
+                    "sharedWithEmails": ["friend@example.com"],
+                    "accessByApp": {
+                        "codex": {
+                            "sharedWithEmails": ["friend@example.com"],
+                            "marketAccessMode": "selected"
+                        }
+                    },
+                    "appSettings": {
+                        "codex": {
+                            "forSale": "Yes",
+                            "saleMarketKind": "token",
+                            "marketAccessMode": "selected",
+                            "sharedWithEmails": ["friend@example.com"],
+                            "tokenLimit": 123,
+                            "parallelLimit": 4,
+                            "expiresAt": "2030-01-01T00:00:00Z"
+                        }
+                    },
+                    "tokenLimit": 123,
+                    "parallelLimit": 4,
+                    "expiresAt": "2030-01-01T00:00:00Z"
+                }
+            }),
             Some(&token),
         ))
         .await
         .unwrap();
-
-    let status = response.status();
-    let body = json_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["remoteSynced"].as_bool(), Some(false));
-    assert!(body["message"]
-        .as_str()
-        .unwrap()
-        .contains("runtime refresh failed"));
-    assert_eq!(refresh_seen.load(Ordering::SeqCst), 1);
-
-    let status = app
-        .oneshot(json_request(
-            Method::GET,
-            "/api/router/status",
-            json!(null),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    let body = json_body(status).await;
-    assert!(body["lastError"]
-        .as_str()
-        .unwrap()
-        .contains("runtime refresh failed"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved = json_body(response).await;
+    assert_eq!(saved["tunnelSubdomain"].as_str(), Some("after-save"));
+    assert_eq!(saved["description"].as_str(), Some("Provider-scoped share"));
+    assert_eq!(saved["forSale"].as_bool(), Some(true));
+    assert_eq!(saved["saleMarketKind"].as_str(), Some("token"));
+    assert_eq!(saved["tokenLimit"].as_u64(), Some(123));
+    assert_eq!(saved["parallelLimit"].as_u64(), Some(4));
+    assert_eq!(saved["expiresAt"].as_i64(), Some(1_893_456_000_000));
+    assert_eq!(
+        saved["acl"]["sharedWithEmails"][0].as_str(),
+        Some("friend@example.com")
+    );
+    assert_eq!(saved["bindings"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        saved["bindings"][0]["providerId"].as_str(),
+        Some("provider-save")
+    );
+    assert_eq!(
+        saved["appSettings"]["codex"]["expiresAt"].as_str(),
+        Some("2030-01-01T00:00:00Z")
+    );
 }
 
 #[tokio::test]

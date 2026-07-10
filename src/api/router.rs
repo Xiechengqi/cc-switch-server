@@ -334,6 +334,9 @@ pub(in crate::api) async fn router_register(
                 })
                 .await
                 .map_err(ApiError::internal)?;
+            if let Err(error) = crate::state::reconcile_all_shares_to_router(state.clone()).await {
+                tracing::warn!(error = %error, "automatic router share reconcile after registration failed");
+            }
             Ok(Json(RouterRegisterResponse {
                 ok: true,
                 registration,
@@ -360,88 +363,6 @@ pub(in crate::api) async fn router_register(
     }
 }
 
-pub(in crate::api) async fn router_batch_sync(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<RouterBatchSyncResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
-    let shares = state
-        .mutate_shares_debounced(|store| {
-            store.refresh_runtime_snapshots(&providers, Some(&accounts), &usage)
-        })
-        .await;
-    let config = state.config.read().await.clone();
-    let mut remote_synced = false;
-    let mut remote_error = None;
-    if config.router.identity.is_some() {
-        let mut refresh_targets = Vec::new();
-        let ops = shares
-            .iter()
-            .map(|share| {
-                let descriptor = descriptor_for_share_with_accounts_and_usage(
-                    share,
-                    &providers,
-                    Some(&accounts),
-                    Some(&usage),
-                );
-                refresh_targets.push((descriptor.share_id.clone(), descriptor.subdomain.clone()));
-                ShareSyncOperation {
-                    kind: "upsert".to_string(),
-                    share_id: None,
-                    share: Some(descriptor),
-                }
-            })
-            .collect();
-        let http_client = state.http_client().await;
-        if let Err(error) =
-            crate::clients::router::client::batch_sync_shares(&http_client, &config, ops).await
-        {
-            remote_error = Some(error.to_string());
-        } else if let Some(error) =
-            notify_runtime_refreshes(&http_client, &config, &refresh_targets).await
-        {
-            remote_error = Some(error);
-        }
-        remote_synced = remote_error.is_none();
-    } else {
-        remote_error = Some("router installation is not registered".to_string());
-    }
-    if let Some(error) = remote_error.clone() {
-        state
-            .mutate_shares_immediate(|store| {
-                store.last_router_error = Some(error);
-            })
-            .await
-            .map_err(ApiError::internal)?;
-    } else {
-        state
-            .mutate_shares_immediate(|store| {
-                store.router_registered = true;
-                store.last_router_error = None;
-            })
-            .await
-            .map_err(ApiError::internal)?;
-    }
-    let message = if remote_synced {
-        "local runtime snapshots refreshed and remote router shares synced".to_string()
-    } else {
-        format!(
-            "local runtime snapshots refreshed; remote router sync skipped/failed: {}",
-            remote_error.unwrap_or_else(|| "unknown error".to_string())
-        )
-    };
-    Ok(Json(RouterBatchSyncResponse {
-        ok: true,
-        synced: shares.len(),
-        remote_synced,
-        message,
-        shares,
-    }))
-}
-
 pub(in crate::api) async fn router_pull_share_edits(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -451,36 +372,6 @@ pub(in crate::api) async fn router_pull_share_edits(
     Ok(Json(RouterShareEditPullResponse {
         ok: summary.error.is_none(),
         summary,
-    }))
-}
-
-pub(in crate::api) async fn router_delete_all_shares(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<RouterDeleteAllSharesResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let config = state.config.read().await.clone();
-    if config.router.identity.is_none() {
-        return Err(ApiError::bad_request(
-            "router installation is not registered",
-        ));
-    }
-    let http_client = state.http_client().await;
-    crate::clients::router::client::delete_all_shares(&http_client, &config)
-        .await
-        .map_err(|error| {
-            ApiError::bad_gateway(format!("router delete_all shares failed: {error}"))
-        })?;
-    state
-        .mutate_shares_immediate(|shares| {
-            shares.router_registered = true;
-            shares.last_router_error = None;
-        })
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(RouterDeleteAllSharesResponse {
-        ok: true,
-        message: "remote router shares for this installation were deleted".to_string(),
     }))
 }
 
@@ -540,7 +431,7 @@ pub(in crate::api) async fn sync_share_ops(state: ServerState, ops: Vec<ShareSyn
     }
     let router_base = config.router_api_base().map(str::to_string);
     let http_client = state.http_client().await;
-    match crate::clients::router::client::batch_sync_shares(&http_client, &config, ops).await {
+    match crate::clients::router::client::push_share_ops(&http_client, &config, ops).await {
         Ok(()) => {
             let now = now_ms();
             let refresh_error =

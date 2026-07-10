@@ -238,6 +238,31 @@ impl ShareStore {
                 .map(|item| item.id.clone())
         });
 
+        if let Some(conflict) = self.shares.iter().find(|item| {
+            item.app == app
+                && item.provider_id == provider_id
+                && existing_id.as_deref() != Some(item.id.as_str())
+                && item.status != "deleted"
+        }) {
+            return Err(SharePatchError::Invalid(format!(
+                "provider already has share {}",
+                conflict.id
+            )));
+        }
+
+        if let Some(subdomain) = tunnel_subdomain.as_deref() {
+            if let Some(conflict) = self.shares.iter().find(|item| {
+                item.tunnel_subdomain.as_deref() == Some(subdomain)
+                    && existing_id.as_deref() != Some(item.id.as_str())
+                    && item.status != "deleted"
+            }) {
+                return Err(SharePatchError::Invalid(format!(
+                    "share subdomain is already used by {}",
+                    conflict.id
+                )));
+            }
+        }
+
         let preserved = existing_id
             .as_deref()
             .and_then(|id| self.shares.iter().find(|item| item.id == id))
@@ -461,6 +486,14 @@ impl ShareStore {
         share_id: &str,
         binding: ShareBinding,
     ) -> Result<Share, ShareUpdateError> {
+        if self.shares.iter().any(|item| {
+            item.id != share_id
+                && item.app == binding.app
+                && item.provider_id == binding.provider_id
+                && item.status != "deleted"
+        }) {
+            return Err(ShareUpdateError::ProviderAlreadyShared);
+        }
         let share = self
             .shares
             .iter_mut()
@@ -473,6 +506,7 @@ impl ShareStore {
         if binding.app != share.app {
             return Err(ShareUpdateError::InvalidApp);
         }
+
         if share.bindings.len() != 1 {
             share.bindings = vec![ShareBinding {
                 app: share.app,
@@ -825,7 +859,7 @@ impl ShareStore {
             share.parallel_limit = (parallel_limit >= 0).then_some(parallel_limit as u32);
         }
         if let Some(expires_at) = patch.expires_at {
-            share.expires_at = expires_at.trim().parse::<i64>().ok();
+            share.expires_at = parse_share_expiration(&expires_at)?;
         }
         if let Some(auto_start) = patch.auto_start {
             share.auto_start = auto_start;
@@ -845,6 +879,38 @@ impl ShareStore {
             imported += 1;
         }
         imported
+    }
+
+    pub fn replace_configured_share(&mut self, candidate: Share) -> Result<Share, SharePatchError> {
+        crate::domain::sharing::invariants::validate_share_import(&candidate)?;
+        let index = self
+            .shares
+            .iter()
+            .position(|share| share.id == candidate.id)
+            .ok_or(SharePatchError::NotFound)?;
+        if self.shares.iter().enumerate().any(|(other_index, share)| {
+            other_index != index
+                && share.status != "deleted"
+                && share.app == candidate.app
+                && share.provider_id == candidate.provider_id
+        }) {
+            return Err(SharePatchError::Invalid(
+                "provider already has an active share".to_string(),
+            ));
+        }
+        if let Some(subdomain) = candidate.tunnel_subdomain.as_deref() {
+            if self.shares.iter().enumerate().any(|(other_index, share)| {
+                other_index != index
+                    && share.status != "deleted"
+                    && share.tunnel_subdomain.as_deref() == Some(subdomain)
+            }) {
+                return Err(SharePatchError::Invalid(
+                    "share subdomain is already in use".to_string(),
+                ));
+            }
+        }
+        self.shares[index] = candidate.clone();
+        Ok(candidate)
     }
 
     pub fn set_share_tunnel_status(
@@ -954,6 +1020,7 @@ pub enum ShareUpdateError {
     NotFound,
     MustBePaused,
     InvalidApp,
+    ProviderAlreadyShared,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1005,6 +1072,9 @@ impl std::fmt::Display for ShareUpdateError {
                 formatter.write_str("share must be paused before updating binding")
             }
             Self::InvalidApp => formatter.write_str("share binding app must match share.app"),
+            Self::ProviderAlreadyShared => {
+                formatter.write_str("provider already has an active share")
+            }
         }
     }
 }
@@ -1074,6 +1144,19 @@ fn share_expired(expires_at: i64, now_ms: i64) -> bool {
         expires_at
     };
     now_ms > expires_at_ms
+}
+
+fn parse_share_expiration(value: &str) -> Result<Option<i64>, SharePatchError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(timestamp) = value.parse::<i64>() {
+        return Ok(Some(timestamp));
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|value| Some(value.timestamp_millis()))
+        .map_err(|_| SharePatchError::Invalid("expiresAt must be a timestamp or RFC3339".into()))
 }
 
 fn parse_router_bool(value: &str) -> bool {
@@ -1306,6 +1389,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_second_share_for_same_provider_instance() {
+        let mut store = ShareStore::default();
+        store.upsert(codex_share_input("s1")).unwrap();
+        let error = store.upsert(codex_share_input("s2")).unwrap_err();
+        assert!(error.to_string().contains("provider already has share"));
+    }
+
+    #[test]
+    fn allows_multiple_instances_of_same_provider_type() {
+        let mut store = ShareStore::default();
+        store.upsert(codex_share_input("s1")).unwrap();
+        let mut second = codex_share_input("s2");
+        second.provider_id = "p2".to_string();
+        let share = store.upsert(second).unwrap();
+        assert_eq!(share.provider_type, ProviderType::Codex);
+        assert_eq!(store.shares.len(), 2);
+    }
+
+    #[test]
     fn validates_share_invocation_lifecycle_limits_and_counters() {
         let mut store = ShareStore::default();
         let _ = store.upsert(codex_share_input("expired")).unwrap();
@@ -1321,7 +1423,9 @@ mod tests {
         assert_eq!(store.shares[0].status, "expired");
         assert!(!store.shares[0].enabled);
 
-        let _ = store.upsert(codex_share_input("paused")).unwrap();
+        let mut paused = codex_share_input("paused");
+        paused.provider_id = "p-paused".to_string();
+        let _ = store.upsert(paused).unwrap();
         store.pause("paused").unwrap();
         let rejection = store
             .validate_for_invocation("paused", 1_000_000)
@@ -1329,7 +1433,9 @@ mod tests {
         assert_eq!(rejection.reason, ShareRejectReason::Inactive);
         assert!(rejection.formatted_message().contains("[Inactive]"));
 
-        let _ = store.upsert(codex_share_input("limited")).unwrap();
+        let mut limited_input = codex_share_input("limited");
+        limited_input.provider_id = "p-limited".to_string();
+        let _ = store.upsert(limited_input).unwrap();
         {
             let limited = store
                 .shares
@@ -1353,7 +1459,9 @@ mod tests {
             "exhausted"
         );
 
-        let _ = store.upsert(codex_share_input("record")).unwrap();
+        let mut record = codex_share_input("record");
+        record.provider_id = "p-record".to_string();
+        let _ = store.upsert(record).unwrap();
         store
             .shares
             .iter_mut()
@@ -2173,8 +2281,11 @@ mod tests {
         });
         first.app_settings = codex_app_settings(vec!["new-owner@example.com", "buyer@example.com"]);
         let _ = store.upsert(first).unwrap();
-        let _ = store.upsert(codex_share_input("s2")).unwrap();
+        let mut second = codex_share_input("s2");
+        second.provider_id = "p2".to_string();
+        let _ = store.upsert(second).unwrap();
         let mut other = codex_share_input("s3");
+        other.provider_id = "p3".to_string();
         other.owner_email = Some("other@example.com".to_string());
         let _ = store.upsert(other).unwrap();
 

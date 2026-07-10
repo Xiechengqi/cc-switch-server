@@ -469,20 +469,12 @@ async fn web_invoke_dispatch(
             Ok(json!(response))
         }
         "email_auth_logout" => web_email_auth_logout(state).await,
-        "update_share_provider_binding" => {
-            let (id, binding) = web_share_binding_input(state, &args).await?;
-            let response = update_share_binding(
-                State(state.clone()),
-                headers.clone(),
-                Path(id),
-                Json(UpdateShareBindingRequest { binding }),
-            )
-            .await?
-            .0;
-            Ok(json!(response.share))
-        }
         "update_share_acl" => {
             let share = web_update_share_acl(state, &args).await?;
+            Ok(json!(share))
+        }
+        "save_provider_share" => {
+            let share = web_save_provider_share(state, &args).await?;
             Ok(json!(share))
         }
         "update_share_owner_email" => {
@@ -1725,25 +1717,6 @@ async fn web_invoke_dispatch(
             .await?
             .0;
             Ok(json!(response.imported))
-        }
-        "list_share_binding_history" => {
-            let share_id = web_arg_share_id(&args)?;
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            let history = state
-                .shares
-                .read()
-                .await
-                .get(&share_id)
-                .map(|share| share.binding_history.clone())
-                .ok_or_else(|| ApiError::not_found("share not found"))?;
-            let history = match limit {
-                Some(limit) => history.into_iter().rev().take(limit).rev().collect(),
-                None => history,
-            };
-            Ok(json!(history))
         }
         "configure_tunnel" => {
             web_configure_share_tunnel(state, &args).await?;

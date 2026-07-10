@@ -76,7 +76,7 @@ export function useToggleProviderShare(
         return;
       }
 
-      const created = await createMutation.mutateAsync({
+      await createMutation.mutateAsync({
         ownerEmail,
         bindings: { [appId]: providerId },
         forSale: "Yes",
@@ -84,8 +84,23 @@ export function useToggleProviderShare(
         tokenLimit: UNLIMITED_TOKEN_LIMIT,
         parallelLimit: UNLIMITED_PARALLEL_LIMIT,
         expiresInSecs: permanentExpiresInSecs(),
+        sharedWithEmails: [],
+        marketAccessMode: "all",
+        accessByApp: {
+          [appId]: { sharedWithEmails: [], marketAccessMode: "all" },
+        },
+        appSettings: {
+          [appId]: {
+            forSale: "Yes",
+            saleMarketKind: "token",
+            marketAccessMode: "all",
+            sharedWithEmails: [],
+            tokenLimit: UNLIMITED_TOKEN_LIMIT,
+            parallelLimit: UNLIMITED_PARALLEL_LIMIT,
+            expiresAt: "2099-12-31T23:59:59Z",
+          },
+        },
       });
-      await enableMutation.mutateAsync(created.id);
     } catch (error) {
       toast.error(
         t("share.toggle.enableFailed", {

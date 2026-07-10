@@ -4,11 +4,7 @@ import {
   normalizeShareRecords,
 } from "@/utils/shareRecordNormalize";
 
-/**
- * 一个 share 在每个 app_type 上各自绑定的 provider id。
- * P8 多 app share：键固定从 "claude" | "codex" | "gemini" 三个 app 里挑，缺省 = 该 app
- * 未绑定，对应请求会被拒绝并 emit share-needs-rebind。
- */
+/** Wire representation of the share's single app/provider binding. */
 export type ShareBindings = Partial<
   Record<"claude" | "codex" | "gemini", string>
 >;
@@ -50,7 +46,7 @@ export interface ShareRecord {
   description?: string | null;
   forSale: "Yes" | "No" | "Free";
   saleMarketKind?: ShareSaleMarketKind;
-  /** P8: 每个 app_type 的 provider 绑定。三个 slot 各自独立，0..3 个 entry。 */
+  /** Exactly one entry for a valid share. */
   bindings: ShareBindings;
   apiKey: string;
   settingsConfig?: string | null;
@@ -78,28 +74,10 @@ export interface CreateShareParams {
   parallelLimit: number;
   expiresInSecs: number;
   subdomain?: string;
-}
-
-export interface UpdateShareProviderBindingParams {
-  shareId: string;
-  /** 目标 slot 的 app_type（claude / codex / gemini）。 */
-  appType: "claude" | "codex" | "gemini";
-  /**
-   * 新 provider id。`null` / 省略 = 清空该 slot（解绑），share 在该 app 上将不再可用。
-   * `dynamic = true` 时该字段可省略，后端会解析当前 app 选中的 provider 并写入动态绑定。
-   */
-  providerId?: string | null;
-  /** 动态绑定当前选中的 provider。 */
-  dynamic?: boolean;
-}
-
-export interface ShareBindingHistoryEntry {
-  id: number;
-  oldProviderId: string | null;
-  /** `null` 表示这是一次解绑事件（slot 被清空）。 */
-  newProviderId: string | null;
-  appType: string;
-  changedAt: string;
+  sharedWithEmails?: string[];
+  marketAccessMode?: "selected" | "all";
+  accessByApp?: ShareAccessByApp;
+  appSettings?: ShareAppSettingsByApp;
 }
 
 export const SHARE_APP_TYPES: ReadonlyArray<keyof ShareBindings> = [
@@ -108,9 +86,7 @@ export const SHARE_APP_TYPES: ReadonlyArray<keyof ShareBindings> = [
   "gemini",
 ];
 
-/**
- * 返回该 share 已绑定的 app_type 列表（按 claude > codex > gemini 顺序）。
- */
+/** Return the share's single bound app as a one-item list. */
 export function shareSupportedApps(
   share: Pick<ShareRecord, "bindings"> | null | undefined,
 ): Array<keyof ShareBindings> {
@@ -122,8 +98,7 @@ export function shareSupportedApps(
 }
 
 /**
- * "主 app"：用于卡片摘要、列表行、表单默认聚焦等单值场景。
- * 优先级与后端 ShareRecord::primary_app 保持一致。
+ * The only app bound to this share.
  */
 export function sharePrimaryApp(
   share: Pick<ShareRecord, "bindings"> | null | undefined,
@@ -156,6 +131,23 @@ export interface UpdateShareAclParams {
   accessByApp?: ShareAccessByApp;
   appSettings?: ShareAppSettingsByApp;
   saleMarketKind?: ShareSaleMarketKind;
+}
+
+/** Complete settings payload saved atomically from a Provider edit page. */
+export interface SaveProviderShareParams {
+  shareId: string;
+  ownerEmail: string;
+  subdomain: string;
+  description?: string;
+  forSale: "Yes" | "No" | "Free";
+  saleMarketKind: ShareSaleMarketKind;
+  marketAccessMode: "selected" | "all";
+  sharedWithEmails: string[];
+  accessByApp: ShareAccessByApp;
+  appSettings: ShareAppSettingsByApp;
+  tokenLimit: number;
+  parallelLimit: number;
+  expiresAt: string;
 }
 
 export interface UpdateShareTokenLimitParams {
@@ -382,23 +374,10 @@ async function updateAcl(params: UpdateShareAclParams): Promise<ShareRecord> {
   return invokeShareRecord("update_share_acl", { params });
 }
 
-async function updateProviderBinding(
-  params: UpdateShareProviderBindingParams,
+async function saveProviderShare(
+  params: SaveProviderShareParams,
 ): Promise<ShareRecord> {
-  return invokeShareRecord("update_share_provider_binding", { params });
-}
-
-async function listBindingHistory(
-  shareId: string,
-  limit?: number,
-): Promise<ShareBindingHistoryEntry[]> {
-  return invokeCommand<ShareBindingHistoryEntry[]>(
-    "list_share_binding_history",
-    {
-      shareId,
-      limit,
-    },
-  );
+  return invokeShareRecord("save_provider_share", { params });
 }
 
 export interface ImportSharesResult {
@@ -503,8 +482,7 @@ export const shareApi = {
   updateOwnerEmail,
   transferOwner,
   updateAcl,
-  updateProviderBinding,
-  listBindingHistory,
+  saveProviderShare,
   exportAll,
   importMany,
   listMarkets,

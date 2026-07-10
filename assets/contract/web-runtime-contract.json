@@ -1269,13 +1269,6 @@
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
-      "name": "list_share_binding_history",
-      "support": "shim",
-      "implemented": true,
-      "feature": "shares",
-      "notes": "Server web runtime shim."
-    },
-    {
       "name": "list_share_markets",
       "support": "native",
       "implemented": true,
@@ -1548,6 +1541,14 @@
       "implemented": true,
       "feature": "proxy",
       "notes": "Server web runtime shim for desktop-synced settings UI."
+    },
+    {
+      "name": "save_provider_share",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/save_provider_share",
+      "notes": "Atomically persists the complete share configuration from a Provider edit page."
     },
     {
       "name": "set_auto_launch",
@@ -1883,14 +1884,6 @@
       "implemented": true,
       "feature": "shares",
       "notes": "Server web runtime shim."
-    },
-    {
-      "name": "update_share_provider_binding",
-      "support": "native",
-      "implemented": true,
-      "feature": "shares",
-      "endpoint": "POST /api/shares/:id/binding",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
       "name": "update_share_subdomain",

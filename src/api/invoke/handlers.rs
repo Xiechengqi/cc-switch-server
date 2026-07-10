@@ -2,7 +2,9 @@ use super::super::*;
 use std::collections::BTreeMap;
 
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
-use crate::domain::sharing::router_contract::ShareSettingsPatch;
+use crate::domain::sharing::router_contract::{
+    descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch,
+};
 
 pub(in crate::api) fn web_provider_health_json(
     app: AppKind,
@@ -456,6 +458,13 @@ pub(in crate::api) async fn web_share_upsert_input(
         })
     });
 
+    let shared_with_emails =
+        web_optional_deserialize::<Vec<String>>(value, "sharedWithEmails")?.unwrap_or_default();
+    let market_access_mode =
+        web_optional_string_any(value, &["marketAccessMode", "market_access_mode"]);
+    let access_by_app = web_optional_deserialize(value, "accessByApp")?.unwrap_or_default();
+    let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
+
     Ok(UpsertShareInput {
         id: web_optional_string_any(value, &["id", "shareId", "share_id"]),
         owner_email: web_optional_string_any(value, &["ownerEmail", "owner_email"]),
@@ -469,14 +478,18 @@ pub(in crate::api) async fn web_share_upsert_input(
         account_email: None,
         quota_percent: None,
         tunnel_subdomain: web_optional_string_any(value, &["tunnelSubdomain", "subdomain"]),
-        acl: None,
+        acl: Some(ShareAcl {
+            shared_with_emails,
+            public_market_email: None,
+            market_access_mode,
+        }),
         token_limit: web_optional_u64(value, &["tokenLimit", "token_limit"]),
         parallel_limit: web_optional_u32(value, &["parallelLimit", "parallel_limit"]),
         expires_at,
         for_sale: web_optional_share_for_sale(value),
         sale_market_kind: web_optional_string_any(value, &["saleMarketKind", "sale_market_kind"]),
-        access_by_app: BTreeMap::new(),
-        app_settings: BTreeMap::new(),
+        access_by_app,
+        app_settings,
         for_sale_official_price_percent_by_app: BTreeMap::new(),
         official_price_percent: None,
         auto_start: web_optional_bool(value, &["autoStart", "auto_start"]),
@@ -485,35 +498,6 @@ pub(in crate::api) async fn web_share_upsert_input(
         runtime_snapshot: None,
         market_grant: None,
     })
-}
-
-pub(in crate::api) async fn web_share_binding_input(
-    state: &ServerState,
-    args: &Value,
-) -> Result<(String, ShareBinding), ApiError> {
-    let value = web_payload(args, &["params", "input"]);
-    let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
-    if let Some(binding_value) = value.get("binding") {
-        let binding = serde_json::from_value::<ShareBinding>(binding_value.clone())
-            .map_err(ApiError::bad_request)?;
-        return Ok((share_id, binding));
-    }
-
-    let app = web_arg_string_any(value, &["appType", "app", "app_type"])
-        .and_then(|value| parse_app_kind(&value))?;
-    let provider_id = web_arg_string_any(value, &["providerId", "provider_id"])?;
-    let provider_type = web_optional_string_any(value, &["providerType", "provider_type"])
-        .map(|value| web_parse_provider_type(&value))
-        .transpose()?
-        .unwrap_or(web_provider_type_for_binding(state, app, &provider_id).await?);
-    Ok((
-        share_id,
-        ShareBinding {
-            app,
-            provider_id,
-            provider_type,
-        },
-    ))
 }
 
 pub(in crate::api) async fn web_update_share_owner_email(
@@ -893,6 +877,107 @@ pub(in crate::api) async fn web_update_share_acl(
     spawn_share_upsert_sync(state.clone(), share.clone());
     emit_share_event(state, "share.changed", &share, "acl_replaced");
     Ok(share)
+}
+
+pub(in crate::api) async fn web_save_provider_share(
+    state: &ServerState,
+    args: &Value,
+) -> Result<Share, ApiError> {
+    let value = web_payload(args, &["params", "input"]);
+    let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
+    let owner_email = web_arg_string_any(value, &["ownerEmail", "owner_email"])?;
+    let subdomain = web_arg_string_any(value, &["subdomain"])?;
+    let description = web_optional_string_any(value, &["description"]);
+    let for_sale = web_arg_string_any(value, &["forSale", "for_sale"])?;
+    let sale_market_kind = web_arg_string_any(value, &["saleMarketKind", "sale_market_kind"])?;
+    let market_access_mode =
+        web_arg_string_any(value, &["marketAccessMode", "market_access_mode"])?;
+    let shared_with_emails =
+        web_optional_deserialize::<Vec<String>>(value, "sharedWithEmails")?.unwrap_or_default();
+    let access_by_app = web_optional_deserialize(value, "accessByApp")?.unwrap_or_default();
+    let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
+    let token_limit = web_optional_i64(value, &["tokenLimit", "token_limit"])
+        .ok_or_else(|| ApiError::bad_request("tokenLimit is required"))?;
+    let parallel_limit = web_optional_i64(value, &["parallelLimit", "parallel_limit"])
+        .ok_or_else(|| ApiError::bad_request("parallelLimit is required"))?;
+    let expires_at = web_arg_string_any(value, &["expiresAt", "expires_at"])?;
+
+    let mut staged = state.shares.read().await.clone();
+    let current = staged
+        .get(&share_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("share not found"))?;
+    let subdomain_changed = current.tunnel_subdomain.as_deref() != Some(subdomain.as_str());
+    let was_running = current.enabled && current.status == "active";
+
+    staged
+        .update_owner_email(&share_id, &owner_email)
+        .map_err(map_share_patch_error)?;
+    staged
+        .update_subdomain(&share_id, subdomain)
+        .map_err(map_share_patch_error)?;
+    let candidate = staged
+        .apply_settings_patch(
+            &share_id,
+            ShareSettingsPatch {
+                description: Some(description),
+                for_sale: Some(for_sale),
+                sale_market_kind: Some(sale_market_kind),
+                market_access_mode: Some(market_access_mode),
+                shared_with_emails: Some(shared_with_emails),
+                access_by_app: Some(access_by_app),
+                app_settings: Some(app_settings),
+                token_limit: Some(token_limit),
+                parallel_limit: Some(parallel_limit),
+                expires_at: Some(expires_at),
+                ..ShareSettingsPatch::default()
+            },
+        )
+        .map_err(map_share_patch_error)?;
+    staged
+        .replace_configured_share(candidate.clone())
+        .map_err(map_share_patch_error)?;
+
+    if subdomain_changed {
+        let config = state.config.read().await.clone();
+        if config.router.identity.is_some() {
+            let providers = state.providers.read().await.clone();
+            let accounts = state.accounts.read().await.clone();
+            let usage = state.usage.read().await.clone();
+            let descriptor = descriptor_for_share_with_accounts_and_usage(
+                &candidate,
+                &providers,
+                Some(&accounts),
+                Some(&usage),
+            );
+            let http_client = state.http_client().await;
+            crate::clients::router::client::claim_share_subdomain(
+                &http_client,
+                &config,
+                descriptor,
+            )
+            .await
+            .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+        }
+    }
+
+    let saved = state
+        .try_mutate_shares_immediate(|store| store.replace_configured_share(candidate))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_share_patch_error)?;
+    if subdomain_changed && was_running {
+        crate::state::stop_share_tunnel(state, &share_id).await;
+        crate::state::start_share_tunnel(state.clone(), share_id.clone()).await;
+    }
+    spawn_share_upsert_sync(state.clone(), saved.clone());
+    emit_share_event(
+        state,
+        "share.changed",
+        &saved,
+        "provider_share_settings_saved",
+    );
+    Ok(saved)
 }
 
 pub(in crate::api) fn web_client_tunnel_share_status(

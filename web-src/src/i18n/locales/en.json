@@ -128,6 +128,8 @@
       "deleteConfirmMessage": "This share will be removed from the Share page and cannot be restored.",
       "deleteRemember": "Remember my choice and do not ask again",
       "openShareSettings": "Open share settings",
+      "saveSuccess": "Share settings saved",
+      "saveError": "Failed to save share settings: {{error}}",
       "routerFromSettingsHint": "New shares use the default router from Settings → Share."
     },
     "inUse": "In Use",
@@ -405,11 +407,6 @@
         "hint": "Choose the router node below under Default Router Node. Use this section for API Base, SSH, and other advanced options.",
         "save": "Save advanced settings",
         "saved": "Advanced router settings saved"
-      },
-      "batchSyncConfirm": {
-        "title": "Batch sync shares to router?",
-        "message": "This syncs local share metadata to the remote router. Matching share records may be updated.",
-        "confirm": "Sync"
       }
     },
     "authCenter": {

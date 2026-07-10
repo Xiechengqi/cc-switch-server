@@ -135,8 +135,8 @@
 
 ### X9 router 次要契约补齐：runtime-refresh 通知 + client-tunnel 状态/释放
 
-- **状态（2026-07-07）**：**已完成**。`src/clients/router/client.rs` 已新增 `notify_runtime_refresh()`、`get_client_tunnel()`、`update_client_tunnel()` / `release_client_tunnel()`；`/api/router/batch-sync` 与 share upsert 同步成功后会追加 `POST /v1/shares/runtime-refresh`，失败只记录 `last_router_error`；`/api/router/client-tunnel` GET 会 best-effort 查询 router 远端状态，stop 路径会 PATCH `/v1/installations/client-tunnel` 写入 `enabled=false` 后返回本地 stopped 状态。合同测试覆盖状态查询、释放请求 shape、runtime-refresh 请求 shape。
-- **现状证据**：desktop `tunnel/sync.rs:524` 在本地 share/provider 变更后调用 router `POST /v1/shares/runtime-refresh` 主动触发 router 重拉 runtime；desktop `tunnel/connection.rs:157` 使用 `/v1/installations/client-tunnel`（状态查询/释放）。server 均未调用——runtime 时效依赖 batch-sync 推送与 router 自主经 `_share-router/share-runtime` 拉取，client tunnel stop 只做本地清理，router 侧 lease 悬挂到自然过期。
+- **状态（2026-07-10）**：**已完成并收敛为自动同步**。`src/clients/router/client.rs` 提供 share op 传输、runtime refresh、client tunnel 查询和释放；share 变更会自动增量同步，client 启动或重新注册后会自动 reconcile。旧 `/api/router/batch-sync` 人工入口已删除；诊断页只展示同步结果和错误。
+- **现状证据**：server 已对齐 desktop 的 runtime-refresh 与 client-tunnel 状态/释放调用；share 增量变更自动推送，启动或注册后的安装级 reconcile 使用同一批量传输协议，但不再暴露人工触发 API。
 - **实施细节**：
   1. ✅ `src/clients/router/client.rs` 新增 `notify_runtime_refresh()`（POST `v1/shares/runtime-refresh`，签名与既有调用一致），在 share batch-sync / upsert 成功后触发（失败仅记 `last_router_error`，不阻塞本地写路径）；
   2. ✅ `src/api/router.rs` stop 路径追加对 router `/v1/installations/client-tunnel` 的释放调用（PATCH `enabled=false`，按 router 实际 handler 对齐），未注册 identity 时跳过；

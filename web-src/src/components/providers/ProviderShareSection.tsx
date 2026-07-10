@@ -40,16 +40,9 @@ import {
   useEnableShareMutation,
   usePauseShareMutation,
   useResumeShareMutation,
+  useSaveProviderShareMutation,
   useSettingsQuery,
   useShareMarketsQuery,
-  useUpdateShareAclMutation,
-  useUpdateShareDescriptionMutation,
-  useUpdateShareExpirationMutation,
-  useUpdateShareForSaleMutation,
-  useUpdateShareOwnerEmailMutation,
-  useUpdateShareParallelLimitMutation,
-  useUpdateShareSubdomainMutation,
-  useUpdateShareTokenLimitMutation,
 } from "@/lib/query";
 import {
   getProviderShareState,
@@ -64,8 +57,6 @@ import {
   formatShareLimitInput,
   getTunnelConfigFromSettings,
   isPermanentExpiry,
-  isUnlimitedParallelLimit,
-  isUnlimitedTokenLimit,
   MIN_PARALLEL_LIMIT,
   normalizeShareLimitValue,
   PERMANENT_EXPIRES_AT,
@@ -185,14 +176,7 @@ export function ProviderShareSection({
   const disableMutation = useDisableShareMutation();
   const pauseMutation = usePauseShareMutation();
   const resumeMutation = useResumeShareMutation();
-  const updateTokenLimitMutation = useUpdateShareTokenLimitMutation();
-  const updateParallelLimitMutation = useUpdateShareParallelLimitMutation();
-  const updateDescriptionMutation = useUpdateShareDescriptionMutation();
-  const updateSubdomainMutation = useUpdateShareSubdomainMutation();
-  const updateForSaleMutation = useUpdateShareForSaleMutation();
-  const updateExpirationMutation = useUpdateShareExpirationMutation();
-  const updateOwnerEmailMutation = useUpdateShareOwnerEmailMutation();
-  const updateAclMutation = useUpdateShareAclMutation();
+  const saveMutation = useSaveProviderShareMutation();
 
   const [isShareOpen, setIsShareOpen] = useState(false);
   const [confirmFreeOpen, setConfirmFreeOpen] = useState(false);
@@ -330,14 +314,7 @@ export function ProviderShareSection({
     disableMutation.isPending ||
     pauseMutation.isPending ||
     resumeMutation.isPending ||
-    updateTokenLimitMutation.isPending ||
-    updateParallelLimitMutation.isPending ||
-    updateDescriptionMutation.isPending ||
-    updateSubdomainMutation.isPending ||
-    updateForSaleMutation.isPending ||
-    updateExpirationMutation.isPending ||
-    updateOwnerEmailMutation.isPending ||
-    updateAclMutation.isPending;
+    saveMutation.isPending;
 
   if (!shareableApp) {
     return null;
@@ -393,15 +370,6 @@ export function ProviderShareSection({
     return resolveExpiresAt();
   };
 
-  const limitsEqual = (
-    left: number | undefined,
-    right: number | undefined,
-    isUnlimited: (value?: number | null) => boolean,
-  ) => {
-    if (isUnlimited(left) && isUnlimited(right)) return true;
-    return left === right;
-  };
-
   const resolveExpiresAt = () => {
     if (isPermanent) return PERMANENT_EXPIRES_AT;
     const seconds = Number(expiresInSecsInput);
@@ -411,7 +379,11 @@ export function ProviderShareSection({
     return new Date(Date.now() + seconds * 1000).toISOString();
   };
 
-  const buildAclPayload = () =>
+  const buildAclPayload = (
+    tokenLimit: number,
+    parallelLimit: number,
+    expiresAt: string,
+  ) =>
     buildShareAclPayload({
       app: shareableApp,
       forSale: forSaleValue,
@@ -420,9 +392,9 @@ export function ProviderShareSection({
       shareToEmails,
       selectedTokenMarketEmails: normalizedSelectedMarketEmails,
       selectedShareMarketEmail: normalizedSelectedShareMarketEmail,
-      tokenLimit: resolveTokenLimit(),
-      parallelLimit: resolveParallelLimit(),
-      expiresAt: resolveExpiresAt(),
+      tokenLimit,
+      parallelLimit,
+      expiresAt,
     });
 
   const handleCreate = async () => {
@@ -443,7 +415,11 @@ export function ProviderShareSection({
       return;
     }
 
-    const aclPayload = buildAclPayload();
+    const aclPayload = buildAclPayload(
+      tokenLimit,
+      parallelLimit,
+      resolveExpiresAt(),
+    );
     const created = await createMutation.mutateAsync({
       ownerEmail: normalizedOwnerEmail,
       bindings: { [shareableApp]: providerId },
@@ -456,16 +432,12 @@ export function ProviderShareSection({
         : Math.max(1, Number(expiresInSecsInput) || 3600),
       subdomain: subdomainInput.trim() || undefined,
       description: descriptionInput.trim() || undefined,
-    });
-    await enableMutation.mutateAsync(created.id);
-    await updateAclMutation.mutateAsync({
-      shareId: created.id,
       sharedWithEmails: aclPayload.sharedWithEmails,
       marketAccessMode: aclPayload.marketAccessMode,
       accessByApp: aclPayload.accessByApp,
       appSettings: aclPayload.appSettings,
-      saleMarketKind: aclPayload.saleMarketKind,
     });
+    return created;
   };
 
   const handleSave = async () => {
@@ -481,56 +453,26 @@ export function ProviderShareSection({
       return;
     }
 
-    if (normalizedOwnerEmail !== share.ownerEmail.trim().toLowerCase()) {
-      await updateOwnerEmailMutation.mutateAsync({
-        shareId: share.id,
-        ownerEmail: normalizedOwnerEmail,
-      });
-    }
-    if ((share.subdomain || "") !== subdomainInput.trim()) {
-      await updateSubdomainMutation.mutateAsync({
-        shareId: share.id,
-        subdomain: subdomainInput.trim(),
-      });
-    }
-    if ((share.description || "") !== descriptionInput.trim()) {
-      await updateDescriptionMutation.mutateAsync({
-        shareId: share.id,
-        description: descriptionInput.trim(),
-      });
-    }
-    if (share.forSale !== forSaleValue) {
-      await updateForSaleMutation.mutateAsync({
-        shareId: share.id,
-        forSale: forSaleValue,
-      });
-    }
-    if (!limitsEqual(share.tokenLimit, tokenLimit, isUnlimitedTokenLimit)) {
-      await updateTokenLimitMutation.mutateAsync({ shareId: share.id, tokenLimit });
-    }
-    if (!limitsEqual(share.parallelLimit, parallelLimit, isUnlimitedParallelLimit)) {
-      await updateParallelLimitMutation.mutateAsync({
-        shareId: share.id,
-        parallelLimit,
-      });
-    }
-
     const nextExpiresAt = resolveExpiresAtForSave();
-    if (share.expiresAt !== nextExpiresAt) {
-      await updateExpirationMutation.mutateAsync({
-        shareId: share.id,
-        expiresAt: nextExpiresAt,
-      });
-    }
-
-    const aclPayload = buildAclPayload();
-    await updateAclMutation.mutateAsync({
+    const aclPayload = buildAclPayload(
+      tokenLimit,
+      parallelLimit,
+      nextExpiresAt,
+    );
+    await saveMutation.mutateAsync({
       shareId: share.id,
+      ownerEmail: normalizedOwnerEmail,
+      subdomain: subdomainInput.trim(),
+      description: descriptionInput.trim() || undefined,
+      forSale: forSaleValue,
+      saleMarketKind,
       sharedWithEmails: aclPayload.sharedWithEmails,
       marketAccessMode: aclPayload.marketAccessMode,
       accessByApp: aclPayload.accessByApp,
       appSettings: aclPayload.appSettings,
-      saleMarketKind: aclPayload.saleMarketKind,
+      tokenLimit,
+      parallelLimit,
+      expiresAt: nextExpiresAt,
     });
   };
 

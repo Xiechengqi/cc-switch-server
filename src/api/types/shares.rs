@@ -1,5 +1,5 @@
 use crate::domain::providers::model::AppKind;
-use crate::domain::sharing::shares::{Share, ShareAcl, ShareBinding, ShareMarketGrantStatus};
+use crate::domain::sharing::shares::{Share, ShareAcl, ShareMarketGrantStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -68,12 +68,6 @@ pub(in crate::api) struct UpdateShareSubdomainResponse {
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct ReplaceShareAclRequest {
     pub(in crate::api) acl: ShareAcl,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UpdateShareBindingRequest {
-    pub(in crate::api) binding: ShareBinding,
 }
 
 #[derive(Debug, Deserialize)]

@@ -236,7 +236,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 3. setup 完成后 server 可执行 `register -> client tunnel claim -> lease -> SSH reverse tunnel`；失败不会影响本地 Web，可在 Router 页查看错误。
 4. 添加 provider 或 account 后创建 share；未填写 share subdomain 时，server 会自动生成。
 5. 点击 share tunnel start 后，server 会 claim share subdomain、申请 `http` lease 并建立 SSH reverse tunnel。
-6. 点击 Router 页的 Batch sync，把 share descriptor 同步给 router。
+6. share descriptor 会在创建、修改、删除时自动同步，并在 client 启动或重新注册 router 后自动校准，无需人工全量同步。
 7. share-market grant 会通过 router pending share edit 下发；server 后台监听 edit event，也可手动调用 `POST /api/router/share-edits/pull` 拉取并回写 ack。
 8. router 可经 share tunnel 调 `/_share-router/health`、`/_share-router/request-logs`、`/_share-router/share-runtime`、`/_share-router/model-health` 拉取 runtime。
 9. `/_ctl/apply_share_settings` 和 `/_ctl/refresh_share_usage` 使用 router `control_secret` HMAC、timestamp、nonce 防重放。
