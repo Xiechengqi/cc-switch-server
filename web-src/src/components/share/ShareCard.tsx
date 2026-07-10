@@ -418,9 +418,7 @@ export function ShareCard({
           ) : null}
         </section>
 
-        {!readOnly && !hideRuntimeActions ? (
-          <ShareRequestLogTable shareId={share.id} />
-        ) : null}
+        <ShareRequestLogTable shareId={share.id} />
       </CardContent>
     </Card>
   );

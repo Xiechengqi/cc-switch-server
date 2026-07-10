@@ -209,6 +209,9 @@ export function getShareDisplayStatus(
   if (tunnelStatus && !tunnelStatus.healthy) {
     return "connecting";
   }
+  if (share.status === "active" && isShareRunning(share)) {
+    return "sharing";
+  }
   if (share.tunnelUrl) {
     return "connecting";
   }

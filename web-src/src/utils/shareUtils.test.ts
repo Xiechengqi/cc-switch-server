@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   formatShareLimitInput,
+  getShareDisplayStatus,
   isUnlimitedParallelLimit,
   isUnlimitedTokenLimit,
   normalizeShareLimitValue,
@@ -34,5 +35,20 @@ describe("shareUtils limits", () => {
 
     expect(share?.tokenLimit).toBe(UNLIMITED_TOKEN_LIMIT);
     expect(share?.parallelLimit).toBe(UNLIMITED_TOKEN_LIMIT);
+  });
+});
+
+describe("getShareDisplayStatus", () => {
+  it("falls back to sharing when tunnel probe is missing but share is running", () => {
+    expect(
+      getShareDisplayStatus(
+        {
+          status: "active",
+          tunnelUrl: "https://share-abc.example.com",
+        },
+        true,
+        null,
+      ),
+    ).toBe("sharing");
   });
 });

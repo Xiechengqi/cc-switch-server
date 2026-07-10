@@ -1268,13 +1268,15 @@ pub(in crate::api) async fn web_share_tunnel_status(
         .tunnels
         .status(&crate::clients::router::tunnel::share_tunnel_key(share_id))
         .await;
-    Ok(json!({
-        "shareId": share.id,
-        "status": share.status,
-        "lastError": share.last_error,
-        "runtimeStatus": runtime_status,
-        "requiresOwnerLogin": false
-    }))
+    let mut payload = web_client_tunnel_share_status(runtime_status);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("shareId".to_string(), json!(share.id));
+        object.insert("status".to_string(), json!(share.status));
+        if share.last_error.is_some() {
+            object.insert("lastError".to_string(), json!(share.last_error));
+        }
+    }
+    Ok(payload)
 }
 
 pub(in crate::api) async fn web_provider_type_for_binding(

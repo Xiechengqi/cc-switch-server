@@ -460,7 +460,55 @@ async function stopTunnel(shareId: string): Promise<void> {
 }
 
 async function getTunnelStatus(shareId: string): Promise<ShareTunnelStatus> {
-  return invokeCommand<ShareTunnelStatus>("get_tunnel_status", { shareId });
+  const raw = await invokeCommand<ShareTunnelStatus & {
+    runtimeStatus?: {
+      tunnelUrl?: string | null;
+      subdomain?: string | null;
+      remotePort?: number | null;
+      status?: string | null;
+      lastError?: string | null;
+    } | null;
+  }>("get_tunnel_status", { shareId });
+  return normalizeShareTunnelStatus(raw);
+}
+
+function normalizeShareTunnelStatus(
+  raw: ShareTunnelStatus & {
+    runtimeStatus?: {
+      tunnelUrl?: string | null;
+      subdomain?: string | null;
+      remotePort?: number | null;
+      status?: string | null;
+      lastError?: string | null;
+    } | null;
+  },
+): ShareTunnelStatus {
+  if (raw.info) {
+    return {
+      info: raw.info,
+      lastError: raw.lastError ?? null,
+      requiresOwnerLogin: raw.requiresOwnerLogin ?? false,
+    };
+  }
+  const runtime = raw.runtimeStatus;
+  if (runtime?.tunnelUrl) {
+    const status = runtime.status?.trim().toLowerCase() ?? "";
+    return {
+      info: {
+        tunnelUrl: runtime.tunnelUrl,
+        subdomain: runtime.subdomain?.trim() || "",
+        remotePort: runtime.remotePort ?? 0,
+        healthy: status === "connected" || status === "running" || status === "active",
+      },
+      lastError: raw.lastError ?? runtime.lastError ?? null,
+      requiresOwnerLogin: raw.requiresOwnerLogin ?? false,
+    };
+  }
+  return {
+    info: null,
+    lastError: raw.lastError ?? null,
+    requiresOwnerLogin: raw.requiresOwnerLogin ?? false,
+  };
 }
 
 async function getConnectInfo(shareId: string): Promise<ConnectInfo> {
