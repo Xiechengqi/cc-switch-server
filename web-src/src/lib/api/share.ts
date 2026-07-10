@@ -498,7 +498,12 @@ function normalizeShareTunnelStatus(
         tunnelUrl: runtime.tunnelUrl,
         subdomain: runtime.subdomain?.trim() || "",
         remotePort: runtime.remotePort ?? 0,
-        healthy: status === "connected" || status === "running" || status === "active",
+        healthy:
+          status === "connected" ||
+          status === "running" ||
+          status === "active" ||
+          status === "renewing" ||
+          status === "renewal_retrying",
       },
       lastError: raw.lastError ?? runtime.lastError ?? null,
       requiresOwnerLogin: raw.requiresOwnerLogin ?? false,

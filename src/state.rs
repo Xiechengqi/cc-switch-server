@@ -24,7 +24,7 @@ use crate::clients::oauth::refresh::{
 use crate::clients::router::client::{
     self, IssueLeaseResponse, ShareEditAckPayload, ShareEditView,
 };
-use crate::clients::router::tunnel::{self, LeaseFn, TunnelSupervisor};
+use crate::clients::router::tunnel::{self, LeaseFn, RenewLeaseFn, TunnelSupervisor};
 use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::AccountRefreshLocks;
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
@@ -1930,6 +1930,13 @@ pub async fn start_client_tunnel(state: ServerState) {
         let lease_state = lease_state.clone();
         Box::pin(async move { issue_client_tunnel_lease(lease_state).await })
     });
+    let renew_state = state.clone();
+    let renew_lease_fn: RenewLeaseFn = Arc::new(move |lease_id, connection_id| {
+        let renew_state = renew_state.clone();
+        Box::pin(
+            async move { renew_router_tunnel_lease(renew_state, lease_id, connection_id).await },
+        )
+    });
     state
         .tunnels
         .start(
@@ -1937,6 +1944,7 @@ pub async fn start_client_tunnel(state: ServerState) {
             "client-web",
             local_addr,
             lease_fn,
+            renew_lease_fn,
         )
         .await;
 }
@@ -1958,10 +1966,27 @@ pub async fn start_share_tunnel(state: ServerState, share_id: String) {
         let lease_share_id = lease_share_id.clone();
         Box::pin(async move { issue_share_tunnel_lease(lease_state, lease_share_id).await })
     });
+    let renew_state = state.clone();
+    let renew_lease_fn: RenewLeaseFn = Arc::new(move |lease_id, connection_id| {
+        let renew_state = renew_state.clone();
+        Box::pin(
+            async move { renew_router_tunnel_lease(renew_state, lease_id, connection_id).await },
+        )
+    });
     state
         .tunnels
-        .start(key, "share-http", local_addr, lease_fn)
+        .start(key, "share-http", local_addr, lease_fn, renew_lease_fn)
         .await;
+}
+
+async fn renew_router_tunnel_lease(
+    state: ServerState,
+    lease_id: String,
+    connection_id: String,
+) -> Result<String, crate::clients::router::client::RenewLeaseError> {
+    let config = state.config.read().await.clone();
+    let http_client = state.http_client().await;
+    client::renew_tunnel_lease(&http_client, &config, lease_id, connection_id).await
 }
 
 pub async fn stop_share_tunnel(state: &ServerState, share_id: &str) {

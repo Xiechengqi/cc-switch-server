@@ -92,6 +92,8 @@ Web 管理端的一键升级使用同文件系统 staging 和持久 rollback：
 
 Client Tunnel 下所有非登录类 `/web-api/*` 都由 Router 先做 owner/admin 鉴权。SSE 使用带 `Authorization` 的 fetch stream，不允许把 access token 放入 query string。
 
+Client/share SSH tunnel 通过签名的 `/v1/tunnels/lease/renew` 在原连接上续期。正常 lease 到期不会重建 SSH 或短暂删除 public route；续期网络错误和 Router 5xx 会保留当前连接并重试，只有身份、lease 或 route 归属等终态拒绝才回退到重新申请 lease。部署时应先升级 Router，再升级 Server；Server 遇到尚未支持续期接口的旧 Router 会按终态错误回退到旧的重连流程。
+
 ## Docker
 
 示例：

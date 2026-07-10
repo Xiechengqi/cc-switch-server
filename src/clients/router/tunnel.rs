@@ -18,16 +18,19 @@ use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use crate::clients::router::client::IssueLeaseResponse;
+use crate::clients::router::client::{IssueLeaseResponse, RenewLeaseError};
 use crate::infra::time::now_ms;
 
 pub type LeaseFuture = Pin<Box<dyn Future<Output = anyhow::Result<IssueLeaseResponse>> + Send>>;
 pub type LeaseFn = Arc<dyn Fn() -> LeaseFuture + Send + Sync>;
+pub type RenewLeaseFuture = Pin<Box<dyn Future<Output = Result<String, RenewLeaseError>> + Send>>;
+pub type RenewLeaseFn = Arc<dyn Fn(String, String) -> RenewLeaseFuture + Send + Sync>;
 
 const TUNNELS_FILE_NAME: &str = "tunnels.json";
 const LEASE_RENEW_BEFORE: Duration = Duration::from_secs(60);
 const LEASE_RENEW_SHORT_BEFORE: Duration = Duration::from_secs(10);
 const LEASE_RENEW_MIN_DELAY: Duration = Duration::from_secs(5);
+const LEASE_RENEW_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +103,7 @@ impl TunnelSupervisor {
         kind: impl Into<String>,
         local_addr: String,
         lease_fn: LeaseFn,
+        renew_lease_fn: RenewLeaseFn,
     ) {
         let key = key.into();
         let kind = kind.into();
@@ -149,12 +153,10 @@ impl TunnelSupervisor {
                             &store_path,
                             &task_key,
                             &task_kind,
+                            &renew_lease_fn,
                         )
                         .await
                         {
-                            Ok(TunnelConnectionEnd::Renewing) => {
-                                continue;
-                            }
                             Ok(TunnelConnectionEnd::Ended) => {
                                 set_status(
                                     &statuses,
@@ -290,6 +292,7 @@ async fn connect_and_forward(
     store_path: &Path,
     key: &str,
     kind: &str,
+    renew_lease_fn: &RenewLeaseFn,
 ) -> anyhow::Result<TunnelConnectionEnd> {
     let ssh_config = Arc::new(client::Config {
         keepalive_interval: Some(Duration::from_secs(15)),
@@ -316,23 +319,86 @@ async fn connect_and_forward(
     connected.connected_at_ms = Some(now_ms());
     set_status(statuses, store_path, connected).await;
 
-    let result = if let Some(delay) = renewal_delay(&lease.expires_at) {
-        tokio::select! {
-            result = accept_loop(fwd_rx, local_addr) => result.map(|_| TunnelConnectionEnd::Ended),
-            _ = tokio::time::sleep(delay) => {
-                let mut renewing = status_from_lease(key, kind, "renewing", lease, None);
-                renewing.remote_port = Some(remote_port);
-                set_status(statuses, store_path, renewing).await;
-                Ok(TunnelConnectionEnd::Renewing)
-            }
-        }
-    } else {
-        accept_loop(fwd_rx, local_addr)
-            .await
-            .map(|_| TunnelConnectionEnd::Ended)
-    };
+    let result = maintain_forward(
+        fwd_rx,
+        local_addr,
+        lease,
+        remote_port,
+        statuses,
+        store_path,
+        key,
+        kind,
+        renew_lease_fn,
+    )
+    .await;
     let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maintain_forward(
+    fwd_rx: mpsc::UnboundedReceiver<Channel<client::Msg>>,
+    local_addr: &str,
+    lease: &IssueLeaseResponse,
+    remote_port: u16,
+    statuses: &RwLock<BTreeMap<String, TunnelRuntimeStatus>>,
+    store_path: &Path,
+    key: &str,
+    kind: &str,
+    renew_lease_fn: &RenewLeaseFn,
+) -> anyhow::Result<TunnelConnectionEnd> {
+    let connected_at_ms = now_ms();
+    let mut active_lease = lease.clone();
+    let accept = accept_loop(fwd_rx, local_addr);
+    tokio::pin!(accept);
+    let mut retry_delay = None;
+
+    loop {
+        let delay = match retry_delay.take() {
+            Some(delay) => delay,
+            None => renewal_delay(&active_lease.expires_at)
+                .ok_or_else(|| anyhow::anyhow!("router lease expiration is invalid"))?,
+        };
+        tokio::select! {
+            result = &mut accept => return result.map(|_| TunnelConnectionEnd::Ended),
+            _ = tokio::time::sleep(delay) => {}
+        }
+
+        let mut renewing = status_from_lease(key, kind, "renewing", &active_lease, None);
+        renewing.remote_port = Some(remote_port);
+        renewing.connected_at_ms = Some(connected_at_ms);
+        set_status(statuses, store_path, renewing).await;
+
+        let renewal = renew_lease_fn(
+            active_lease.lease_id.clone(),
+            active_lease.connection_id.clone(),
+        );
+        tokio::pin!(renewal);
+        let renewed = tokio::select! {
+            result = &mut accept => return result.map(|_| TunnelConnectionEnd::Ended),
+            result = &mut renewal => result,
+        };
+        match renewed {
+            Ok(expires_at) => {
+                active_lease.expires_at = expires_at;
+                let mut connected = status_from_lease(key, kind, "connected", &active_lease, None);
+                connected.remote_port = Some(remote_port);
+                connected.connected_at_ms = Some(connected_at_ms);
+                set_status(statuses, store_path, connected).await;
+            }
+            Err(RenewLeaseError::Retryable(error)) => {
+                let mut retrying =
+                    status_from_lease(key, kind, "renewal_retrying", &active_lease, Some(error));
+                retrying.remote_port = Some(remote_port);
+                retrying.connected_at_ms = Some(connected_at_ms);
+                set_status(statuses, store_path, retrying).await;
+                retry_delay = Some(LEASE_RENEW_RETRY_DELAY);
+            }
+            Err(RenewLeaseError::Terminal(error)) => {
+                anyhow::bail!("router rejected tunnel lease renewal: {error}");
+            }
+        }
+    }
 }
 
 async fn request_forward(handle: &mut client::Handle<TunnelHandler>) -> anyhow::Result<u16> {
@@ -392,7 +458,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TunnelConnectionEnd {
     Ended,
-    Renewing,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -498,6 +563,7 @@ impl client::Handler for TunnelHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -508,6 +574,20 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("cc-switch-server-{name}-{nanos}"))
+    }
+
+    fn test_lease(expires_at: String) -> IssueLeaseResponse {
+        IssueLeaseResponse {
+            lease_id: "lease-1".into(),
+            connection_id: "connection-1".into(),
+            ssh_username: "connection-1".into(),
+            ssh_password: "password".into(),
+            ssh_addr: "127.0.0.1:22".into(),
+            expires_at,
+            tunnel_url: "https://client.example.test".into(),
+            subdomain: "client".into(),
+            ssh_host_fingerprint: None,
+        }
     }
 
     #[tokio::test]
@@ -576,5 +656,114 @@ mod tests {
         let delay = renewal_delay(&future).unwrap();
         assert!(delay <= Duration::from_secs(121));
         assert!(delay >= Duration::from_secs(100));
+    }
+
+    #[tokio::test]
+    async fn successful_renewal_keeps_same_forward_pending() {
+        let dir = temp_config_dir("tunnel-renew-success");
+        fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join(TUNNELS_FILE_NAME);
+        let statuses = RwLock::new(BTreeMap::new());
+        let lease = test_lease((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_renewal = calls.clone();
+        let renew: RenewLeaseFn = Arc::new(move |lease_id, connection_id| {
+            assert_eq!(lease_id, "lease-1");
+            assert_eq!(connection_id, "connection-1");
+            calls_for_renewal.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok((Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()) })
+        });
+        let (_forward_tx, forward_rx) = mpsc::unbounded_channel();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            maintain_forward(
+                forward_rx,
+                "127.0.0.1:9",
+                &lease,
+                23456,
+                &statuses,
+                &store_path,
+                "client-web",
+                "client-web",
+                &renew,
+            ),
+        )
+        .await;
+
+        assert!(result.is_err(), "forward must remain active after renewal");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let status = statuses.read().await.get("client-web").cloned().unwrap();
+        assert_eq!(status.status, "connected");
+        assert_eq!(status.connection_id.as_deref(), Some("connection-1"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retryable_renewal_error_keeps_same_forward_pending() {
+        let dir = temp_config_dir("tunnel-renew-retry");
+        fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join(TUNNELS_FILE_NAME);
+        let statuses = RwLock::new(BTreeMap::new());
+        let lease = test_lease((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        let renew: RenewLeaseFn = Arc::new(|_, _| {
+            Box::pin(async { Err(RenewLeaseError::Retryable("router unavailable".into())) })
+        });
+        let (_forward_tx, forward_rx) = mpsc::unbounded_channel();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            maintain_forward(
+                forward_rx,
+                "127.0.0.1:9",
+                &lease,
+                23456,
+                &statuses,
+                &store_path,
+                "client-web",
+                "client-web",
+                &renew,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "transient failure must not end the forward"
+        );
+        let status = statuses.read().await.get("client-web").cloned().unwrap();
+        assert_eq!(status.status, "renewal_retrying");
+        assert_eq!(status.last_error.as_deref(), Some("router unavailable"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_renewal_error_ends_forward_for_fallback_reconnect() {
+        let dir = temp_config_dir("tunnel-renew-terminal");
+        fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join(TUNNELS_FILE_NAME);
+        let statuses = RwLock::new(BTreeMap::new());
+        let lease = test_lease((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        let renew: RenewLeaseFn = Arc::new(|_, _| {
+            Box::pin(async { Err(RenewLeaseError::Terminal("lease not found".into())) })
+        });
+        let (_forward_tx, forward_rx) = mpsc::unbounded_channel();
+
+        let error = maintain_forward(
+            forward_rx,
+            "127.0.0.1:9",
+            &lease,
+            23456,
+            &statuses,
+            &store_path,
+            "client-web",
+            "client-web",
+            &renew,
+        )
+        .await
+        .expect_err("terminal rejection must trigger fallback reconnect");
+
+        assert!(error.to_string().contains("lease not found"));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

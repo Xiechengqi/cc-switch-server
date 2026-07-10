@@ -1000,10 +1000,7 @@ pub(in crate::api) fn web_client_tunnel_share_status(
             "tunnelUrl": tunnel_url,
             "subdomain": status.subdomain.clone().unwrap_or_default(),
             "remotePort": status.remote_port.unwrap_or(0),
-            "healthy": matches!(
-                status.status.as_str(),
-                "connected" | "running" | "active"
-            ),
+            "healthy": tunnel_runtime_is_healthy(status.status.as_str()),
         }))
     });
     json!({
@@ -1068,7 +1065,7 @@ pub(in crate::api) async fn web_client_tunnel_state(state: &ServerState) -> Valu
         Some("active") | Some("running") | Some("connected")
     ) || runtime
         .as_ref()
-        .is_some_and(|status| matches!(status.status.as_str(), "connected" | "running" | "active"));
+        .is_some_and(|status| tunnel_runtime_is_healthy(status.status.as_str()));
     let status = web_client_tunnel_share_status(runtime);
     let mut response = json!({
         "config": {
@@ -1103,7 +1100,10 @@ impl ShareHealthLevel {
 }
 
 fn tunnel_runtime_is_healthy(status: &str) -> bool {
-    matches!(status, "connected" | "running" | "active")
+    matches!(
+        status,
+        "connected" | "running" | "active" | "renewing" | "renewal_retrying"
+    )
 }
 
 fn share_health_level(
@@ -1172,7 +1172,12 @@ pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Valu
     let client_last_error = client_runtime
         .as_ref()
         .and_then(|status| status.last_error.clone());
-    let client_tunnel_level = if client_last_error.is_some() {
+    let client_tunnel_level = if client_runtime
+        .as_ref()
+        .is_some_and(|status| status.status == "renewal_retrying")
+    {
+        ShareHealthLevel::Warning
+    } else if client_last_error.is_some() {
         ShareHealthLevel::Unhealthy
     } else if client_runtime
         .as_ref()
@@ -1192,12 +1197,20 @@ pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Valu
         let tunnel_error = runtime
             .and_then(|status| status.last_error.clone())
             .or_else(|| share.last_error.clone());
-        let level = share_health_level(
-            share.enabled,
-            share.status.as_str(),
-            share.router_last_sync_error.as_deref(),
-            tunnel_error.as_deref(),
-        );
+        let level = if runtime.is_some_and(|status| status.status == "renewal_retrying")
+            && share.enabled
+            && share.status == "active"
+            && share.router_last_sync_error.is_none()
+        {
+            ShareHealthLevel::Warning
+        } else {
+            share_health_level(
+                share.enabled,
+                share.status.as_str(),
+                share.router_last_sync_error.as_deref(),
+                tunnel_error.as_deref(),
+            )
+        };
         share_aggregate_level = share_aggregate_level.max(level);
         share_items.push(json!({
             "id": share.id,

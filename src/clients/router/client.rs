@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use base64::engine::general_purpose::STANDARD;
@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::settings::config::{PayoutProfileState, RouterIdentity, ServerConfig};
 use crate::domain::sharing::router_contract::*;
+
+const ROUTER_LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -267,6 +269,27 @@ pub struct IssueLeaseResponse {
     pub subdomain: String,
     #[serde(default)]
     pub ssh_host_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenewLeasePayload {
+    pub lease_id: String,
+    pub connection_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenewLeaseResponse {
+    expires_at: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RenewLeaseError {
+    #[error("{0}")]
+    Retryable(String),
+    #[error("{0}")]
+    Terminal(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -560,6 +583,89 @@ pub async fn issue_share_lease(
     share: ShareDescriptor,
 ) -> anyhow::Result<IssueLeaseResponse> {
     issue_lease(http, config, requested_subdomain, "http", Some(share)).await
+}
+
+pub async fn renew_tunnel_lease(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    lease_id: String,
+    connection_id: String,
+) -> Result<String, RenewLeaseError> {
+    renew_tunnel_lease_with_timeout(
+        http,
+        config,
+        lease_id,
+        connection_id,
+        ROUTER_LEASE_RENEW_TIMEOUT,
+    )
+    .await
+}
+
+async fn renew_tunnel_lease_with_timeout(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    lease_id: String,
+    connection_id: String,
+    timeout: Duration,
+) -> Result<String, RenewLeaseError> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| RenewLeaseError::Terminal("router api base is not configured".into()))?
+        .trim_end_matches('/')
+        .to_string();
+    let identity =
+        config.router.identity.as_ref().ok_or_else(|| {
+            RenewLeaseError::Terminal("router installation is not registered".into())
+        })?;
+    let request = signed_request(
+        identity,
+        "renew_lease",
+        RenewLeasePayload {
+            lease_id,
+            connection_id,
+        },
+    )
+    .map_err(|error| RenewLeaseError::Terminal(error.to_string()))?;
+    let response = http
+        .post(format!("{api_base}/v1/tunnels/lease/renew"))
+        .timeout(timeout)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| {
+            RenewLeaseError::Retryable(format!("send router tunnel lease renewal: {error}"))
+        })?;
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .json::<RenewLeaseResponse>()
+            .await
+            .map(|response| response.expires_at)
+            .map_err(|error| {
+                RenewLeaseError::Retryable(format!(
+                    "parse router tunnel lease renewal response: {error}"
+                ))
+            });
+    }
+    let body = response.text().await.unwrap_or_default();
+    let message = format!("router tunnel lease renewal failed: {status}: {body}");
+    if renew_status_is_retryable(status) {
+        Err(RenewLeaseError::Retryable(message))
+    } else {
+        Err(RenewLeaseError::Terminal(message))
+    }
+}
+
+fn renew_status_is_retryable(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            reqwest::StatusCode::REQUEST_TIMEOUT
+                | reqwest::StatusCode::TOO_MANY_REQUESTS
+                | reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+        )
 }
 
 pub async fn claim_share_subdomain(
@@ -1083,6 +1189,52 @@ mod tests {
         assert!(verifying_key
             .verify(tampered.as_bytes(), &signature)
             .is_err());
+    }
+
+    #[test]
+    fn lease_renewal_status_classification_preserves_transient_connections() {
+        assert!(renew_status_is_retryable(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(renew_status_is_retryable(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(renew_status_is_retryable(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!renew_status_is_retryable(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!renew_status_is_retryable(reqwest::StatusCode::NOT_FOUND));
+        assert!(!renew_status_is_retryable(reqwest::StatusCode::CONFLICT));
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_timeout_is_retryable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-timeout".into();
+        config.router.identity = Some(identity);
+
+        let error = renew_tunnel_lease_with_timeout(
+            &reqwest::Client::new(),
+            &config,
+            "lease-timeout".into(),
+            "connection-timeout".into(),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a hung renewal response must time out");
+
+        assert!(matches!(error, RenewLeaseError::Retryable(_)));
+        server.abort();
     }
 
     #[test]
