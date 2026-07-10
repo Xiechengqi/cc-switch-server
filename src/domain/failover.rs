@@ -234,11 +234,22 @@ impl FailoverStore {
         candidates: &'a [&StoredProvider],
         now_ms: u128,
     ) -> Option<FailoverSelection<'a>> {
+        self.select_provider_with_load(app, candidates, now_ms, |_| 0)
+    }
+
+    pub fn select_provider_with_load<'a>(
+        &mut self,
+        app: AppKind,
+        candidates: &'a [&StoredProvider],
+        now_ms: u128,
+        load: impl Fn(&StoredProvider) -> u64,
+    ) -> Option<FailoverSelection<'a>> {
         let config = self.apps.get(&app).cloned().unwrap_or_default();
         if !config.enabled {
             return candidates
-                .first()
+                .iter()
                 .copied()
+                .min_by_key(|provider| load(provider))
                 .map(|provider| FailoverSelection {
                     provider,
                     state_changed: false,
@@ -247,6 +258,8 @@ impl FailoverStore {
 
         let queue = provider_queue_for_candidates(&config.provider_queue, candidates);
         let mut fallback = None;
+        let mut selected = None;
+        let mut selected_load = u64::MAX;
         for provider_id in queue {
             let Some(provider) = candidates
                 .iter()
@@ -256,14 +269,24 @@ impl FailoverStore {
                 continue;
             };
             fallback.get_or_insert(provider);
-            match self.provider_availability_for_selection(provider, &config, now_ms) {
-                ProviderAvailability::Available { state_changed } => {
-                    return Some(FailoverSelection {
-                        provider,
-                        state_changed,
-                    });
-                }
-                ProviderAvailability::Unavailable => {}
+            if !self.provider_can_be_selected(provider, &config, now_ms) {
+                continue;
+            }
+            let provider_load = load(provider);
+            if provider_load < selected_load {
+                selected = Some(provider);
+                selected_load = provider_load;
+            }
+        }
+
+        if let Some(provider) = selected {
+            if let ProviderAvailability::Available { state_changed } =
+                self.provider_availability_for_selection(provider, &config, now_ms)
+            {
+                return Some(FailoverSelection {
+                    provider,
+                    state_changed,
+                });
             }
         }
 
@@ -394,6 +417,33 @@ impl FailoverStore {
                     state_changed: true,
                 }
             }
+        }
+    }
+
+    fn provider_can_be_selected(
+        &self,
+        provider: &StoredProvider,
+        config: &FailoverAppConfig,
+        now_ms: u128,
+    ) -> bool {
+        let Some(breaker) = self
+            .breakers
+            .get(&breaker_key(provider.app, &provider.provider.id))
+        else {
+            return true;
+        };
+        match breaker.state {
+            BreakerState::Closed => true,
+            BreakerState::Open => {
+                let open_until_ms = breaker.open_until_ms.unwrap_or_else(|| {
+                    breaker
+                        .opened_at_ms
+                        .unwrap_or(now_ms)
+                        .saturating_add(config.open_duration_ms)
+                });
+                now_ms >= open_until_ms
+            }
+            BreakerState::HalfOpen => breaker.half_open_probe_count < config.half_open_max_probes,
         }
     }
 

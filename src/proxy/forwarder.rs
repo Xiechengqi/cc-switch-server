@@ -26,8 +26,9 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
 use crate::state::{
-    build_provider_http_client, CopilotUpstreamAuthError, DeepSeekUpstreamError,
-    ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
+    build_provider_http_client, AccountInFlightGuard, AccountInFlightSnapshot,
+    CopilotUpstreamAuthError, DeepSeekUpstreamError, ManagedAccountRefreshError, ServerState,
+    ShareInFlightGuard,
 };
 
 use super::adapters::{self, ProviderAdapter};
@@ -38,7 +39,10 @@ use super::kiro;
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy, decode_response_body_for_proxy,
 };
-use super::router::{select_provider, select_provider_for_codex_image_generation, ProxyRoute};
+use super::router::{
+    account_concurrency_for_provider, select_provider, select_provider_for_codex_image_generation,
+    select_provider_with_account_inflight, ProxyRoute,
+};
 use super::streaming::{ClaudeSseErrorDetector, StreamUsageAccumulator};
 use super::usage::{log_usage, update_stream_usage};
 use super::{setting, ProxyError};
@@ -81,20 +85,48 @@ pub async fn forward(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let stored = if let Some(share_id) = request_context.share_id.as_deref() {
+    let (stored, account_in_flight_guard) = if let Some(share_id) =
+        request_context.share_id.as_deref()
+    {
         let (stored, _share_name) = select_share_provider(&providers, &shares, app, share_id)?;
-        stored
+        let snapshot = state.account_in_flight.snapshot();
+        let guard = acquire_account_in_flight(&state, &stored, &accounts_for_selection, &snapshot)?;
+        (stored, guard)
     } else {
-        state
-            .try_mutate_failover_best_effort_if_changed("failover selection state", |failover| {
-                select_provider(&providers, &accounts_for_selection, failover, app, &headers).map(
-                    |selected| {
-                        let changed = selected.failover_state_changed;
-                        (selected.provider, changed)
+        let mut attempts = 0;
+        loop {
+            let snapshot = state.account_in_flight.snapshot();
+            let stored = state
+                .try_mutate_failover_best_effort_if_changed(
+                    "failover selection state",
+                    |failover| {
+                        select_provider_with_account_inflight(
+                            &providers,
+                            &accounts_for_selection,
+                            failover,
+                            app,
+                            &headers,
+                            &snapshot,
+                        )
+                        .map(|selected| {
+                            let changed = selected.failover_state_changed;
+                            (selected.provider, changed)
+                        })
                     },
                 )
-            })
-            .await?
+                .await?;
+            match try_acquire_account_in_flight(&state, &stored, &accounts_for_selection, &snapshot)
+            {
+                AccountInFlightAcquire::Acquired(guard) => break (stored, Some(guard)),
+                AccountInFlightAcquire::NotManaged => break (stored, None),
+                AccountInFlightAcquire::Saturated => {
+                    attempts += 1;
+                    if attempts >= 3 {
+                        return Err(account_concurrency_proxy_error(&stored));
+                    }
+                }
+            }
+        }
     };
     drop(providers);
     validate_codex_allowed_client(&stored, route, &headers)?;
@@ -388,6 +420,7 @@ pub async fn forward(
                                 claude_retry_started_at_ms,
                                 claude_body_retry_stage,
                             );
+                            drop(account_in_flight_guard);
                             drop(share_invocation_guard);
                             return Box::pin(forward(
                                 state,
@@ -415,6 +448,7 @@ pub async fn forward(
                                     claude_retry_started_at_ms,
                                     Some(next_stage),
                                 );
+                                drop(account_in_flight_guard);
                                 drop(share_invocation_guard);
                                 return Box::pin(forward(
                                     state,
@@ -483,6 +517,7 @@ pub async fn forward(
             sse_error_outcome_recorded,
             terminal_frame_sent: false,
             interrupted_update_armed,
+            _account_in_flight_guard: account_in_flight_guard,
             _share_invocation_guard: share_invocation_guard,
         };
         let stream = stream::try_unfold(stream_state, |mut stream_state| async move {
@@ -706,6 +741,7 @@ pub async fn forward(
                 claude_retry_started_at_ms,
                 Some(next_stage),
             );
+            drop(account_in_flight_guard);
             drop(share_invocation_guard);
             return Box::pin(forward(
                 state,
@@ -2295,6 +2331,54 @@ fn kiro_api_base_override(stored: &StoredProvider) -> Option<String> {
     )
 }
 
+enum AccountInFlightAcquire {
+    Acquired(AccountInFlightGuard),
+    NotManaged,
+    Saturated,
+}
+
+fn try_acquire_account_in_flight(
+    state: &ServerState,
+    stored: &StoredProvider,
+    accounts: &crate::domain::accounts::store::AccountStore,
+    snapshot: &AccountInFlightSnapshot,
+) -> AccountInFlightAcquire {
+    let Some(selection) = account_concurrency_for_provider(stored, accounts, snapshot) else {
+        return AccountInFlightAcquire::NotManaged;
+    };
+    match state.account_in_flight.try_acquire(
+        selection.provider_type,
+        &selection.account_id,
+        selection.max_concurrent,
+    ) {
+        Some(guard) => AccountInFlightAcquire::Acquired(guard),
+        None => AccountInFlightAcquire::Saturated,
+    }
+}
+
+fn acquire_account_in_flight(
+    state: &ServerState,
+    stored: &StoredProvider,
+    accounts: &crate::domain::accounts::store::AccountStore,
+    snapshot: &AccountInFlightSnapshot,
+) -> Result<Option<AccountInFlightGuard>, ProxyError> {
+    match try_acquire_account_in_flight(state, stored, accounts, snapshot) {
+        AccountInFlightAcquire::Acquired(guard) => Ok(Some(guard)),
+        AccountInFlightAcquire::NotManaged => Ok(None),
+        AccountInFlightAcquire::Saturated => Err(account_concurrency_proxy_error(stored)),
+    }
+}
+
+fn account_concurrency_proxy_error(stored: &StoredProvider) -> ProxyError {
+    ProxyError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        message: format!(
+            "provider {} account concurrency limit has been reached",
+            stored.provider.id
+        ),
+    }
+}
+
 async fn validate_and_acquire_share_invocation(
     state: &ServerState,
     share_id: &str,
@@ -3053,6 +3137,7 @@ struct StreamForwardState {
     sse_error_outcome_recorded: bool,
     terminal_frame_sent: bool,
     interrupted_update_armed: Arc<AtomicBool>,
+    _account_in_flight_guard: Option<AccountInFlightGuard>,
     _share_invocation_guard: Option<ShareInFlightGuard>,
 }
 

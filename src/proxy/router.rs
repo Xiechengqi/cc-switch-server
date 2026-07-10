@@ -4,6 +4,7 @@ use crate::domain::accounts::store::AccountStore;
 use crate::domain::failover::{current_time_ms, FailoverStore};
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
+use crate::state::AccountInFlightSnapshot;
 
 use super::ProxyError;
 
@@ -44,6 +45,23 @@ pub(super) struct ProviderRouteSelection {
     pub failover_state_changed: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct AccountConcurrencySelection {
+    pub provider_type: ProviderType,
+    pub account_id: String,
+    pub max_concurrent: u32,
+    pub current: u32,
+}
+
+#[derive(Default)]
+struct ProviderSelectionOptions<'a> {
+    provider_type_filter: Option<ProviderType>,
+    provider_filter: Option<fn(&StoredProvider) -> bool>,
+    account_in_flight: Option<&'a AccountInFlightSnapshot>,
+}
+
+const DEFAULT_CLAUDE_ACCOUNT_MAX_CONCURRENT: u32 = 8;
+
 pub(super) fn select_provider(
     store: &ProviderStore,
     accounts: &AccountStore,
@@ -51,7 +69,26 @@ pub(super) fn select_provider(
     app: AppKind,
     headers: &HeaderMap,
 ) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_inner(store, accounts, failover, app, headers, None)
+    select_provider_inner(store, accounts, failover, app, headers, None, None)
+}
+
+pub(super) fn select_provider_with_account_inflight(
+    store: &ProviderStore,
+    accounts: &AccountStore,
+    failover: &mut FailoverStore,
+    app: AppKind,
+    headers: &HeaderMap,
+    account_in_flight: &AccountInFlightSnapshot,
+) -> Result<ProviderRouteSelection, ProxyError> {
+    select_provider_inner(
+        store,
+        accounts,
+        failover,
+        app,
+        headers,
+        None,
+        Some(account_in_flight),
+    )
 }
 
 pub(super) fn select_provider_for_type(
@@ -62,7 +99,15 @@ pub(super) fn select_provider_for_type(
     headers: &HeaderMap,
     provider_type: ProviderType,
 ) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_inner(store, accounts, failover, app, headers, Some(provider_type))
+    select_provider_inner(
+        store,
+        accounts,
+        failover,
+        app,
+        headers,
+        Some(provider_type),
+        None,
+    )
 }
 
 pub(super) fn select_provider_for_codex_image_generation(
@@ -78,6 +123,7 @@ pub(super) fn select_provider_for_codex_image_generation(
         AppKind::Codex,
         headers,
         codex_image_generation_provider,
+        None,
     )
 }
 
@@ -88,6 +134,7 @@ fn select_provider_inner(
     app: AppKind,
     headers: &HeaderMap,
     provider_type_filter: Option<ProviderType>,
+    account_in_flight: Option<&AccountInFlightSnapshot>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
     select_provider_with_optional_filter(
         store,
@@ -95,8 +142,11 @@ fn select_provider_inner(
         failover,
         app,
         headers,
-        provider_type_filter,
-        None,
+        ProviderSelectionOptions {
+            provider_type_filter,
+            account_in_flight,
+            ..ProviderSelectionOptions::default()
+        },
     )
 }
 
@@ -107,6 +157,7 @@ fn select_provider_with_filter(
     app: AppKind,
     headers: &HeaderMap,
     filter: fn(&StoredProvider) -> bool,
+    account_in_flight: Option<&AccountInFlightSnapshot>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
     select_provider_with_optional_filter(
         store,
@@ -114,8 +165,11 @@ fn select_provider_with_filter(
         failover,
         app,
         headers,
-        None,
-        Some(filter),
+        ProviderSelectionOptions {
+            provider_filter: Some(filter),
+            account_in_flight,
+            ..ProviderSelectionOptions::default()
+        },
     )
 }
 
@@ -125,9 +179,13 @@ fn select_provider_with_optional_filter(
     failover: &mut FailoverStore,
     app: AppKind,
     headers: &HeaderMap,
-    provider_type_filter: Option<ProviderType>,
-    provider_filter: Option<fn(&StoredProvider) -> bool>,
+    options: ProviderSelectionOptions<'_>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
+    let ProviderSelectionOptions {
+        provider_type_filter,
+        provider_filter,
+        account_in_flight,
+    } = options;
     let now = current_time_ms();
     let provider_id = headers
         .get("x-cc-provider-id")
@@ -148,13 +206,19 @@ fn select_provider_with_optional_filter(
             .cloned()
             .ok_or_else(|| ProxyError::not_found(format!("provider not found: {provider_id}")))?;
         ensure_provider_not_rate_limited(&provider, accounts, now)?;
+        if account_in_flight
+            .and_then(|snapshot| account_concurrency_for_provider(&provider, accounts, snapshot))
+            .is_some_and(|selection| selection.current >= selection.max_concurrent)
+        {
+            return Err(account_concurrency_limit_error(&provider));
+        }
         return Ok(ProviderRouteSelection {
             provider,
             failover_state_changed: false,
         });
     }
 
-    let candidates = store
+    let rate_available_candidates = store
         .providers
         .iter()
         .filter(|item| item.app == app)
@@ -166,6 +230,15 @@ fn select_provider_with_optional_filter(
         })
         .filter(|item| provider_rate_limited_until(item, accounts, now).is_none())
         .collect::<Vec<_>>();
+    let candidates = rate_available_candidates
+        .iter()
+        .copied()
+        .filter(|provider| {
+            account_in_flight
+                .and_then(|snapshot| account_concurrency_for_provider(provider, accounts, snapshot))
+                .is_none_or(|selection| selection.current < selection.max_concurrent)
+        })
+        .collect::<Vec<_>>();
     let has_matching_provider = store.providers.iter().any(|item| {
         item.app == app
             && provider_type_filter
@@ -173,6 +246,12 @@ fn select_provider_with_optional_filter(
                 .unwrap_or(true)
             && provider_filter.map(|filter| filter(item)).unwrap_or(true)
     });
+    if candidates.is_empty() && !rate_available_candidates.is_empty() {
+        return Err(ProxyError {
+            status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+            message: "all Claude OAuth accounts are at their concurrency limit".to_string(),
+        });
+    }
     if candidates.is_empty() && has_matching_provider {
         let until = store
             .providers
@@ -220,12 +299,113 @@ fn select_provider_with_optional_filter(
     }
 
     let selection = failover
-        .select_provider(app, &candidates, now)
+        .select_provider_with_load(app, &candidates, now, |provider| {
+            account_in_flight
+                .and_then(|snapshot| account_concurrency_for_provider(provider, accounts, snapshot))
+                .map(account_concurrency_load_score)
+                .unwrap_or_default()
+        })
         .ok_or_else(|| ProxyError::not_found(format!("no provider configured for {:?}", app)))?;
     Ok(ProviderRouteSelection {
         provider: selection.provider.clone(),
         failover_state_changed: selection.state_changed,
     })
+}
+
+pub(super) fn account_concurrency_for_provider(
+    provider: &StoredProvider,
+    accounts: &AccountStore,
+    snapshot: &AccountInFlightSnapshot,
+) -> Option<AccountConcurrencySelection> {
+    if provider.provider_type != ProviderType::ClaudeOAuth {
+        return None;
+    }
+    let bound_account_id = provider
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.account_id.as_deref());
+    let account = accounts.find_for_provider(provider.provider_type, bound_account_id)?;
+    let max_concurrent = provider_account_concurrency_limit(provider, account)?;
+    Some(AccountConcurrencySelection {
+        provider_type: provider.provider_type,
+        account_id: account.id.clone(),
+        max_concurrent,
+        current: snapshot.current(provider.provider_type, &account.id),
+    })
+}
+
+fn provider_account_concurrency_limit(
+    provider: &StoredProvider,
+    account: &crate::domain::accounts::store::Account,
+) -> Option<u32> {
+    let limit = provider_concurrency_override(provider)
+        .or_else(|| account_profile_concurrency_limit(account))
+        .or_else(|| {
+            std::env::var("CC_SWITCH_ACCOUNT_MAX_CONCURRENT")
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        })
+        .unwrap_or(DEFAULT_CLAUDE_ACCOUNT_MAX_CONCURRENT);
+    (limit > 0).then_some(limit)
+}
+
+fn provider_concurrency_override(provider: &StoredProvider) -> Option<u32> {
+    const POINTERS: &[&str] = &[
+        "/env/ACCOUNT_MAX_CONCURRENT",
+        "/env/MAX_CONCURRENT_REQUESTS",
+        "/ACCOUNT_MAX_CONCURRENT",
+        "/MAX_CONCURRENT_REQUESTS",
+        "/accountMaxConcurrent",
+        "/maxConcurrentRequests",
+    ];
+    POINTERS.iter().find_map(|pointer| {
+        provider
+            .provider
+            .settings_config
+            .pointer(pointer)
+            .and_then(json_u32)
+    })
+}
+
+fn account_profile_concurrency_limit(
+    account: &crate::domain::accounts::store::Account,
+) -> Option<u32> {
+    const POINTERS: &[&str] = &[
+        "/max_concurrent_requests",
+        "/maxConcurrentRequests",
+        "/rate_limit/max_concurrent_requests",
+        "/rateLimit/maxConcurrentRequests",
+    ];
+    let profile = account.profile.as_ref()?;
+    POINTERS
+        .iter()
+        .find_map(|pointer| profile.pointer(pointer).and_then(json_u32))
+}
+
+fn json_u32(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| value.as_str()?.trim().parse::<u32>().ok())
+}
+
+fn account_concurrency_load_score(selection: AccountConcurrencySelection) -> u64 {
+    u64::from(selection.current)
+        .saturating_mul(1_000_000)
+        .checked_div(u64::from(selection.max_concurrent))
+        .unwrap_or_default()
+}
+
+fn account_concurrency_limit_error(provider: &StoredProvider) -> ProxyError {
+    ProxyError {
+        status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+        message: format!(
+            "provider {} account concurrency limit has been reached",
+            provider.provider.id
+        ),
+    }
 }
 
 fn codex_image_generation_provider(provider: &StoredProvider) -> bool {
@@ -293,6 +473,7 @@ mod tests {
     use crate::domain::accounts::store::UpsertAccountInput;
     use crate::domain::failover::{FailoverStore, ProviderOutcome, UpdateFailoverAppInput};
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
+    use crate::state::AccountInFlightTracker;
 
     fn provider(app: AppKind, id: &str) -> StoredProvider {
         StoredProvider {
@@ -330,6 +511,62 @@ mod tests {
             },
             provider_type: ProviderType::CodexOAuth,
             provider_type_id: "codex_oauth".to_string(),
+        }
+    }
+
+    fn claude_oauth_provider(
+        id: &str,
+        account_id: &str,
+        max_concurrent: Option<u32>,
+    ) -> StoredProvider {
+        let mut settings = json!({});
+        if let Some(max_concurrent) = max_concurrent {
+            settings["ACCOUNT_MAX_CONCURRENT"] = json!(max_concurrent);
+        }
+        StoredProvider {
+            app: AppKind::Claude,
+            provider: Provider {
+                id: id.to_string(),
+                name: id.to_string(),
+                settings_config: settings,
+                category: None,
+                meta: Some(ProviderMeta {
+                    auth_binding: Some(AuthBinding {
+                        source: Some("account_store".to_string()),
+                        auth_provider: Some("claude_oauth".to_string()),
+                        account_id: Some(account_id.to_string()),
+                    }),
+                    ..ProviderMeta::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::ClaudeOAuth,
+            provider_type_id: "claude_oauth".to_string(),
+        }
+    }
+
+    fn claude_oauth_account(id: &str) -> UpsertAccountInput {
+        UpsertAccountInput {
+            id: Some(id.to_string()),
+            provider_type: ProviderType::ClaudeOAuth,
+            email: None,
+            access_token: Some(format!("token-{id}")),
+            refresh_token: Some(format!("refresh-{id}")),
+            id_token: None,
+            token_type: Some("Bearer".to_string()),
+            api_key: None,
+            scopes: Vec::new(),
+            profile: None,
+            raw: None,
+            subscription_level: None,
+            entitlement_status: None,
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at: None,
+            rate_limited_until: None,
+            last_refresh_error: None,
         }
     }
 
@@ -534,6 +771,91 @@ mod tests {
         let error = select_provider(&store, &accounts, &mut failover, AppKind::Codex, &headers)
             .unwrap_err();
 
+        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn claude_oauth_selection_prefers_lower_account_load() {
+        let store = ProviderStore {
+            providers: vec![
+                claude_oauth_provider("p1", "acct-1", Some(8)),
+                claude_oauth_provider("p2", "acct-2", Some(8)),
+            ],
+        };
+        let mut accounts = AccountStore::default();
+        accounts.upsert(claude_oauth_account("acct-1"));
+        accounts.upsert(claude_oauth_account("acct-2"));
+        let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
+        let _guard = tracker
+            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 8)
+            .unwrap();
+        let snapshot = tracker.snapshot();
+        let mut failover = FailoverStore::default();
+        failover.update_app_config(
+            AppKind::Claude,
+            UpdateFailoverAppInput {
+                enabled: Some(true),
+                provider_queue: Some(vec!["p1".to_string(), "p2".to_string()]),
+                failure_threshold: None,
+                open_duration_ms: None,
+                half_open_max_probes: None,
+            },
+            &store,
+        );
+
+        let selected = select_provider_with_account_inflight(
+            &store,
+            &accounts,
+            &mut failover,
+            AppKind::Claude,
+            &HeaderMap::new(),
+            &snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(selected.provider.provider.id, "p2");
+    }
+
+    #[test]
+    fn claude_oauth_selection_skips_saturated_account() {
+        let store = ProviderStore {
+            providers: vec![
+                claude_oauth_provider("p1", "acct-1", Some(1)),
+                claude_oauth_provider("p2", "acct-2", Some(1)),
+            ],
+        };
+        let mut accounts = AccountStore::default();
+        accounts.upsert(claude_oauth_account("acct-1"));
+        accounts.upsert(claude_oauth_account("acct-2"));
+        let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
+        let _guard = tracker
+            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
+            .unwrap();
+        let snapshot = tracker.snapshot();
+        let mut failover = FailoverStore::default();
+
+        let selected = select_provider_with_account_inflight(
+            &store,
+            &accounts,
+            &mut failover,
+            AppKind::Claude,
+            &HeaderMap::new(),
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(selected.provider.provider.id, "p2");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cc-provider-id", HeaderValue::from_static("p1"));
+        let error = select_provider_with_account_inflight(
+            &store,
+            &accounts,
+            &mut failover,
+            AppKind::Claude,
+            &headers,
+            &snapshot,
+        )
+        .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 }

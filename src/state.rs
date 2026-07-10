@@ -68,6 +68,7 @@ pub struct ServerStateInner {
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
     pub cursor_sessions: CursorSessionManager,
     pub account_refresh_locks: AccountRefreshLocks,
+    pub account_in_flight: Arc<AccountInFlightTracker>,
     pub share_in_flight: Arc<ShareInFlightTracker>,
     pub control_nonces: Arc<ControlNonceCache>,
     pub http_client: RwLock<reqwest::Client>,
@@ -223,6 +224,22 @@ pub struct ShareInFlightGuard {
 }
 
 #[derive(Debug, Default)]
+pub struct AccountInFlightTracker {
+    counts: Mutex<BTreeMap<String, u32>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AccountInFlightSnapshot {
+    counts: BTreeMap<String, u32>,
+}
+
+#[derive(Debug)]
+pub struct AccountInFlightGuard {
+    tracker: Arc<AccountInFlightTracker>,
+    key: String,
+}
+
+#[derive(Debug, Default)]
 pub struct ControlNonceCache {
     seen: Mutex<BTreeMap<String, i64>>,
 }
@@ -281,6 +298,69 @@ impl Drop for ShareInFlightGuard {
     fn drop(&mut self) {
         self.tracker.release(&self.share_id);
     }
+}
+
+impl AccountInFlightTracker {
+    pub fn snapshot(&self) -> AccountInFlightSnapshot {
+        let counts = self
+            .counts
+            .lock()
+            .map(|counts| counts.clone())
+            .unwrap_or_default();
+        AccountInFlightSnapshot { counts }
+    }
+
+    pub fn try_acquire(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        max_concurrent: u32,
+    ) -> Option<AccountInFlightGuard> {
+        let key = account_in_flight_key(provider_type, account_id);
+        let mut counts = self.counts.lock().ok()?;
+        let current = *counts.get(&key).unwrap_or(&0);
+        if current >= max_concurrent {
+            return None;
+        }
+        counts.insert(key.clone(), current.saturating_add(1));
+        Some(AccountInFlightGuard {
+            tracker: self.clone(),
+            key,
+        })
+    }
+
+    fn release(&self, key: &str) {
+        let Ok(mut counts) = self.counts.lock() else {
+            return;
+        };
+        let Some(current) = counts.get_mut(key) else {
+            return;
+        };
+        if *current <= 1 {
+            counts.remove(key);
+        } else {
+            *current -= 1;
+        }
+    }
+}
+
+impl AccountInFlightSnapshot {
+    pub fn current(&self, provider_type: ProviderType, account_id: &str) -> u32 {
+        self.counts
+            .get(&account_in_flight_key(provider_type, account_id))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for AccountInFlightGuard {
+    fn drop(&mut self) {
+        self.tracker.release(&self.key);
+    }
+}
+
+fn account_in_flight_key(provider_type: ProviderType, account_id: &str) -> String {
+    format!("{}:{account_id}", provider_type.as_str())
 }
 
 impl CachedCopilotUpstreamAuth {
@@ -531,6 +611,7 @@ impl ServerStateInner {
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             cursor_sessions: CursorSessionManager::default(),
             account_refresh_locks: AccountRefreshLocks::default(),
+            account_in_flight: Arc::new(AccountInFlightTracker::default()),
             share_in_flight: Arc::new(ShareInFlightTracker::default()),
             control_nonces: Arc::new(ControlNonceCache::default()),
             http_client: RwLock::new(http_client),
@@ -2623,6 +2704,35 @@ mod tests {
 
         drop(first);
         assert!(tracker.try_acquire("share-1", Some(1)).is_some());
+    }
+
+    #[test]
+    fn account_in_flight_tracker_enforces_limit_and_snapshots_load() {
+        let tracker = Arc::new(AccountInFlightTracker::default());
+        let guard = tracker
+            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
+            .expect("first request should acquire account capacity");
+
+        assert_eq!(
+            tracker
+                .snapshot()
+                .current(ProviderType::ClaudeOAuth, "acct-1"),
+            1
+        );
+        assert!(tracker
+            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
+            .is_none());
+
+        drop(guard);
+        assert_eq!(
+            tracker
+                .snapshot()
+                .current(ProviderType::ClaudeOAuth, "acct-1"),
+            0
+        );
+        assert!(tracker
+            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
+            .is_some());
     }
 
     #[test]
