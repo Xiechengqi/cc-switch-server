@@ -304,6 +304,14 @@
       "notes": "Server web runtime shim."
     },
     {
+      "name": "clear_owner_payout_profile",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "DELETE /api/settings/payout-profile",
+      "notes": "Clears the installation-scoped public payout profile and syncs a tombstone to Router."
+    },
+    {
       "name": "codex_banked_reset_invite",
       "support": "shim",
       "implemented": true,
@@ -1078,6 +1086,14 @@
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
+      "name": "get_owner_payout_profile",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "GET /api/settings/payout-profile",
+      "notes": "Reads the installation-scoped public payout profile and Router sync state."
+    },
+    {
       "name": "get_share_connect_info",
       "support": "native",
       "implemented": true,
@@ -1520,6 +1536,14 @@
       "feature": "settings",
       "endpoint": "ui-settings.json",
       "notes": "Persists desktop-compatible UI settings for server web admin."
+    },
+    {
+      "name": "save_owner_payout_profile",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "PUT /api/settings/payout-profile",
+      "notes": "Validates, persists, and reconciles the installation-scoped public payout profile."
     },
     {
       "name": "save_stream_check_config",

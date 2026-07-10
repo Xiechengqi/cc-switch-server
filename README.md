@@ -43,7 +43,7 @@ market or direct share URL
 - Cursor 三入口保持 AgentService planned；已移植协议、请求、事件、tool、h2、session、identity、image 前置层，并在显式 opt-in 下接入 Claude/Codex/Gemini AgentService driver。
 - GitHub Copilot 和 Kiro 已提供 device flow 静态导入路径；真实 token refresh、live models、usage 和 proxy 回归完成前仍保持 fallback/manual-import。
 - Codex、Claude、Gemini、Ollama、Antigravity/Agy 等账号在手动导入 refresh token 后可执行 server-native refresh/profile/quota；proxy 转发前会自动刷新临近过期的 managed account。
-- 支持 router installation register、client tunnel、share tunnel、share batch sync、direct share request log sync、pending share edit pull/ack/event 监听。
+- 支持 router installation register、client tunnel、share tunnel、share batch sync、installation 级公开收款资料同步、direct share request log sync、pending share edit pull/ack/event 监听。
 - 支持 share-market grant add/revoke 通过 router pending edit 应用到 server share，并同步 per-app 授权展示状态。
 - usage log 记录 requestId、sessionId、source、provider、model、stream status、cache/usage detail，并提供 summary/trends/provider/model stats。
 - 内置全局模型定价和 limits 运维面：模型定价 CRUD、成本回填、provider 日/月成本、账号 quota 和 share 限额展示。
@@ -234,6 +234,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 1. 启动 server，打开 `http://server-host:15721` 完成 setup。
 2. Router URL 填 router API base，例如 `https://router.example.com`。
 3. setup 完成后 server 可执行 `register -> client tunnel claim -> lease -> SSH reverse tunnel`；失败不会影响本地 Web，可在 Router 页查看错误。
+4. “设置 → 分享 → 收款信息”可配置一个公开 EVM 地址、USDC/USDT 及 BSC/Base/Arbitrum One 网络；本地保存独立成功，随后自动签名同步到 Router。公开资料可通过 `GET /.well-known/cc-switch/payout-profile` 获取，且仅表示 owner 自行声明，未验证钱包所有权。
 4. 添加 provider 或 account 后创建 share；未填写 share subdomain 时，server 会自动生成。
 5. 点击 share tunnel start 后，server 会 claim share subdomain、申请 `http` lease 并建立 SSH reverse tunnel。
 6. share descriptor 会在创建、修改、删除时自动同步，并在 client 启动或重新注册 router 后自动校准，无需人工全量同步。
@@ -263,13 +264,16 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | 日志级别 | `--log-level` / `CC_SWITCH_SERVER_LOG`，默认 `info` |
 | OAuth client | Gemini 浏览器登录需要 `CC_SWITCH_SERVER_GEMINI_CLIENT_ID` / `CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET`；Antigravity/Agy 浏览器登录需要 `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID` / `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET` |
 | Claude OAuth 并发 | 每账号默认最多 8 个 in-flight 请求；provider 可设置 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS`，全局可用 `CC_SWITCH_ACCOUNT_MAX_CONCURRENT` 覆盖，设为 `0` 关闭 |
+| Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
+| OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出自动选号；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
+| Prometheus | `GET /metrics` 暴露账号并发、Claude retry、breaker、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
 | 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_MARKET_GRANT_TOKEN` |
 | stream 验收 | `STREAM_PROBE`、`REQUIRE_STREAM_USAGE` |
 | release readiness | `RUN_REAL`、`RUN_DEPLOYMENT_TESTS` |
 
 主要本地 store：
 
-- `server.json`：owner、password hash、router、client tunnel subdomain 和 installation identity。
+- `server.json`：owner、公开收款资料及同步状态、password hash、router、client tunnel subdomain 和 installation identity。
 - `providers.json` / `universal-providers.json`：provider 和 Universal Provider 配置。
 - `accounts.json`：账号 token、profile、quota、raw snapshot；token 字段用 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 做 XChaCha20Poly1305 加密。
 - `accounts.key`：本机生成的账号 token 加密密钥；备份/迁移时必须和 `accounts.json` 一起保留。
@@ -284,6 +288,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 常用健康和管理入口：
 
 - `GET /health`
+- `GET /metrics`
 - `GET /version`
 - `GET /api/setup/status`
 - `POST /api/setup`

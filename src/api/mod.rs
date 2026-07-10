@@ -11,6 +11,7 @@ pub(crate) mod error;
 pub(in crate::api) mod events;
 pub(crate) mod invoke;
 pub(in crate::api) mod models;
+pub(in crate::api) mod payout;
 pub(in crate::api) mod providers;
 pub(in crate::api) mod router;
 pub(in crate::api) mod self_update;
@@ -37,6 +38,7 @@ pub(in crate::api) use events::*;
 pub(in crate::api) use invoke::dispatch::web_invoke_compat;
 pub(in crate::api) use invoke::handlers::*;
 pub(in crate::api) use models::*;
+pub(in crate::api) use payout::*;
 pub(in crate::api) use providers::*;
 pub(in crate::api) use router::*;
 pub(in crate::api) use self_update::*;
@@ -135,6 +137,7 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
 pub fn app_router(state: ServerState) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(prometheus_metrics))
         .route("/version", get(version))
         .route("/_share-router/health", get(share_router_health))
         .route(
@@ -167,12 +170,23 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/admin/rollback", post(admin_rollback))
         .route("/api/admin/upgrade", post(admin_upgrade_start))
         .route("/api/admin/upgrade/stream", get(admin_upgrade_stream))
+        .route("/api/admin/upgrade/status", get(admin_upgrade_status))
         .route("/api/events", get(events))
         .route("/api/backup", get(list_backups).post(create_backup))
         .route("/api/backups", get(list_backups).post(create_backup))
         .route("/api/backup/:id/restore", post(restore_backup))
         .route("/api/backups/:id/restore", post(restore_backup))
         .route("/api/config", get(config_snapshot))
+        .route(
+            "/api/settings/payout-profile",
+            get(get_payout_profile)
+                .put(save_payout_profile)
+                .delete(clear_payout_profile),
+        )
+        .route(
+            "/.well-known/cc-switch/payout-profile",
+            get(public_payout_profile),
+        )
         .route(
             "/api/upstream-proxy",
             get(upstream_proxy).put(update_upstream_proxy),
@@ -395,6 +409,10 @@ pub fn app_router(state: ServerState) -> Router {
             "/web-api/admin/upgrade/stream",
             get(crate::api::self_update::admin_upgrade_stream),
         )
+        .route(
+            "/web-api/admin/upgrade/status",
+            get(crate::api::self_update::admin_upgrade_status),
+        )
         .route("/v1/models", get(proxy_models))
         .route("/models", get(proxy_models))
         .route("/v1/messages", post(proxy_claude_messages))
@@ -538,6 +556,16 @@ async fn health(State(state): State<ServerState>) -> Json<HealthResponse> {
         embedded_web_assets: web_assets::asset_count(),
         unix_ms: now_ms(),
     })
+}
+
+async fn prometheus_metrics() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        crate::metrics::render(),
+    )
 }
 
 async fn version() -> Json<VersionResponse> {

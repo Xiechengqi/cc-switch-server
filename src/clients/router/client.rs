@@ -10,7 +10,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::settings::config::{RouterIdentity, ServerConfig};
+use crate::domain::settings::config::{PayoutProfileState, RouterIdentity, ServerConfig};
 use crate::domain::sharing::router_contract::*;
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +93,23 @@ struct ClientTunnelUpdateRequest {
     nonce: String,
     signature: String,
     tunnel: ClientTunnelConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallationPayoutProfileUpdateRequest {
+    installation_id: String,
+    timestamp_ms: i64,
+    nonce: String,
+    signature: String,
+    update: PayoutProfileState,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationPayoutProfileUpdateResponse {
+    pub ok: bool,
+    pub revision: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -473,6 +490,59 @@ pub async fn release_client_tunnel(
         },
     )
     .await
+}
+
+pub async fn push_payout_profile(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    update: PayoutProfileState,
+) -> anyhow::Result<InstallationPayoutProfileUpdateResponse> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/')
+        .to_string();
+    let identity = config
+        .router
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let signature = sign_payload(
+        identity,
+        "update_installation_payout_profile",
+        &update,
+        timestamp_ms,
+        &nonce,
+    )?;
+    let revision = update.revision;
+    let request = InstallationPayoutProfileUpdateRequest {
+        installation_id: identity.installation_id.clone(),
+        timestamp_ms,
+        nonce,
+        signature,
+        update,
+    };
+    let response = http
+        .put(format!("{api_base}/v1/installations/payout-profile"))
+        .json(&request)
+        .send()
+        .await
+        .context("send router payout profile update")?;
+    if response.status().is_success() {
+        let response = response
+            .json::<InstallationPayoutProfileUpdateResponse>()
+            .await
+            .context("parse router payout profile update response")?;
+        if !response.ok || response.revision != revision {
+            bail!("router payout profile update acknowledgement mismatch");
+        }
+        return Ok(response);
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    bail!("router payout profile update failed: {status}: {body}");
 }
 
 pub async fn issue_client_web_lease(

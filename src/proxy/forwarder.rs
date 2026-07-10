@@ -414,6 +414,7 @@ pub async fn forward(
                     if let Some(outcome) = sse_error_outcome {
                         record_provider_outcome(&state, &stored, outcome).await;
                         if claude_retry_allowed(claude_retry_attempt, claude_retry_started_at_ms) {
+                            crate::metrics::record_claude_retry("transport", "sse_error");
                             let retry_headers = claude_retry_headers(
                                 &headers,
                                 claude_retry_attempt + 1,
@@ -442,6 +443,10 @@ pub async fn forward(
                                 claude_retry_attempt,
                                 claude_retry_started_at_ms,
                             ) {
+                                crate::metrics::record_claude_retry(
+                                    next_stage.as_header_value(),
+                                    "sse_error",
+                                );
                                 let retry_headers = claude_retry_headers(
                                     &headers,
                                     claude_retry_attempt + 1,
@@ -735,6 +740,7 @@ pub async fn forward(
         &adapter_request.body,
     ) {
         if claude_retry_allowed(claude_retry_attempt, claude_retry_started_at_ms) {
+            crate::metrics::record_claude_retry(next_stage.as_header_value(), "http_error");
             let retry_headers = claude_retry_headers(
                 &headers,
                 claude_retry_attempt + 1,
@@ -2441,7 +2447,8 @@ pub(super) async fn record_provider_outcome(
     stored: &StoredProvider,
     outcome: ProviderOutcome,
 ) {
-    state
+    crate::metrics::record_provider_outcome(stored.app.as_str(), &stored.provider.id, outcome);
+    let breaker_state = state
         .mutate_failover_best_effort_if_changed("failover breaker state", |failover| {
             let updated = failover.record_outcome(
                 stored.app,
@@ -2449,9 +2456,23 @@ pub(super) async fn record_provider_outcome(
                 outcome,
                 current_time_ms(),
             );
-            ((), updated)
+            let breaker_state = failover
+                .breakers
+                .values()
+                .find(|breaker| {
+                    breaker.app == stored.app && breaker.provider_id == stored.provider.id
+                })
+                .map(|breaker| breaker.state);
+            (breaker_state, updated)
         })
         .await;
+    if let Some(breaker_state) = breaker_state {
+        crate::metrics::record_breaker_state(
+            stored.app.as_str(),
+            &stored.provider.id,
+            breaker_state,
+        );
+    }
 }
 
 fn provider_outcome_from_status_and_headers(
@@ -2561,6 +2582,7 @@ fn maybe_rewrite_claude_cli_version_gate_body(
         cli_version = %crate::domain::claude_cli::claude_cli_version(),
         "Claude OAuth upstream rejected the advertised Claude Code CLI version; set CC_SWITCH_CLI_UA_VERSION or CC_SWITCH_CLI_UA to a currently accepted version"
     );
+    crate::metrics::record_claude_cli_version_gate();
 
     let admin_message = claude_cli_version_gate_admin_message();
     let bytes = rewrite_error_message_body(&body, &admin_message)

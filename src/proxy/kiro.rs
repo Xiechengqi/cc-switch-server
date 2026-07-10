@@ -2803,6 +2803,8 @@ mod tests {
             expires_at: Some(9_999_999),
             rate_limited_until: None,
             last_refresh_error: None,
+            refresh_consecutive_failures: 0,
+            needs_relogin: false,
         }
     }
 

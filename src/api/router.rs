@@ -337,6 +337,11 @@ pub(in crate::api) async fn router_register(
             if let Err(error) = crate::state::reconcile_all_shares_to_router(state.clone()).await {
                 tracing::warn!(error = %error, "automatic router share reconcile after registration failed");
             }
+            if let Err(error) =
+                crate::state::reconcile_payout_profile_to_router(state.clone()).await
+            {
+                tracing::warn!(error = %error, "automatic router payout profile reconcile after registration failed");
+            }
             Ok(Json(RouterRegisterResponse {
                 ok: true,
                 registration,

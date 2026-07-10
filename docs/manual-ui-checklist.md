@@ -49,6 +49,8 @@ Run the checks manually at:
 ## Settings, Auth, Router, Backup
 
 - First setup, password login, API token, email code flow, router config, client tunnel, upstream proxy, and backup/restore are reachable.
+- Settings → Share → Payout Information persists one EVM address, explicit USDC/USDT selection, and one or more BSC/Base/Arbitrum One networks; warnings prohibit secrets and identify the address as public/self-declared.
+- Payout clear requires confirmation; Router outage leaves the local save active and visibly reports pending/failed sync.
 - Desktop-only settings are absent.
 - Destructive actions have clear confirmation or disabled states.
 

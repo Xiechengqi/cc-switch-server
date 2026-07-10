@@ -323,6 +323,37 @@
     "tabShare": "分享",
     "tabRouter": "Router",
     "share": {
+      "sections": {
+        "payout": {
+          "title": "收款資訊",
+          "description": "設定公開的 EVM 收款地址、Token 與支援網路。"
+        }
+      },
+      "payout": {
+        "publicTitle": "公開收款資訊",
+        "publicDescription": "此地址、Token 與網路清單會公開給 Router 及未來接入的 Market。",
+        "secretWarning": "切勿填寫私鑰、助記詞或錢包密碼。",
+        "unverifiedWarning": "地址僅為自行聲明，目前尚未驗證錢包所有權。",
+        "addressType": "地址類型",
+        "token": "收款 Token",
+        "selectToken": "請選擇 Token",
+        "address": "EVM 收款地址",
+        "invalidAddress": "請輸入以 0x 開頭的 40 位十六進位 EVM 地址。",
+        "networks": "支援的收款網路",
+        "synced": "已同步 Router",
+        "pending": "等待同步 Router",
+        "syncFailed": "Router 同步失敗，本機設定已儲存",
+        "notConfigured": "尚未設定",
+        "clear": "清除",
+        "save": "儲存收款資訊",
+        "saveSuccess": "收款資訊已儲存",
+        "saveError": "儲存收款資訊失敗: {{error}}",
+        "clearSuccess": "收款資訊已清除",
+        "clearError": "清除收款資訊失敗: {{error}}",
+        "clearTitle": "清除收款資訊",
+        "clearDescription": "公開收款地址將被清除，並向 Router 同步刪除狀態。確定繼續嗎？",
+        "clearConfirm": "確認清除"
+      },
       "defaultRouter": {
         "title": "預設 Router 節點",
         "description": "新建 share 時預設使用此路由節點。已建立的 share 仍綁定建立時的節點。",

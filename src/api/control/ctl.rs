@@ -303,7 +303,7 @@ pub(crate) async fn refresh_share_usage_item(
                 Ok(update) => {
                     let updated = state
                         .mutate_accounts_debounced(|accounts| {
-                            accounts.mark_refresh_success(&active_account.id, update)
+                            accounts.mark_native_refresh_success(&active_account.id, update)
                         })
                         .await;
                     if let Some(updated) = updated {
@@ -313,8 +313,11 @@ pub(crate) async fn refresh_share_usage_item(
                 Err(error) => {
                     state
                         .mutate_accounts_debounced(|accounts| {
-                            accounts
-                                .mark_refresh_failure(&active_account.id, error.message.clone());
+                            accounts.mark_native_refresh_failure(
+                                &active_account.id,
+                                error.message.clone(),
+                                error.kind,
+                            );
                         })
                         .await;
                     return ControlRefreshShareUsageItem {

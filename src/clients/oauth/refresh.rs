@@ -106,7 +106,8 @@ pub fn account_has_refresh_token(account: &Account) -> bool {
 }
 
 pub fn account_needs_native_refresh(account: &Account, now_ms: i64) -> bool {
-    provider_native_refresh_available(account.provider_type)
+    !account.needs_relogin
+        && provider_native_refresh_available(account.provider_type)
         && account_has_refresh_token(account)
         && (account
             .access_token
@@ -711,6 +712,8 @@ mod tests {
             expires_at,
             rate_limited_until: None,
             last_refresh_error: None,
+            refresh_consecutive_failures: 0,
+            needs_relogin: false,
         }
     }
 
@@ -748,6 +751,9 @@ mod tests {
             &account(ProviderType::Codex, None, Some("refresh"), None),
             now_ms
         ));
+        let mut relogin = account(ProviderType::CodexOAuth, None, Some("refresh"), None);
+        relogin.needs_relogin = true;
+        assert!(!account_needs_native_refresh(&relogin, now_ms));
     }
 
     #[test]

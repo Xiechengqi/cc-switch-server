@@ -133,6 +133,30 @@ async fn web_invoke_dispatch(
             let config = state.config.read().await;
             Ok(store.settings_for_frontend(&config))
         }
+        "get_owner_payout_profile" => {
+            let response =
+                crate::api::payout::get_payout_profile(State(state.clone()), headers.clone())
+                    .await?;
+            Ok(json!(response.0))
+        }
+        "save_owner_payout_profile" => {
+            let value = args.get("profile").cloned().unwrap_or(args);
+            let input = serde_json::from_value::<crate::api::payout::SavePayoutProfileInput>(value)
+                .map_err(ApiError::bad_request)?;
+            let response = crate::api::payout::save_payout_profile(
+                State(state.clone()),
+                headers.clone(),
+                Json(input),
+            )
+            .await?;
+            Ok(json!(response.0))
+        }
+        "clear_owner_payout_profile" => {
+            let response =
+                crate::api::payout::clear_payout_profile(State(state.clone()), headers.clone())
+                    .await?;
+            Ok(json!(response.0))
+        }
         "get_rectifier_config" => {
             let store = state.ui_settings.read().await;
             Ok(ui_settings::rectifier_config_for_frontend(&store))

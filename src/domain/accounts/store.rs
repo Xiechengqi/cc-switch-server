@@ -13,7 +13,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::domain::accounts::oauth::oauth_provider_spec;
+use crate::domain::accounts::oauth::{oauth_provider_spec, OAuthErrorKind};
 use crate::domain::providers::model::ProviderType;
 
 const ACCOUNTS_FILE_NAME: &str = "accounts.json";
@@ -77,6 +77,10 @@ pub struct Account {
     pub rate_limited_until: Option<i64>,
     #[serde(default)]
     pub last_refresh_error: Option<String>,
+    #[serde(default)]
+    pub refresh_consecutive_failures: u32,
+    #[serde(default)]
+    pub needs_relogin: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -226,6 +230,8 @@ impl AccountStore {
             expires_at: input.expires_at,
             rate_limited_until: input.rate_limited_until,
             last_refresh_error: input.last_refresh_error,
+            refresh_consecutive_failures: 0,
+            needs_relogin: false,
         };
 
         if let Some(existing) = self.accounts.iter_mut().find(|item| item.id == account.id) {
@@ -412,6 +418,65 @@ impl AccountStore {
         account.last_refresh_error = Some(error);
         Some(account.clone())
     }
+
+    pub fn mark_native_refresh_success(
+        &mut self,
+        account_id: &str,
+        update: AccountRefreshUpdate,
+    ) -> Option<Account> {
+        self.mark_refresh_success(account_id, update)?;
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|item| item.id == account_id)?;
+        account.refresh_consecutive_failures = 0;
+        account.needs_relogin = false;
+        Some(account.clone())
+    }
+
+    pub fn mark_native_refresh_failure(
+        &mut self,
+        account_id: &str,
+        error: String,
+        kind: OAuthErrorKind,
+    ) -> Option<Account> {
+        self.mark_native_refresh_failure_with_threshold(
+            account_id,
+            error,
+            kind,
+            native_refresh_failure_threshold(),
+        )
+    }
+
+    fn mark_native_refresh_failure_with_threshold(
+        &mut self,
+        account_id: &str,
+        error: String,
+        kind: OAuthErrorKind,
+        threshold: u32,
+    ) -> Option<Account> {
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|item| item.id == account_id)?;
+        account.last_refresh_error = Some(error);
+        if kind == OAuthErrorKind::InvalidGrant {
+            account.refresh_consecutive_failures =
+                account.refresh_consecutive_failures.saturating_add(1);
+            if account.refresh_consecutive_failures >= threshold.max(1) {
+                account.needs_relogin = true;
+            }
+        }
+        Some(account.clone())
+    }
+}
+
+fn native_refresh_failure_threshold() -> u32 {
+    std::env::var("CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(20)
 }
 
 pub fn accounts_path(config_dir: &Path) -> std::path::PathBuf {
@@ -808,6 +873,78 @@ mod tests {
             Some("quota endpoint failed")
         );
         assert_eq!(failed.access_token.as_deref(), Some("new-token"));
+    }
+
+    #[test]
+    fn native_refresh_invalid_grants_require_relogin_after_threshold() {
+        let mut store = AccountStore::default();
+        store.upsert(UpsertAccountInput {
+            id: Some("acct-1".to_string()),
+            provider_type: ProviderType::ClaudeOAuth,
+            email: None,
+            access_token: None,
+            refresh_token: Some("refresh".to_string()),
+            id_token: None,
+            token_type: None,
+            api_key: None,
+            scopes: Vec::new(),
+            profile: None,
+            raw: None,
+            subscription_level: None,
+            entitlement_status: None,
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at: None,
+            rate_limited_until: None,
+            last_refresh_error: None,
+        });
+
+        let network_failure = store
+            .mark_native_refresh_failure(
+                "acct-1",
+                "network unavailable".to_string(),
+                OAuthErrorKind::Network,
+            )
+            .unwrap();
+        assert_eq!(network_failure.refresh_consecutive_failures, 0);
+        assert!(!network_failure.needs_relogin);
+
+        let first = store
+            .mark_native_refresh_failure_with_threshold(
+                "acct-1",
+                "invalid grant".to_string(),
+                OAuthErrorKind::InvalidGrant,
+                2,
+            )
+            .unwrap();
+        assert_eq!(first.refresh_consecutive_failures, 1);
+        assert!(!first.needs_relogin);
+
+        let second = store
+            .mark_native_refresh_failure_with_threshold(
+                "acct-1",
+                "invalid grant".to_string(),
+                OAuthErrorKind::InvalidGrant,
+                2,
+            )
+            .unwrap();
+        assert_eq!(second.refresh_consecutive_failures, 2);
+        assert!(second.needs_relogin);
+
+        let recovered = store
+            .mark_native_refresh_success(
+                "acct-1",
+                AccountRefreshUpdate {
+                    access_token: Some("new-token".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(recovered.refresh_consecutive_failures, 0);
+        assert!(!recovered.needs_relogin);
+        assert!(recovered.last_refresh_error.is_none());
     }
 
     #[test]

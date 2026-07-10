@@ -60,14 +60,16 @@ pub fn rollback_from_backup_and_restart() -> Result<String, SelfUpdateError> {
 fn render_restart_script(strategy: RestartStrategy) -> String {
     match strategy {
         RestartStrategy::Service => format!(
-            "if [ -f {staging} ]; then mv -f {staging} {bin}; fi; \
+            "sleep 3; \
+             if [ -f {staging} ]; then mv -f {staging} {bin}; fi; \
              service {service} restart",
             staging = BINARY_STAGING_PATH,
             bin = BINARY_INSTALL_PATH,
             service = SERVICE_NAME,
         ),
         RestartStrategy::Nohup => format!(
-            "pkill -9 cc-switch-server 2>/dev/null || true; \
+            "sleep 3; \
+             pkill -9 cc-switch-server 2>/dev/null || true; \
              if [ -f {staging} ]; then mv -f {staging} {bin}; fi; \
              chmod +x {bin} 2>/dev/null || true; \
              nohup {bin} >/dev/null 2>&1 &",
@@ -81,7 +83,8 @@ fn render_rollback_restart_script(strategy: RestartStrategy) -> String {
     match strategy {
         RestartStrategy::Service => format!("service {service} restart", service = SERVICE_NAME),
         RestartStrategy::Nohup => format!(
-            "pkill -9 cc-switch-server 2>/dev/null || true; \
+            "sleep 3; \
+             pkill -9 cc-switch-server 2>/dev/null || true; \
              nohup {bin} >/dev/null 2>&1 &",
             bin = BINARY_INSTALL_PATH,
         ),
@@ -134,6 +137,7 @@ mod tests {
     #[test]
     fn service_restart_script_moves_staging_and_restarts_service() {
         let script = render_restart_script(RestartStrategy::Service);
+        assert!(script.contains("sleep 3"));
         assert!(script.contains("/tmp/cc-switch-server"));
         assert!(script.contains("service cc-switch-server restart"));
     }
@@ -141,6 +145,7 @@ mod tests {
     #[test]
     fn nohup_restart_script_matches_manual_ops_flow() {
         let script = render_restart_script(RestartStrategy::Nohup);
+        assert!(script.contains("sleep 3"));
         assert!(script.contains("pkill -9 cc-switch-server"));
         assert!(script.contains("mv -f /tmp/cc-switch-server /usr/local/bin/cc-switch-server"));
         assert!(script.contains("nohup /usr/local/bin/cc-switch-server"));

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Activity, Laptop, Network } from "lucide-react";
+import { Activity, Laptop, Network, WalletCards } from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { ClientTunnelSettingsPanel } from "@/components/settings/ClientTunnelSettingsPanel";
+import { PayoutProfileSettingsPanel } from "@/components/settings/PayoutProfileSettingsPanel";
 import {
   formatShareHealthOverview,
   ShareHealthStatusPanel,
@@ -138,6 +139,19 @@ export function ShareSettingsTab() {
           })}
         >
           <ClientTunnelSettingsPanel embedded />
+        </ShareSettingsAccordionItem>
+
+        <ShareSettingsAccordionItem
+          value="payout"
+          icon={<WalletCards className="h-5 w-5 text-amber-500" />}
+          title={t("settings.share.sections.payout.title", {
+            defaultValue: "收款信息",
+          })}
+          description={t("settings.share.sections.payout.description", {
+            defaultValue: "配置公开的 EVM 收款地址、Token 与支持网络。",
+          })}
+        >
+          <PayoutProfileSettingsPanel />
         </ShareSettingsAccordionItem>
 
         <ShareSettingsAccordionItem

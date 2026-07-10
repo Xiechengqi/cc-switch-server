@@ -1219,23 +1219,24 @@ pub(in crate::api) async fn refresh_account(
             .ok_or_else(|| ApiError::conflict("account refresh is already in progress"))?;
         let http_client = state.http_client().await;
         let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-        let update =
-            match execute_native_account_refresh(&http_client, &existing, now, interval_ms).await {
-                Ok(update) => update,
-                Err(error) => {
-                    state
-                        .mutate_accounts_immediate(|store| {
-                            store.mark_refresh_failure(&id, error.message.clone());
-                        })
-                        .await
-                        .map_err(ApiError::internal)?;
-                    return Err(account_refresh_api_error(error));
-                }
-            };
+        let update = match execute_native_account_refresh(&http_client, &existing, now, interval_ms)
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                state
+                    .mutate_accounts_immediate(|store| {
+                        store.mark_native_refresh_failure(&id, error.message.clone(), error.kind);
+                    })
+                    .await
+                    .map_err(ApiError::internal)?;
+                return Err(account_refresh_api_error(error));
+            }
+        };
         let account = state
             .try_mutate_accounts_immediate(|store| {
                 store
-                    .mark_refresh_success(&id, update)
+                    .mark_native_refresh_success(&id, update)
                     .ok_or_else(|| ApiError::not_found("account not found"))
             })
             .await
@@ -1390,7 +1391,11 @@ pub(in crate::api) async fn account_quota(
                 Err(error) => {
                     state
                         .mutate_accounts_immediate(|store| {
-                            store.mark_refresh_failure(&id, error.message.clone());
+                            store.mark_native_refresh_failure(
+                                &id,
+                                error.message.clone(),
+                                error.kind,
+                            );
                         })
                         .await
                         .map_err(ApiError::internal)?;
@@ -1400,7 +1405,7 @@ pub(in crate::api) async fn account_quota(
         active_account = state
             .try_mutate_accounts_immediate(|store| {
                 store
-                    .mark_refresh_success(&id, update)
+                    .mark_native_refresh_success(&id, update)
                     .ok_or_else(|| ApiError::not_found("account not found"))
             })
             .await

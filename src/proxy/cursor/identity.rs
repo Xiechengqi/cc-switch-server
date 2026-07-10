@@ -417,6 +417,8 @@ mod tests {
             expires_at: None,
             rate_limited_until: None,
             last_refresh_error: None,
+            refresh_consecutive_failures: 0,
+            needs_relogin: false,
         };
         let cursor = cursor_account_from_managed_account(&account);
         assert_eq!(cursor.machine_id(), "machine");

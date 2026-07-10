@@ -208,6 +208,9 @@ function refreshRegressionBadge(
   account: AccountRecord,
   capability?: AccountManagerCapability,
 ): AccountRegressionBadge {
+  if (account.needsRelogin) {
+    return { label: "refresh", value: "relogin", tone: "danger" };
+  }
   if (account.lastRefreshError) {
     return { label: "refresh", value: "error", tone: "danger" };
   }

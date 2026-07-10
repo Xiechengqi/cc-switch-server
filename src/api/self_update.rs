@@ -57,6 +57,24 @@ pub(in crate::api) struct UpgradeStreamQuery {
     task_id: Option<String>,
     #[serde(default)]
     access_token: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct UpgradeStatusQuery {
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct AdminUpgradeStatusResponse {
+    pub task_id: String,
+    pub status: &'static str,
+    pub restart_pending: bool,
+    pub logs: Vec<UpgradeLogEntry>,
 }
 
 pub(in crate::api) async fn build_admin_version_response(
@@ -140,7 +158,8 @@ pub(in crate::api) async fn admin_upgrade_stream(
     headers: HeaderMap,
     Query(query): Query<UpgradeStreamQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    require_event_session(&state, &headers, query.access_token.as_deref()).await?;
+    let query_token = query.access_token.as_deref().or(query.token.as_deref());
+    require_event_session(&state, &headers, query_token).await?;
 
     let handle = state
         .upgrade
@@ -188,6 +207,38 @@ pub(in crate::api) async fn admin_upgrade_stream(
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15))))
+}
+
+pub(in crate::api) async fn admin_upgrade_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<UpgradeStatusQuery>,
+) -> Result<Json<AdminUpgradeStatusResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let snapshot = state
+        .upgrade
+        .status_snapshot()
+        .await
+        .ok_or_else(|| ApiError::not_found("no upgrade task running"))?;
+    if let Some(expected) = query.task_id.as_deref() {
+        if expected != snapshot.task_id {
+            return Err(ApiError::not_found("upgrade task id does not match"));
+        }
+    }
+    Ok(Json(AdminUpgradeStatusResponse {
+        task_id: snapshot.task_id,
+        status: upgrade_status_label(snapshot.status),
+        restart_pending: snapshot.restart_pending,
+        logs: snapshot.logs,
+    }))
+}
+
+fn upgrade_status_label(status: UpgradeStatus) -> &'static str {
+    match status {
+        UpgradeStatus::Running => "running",
+        UpgradeStatus::Success => "success",
+        UpgradeStatus::Failed => "failed",
+    }
 }
 
 fn map_self_update_error<T>(

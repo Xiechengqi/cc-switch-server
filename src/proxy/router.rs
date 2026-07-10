@@ -205,6 +205,7 @@ fn select_provider_with_optional_filter(
             })
             .cloned()
             .ok_or_else(|| ProxyError::not_found(format!("provider not found: {provider_id}")))?;
+        ensure_provider_account_does_not_need_relogin(&provider, accounts)?;
         ensure_provider_not_rate_limited(&provider, accounts, now)?;
         if account_in_flight
             .and_then(|snapshot| account_concurrency_for_provider(&provider, accounts, snapshot))
@@ -218,7 +219,7 @@ fn select_provider_with_optional_filter(
         });
     }
 
-    let rate_available_candidates = store
+    let matching_candidates = store
         .providers
         .iter()
         .filter(|item| item.app == app)
@@ -228,6 +229,21 @@ fn select_provider_with_optional_filter(
                 .unwrap_or(true)
                 && provider_filter.map(|filter| filter(item)).unwrap_or(true)
         })
+        .collect::<Vec<_>>();
+    let active_candidates = matching_candidates
+        .iter()
+        .copied()
+        .filter(|item| !provider_account_needs_relogin(item, accounts))
+        .collect::<Vec<_>>();
+    if active_candidates.is_empty() && !matching_candidates.is_empty() {
+        return Err(ProxyError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            message: "all managed accounts require login".to_string(),
+        });
+    }
+    let rate_available_candidates = active_candidates
+        .iter()
+        .copied()
         .filter(|item| provider_rate_limited_until(item, accounts, now).is_none())
         .collect::<Vec<_>>();
     let candidates = rate_available_candidates
@@ -239,13 +255,7 @@ fn select_provider_with_optional_filter(
                 .is_none_or(|selection| selection.current < selection.max_concurrent)
         })
         .collect::<Vec<_>>();
-    let has_matching_provider = store.providers.iter().any(|item| {
-        item.app == app
-            && provider_type_filter
-                .map(|provider_type| item.provider_type == provider_type)
-                .unwrap_or(true)
-            && provider_filter.map(|filter| filter(item)).unwrap_or(true)
-    });
+    let has_matching_provider = !matching_candidates.is_empty();
     if candidates.is_empty() && !rate_available_candidates.is_empty() {
         return Err(ProxyError {
             status: axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -436,6 +446,31 @@ fn ensure_provider_not_rate_limited(
         });
     }
     Ok(())
+}
+
+fn ensure_provider_account_does_not_need_relogin(
+    provider: &StoredProvider,
+    accounts: &AccountStore,
+) -> Result<(), ProxyError> {
+    if provider_account_needs_relogin(provider, accounts) {
+        return Err(ProxyError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            message: format!("provider {} account requires login", provider.provider.id),
+        });
+    }
+    Ok(())
+}
+
+fn provider_account_needs_relogin(provider: &StoredProvider, accounts: &AccountStore) -> bool {
+    let account_id = provider
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.account_id.as_deref());
+    accounts
+        .find_for_provider(provider.provider_type, account_id)
+        .is_some_and(|account| account.needs_relogin)
 }
 
 fn provider_rate_limited_until(
@@ -772,6 +807,51 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn automatic_selection_skips_account_that_requires_relogin() {
+        let store = ProviderStore {
+            providers: vec![
+                codex_oauth_provider("p1", "acct-1"),
+                codex_oauth_provider("p2", "acct-2"),
+            ],
+        };
+        let mut accounts = AccountStore::default();
+        accounts.upsert(codex_oauth_account("acct-1", None));
+        accounts.upsert(codex_oauth_account("acct-2", None));
+        accounts.accounts[0].needs_relogin = true;
+        let mut failover = enabled_failover(&store);
+
+        let selected = select_provider(
+            &store,
+            &accounts,
+            &mut failover,
+            AppKind::Codex,
+            &HeaderMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(selected.provider.provider.id, "p2");
+    }
+
+    #[test]
+    fn explicit_provider_returns_401_when_account_requires_relogin() {
+        let store = ProviderStore {
+            providers: vec![codex_oauth_provider("p1", "acct-1")],
+        };
+        let mut accounts = AccountStore::default();
+        accounts.upsert(codex_oauth_account("acct-1", None));
+        accounts.accounts[0].needs_relogin = true;
+        let mut failover = enabled_failover(&store);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cc-provider-id", HeaderValue::from_static("p1"));
+
+        let error = select_provider(&store, &accounts, &mut failover, AppKind::Codex, &headers)
+            .unwrap_err();
+
+        assert_eq!(error.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(error.message.contains("requires login"));
     }
 
     #[test]

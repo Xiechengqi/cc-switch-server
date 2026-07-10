@@ -19,6 +19,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(cli: Cli) -> anyhow::Result<()> {
+    cc_switch_server::metrics::init()?;
     let state = ServerStateInner::load(cli.clone()).context("initialize server state")?;
     cc_switch_server::state::restore_tunnels(state.clone()).await;
     cc_switch_server::state::spawn_periodic_backups(state.clone());

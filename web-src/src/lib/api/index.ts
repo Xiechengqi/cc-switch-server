@@ -45,6 +45,11 @@ export type {
   ShareHealthStatus,
   ShareHealthItem,
   ShareHealthLevel,
+  PayoutToken,
+  PayoutNetwork,
+  PayoutProfile,
+  PayoutProfileState,
+  SavePayoutProfileParams,
 } from "./share";
 export {
   SHARE_APP_TYPES,

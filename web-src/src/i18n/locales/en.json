@@ -334,6 +334,10 @@
           "title": "Client",
           "description": "Configure Client Tunnel owner email, subdomain, and runtime status. Current: {{status}}"
         },
+        "payout": {
+          "title": "Payout Information",
+          "description": "Configure a public EVM payout address, token, and supported networks."
+        },
         "router": {
           "title": "Router",
           "description": "Default router node for new shares. Current: {{value}}"
@@ -342,6 +346,31 @@
           "title": "Health",
           "descriptionLoading": "Router, Client Tunnel, and Share link health"
         }
+      },
+      "payout": {
+        "publicTitle": "Public payout information",
+        "publicDescription": "This address, token, and network list are public to Router and future Market integrations.",
+        "secretWarning": "Never enter a private key, seed phrase, or wallet password.",
+        "unverifiedWarning": "This address is self-declared; wallet ownership has not been verified.",
+        "addressType": "Address type",
+        "token": "Payout token",
+        "selectToken": "Select a token",
+        "address": "EVM payout address",
+        "invalidAddress": "Enter an EVM address beginning with 0x followed by 40 hexadecimal characters.",
+        "networks": "Supported payout networks",
+        "synced": "Synced to Router",
+        "pending": "Waiting for Router sync",
+        "syncFailed": "Router sync failed; local configuration is saved",
+        "notConfigured": "Not configured",
+        "clear": "Clear",
+        "save": "Save payout information",
+        "saveSuccess": "Payout information saved",
+        "saveError": "Failed to save payout information: {{error}}",
+        "clearSuccess": "Payout information cleared",
+        "clearError": "Failed to clear payout information: {{error}}",
+        "clearTitle": "Clear payout information",
+        "clearDescription": "The public payout address will be cleared and a deletion state will be synced to Router. Continue?",
+        "clearConfirm": "Clear information"
       },
       "health": {
         "overallTitle": "Link overview",
@@ -463,6 +492,7 @@
       "upgradeLogDesc": "Live output from the binary upgrade task.",
       "upgradeStep": "Step {{step}} / {{total}}",
       "upgradeRunning": "Upgrade in progress…",
+      "upgradeRestarting": "Upgrade complete. Restarting service…",
       "upgradeSucceeded": "Upgrade completed",
       "waitingLogs": "Waiting for upgrade logs…",
       "streamDisconnected": "Upgrade log stream disconnected",

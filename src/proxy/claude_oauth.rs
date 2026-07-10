@@ -22,7 +22,9 @@ const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const COMPUTER_USE_BETA: &str = "computer-use-2024-10-22";
+const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
+const CLAUDE_CACHE_TTL_ENV: &str = "CC_SWITCH_CLAUDE_CACHE_TTL";
 const CLAUDE_CODE_PROMPT_MATCH_THRESHOLD: f64 = 0.5;
 pub(crate) const CLAUDE_BODY_RETRY_STAGE_HEADER: &str = "x-cc-switch-claude-body-retry";
 
@@ -213,6 +215,7 @@ fn ensure_claude_code_identity(mut body: Value) -> Value {
         .is_some_and(|t| t.starts_with(BILLING_PREFIX))
     {
         ensure_claude_tools_array(&mut body);
+        ensure_claude_defaults(&mut body);
         return sign_claude_oauth_messages_body(body);
     }
 
@@ -243,6 +246,7 @@ fn ensure_claude_code_identity(mut body: Value) -> Value {
 
     body["system"] = Value::Array(blocks);
     ensure_claude_tools_array(&mut body);
+    ensure_claude_defaults(&mut body);
     sign_claude_oauth_messages_body(body)
 }
 
@@ -277,11 +281,47 @@ fn ensure_claude_tools_array(body: &mut Value) {
         .or_insert_with(|| Value::Array(Vec::new()));
 }
 
+fn ensure_claude_defaults(body: &mut Value) {
+    let thinking_uses_context_management = body
+        .pointer("/thinking/type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "enabled" | "adaptive"));
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("max_tokens".to_string())
+        .or_insert_with(|| serde_json::json!(128_000));
+    object
+        .entry("temperature".to_string())
+        .or_insert_with(|| serde_json::json!(1));
+    if thinking_uses_context_management {
+        object
+            .entry("context_management".to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+                })
+            });
+    }
+}
+
+fn claude_cache_control() -> Value {
+    claude_cache_control_for_ttl(std::env::var(CLAUDE_CACHE_TTL_ENV).ok().as_deref())
+}
+
+fn claude_cache_control_for_ttl(ttl: Option<&str>) -> Value {
+    match ttl.map(str::trim) {
+        Some("1h") => serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+        _ => serde_json::json!({"type": "ephemeral"}),
+    }
+}
+
 fn claude_billing_block() -> Value {
     serde_json::json!({
         "type": "text",
         "text": claude_billing_header_text(),
-        "cache_control": {"type": "ephemeral"}
+        "cache_control": claude_cache_control()
     })
 }
 
@@ -289,7 +329,7 @@ fn claude_identity_block() -> Value {
     serde_json::json!({
         "type": "text",
         "text": CLAUDE_CODE_IDENTITY_TEXT,
-        "cache_control": {"type": "ephemeral"}
+        "cache_control": claude_cache_control()
     })
 }
 
@@ -602,6 +642,9 @@ fn build_anthropic_beta_value(
         if body.is_some_and(body_has_computer_use_tool) {
             push_beta(&mut betas, COMPUTER_USE_BETA);
         }
+        if body.is_some_and(body_has_context_management) {
+            push_beta(&mut betas, CONTEXT_MANAGEMENT_BETA);
+        }
     }
 
     betas.join(",")
@@ -635,6 +678,11 @@ fn body_has_computer_use_tool(body: &Value) -> bool {
                     .is_some_and(|tool_type| tool_type.contains("computer"))
             })
         })
+}
+
+fn body_has_context_management(body: &Value) -> bool {
+    body.get("context_management")
+        .is_some_and(|value| !value.is_null())
 }
 
 fn stainless_timeout_for_body(body: Option<&Value>) -> String {
@@ -883,6 +931,69 @@ mod tests {
     }
 
     #[test]
+    fn claude_defaults_fill_missing_wire_fields() {
+        let result = ensure_claude_oauth_billing_header_system(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [],
+            "thinking": {"type": "enabled"}
+        }));
+
+        assert_eq!(result["max_tokens"], json!(128_000));
+        assert_eq!(result["temperature"], json!(1));
+        assert_eq!(
+            result["context_management"],
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]})
+        );
+    }
+
+    #[test]
+    fn claude_defaults_preserve_explicit_values() {
+        let result = ensure_claude_oauth_billing_header_system(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "temperature": 0,
+            "messages": [],
+            "thinking": {"type": "adaptive"},
+            "context_management": {"edits": []}
+        }));
+
+        assert_eq!(result["max_tokens"], json!(4096));
+        assert_eq!(result["temperature"], json!(0));
+        assert_eq!(result["context_management"], json!({"edits": []}));
+    }
+
+    #[test]
+    fn claude_context_management_is_only_added_for_supported_thinking_modes() {
+        let result = ensure_claude_oauth_billing_header_system(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [],
+            "thinking": {"type": "disabled"}
+        }));
+
+        assert!(result.get("context_management").is_none());
+    }
+
+    #[test]
+    fn claude_cache_ttl_defaults_to_wire_compatible_five_minutes() {
+        assert_eq!(
+            claude_cache_control_for_ttl(None),
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            claude_cache_control_for_ttl(Some("5m")),
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            claude_cache_control_for_ttl(Some("invalid")),
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            claude_cache_control_for_ttl(Some("1h")),
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+    }
+
+    #[test]
     fn non_claude_code_string_system_moves_to_first_user_message() {
         let body = json!({"model": "x", "max_tokens": 1, "system": "Be helpful.", "messages": []});
         let result = ensure_claude_oauth_billing_header_system(body);
@@ -940,6 +1051,17 @@ mod tests {
             beta,
             "claude-code-20250219,oauth-2025-04-20,custom-beta,interleaved-thinking-2025-05-14"
         );
+    }
+
+    #[test]
+    fn anthropic_beta_for_claude_oauth_tracks_context_management() {
+        let headers = HeaderMap::new();
+        let body = json!({"context_management": {"edits": []}});
+        let beta = build_anthropic_beta_value(&headers, Some(&body), true);
+
+        assert!(beta
+            .split(',')
+            .any(|value| value == CONTEXT_MANAGEMENT_BETA));
     }
 
     #[test]

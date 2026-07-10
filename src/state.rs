@@ -33,7 +33,9 @@ use crate::domain::failover::FailoverStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::providers::universal::UniversalProviderStore;
-use crate::domain::settings::config::{mask_proxy_url, ServerConfig};
+use crate::domain::settings::config::{
+    mask_proxy_url, PayoutProfile, PayoutProfileState, ServerConfig,
+};
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, ShareRequestLogEntry, ShareSyncOperation,
@@ -237,6 +239,9 @@ pub struct AccountInFlightSnapshot {
 pub struct AccountInFlightGuard {
     tracker: Arc<AccountInFlightTracker>,
     key: String,
+    provider_type: String,
+    account_id: String,
+    max_concurrent: u32,
 }
 
 #[derive(Debug, Default)]
@@ -322,25 +327,38 @@ impl AccountInFlightTracker {
         if current >= max_concurrent {
             return None;
         }
-        counts.insert(key.clone(), current.saturating_add(1));
+        let next = current.saturating_add(1);
+        counts.insert(key.clone(), next);
+        let provider_type_label = provider_type.as_str().to_string();
+        crate::metrics::record_account_inflight(
+            &provider_type_label,
+            account_id,
+            next,
+            max_concurrent,
+        );
         Some(AccountInFlightGuard {
             tracker: self.clone(),
             key,
+            provider_type: provider_type_label,
+            account_id: account_id.to_string(),
+            max_concurrent,
         })
     }
 
-    fn release(&self, key: &str) {
+    fn release(&self, key: &str, provider_type: &str, account_id: &str, max_concurrent: u32) {
         let Ok(mut counts) = self.counts.lock() else {
             return;
         };
         let Some(current) = counts.get_mut(key) else {
             return;
         };
-        if *current <= 1 {
+        let next = current.saturating_sub(1);
+        if next == 0 {
             counts.remove(key);
         } else {
-            *current -= 1;
+            *current = next;
         }
+        crate::metrics::record_account_inflight(provider_type, account_id, next, max_concurrent);
     }
 }
 
@@ -355,7 +373,12 @@ impl AccountInFlightSnapshot {
 
 impl Drop for AccountInFlightGuard {
     fn drop(&mut self) {
-        self.tracker.release(&self.key);
+        self.tracker.release(
+            &self.key,
+            &self.provider_type,
+            &self.account_id,
+            self.max_concurrent,
+        );
     }
 }
 
@@ -634,6 +657,52 @@ impl ServerStateInner {
 
     pub async fn config_snapshot(&self) -> ServerConfig {
         self.config.read().await.clone()
+    }
+
+    pub async fn update_owner_payout_profile(
+        &self,
+        profile: PayoutProfile,
+    ) -> anyhow::Result<PayoutProfileState> {
+        let mut config = self.config.write().await;
+        let state = config.update_owner_payout_profile(
+            profile,
+            crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+        )?;
+        config.save(&self.config_dir)?;
+        Ok(state)
+    }
+
+    pub async fn clear_owner_payout_profile(&self) -> anyhow::Result<PayoutProfileState> {
+        let mut config = self.config.write().await;
+        let state = config
+            .clear_owner_payout_profile(crate::infra::time::now_ms().min(i64::MAX as u128) as i64)?;
+        config.save(&self.config_dir)?;
+        Ok(state)
+    }
+
+    pub async fn mark_payout_profile_sync_success(&self, revision: i64) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        if config.owner.payout_profile.revision == revision {
+            config.owner.payout_profile_sync.last_synced_revision = Some(revision);
+            config.owner.payout_profile_sync.last_synced_at_ms =
+                Some(crate::infra::time::now_ms().min(i64::MAX as u128) as i64);
+            config.owner.payout_profile_sync.last_error = None;
+            config.save(&self.config_dir)?;
+        }
+        Ok(())
+    }
+
+    pub async fn mark_payout_profile_sync_error(
+        &self,
+        revision: i64,
+        error: String,
+    ) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        if config.owner.payout_profile.revision == revision {
+            config.owner.payout_profile_sync.last_error = Some(error);
+            config.save(&self.config_dir)?;
+        }
+        Ok(())
     }
 
     pub async fn reload_persistent_stores(&self) -> anyhow::Result<()> {
@@ -1007,7 +1076,11 @@ impl ServerStateInner {
                 Err(error) => {
                     {
                         let mut accounts = self.accounts.write().await;
-                        accounts.mark_refresh_failure(&account.id, error.message.clone());
+                        accounts.mark_native_refresh_failure(
+                            &account.id,
+                            error.message.clone(),
+                            error.kind,
+                        );
                     }
                     save_accounts_debounced(self);
                     return Err(ManagedAccountRefreshError::Refresh {
@@ -1020,7 +1093,7 @@ impl ServerStateInner {
         {
             let mut accounts = self.accounts.write().await;
             accounts
-                .mark_refresh_success(&account.id, update)
+                .mark_native_refresh_success(&account.id, update)
                 .ok_or(ManagedAccountRefreshError::NotFound)?;
         }
         save_accounts_debounced(self);
@@ -1508,6 +1581,9 @@ pub async fn restore_tunnels(state: ServerState) {
     if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
         tracing::warn!(error = %error, "automatic router share reconcile failed");
     }
+    if let Err(error) = reconcile_payout_profile_to_router(state.clone()).await {
+        tracing::warn!(error = %error, "automatic router payout profile reconcile failed");
+    }
 }
 
 pub fn spawn_periodic_backups(state: ServerState) {
@@ -1586,22 +1662,37 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
     match execute_native_account_refresh(&http_client, &account, now, interval_ms).await {
         Ok(update) => {
+            crate::metrics::record_warm_refresh(account.provider_type.as_str(), "success");
             {
                 let mut store = state.accounts.write().await;
-                store.mark_refresh_success(&account.id, update);
+                store.mark_native_refresh_success(&account.id, update);
             }
             save_accounts_debounced(state);
         }
         Err(error) => {
+            let metric_result =
+                if error.kind == crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant {
+                    "invalid_grant"
+                } else {
+                    "failure"
+                };
+            crate::metrics::record_warm_refresh(account.provider_type.as_str(), metric_result);
             tracing::warn!(
                 account_id = %account.id,
                 provider_type = %account.provider_type.as_str(),
                 error = %error.message,
                 "background OAuth token warm-refresh failed"
             );
-            {
+            let updated = {
                 let mut store = state.accounts.write().await;
-                store.mark_refresh_failure(&account.id, error.message);
+                store.mark_native_refresh_failure(&account.id, error.message, error.kind)
+            };
+            if updated.is_some_and(|account| account.needs_relogin) {
+                tracing::error!(
+                    account_id = %account.id,
+                    provider_type = %account.provider_type.as_str(),
+                    "managed OAuth account isolated after repeated invalid_grant refresh failures"
+                );
             }
             save_accounts_debounced(state);
         }
@@ -1696,7 +1787,7 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
         };
         active_account = {
             let mut store = state.accounts.write().await;
-            match store.mark_refresh_success(&active_account.id, update) {
+            match store.mark_native_refresh_success(&active_account.id, update) {
                 Some(account) => account,
                 None => return,
             }
@@ -2219,6 +2310,34 @@ pub async fn reconcile_all_shares_to_router(state: ServerState) -> anyhow::Resul
     result.map(|()| shares.len())
 }
 
+pub async fn reconcile_payout_profile_to_router(state: ServerState) -> anyhow::Result<()> {
+    let config = state.config_snapshot().await;
+    let payout_state = config.owner.payout_profile.clone();
+    if payout_state.revision <= 0 {
+        return Ok(());
+    }
+    let revision = payout_state.revision;
+    let result = async {
+        let http_client = state.http_client().await;
+        client::push_payout_profile(&http_client, &config, payout_state).await?;
+        anyhow::Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            state.mark_payout_profile_sync_success(revision).await?;
+            Ok(())
+        }
+        Err(error) => {
+            let message = error.to_string();
+            state
+                .mark_payout_profile_sync_error(revision, message.clone())
+                .await?;
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
 async fn share_edit_event_loop(state: ServerState) {
     loop {
         if let Err(error) = listen_for_share_edit_events_once(state.clone()).await {
@@ -2394,6 +2513,9 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
         }
         state.save_shares().await?;
         reconcile_all_shares_to_router(state.clone()).await?;
+        if let Err(error) = reconcile_payout_profile_to_router(state.clone()).await {
+            tracing::warn!(error = %error, "router payout profile reconcile after implicit registration failed");
+        }
     }
 
     let owner_email = config
@@ -2534,6 +2656,8 @@ mod tests {
             expires_at,
             rate_limited_until: None,
             last_refresh_error: None,
+            refresh_consecutive_failures: 0,
+            needs_relogin: false,
         }
     }
 

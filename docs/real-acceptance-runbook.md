@@ -143,6 +143,9 @@ Claude OAuth 专项补充：
 13. 上游响应含 `x-request-id` 时，下游客户端应能拿到同名 header，便于 Anthropic support 联合排查。
 14. Claude OAuth 多账号并发时，应优先选择当前占用比例较低的账号；默认每账号上限为 8，provider 的 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS` 可覆盖，`CC_SWITCH_ACCOUNT_MAX_CONCURRENT=0` 可关闭。达到上限的账号应从自动选择中跳过，显式 provider/share 绑定应返回 429，SSE 结束或中断后容量必须释放。
 15. 如使用 `~/.claude/.credentials.json` 迁移，只通过显式 `POST /api/accounts/claude/credentials/import` / `GET /api/accounts/:id/claude/credentials` 操作；server 不自动扫描本机目录，也不写 Claude Desktop profile。
+16. 缺省 `max_tokens` / `temperature` 的请求应分别补为 `128000` / `1`；`thinking.type=enabled|adaptive` 时应补 `context_management.edits` 并携带 `context-management-2025-06-27` beta，客户端显式值不得被覆盖。
+17. 连续 `invalid_grant` 达到 `CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 阈值后，账号应显示 `relogin` 并退出自动选号；网络错误、限流和普通 quota 错误不得累计该计数，手工 refresh 成功后状态应清零。
+18. `GET /metrics` 应能看到账号 inflight/max、Claude retry、breaker、warm-refresh 和 CLI version-gate 指标；该端点默认无鉴权，公网部署必须由反向代理或网络策略限制抓取来源。
 
 Cursor/Copilot/Kiro/Bedrock 的真实验收变量已经接入 `scripts/smoke/real-acceptance-env-check.sh` 的 AB7 gate 和 `scripts/smoke/oauth-readiness-check.sh` 的脱敏 evidence。变量齐备只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。
 

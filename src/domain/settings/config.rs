@@ -8,6 +8,7 @@ use argon2::password_hash::{
 use argon2::Argon2;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 
 const CONFIG_FILE_NAME: &str = "server.json";
 const CLIENT_SUBDOMAIN_SUFFIX_LEN: usize = 5;
@@ -38,6 +39,139 @@ pub struct AuthConfig {
 pub struct OwnerConfig {
     #[serde(default)]
     pub email: Option<String>,
+    #[serde(default)]
+    pub payout_profile: PayoutProfileState,
+    #[serde(default)]
+    pub payout_profile_sync: PayoutProfileSyncStatus,
+}
+
+pub const PAYOUT_PROFILE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayoutAddressType {
+    #[serde(rename = "evm")]
+    Evm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayoutToken {
+    USDC,
+    USDT,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PayoutNetwork {
+    #[serde(rename = "eip155:56")]
+    Bsc,
+    #[serde(rename = "eip155:8453")]
+    Base,
+    #[serde(rename = "eip155:42161")]
+    ArbitrumOne,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayoutVerificationStatus {
+    #[serde(rename = "self_declared")]
+    SelfDeclared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PayoutProfile {
+    pub address_type: PayoutAddressType,
+    pub address: String,
+    pub token: PayoutToken,
+    pub networks: Vec<PayoutNetwork>,
+    pub verification_status: PayoutVerificationStatus,
+}
+
+impl PayoutProfile {
+    pub fn validate_and_normalize(mut self) -> anyhow::Result<Self> {
+        self.address = normalize_evm_address(&self.address)?;
+        self.networks.sort_unstable();
+        self.networks.dedup();
+        if self.networks.is_empty() {
+            bail!("at least one payout network is required");
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutProfileState {
+    #[serde(default = "default_payout_profile_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub revision: i64,
+    #[serde(default)]
+    pub profile: Option<PayoutProfile>,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+impl Default for PayoutProfileState {
+    fn default() -> Self {
+        Self {
+            schema_version: PAYOUT_PROFILE_SCHEMA_VERSION,
+            revision: 0,
+            profile: None,
+            updated_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutProfileSyncStatus {
+    #[serde(default)]
+    pub last_synced_revision: Option<i64>,
+    #[serde(default)]
+    pub last_synced_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+fn default_payout_profile_schema_version() -> u32 {
+    PAYOUT_PROFILE_SCHEMA_VERSION
+}
+
+pub fn normalize_evm_address(value: &str) -> anyhow::Result<String> {
+    if value.trim() != value || !value.starts_with("0x") || value.len() != 42 {
+        bail!("EVM address must be 0x followed by 40 hexadecimal characters");
+    }
+    let body = &value[2..];
+    if !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("EVM address must contain only hexadecimal characters");
+    }
+    let normalized = checksum_evm_address(&body.to_ascii_lowercase());
+    let has_lower = body.bytes().any(|byte| byte.is_ascii_lowercase());
+    let has_upper = body.bytes().any(|byte| byte.is_ascii_uppercase());
+    if has_lower && has_upper && normalized != value {
+        bail!("mixed-case EVM address must use a valid EIP-55 checksum");
+    }
+    Ok(normalized)
+}
+
+fn checksum_evm_address(lowercase_body: &str) -> String {
+    let digest = Keccak256::digest(lowercase_body.as_bytes());
+    let mut output = String::with_capacity(42);
+    output.push_str("0x");
+    for (index, byte) in lowercase_body.bytes().enumerate() {
+        if byte.is_ascii_alphabetic() {
+            let hash_nibble = if index % 2 == 0 {
+                digest[index / 2] >> 4
+            } else {
+                digest[index / 2] & 0x0f
+            };
+            if hash_nibble >= 8 {
+                output.push((byte as char).to_ascii_uppercase());
+                continue;
+            }
+        }
+        output.push(byte as char);
+    }
+    output
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -217,6 +351,7 @@ impl ServerConfig {
             },
             owner: OwnerConfig {
                 email: Some(owner_email),
+                ..OwnerConfig::default()
             },
             router: RouterConfig {
                 url: Some(router_url),
@@ -293,6 +428,42 @@ impl ServerConfig {
             self.upstream_proxy.follow_system_proxy = follow_system_proxy;
         }
         Ok(())
+    }
+
+    pub fn update_owner_payout_profile(
+        &mut self,
+        profile: PayoutProfile,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<PayoutProfileState> {
+        if updated_at_ms <= 0 {
+            bail!("payout profile update timestamp must be positive");
+        }
+        let profile = profile.validate_and_normalize()?;
+        self.owner.payout_profile = PayoutProfileState {
+            schema_version: PAYOUT_PROFILE_SCHEMA_VERSION,
+            revision: self.owner.payout_profile.revision.saturating_add(1).max(1),
+            profile: Some(profile),
+            updated_at_ms,
+        };
+        self.owner.payout_profile_sync.last_error = None;
+        Ok(self.owner.payout_profile.clone())
+    }
+
+    pub fn clear_owner_payout_profile(
+        &mut self,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<PayoutProfileState> {
+        if updated_at_ms <= 0 {
+            bail!("payout profile update timestamp must be positive");
+        }
+        self.owner.payout_profile = PayoutProfileState {
+            schema_version: PAYOUT_PROFILE_SCHEMA_VERSION,
+            revision: self.owner.payout_profile.revision.saturating_add(1).max(1),
+            profile: None,
+            updated_at_ms,
+        };
+        self.owner.payout_profile_sync.last_error = None;
+        Ok(self.owner.payout_profile.clone())
     }
 }
 
@@ -570,6 +741,82 @@ mod tests {
                 follow_system_proxy: None,
             })
             .is_err());
+    }
+
+    #[test]
+    fn payout_profile_normalizes_address_networks_and_increments_revision() {
+        let mut config = ServerConfig::empty();
+        let first = config
+            .update_owner_payout_profile(
+                PayoutProfile {
+                    address_type: PayoutAddressType::Evm,
+                    address: "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed".into(),
+                    token: PayoutToken::USDC,
+                    networks: vec![
+                        PayoutNetwork::ArbitrumOne,
+                        PayoutNetwork::Bsc,
+                        PayoutNetwork::Bsc,
+                    ],
+                    verification_status: PayoutVerificationStatus::SelfDeclared,
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(first.revision, 1);
+        assert_eq!(
+            first.profile.as_ref().unwrap().address,
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+        );
+        assert_eq!(
+            first.profile.as_ref().unwrap().networks,
+            vec![PayoutNetwork::Bsc, PayoutNetwork::ArbitrumOne]
+        );
+
+        let cleared = config.clear_owner_payout_profile(200).unwrap();
+        assert_eq!(cleared.revision, 2);
+        assert!(cleared.profile.is_none());
+        assert_eq!(cleared.updated_at_ms, 200);
+    }
+
+    #[test]
+    fn payout_profile_rejects_invalid_mixed_case_checksum_and_empty_networks() {
+        let invalid_checksum = PayoutProfile {
+            address_type: PayoutAddressType::Evm,
+            address: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAee".into(),
+            token: PayoutToken::USDT,
+            networks: vec![PayoutNetwork::Base],
+            verification_status: PayoutVerificationStatus::SelfDeclared,
+        };
+        assert!(invalid_checksum.validate_and_normalize().is_err());
+
+        let no_networks = PayoutProfile {
+            address_type: PayoutAddressType::Evm,
+            address: "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed".into(),
+            token: PayoutToken::USDT,
+            networks: vec![],
+            verification_status: PayoutVerificationStatus::SelfDeclared,
+        };
+        assert!(no_networks.validate_and_normalize().is_err());
+    }
+
+    #[test]
+    fn payout_state_canonical_json_matches_router_signing_contract() {
+        let state = PayoutProfileState {
+            schema_version: 1,
+            revision: 3,
+            profile: Some(PayoutProfile {
+                address_type: PayoutAddressType::Evm,
+                address: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed".into(),
+                token: PayoutToken::USDT,
+                networks: vec![PayoutNetwork::Bsc, PayoutNetwork::Base],
+                verification_status: PayoutVerificationStatus::SelfDeclared,
+            }),
+            updated_at_ms: 1_753_000_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            r#"{"schemaVersion":1,"revision":3,"profile":{"addressType":"evm","address":"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed","token":"USDT","networks":["eip155:56","eip155:8453"],"verificationStatus":"self_declared"},"updatedAtMs":1753000000000}"#
+        );
     }
 
     #[test]

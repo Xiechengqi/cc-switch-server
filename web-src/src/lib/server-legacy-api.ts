@@ -148,6 +148,8 @@ export interface AccountRecord {
   quotaNextRefreshAt?: number | null;
   expiresAt?: number | null;
   lastRefreshError?: string | null;
+  refreshConsecutiveFailures?: number;
+  needsRelogin?: boolean;
 }
 
 export interface AccountQuota {
@@ -940,6 +942,30 @@ export async function startServerUpgrade(input: {
     { restartAfter: input.restartAfter },
   );
   return { taskId: result.taskId };
+}
+
+export interface AdminUpgradeStatus {
+  taskId: string;
+  status: "running" | "success" | "failed";
+  restartPending: boolean;
+  logs: Array<{
+    taskId?: string;
+    step?: number;
+    totalSteps?: number;
+    level?: string;
+    message?: string;
+    progress?: number | null;
+    at?: string;
+  }>;
+}
+
+export async function loadUpgradeStatus(
+  taskId: string,
+): Promise<AdminUpgradeStatus> {
+  const params = new URLSearchParams({ taskId });
+  return jsonFetch<AdminUpgradeStatus>(
+    `/web-api/admin/upgrade/status?${params}`,
+  );
 }
 
 export async function completeServerSetup(input: {

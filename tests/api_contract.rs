@@ -1980,6 +1980,86 @@ async fn web_invoke_get_providers_returns_desktop_record_shape() {
     assert_eq!(json_body(response).await.as_str(), Some(""));
 }
 
+#[tokio::test]
+async fn payout_profile_admin_write_public_read_and_clear_contract() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let unauthorized = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/settings/payout-profile",
+            json!(null),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let saved = app
+        .clone()
+        .oneshot(json_request(
+            Method::PUT,
+            "/api/settings/payout-profile",
+            json!({
+                "address": "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+                "token": "USDC",
+                "networks": ["eip155:8453", "eip155:56", "eip155:56"]
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved = json_body(saved).await;
+    assert_eq!(saved["configured"], true);
+    assert_eq!(saved["revision"], 1);
+    assert_eq!(
+        saved["profile"]["address"],
+        "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+    );
+    assert_eq!(
+        saved["profile"]["networks"],
+        json!(["eip155:56", "eip155:8453"])
+    );
+    assert!(saved["sync"]["lastError"].as_str().is_some());
+
+    let public = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/.well-known/cc-switch/payout-profile",
+            json!(null),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(public.status(), StatusCode::OK);
+    assert_eq!(public.headers()["cache-control"], "public, max-age=60");
+    assert!(public.headers().get("etag").is_some());
+    let public = json_body(public).await;
+    assert_eq!(public["configured"], true);
+    assert!(public.get("sync").is_none());
+
+    let cleared = app
+        .clone()
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/settings/payout-profile",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let cleared = json_body(cleared).await;
+    assert_eq!(cleared["configured"], false);
+    assert_eq!(cleared["revision"], 2);
+    assert!(cleared["profile"].is_null());
+}
+
 fn test_state() -> ServerState {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

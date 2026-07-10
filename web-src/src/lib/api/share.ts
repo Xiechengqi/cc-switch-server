@@ -124,6 +124,41 @@ export interface PublicMarket {
   status: string;
 }
 
+export type PayoutToken = "USDC" | "USDT";
+export type PayoutNetwork =
+  | "eip155:56"
+  | "eip155:8453"
+  | "eip155:42161";
+
+export interface PayoutProfile {
+  addressType: "evm";
+  address: string;
+  token: PayoutToken;
+  networks: PayoutNetwork[];
+  verificationStatus: "self_declared";
+}
+
+export interface PayoutProfileState {
+  schemaVersion: number;
+  revision: number;
+  configured: boolean;
+  ownerEmail?: string | null;
+  installationId?: string | null;
+  profile?: PayoutProfile | null;
+  updatedAt?: string | null;
+  sync: {
+    lastSyncedRevision?: number | null;
+    lastSyncedAtMs?: number | null;
+    lastError?: string | null;
+  };
+}
+
+export interface SavePayoutProfileParams {
+  address: string;
+  token: PayoutToken;
+  networks: PayoutNetwork[];
+}
+
 export interface UpdateShareAclParams {
   shareId: string;
   sharedWithEmails: string[];
@@ -440,6 +475,22 @@ async function getClientTunnel(): Promise<ClientTunnelState> {
   return invokeCommand<ClientTunnelState>("get_client_tunnel");
 }
 
+async function getOwnerPayoutProfile(): Promise<PayoutProfileState> {
+  return invokeCommand<PayoutProfileState>("get_owner_payout_profile");
+}
+
+async function saveOwnerPayoutProfile(
+  profile: SavePayoutProfileParams,
+): Promise<PayoutProfileState> {
+  return invokeCommand<PayoutProfileState>("save_owner_payout_profile", {
+    profile,
+  });
+}
+
+async function clearOwnerPayoutProfile(): Promise<PayoutProfileState> {
+  return invokeCommand<PayoutProfileState>("clear_owner_payout_profile");
+}
+
 async function claimClientTunnel(
   params: ClientTunnelUpdateParams,
 ): Promise<ClientTunnelState> {
@@ -495,6 +546,9 @@ export const shareApi = {
   getConnectInfo,
   configureTunnel,
   getClientTunnel,
+  getOwnerPayoutProfile,
+  saveOwnerPayoutProfile,
+  clearOwnerPayoutProfile,
   claimClientTunnel,
   updateClientTunnel,
   startClientTunnel,

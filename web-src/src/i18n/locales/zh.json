@@ -338,6 +338,10 @@
           "title": "Client",
           "description": "配置 Client Tunnel 的 Owner 邮箱、子域名与启停状态。当前：{{status}}"
         },
+        "payout": {
+          "title": "收款信息",
+          "description": "配置公开的 EVM 收款地址、Token 与支持网络。"
+        },
         "router": {
           "title": "Router",
           "description": "配置新建 share 时使用的默认路由节点。当前：{{value}}"
@@ -346,6 +350,31 @@
           "title": "健康状态",
           "descriptionLoading": "查看 Router、Client Tunnel 与 Share 链路健康状态"
         }
+      },
+      "payout": {
+        "publicTitle": "公开收款信息",
+        "publicDescription": "该地址、Token 和网络会公开给 Router 及未来接入的 Market。",
+        "secretWarning": "切勿填写私钥、助记词或钱包密码。",
+        "unverifiedWarning": "地址仅为自行声明，当前未验证钱包所有权。",
+        "addressType": "地址类型",
+        "token": "收款 Token",
+        "selectToken": "请选择 Token",
+        "address": "EVM 收款地址",
+        "invalidAddress": "请输入 0x 开头的 40 位十六进制 EVM 地址。",
+        "networks": "支持的收款网络",
+        "synced": "已同步 Router",
+        "pending": "等待同步 Router",
+        "syncFailed": "Router 同步失败，本地配置已保存",
+        "notConfigured": "尚未配置",
+        "clear": "清除",
+        "save": "保存收款信息",
+        "saveSuccess": "收款信息已保存",
+        "saveError": "保存收款信息失败: {{error}}",
+        "clearSuccess": "收款信息已清除",
+        "clearError": "清除收款信息失败: {{error}}",
+        "clearTitle": "清除收款信息",
+        "clearDescription": "公开收款地址将被清除，并向 Router 同步删除状态。确定继续吗？",
+        "clearConfirm": "确认清除"
       },
       "health": {
         "overallTitle": "链路总览",
@@ -467,6 +496,7 @@
       "upgradeLogDesc": "二进制升级任务的实时输出。",
       "upgradeStep": "步骤 {{step}} / {{total}}",
       "upgradeRunning": "升级进行中…",
+      "upgradeRestarting": "升级完成，服务重启中…",
       "upgradeSucceeded": "升级完成",
       "waitingLogs": "等待升级日志…",
       "streamDisconnected": "升级日志流已断开",

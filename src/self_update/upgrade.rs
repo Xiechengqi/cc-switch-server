@@ -55,6 +55,15 @@ pub enum UpgradeStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeStatusSnapshot {
+    pub task_id: String,
+    pub status: UpgradeStatus,
+    pub restart_pending: bool,
+    pub logs: Vec<UpgradeLogEntry>,
+}
+
 #[derive(Clone)]
 pub struct UpgradeHandle {
     pub task_id: String,
@@ -122,6 +131,19 @@ impl UpgradeRegistry {
 
     pub async fn current(&self) -> Option<UpgradeHandle> {
         self.inner.lock().await.clone()
+    }
+
+    pub async fn status_snapshot(&self) -> Option<UpgradeStatusSnapshot> {
+        let handle = self.inner.lock().await.clone()?;
+        let status = *handle.status.lock().await;
+        let restart_pending = *handle.restart_pending.lock().await;
+        let logs = handle.history.lock().await.clone();
+        Some(UpgradeStatusSnapshot {
+            task_id: handle.task_id.clone(),
+            status,
+            restart_pending,
+            logs,
+        })
     }
 
     pub async fn clear_restart_pending(&self) {

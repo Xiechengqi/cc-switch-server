@@ -8,6 +8,8 @@ import {
   type ConnectInfo,
   type CreateShareParams,
   type PublicMarket,
+  type PayoutProfileState,
+  type SavePayoutProfileParams,
   type SaveProviderShareParams,
   type ShareRecord,
   type ShareHealthStatus,
@@ -34,6 +36,7 @@ export const shareKeys = {
   clientTunnel: () => [...shareKeys.all, "client-tunnel"] as const,
   clientTunnelStatus: () => [...shareKeys.all, "client-tunnel-status"] as const,
   health: () => [...shareKeys.all, "health"] as const,
+  payoutProfile: () => [...shareKeys.all, "payout-profile"] as const,
 };
 
 type ShareMutationMessages = {
@@ -137,6 +140,47 @@ export function useShareHealthQuery(enabled = true) {
     enabled,
     refetchInterval: enabled ? SHARE_POLL_INTERVAL_MS : false,
     refetchIntervalInBackground: true,
+  });
+}
+
+export function usePayoutProfileQuery(enabled = true) {
+  return useQuery<PayoutProfileState>({
+    queryKey: shareKeys.payoutProfile(),
+    queryFn: shareApi.getOwnerPayoutProfile,
+    enabled,
+    refetchInterval: enabled ? SHARE_POLL_INTERVAL_MS : false,
+    refetchIntervalInBackground: true,
+  });
+}
+
+export function useSavePayoutProfileMutation() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  return useMutation({
+    mutationFn: (profile: SavePayoutProfileParams) =>
+      shareApi.saveOwnerPayoutProfile(profile),
+    onSuccess: (state) => {
+      queryClient.setQueryData(shareKeys.payoutProfile(), state);
+      toast.success(t("settings.share.payout.saveSuccess", { defaultValue: "收款信息已保存" }));
+    },
+    onError: (error: Error) => {
+      toast.error(t("settings.share.payout.saveError", { defaultValue: "保存收款信息失败: {{error}}", error: extractErrorMessage(error) }));
+    },
+  });
+}
+
+export function useClearPayoutProfileMutation() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  return useMutation({
+    mutationFn: shareApi.clearOwnerPayoutProfile,
+    onSuccess: (state) => {
+      queryClient.setQueryData(shareKeys.payoutProfile(), state);
+      toast.success(t("settings.share.payout.clearSuccess", { defaultValue: "收款信息已清除" }));
+    },
+    onError: (error: Error) => {
+      toast.error(t("settings.share.payout.clearError", { defaultValue: "清除收款信息失败: {{error}}", error: extractErrorMessage(error) }));
+    },
   });
 }
 

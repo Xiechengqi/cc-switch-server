@@ -37,6 +37,7 @@ import { getWebRuntimeContext, readWebSessionToken } from "@/lib/runtime";
 import {
   loadAdminVersionInfo,
   loadBuildInfo,
+  loadUpgradeStatus,
   readAdminVersionInfoCache,
   restartServerService,
   rollbackServerService,
@@ -60,7 +61,35 @@ interface UpgradeLogEntry {
   at?: string;
 }
 
-type UpgradeOutcome = "running" | "success" | "failed" | null;
+type UpgradeOutcome = "running" | "restarting" | "success" | "failed" | null;
+
+type UpgradeDonePayload = {
+  status?: string;
+  restartPending?: boolean;
+};
+
+function upgradeLogsIndicateRestartScheduled(logs: UpgradeLogEntry[]): boolean {
+  return logs.some((entry) => {
+    if ((entry.step ?? 0) >= 6) {
+      return true;
+    }
+    const message = (entry.message ?? "").toLowerCase();
+    return (
+      message.includes("restart scheduled") ||
+      message.includes("process will restart")
+    );
+  });
+}
+
+function buildUpgradeStreamParams(taskId: string): string {
+  const params = new URLSearchParams({ taskId });
+  const token = readWebSessionToken();
+  if (token) {
+    params.set("accessToken", token);
+    params.set("token", token);
+  }
+  return params.toString();
+}
 
 function formatVersionDetails(info: AdminVersionInfo): string {
   return [
@@ -96,6 +125,19 @@ function normalizeUpgradeLogLevel(level?: UpgradeLogLevel): string {
   return (level || "info").toLowerCase();
 }
 
+function upgradeLogsIndicateHardFailure(logs: UpgradeLogEntry[]): boolean {
+  return logs.some((entry) => {
+    if (normalizeUpgradeLogLevel(entry.level) !== "error") {
+      return false;
+    }
+    const message = (entry.message ?? "").toLowerCase();
+    return (
+      !message.includes("stream disconnected") &&
+      !message.includes("日志流已断开")
+    );
+  });
+}
+
 function upgradeLogLevelClass(level?: UpgradeLogLevel): string {
   switch (normalizeUpgradeLogLevel(level)) {
     case "success":
@@ -129,11 +171,15 @@ function upgradeLogBadgeClass(level?: UpgradeLogLevel): string {
 function computeUpgradeProgress(
   logs: UpgradeLogEntry[],
   outcome: UpgradeOutcome,
-  running: boolean,
+  active: boolean,
 ): number {
   if (outcome === "success") return 100;
+  if (outcome === "restarting") {
+    const base = logs.length > 0 ? computeUpgradeProgress(logs, "running", true) : 90;
+    return Math.max(base, 95);
+  }
   if (logs.length === 0) {
-    return running ? 4 : 0;
+    return active ? 4 : 0;
   }
   const latest = logs[logs.length - 1];
   if (typeof latest.progress === "number") {
@@ -142,7 +188,7 @@ function computeUpgradeProgress(
   if (latest.step && latest.totalSteps) {
     return Math.round((latest.step / latest.totalSteps) * 100);
   }
-  return running ? 4 : 0;
+  return active ? 4 : 0;
 }
 
 function UpgradeLogRow({ entry }: { entry: UpgradeLogEntry }) {
@@ -250,6 +296,7 @@ export function ServerVersionSettings() {
   const streamRef = useRef<EventSource | null>(null);
   const streamFinishedRef = useRef(false);
   const streamReconnectAttemptsRef = useRef(0);
+  const upgradeLogsRef = useRef<UpgradeLogEntry[]>([]);
   const logEndRef = useRef<HTMLDivElement | null>(null);
 
   const refresh = useCallback(async () => {
@@ -316,11 +363,15 @@ export function ServerVersionSettings() {
     [info],
   );
 
+  const upgradeActive =
+    busy === "upgrade" ||
+    upgradeOutcome === "running" ||
+    upgradeOutcome === "restarting";
   const upgradeRunning = busy === "upgrade" || upgradeOutcome === "running";
 
   const upgradeProgress = useMemo(
-    () => computeUpgradeProgress(upgradeLogs, upgradeOutcome, upgradeRunning),
-    [upgradeLogs, upgradeOutcome, upgradeRunning],
+    () => computeUpgradeProgress(upgradeLogs, upgradeOutcome, upgradeActive),
+    [upgradeLogs, upgradeOutcome, upgradeActive],
   );
 
   const latestStepLabel = useMemo(() => {
@@ -334,6 +385,9 @@ export function ServerVersionSettings() {
   }, [upgradeLogs, t]);
 
   const upgradeStatusMessage = useMemo(() => {
+    if (upgradeOutcome === "restarting") {
+      return t("settings.serverVersion.upgradeRestarting");
+    }
     if (upgradeRunning) {
       return latestStepLabel || t("settings.serverVersion.upgradeRunning");
     }
@@ -355,8 +409,105 @@ export function ServerVersionSettings() {
   }, []);
 
   const appendUpgradeLog = useCallback((entry: UpgradeLogEntry) => {
-    setUpgradeLogs((prev) => [...prev, entry]);
+    setUpgradeLogs((prev) => {
+      const next = [...prev, entry];
+      upgradeLogsRef.current = next;
+      return next;
+    });
   }, []);
+
+  const applyUpgradeDone = useCallback(
+    (payload: UpgradeDonePayload) => {
+      if (streamFinishedRef.current) return;
+      streamFinishedRef.current = true;
+      closeUpgradeStream();
+      setBusy(null);
+      if (payload.status === "success") {
+        setUpgradeOutcome("success");
+        if (payload.restartPending) {
+          toast.success(t("settings.serverVersion.upgradePendingRestart"));
+          void refresh();
+        } else {
+          toast.success(t("settings.serverVersion.upgradeSucceeded"));
+          void pollHealthAndReload();
+        }
+        return;
+      }
+      if (payload.status === "failed") {
+        setUpgradeOutcome("failed");
+        toast.error(t("settings.serverVersion.upgradeFailed"));
+        return;
+      }
+      void refresh();
+    },
+    [closeUpgradeStream, refresh, t],
+  );
+
+  const beginUpgradeRestartWait = useCallback(() => {
+    if (streamFinishedRef.current) return;
+    streamFinishedRef.current = true;
+    closeUpgradeStream();
+    setBusy(null);
+    setUpgradeOutcome("restarting");
+    toast.success(t("settings.serverVersion.upgradeRestarting"));
+    void pollHealthAndReload();
+  }, [closeUpgradeStream, t]);
+
+  const resolveUpgradeAfterStreamLoss = useCallback(
+    async (taskId: string) => {
+      const logs = upgradeLogsRef.current;
+      try {
+        const status = await loadUpgradeStatus(taskId);
+        if (status.logs.length > 0) {
+          setUpgradeLogs(status.logs);
+          upgradeLogsRef.current = status.logs;
+        }
+        if (status.status === "success") {
+          applyUpgradeDone({
+            status: "success",
+            restartPending: status.restartPending,
+          });
+          return;
+        }
+        if (status.status === "failed") {
+          applyUpgradeDone({ status: "failed" });
+          return;
+        }
+      } catch {
+        // status endpoint may be unavailable while the service is restarting
+      }
+
+      if (upgradeLogsIndicateRestartScheduled(logs)) {
+        beginUpgradeRestartWait();
+        return;
+      }
+      if (upgradeLogsIndicateHardFailure(logs)) {
+        streamFinishedRef.current = true;
+        closeUpgradeStream();
+        setBusy(null);
+        setUpgradeOutcome("failed");
+        toast.error(t("settings.serverVersion.upgradeFailed"));
+        return;
+      }
+
+      streamFinishedRef.current = true;
+      closeUpgradeStream();
+      setBusy(null);
+      appendUpgradeLog({
+        level: "error",
+        message: t("settings.serverVersion.streamDisconnected"),
+      });
+      setUpgradeOutcome("failed");
+      toast.error(t("settings.serverVersion.upgradeFailed"));
+    },
+    [
+      appendUpgradeLog,
+      applyUpgradeDone,
+      beginUpgradeRestartWait,
+      closeUpgradeStream,
+      t,
+    ],
+  );
 
   const streamUpgrade = useCallback(
     (taskId: string) => {
@@ -365,11 +516,8 @@ export function ServerVersionSettings() {
       streamReconnectAttemptsRef.current = 0;
 
       const connect = () => {
-        const token = readWebSessionToken();
-        const params = new URLSearchParams({ taskId });
-        if (token) params.set("accessToken", token);
         const source = new EventSource(
-          `/web-api/admin/upgrade/stream?${params}`,
+          `/web-api/admin/upgrade/stream?${buildUpgradeStreamParams(taskId)}`,
         );
         streamRef.current = source;
 
@@ -379,34 +527,13 @@ export function ServerVersionSettings() {
         });
 
         source.addEventListener("done", (event) => {
-          if (streamFinishedRef.current) return;
-          streamFinishedRef.current = true;
-          closeUpgradeStream();
-          setBusy(null);
           try {
-            const payload = JSON.parse((event as MessageEvent).data) as {
-              status?: string;
-              restartPending?: boolean;
-            };
-            if (payload.status === "success") {
-              setUpgradeOutcome("success");
-              if (payload.restartPending) {
-                toast.success(
-                  t("settings.serverVersion.upgradePendingRestart"),
-                );
-                void refresh();
-              } else {
-                toast.success(t("settings.serverVersion.upgradeSucceeded"));
-                void pollHealthAndReload();
-              }
-            } else if (payload.status === "failed") {
-              setUpgradeOutcome("failed");
-              toast.error(t("settings.serverVersion.upgradeFailed"));
-            } else {
-              void refresh();
-            }
+            const payload = JSON.parse(
+              (event as MessageEvent).data,
+            ) as UpgradeDonePayload;
+            applyUpgradeDone(payload);
           } catch {
-            void refresh();
+            applyUpgradeDone({ status: "success" });
           }
         });
 
@@ -428,23 +555,18 @@ export function ServerVersionSettings() {
             return;
           }
 
-          if (!streamFinishedRef.current) {
-            streamFinishedRef.current = true;
-            closeUpgradeStream();
-            appendUpgradeLog({
-              level: "error",
-              message: t("settings.serverVersion.streamDisconnected"),
-            });
-            setUpgradeOutcome("failed");
-            setBusy(null);
-            toast.error(t("settings.serverVersion.upgradeFailed"));
-          }
+          void resolveUpgradeAfterStreamLoss(taskId);
         };
       };
 
       connect();
     },
-    [appendUpgradeLog, closeUpgradeStream, refresh, t],
+    [
+      appendUpgradeLog,
+      applyUpgradeDone,
+      closeUpgradeStream,
+      resolveUpgradeAfterStreamLoss,
+    ],
   );
 
   const handleUpgrade = useCallback(
@@ -452,6 +574,7 @@ export function ServerVersionSettings() {
       setUpgradeConfirmOpen(false);
       setBusy("upgrade");
       setUpgradeLogs([]);
+      upgradeLogsRef.current = [];
       setUpgradeOutcome("running");
       setUpgradeLogOpen(true);
       try {
@@ -509,6 +632,14 @@ export function ServerVersionSettings() {
   }, [info, loading, t]);
 
   const upgradeStatusVisual = useMemo(() => {
+    if (upgradeOutcome === "restarting") {
+      return {
+        Icon: Loader2,
+        spin: true,
+        ring: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+        bar: "bg-amber-500",
+      };
+    }
     if (upgradeRunning) {
       return {
         Icon: Loader2,
@@ -801,18 +932,22 @@ export function ServerVersionSettings() {
           setUpgradeLogOpen(nextOpen);
         }}
       >
-        <DialogContent className="relative max-w-2xl gap-0 overflow-hidden p-0">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="absolute right-3 top-3 z-10 h-8 w-8 rounded-full"
-            disabled={busy === "upgrade"}
-            onClick={() => setUpgradeLogOpen(false)}
-            aria-label={t("common.close")}
-          >
-            <X className="h-4 w-4" />
-          </Button>
+        <DialogContent
+          zIndex="alert"
+          className="max-w-2xl gap-0 overflow-hidden p-0"
+        >
+          <div className="relative">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="absolute right-3 top-3 z-10 h-8 w-8 rounded-full"
+              disabled={busy === "upgrade"}
+              onClick={() => setUpgradeLogOpen(false)}
+              aria-label={t("common.close")}
+            >
+              <X className="h-4 w-4" />
+            </Button>
 
           <div className="border-b bg-muted/20 px-6 py-5 pr-14">
             <DialogHeader className="space-y-4 text-left">
@@ -856,11 +991,13 @@ export function ServerVersionSettings() {
                     className={cn(
                       "h-full rounded-full transition-all duration-500 ease-out",
                       upgradeStatusVisual.bar,
-                      upgradeRunning && upgradeProgress < 8
+                      upgradeActive && upgradeProgress < 8
                         ? "animate-pulse"
                         : "",
                     )}
-                    style={{ width: `${Math.max(upgradeProgress, upgradeRunning ? 4 : 0)}%` }}
+                    style={{
+                      width: `${Math.max(upgradeProgress, upgradeActive ? 4 : 0)}%`,
+                    }}
                   />
                 </div>
               </div>
@@ -878,10 +1015,12 @@ export function ServerVersionSettings() {
                 ))
               ) : (
                 <div className="flex min-h-40 items-center justify-center px-4 text-sm text-muted-foreground">
-                  {upgradeRunning ? (
+                  {upgradeActive ? (
                     <span className="inline-flex items-center gap-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      {t("settings.serverVersion.waitingLogs")}
+                      {upgradeOutcome === "restarting"
+                        ? t("settings.serverVersion.upgradeRestarting")
+                        : t("settings.serverVersion.waitingLogs")}
                     </span>
                   ) : (
                     t("settings.serverVersion.waitingLogs")
@@ -901,6 +1040,7 @@ export function ServerVersionSettings() {
             >
               {t("common.close")}
             </Button>
+          </div>
           </div>
         </DialogContent>
       </Dialog>

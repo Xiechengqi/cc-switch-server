@@ -311,6 +311,37 @@
     "tabShare": "共有",
     "tabRouter": "Router",
     "share": {
+      "sections": {
+        "payout": {
+          "title": "受取情報",
+          "description": "公開 EVM 受取アドレス、トークン、対応ネットワークを設定します。"
+        }
+      },
+      "payout": {
+        "publicTitle": "公開受取情報",
+        "publicDescription": "このアドレス、トークン、ネットワーク一覧は Router と将来の Market 連携に公開されます。",
+        "secretWarning": "秘密鍵、シードフレーズ、ウォレットのパスワードは絶対に入力しないでください。",
+        "unverifiedWarning": "このアドレスは自己申告であり、ウォレット所有権は未検証です。",
+        "addressType": "アドレス種別",
+        "token": "受取トークン",
+        "selectToken": "トークンを選択",
+        "address": "EVM 受取アドレス",
+        "invalidAddress": "0x に続く40桁の16進数 EVM アドレスを入力してください。",
+        "networks": "対応受取ネットワーク",
+        "synced": "Router に同期済み",
+        "pending": "Router 同期待ち",
+        "syncFailed": "Router 同期に失敗しました。ローカル設定は保存済みです",
+        "notConfigured": "未設定",
+        "clear": "クリア",
+        "save": "受取情報を保存",
+        "saveSuccess": "受取情報を保存しました",
+        "saveError": "受取情報の保存に失敗しました: {{error}}",
+        "clearSuccess": "受取情報をクリアしました",
+        "clearError": "受取情報のクリアに失敗しました: {{error}}",
+        "clearTitle": "受取情報をクリア",
+        "clearDescription": "公開受取アドレスをクリアし、削除状態を Router に同期します。続行しますか？",
+        "clearConfirm": "情報をクリア"
+      },
       "defaultRouter": {
         "title": "デフォルト Router ノード",
         "description": "新規 share はこのルーターをデフォルトで使用します。既存の share は作成時のルーターに紐づいたままです。",
