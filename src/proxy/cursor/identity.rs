@@ -3,11 +3,12 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::domain::accounts::cursor_import::detect_cursor_ide_version;
 use crate::domain::accounts::store::Account;
 
 use super::h2_client::agent_connect_headers;
 
-pub const DEFAULT_CURSOR_CLIENT_VERSION: &str = "cli-1.0.0";
+pub const DEFAULT_CURSOR_CLIENT_VERSION: &str = "cli-2026.01.09-231024f";
 const CURSOR_CLIENT_ID: &str = "cc-switch-server";
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +41,7 @@ impl CursorAccountData {
     pub fn resolved_client_version(&self) -> String {
         self.cursor_client_version
             .clone()
+            .or_else(detect_cursor_cli_version)
             .unwrap_or_else(|| DEFAULT_CURSOR_CLIENT_VERSION.to_string())
     }
 
@@ -102,6 +104,7 @@ pub fn cursor_agentservice_headers(
 ) -> Vec<(String, String)> {
     let mut headers = agent_connect_headers();
     let request_id = random_uuid_like();
+    let traceparent = random_traceparent();
     headers.extend([
         ("authorization".to_string(), format!("Bearer {token}")),
         (
@@ -115,6 +118,8 @@ pub fn cursor_agentservice_headers(
             std::env::consts::ARCH.to_string(),
         ),
         ("x-ghost-mode".to_string(), "true".to_string()),
+        ("traceparent".to_string(), traceparent.clone()),
+        ("backend-traceparent".to_string(), traceparent),
         ("x-request-id".to_string(), request_id.clone()),
         ("x-original-request-id".to_string(), request_id),
     ]);
@@ -151,7 +156,7 @@ pub fn identity_headers(account: &CursorAccountData, token: &str) -> Vec<(String
             "x-cursor-client-id".to_string(),
             account.client_id().to_string(),
         ),
-        ("x-cursor-timezone".to_string(), "UTC".to_string()),
+        ("x-cursor-timezone".to_string(), cursor_timezone()),
         ("x-ghost-mode".to_string(), "true".to_string()),
         ("x-session-id".to_string(), random_uuid_like()),
         ("x-request-id".to_string(), random_uuid_like()),
@@ -164,6 +169,23 @@ fn cursor_os() -> &'static str {
         "windows" => "windows",
         _ => "linux",
     }
+}
+
+fn cursor_timezone() -> String {
+    std::env::var("TZ")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "UTC".to_string())
+}
+
+fn detect_cursor_cli_version() -> Option<String> {
+    let version = detect_cursor_ide_version()?;
+    Some(if version.starts_with("cli-") {
+        version
+    } else {
+        format!("cli-{version}")
+    })
 }
 
 fn build_cursor_checksum(token: &str, machine_id: &str) -> String {
@@ -297,6 +319,21 @@ fn random_uuid_like() -> String {
     )
 }
 
+fn random_traceparent() -> String {
+    let mut trace_id = [0u8; 16];
+    let mut parent_id = [0u8; 8];
+    let mut rng = rand::thread_rng();
+    rng.fill_bytes(&mut trace_id);
+    rng.fill_bytes(&mut parent_id);
+    if trace_id.iter().all(|byte| *byte == 0) {
+        trace_id[15] = 1;
+    }
+    if parent_id.iter().all(|byte| *byte == 0) {
+        parent_id[7] = 1;
+    }
+    format!("00-{}-{}-01", hex_lower(&trace_id), hex_lower(&parent_id))
+}
+
 const MACHINE_ID_PATHS: [&str; 8] = [
     "/cursorServiceMachineId",
     "/cursor_service_machine_id",
@@ -372,11 +409,13 @@ mod tests {
                 "cursorClientId": "client"
             })),
             subscription_level: None,
+            entitlement_status: None,
             quota_percent: None,
             quota: None,
             quota_refreshed_at: None,
             quota_next_refresh_at: None,
             expires_at: None,
+            rate_limited_until: None,
             last_refresh_error: None,
         };
         let cursor = cursor_account_from_managed_account(&account);

@@ -31,6 +31,7 @@ import { ClaudeOAuthSection } from "@/components/providers/forms/ClaudeOAuthSect
 import { CursorOAuthSection } from "@/components/providers/forms/CursorOAuthSection";
 import { DeepSeekAccountSection } from "@/components/providers/forms/DeepSeekAccountSection";
 import { GeminiOAuthSection } from "@/components/providers/forms/GeminiOAuthSection";
+import { GrokOAuthSection } from "@/components/providers/forms/GrokOAuthSection";
 import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { settingsApi } from "@/lib/api";
@@ -204,12 +205,12 @@ export function AuthCenterPanel() {
     >
       <Collapsible open={centerOpen} onOpenChange={setCenterOpen}>
         <div className="rounded-xl border border-border bg-card/50 transition-colors hover:bg-muted/50">
-          <div className="flex items-center justify-between gap-4 p-4">
-            <CollapsibleTrigger asChild>
-              <button
-                type="button"
-                className="flex min-w-0 flex-1 items-center gap-3 text-left"
-              >
+          <CollapsibleTrigger asChild>
+            <button
+              type="button"
+              className="flex w-full items-center justify-between gap-4 p-4 text-left hover:bg-muted/50"
+            >
+              <div className="flex min-w-0 items-center gap-3">
                 <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
                   <ShieldCheck className="h-4 w-4 text-primary" />
                 </div>
@@ -223,15 +224,15 @@ export function AuthCenterPanel() {
                     {centerSubtitle}
                   </p>
                 </div>
-                <ChevronDown
-                  className={cn(
-                    "h-4 w-4 shrink-0 text-muted-foreground transition-transform",
-                    centerOpen && "rotate-180",
-                  )}
-                />
-              </button>
-            </CollapsibleTrigger>
-          </div>
+              </div>
+              <ChevronDown
+                className={cn(
+                  "h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200",
+                  centerOpen && "rotate-180",
+                )}
+              />
+            </button>
+          </CollapsibleTrigger>
 
           <CollapsibleContent>
             <div className="space-y-5 border-t border-border/50 px-4 pb-4 pt-4">
@@ -357,6 +358,17 @@ export function AuthCenterPanel() {
           })}
         >
           <CodexOAuthSection showLoggedInAccounts />
+        </AuthProviderAccordionItem>
+
+        <AuthProviderAccordionItem
+          value="grok"
+          icon={<ProviderIcon icon="grok" name="Grok" size={24} />}
+          title="Grok OAuth"
+          description={t("settings.authCenter.grokOauthDescription", {
+            defaultValue: "管理 Grok/xAI 订阅账号",
+          })}
+        >
+          <GrokOAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
 
         <AuthProviderAccordionItem

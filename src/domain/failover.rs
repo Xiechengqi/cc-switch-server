@@ -62,6 +62,8 @@ pub struct ProviderBreaker {
     #[serde(default)]
     pub opened_at_ms: Option<u128>,
     #[serde(default)]
+    pub open_until_ms: Option<u128>,
+    #[serde(default)]
     pub half_open_started_at_ms: Option<u128>,
     #[serde(default)]
     pub half_open_probe_count: u32,
@@ -83,6 +85,7 @@ impl ProviderBreaker {
             state: BreakerState::Closed,
             consecutive_failures: 0,
             opened_at_ms: None,
+            open_until_ms: None,
             half_open_started_at_ms: None,
             half_open_probe_count: 0,
             last_status_code: None,
@@ -126,8 +129,16 @@ pub struct UpdateFailoverAppInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderOutcome {
-    Success { status_code: u16 },
-    Failure { status_code: u16 },
+    Success {
+        status_code: u16,
+    },
+    Failure {
+        status_code: u16,
+    },
+    RateLimited {
+        status_code: u16,
+        open_until_ms: Option<u128>,
+    },
     NetworkFailure,
 }
 
@@ -281,12 +292,14 @@ impl FailoverStore {
                 let should_persist = breaker.state != BreakerState::Closed
                     || breaker.consecutive_failures > 0
                     || breaker.opened_at_ms.is_some()
+                    || breaker.open_until_ms.is_some()
                     || breaker.half_open_started_at_ms.is_some()
                     || breaker.half_open_probe_count > 0
                     || breaker.last_error.is_some();
                 breaker.state = BreakerState::Closed;
                 breaker.consecutive_failures = 0;
                 breaker.opened_at_ms = None;
+                breaker.open_until_ms = None;
                 breaker.half_open_started_at_ms = None;
                 breaker.half_open_probe_count = 0;
                 breaker.last_status_code = Some(status_code);
@@ -296,7 +309,22 @@ impl FailoverStore {
             }
             ProviderOutcome::Failure { status_code } => {
                 let breaker = self.breaker_mut(app, provider_id);
-                record_failure(breaker, &config, now_ms, Some(status_code), None);
+                record_failure(breaker, &config, now_ms, Some(status_code), None, None);
+                true
+            }
+            ProviderOutcome::RateLimited {
+                status_code,
+                open_until_ms,
+            } => {
+                let breaker = self.breaker_mut(app, provider_id);
+                record_failure(
+                    breaker,
+                    &config,
+                    now_ms,
+                    Some(status_code),
+                    None,
+                    open_until_ms,
+                );
                 true
             }
             ProviderOutcome::NetworkFailure => {
@@ -307,6 +335,7 @@ impl FailoverStore {
                     now_ms,
                     None,
                     Some("network failure".to_string()),
+                    None,
                 );
                 true
             }
@@ -339,12 +368,18 @@ impl FailoverStore {
                 state_changed: false,
             },
             BreakerState::Open => {
-                let opened_at = breaker.opened_at_ms.unwrap_or(now_ms);
-                if now_ms.saturating_sub(opened_at) < config.open_duration_ms {
+                let open_until_ms = breaker.open_until_ms.unwrap_or_else(|| {
+                    breaker
+                        .opened_at_ms
+                        .unwrap_or(now_ms)
+                        .saturating_add(config.open_duration_ms)
+                });
+                if now_ms < open_until_ms {
                     return ProviderAvailability::Unavailable;
                 }
                 breaker.state = BreakerState::HalfOpen;
                 breaker.half_open_started_at_ms = Some(now_ms);
+                breaker.open_until_ms = None;
                 breaker.half_open_probe_count = 1;
                 ProviderAvailability::Available {
                     state_changed: true,
@@ -393,6 +428,7 @@ fn record_failure(
     now_ms: u128,
     status_code: Option<u16>,
     error: Option<String>,
+    open_until_ms: Option<u128>,
 ) {
     breaker.consecutive_failures = breaker.consecutive_failures.saturating_add(1);
     breaker.last_status_code = status_code;
@@ -403,6 +439,7 @@ fn record_failure(
     {
         breaker.state = BreakerState::Open;
         breaker.opened_at_ms = Some(now_ms);
+        breaker.open_until_ms = open_until_ms;
         breaker.half_open_started_at_ms = None;
         breaker.half_open_probe_count = 0;
     }

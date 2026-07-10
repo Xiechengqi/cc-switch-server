@@ -25,9 +25,9 @@
       "providerFamilies": ["claude", "claude_auth", "claude_oauth", "codex", "codex_oauth", "gemini", "gemini_cli", "openrouter", "cursor_oauth", "cursor_apikey", "antigravity_oauth", "agy_oauth", "ollama_cloud", "aws_bedrock", "nvidia", "deepseek_api", "github_copilot", "kiro_oauth", "deepseek_account"],
       "staticCoverage": {
         "nativeFamilies": ["claude", "claude_auth", "claude_oauth", "codex", "codex_oauth", "gemini", "gemini_cli", "openrouter", "antigravity_oauth", "agy_oauth", "ollama_cloud", "nvidia", "deepseek_api"],
-        "plannedFamilies": ["cursor_oauth", "cursor_apikey", "aws_bedrock"],
-        "remainingFallbackFamilies": ["github_copilot", "kiro_oauth", "deepseek_account"],
-        "notes": "Local static adapter contracts are native for listed families; GitHub Copilot static preflight covers model normalization, /chat/completions endpoint and optimizer headers/body handling but remains fallback until real token/live models/non-stream/stream validation; Cursor AgentService opt-in text/image/tool driver exists for Claude/Codex/Gemini, including MCP/built-in tool bridge and tool_result park-resume, but capability remains planned until real Cursor validation."
+        "plannedFamilies": ["cursor_oauth", "cursor_apikey", "aws_bedrock", "kiro_oauth"],
+        "remainingFallbackFamilies": ["github_copilot", "deepseek_account"],
+        "notes": "Local static adapter contracts are native for listed families; Kiro Claude->CodeWhisperer bridge and native refresh are wired but remain planned until real Kiro validation; GitHub Copilot static preflight covers model normalization, /chat/completions endpoint and optimizer headers/body handling but remains fallback until real token/live models/non-stream/stream validation; Cursor AgentService opt-in text/image/tool driver exists for Claude/Codex/Gemini, including MCP/built-in tool bridge and tool_result park-resume, but capability remains planned until real Cursor validation."
       },
       "shareEnv": "CLAUDE_SHARE_ID",
       "urlEnv": "SERVER_URL",

@@ -5,9 +5,13 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGE
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::clients::oauth::kiro_device::{
+    default_profile_arn, fetch_usage_limits, machine_id_from_refresh_token, quota_from_usage_limits,
+};
 use crate::domain::accounts::store::{
     Account, AccountQuota, AccountQuotaTier, AccountRefreshUpdate,
 };
+use crate::domain::claude_cli::claude_cli_user_agent;
 use crate::domain::providers::model::ProviderType;
 
 pub const QUOTA_FAILURE_COOLDOWN_MS: i64 = 2 * 60 * 1000;
@@ -148,10 +152,10 @@ pub async fn refresh_account_quota(
             refresh_antigravity_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
                 .await?
         }
-        ProviderType::GitHubCopilot
-        | ProviderType::KiroOAuth
-        | ProviderType::CursorOAuth
-        | ProviderType::CursorApiKey => {
+        ProviderType::KiroOAuth => {
+            refresh_kiro_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
+        }
+        ProviderType::GitHubCopilot | ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
             refresh_imported_snapshot_quota(account, now_ms, success_cooldown_ms)?
         }
         ProviderType::OllamaCloud => {
@@ -261,7 +265,7 @@ async fn refresh_claude_quota(
         .header("anthropic-beta", "oauth-2025-04-20")
         .header(ACCEPT, "application/json")
         .header("accept-language", "*")
-        .header(USER_AGENT, "claude-cli/2.1.2 (external, cli)")
+        .header(USER_AGENT, claude_cli_user_agent())
         .header("x-app", "cli")
         .timeout(request_timeout);
     let (body, plan_label) = tokio::join!(
@@ -448,6 +452,136 @@ async fn refresh_ollama_cloud_quota(
         .timeout(request_timeout);
     let body = request_json(account.provider_type, request, now_ms).await?;
     Ok(parse_ollama_me_update(&body, now_ms, success_cooldown_ms))
+}
+
+async fn refresh_kiro_quota(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let access_token = account
+        .access_token
+        .as_deref()
+        .or(account.api_key.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            QuotaRefreshFailure::bad_request("kiro_oauth access token or api key is required")
+        })?;
+    let raw = account.raw.as_ref();
+    let profile = account.profile.as_ref();
+    let api_region = raw
+        .and_then(|value| string_at(value, &["/apiRegion", "/api_region"]))
+        .or_else(|| profile.and_then(|value| string_at(value, &["/apiRegion", "/api_region"])))
+        .or_else(|| profile.and_then(region_from_profile_value))
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let profile_arn = profile
+        .and_then(|value| string_at(value, &["/profileArn", "/profile_arn"]))
+        .or_else(|| raw.and_then(|value| string_at(value, &["/resolvedProfileArn", "/profileArn"])))
+        .unwrap_or_else(|| default_profile_arn(raw.unwrap_or(&Value::Null), &api_region));
+    let machine_id = raw
+        .and_then(|value| string_at(value, &["/machineId", "/machine_id"]))
+        .or_else(|| profile.and_then(|value| string_at(value, &["/machineId", "/machine_id"])))
+        .or_else(|| {
+            account
+                .refresh_token
+                .as_deref()
+                .map(machine_id_from_refresh_token)
+        })
+        .unwrap_or_else(|| "kiro-api-key".to_string());
+    let http = http.clone();
+    let usage = tokio::time::timeout(
+        request_timeout,
+        fetch_usage_limits(
+            &http,
+            &api_region,
+            &profile_arn,
+            &machine_id,
+            access_token,
+            kiro_quota_token_type(account),
+        ),
+    )
+    .await
+    .map_err(|_| QuotaRefreshFailure {
+        status_code: 504,
+        message: "kiro_oauth quota request timed out".to_string(),
+        retryable: true,
+        next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+    })?
+    .map_err(|error| {
+        QuotaRefreshFailure::upstream(
+            account.provider_type,
+            error.status,
+            error.message,
+            None,
+            now_ms,
+        )
+    })?;
+    let subscription_level = string_at(
+        &usage,
+        &[
+            "/subscriptionInfo/subscriptionTitle",
+            "/subscription_info/subscription_title",
+        ],
+    )
+    .or_else(|| account.subscription_level.clone())
+    .or_else(|| Some("Kiro OAuth".to_string()));
+    let quota = quota_from_usage_limits(usage.clone(), subscription_level.clone(), now_ms);
+    let mut raw = account
+        .raw
+        .clone()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = raw.as_object_mut() {
+        object.insert("kiroUsageLimits".to_string(), usage);
+        object.insert("quotaRefreshedAtMs".to_string(), Value::from(now_ms));
+    }
+    Ok(
+        update_from_quota(quota, subscription_level, None, now_ms, success_cooldown_ms)
+            .with_raw(raw),
+    )
+}
+
+fn kiro_quota_token_type(account: &Account) -> Option<&'static str> {
+    let method = account
+        .raw
+        .as_ref()
+        .and_then(|value| string_at(value, &["/authMethod", "/auth_method", "/provider"]))
+        .or_else(|| {
+            account
+                .profile
+                .as_ref()
+                .and_then(|value| string_at(value, &["/authMethod", "/auth_method", "/provider"]))
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match method.as_str() {
+        "api_key" | "api-key" | "apikey" => Some("API_KEY"),
+        "external_idp" | "external-idp" | "externalidp" => Some("EXTERNAL_IDP"),
+        _ => None,
+    }
+}
+
+fn region_from_profile_value(value: &Value) -> Option<String> {
+    let arn = string_at(value, &["/profileArn", "/profile_arn"])?;
+    let mut parts = arn.split(':');
+    (parts.next() == Some("arn")).then_some(())?;
+    (parts.next() == Some("aws")).then_some(())?;
+    (parts.next() == Some("codewhisperer")).then_some(())?;
+    parts.next().map(str::to_string)
+}
+
+trait AccountRefreshUpdateExt {
+    fn with_raw(self, raw: Value) -> Self;
+}
+
+impl AccountRefreshUpdateExt for AccountRefreshUpdate {
+    fn with_raw(mut self, raw: Value) -> Self {
+        self.raw = Some(raw);
+        self
+    }
 }
 
 async fn request_json(
@@ -1037,7 +1171,7 @@ async fn fetch_claude_plan_label(
         .header("anthropic-beta", "oauth-2025-04-20")
         .header(ACCEPT, "application/json")
         .header("accept-language", "*")
-        .header(USER_AGENT, "claude-cli/2.1.2 (external, cli)")
+        .header(USER_AGENT, claude_cli_user_agent())
         .header("x-app", "cli")
         .timeout(request_timeout)
         .send()
@@ -2205,11 +2339,13 @@ mod tests {
             profile: None,
             raw: Some(raw),
             subscription_level: None,
+            entitlement_status: None,
             quota_percent: None,
             quota: None,
             quota_refreshed_at: None,
             quota_next_refresh_at: None,
             expires_at: None,
+            rate_limited_until: None,
             last_refresh_error: None,
         }
     }

@@ -61,6 +61,8 @@ pub enum ProviderType {
     Nvidia,
     #[serde(rename = "deepseek_api")]
     DeepSeekApi,
+    #[serde(rename = "grok_oauth")]
+    GrokOAuth,
 }
 
 impl ProviderType {
@@ -85,6 +87,7 @@ impl ProviderType {
             Self::AwsBedrock => "aws_bedrock",
             Self::Nvidia => "nvidia",
             Self::DeepSeekApi => "deepseek_api",
+            Self::GrokOAuth => "grok_oauth",
         }
     }
 }
@@ -231,6 +234,7 @@ fn classify_claude_provider(provider: &Provider) -> ProviderType {
         Some("aws_bedrock") => return ProviderType::AwsBedrock,
         Some("nvidia") => return ProviderType::Nvidia,
         Some("deepseek_api") => return ProviderType::DeepSeekApi,
+        Some("grok_oauth") => return ProviderType::GrokOAuth,
         Some("ollama_cloud") => return ProviderType::OllamaCloud,
         Some("kiro_oauth") => return ProviderType::KiroOAuth,
         Some("cursor_oauth") => return ProviderType::CursorOAuth,
@@ -278,6 +282,7 @@ fn classify_codex_provider(provider: &Provider) -> ProviderType {
         Some("github_copilot") => ProviderType::GitHubCopilot,
         Some("nvidia") => ProviderType::Nvidia,
         Some("deepseek_api") => ProviderType::DeepSeekApi,
+        Some("grok_oauth") => ProviderType::GrokOAuth,
         _ => {
             if provider_base_url(provider).is_some_and(|url| url.contains("githubcopilot.com")) {
                 ProviderType::GitHubCopilot
@@ -311,6 +316,7 @@ fn classify_gemini_provider(provider: &Provider) -> ProviderType {
         Some("github_copilot") => return ProviderType::GitHubCopilot,
         Some("nvidia") => return ProviderType::Nvidia,
         Some("deepseek_api") => return ProviderType::DeepSeekApi,
+        Some("grok_oauth") => return ProviderType::GrokOAuth,
         Some("antigravity_oauth") => return ProviderType::AntigravityOAuth,
         Some("agy_oauth") => return ProviderType::AgyOAuth,
         Some("google_gemini_oauth") => return ProviderType::GeminiCli,

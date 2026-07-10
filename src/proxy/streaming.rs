@@ -39,6 +39,71 @@ pub struct StreamUsageAccumulator {
     usage: TokenUsage,
 }
 
+#[derive(Debug, Default)]
+pub struct ClaudeSseErrorDetector {
+    lines: SseLineBuffer,
+    current_event: Option<String>,
+    current_data: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeSseError {
+    pub error_type: String,
+    pub message: Option<String>,
+}
+
+impl ClaudeSseErrorDetector {
+    pub fn push(&mut self, chunk: &[u8]) -> Option<ClaudeSseError> {
+        for line in self.lines.push_chunk(chunk) {
+            if let Some(error) = self.push_line(&line) {
+                return Some(error);
+            }
+        }
+        None
+    }
+
+    fn push_line(&mut self, line: &str) -> Option<ClaudeSseError> {
+        if let Some(event) = line.strip_prefix("event:").map(str::trim) {
+            self.flush_event();
+            self.current_event = Some(event.to_string());
+            return None;
+        }
+        if let Some(data) = line.strip_prefix("data:").map(str::trim) {
+            self.current_data.push(data.to_string());
+            return self.flush_if_error_event();
+        }
+        None
+    }
+
+    fn flush_if_error_event(&mut self) -> Option<ClaudeSseError> {
+        if self.current_event.as_deref() != Some("error") {
+            return None;
+        }
+        let payload = self.current_data.join("\n");
+        let value = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
+        let error_type = value
+            .pointer("/error/type")
+            .or_else(|| value.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let message = value
+            .pointer("/error/message")
+            .or_else(|| value.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        self.flush_event();
+        error_type.map(|error_type| ClaudeSseError {
+            error_type,
+            message,
+        })
+    }
+
+    fn flush_event(&mut self) {
+        self.current_event = None;
+        self.current_data.clear();
+    }
+}
+
 impl StreamUsageAccumulator {
     pub fn push(&mut self, chunk: &[u8]) -> TokenUsage {
         let text = String::from_utf8_lossy(chunk);
@@ -168,6 +233,32 @@ mod tests {
         let lines = buffer.push_chunk(&bytes[split..]);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("data:"));
+    }
+
+    #[test]
+    fn claude_sse_error_detector_extracts_error_type_across_chunks() {
+        let mut detector = ClaudeSseErrorDetector::default();
+        assert!(detector.push(b"event: error\n").is_none());
+        let error_type = detector
+            .push(
+                br#"data: {"error":{"type":"rate_limit_error","message":"slow down"}}
+"#,
+            )
+            .unwrap();
+        assert_eq!(error_type.error_type, "rate_limit_error");
+        assert_eq!(error_type.message.as_deref(), Some("slow down"));
+    }
+
+    #[test]
+    fn claude_sse_error_detector_ignores_non_error_events() {
+        let mut detector = ClaudeSseErrorDetector::default();
+        assert!(detector
+            .push(
+                br#"event: message_delta
+data: {"type":"message_delta","delta":{"text":"hi"}}
+"#
+            )
+            .is_none());
     }
 
     #[test]

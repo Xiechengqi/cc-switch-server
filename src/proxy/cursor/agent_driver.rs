@@ -8,7 +8,7 @@ use std::time::Instant;
 use async_stream::stream;
 use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use rand::RngCore;
@@ -59,6 +59,7 @@ use super::tool_resolver::resolve_tool_call;
 
 const DEFAULT_CURSOR_BACKEND_BASE_URL: &str = "https://api2.cursor.sh";
 const EXCHANGE_USER_API_KEY_PATH: &str = "/auth/exchange_user_api_key";
+const MAX_CURSOR_ERROR_BODY_BYTES: usize = 8 * 1024;
 
 pub struct AgentServiceForwardOptions {
     pub state: ServerState,
@@ -135,6 +136,15 @@ pub async fn forward_agentservice(
     let session_entry = acquire_or_open_session(&state, &stored, &plan, &session_key).await?;
     let status = session_status(&session_entry).await?;
     if !status.is_success() {
+        let upstream_error = read_cursor_upstream_error(&session_entry).await;
+        maybe_mark_cursor_rate_limited(
+            &state,
+            &stored,
+            status,
+            &upstream_error.headers,
+            &upstream_error.body,
+        )
+        .await;
         record_provider_outcome(
             &state,
             &stored,
@@ -145,9 +155,14 @@ pub async fn forward_agentservice(
             .cursor_sessions
             .release(session_entry.clone(), SessionState::Closed)
             .await;
+        let proxy_status = if status == StatusCode::TOO_MANY_REQUESTS {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
         return Err(ProxyError {
-            status: StatusCode::BAD_GATEWAY,
-            message: format!("Cursor AgentService returned HTTP {}", status.as_u16()),
+            status: proxy_status,
+            message: cursor_upstream_error_message(status, upstream_error.message),
         });
     }
 
@@ -977,6 +992,194 @@ async fn session_status(
     Ok(stream.status())
 }
 
+struct CursorUpstreamError {
+    headers: HeaderMap,
+    body: Bytes,
+    message: Option<String>,
+}
+
+async fn read_cursor_upstream_error(
+    session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
+) -> CursorUpstreamError {
+    let (headers, body) = {
+        let mut session = session_entry.lock().await;
+        let Some(stream) = session.stream.as_mut() else {
+            return CursorUpstreamError {
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+                message: None,
+            };
+        };
+        let headers = stream.headers().clone();
+        stream.close_writer();
+        let body = if cursor_error_body_is_json_like(&headers) {
+            stream
+                .read_body_limited(MAX_CURSOR_ERROR_BODY_BYTES)
+                .await
+                .unwrap_or_else(|_| Bytes::new())
+        } else {
+            Bytes::new()
+        };
+        (headers, body)
+    };
+    let message = cursor_error_message_from_body(&body);
+    CursorUpstreamError {
+        headers,
+        body,
+        message,
+    }
+}
+
+fn cursor_error_body_is_json_like(headers: &HeaderMap) -> bool {
+    let Some(content_type) = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    let content_type = content_type.to_ascii_lowercase();
+    content_type.contains("json")
+}
+
+fn cursor_upstream_error_message(status: StatusCode, detail: Option<String>) -> String {
+    match detail {
+        Some(detail) => format!(
+            "Cursor AgentService returned HTTP {}: {detail}",
+            status.as_u16()
+        ),
+        None => format!("Cursor AgentService returned HTTP {}", status.as_u16()),
+    }
+}
+
+fn cursor_error_message_from_body(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let message = cursor_error_field(&value, &["/error/message", "/message"])
+        .or_else(|| cursor_error_field(&value, &["/details/0/message"]))
+        .or_else(|| cursor_error_field(&value, &["/error", "/code"]));
+    let code = cursor_error_field(&value, &["/error/code", "/code"]);
+    match (code, message) {
+        (Some(code), Some(message)) if code != message => Some(format!("{code}: {message}")),
+        (_, Some(message)) => Some(message),
+        (Some(code), None) => Some(code),
+        _ => None,
+    }
+}
+
+fn cursor_error_field(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        let value = value.pointer(pointer)?;
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                value
+                    .as_i64()
+                    .map(|number| number.to_string())
+                    .or_else(|| value.as_u64().map(|number| number.to_string()))
+            })
+    })
+}
+
+async fn maybe_mark_cursor_rate_limited(
+    state: &ServerState,
+    stored: &StoredProvider,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+) {
+    if status != StatusCode::TOO_MANY_REQUESTS || !is_cursor_account_provider(stored.provider_type)
+    {
+        return;
+    }
+    let Some(account_id) = cursor_bound_account_id(state, stored).await else {
+        return;
+    };
+    let now = crate::infra::time::now_ms() as i64;
+    let until = super::super::grok::retry_after_until_ms(headers, now)
+        .or_else(|| cursor_rate_limit_until_from_body(body, now))
+        .unwrap_or_else(|| now.saturating_add(60_000));
+    let detail = cursor_error_message_from_body(body)
+        .map(|message| format!("; {message}"))
+        .unwrap_or_default();
+    let message = format!("cursor upstream returned 429; cooling account until {until}{detail}");
+    state
+        .mark_account_rate_limited_until(&account_id, until, Some(message))
+        .await;
+}
+
+fn is_cursor_account_provider(provider_type: ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::CursorOAuth | ProviderType::CursorApiKey
+    )
+}
+
+async fn cursor_bound_account_id(state: &ServerState, stored: &StoredProvider) -> Option<String> {
+    let explicit = stored
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.account_id.as_deref())
+        .map(str::to_string);
+    if explicit.is_some() {
+        return explicit;
+    }
+    let accounts = state.accounts.read().await;
+    accounts
+        .find_for_provider(stored.provider_type, None)
+        .map(|account| account.id.clone())
+}
+
+fn cursor_rate_limit_until_from_body(body: &[u8], now_ms: i64) -> Option<i64> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    cursor_duration_ms(&value, &["/error/retry_after_ms"], now_ms)
+        .or_else(|| cursor_duration_seconds(&value, &["/retryAfterSeconds"], now_ms))
+        .or_else(|| cursor_absolute_ms(&value, &["/rateLimited/resetAtMs"]))
+        .filter(|until| *until > now_ms)
+}
+
+fn cursor_duration_ms(value: &Value, pointers: &[&str], now_ms: i64) -> Option<i64> {
+    pointers
+        .iter()
+        .find_map(|pointer| number_at(value, pointer))
+        .filter(|ms| *ms > 0)
+        .map(|ms| now_ms.saturating_add(ms))
+}
+
+fn cursor_duration_seconds(value: &Value, pointers: &[&str], now_ms: i64) -> Option<i64> {
+    pointers
+        .iter()
+        .find_map(|pointer| number_at(value, pointer))
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000)))
+}
+
+fn cursor_absolute_ms(value: &Value, pointers: &[&str]) -> Option<i64> {
+    pointers
+        .iter()
+        .find_map(|pointer| number_at(value, pointer))
+        .map(|value| {
+            if value < 10_000_000_000 {
+                value.saturating_mul(1000)
+            } else {
+                value
+            }
+        })
+}
+
+fn number_at(value: &Value, pointer: &str) -> Option<i64> {
+    value.pointer(pointer).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str()?.trim().parse().ok())
+    })
+}
+
 async fn next_session_frame(
     session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
 ) -> Result<Option<ConnectFrame>, ProxyError> {
@@ -1242,6 +1445,66 @@ impl Drop for CursorStreamInterruptGuard {
                     .await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_error_message_extracts_known_json_shapes() {
+        assert_eq!(
+            cursor_error_message_from_body(br#"{"error":"insufficient_quota"}"#).as_deref(),
+            Some("insufficient_quota")
+        );
+        assert_eq!(
+            cursor_error_message_from_body(
+                br#"{"code":"internal","message":"upstream unavailable"}"#
+            )
+            .as_deref(),
+            Some("internal: upstream unavailable")
+        );
+        assert_eq!(
+            cursor_error_message_from_body(
+                br#"{"details":[{"type":"cursor.CursorError","message":"quota exhausted"}]}"#
+            )
+            .as_deref(),
+            Some("quota exhausted")
+        );
+    }
+
+    #[test]
+    fn cursor_rate_limit_body_parses_duration_and_absolute_reset() {
+        let now = 1_700_000_000_000;
+        assert_eq!(
+            cursor_rate_limit_until_from_body(br#"{"error":{"retry_after_ms":2500}}"#, now),
+            Some(now + 2_500)
+        );
+        assert_eq!(
+            cursor_rate_limit_until_from_body(br#"{"retryAfterSeconds":3}"#, now),
+            Some(now + 3_000)
+        );
+        assert_eq!(
+            cursor_rate_limit_until_from_body(
+                br#"{"rateLimited":{"resetAtMs":1700000060000}}"#,
+                now
+            ),
+            Some(now + 60_000)
+        );
+    }
+
+    #[test]
+    fn cursor_error_body_accepts_json_or_missing_content_type_only() {
+        let mut headers = HeaderMap::new();
+        assert!(cursor_error_body_is_json_like(&headers));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        assert!(cursor_error_body_is_json_like(&headers));
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/connect+proto"),
+        );
+        assert!(!cursor_error_body_is_json_like(&headers));
     }
 }
 

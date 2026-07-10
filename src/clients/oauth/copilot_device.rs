@@ -307,11 +307,13 @@ fn account_input_from_device_flow(
         profile: Some(profile),
         raw: Some(raw),
         subscription_level: None,
+        entitlement_status: None,
         quota_percent: None,
         quota: None,
         quota_refreshed_at: None,
         quota_next_refresh_at: None,
         expires_at,
+        rate_limited_until: None,
         last_refresh_error: None,
     })
 }

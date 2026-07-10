@@ -12,6 +12,7 @@ use crate::proxy::ProxyError;
 
 pub const MAX_IMAGE_BYTES: usize = 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REDIRECTS: usize = 3;
 
 /// Image references extracted from downstream request bodies.
 #[derive(Debug, Clone)]
@@ -75,44 +76,42 @@ fn decode_data_uri(uri: &str) -> Result<EncodedImage, ProxyError> {
 }
 
 async fn fetch_http(url: &str) -> Result<EncodedImage, ProxyError> {
-    let parsed = reqwest::Url::parse(url)
+    let mut current_url = reqwest::Url::parse(url)
         .map_err(|error| invalid_image(format!("image URL invalid: {error}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(invalid_image(format!(
-            "image URL scheme must be http/https: {}",
-            parsed.scheme()
-        )));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| invalid_image("image URL is missing host"))?
-        .to_string();
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let resolved = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|error| invalid_image(format!("image host resolution failed ({host}): {error}")))?
-        .collect::<Vec<_>>();
-    if resolved.is_empty() {
-        return Err(invalid_image(format!(
-            "image host resolved to no addresses: {host}"
-        )));
-    }
-    for address in &resolved {
-        guard_ip(&address.ip())?;
-    }
 
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| {
             cursor_forward_error(format!("build image fetch client failed: {error}"))
         })?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| cursor_forward_error(format!("image download failed: {error}")))?;
+    let mut response = None;
+    for redirect_count in 0..=MAX_REDIRECTS {
+        guard_http_url(&current_url).await?;
+        let candidate = client
+            .get(current_url.clone())
+            .send()
+            .await
+            .map_err(|error| cursor_forward_error(format!("image download failed: {error}")))?;
+        if candidate.status().is_redirection() {
+            if redirect_count >= MAX_REDIRECTS {
+                return Err(invalid_image("image redirect limit exceeded"));
+            }
+            let location = candidate
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| invalid_image("image redirect is missing Location header"))?;
+            current_url = current_url.join(location).map_err(|error| {
+                invalid_image(format!("image redirect Location invalid: {error}"))
+            })?;
+            continue;
+        }
+        response = Some(candidate);
+        break;
+    }
+    let response = response.ok_or_else(|| invalid_image("image redirect limit exceeded"))?;
     if !response.status().is_success() {
         return Err(cursor_forward_error(format!(
             "image download returned HTTP {}",
@@ -138,6 +137,34 @@ async fn fetch_http(url: &str) -> Result<EncodedImage, ProxyError> {
         height: None,
         uuid: random_uuid_like(),
     })
+}
+
+async fn guard_http_url(parsed: &reqwest::Url) -> Result<(), ProxyError> {
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(invalid_image(format!(
+            "image URL scheme must be http/https: {}",
+            parsed.scheme()
+        )));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| invalid_image("image URL is missing host"))?
+        .to_string();
+    guard_host(&host)?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let resolved = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|error| invalid_image(format!("image host resolution failed ({host}): {error}")))?
+        .collect::<Vec<_>>();
+    if resolved.is_empty() {
+        return Err(invalid_image(format!(
+            "image host resolved to no addresses: {host}"
+        )));
+    }
+    for address in &resolved {
+        guard_ip(&address.ip())?;
+    }
+    Ok(())
 }
 
 fn check_mime(mime: &str) -> Result<(), ProxyError> {
@@ -182,6 +209,17 @@ fn guard_ip(ip: &IpAddr) -> Result<(), ProxyError> {
         return Err(invalid_image(format!(
             "image host resolved to blocked IP: {ip}"
         )));
+    }
+    Ok(())
+}
+
+fn guard_host(host: &str) -> Result<(), ProxyError> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if [".internal", ".local", ".lan"]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
+        return Err(invalid_image(format!("image host is blocked: {host}")));
     }
     Ok(())
 }
@@ -247,5 +285,14 @@ mod tests {
     fn blocks_private_ip() {
         let error = guard_ip(&"127.0.0.1".parse().unwrap()).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn blocks_internal_host_suffixes() {
+        for host in ["service.internal", "printer.local.", "router.lan"] {
+            let error = guard_host(host).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+        assert!(guard_host("images.example.com").is_ok());
     }
 }

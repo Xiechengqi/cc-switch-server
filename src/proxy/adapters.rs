@@ -20,6 +20,10 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+const CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_OAUTH_VERSION: &str = "0.125.0";
+const CODEX_OAUTH_USER_AGENT: &str = "codex_cli_rs/0.125.0 (Ubuntu 22.04.0; x86_64) xterm-256color";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
@@ -200,12 +204,12 @@ impl GenericForwardingAdapter {
                 }
             }
             (
-                transform_body_for_upstream(body, stored)?,
+                transform_body_for_upstream(body, stored, route)?,
                 model,
                 upstream_headers,
             )
         } else {
-            let body = transform_body_for_upstream(body, stored)?;
+            let body = transform_body_for_upstream(body, stored, route)?;
             let (body, model) = apply_request_preprocessors(body, stored, route);
             (body, model, Vec::new())
         };
@@ -264,7 +268,9 @@ impl GenericForwardingAdapter {
     ) -> Result<(), ProxyError> {
         if route_implies_stream(route, gemini_path) {
             request.stream_requested = true;
-            if let Some(upstream_format) = upstream_format_for(stored, &request.body) {
+            if let Some(upstream_format) =
+                upstream_format_for_route(stored, Some(route), &request.body)
+            {
                 request.body = ensure_stream_enabled(request.body.clone(), upstream_format)?;
             }
         }
@@ -281,7 +287,8 @@ impl GenericForwardingAdapter {
         if let Some(endpoint) = request.upstream_endpoint.as_ref() {
             return Ok(endpoint.clone());
         }
-        let Some(upstream_format) = upstream_format_for(stored, &request.body) else {
+        let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &request.body)
+        else {
             return self.resolve_endpoint(route, gemini_path, stored);
         };
         let base_url = base_url_for_upstream(upstream_format, stored)?;
@@ -400,6 +407,7 @@ fn all_provider_types() -> impl Iterator<Item = ProviderType> {
         ProviderType::AwsBedrock,
         ProviderType::Nvidia,
         ProviderType::DeepSeekApi,
+        ProviderType::GrokOAuth,
     ]
     .into_iter()
 }
@@ -449,10 +457,10 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         }
         (AppKind::Claude, ProviderType::KiroOAuth) => planned("claude_kiro_codewhisperer_planned"),
         (AppKind::Claude, ProviderType::CursorOAuth) => {
-            planned("claude_cursor_agentservice_planned")
+            ("claude_cursor_agentservice", AdapterSupport::Native)
         }
         (AppKind::Claude, ProviderType::CursorApiKey) => {
-            planned("claude_cursor_apikey_agentservice_planned")
+            ("claude_cursor_apikey_agentservice", AdapterSupport::Native)
         }
         (AppKind::Claude, ProviderType::AntigravityOAuth | ProviderType::AgyOAuth) => {
             ("claude_antigravity_gemini_native", AdapterSupport::Native)
@@ -467,6 +475,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Claude, ProviderType::DeepSeekApi) => {
             ("claude_deepseek_anthropic_api", AdapterSupport::Native)
         }
+        (AppKind::Claude, ProviderType::GrokOAuth) => {
+            ("claude_to_grok_responses", AdapterSupport::Native)
+        }
 
         (AppKind::Codex, ProviderType::Codex) => {
             ("codex_openai_compatible", AdapterSupport::Native)
@@ -477,9 +488,11 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Codex, ProviderType::OpenRouter) => {
             ("codex_openrouter_compatible", AdapterSupport::Native)
         }
-        (AppKind::Codex, ProviderType::CursorOAuth) => planned("codex_cursor_agentservice_planned"),
+        (AppKind::Codex, ProviderType::CursorOAuth) => {
+            ("codex_cursor_agentservice", AdapterSupport::Native)
+        }
         (AppKind::Codex, ProviderType::CursorApiKey) => {
-            planned("codex_cursor_apikey_agentservice_planned")
+            ("codex_cursor_apikey_agentservice", AdapterSupport::Native)
         }
         (AppKind::Codex, ProviderType::OllamaCloud) => {
             ("codex_ollama_openai_compatible", AdapterSupport::Native)
@@ -500,6 +513,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Codex, ProviderType::AwsBedrock) => planned("codex_bedrock_planned"),
         (AppKind::Codex, ProviderType::Nvidia | ProviderType::DeepSeekApi) => {
             ("codex_openai_chat_compatible", AdapterSupport::Native)
+        }
+        (AppKind::Codex, ProviderType::GrokOAuth) => {
+            ("codex_grok_responses", AdapterSupport::Native)
         }
 
         (AppKind::Gemini, ProviderType::Gemini) => ("gemini_api_key", AdapterSupport::Native),
@@ -523,7 +539,7 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Gemini, ProviderType::DeepSeekAccount) => fallback("gemini_deepseek_skeleton"),
         (AppKind::Gemini, ProviderType::KiroOAuth) => fallback("gemini_kiro_skeleton"),
         (AppKind::Gemini, ProviderType::CursorOAuth | ProviderType::CursorApiKey) => {
-            planned("gemini_cursor_agentservice_planned")
+            ("gemini_cursor_agentservice", AdapterSupport::Native)
         }
         (AppKind::Gemini, ProviderType::OllamaCloud) => {
             ("gemini_ollama_openai_chat", AdapterSupport::Native)
@@ -534,6 +550,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         }
         (AppKind::Gemini, ProviderType::DeepSeekApi) => {
             ("gemini_deepseek_openai_chat", AdapterSupport::Native)
+        }
+        (AppKind::Gemini, ProviderType::GrokOAuth) => {
+            ("gemini_to_grok_responses", AdapterSupport::Native)
         }
     };
 
@@ -573,6 +592,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::AgyOAuth
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
+                | ProviderType::GrokOAuth
         ),
         AppKind::Codex => matches!(
             provider_type,
@@ -590,6 +610,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::AgyOAuth
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
+                | ProviderType::GrokOAuth
         ),
         AppKind::Gemini => matches!(
             provider_type,
@@ -605,6 +626,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
+                | ProviderType::GrokOAuth
         ),
     }
 }
@@ -628,6 +650,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::KiroOAuth
                 | ProviderType::DeepSeekAccount
+                | ProviderType::GrokOAuth
         ) | (
             AppKind::Codex,
             ProviderType::Claude
@@ -643,6 +666,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::AgyOAuth
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
+                | ProviderType::GrokOAuth
         ) | (
             AppKind::Gemini,
             ProviderType::Gemini
@@ -658,6 +682,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
+                | ProviderType::GrokOAuth
         )
     )
 }
@@ -672,6 +697,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
+                | ProviderType::GrokOAuth
         ) | (
             AppKind::Codex,
             ProviderType::Codex
@@ -679,6 +705,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
+                | ProviderType::GrokOAuth
         ) | (
             AppKind::Gemini,
             ProviderType::Gemini
@@ -686,6 +713,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
+                | ProviderType::GrokOAuth
         )
     )
 }
@@ -703,9 +731,10 @@ fn header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth => {
             AppKind::Claude
         }
-        ProviderType::Codex | ProviderType::CodexOAuth | ProviderType::OllamaCloud => {
-            AppKind::Codex
-        }
+        ProviderType::Codex
+        | ProviderType::CodexOAuth
+        | ProviderType::OllamaCloud
+        | ProviderType::GrokOAuth => AppKind::Codex,
         ProviderType::Gemini | ProviderType::GeminiCli => AppKind::Gemini,
         ProviderType::OpenRouter => {
             if app == AppKind::Gemini {
@@ -749,8 +778,12 @@ enum ExplicitUpstreamFormat {
     Transform(UpstreamFormat),
 }
 
-fn transform_body_for_upstream(body: Bytes, stored: &StoredProvider) -> Result<Bytes, ProxyError> {
-    let Some(upstream_format) = upstream_format_for(stored, &body) else {
+fn transform_body_for_upstream(
+    body: Bytes,
+    stored: &StoredProvider,
+    route: Option<ProxyRoute>,
+) -> Result<Bytes, ProxyError> {
+    let Some(upstream_format) = upstream_format_for_route(stored, route, &body) else {
         return Ok(body);
     };
     let input = serde_json::from_slice::<Value>(&body).map_err(|error| {
@@ -842,7 +875,7 @@ fn transform_response_for_downstream(
     stored: &StoredProvider,
     route: ProxyRoute,
 ) -> Bytes {
-    let Some(upstream_format) = upstream_format_for(stored, &[]) else {
+    let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &[]) else {
         return body;
     };
     let downstream_format = downstream_format_for_route(route);
@@ -921,7 +954,7 @@ fn transform_stream_event_for_downstream(
     stored: &StoredProvider,
     route: ProxyRoute,
 ) -> Bytes {
-    let Some(upstream_format) = upstream_format_for(stored, &[]) else {
+    let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &[]) else {
         return chunk;
     };
     let downstream_format = downstream_format_for_route(route);
@@ -1041,6 +1074,10 @@ fn encode_stream_frames(frames: &[transforms::StreamFrame]) -> String {
         }
         match &frame.payload {
             transforms::StreamPayload::Json(value) => {
+                if let Some(event) = super::responses_wire::encode_sse_event(value) {
+                    output.push_str(&event);
+                    continue;
+                }
                 if let Ok(data) = serde_json::to_string(value) {
                     output.push_str("data: ");
                     output.push_str(&data);
@@ -1060,6 +1097,25 @@ fn looks_like_error_response(value: &Value) -> bool {
         || value.get("errorMessage").is_some()
 }
 
+fn upstream_format_for_route(
+    stored: &StoredProvider,
+    route: Option<ProxyRoute>,
+    body: &[u8],
+) -> Option<UpstreamFormat> {
+    if stored.provider_type == ProviderType::GrokOAuth {
+        if matches!(route, Some(ProxyRoute::CodexChatCompletions)) {
+            return Some(UpstreamFormat::OpenAiChat);
+        }
+        if matches!(
+            route,
+            Some(ProxyRoute::CodexResponses | ProxyRoute::CodexResponsesCompact)
+        ) {
+            return Some(UpstreamFormat::OpenAiResponses);
+        }
+    }
+    upstream_format_for(stored, body)
+}
+
 fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamFormat> {
     match explicit_upstream_format(stored) {
         Some(ExplicitUpstreamFormat::Passthrough) => return None,
@@ -1076,6 +1132,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             }
             ProviderType::OllamaCloud => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Nvidia => Some(UpstreamFormat::OpenAiChat),
+            ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::Gemini | ProviderType::GeminiCli => Some(UpstreamFormat::GeminiNative),
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -1090,6 +1147,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
                 Some(UpstreamFormat::OpenAiChat)
             }
             ProviderType::Nvidia | ProviderType::DeepSeekApi => Some(UpstreamFormat::OpenAiChat),
+            ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth => {
                 Some(UpstreamFormat::AnthropicMessages)
             }
@@ -1109,6 +1167,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
                 Some(UpstreamFormat::OpenAiChat)
             }
             ProviderType::Nvidia | ProviderType::DeepSeekApi => Some(UpstreamFormat::OpenAiChat),
+            ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::Codex | ProviderType::CodexOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -1148,7 +1207,9 @@ fn explicit_upstream_format(stored: &StoredProvider) -> Option<ExplicitUpstreamF
 fn downstream_format_for_route(route: ProxyRoute) -> UpstreamFormat {
     match route {
         ProxyRoute::ClaudeMessages => UpstreamFormat::AnthropicMessages,
-        ProxyRoute::CodexResponses => UpstreamFormat::OpenAiResponses,
+        ProxyRoute::CodexResponses | ProxyRoute::CodexResponsesCompact => {
+            UpstreamFormat::OpenAiResponses
+        }
         ProxyRoute::CodexChatCompletions => UpstreamFormat::OpenAiChat,
         ProxyRoute::Gemini => UpstreamFormat::GeminiNative,
     }
@@ -1284,6 +1345,9 @@ fn upstream_path(
 ) -> String {
     match upstream_format {
         UpstreamFormat::AnthropicMessages => "/v1/messages".to_string(),
+        UpstreamFormat::OpenAiResponses if route == ProxyRoute::CodexResponsesCompact => {
+            "/v1/responses/compact".to_string()
+        }
         UpstreamFormat::OpenAiResponses => "/v1/responses".to_string(),
         UpstreamFormat::OpenAiChat => "/v1/chat/completions".to_string(),
         UpstreamFormat::GeminiNative => {
@@ -1466,6 +1530,7 @@ fn default_base_url(provider_type: ProviderType) -> Option<String> {
         ProviderType::OllamaCloud => Some("https://ollama.com".to_string()),
         ProviderType::Nvidia => Some("https://integrate.api.nvidia.com".to_string()),
         ProviderType::DeepSeekApi => Some("https://api.deepseek.com".to_string()),
+        ProviderType::GrokOAuth => Some(super::grok::default_base_url().to_string()),
         _ => None,
     }
 }
@@ -1960,6 +2025,17 @@ fn apply_auth_headers(
             }) {
                 headers.push(("authorization", format!("Bearer {token}")));
             }
+            if matches!(
+                stored.provider_type,
+                ProviderType::CodexOAuth | ProviderType::GrokOAuth
+            ) && !provider_secret_configured
+                && account_credential.is_none()
+            {
+                return Err(ProxyError::bad_request(format!(
+                    "{} managed account access token is required",
+                    stored.provider_type.as_str()
+                )));
+            }
             if stored.provider_type == ProviderType::CodexOAuth && !provider_secret_configured {
                 if account_credential.is_none() {
                     return Err(ProxyError::bad_request(
@@ -1975,7 +2051,8 @@ fn apply_auth_headers(
                     )
                 })?;
                 headers.push(("chatgpt-account-id", account_id));
-                headers.push(("originator", "cc-switch".to_string()));
+                headers.push(("originator", CODEX_OAUTH_ORIGINATOR.to_string()));
+                headers.push(("version", CODEX_OAUTH_VERSION.to_string()));
             }
         }
         AppKind::Gemini => {
@@ -2038,7 +2115,21 @@ fn apply_common_provider_headers(
     provider: &crate::domain::providers::model::Provider,
     provider_type: ProviderType,
 ) {
-    if provider_type != ProviderType::GitHubCopilot {
+    if provider_type == ProviderType::CodexOAuth {
+        if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            let user_agent = provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.custom_user_agent.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(CODEX_OAUTH_USER_AGENT);
+            headers.push(("user-agent", user_agent.to_string()));
+        }
+    } else if provider_type != ProviderType::GitHubCopilot {
         if let Some(user_agent) = provider
             .meta
             .as_ref()
@@ -2909,6 +3000,11 @@ fn route_aliases(route: ProxyRoute) -> &'static [&'static str] {
             "/v1/chat/completions",
         ],
         ProxyRoute::CodexResponses => &["codex_responses", "responses", "/v1/responses"],
+        ProxyRoute::CodexResponsesCompact => &[
+            "codex_responses_compact",
+            "responses_compact",
+            "/v1/responses/compact",
+        ],
         ProxyRoute::Gemini => &["gemini", "generate_content", "stream_generate_content"],
     }
 }
@@ -3090,11 +3186,13 @@ mod tests {
             profile: Some(profile),
             raw: None,
             subscription_level: None,
+            entitlement_status: None,
             quota_percent: None,
             quota: None,
             quota_refreshed_at: None,
             quota_next_refresh_at: None,
             expires_at: None,
+            rate_limited_until: None,
             last_refresh_error: None,
         }
     }
@@ -3225,44 +3323,44 @@ mod tests {
     }
 
     #[test]
-    fn cursor_capabilities_are_planned_until_agentservice_lands() {
+    fn cursor_capabilities_are_native_agentservice() {
         let cases = [
             (
                 AppKind::Claude,
                 ProviderType::CursorOAuth,
-                "claude_cursor_agentservice_planned",
+                "claude_cursor_agentservice",
             ),
             (
                 AppKind::Claude,
                 ProviderType::CursorApiKey,
-                "claude_cursor_apikey_agentservice_planned",
+                "claude_cursor_apikey_agentservice",
             ),
             (
                 AppKind::Codex,
                 ProviderType::CursorOAuth,
-                "codex_cursor_agentservice_planned",
+                "codex_cursor_agentservice",
             ),
             (
                 AppKind::Codex,
                 ProviderType::CursorApiKey,
-                "codex_cursor_apikey_agentservice_planned",
+                "codex_cursor_apikey_agentservice",
             ),
             (
                 AppKind::Gemini,
                 ProviderType::CursorOAuth,
-                "gemini_cursor_agentservice_planned",
+                "gemini_cursor_agentservice",
             ),
             (
                 AppKind::Gemini,
                 ProviderType::CursorApiKey,
-                "gemini_cursor_agentservice_planned",
+                "gemini_cursor_agentservice",
             ),
         ];
 
         for (app, provider_type, adapter_name) in cases {
             let capability = capability_for(app, provider_type);
             assert_eq!(capability.adapter, adapter_name);
-            assert_eq!(capability.support, AdapterSupport::Planned);
+            assert_eq!(capability.support, AdapterSupport::Native);
             assert!(capability.requires_transform);
             assert!(!capability.supports_stream_usage);
             assert!(!capability.supports_model_list);
@@ -3535,9 +3633,12 @@ mod tests {
     #[test]
     fn exposes_all_provider_type_capabilities_for_each_app() {
         let capabilities = all_capabilities();
-        assert_eq!(capabilities.len(), 57);
+        assert_eq!(capabilities.len(), 60);
         assert!(capabilities.iter().any(|item| {
             item.app == AppKind::Gemini && item.provider_type == ProviderType::AntigravityOAuth
+        }));
+        assert!(capabilities.iter().any(|item| {
+            item.app == AppKind::Codex && item.provider_type == ProviderType::GrokOAuth
         }));
     }
 
@@ -4933,7 +5034,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_cursor_apikey_planned_contract_uses_openai_chat_upstream_fixture() {
+    fn claude_cursor_apikey_agentservice_contract_uses_openai_chat_upstream_fixture() {
         let stored = stored_provider(
             AppKind::Claude,
             ProviderType::CursorApiKey,
@@ -4950,7 +5051,7 @@ mod tests {
 
         assert_eq!(
             capability_for(AppKind::Claude, ProviderType::CursorApiKey).support,
-            AdapterSupport::Planned
+            AdapterSupport::Native
         );
         assert_adapter_contract(AdapterContract {
             app: AppKind::Claude,
@@ -4997,7 +5098,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_cursor_oauth_planned_contract_uses_chat_completions_fixture() {
+    fn codex_cursor_oauth_agentservice_contract_uses_chat_completions_fixture() {
         let stored = stored_provider(
             AppKind::Codex,
             ProviderType::CursorOAuth,
@@ -5014,7 +5115,7 @@ mod tests {
 
         assert_eq!(
             capability_for(AppKind::Codex, ProviderType::CursorOAuth).support,
-            AdapterSupport::Planned
+            AdapterSupport::Native
         );
         assert_adapter_contract(AdapterContract {
             app: AppKind::Codex,

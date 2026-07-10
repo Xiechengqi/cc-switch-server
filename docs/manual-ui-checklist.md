@@ -8,7 +8,7 @@ scripts, or automated click flows.
 
 - Compare the server Web UI against `/data/projects/cc-switch` desktop UI for the token server main path only.
 - Retained pages: Providers, Shares, Usage/Pricing, Settings/Auth/Router/Backup, Universal Providers, Accounts/OAuth/quota.
-- Hidden or excluded areas must not appear in navigation or primary actions: skills, MCP, OpenClaw workspace/tools/agents, Hermes, OMO, Tauri shell, updater, deeplink, Claude Desktop profile writing, WebDAV/S3 sync, speedtest, local CLI session parsing, `codex_responses_ws`, Codex OAuth image generation.
+- Hidden or excluded areas must not appear in navigation or primary actions: skills, MCP, OpenClaw workspace/tools/agents, Hermes, OMO, Tauri shell, updater, deeplink, Claude Desktop profile writing, WebDAV/S3 sync, speedtest, local CLI session parsing, `codex_responses_ws`.
 
 ## Viewports
 

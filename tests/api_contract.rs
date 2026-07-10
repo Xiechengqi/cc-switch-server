@@ -106,7 +106,7 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
     .await;
     state
         .mutate_shares_immediate(|store| {
-            store.upsert(test_share_input("share-ctl", "p-ctl", ProviderType::Codex));
+            let _ = store.upsert(test_share_input("share-ctl", "p-ctl", ProviderType::Codex));
         })
         .await
         .unwrap();
@@ -210,11 +210,13 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
                     }
                 })),
                 subscription_level: None,
+                entitlement_status: None,
                 quota_percent: None,
                 quota: None,
                 quota_refreshed_at: None,
                 quota_next_refresh_at: None,
                 expires_at: None,
+                rate_limited_until: None,
                 last_refresh_error: None,
             });
         })
@@ -232,6 +234,7 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
     let share = state
         .mutate_shares_immediate(|store| store.upsert(share))
         .await
+        .unwrap()
         .unwrap();
     let providers = providers_snapshot(&state).await;
 
@@ -842,11 +845,13 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
                     }
                 })),
                 subscription_level: None,
+                entitlement_status: None,
                 quota: None,
                 quota_percent: None,
                 quota_refreshed_at: None,
                 quota_next_refresh_at: None,
                 expires_at: Some(4_102_444_800_000),
+                rate_limited_until: None,
                 last_refresh_error: None,
             });
         })
@@ -986,11 +991,13 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
                     "importedAtMs": 1000
                 })),
                 subscription_level: Some("Kiro Pro".to_string()),
+                entitlement_status: None,
                 quota: None,
                 quota_percent: None,
                 quota_refreshed_at: None,
                 quota_next_refresh_at: None,
                 expires_at: Some(4_102_444_800_000),
+                rate_limited_until: None,
                 last_refresh_error: None,
             });
         })
@@ -1114,11 +1121,13 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
                     "importedAtMs": 1000
                 })),
                 subscription_level: Some("Kiro Pro".to_string()),
+                entitlement_status: None,
                 quota: None,
                 quota_percent: None,
                 quota_refreshed_at: None,
                 quota_next_refresh_at: None,
                 expires_at: Some(4_102_444_800_000),
+                rate_limited_until: None,
                 last_refresh_error: None,
             });
         })
@@ -1298,6 +1307,7 @@ fn codex_oauth_schema_fixture_preserves_future_native_fields() {
         profile: Some(json!({"plan":"pro"})),
         raw: Some(json!({"source":"mock"})),
         subscription_level: Some("pro".to_string()),
+        entitlement_status: None,
         quota_percent: Some(12.5),
         quota: Some(AccountQuota {
             success: true,
@@ -1317,6 +1327,7 @@ fn codex_oauth_schema_fixture_preserves_future_native_fields() {
         quota_refreshed_at: Some(1000),
         quota_next_refresh_at: Some(2000),
         expires_at: Some(3000),
+        rate_limited_until: None,
         last_refresh_error: None,
     });
 
@@ -1696,7 +1707,7 @@ async fn router_batch_sync_notifies_runtime_refresh_after_remote_sync() {
     share.tunnel_subdomain = Some("runtime-sub".to_string());
     state
         .mutate_shares_immediate(|store| {
-            store.upsert(share);
+            let _ = store.upsert(share);
         })
         .await
         .unwrap();
@@ -1771,7 +1782,7 @@ async fn router_batch_sync_records_runtime_refresh_failure_without_failing_local
     share.tunnel_subdomain = Some("runtime-fail".to_string());
     state
         .mutate_shares_immediate(|store| {
-            store.upsert(share);
+            let _ = store.upsert(share);
         })
         .await
         .unwrap();
@@ -2097,7 +2108,7 @@ async fn web_invoke_direct_owner_update_succeeds_with_admin_session() {
     let token = setup_and_login(&app).await;
     state
         .mutate_shares_immediate(|store| {
-            store.upsert(test_share_input(
+            let _ = store.upsert(test_share_input(
                 "share-owner-gate",
                 "p-owner",
                 ProviderType::Codex,
@@ -2224,7 +2235,7 @@ async fn web_invoke_email_auth_owner_change_updates_config_and_shares() {
     .unwrap();
     state
         .mutate_shares_immediate(|store| {
-            store.upsert(test_share_input(
+            let _ = store.upsert(test_share_input(
                 "share-owner-change",
                 "p-owner",
                 ProviderType::Codex,
@@ -2411,11 +2422,25 @@ fn event_frame(event_type: &str, payload: Value) -> Vec<u8> {
     let mut frame = Vec::with_capacity(total_len);
     frame.extend_from_slice(&(total_len as u32).to_be_bytes());
     frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&0u32.to_be_bytes());
+    let prelude_crc = event_crc32(&frame[..8]);
+    frame.extend_from_slice(&prelude_crc.to_be_bytes());
     frame.extend_from_slice(&headers);
     frame.extend_from_slice(&payload);
-    frame.extend_from_slice(&0u32.to_be_bytes());
+    let message_crc = event_crc32(&frame);
+    frame.extend_from_slice(&message_crc.to_be_bytes());
     frame
+}
+
+fn event_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 fn push_event_string_header(out: &mut Vec<u8>, name: &str, value: &str) {

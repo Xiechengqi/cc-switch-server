@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod claude_cli;
 pub mod failover;
 pub mod health;
 pub mod providers;

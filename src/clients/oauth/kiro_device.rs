@@ -12,22 +12,28 @@ use sha2::{Digest, Sha256};
 use crate::domain::accounts::store::{AccountQuota, AccountQuotaTier, UpsertAccountInput};
 use crate::domain::providers::model::ProviderType;
 
-const DEFAULT_REGION: &str = "us-east-1";
-const DEFAULT_START_URL: &str = "https://view.awsapps.com/start";
-const KIRO_CLIENT_NAME: &str = "kiro-oauth-client";
-const KIRO_CLIENT_TYPE: &str = "public";
-const KIRO_ISSUER_URL: &str = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6";
-const KIRO_AUTH_METHOD_BUILDER_ID: &str = "builder-id";
-const BUILDER_ID_PROFILE_ARN: &str =
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
+pub(crate) const DEFAULT_START_URL: &str = "https://view.awsapps.com/start";
+pub(crate) const KIRO_CLIENT_NAME: &str = "kiro-oauth-client";
+pub(crate) const KIRO_CLIENT_TYPE: &str = "public";
+pub(crate) const KIRO_ISSUER_URL: &str =
+    "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6";
+pub(crate) const KIRO_AUTH_METHOD_BUILDER_ID: &str = "builder-id";
+pub(crate) const KIRO_AUTH_METHOD_IDC: &str = "idc";
+pub(crate) const KIRO_AUTH_METHOD_API_KEY: &str = "api_key";
+pub(crate) const KIRO_AUTH_METHOD_SOCIAL: &str = "social";
+const KIRO_SOCIAL_CLIENT_ID: &str = "kiro-cli";
+pub(crate) const BUILDER_ID_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
-const SOCIAL_PROFILE_ARN: &str =
+pub(crate) const SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
-const ENTERPRISE_FALLBACK_PROFILE_ACCOUNT_ID: &str = "610548660232";
-const ENTERPRISE_FALLBACK_PROFILE_ID: &str = "VNECVYCYYAWN";
+pub(crate) const ENTERPRISE_FALLBACK_PROFILE_ACCOUNT_ID: &str = "610548660232";
+pub(crate) const ENTERPRISE_FALLBACK_PROFILE_ID: &str = "VNECVYCYYAWN";
 
 #[derive(Debug, Clone, Default)]
 pub struct KiroDeviceFlowStore {
     pending: BTreeMap<String, PendingKiroDeviceFlow>,
+    pending_social: BTreeMap<String, PendingKiroSocialDeviceFlow>,
 }
 
 impl KiroDeviceFlowStore {
@@ -44,6 +50,31 @@ impl KiroDeviceFlowStore {
     pub fn remove(&mut self, device_code: &str) {
         self.pending.remove(device_code);
     }
+
+    pub fn insert_social(
+        &mut self,
+        device_code: String,
+        flow: PendingKiroSocialDeviceFlow,
+        now_ms: i64,
+    ) {
+        self.pending_social
+            .retain(|_, flow| flow.expires_at_ms > now_ms);
+        self.pending_social.insert(device_code, flow);
+    }
+
+    pub fn get_social(
+        &mut self,
+        device_code: &str,
+        now_ms: i64,
+    ) -> Option<PendingKiroSocialDeviceFlow> {
+        self.pending_social
+            .retain(|_, flow| flow.expires_at_ms > now_ms);
+        self.pending_social.get(device_code).cloned()
+    }
+
+    pub fn remove_social(&mut self, device_code: &str) {
+        self.pending_social.remove(device_code);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +84,16 @@ pub struct PendingKiroDeviceFlow {
     client_secret_expires_at: Option<i64>,
     region: String,
     start_url: String,
+    issuer_url: String,
+    auth_method: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingKiroSocialDeviceFlow {
+    provider: String,
+    auth_region: String,
+    client_id: String,
     expires_at_ms: i64,
 }
 
@@ -135,11 +176,11 @@ impl std::error::Error for KiroDeviceError {}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RegisterClientResponse {
-    client_id: String,
-    client_secret: String,
+pub(crate) struct RegisterClientResponse {
+    pub(crate) client_id: String,
+    pub(crate) client_secret: String,
     #[serde(default)]
-    client_secret_expires_at: Option<i64>,
+    pub(crate) client_secret_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +195,25 @@ struct DeviceAuthorizationResponse {
     expires_in: u64,
     #[serde(default)]
     interval: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SocialDeviceAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    #[serde(default)]
+    verification_uri: Option<String>,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    expires_in_milliseconds: Option<u64>,
+    #[serde(default)]
+    interval: Option<u64>,
+    #[serde(default)]
+    interval_in_milliseconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,11 +264,18 @@ pub async fn start_device_flow(
     http: &reqwest::Client,
     region: Option<&str>,
     start_url: Option<&str>,
+    issuer_url: Option<&str>,
     now_ms: i64,
 ) -> Result<(KiroDeviceCodeResponse, PendingKiroDeviceFlow), KiroDeviceError> {
     let region = normalize_region(region.unwrap_or(DEFAULT_REGION))?;
     let start_url = normalize_start_url(start_url.unwrap_or(DEFAULT_START_URL))?;
-    let client = register_client(http, &region).await?;
+    let issuer_url = normalize_issuer_url(issuer_url.unwrap_or(KIRO_ISSUER_URL))?;
+    let auth_method = if issuer_url == KIRO_ISSUER_URL && start_url == DEFAULT_START_URL {
+        KIRO_AUTH_METHOD_BUILDER_ID
+    } else {
+        KIRO_AUTH_METHOD_IDC
+    };
+    let client = register_client_with_issuer(http, &region, &issuer_url).await?;
     let device = request_device_authorization(http, &region, &client, &start_url).await?;
     let expires_at_ms = now_ms.saturating_add((device.expires_in as i64).saturating_mul(1000));
     let flow = PendingKiroDeviceFlow {
@@ -217,6 +284,8 @@ pub async fn start_device_flow(
         client_secret_expires_at: client.client_secret_expires_at,
         region: region.clone(),
         start_url: start_url.clone(),
+        issuer_url,
+        auth_method: auth_method.to_string(),
         expires_at_ms,
     };
     let response = KiroDeviceCodeResponse {
@@ -230,6 +299,72 @@ pub async fn start_device_flow(
         start_url,
     };
     Ok((response, flow))
+}
+
+pub async fn start_social_device_flow(
+    http: &reqwest::Client,
+    provider: &str,
+    auth_region: Option<&str>,
+    now_ms: i64,
+) -> Result<(KiroDeviceCodeResponse, PendingKiroSocialDeviceFlow), KiroDeviceError> {
+    let provider = normalize_social_provider(provider)?;
+    let auth_region = normalize_region(auth_region.unwrap_or(DEFAULT_REGION))?;
+    let url =
+        format!("https://prod.{auth_region}.auth.desktop.kiro.dev/oauth/device/authorization");
+    let response = http
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(&json!({
+            "clientId": KIRO_SOCIAL_CLIENT_ID,
+            "loginProvider": social_provider_label(&provider),
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            KiroDeviceError::bad_gateway(format!(
+                "kiro social device authorization failed: {error}"
+            ))
+        })?;
+    let device: SocialDeviceAuthorizationResponse =
+        handle_json_response(response, "kiro social device authorization").await?;
+    let expires_in = device
+        .expires_in
+        .or_else(|| device.expires_in_milliseconds.map(|value| value / 1000))
+        .unwrap_or(300)
+        .max(1);
+    let interval = device
+        .interval
+        .or_else(|| device.interval_in_milliseconds.map(|value| value / 1000))
+        .unwrap_or(5)
+        .max(1);
+    let verification_uri = device
+        .verification_uri_complete
+        .clone()
+        .or(device.verification_uri.clone())
+        .ok_or_else(|| {
+            KiroDeviceError::bad_gateway("kiro social device authorization lacks verification URI")
+        })?;
+    let expires_at_ms = now_ms.saturating_add((expires_in as i64).saturating_mul(1000));
+    let flow = PendingKiroSocialDeviceFlow {
+        provider: provider.clone(),
+        auth_region: auth_region.clone(),
+        client_id: KIRO_SOCIAL_CLIENT_ID.to_string(),
+        expires_at_ms,
+    };
+    Ok((
+        KiroDeviceCodeResponse {
+            device_code: device.device_code,
+            user_code: device.user_code,
+            verification_uri,
+            verification_uri_complete: device.verification_uri_complete,
+            expires_in,
+            interval,
+            region: auth_region,
+            start_url: format!("social:{provider}"),
+        },
+        flow,
+    ))
 }
 
 pub async fn poll_device_flow(
@@ -276,9 +411,142 @@ pub async fn poll_device_flow(
     })
 }
 
-async fn register_client(
+pub async fn poll_social_device_flow(
+    http: &reqwest::Client,
+    device_code: &str,
+    flow: PendingKiroSocialDeviceFlow,
+    now_ms: i64,
+) -> Result<KiroDevicePollResult, KiroDeviceError> {
+    let device_code = device_code.trim();
+    if device_code.is_empty() {
+        return Err(KiroDeviceError::bad_request("deviceCode is required"));
+    }
+    if flow.expires_at_ms <= now_ms {
+        return Err(KiroDeviceError::unauthorized("device code expired"));
+    }
+    let url = format!(
+        "https://prod.{}.auth.desktop.kiro.dev/oauth/device/poll",
+        flow.auth_region
+    );
+    let response = http
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(&json!({
+            "deviceCode": device_code,
+            "clientId": flow.client_id,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            KiroDeviceError::bad_gateway(format!("kiro social device poll failed: {error}"))
+        })?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| format!("HTTP {status}"));
+    let token: Value = serde_json::from_str(&body).map_err(|error| {
+        KiroDeviceError::remote(
+            status,
+            format!("parse kiro social device response failed: {error}"),
+        )
+    })?;
+    let error = string_at(&token, &["/error"]);
+    if matches!(
+        error.as_deref(),
+        Some("authorization_pending" | "slow_down")
+    ) {
+        return Ok(KiroDevicePollResult {
+            pending: true,
+            message: "authorization pending".to_string(),
+            retry_after_secs: Some(if error.as_deref() == Some("slow_down") {
+                10
+            } else {
+                5
+            }),
+            account_input: None,
+        });
+    }
+    if !status.is_success() || error.is_some() {
+        let message = string_at(
+            &token,
+            &["/errorDescription", "/error_description", "/message"],
+        )
+        .or(error)
+        .unwrap_or(body);
+        let status = if status.is_success() {
+            StatusCode::UNAUTHORIZED
+        } else {
+            status
+        };
+        return Err(KiroDeviceError::remote(status, message));
+    }
+    let access_token = string_at(&token, &["/accessToken", "/access_token"])
+        .ok_or_else(|| KiroDeviceError::bad_gateway("kiro social token lacks accessToken"))?;
+    let refresh_token = string_at(&token, &["/refreshToken", "/refresh_token"])
+        .ok_or_else(|| KiroDeviceError::bad_gateway("kiro social token lacks refreshToken"))?;
+    let expires_in = token
+        .pointer("/expiresIn")
+        .or_else(|| token.pointer("/expires_in"))
+        .and_then(Value::as_i64)
+        .unwrap_or(3600);
+    let input = crate::clients::oauth::kiro::import_credentials_json(
+        json!({
+            "accessToken": access_token,
+            "refreshToken": refresh_token,
+            "profileArn": string_at(&token, &["/profileArn", "/profile_arn"]),
+            "expiresAt": now_ms.saturating_add(expires_in.saturating_mul(1000)),
+            "authMethod": KIRO_AUTH_METHOD_SOCIAL,
+            "provider": social_provider_label(&flow.provider),
+            "authRegion": flow.auth_region,
+            "apiRegion": DEFAULT_REGION,
+        }),
+        now_ms,
+    )
+    .map_err(|error| {
+        KiroDeviceError::remote(
+            StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            error.message,
+        )
+    })?;
+    Ok(KiroDevicePollResult {
+        pending: false,
+        message: "kiro social device authorization completed".to_string(),
+        retry_after_secs: None,
+        account_input: Some(input),
+    })
+}
+
+fn normalize_social_provider(provider: &str) -> Result<String, KiroDeviceError> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "google" => Ok("google".to_string()),
+        "github" => Ok("github".to_string()),
+        _ => Err(KiroDeviceError::bad_request(
+            "Kiro social loginProvider must be google or github",
+        )),
+    }
+}
+
+fn social_provider_label(provider: &str) -> &'static str {
+    if provider.eq_ignore_ascii_case("github") {
+        "Github"
+    } else {
+        "Google"
+    }
+}
+
+pub(crate) async fn register_client(
     http: &reqwest::Client,
     region: &str,
+) -> Result<RegisterClientResponse, KiroDeviceError> {
+    register_client_with_issuer(http, region, KIRO_ISSUER_URL).await
+}
+
+pub(crate) async fn register_client_with_issuer(
+    http: &reqwest::Client,
+    region: &str,
+    issuer_url: &str,
 ) -> Result<RegisterClientResponse, KiroDeviceError> {
     let response = http
         .post(format!(
@@ -298,7 +566,7 @@ async fn register_client(
                 "urn:ietf:params:oauth:grant-type:device_code",
                 "refresh_token"
             ],
-            "issuerUrl": KIRO_ISSUER_URL
+            "issuerUrl": issuer_url
         }))
         .send()
         .await
@@ -399,16 +667,35 @@ async fn account_input_from_token(
         .ok_or_else(|| KiroDeviceError::bad_gateway("kiro token response lacks refresh_token"))?;
     let account_id = format!("kiro_{}", &sha256_hex(&refresh_token)[..24]);
     let machine_id = machine_id_from_refresh_token(&refresh_token);
-    let profile_arn = token
+    let explicit_profile_arn = token
         .profile_arn
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| default_profile_arn(&token.extra, &flow.region));
-    let usage = fetch_usage_limits(http, &flow.region, &profile_arn, &machine_id, &access_token)
-        .await
-        .ok();
+        .map(str::to_string);
+    let discovered_profile_arn = if explicit_profile_arn.is_none() {
+        fetch_available_profile_arn(http, &flow.region, &access_token, None)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let profile_arn = explicit_profile_arn
+        .or(discovered_profile_arn)
+        .unwrap_or_else(|| {
+            default_profile_arn(&json!({ "authMethod": flow.auth_method }), &flow.region)
+        });
+    let usage = fetch_usage_limits(
+        http,
+        &flow.region,
+        &profile_arn,
+        &machine_id,
+        &access_token,
+        None,
+    )
+    .await
+    .ok();
     let email = token.first_email().or_else(|| {
         usage
             .as_ref()
@@ -439,6 +726,15 @@ async fn account_input_from_token(
     let raw_api_region = flow.region.clone();
     let profile_start_url = flow.start_url.clone();
     let raw_start_url = flow.start_url.clone();
+    let profile_issuer_url = flow.issuer_url.clone();
+    let raw_issuer_url = flow.issuer_url.clone();
+    let profile_auth_method = flow.auth_method.clone();
+    let raw_auth_method = flow.auth_method.clone();
+    let provider = if flow.auth_method == KIRO_AUTH_METHOD_IDC {
+        "IdC"
+    } else {
+        "BuilderId"
+    };
     let client_id = flow.client_id.clone();
     let client_secret = flow.client_secret.clone();
     let client_secret_expires_at = flow.client_secret_expires_at;
@@ -456,16 +752,18 @@ async fn account_input_from_token(
         "apiRegion": profile_api_region,
         "machineId": profile_machine_id,
         "startUrl": profile_start_url,
-        "authMethod": KIRO_AUTH_METHOD_BUILDER_ID,
-        "provider": "BuilderId",
+        "issuerUrl": profile_issuer_url,
+        "authMethod": profile_auth_method,
+        "provider": provider,
     });
     let raw = json!({
-        "provider": "BuilderId",
-        "authMethod": KIRO_AUTH_METHOD_BUILDER_ID,
+        "provider": provider,
+        "authMethod": raw_auth_method,
         "clientId": client_id,
         "clientSecret": client_secret,
         "clientSecretExpiresAt": client_secret_expires_at,
         "startUrl": raw_start_url,
+        "issuerUrl": raw_issuer_url,
         "authRegion": raw_auth_region,
         "apiRegion": raw_api_region,
         "profileArn": token.profile_arn,
@@ -493,6 +791,7 @@ async fn account_input_from_token(
         profile: Some(profile),
         raw: Some(raw),
         subscription_level,
+        entitlement_status: None,
         quota_percent: None,
         quota,
         quota_refreshed_at: usage_fetched.then_some(now_ms),
@@ -500,16 +799,18 @@ async fn account_input_from_token(
             crate::domain::settings::ui_settings::default_oauth_quota_refresh_interval_ms(),
         )),
         expires_at,
+        rate_limited_until: None,
         last_refresh_error: None,
     })
 }
 
-async fn fetch_usage_limits(
+pub(crate) async fn fetch_usage_limits(
     http: &reqwest::Client,
     region: &str,
     profile_arn: &str,
     machine_id: &str,
     access_token: &str,
+    token_type: Option<&str>,
 ) -> Result<Value, KiroDeviceError> {
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/macos lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-2.3.0-{machine_id}"
@@ -527,6 +828,7 @@ async fn fetch_usage_limits(
             &amz_user_agent,
             &user_agent,
             access_token,
+            token_type,
         )
         .await
         {
@@ -543,6 +845,7 @@ async fn fetch_usage_limits(
         &amz_user_agent,
         &user_agent,
         access_token,
+        token_type,
     )
     .await
 }
@@ -554,8 +857,9 @@ async fn send_usage_limits_get(
     amz_user_agent: &str,
     user_agent: &str,
     access_token: &str,
+    token_type: Option<&str>,
 ) -> Result<Value, KiroDeviceError> {
-    let response = http
+    let mut request = http
         .get(url)
         .header("x-amz-user-agent", amz_user_agent)
         .header("user-agent", user_agent)
@@ -564,13 +868,67 @@ async fn send_usage_limits_get(
         .header("amz-sdk-invocation-id", random_hex(16))
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {access_token}"))
-        .header("Connection", "close")
-        .send()
-        .await
-        .map_err(|error| {
-            KiroDeviceError::bad_gateway(format!("kiro usage limits request failed: {error}"))
-        })?;
+        .header("Connection", "close");
+    if let Some(token_type) = token_type {
+        request = request.header("tokentype", token_type);
+    }
+    let response = request.send().await.map_err(|error| {
+        KiroDeviceError::bad_gateway(format!("kiro usage limits request failed: {error}"))
+    })?;
     handle_json_response(response, "kiro usage limits").await
+}
+
+pub(crate) async fn fetch_available_profile_arn(
+    http: &reqwest::Client,
+    region: &str,
+    access_token: &str,
+    token_type: Option<&str>,
+) -> Result<Option<String>, KiroDeviceError> {
+    let region = normalize_region(region)?;
+    let host = format!("q.{region}.amazonaws.com");
+    let mut request = http
+        .post(format!("https://{host}/"))
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "x-amz-target",
+            "AmazonCodeWhispererService.ListAvailableProfiles",
+        )
+        .header("accept", "application/json")
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", random_hex(16))
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("connection", "close")
+        .body(r#"{"maxResults":10}"#);
+    if let Some(token_type) = token_type {
+        request = request.header("tokentype", token_type);
+    }
+    let response = request.send().await.map_err(|error| {
+        KiroDeviceError::bad_gateway(format!("kiro profile discovery failed: {error}"))
+    })?;
+    let body: Value = handle_json_response(response, "kiro profile discovery").await?;
+    let profiles = body
+        .get("profiles")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let matching = profiles
+        .iter()
+        .filter_map(|profile| string_at(profile, &["/arn", "/profileArn"]))
+        .find(|arn| region_from_profile_arn(arn).as_deref() == Some(region.as_str()));
+    Ok(matching.or_else(|| {
+        profiles
+            .iter()
+            .find_map(|profile| string_at(profile, &["/arn", "/profileArn"]))
+    }))
+}
+
+fn region_from_profile_arn(arn: &str) -> Option<String> {
+    let mut parts = arn.split(':');
+    (parts.next() == Some("arn")).then_some(())?;
+    (parts.next() == Some("aws")).then_some(())?;
+    (parts.next() == Some("codewhisperer")).then_some(())?;
+    parts.next().map(str::to_string)
 }
 
 async fn handle_json_response<T: for<'de> Deserialize<'de>>(
@@ -601,7 +959,11 @@ async fn handle_json_response<T: for<'de> Deserialize<'de>>(
     Err(KiroDeviceError::remote(status, message))
 }
 
-fn quota_from_usage_limits(body: Value, plan: Option<String>, now_ms: i64) -> AccountQuota {
+pub(crate) fn quota_from_usage_limits(
+    body: Value,
+    plan: Option<String>,
+    now_ms: i64,
+) -> AccountQuota {
     let overage_enabled = bool_at(
         &body,
         &[
@@ -724,6 +1086,19 @@ fn normalize_start_url(raw: &str) -> Result<String, KiroDeviceError> {
     Ok(url.to_string())
 }
 
+fn normalize_issuer_url(raw: &str) -> Result<String, KiroDeviceError> {
+    let url = raw.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(KiroDeviceError::bad_request(
+            "Kiro issuerUrl must be an http(s) URL",
+        ));
+    }
+    if url.contains('@') || url.len() > 512 {
+        return Err(KiroDeviceError::bad_request("invalid Kiro issuerUrl"));
+    }
+    Ok(url.to_string())
+}
+
 fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
     let mut url = format!(
         "https://{host}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
@@ -735,7 +1110,7 @@ fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
     url
 }
 
-fn default_profile_arn(token_extra: &Value, region: &str) -> String {
+pub(crate) fn default_profile_arn(token_extra: &Value, region: &str) -> String {
     let kind = string_at(
         token_extra,
         &[
@@ -751,7 +1126,10 @@ fn default_profile_arn(token_extra: &Value, region: &str) -> String {
     if matches!(kind.as_str(), "social" | "google" | "github") {
         return SOCIAL_PROFILE_ARN.to_string();
     }
-    if matches!(kind.as_str(), "enterprise" | "external_idp" | "externalidp") {
+    if matches!(
+        kind.as_str(),
+        "enterprise" | "idc" | "iam_sso" | "iam-sso" | "external_idp" | "externalidp"
+    ) {
         let region = if region.starts_with("eu-") {
             "eu-central-1"
         } else {
@@ -776,7 +1154,7 @@ fn percent_encode(value: &str) -> String {
     output
 }
 
-fn sha256_hex(input: &str) -> String {
+pub(crate) fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -846,7 +1224,7 @@ fn valid_email(value: &str) -> Option<&str> {
     Some(trimmed)
 }
 
-fn find_email_in_value(value: &Value) -> Option<&str> {
+pub(crate) fn find_email_in_value(value: &Value) -> Option<&str> {
     match value {
         Value::String(value) => valid_email(value),
         Value::Array(values) => values.iter().find_map(find_email_in_value),
@@ -874,7 +1252,7 @@ fn value_at(value: &Value, pointers: &[&str]) -> Option<Value> {
         .find_map(|pointer| value.pointer(pointer).cloned())
 }
 
-fn string_at(value: &Value, pointers: &[&str]) -> Option<String> {
+pub(crate) fn string_at(value: &Value, pointers: &[&str]) -> Option<String> {
     pointers.iter().find_map(|pointer| {
         value
             .pointer(pointer)
@@ -953,6 +1331,23 @@ mod tests {
         assert_eq!(
             machine_id_from_refresh_token("rt"),
             sha256_hex("KotlinNativeAPI/rt")
+        );
+    }
+
+    #[test]
+    fn social_provider_and_enterprise_profile_fallback_are_normalized() {
+        assert_eq!(normalize_social_provider("Google").unwrap(), "google");
+        assert_eq!(normalize_social_provider("github").unwrap(), "github");
+        assert!(normalize_social_provider("amazon").is_err());
+        assert_eq!(
+            default_profile_arn(&json!({ "authMethod": "social" }), "us-west-2"),
+            SOCIAL_PROFILE_ARN
+        );
+        assert_eq!(
+            default_profile_arn(&json!({ "authMethod": "idc" }), "eu-west-1"),
+            format!(
+                "arn:aws:codewhisperer:eu-central-1:{ENTERPRISE_FALLBACK_PROFILE_ACCOUNT_ID}:profile/{ENTERPRISE_FALLBACK_PROFILE_ID}"
+            )
         );
     }
 }

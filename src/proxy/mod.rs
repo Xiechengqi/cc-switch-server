@@ -3,13 +3,16 @@
 pub mod adapters;
 mod cache_injector;
 pub(crate) mod claude_oauth;
+mod codex_instructions;
 mod copilot_model_map;
 mod copilot_optimizer;
 pub(crate) mod cursor;
 mod deepseek;
 mod forwarder;
+mod grok;
 mod kiro;
 mod request_governance;
+mod responses_wire;
 mod router;
 mod streaming;
 mod thinking;
@@ -19,6 +22,9 @@ mod usage;
 use serde_json::Value;
 
 pub use forwarder::forward;
+pub use forwarder::forward_codex_responses_ws;
+pub use forwarder::forward_grok_media;
+pub use forwarder::forward_images_generations;
 pub use router::ProxyRoute;
 
 pub fn capabilities() -> Vec<adapters::AdapterCapability> {
@@ -142,6 +148,8 @@ pub(super) fn codex_provider_api_key(
         provider,
         &[
             "OPENAI_API_KEY",
+            "XAI_API_KEY",
+            "GROK_API_KEY",
             "CODEX_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_API_KEY",
@@ -284,11 +292,13 @@ mod tests {
             profile: Some(json!({"chatgpt_account_id":"acct_123"})),
             raw: None,
             subscription_level: None,
+            entitlement_status: None,
             quota: None,
             quota_percent: None,
             quota_refreshed_at: None,
             quota_next_refresh_at: None,
             expires_at: None,
+            rate_limited_until: None,
             last_refresh_error: None,
         });
 
@@ -301,7 +311,12 @@ mod tests {
             vec![
                 ("authorization", "Bearer token".to_string()),
                 ("chatgpt-account-id", "acct_123".to_string()),
-                ("originator", "cc-switch".to_string()),
+                ("originator", "codex_cli_rs".to_string()),
+                ("version", "0.125.0".to_string()),
+                (
+                    "user-agent",
+                    "codex_cli_rs/0.125.0 (Ubuntu 22.04.0; x86_64) xterm-256color".to_string()
+                ),
             ]
         );
     }

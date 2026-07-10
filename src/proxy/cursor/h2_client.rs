@@ -65,6 +65,7 @@ const FIRST_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `DEFAULT_TIMEOUT` (600s); this shorter deadline surfaces errors to the
 /// client within a minute.
 const INTER_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl CursorH2Stream {
     /// Open a fresh h2 stream to Cursor's AgentService endpoint,
@@ -164,6 +165,35 @@ impl CursorH2Stream {
     /// H2 END_STREAM on the request body. After this, [`send_frame`] fails fast.
     pub fn close_writer(&mut self) {
         self.writer = None;
+    }
+
+    pub async fn read_body_limited(&mut self, max_bytes: usize) -> Result<Bytes, ProxyError> {
+        let mut out = bytes::BytesMut::new();
+        let read = async {
+            while out.len() < max_bytes {
+                let Some(frame) = self.response.body_mut().frame().await else {
+                    self.closed = true;
+                    break;
+                };
+                let frame = frame.map_err(|error| {
+                    cursor_forward_error(format!("Cursor error body read failed: {error}"))
+                })?;
+                if frame.is_trailers() {
+                    if let Ok(trailers) = frame.into_trailers() {
+                        self.trailers = Some(trailers);
+                    }
+                    continue;
+                }
+                if let Ok(data) = frame.into_data() {
+                    let remaining = max_bytes.saturating_sub(out.len());
+                    out.extend_from_slice(&data[..data.len().min(remaining)]);
+                }
+            }
+            Ok::<Bytes, ProxyError>(out.freeze())
+        };
+        tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, read)
+            .await
+            .map_err(|_| cursor_forward_error("Cursor error body read timed out"))?
     }
 
     /// Pull the next decoded Connect-RPC frame from the response body. Returns

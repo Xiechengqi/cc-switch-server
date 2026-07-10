@@ -185,6 +185,17 @@
       ],
       "required": false,
       "presentInSource": false
+    },
+    {
+      "id": "grok_oauth",
+      "label": "Grok/xAI OAuth reverse proxy",
+      "apps": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "required": false,
+      "presentInSource": false
     }
   ],
   "presets": {

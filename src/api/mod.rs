@@ -52,6 +52,7 @@ pub(in crate::api) use usage::*;
 
 use anyhow::Context;
 use axum::body::{Body, Bytes};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
@@ -77,13 +78,18 @@ use crate::clients::oauth::refresh::{
     account_needs_native_refresh, execute_native_account_refresh, execute_oauth_json_request,
     execute_oauth_token_request, provider_native_refresh_available, AccountRefreshFailure,
 };
+use crate::domain::accounts::cursor_import::{
+    cursor_workos_user_id_from_access_token, import_from_local_cursor,
+    upsert_input_from_cursor_local_import,
+};
 use crate::domain::accounts::login::{
     OAuthLoginError, OAuthLoginFinish, OAuthLoginStart, OAuthLoginStatus, OAuthSessionPollState,
 };
 use crate::domain::accounts::managers::{manager_for, AccountManager};
 use crate::domain::accounts::oauth::{
-    build_profile_request, build_refresh_request, oauth_provider_spec, token_expires_soon,
-    upsert_input_from_login_response, OAuthAuthorizeFlow, OAuthHttpRequest,
+    build_cursor_profile_request, build_profile_request, build_refresh_request, identity_from_jwt,
+    oauth_provider_spec, token_expires_soon, upsert_input_from_login_response, OAuthAuthorizeFlow,
+    OAuthHttpRequest,
 };
 use crate::domain::accounts::store::{
     Account, AccountRefreshUpdate, AccountStore, UpsertAccountInput,
@@ -226,9 +232,37 @@ pub fn app_router(state: ServerState) -> Router {
             "/api/accounts/import-templates",
             get(account_import_templates),
         )
+        .route(
+            "/api/accounts/claude/credentials/import",
+            post(import_claude_credentials),
+        )
+        .route(
+            "/api/accounts/grok/auth-json/import",
+            post(import_grok_auth_json),
+        )
+        .route(
+            "/api/accounts/kiro/credentials/import",
+            post(import_kiro_credentials_json),
+        )
+        .route(
+            "/api/accounts/kiro/local/import",
+            post(import_kiro_local_credentials),
+        )
+        .route(
+            "/api/accounts/kiro/api-key/import",
+            post(import_kiro_api_key),
+        )
+        .route(
+            "/api/accounts/cursor/local/import",
+            post(import_cursor_local_auth),
+        )
         .route("/api/accounts/login/start", post(start_account_login))
         .route("/api/accounts/login/callback", get(account_login_callback))
         .route("/api/accounts/login/finish", post(finish_account_login))
+        .route(
+            "/web-api/oauth/claude-cli/callback",
+            get(claude_cli_oauth_callback),
+        )
         .route(
             "/api/accounts/copilot/device/start",
             post(start_copilot_device_login),
@@ -254,6 +288,10 @@ pub fn app_router(state: ServerState) -> Router {
             post(poll_codex_device_login),
         )
         .route("/api/accounts/:id", delete(delete_account))
+        .route(
+            "/api/accounts/:id/claude/credentials",
+            get(export_claude_credentials),
+        )
         .route("/api/accounts/:id/refresh", post(refresh_account))
         .route("/api/accounts/:id/refresh-plan", get(account_refresh_plan))
         .route("/api/accounts/:id/quota", get(account_quota))
@@ -353,6 +391,10 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/web-api/auth/password/change", post(web_password_change))
         .route("/web-api/auth/password/set", post(web_password_set))
         .route("/web-api/auth/session/refresh", post(web_session_refresh))
+        .route(
+            "/web-api/oauth/openai-cli/callback",
+            get(openai_cli_oauth_callback),
+        )
         .route("/web-api/context", get(web_runtime_context))
         .route("/web-api/invoke/*command", post(web_invoke_compat))
         .route("/web-api/events", get(events))
@@ -374,19 +416,54 @@ pub fn app_router(state: ServerState) -> Router {
             "/codex/v1/chat/completions",
             post(proxy_codex_chat_completions),
         )
-        .route("/v1/responses", post(proxy_codex_responses))
-        .route("/v1/responses/compact", post(proxy_codex_responses))
-        .route("/v1/v1/responses", post(proxy_codex_responses))
-        .route("/v1/v1/responses/compact", post(proxy_codex_responses))
-        .route("/responses", post(proxy_codex_responses))
-        .route("/responses/compact", post(proxy_codex_responses))
-        .route("/codex/v1/responses", post(proxy_codex_responses))
-        .route("/codex/v1/responses/compact", post(proxy_codex_responses))
+        .route(
+            "/v1/responses",
+            post(proxy_codex_responses).get(proxy_codex_responses_ws),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(proxy_codex_responses_compact).get(proxy_codex_responses_ws),
+        )
+        .route(
+            "/v1/v1/responses",
+            post(proxy_codex_responses).get(proxy_codex_responses_ws),
+        )
+        .route(
+            "/v1/v1/responses/compact",
+            post(proxy_codex_responses_compact).get(proxy_codex_responses_ws),
+        )
+        .route(
+            "/responses",
+            post(proxy_codex_responses).get(proxy_codex_responses_ws),
+        )
+        .route(
+            "/responses/compact",
+            post(proxy_codex_responses_compact).get(proxy_codex_responses_ws),
+        )
+        .route(
+            "/codex/v1/responses",
+            post(proxy_codex_responses).get(proxy_codex_responses_ws),
+        )
+        .route(
+            "/codex/v1/responses/compact",
+            post(proxy_codex_responses_compact),
+        )
         .route("/backend-api/codex/responses", post(proxy_codex_responses))
         .route(
             "/backend-api/codex/responses/compact",
-            post(proxy_codex_responses),
+            post(proxy_codex_responses_compact),
         )
+        .route("/v1/images/generations", post(proxy_images_generations))
+        .route("/images/generations", post(proxy_images_generations))
+        .route("/v1/images/edits", post(proxy_grok_images_edits))
+        .route("/images/edits", post(proxy_grok_images_edits))
+        .route(
+            "/v1/videos/generations",
+            post(proxy_grok_videos_generations),
+        )
+        .route("/videos/generations", post(proxy_grok_videos_generations))
+        .route("/v1/videos/:request_id", get(proxy_grok_video_status))
+        .route("/videos/:request_id", get(proxy_grok_video_status))
         .route("/v1beta/*path", any(proxy_gemini))
         .route("/gemini/v1/*path", any(proxy_gemini))
         .route("/gemini/v1beta/*path", any(proxy_gemini))
@@ -618,6 +695,90 @@ async fn proxy_codex_responses(
     proxy::forward(state, ProxyRoute::CodexResponses, None, headers, body)
         .await
         .map_err(ApiError::proxy)
+}
+
+async fn proxy_codex_responses_compact(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward(
+        state,
+        ProxyRoute::CodexResponsesCompact,
+        None,
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
+}
+
+async fn proxy_codex_responses_ws(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    proxy::forward_codex_responses_ws(state, headers, ws)
+        .await
+        .map_err(ApiError::proxy)
+}
+
+async fn proxy_images_generations(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_images_generations(state, headers, body)
+        .await
+        .map_err(ApiError::proxy)
+}
+
+async fn proxy_grok_images_edits(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_grok_media(
+        state,
+        Method::POST,
+        "/images/edits".to_string(),
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
+}
+
+async fn proxy_grok_videos_generations(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_grok_media(
+        state,
+        Method::POST,
+        "/videos/generations".to_string(),
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
+}
+
+async fn proxy_grok_video_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Response, ApiError> {
+    proxy::forward_grok_media(
+        state,
+        Method::GET,
+        format!("/videos/{request_id}"),
+        headers,
+        Bytes::new(),
+    )
+    .await
+    .map_err(ApiError::proxy)
 }
 
 async fn proxy_gemini(

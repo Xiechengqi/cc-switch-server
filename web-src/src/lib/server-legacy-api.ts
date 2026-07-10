@@ -141,6 +141,7 @@ export interface AccountRecord {
   profile?: unknown;
   raw?: unknown;
   subscriptionLevel?: string | null;
+  entitlementStatus?: string | null;
   quotaPercent?: number | null;
   quota?: AccountQuota | null;
   quotaRefreshedAt?: number | null;
@@ -258,6 +259,7 @@ export interface AccountLoginAccountSummary {
   providerType: string;
   email?: string | null;
   subscriptionLevel?: string | null;
+  entitlementStatus?: string | null;
   expiresAt?: number | null;
   hasAccessToken: boolean;
   hasRefreshToken: boolean;

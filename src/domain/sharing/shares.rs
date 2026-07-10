@@ -1265,35 +1265,37 @@ mod tests {
     #[test]
     fn upsert_share_defaults_binding_and_status() {
         let mut store = ShareStore::default();
-        let share = store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: Some("owner@example.com".to_string()),
-            app: AppKind::Claude,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Claude,
-            display_name: Some("share".to_string()),
-            enabled: None,
-            status: None,
-            subscription_level: Some("pro".to_string()),
-            account_email: Some("owner@example.com".to_string()),
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: None,
-            token_limit: Some(1000),
-            parallel_limit: Some(2),
-            expires_at: None,
-            for_sale: Some(true),
-            sale_market_kind: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: Some(80.0),
-            auto_start: Some(true),
-            description: Some("test".to_string()),
-            bindings: Vec::new(),
-            runtime_snapshot: None,
-            market_grant: None,
-        });
+        let share = store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: Some("owner@example.com".to_string()),
+                app: AppKind::Claude,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Claude,
+                display_name: Some("share".to_string()),
+                enabled: None,
+                status: None,
+                subscription_level: Some("pro".to_string()),
+                account_email: Some("owner@example.com".to_string()),
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: None,
+                token_limit: Some(1000),
+                parallel_limit: Some(2),
+                expires_at: None,
+                for_sale: Some(true),
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: Some(80.0),
+                auto_start: Some(true),
+                description: Some("test".to_string()),
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: None,
+            })
+            .unwrap();
 
         assert_eq!(share.status, "active");
         assert!(share.enabled);
@@ -1306,7 +1308,7 @@ mod tests {
     #[test]
     fn validates_share_invocation_lifecycle_limits_and_counters() {
         let mut store = ShareStore::default();
-        store.upsert(codex_share_input("expired"));
+        let _ = store.upsert(codex_share_input("expired")).unwrap();
         store.shares[0].expires_at = Some(999);
         let rejection = store
             .validate_for_invocation("expired", 1_000_000)
@@ -1319,7 +1321,7 @@ mod tests {
         assert_eq!(store.shares[0].status, "expired");
         assert!(!store.shares[0].enabled);
 
-        store.upsert(codex_share_input("paused"));
+        let _ = store.upsert(codex_share_input("paused")).unwrap();
         store.pause("paused").unwrap();
         let rejection = store
             .validate_for_invocation("paused", 1_000_000)
@@ -1327,7 +1329,7 @@ mod tests {
         assert_eq!(rejection.reason, ShareRejectReason::Inactive);
         assert!(rejection.formatted_message().contains("[Inactive]"));
 
-        store.upsert(codex_share_input("limited"));
+        let _ = store.upsert(codex_share_input("limited")).unwrap();
         {
             let limited = store
                 .shares
@@ -1351,7 +1353,7 @@ mod tests {
             "exhausted"
         );
 
-        store.upsert(codex_share_input("record"));
+        let _ = store.upsert(codex_share_input("record")).unwrap();
         store
             .shares
             .iter_mut()
@@ -1373,35 +1375,37 @@ mod tests {
     #[test]
     fn upsert_share_generates_default_subdomain_from_owner_email() {
         let mut store = ShareStore::default();
-        let share = store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: Some("abc.def@example.com".to_string()),
-            app: AppKind::Claude,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Claude,
-            display_name: None,
-            enabled: None,
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: None,
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: None,
-            sale_market_kind: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: None,
-            market_grant: None,
-        });
+        let share = store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: Some("abc.def@example.com".to_string()),
+                app: AppKind::Claude,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Claude,
+                display_name: None,
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: None,
+            })
+            .unwrap();
 
         let subdomain = share.tunnel_subdomain.unwrap();
         assert!(subdomain.starts_with("abcde"));
@@ -1411,35 +1415,37 @@ mod tests {
     #[test]
     fn updates_binding_only_when_paused() {
         let mut store = ShareStore::default();
-        store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: None,
-            app: AppKind::Codex,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Codex,
-            display_name: None,
-            enabled: None,
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: None,
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: None,
-            sale_market_kind: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: None,
-            market_grant: None,
-        });
+        store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: None,
+                app: AppKind::Codex,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Codex,
+                display_name: None,
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: None,
+            })
+            .unwrap();
 
         let error = store
             .update_binding(
@@ -1492,6 +1498,7 @@ mod tests {
             tokens_used: 0,
             requests_count: 0,
             expires_at: None,
+            created_at_ms: 0,
             for_sale: false,
             sale_market_kind: "token".to_string(),
             access_by_app: BTreeMap::new(),
@@ -1531,35 +1538,37 @@ mod tests {
     #[test]
     fn applies_share_market_app_settings_patch() {
         let mut store = ShareStore::default();
-        store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: Some("owner@example.com".to_string()),
-            app: AppKind::Codex,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Codex,
-            display_name: None,
-            enabled: None,
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: None,
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: Some(true),
-            sale_market_kind: Some("share".to_string()),
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: None,
-            market_grant: None,
-        });
+        store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: Some("owner@example.com".to_string()),
+                app: AppKind::Codex,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Codex,
+                display_name: None,
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: Some(true),
+                sale_market_kind: Some("share".to_string()),
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: None,
+            })
+            .unwrap();
 
         let mut app_settings = BTreeMap::new();
         app_settings.insert(
@@ -1610,35 +1619,37 @@ mod tests {
     #[test]
     fn authorize_share_market_marks_app_settings_for_sale() {
         let mut store = ShareStore::default();
-        store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: Some("owner@example.com".to_string()),
-            app: AppKind::Codex,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Codex,
-            display_name: None,
-            enabled: None,
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: None,
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: None,
-            sale_market_kind: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: Some(json!({"shareId": "s1"})),
-            market_grant: None,
-        });
+        store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: Some("owner@example.com".to_string()),
+                app: AppKind::Codex,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Codex,
+                display_name: None,
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: Some(json!({"shareId": "s1"})),
+                market_grant: None,
+            })
+            .unwrap();
         let stored = store
             .shares
             .iter_mut()
@@ -1713,35 +1724,37 @@ mod tests {
     #[test]
     fn mark_router_sync_records_success_and_failure_details() {
         let mut store = ShareStore::default();
-        store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: None,
-            app: AppKind::Codex,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Codex,
-            display_name: None,
-            enabled: None,
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: None,
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: None,
-            sale_market_kind: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: None,
-            market_grant: None,
-        });
+        store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: None,
+                app: AppKind::Codex,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Codex,
+                display_name: None,
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: None,
+            })
+            .unwrap();
 
         store.mark_router_sync("s1", Some("https://router.example".to_string()), Ok(123));
         let share = store.shares.iter().find(|share| share.id == "s1").unwrap();
@@ -1762,40 +1775,42 @@ mod tests {
     #[test]
     fn share_market_grant_status_is_persisted_for_web_display() {
         let mut store = ShareStore::default();
-        let share = store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: None,
-            app: AppKind::Codex,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Codex,
-            display_name: None,
-            enabled: None,
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: None,
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: None,
-            sale_market_kind: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: None,
-            market_grant: Some(ShareMarketGrantStatus {
-                status: "pending".to_string(),
-                grant_id: Some("grant-1".to_string()),
-                last_error: None,
-                updated_at_ms: Some(123),
-            }),
-        });
+        let share = store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: None,
+                app: AppKind::Codex,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Codex,
+                display_name: None,
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: Some(ShareMarketGrantStatus {
+                    status: "pending".to_string(),
+                    grant_id: Some("grant-1".to_string()),
+                    last_error: None,
+                    updated_at_ms: Some(123),
+                }),
+            })
+            .unwrap();
 
         assert_eq!(
             share
@@ -1826,7 +1841,7 @@ mod tests {
     #[test]
     fn runtime_snapshot_includes_model_health_summary() {
         let mut store = ShareStore::default();
-        let share = store.upsert(codex_share_input("s1"));
+        let share = store.upsert(codex_share_input("s1")).unwrap();
         let providers = ProviderStore::default();
         let usage = UsageStore::default();
 
@@ -1845,43 +1860,45 @@ mod tests {
     #[test]
     fn updates_market_grant_and_keeps_existing_snapshot_consistent() {
         let mut store = ShareStore::default();
-        store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: None,
-            app: AppKind::Codex,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Codex,
-            display_name: None,
-            enabled: None,
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: None,
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: None,
-            sale_market_kind: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: Some(json!({
-                "shareId": "s1",
-                "marketGrant": {"status": "pending"}
-            })),
-            market_grant: Some(ShareMarketGrantStatus {
-                status: "pending".to_string(),
-                grant_id: None,
-                last_error: None,
-                updated_at_ms: Some(100),
-            }),
-        });
+        store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: None,
+                app: AppKind::Codex,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Codex,
+                display_name: None,
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: Some(json!({
+                    "shareId": "s1",
+                    "marketGrant": {"status": "pending"}
+                })),
+                market_grant: Some(ShareMarketGrantStatus {
+                    status: "pending".to_string(),
+                    grant_id: None,
+                    last_error: None,
+                    updated_at_ms: Some(100),
+                }),
+            })
+            .unwrap();
 
         let updated = store
             .update_market_grant(
@@ -1922,7 +1939,7 @@ mod tests {
     #[test]
     fn share_market_grant_app_settings_add_and_revoke_target_buyer() {
         let mut store = ShareStore::default();
-        store.upsert(codex_share_input("s1"));
+        let _ = store.upsert(codex_share_input("s1")).unwrap();
 
         let added = store
             .apply_settings_patch(
@@ -1966,7 +1983,7 @@ mod tests {
     #[test]
     fn share_market_grant_duplicate_status_update_is_idempotent_for_display() {
         let mut store = ShareStore::default();
-        store.upsert(codex_share_input("s1"));
+        let _ = store.upsert(codex_share_input("s1")).unwrap();
 
         let first = ShareMarketGrantStatus {
             status: "applied".to_string(),
@@ -2008,7 +2025,7 @@ mod tests {
     #[test]
     fn share_market_grant_rejected_error_is_display_only() {
         let mut store = ShareStore::default();
-        store.upsert(codex_share_input("s1"));
+        let _ = store.upsert(codex_share_input("s1")).unwrap();
         store
             .apply_settings_patch(
                 "s1",
@@ -2050,7 +2067,7 @@ mod tests {
     #[test]
     fn sequential_share_market_patches_are_deterministic() {
         let mut store = ShareStore::default();
-        store.upsert(codex_share_input("s1"));
+        let _ = store.upsert(codex_share_input("s1")).unwrap();
 
         store
             .apply_settings_patch(
@@ -2087,42 +2104,44 @@ mod tests {
     #[test]
     fn update_owner_email_renormalizes_acl_without_verification() {
         let mut store = ShareStore::default();
-        store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: Some("owner@example.com".to_string()),
-            app: AppKind::Claude,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Claude,
-            display_name: None,
-            enabled: Some(true),
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: Some(ShareAcl {
-                shared_with_emails: vec![
-                    "owner@example.com".to_string(),
-                    "buyer@example.com".to_string(),
-                ],
-                public_market_email: None,
-                market_access_mode: Some("selected".to_string()),
-            }),
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: None,
-            sale_market_kind: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: None,
-            market_grant: None,
-        });
+        store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: Some("owner@example.com".to_string()),
+                app: AppKind::Claude,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Claude,
+                display_name: None,
+                enabled: Some(true),
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: Some(ShareAcl {
+                    shared_with_emails: vec![
+                        "owner@example.com".to_string(),
+                        "buyer@example.com".to_string(),
+                    ],
+                    public_market_email: None,
+                    market_access_mode: Some("selected".to_string()),
+                }),
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: None,
+            })
+            .unwrap();
 
         let updated = store
             .update_owner_email("s1", "new-owner@example.com")
@@ -2153,11 +2172,11 @@ mod tests {
             market_access_mode: Some("selected".to_string()),
         });
         first.app_settings = codex_app_settings(vec!["new-owner@example.com", "buyer@example.com"]);
-        store.upsert(first);
-        store.upsert(codex_share_input("s2"));
+        let _ = store.upsert(first).unwrap();
+        let _ = store.upsert(codex_share_input("s2")).unwrap();
         let mut other = codex_share_input("s3");
         other.owner_email = Some("other@example.com".to_string());
-        store.upsert(other);
+        let _ = store.upsert(other).unwrap();
 
         let updated = store
             .change_owner_email_for_all("OWNER@example.com", "New-Owner@Example.com")
@@ -2197,39 +2216,41 @@ mod tests {
     #[test]
     fn transfer_owner_email_requires_existing_acl_member() {
         let mut store = ShareStore::default();
-        store.upsert(UpsertShareInput {
-            id: Some("s1".to_string()),
-            owner_email: Some("owner@example.com".to_string()),
-            app: AppKind::Claude,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Claude,
-            display_name: None,
-            enabled: Some(true),
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: None,
-            acl: Some(ShareAcl {
-                shared_with_emails: vec!["buyer@example.com".to_string()],
-                public_market_email: None,
-                market_access_mode: Some("selected".to_string()),
-            }),
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: None,
-            sale_market_kind: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: None,
-            market_grant: None,
-        });
+        store
+            .upsert(UpsertShareInput {
+                id: Some("s1".to_string()),
+                owner_email: Some("owner@example.com".to_string()),
+                app: AppKind::Claude,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Claude,
+                display_name: None,
+                enabled: Some(true),
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                acl: Some(ShareAcl {
+                    shared_with_emails: vec!["buyer@example.com".to_string()],
+                    public_market_email: None,
+                    market_access_mode: Some("selected".to_string()),
+                }),
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: None,
+            })
+            .unwrap();
 
         let updated = store
             .transfer_owner_email("s1", "buyer@example.com")

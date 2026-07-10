@@ -80,6 +80,7 @@ import { ClaudeFormFields } from "./ClaudeFormFields";
 import { ClaudeDesktopProviderForm } from "./ClaudeDesktopProviderForm";
 import { CodexFormFields } from "./CodexFormFields";
 import { GeminiFormFields } from "./GeminiFormFields";
+import { GrokOAuthSection } from "./GrokOAuthSection";
 import { OmoFormFields } from "./OmoFormFields";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
 import {
@@ -118,6 +119,7 @@ import {
   useCursorOauth,
   useKiroOauth,
   useDeepSeekAccount,
+  useManagedAuth,
 } from "./hooks";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useSettingsQuery, useSharesQuery } from "@/lib/query";
@@ -147,6 +149,9 @@ const isAntigravityFamilyType = (providerType?: string | null) =>
 
 const isOpenAIOAuthProviderType = (providerType?: string | null) =>
   providerType === PROVIDER_TYPES.CODEX_OAUTH || providerType === "codex_oauth";
+
+const isGrokOauthProviderType = (providerType?: string | null) =>
+  providerType === PROVIDER_TYPES.GROK_OAUTH || providerType === "grok_oauth";
 
 const CURSOR_DEFAULT_UPSTREAM_MODEL = "composer-2.5";
 
@@ -615,6 +620,11 @@ function ProviderFormFull({
     accounts: codexOauthAccounts,
     defaultAccountId: defaultCodexAccountId,
   } = useCodexOauth();
+  const {
+    isAuthenticated: isGrokOauthAuthenticated,
+    accounts: grokOauthAccounts,
+    defaultAccountId: defaultGrokAccountId,
+  } = useManagedAuth("grok_oauth");
 
   // Claude OAuth 认证状态（Anthropic 官方订阅）
   const { isAuthenticated: isClaudeOauthAuthenticated } = useClaudeOauth();
@@ -653,6 +663,9 @@ function ProviderFormFull({
   const [selectedCodexAccountId, setSelectedCodexAccountId] = useState<
     string | null
   >(() => resolveManagedAccountId(initialData?.meta, "codex_oauth"));
+  const [selectedGrokAccountId, setSelectedGrokAccountId] = useState<
+    string | null
+  >(() => resolveManagedAccountId(initialData?.meta, "grok_oauth"));
   const [codexFastMode, setCodexFastMode] = useState<boolean>(
     () => initialData?.meta?.codexFastMode ?? false,
   );
@@ -893,6 +906,27 @@ function ProviderFormFull({
     (appId === "gemini" && category === "official" && hasGoogleGeminiAuthBinding
       ? PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH
       : undefined);
+  const isGrokOauthProvider =
+    isGrokOauthProviderType(currentProviderType) ||
+    isGrokOauthProviderType(selectedCodexPresetProviderType) ||
+    isGrokOauthProviderType(templatePreset?.providerType) ||
+    isGrokOauthProviderType(initialData?.meta?.providerType);
+
+  useEffect(() => {
+    if (!isGrokOauthProvider || selectedGrokAccountId) {
+      return;
+    }
+    const preferredAccountId =
+      defaultGrokAccountId ?? grokOauthAccounts[0]?.id ?? null;
+    if (preferredAccountId) {
+      setSelectedGrokAccountId(preferredAccountId);
+    }
+  }, [
+    defaultGrokAccountId,
+    grokOauthAccounts,
+    isGrokOauthProvider,
+    selectedGrokAccountId,
+  ]);
   const isGeminiOfficialPreset =
     appId === "gemini" &&
     currentProviderType === PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH;
@@ -1609,6 +1643,24 @@ function ProviderFormFull({
       );
       return;
     }
+    if (isGrokOauthProvider) {
+      if (!isGrokOauthAuthenticated) {
+        toast.error(
+          t("grokOauth.loginRequired", {
+            defaultValue: "请先登录 Grok 账号",
+          }),
+        );
+        return;
+      }
+      if (!selectedGrokAccountId) {
+        toast.error(
+          t("grokOauth.selectAccountRequired", {
+            defaultValue: "Grok OAuth 必须绑定一个 Grok 账号",
+          }),
+        );
+        return;
+      }
+    }
     if (isCursorOauthProvider) {
       if (!isCursorOauthAuthenticated) {
         toast.error(
@@ -2154,7 +2206,13 @@ function ProviderFormFull({
               authProvider: "cursor_oauth",
               accountId: selectedCursorAccountId ?? undefined,
             }
-          : isCodexOauthProvider || isCodexOfficialPreset
+          : isGrokOauthProvider
+            ? {
+                source: "managed_account",
+                authProvider: "grok_oauth",
+                accountId: selectedGrokAccountId ?? undefined,
+              }
+            : isCodexOauthProvider || isCodexOfficialPreset
             ? {
                 source: "managed_account",
                 authProvider: "codex_oauth",
@@ -2914,6 +2972,8 @@ function ProviderFormFull({
                 baseUrl.includes("githubcopilot.com") ||
                 isOpenAIOAuthProviderType(templatePreset?.providerType) ||
                 isOpenAIOAuthProviderType(initialData?.meta?.providerType) ||
+                isGrokOauthProviderType(templatePreset?.providerType) ||
+                isGrokOauthProviderType(initialData?.meta?.providerType) ||
                 templatePreset?.providerType === "claude_oauth" ||
                 initialData?.meta?.providerType === "claude_oauth" ||
                 isAntigravityFamilyType(templatePreset?.providerType) ||
@@ -3069,6 +3129,14 @@ function ProviderFormFull({
               model={geminiModel}
               onModelChange={handleGeminiModelChange}
               speedTestEndpoints={speedTestEndpoints}
+            />
+          )}
+
+          {isGrokOauthProvider && (
+            <GrokOAuthSection
+              selectedAccountId={selectedGrokAccountId}
+              onAccountSelect={setSelectedGrokAccountId}
+              allowDefaultAccountOption={false}
             />
           )}
 

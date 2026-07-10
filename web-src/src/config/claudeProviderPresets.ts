@@ -69,6 +69,7 @@ export interface ProviderPreset {
   providerType?:
     | "github_copilot"
     | "codex_oauth"
+    | "grok_oauth"
     | "claude_oauth"
     | "google_gemini_oauth"
     | "antigravity_oauth"
@@ -137,6 +138,31 @@ export const providerPresets: ProviderPreset[] = [
     },
     icon: "openai",
     iconColor: "#00A67E",
+  },
+  {
+    name: "Grok OAuth",
+    websiteUrl: "https://x.ai",
+    settingsConfig: {
+      env: {
+        ANTHROPIC_BASE_URL: "https://api.x.ai/v1",
+        ANTHROPIC_MODEL: "grok-4.3",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "grok-3-mini",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "grok-4.3",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "grok-4.3",
+      },
+    },
+    isOfficial: true,
+    category: "official",
+    apiFormat: "openai_responses",
+    providerType: "grok_oauth",
+    requiresOAuth: true,
+    theme: {
+      icon: "generic",
+      backgroundColor: "#111827",
+      textColor: "#FFFFFF",
+    },
+    icon: "grok",
+    iconColor: "#111827",
   },
   {
     name: "Kiro OAuth",

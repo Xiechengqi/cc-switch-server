@@ -526,19 +526,22 @@ pub(in crate::api) async fn test_provider_inner(
             .map_err(ApiError::proxy)?;
         target_headers.extend(adapter_request.upstream_headers.iter().cloned());
         if stored.app == AppKind::Claude && stored.provider_type == ProviderType::ClaudeOAuth {
-            let (beta_name, beta_value) = proxy::claude_oauth::apply_forward_contract(
+            let contract = proxy::claude_oauth::apply_forward_contract(
                 &mut endpoint_for_request,
                 &mut adapter_request.body,
                 &axum::http::HeaderMap::new(),
+                &stored.provider.id,
             )
             .map_err(ApiError::proxy)?;
-            if let Some((_, existing)) = target_headers
-                .iter_mut()
-                .find(|(name, _)| name.eq_ignore_ascii_case(beta_name))
-            {
-                *existing = beta_value;
-            } else {
-                target_headers.push((beta_name, beta_value));
+            for (header_name, header_value) in contract.headers {
+                if let Some((_, existing)) = target_headers
+                    .iter_mut()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(header_name))
+                {
+                    *existing = header_value;
+                } else {
+                    target_headers.push((header_name, header_value));
+                }
             }
         }
         let stream = adapter_request.stream_requested || stream;

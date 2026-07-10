@@ -1229,6 +1229,7 @@ mod tests {
             tokens_used: 0,
             requests_count: 0,
             expires_at: None,
+            created_at_ms: 0,
             for_sale: false,
             sale_market_kind: "token".to_string(),
             access_by_app: BTreeMap::new(),
@@ -1266,6 +1267,7 @@ mod tests {
             profile: None,
             raw: None,
             subscription_level: Some("ChatGPT Pro 20x".to_string()),
+            entitlement_status: None,
             quota_percent: Some(42.0),
             quota: Some(AccountQuota {
                 success: true,
@@ -1280,6 +1282,7 @@ mod tests {
             quota_refreshed_at: Some(1_000),
             quota_next_refresh_at: Some(2_000),
             expires_at: None,
+            rate_limited_until: None,
             last_refresh_error: None,
         }
     }

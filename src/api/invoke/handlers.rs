@@ -1,7 +1,7 @@
 use super::super::*;
 use std::collections::BTreeMap;
 
-use crate::domain::accounts::oauth::CLAUDE_WEB_PASTE_REDIRECT_URI;
+use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
 use crate::domain::sharing::router_contract::ShareSettingsPatch;
 
 pub(in crate::api) fn web_provider_health_json(
@@ -1057,8 +1057,6 @@ pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Valu
         ShareHealthLevel::Unhealthy
     } else if shares_store.router_registered {
         ShareHealthLevel::Healthy
-    } else if router_domain.is_empty() {
-        ShareHealthLevel::Warning
     } else {
         ShareHealthLevel::Warning
     };
@@ -1088,8 +1086,6 @@ pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Valu
         .is_some_and(|status| tunnel_runtime_is_healthy(status.status.as_str()))
     {
         ShareHealthLevel::Healthy
-    } else if client_subdomain.trim().is_empty() {
-        ShareHealthLevel::Warning
     } else {
         ShareHealthLevel::Warning
     };
@@ -1673,6 +1669,7 @@ pub(in crate::api) fn web_parse_auth_provider_type(value: &str) -> Result<Provid
         "google_gemini_oauth" | "gemini_cli" => Ok(ProviderType::GeminiCli),
         "github_copilot" => Ok(ProviderType::GitHubCopilot),
         "codex_oauth" => Ok(ProviderType::CodexOAuth),
+        "grok_oauth" => Ok(ProviderType::GrokOAuth),
         "claude_oauth" => Ok(ProviderType::ClaudeOAuth),
         "antigravity_oauth" => Ok(ProviderType::AntigravityOAuth),
         "cursor_oauth" => Ok(ProviderType::CursorOAuth),
@@ -1710,6 +1707,7 @@ pub(in crate::api) fn managed_auth_provider_label(provider_type: ProviderType) -
     match provider_type {
         ProviderType::GitHubCopilot => "github_copilot",
         ProviderType::CodexOAuth => "codex_oauth",
+        ProviderType::GrokOAuth => "grok_oauth",
         ProviderType::ClaudeOAuth => "claude_oauth",
         ProviderType::GeminiCli => "google_gemini_oauth",
         ProviderType::AntigravityOAuth => "antigravity_oauth",
@@ -1782,6 +1780,9 @@ pub(in crate::api) fn web_managed_auth_redirect_uri(
         )
     {
         return CLAUDE_WEB_PASTE_REDIRECT_URI.to_string();
+    }
+    if provider_type == ProviderType::GrokOAuth {
+        return XAI_LOOPBACK_REDIRECT_URI.to_string();
     }
     if let Some(uri) = web_optional_string_any(
         args,
@@ -1919,6 +1920,11 @@ pub(in crate::api) async fn web_managed_auth_start_login(
                 Json(StartKiroDeviceLoginRequest {
                     region: web_optional_string_any(args, &["region"]),
                     start_url: web_optional_string_any(args, &["startUrl", "start_url"]),
+                    issuer_url: web_optional_string_any(args, &["issuerUrl", "issuer_url"]),
+                    login_provider: web_optional_string_any(
+                        args,
+                        &["kiroLoginProvider", "kiro_login_provider", "loginProvider"],
+                    ),
                 }),
             )
             .await?

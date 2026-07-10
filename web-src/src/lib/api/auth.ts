@@ -3,6 +3,7 @@ import { invokeCommand, isTauriRuntime } from "@/lib/runtime";
 export type ManagedAuthProvider =
   | "github_copilot"
   | "codex_oauth"
+  | "grok_oauth"
   | "claude_oauth"
   | "google_gemini_oauth"
   | "antigravity_oauth"
@@ -51,18 +52,38 @@ export interface ManagedAuthDeviceCodeResponse {
   interval: number;
 }
 
+export interface ImportGrokAuthJsonResponse {
+  ok: boolean;
+  account: ManagedAuthAccount;
+}
+
+export interface ImportCursorLocalAuthResponse {
+  ok: boolean;
+  account: ManagedAuthAccount;
+  source: "ide_state_vscdb" | "cursor_agent_auth_json" | string;
+  path?: string | null;
+  profileError?: string | null;
+}
+
+export interface ImportKiroCredentialsResponse {
+  ok: boolean;
+  account: ManagedAuthAccount;
+  source?: string | null;
+}
+
 /**
- * `claude_oauth` 在 web 模式（client URL 访问、非桌面 Tauri）下，redirect_uri 改成
- * `https://platform.claude.com/oauth/code/callback`，用户手动复制授权码后调用
- * `authSubmitOauthCode` 提交。其它 provider 缺乏对应的 out-of-band 回调端点，
+ * `claude_oauth` / `grok_oauth` 在 web 模式（client URL 访问、非桌面 Tauri）下走手动粘贴回调，
+ * 用户复制授权码或 callback URL 后调用 `authSubmitOauthCode` 提交。其它 provider 缺乏对应的 out-of-band 回调端点，
  * 维持原来的"web 模式禁用"行为。
  */
 const WEB_PASTE_CAPABLE_PROVIDERS = new Set<ManagedAuthProvider>([
   "claude_oauth",
+  "grok_oauth",
 ]);
 
 const LOCAL_CALLBACK_AUTH_PROVIDERS = new Set<ManagedAuthProvider>([
   "claude_oauth",
+  "grok_oauth",
   "google_gemini_oauth",
   "antigravity_oauth",
 ]);
@@ -149,6 +170,7 @@ export async function authStartLogin(
    */
   oauthFlowMode?: "web_paste" | "localhost" | "cli" | "device",
   codexCallbackUrl?: string | null,
+  kiroLoginProvider?: "google" | "github" | null,
 ): Promise<ManagedAuthDeviceCodeResponse> {
   if (shouldBlockLocalCallbackAuthInClientWeb(authProvider)) {
     throw new Error(localCallbackAuthBlockedMessage());
@@ -158,6 +180,7 @@ export async function authStartLogin(
     githubDomain: githubDomain || null,
     oauthFlowMode: oauthFlowMode || null,
     codexCallbackUrl: codexCallbackUrl || null,
+    kiroLoginProvider: kiroLoginProvider || null,
   });
 }
 
@@ -233,6 +256,46 @@ export async function authLogout(
   });
 }
 
+export async function importGrokAuthJson(
+  authJson: unknown,
+): Promise<ImportGrokAuthJsonResponse> {
+  return invokeCommand<ImportGrokAuthJsonResponse>("grok_import_auth_json", {
+    authJson,
+  });
+}
+
+export async function importCursorLocalAuth(): Promise<ImportCursorLocalAuthResponse> {
+  return invokeCommand<ImportCursorLocalAuthResponse>("cursor_import_local_auth");
+}
+
+export async function importKiroCredentials(
+  credentials: unknown,
+): Promise<ImportKiroCredentialsResponse> {
+  return invokeCommand<ImportKiroCredentialsResponse>(
+    "kiro_import_credentials_json",
+    { credentials },
+  );
+}
+
+export async function importKiroLocalCredentials(
+  path?: string | null,
+): Promise<ImportKiroCredentialsResponse> {
+  return invokeCommand<ImportKiroCredentialsResponse>(
+    "kiro_import_local_credentials",
+    { path: path || null },
+  );
+}
+
+export async function importKiroApiKey(
+  apiKey: string,
+  region?: string | null,
+): Promise<ImportKiroCredentialsResponse> {
+  return invokeCommand<ImportKiroCredentialsResponse>("kiro_import_api_key", {
+    apiKey,
+    region: region || null,
+  });
+}
+
 export async function deepseekAccountAdd(params: {
   email?: string | null;
   mobile?: string | null;
@@ -272,6 +335,11 @@ export const authApi = {
   authRemoveAccount,
   authSetDefaultAccount,
   authLogout,
+  importGrokAuthJson,
+  importCursorLocalAuth,
+  importKiroCredentials,
+  importKiroLocalCredentials,
+  importKiroApiKey,
   deepseekAccountAdd,
   deepseekAccountList,
   deepseekAccountStatus,

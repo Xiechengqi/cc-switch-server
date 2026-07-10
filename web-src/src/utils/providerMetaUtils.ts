@@ -206,6 +206,7 @@ export function canTestProvider(
 export type ProviderQuotaSource =
   | "copilot"
   | "codex_oauth"
+  | "grok_oauth"
   | "claude_oauth"
   | "google_gemini_oauth"
   | "antigravity_oauth"
@@ -233,6 +234,10 @@ export function getProviderQuotaSource(
     (appId === "codex" && isCodexOfficialWithManagedAuth(provider))
   ) {
     return "codex_oauth";
+  }
+
+  if (provider.meta?.providerType === PROVIDER_TYPES.GROK_OAUTH) {
+    return "grok_oauth";
   }
 
   if (provider.meta?.providerType === PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH) {

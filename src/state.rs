@@ -12,9 +12,11 @@ use tokio::time::{sleep, Duration};
 
 use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::Cli;
-use crate::clients::oauth::codex_device::CodexDeviceFlowStore;
+use crate::clients::oauth::codex_device::{CodexDeviceFlowStore, PendingCodexDeviceFlow};
 use crate::clients::oauth::copilot_device;
-use crate::clients::oauth::kiro_device::KiroDeviceFlowStore;
+use crate::clients::oauth::kiro_device::{
+    KiroDeviceFlowStore, PendingKiroDeviceFlow, PendingKiroSocialDeviceFlow,
+};
 use crate::clients::oauth::quota::{refresh_account_quota, QuotaRefreshResult};
 use crate::clients::oauth::refresh::{
     account_needs_native_refresh, execute_native_account_refresh,
@@ -61,8 +63,9 @@ pub struct ServerStateInner {
     pub(crate) sessions: RwLock<Vec<Session>>,
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
-    pub kiro_device_flows: RwLock<KiroDeviceFlowStore>,
-    pub codex_device_flows: RwLock<CodexDeviceFlowStore>,
+    grok_media_sessions: Mutex<BTreeMap<String, GrokMediaSessionBinding>>,
+    kiro_device_flows: RwLock<KiroDeviceFlowStore>,
+    codex_device_flows: RwLock<CodexDeviceFlowStore>,
     pub cursor_sessions: CursorSessionManager,
     pub account_refresh_locks: AccountRefreshLocks,
     pub share_in_flight: Arc<ShareInFlightTracker>,
@@ -114,6 +117,13 @@ pub(crate) struct CachedCopilotUpstreamAuth {
     expires_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GrokMediaSessionBinding {
+    pub provider_id: String,
+    pub account_id: Option<String>,
+    pub expires_at_ms: i64,
+}
+
 pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
     vec![
         crate::domain::settings::config::config_path(config_dir),
@@ -121,6 +131,7 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::providers::store::providers_path(config_dir),
         crate::domain::providers::universal::universal_providers_path(config_dir),
         crate::domain::accounts::store::accounts_path(config_dir),
+        crate::domain::accounts::store::accounts_key_path(config_dir),
         crate::domain::failover::failover_path(config_dir),
         crate::domain::usage::pricing::model_pricing_path(config_dir),
         crate::domain::usage::store::usage_path(config_dir),
@@ -515,6 +526,7 @@ impl ServerStateInner {
             sessions: RwLock::new(Vec::new()),
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
             copilot_upstream_auth: RwLock::new(BTreeMap::new()),
+            grok_media_sessions: Mutex::new(BTreeMap::new()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             cursor_sessions: CursorSessionManager::default(),
@@ -892,10 +904,8 @@ impl ServerStateInner {
 
         let _refresh_guard = self
             .account_refresh_locks
-            .try_lock(account.provider_type, &account.id)
-            .ok_or(ManagedAccountRefreshError::Conflict {
-                provider_type: account.provider_type,
-            })?;
+            .lock(account.provider_type, &account.id)
+            .await;
 
         let account = {
             let accounts = self.accounts.read().await;
@@ -934,6 +944,165 @@ impl ServerStateInner {
         }
         save_accounts_debounced(self);
         Ok(())
+    }
+
+    pub async fn mark_account_rate_limited_until(
+        self: &Arc<Self>,
+        account_id: &str,
+        rate_limited_until: i64,
+        message: Option<String>,
+    ) -> Option<Account> {
+        let account = {
+            let mut accounts = self.accounts.write().await;
+            accounts.mark_rate_limited_until(account_id, rate_limited_until, message)
+        };
+        if account.is_some() {
+            save_accounts_debounced(self);
+        }
+        account
+    }
+
+    pub async fn update_account_entitlement_snapshot(
+        self: &Arc<Self>,
+        account_id: &str,
+        subscription_level: Option<String>,
+        entitlement_status: Option<String>,
+        updated_at_ms: i64,
+    ) -> Option<Account> {
+        if subscription_level.is_none() && entitlement_status.is_none() {
+            return None;
+        }
+        let account = {
+            let mut accounts = self.accounts.write().await;
+            accounts.update_entitlement_snapshot(
+                account_id,
+                subscription_level,
+                entitlement_status,
+                updated_at_ms,
+            )
+        };
+        if account.is_some() {
+            save_accounts_debounced(self);
+        }
+        account
+    }
+
+    pub fn remember_grok_media_session(
+        &self,
+        session_key: String,
+        provider_id: String,
+        account_id: Option<String>,
+        ttl_ms: i64,
+    ) {
+        let now = crate::infra::time::now_ms() as i64;
+        let expires_at_ms = now.saturating_add(ttl_ms);
+        let mut sessions = self
+            .grok_media_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions.retain(|_, binding| binding.expires_at_ms > now);
+        sessions.insert(
+            session_key,
+            GrokMediaSessionBinding {
+                provider_id,
+                account_id,
+                expires_at_ms,
+            },
+        );
+    }
+
+    pub fn grok_media_session_binding(&self, session_key: &str) -> Option<GrokMediaSessionBinding> {
+        let now = crate::infra::time::now_ms() as i64;
+        let mut sessions = self
+            .grok_media_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions.retain(|_, binding| binding.expires_at_ms > now);
+        sessions.get(session_key).cloned()
+    }
+
+    pub async fn insert_kiro_device_flow(
+        &self,
+        device_code: String,
+        flow: PendingKiroDeviceFlow,
+        now_ms: i64,
+    ) {
+        self.kiro_device_flows
+            .write()
+            .await
+            .insert(device_code, flow, now_ms);
+    }
+
+    pub async fn get_kiro_device_flow(
+        &self,
+        device_code: &str,
+        now_ms: i64,
+    ) -> Option<PendingKiroDeviceFlow> {
+        self.kiro_device_flows
+            .write()
+            .await
+            .get(device_code, now_ms)
+    }
+
+    pub async fn remove_kiro_device_flow(&self, device_code: &str) {
+        self.kiro_device_flows.write().await.remove(device_code);
+    }
+
+    pub async fn insert_kiro_social_device_flow(
+        &self,
+        device_code: String,
+        flow: PendingKiroSocialDeviceFlow,
+        now_ms: i64,
+    ) {
+        self.kiro_device_flows
+            .write()
+            .await
+            .insert_social(device_code, flow, now_ms);
+    }
+
+    pub async fn get_kiro_social_device_flow(
+        &self,
+        device_code: &str,
+        now_ms: i64,
+    ) -> Option<PendingKiroSocialDeviceFlow> {
+        self.kiro_device_flows
+            .write()
+            .await
+            .get_social(device_code, now_ms)
+    }
+
+    pub async fn remove_kiro_social_device_flow(&self, device_code: &str) {
+        self.kiro_device_flows
+            .write()
+            .await
+            .remove_social(device_code);
+    }
+
+    pub async fn insert_codex_device_flow(
+        &self,
+        device_code: String,
+        flow: PendingCodexDeviceFlow,
+        now_ms: i64,
+    ) {
+        self.codex_device_flows
+            .write()
+            .await
+            .insert(device_code, flow, now_ms);
+    }
+
+    pub async fn get_codex_device_flow(
+        &self,
+        device_code: &str,
+        now_ms: i64,
+    ) -> Option<PendingCodexDeviceFlow> {
+        self.codex_device_flows
+            .write()
+            .await
+            .get(device_code, now_ms)
+    }
+
+    pub async fn remove_codex_device_flow(&self, device_code: &str) {
+        self.codex_device_flows.write().await.remove(device_code);
     }
 
     pub async fn prepare_copilot_upstream_auth(
@@ -1290,11 +1459,68 @@ pub fn spawn_account_quota_refresh(state: ServerState) {
     tokio::spawn(async move {
         sleep(Duration::from_secs(60)).await;
         loop {
+            refresh_due_native_account_tokens(&state).await;
             refresh_due_account_quotas(&state).await;
             let delay = next_account_quota_refresh_delay(&state).await;
             sleep(delay).await;
         }
     });
+}
+
+async fn refresh_due_native_account_tokens(state: &ServerState) {
+    let now = crate::infra::time::now_ms() as i64;
+    let accounts = state.accounts.read().await.accounts.clone();
+    for account in accounts
+        .into_iter()
+        .filter(|account| account_needs_native_refresh(account, now))
+    {
+        refresh_one_native_account_token(state, account, now).await;
+    }
+}
+
+async fn refresh_one_native_account_token(state: &ServerState, account: Account, now: i64) {
+    let Some(_guard) = state
+        .account_refresh_locks
+        .try_lock(account.provider_type, &account.id)
+    else {
+        return;
+    };
+    let Some(account) = ({
+        let accounts = state.accounts.read().await;
+        accounts
+            .find_for_provider(account.provider_type, Some(&account.id))
+            .cloned()
+    }) else {
+        return;
+    };
+    if !account_needs_native_refresh(&account, now) {
+        return;
+    }
+
+    let http_client = state.http_client().await;
+    let interval_ms = state.oauth_quota_refresh_interval_ms().await;
+    match execute_native_account_refresh(&http_client, &account, now, interval_ms).await {
+        Ok(update) => {
+            {
+                let mut store = state.accounts.write().await;
+                store.mark_refresh_success(&account.id, update);
+            }
+            save_accounts_debounced(state);
+        }
+        Err(error) => {
+            tracing::warn!(
+                account_id = %account.id,
+                provider_type = %account.provider_type.as_str(),
+                error = %error.message,
+                "background OAuth token warm-refresh failed"
+            );
+            {
+                let mut store = state.accounts.write().await;
+                store.mark_refresh_failure(&account.id, error.message);
+            }
+            save_accounts_debounced(state);
+        }
+    }
 }
 
 async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
@@ -2159,11 +2385,13 @@ mod tests {
                 }
             })),
             subscription_level: None,
+            entitlement_status: None,
             quota_percent: None,
             quota: None,
             quota_refreshed_at: None,
             quota_next_refresh_at: None,
             expires_at,
+            rate_limited_until: None,
             last_refresh_error: None,
         }
     }
@@ -2206,35 +2434,40 @@ mod tests {
     #[tokio::test]
     async fn share_request_log_entry_preserves_router_sync_fields() {
         let state = test_state();
-        state.shares.write().await.upsert(UpsertShareInput {
-            id: Some("share-1".to_string()),
-            owner_email: Some("owner@example.com".to_string()),
-            app: AppKind::Codex,
-            provider_id: "p1".to_string(),
-            provider_type: ProviderType::Codex,
-            display_name: Some("Codex Share".to_string()),
-            enabled: None,
-            status: None,
-            subscription_level: None,
-            account_email: None,
-            quota_percent: None,
-            tunnel_subdomain: Some("codexshare".to_string()),
-            acl: None,
-            token_limit: None,
-            parallel_limit: None,
-            expires_at: None,
-            for_sale: None,
-            sale_market_kind: None,
-            access_by_app: std::collections::BTreeMap::new(),
-            app_settings: std::collections::BTreeMap::new(),
-            for_sale_official_price_percent_by_app: std::collections::BTreeMap::new(),
-            official_price_percent: None,
-            auto_start: None,
-            description: None,
-            bindings: Vec::new(),
-            runtime_snapshot: None,
-            market_grant: None,
-        });
+        state
+            .shares
+            .write()
+            .await
+            .upsert(UpsertShareInput {
+                id: Some("share-1".to_string()),
+                owner_email: Some("owner@example.com".to_string()),
+                app: AppKind::Codex,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Codex,
+                display_name: Some("Codex Share".to_string()),
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: Some("codexshare".to_string()),
+                acl: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                sale_market_kind: None,
+                access_by_app: std::collections::BTreeMap::new(),
+                app_settings: std::collections::BTreeMap::new(),
+                for_sale_official_price_percent_by_app: std::collections::BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: None,
+            })
+            .unwrap();
 
         let mut log = UsageLog::new(
             AppKind::Codex,

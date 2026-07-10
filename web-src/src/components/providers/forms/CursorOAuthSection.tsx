@@ -13,6 +13,7 @@ import {
 import {
   Check,
   Copy,
+  Download,
   ExternalLink,
   Loader2,
   LogOut,
@@ -47,11 +48,13 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
     error,
     isPolling,
     isAddingAccount,
+    isImportingCursorLocalAuth,
     isRemovingAccount,
     isSettingDefaultAccount,
     defaultAccountId,
     addAccount,
     cancelAuth,
+    importCursorLocalAuth,
     logout,
     removeAccount,
     setDefaultAccount,
@@ -238,6 +241,29 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
           <Plus className="mr-2 h-4 w-4" />
           {t("cursorOauth.addAnotherAccount", {
             defaultValue: "添加其他账号",
+          })}
+        </Button>
+      )}
+
+      {pollingState === "idle" && (
+        <Button
+          type="button"
+          onClick={importCursorLocalAuth}
+          className="w-full"
+          variant="secondary"
+          disabled={isImportingCursorLocalAuth}
+          title={t("cursorOauth.importLocalServerTitle", {
+            defaultValue:
+              "从运行 cc-switch-server 的这台机器读取 Cursor IDE 或 cursor-agent 登录状态",
+          })}
+        >
+          {isImportingCursorLocalAuth ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <Download className="mr-2 h-4 w-4" />
+          )}
+          {t("cursorOauth.importLocalServer", {
+            defaultValue: "从本机 Cursor 导入",
           })}
         </Button>
       )}

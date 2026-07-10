@@ -27,7 +27,11 @@ export interface GeminiProviderPreset {
   partnerPromotionKey?: string;
   endpointCandidates?: string[];
   theme?: GeminiPresetTheme;
-  providerType?: "google_gemini_oauth" | "antigravity_oauth" | "agy_oauth";
+  providerType?:
+    | "google_gemini_oauth"
+    | "antigravity_oauth"
+    | "agy_oauth"
+    | "grok_oauth";
   requiresOAuth?: boolean;
   // 图标配置
   icon?: string; // 图标名称
@@ -111,6 +115,29 @@ export const geminiProviderPresets: GeminiProviderPreset[] = [
       textColor: "#FFFFFF",
     },
     icon: "gemini",
+    iconColor: "#111827",
+  },
+  {
+    name: "Grok OAuth",
+    websiteUrl: "https://x.ai",
+    settingsConfig: {
+      env: {
+        GOOGLE_GEMINI_BASE_URL: "https://api.x.ai/v1",
+        GEMINI_MODEL: "grok-4.3",
+      },
+    },
+    baseURL: "https://api.x.ai/v1",
+    model: "grok-4.3",
+    description: "Grok OAuth",
+    category: "official",
+    providerType: "grok_oauth",
+    requiresOAuth: true,
+    theme: {
+      icon: "generic",
+      backgroundColor: "#111827",
+      textColor: "#FFFFFF",
+    },
+    icon: "grok",
     iconColor: "#111827",
   },
   {

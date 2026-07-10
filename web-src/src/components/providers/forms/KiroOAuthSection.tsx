@@ -2,7 +2,11 @@ import React from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import {
   Select,
   SelectContent,
@@ -14,15 +18,21 @@ import {
   Check,
   Copy,
   ExternalLink,
+  FileJson,
+  Github,
+  Globe2,
+  KeyRound,
   Loader2,
   LogOut,
   Plus,
   Sparkles,
   User,
+  Upload,
   X,
 } from "lucide-react";
 import { useKiroOauth } from "./hooks/useKiroOauth";
 import { copyText } from "@/lib/clipboard";
+import { authApi } from "@/lib/api";
 
 interface KiroOAuthSectionProps {
   className?: string;
@@ -38,8 +48,16 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
   showLoggedInAccounts = false,
 }) => {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [copied, setCopied] = React.useState(false);
   const [copiedCode, setCopiedCode] = React.useState(false);
+  const [importMode, setImportMode] = React.useState<
+    "credentials" | "api-key" | null
+  >(null);
+  const [credentialsJson, setCredentialsJson] = React.useState("");
+  const [apiKey, setApiKey] = React.useState("");
+  const [apiRegion, setApiRegion] = React.useState("us-east-1");
+  const [isImporting, setIsImporting] = React.useState(false);
   const {
     accounts,
     hasAnyAccount,
@@ -53,10 +71,12 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
     defaultAccountId,
     migrationError,
     addAccount,
+    addSocialAccount,
     cancelAuth,
     logout,
     removeAccount,
     setDefaultAccount,
+    refetchStatus,
   } = useKiroOauth();
 
   const handleAccountSelect = (value: string) => {
@@ -90,6 +110,78 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
     await copyText(deviceCode.user_code);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  const finishImport = async (accountId: string) => {
+    await refetchStatus();
+    await queryClient.invalidateQueries({
+      queryKey: ["managed-auth-status", "kiro_oauth"],
+    });
+    onAccountSelect?.(accountId);
+    setImportMode(null);
+    toast.success(
+      t("kiroOauth.importSuccess", { defaultValue: "Kiro 凭据已导入" }),
+    );
+  };
+
+  const importLocalCredentials = async () => {
+    setIsImporting(true);
+    try {
+      const response = await authApi.importKiroLocalCredentials();
+      await finishImport(response.account.id);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const importCredentials = async () => {
+    let credentials: unknown;
+    try {
+      credentials = JSON.parse(credentialsJson);
+    } catch {
+      toast.error(
+        t("kiroOauth.credentialsInvalid", {
+          defaultValue: "credentials.json 不是合法 JSON",
+        }),
+      );
+      return;
+    }
+    setIsImporting(true);
+    try {
+      const response = await authApi.importKiroCredentials(credentials);
+      setCredentialsJson("");
+      await finishImport(response.account.id);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const importApiKey = async () => {
+    if (!apiKey.trim().startsWith("ksk_")) {
+      toast.error(
+        t("kiroOauth.apiKeyInvalid", {
+          defaultValue: "Kiro API Key 必须以 ksk_ 开头",
+        }),
+      );
+      return;
+    }
+    setIsImporting(true);
+    try {
+      const response = await authApi.importKiroApiKey(
+        apiKey.trim(),
+        apiRegion.trim() || "us-east-1",
+      );
+      setApiKey("");
+      await finishImport(response.account.id);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsImporting(false);
+    }
   };
 
   return (
@@ -229,32 +321,180 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
       )}
 
       {!hasAnyAccount && pollingState === "idle" && (
-        <Button
-          type="button"
-          onClick={addAccount}
-          className="w-full"
-          variant="outline"
-        >
-          <Sparkles className="mr-2 h-4 w-4" />
-          {t("kiroOauth.loginWithKiro", {
-            defaultValue: "使用 AWS Builder ID 登录",
-          })}
-        </Button>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <Button
+            type="button"
+            onClick={addAccount}
+            className="sm:col-span-2"
+            variant="outline"
+          >
+            <Sparkles className="mr-2 h-4 w-4" />
+            {t("kiroOauth.loginWithKiro", {
+              defaultValue: "使用 AWS Builder ID 登录",
+            })}
+          </Button>
+          <Button
+            type="button"
+            onClick={() => addSocialAccount("google")}
+            variant="outline"
+          >
+            <Globe2 className="mr-2 h-4 w-4" />
+            {t("kiroOauth.loginWithGoogle", {
+              defaultValue: "使用 Google 登录",
+            })}
+          </Button>
+          <Button
+            type="button"
+            onClick={() => addSocialAccount("github")}
+            variant="outline"
+          >
+            <Github className="mr-2 h-4 w-4" />
+            {t("kiroOauth.loginWithGithub", {
+              defaultValue: "使用 GitHub 登录",
+            })}
+          </Button>
+        </div>
       )}
 
       {hasAnyAccount && pollingState === "idle" && (
-        <Button
-          type="button"
-          onClick={addAccount}
-          className="w-full"
-          variant="outline"
-          disabled={isAddingAccount}
-        >
-          <Plus className="mr-2 h-4 w-4" />
-          {t("kiroOauth.addAnotherAccount", {
-            defaultValue: "添加 AWS Builder ID 账号",
-          })}
-        </Button>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <Button
+            type="button"
+            onClick={addAccount}
+            className="sm:col-span-2"
+            variant="outline"
+            disabled={isAddingAccount}
+          >
+            <Plus className="mr-2 h-4 w-4" />
+            {t("kiroOauth.addAnotherAccount", {
+              defaultValue: "添加 AWS Builder ID 账号",
+            })}
+          </Button>
+          <Button
+            type="button"
+            onClick={() => addSocialAccount("google")}
+            variant="outline"
+            disabled={isAddingAccount}
+          >
+            <Globe2 className="mr-2 h-4 w-4" />
+            {t("kiroOauth.addGoogleAccount", {
+              defaultValue: "添加 Google 账号",
+            })}
+          </Button>
+          <Button
+            type="button"
+            onClick={() => addSocialAccount("github")}
+            variant="outline"
+            disabled={isAddingAccount}
+          >
+            <Github className="mr-2 h-4 w-4" />
+            {t("kiroOauth.addGithubAccount", {
+              defaultValue: "添加 GitHub 账号",
+            })}
+          </Button>
+        </div>
+      )}
+
+      {pollingState === "idle" && (
+        <div className="grid grid-cols-3 gap-2">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() =>
+              setImportMode((mode) =>
+                mode === "credentials" ? null : "credentials",
+              )
+            }
+            disabled={isImporting}
+          >
+            <FileJson className="mr-2 h-4 w-4" />
+            {t("kiroOauth.importJson", { defaultValue: "导入 JSON" })}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() =>
+              setImportMode((mode) =>
+                mode === "api-key" ? null : "api-key",
+              )
+            }
+            disabled={isImporting}
+          >
+            <KeyRound className="mr-2 h-4 w-4" />
+            {t("kiroOauth.importApiKey", { defaultValue: "API Key" })}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={importLocalCredentials}
+            disabled={isImporting}
+          >
+            {isImporting ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Upload className="mr-2 h-4 w-4" />
+            )}
+            {t("kiroOauth.importLocal", { defaultValue: "本机 Kiro" })}
+          </Button>
+        </div>
+      )}
+
+      {pollingState === "idle" && importMode === "credentials" && (
+        <div className="space-y-2">
+          <Textarea
+            value={credentialsJson}
+            onChange={(event) => setCredentialsJson(event.currentTarget.value)}
+            placeholder="credentials.json"
+            className="min-h-28 font-mono text-xs"
+          />
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setImportMode(null)}
+            >
+              {t("common.cancel", { defaultValue: "取消" })}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              onClick={importCredentials}
+              disabled={isImporting || !credentialsJson.trim()}
+            >
+              {isImporting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {t("common.import", { defaultValue: "导入" })}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {pollingState === "idle" && importMode === "api-key" && (
+        <div className="grid gap-2 sm:grid-cols-[1fr_9rem_auto]">
+          <Input
+            type="password"
+            value={apiKey}
+            onChange={(event) => setApiKey(event.currentTarget.value)}
+            placeholder="ksk_..."
+            autoComplete="off"
+          />
+          <Input
+            value={apiRegion}
+            onChange={(event) => setApiRegion(event.currentTarget.value)}
+            placeholder="us-east-1"
+          />
+          <Button
+            type="button"
+            onClick={importApiKey}
+            disabled={isImporting || !apiKey.trim()}
+          >
+            {isImporting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            {t("common.import", { defaultValue: "导入" })}
+          </Button>
+        </div>
       )}
 
       {isPolling && deviceCode && (

@@ -54,35 +54,39 @@ pub fn is_cursor_provider(provider_type: ProviderType) -> bool {
     )
 }
 
-/// Explicit opt-in for the staged h2 AgentService transport.
-///
-/// Defaulting to false preserves the current planned/generic behavior and
-/// prevents accidental native capability claims before real Cursor validation.
+/// Cursor providers use the native h2 AgentService transport by default.
+/// Operators can still disable it with provider env/settings while doing
+/// upstream incident triage.
 pub fn agentservice_driver_requested(stored: &StoredProvider) -> bool {
     if !is_cursor_provider(stored.provider_type) {
         return false;
     }
-    setting(
+    if let Some(value) = setting(
         &stored.provider,
         &[
             "CURSOR_AGENT_SERVICE",
             "CURSOR_AGENTSERVICE",
             "CC_SWITCH_CURSOR_AGENT_SERVICE",
         ],
-    )
-    .is_some_and(|value| truthy(&value))
-        || stored
-            .provider
-            .settings_config
-            .pointer("/cursorAgentService/enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        || stored
-            .provider
-            .settings_config
-            .pointer("/cursor_agent_service/enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+    ) {
+        return truthy(&value);
+    }
+    if let Some(enabled) = stored
+        .provider
+        .settings_config
+        .pointer("/cursorAgentService/enabled")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            stored
+                .provider
+                .settings_config
+                .pointer("/cursor_agent_service/enabled")
+                .and_then(Value::as_bool)
+        })
+    {
+        return enabled;
+    }
+    true
 }
 
 pub fn build_agent_plan_preview(
@@ -120,7 +124,7 @@ pub fn agentservice_not_ready_error(
         Ok(Some(preview)) => ProxyError {
             status: StatusCode::NOT_IMPLEMENTED,
             message: format!(
-                "Cursor AgentService native driver is staged behind explicit opt-in and remains planned until real Cursor validation; provider={}; model={}; protocol={}",
+                "Cursor AgentService native driver is disabled for this provider; provider={}; model={}; protocol={}",
                 preview.provider_id, preview.model_id, preview.inbound_protocol
             ),
         },
@@ -146,7 +150,7 @@ pub(super) fn protocol_for_route(
             CursorResponseFormat::OpenAiChatCompletions,
             "openai_chat",
         )),
-        ProxyRoute::CodexResponses => Some((
+        ProxyRoute::CodexResponses | ProxyRoute::CodexResponsesCompact => Some((
             InboundProtocol::OpenAiResponses,
             CursorResponseFormat::OpenAiResponses,
             "openai_responses",
@@ -234,10 +238,13 @@ mod tests {
     }
 
     #[test]
-    fn explicit_agentservice_flag_is_required() {
-        assert!(!agentservice_driver_requested(&stored(json!({}))));
+    fn agentservice_driver_defaults_on_with_explicit_disable() {
+        assert!(agentservice_driver_requested(&stored(json!({}))));
         assert!(agentservice_driver_requested(&stored(json!({
             "cursorAgentService": {"enabled": true}
+        }))));
+        assert!(!agentservice_driver_requested(&stored(json!({
+            "cursorAgentService": {"enabled": false}
         }))));
     }
 }

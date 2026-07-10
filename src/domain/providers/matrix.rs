@@ -125,6 +125,7 @@ pub fn all_provider_types() -> &'static [ProviderType] {
         ProviderType::AwsBedrock,
         ProviderType::Nvidia,
         ProviderType::DeepSeekApi,
+        ProviderType::GrokOAuth,
     ]
 }
 
@@ -148,6 +149,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::AwsBedrock,
             ProviderType::Nvidia,
             ProviderType::DeepSeekApi,
+            ProviderType::GrokOAuth,
         ],
         AppKind::Codex => &[
             ProviderType::Codex,
@@ -158,6 +160,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::OllamaCloud,
             ProviderType::Nvidia,
             ProviderType::DeepSeekApi,
+            ProviderType::GrokOAuth,
             ProviderType::Claude,
             ProviderType::ClaudeAuth,
             ProviderType::ClaudeOAuth,
@@ -175,6 +178,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::ClaudeOAuth,
             ProviderType::Codex,
             ProviderType::CodexOAuth,
+            ProviderType::GrokOAuth,
             ProviderType::Nvidia,
             ProviderType::DeepSeekApi,
         ],
@@ -244,7 +248,8 @@ fn provider_api_key_url(provider_type: ProviderType) -> Option<&'static str> {
         | ProviderType::KiroOAuth
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
-        | ProviderType::AgyOAuth => None,
+        | ProviderType::AgyOAuth
+        | ProviderType::GrokOAuth => None,
     }
 }
 
@@ -268,6 +273,7 @@ fn provider_website_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::OllamaCloud => Some("https://ollama.com"),
         ProviderType::AwsBedrock => Some("https://aws.amazon.com/bedrock"),
         ProviderType::Nvidia => Some("https://build.nvidia.com"),
+        ProviderType::GrokOAuth => Some("https://x.ai"),
     }
 }
 
@@ -292,6 +298,7 @@ fn provider_label(provider_type: ProviderType) -> &'static str {
         ProviderType::AwsBedrock => "AWS Bedrock",
         ProviderType::Nvidia => "Nvidia",
         ProviderType::DeepSeekApi => "DeepSeek API Key",
+        ProviderType::GrokOAuth => "Grok OAuth",
     }
 }
 
@@ -423,6 +430,13 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
             key: "OPENAI_API_KEY",
             aws_region: None,
         },
+        ProviderType::GrokOAuth => ProviderDefaults {
+            base_url: "https://api.x.ai/v1",
+            api_format: "openai_responses",
+            model: "grok-4.3",
+            key: "XAI_API_KEY",
+            aws_region: None,
+        },
     }
 }
 
@@ -467,6 +481,7 @@ fn provider_template_env(provider_type: ProviderType) -> &'static [&'static str]
             "CLAUDE_CODE_USE_BEDROCK",
         ],
         ProviderType::Nvidia | ProviderType::DeepSeekApi => &["OPENAI_BASE_URL", "OPENAI_API_KEY"],
+        ProviderType::GrokOAuth => &["OPENAI_BASE_URL", "XAI_API_KEY"],
     }
 }
 
@@ -490,7 +505,8 @@ fn credential_mode(provider_type: ProviderType) -> &'static str {
         | ProviderType::KiroOAuth
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
-        | ProviderType::AgyOAuth => "oauth_or_manual_token",
+        | ProviderType::AgyOAuth
+        | ProviderType::GrokOAuth => "oauth_or_manual_token",
     }
 }
 
@@ -511,6 +527,7 @@ fn account_supported(provider_type: ProviderType) -> bool {
             | ProviderType::AwsBedrock
             | ProviderType::Nvidia
             | ProviderType::DeepSeekApi
+            | ProviderType::GrokOAuth
     )
 }
 
@@ -530,6 +547,7 @@ fn managed_account_recommended(provider_type: ProviderType) -> bool {
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
+            | ProviderType::GrokOAuth
     )
 }
 
@@ -560,6 +578,7 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
             _,
             ProviderType::ClaudeOAuth
             | ProviderType::CodexOAuth
+            | ProviderType::GrokOAuth
             | ProviderType::GeminiCli
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth,

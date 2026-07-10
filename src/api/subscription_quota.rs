@@ -272,11 +272,13 @@ mod tests {
             profile: None,
             raw: None,
             subscription_level: None,
+            entitlement_status: None,
             quota_percent: None,
             quota: Some(quota),
             quota_refreshed_at: Some(1_700_000_000_000),
             quota_next_refresh_at: None,
             expires_at: None,
+            rate_limited_until: None,
             last_refresh_error: None,
         }
     }
@@ -308,7 +310,7 @@ mod tests {
                 },
             ],
             extra_usage: Some(json!({
-                "queriedAt": 1_700_000_000_000,
+                "queriedAt": 1_700_000_000_000i64,
                 "subscription": {
                     "planType": "plus",
                     "planLabel": "ChatGPT Plus",
@@ -360,6 +362,6 @@ mod tests {
         );
         assert_eq!(cached["authProvider"], "codex_oauth");
         assert_eq!(cached["quota"]["tiers"][0]["utilization"], 25.0);
-        assert_eq!(cached["nextRefreshAt"], 1_700_000_300_000);
+        assert_eq!(cached["nextRefreshAt"], json!(1_700_000_300_000i64));
     }
 }

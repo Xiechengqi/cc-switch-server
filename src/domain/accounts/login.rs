@@ -141,7 +141,7 @@ impl OAuthLoginStore {
         })?;
         let session_id = generate_base64url_token();
         let state = generate_base64url_token();
-        let code_verifier = generate_base64url_token();
+        let code_verifier = generate_pkce_verifier(provider_type);
         let code_challenge = generate_code_challenge(&code_verifier);
         let effective_redirect_uri = match spec.authorize_flow {
             OAuthAuthorizeFlow::CursorDeepControl => None,
@@ -249,6 +249,9 @@ impl OAuthLoginStore {
                 let (authorization_code, token_state) =
                     if session.provider_type == ProviderType::ClaudeOAuth {
                         super::oauth::parse_claude_authorization_code_input(code, &session.state)
+                            .map_err(|error| OAuthLoginError::RequestShape(error.message))?
+                    } else if session.provider_type == ProviderType::GrokOAuth {
+                        super::oauth::parse_grok_authorization_code_input(code, &session.state)
                             .map_err(|error| OAuthLoginError::RequestShape(error.message))?
                     } else {
                         (code.to_string(), session.state.clone())
@@ -405,6 +408,15 @@ fn generate_base64url_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn generate_pkce_verifier(provider_type: ProviderType) -> String {
+    if provider_type == ProviderType::GrokOAuth {
+        let mut bytes = [0u8; 96];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        return URL_SAFE_NO_PAD.encode(bytes);
+    }
+    generate_base64url_token()
 }
 
 fn generate_code_challenge(code_verifier: &str) -> String {

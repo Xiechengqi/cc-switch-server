@@ -60,7 +60,7 @@ market or direct share URL
 | Code Agent | 反代入口 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | **Claude Code** | `POST /v1/messages` | ✅ Native | Anthropic Messages 原生转发；支持 Claude/Codex/Gemini/OpenRouter 等跨协议 adapter |
-| **Codex CLI** | `POST /v1/responses`、`POST /v1/chat/completions` | ✅ Native | Responses 与 Chat Completions 互转；Codex OAuth device flow 已接线 |
+| **Codex CLI** | `POST /v1/responses`、`POST /v1/chat/completions`、`POST /v1/images/generations` | ✅ Native | Responses 与 Chat Completions 互转；Codex OAuth device flow 与 image-generation bridge 已接线 |
 | **Gemini CLI** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 透传；`GET /v1beta/models` 等列表端点已覆盖 |
 | **OpenAI-compatible** | `GET /v1/models`、`GET /models` | ✅ Native | 模型列表与 OpenAI-compatible 探测 |
 | **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | ⚠️ Partial | OAuth/模型列表已接入；无独立 `/antigravity/v1*` 路由组 |
@@ -270,7 +270,8 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 
 - `server.json`：owner、password hash、router、client tunnel subdomain 和 installation identity。
 - `providers.json` / `universal-providers.json`：provider 和 Universal Provider 配置。
-- `accounts.json`：账号 token、profile、quota、raw snapshot。
+- `accounts.json`：账号 token、profile、quota、raw snapshot；token 字段用 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 做 XChaCha20Poly1305 加密。
+- `accounts.key`：本机生成的账号 token 加密密钥；备份/迁移时必须和 `accounts.json` 一起保留。
 - `shares.json` / `tunnels.json`：share、binding、ACL、market grant 和 tunnel runtime。
 - `usage-logs.jsonl` / `usage-rollups.json`：请求明细和统计 rollup。
 - `model-pricing.json`、`failover.json`、`email-auth.json`。

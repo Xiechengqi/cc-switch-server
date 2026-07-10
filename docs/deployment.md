@@ -128,11 +128,12 @@ scripts/smoke/router-market-smoke.sh
 - `server.json`
 - `providers.json`
 - `accounts.json`
+- `accounts.key`
 - `shares.json`
 - `usage-logs.json`
 - `tunnels.json`
 
-这些文件使用原子写入方式保存。备份时直接备份整个 config dir。
+这些文件使用原子写入方式保存。`accounts.json` 中的账号 token 字段会用 `accounts.key` 加密；也可以用 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 提供 32 字节 base64 密钥。备份时直接备份整个 config dir，不能只备份 `accounts.json` 而漏掉 `accounts.key`。
 
 备份恢复：
 

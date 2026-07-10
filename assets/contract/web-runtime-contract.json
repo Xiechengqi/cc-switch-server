@@ -213,6 +213,46 @@
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
+      "name": "grok_import_auth_json",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/grok/auth-json/import",
+      "notes": "Imports a pasted ~/.grok/auth.json entry into the managed Grok OAuth account store."
+    },
+    {
+      "name": "kiro_import_credentials_json",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/kiro/credentials/import",
+      "notes": "Imports pasted Kiro credentials JSON into the encrypted managed account store."
+    },
+    {
+      "name": "kiro_import_local_credentials",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/kiro/local/import",
+      "notes": "Imports Kiro credentials.json from the cc-switch-server host."
+    },
+    {
+      "name": "kiro_import_api_key",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/kiro/api-key/import",
+      "notes": "Validates a ksk_ API key with ListAvailableProfiles before importing it."
+    },
+    {
+      "name": "cursor_import_local_auth",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/cursor/local/import",
+      "notes": "Imports Cursor IDE state.vscdb or cursor-agent auth.json from the cc-switch-server host into the managed Cursor OAuth account store."
+    },
+    {
       "name": "authorize_share_market",
       "support": "native",
       "implemented": true,
@@ -794,6 +834,13 @@
     },
     {
       "name": "get_codex_oauth_models",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_grok_oauth_models",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",

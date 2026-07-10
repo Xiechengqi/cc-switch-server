@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
 use crate::domain::accounts::oauth::{
     build_profile_request, build_refresh_request_for_token_url, classify_oauth_error,
     merge_refresh_updates, oauth_provider_spec, refresh_update_from_profile_response,
@@ -6,6 +9,12 @@ use crate::domain::accounts::oauth::{
 };
 use crate::domain::accounts::store::{Account, AccountRefreshUpdate};
 use crate::domain::providers::model::ProviderType;
+use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
+
+const REFRESH_RECENT_SUCCESS_TTL_MS: i64 = 10_000;
+const REFRESH_INITIAL_BACKOFF_MS: i64 = 5_000;
+const REFRESH_MAX_BACKOFF_MS: i64 = 5 * 60_000;
 
 #[derive(Debug, Clone)]
 pub struct AccountRefreshFailure {
@@ -43,7 +52,16 @@ impl AccountRefreshFailure {
         }
     }
 
-    fn parse(message: impl Into<String>) -> Self {
+    fn rate_limited(message: impl Into<String>) -> Self {
+        Self {
+            status_code: 429,
+            message: message.into(),
+            kind: OAuthErrorKind::RateLimited,
+            retryable: true,
+        }
+    }
+
+    pub(crate) fn parse(message: impl Into<String>) -> Self {
         Self {
             status_code: 502,
             message: message.into(),
@@ -73,6 +91,9 @@ impl AccountRefreshFailure {
 }
 
 pub fn provider_native_refresh_available(provider_type: ProviderType) -> bool {
+    if provider_type == ProviderType::KiroOAuth {
+        return true;
+    }
     oauth_provider_spec(provider_type)
         .is_some_and(|spec| spec.server_native_refresh_enabled() && !spec.token_urls.is_empty())
 }
@@ -100,6 +121,59 @@ pub async fn execute_native_account_refresh(
     now_ms: i64,
     quota_refresh_interval_ms: i64,
 ) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+    let Some(refresh_key) = refresh_lock_key(account) else {
+        return execute_native_account_refresh_inner(
+            http,
+            account,
+            now_ms,
+            quota_refresh_interval_ms,
+        )
+        .await;
+    };
+
+    if let Some(blocked) = refresh_backoff_blocked(&refresh_key, now_ms) {
+        return Err(blocked);
+    }
+
+    let lock = refresh_lock(&refresh_key);
+    let _guard = lock.lock().await;
+
+    if let Some(update) = recent_refresh_success(&refresh_key, now_ms) {
+        return Ok(update);
+    }
+    if let Some(blocked) = refresh_backoff_blocked(&refresh_key, now_ms) {
+        return Err(blocked);
+    }
+
+    let result =
+        execute_native_account_refresh_inner(http, account, now_ms, quota_refresh_interval_ms)
+            .await;
+    match &result {
+        Ok(update) => {
+            remember_refresh_success(&refresh_key, now_ms, update);
+            clear_refresh_backoff(&refresh_key);
+        }
+        Err(error) => remember_refresh_failure(&refresh_key, now_ms, error),
+    }
+    result
+}
+
+async fn execute_native_account_refresh_inner(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    quota_refresh_interval_ms: i64,
+) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+    if account.provider_type == ProviderType::KiroOAuth {
+        return crate::clients::oauth::kiro::refresh_kiro_account(
+            http,
+            account,
+            now_ms,
+            quota_refresh_interval_ms,
+        )
+        .await;
+    }
+
     let spec = oauth_provider_spec(account.provider_type).ok_or_else(|| {
         AccountRefreshFailure::bad_request(format!(
             "{} does not have an OAuth refresh spec",
@@ -180,6 +254,153 @@ pub async fn execute_native_account_refresh(
     Err(last_error.unwrap_or_else(|| {
         AccountRefreshFailure::bad_request("OAuth refresh did not produce a request")
     }))
+}
+
+#[derive(Debug, Clone)]
+struct RefreshBackoffState {
+    blocked_until_ms: i64,
+    next_delay_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RefreshRecentSuccess {
+    completed_at_ms: i64,
+    update: AccountRefreshUpdate,
+}
+
+fn refresh_locks() -> &'static StdMutex<HashMap<String, Arc<AsyncMutex<()>>>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn refresh_backoffs() -> &'static StdMutex<HashMap<String, RefreshBackoffState>> {
+    static BACKOFFS: OnceLock<StdMutex<HashMap<String, RefreshBackoffState>>> = OnceLock::new();
+    BACKOFFS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn refresh_recent_successes() -> &'static StdMutex<HashMap<String, RefreshRecentSuccess>> {
+    static SUCCESSES: OnceLock<StdMutex<HashMap<String, RefreshRecentSuccess>>> = OnceLock::new();
+    SUCCESSES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn refresh_lock(key: &str) -> Arc<AsyncMutex<()>> {
+    let mut locks = refresh_locks()
+        .lock()
+        .expect("refresh lock registry poisoned");
+    locks
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+fn refresh_lock_key(account: &Account) -> Option<String> {
+    let refresh_token = account
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let digest = Sha256::digest(refresh_token.as_bytes());
+    Some(format!(
+        "{}:{}",
+        account.provider_type.as_str(),
+        hex_prefix(&digest, 32)
+    ))
+}
+
+fn hex_prefix(bytes: &[u8], max_chars: usize) -> String {
+    let mut output = String::with_capacity(max_chars);
+    for byte in bytes {
+        if output.len() >= max_chars {
+            break;
+        }
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output.truncate(max_chars);
+    output
+}
+
+fn recent_refresh_success(key: &str, now_ms: i64) -> Option<AccountRefreshUpdate> {
+    let mut successes = refresh_recent_successes()
+        .lock()
+        .expect("refresh success registry poisoned");
+    successes.retain(|_, success| {
+        now_ms.saturating_sub(success.completed_at_ms) <= REFRESH_RECENT_SUCCESS_TTL_MS
+    });
+    successes.get(key).and_then(|success| {
+        (now_ms.saturating_sub(success.completed_at_ms) <= REFRESH_RECENT_SUCCESS_TTL_MS)
+            .then(|| success.update.clone())
+    })
+}
+
+fn remember_refresh_success(key: &str, now_ms: i64, update: &AccountRefreshUpdate) {
+    let mut successes = refresh_recent_successes()
+        .lock()
+        .expect("refresh success registry poisoned");
+    successes.insert(
+        key.to_string(),
+        RefreshRecentSuccess {
+            completed_at_ms: now_ms,
+            update: update.clone(),
+        },
+    );
+}
+
+fn refresh_backoff_blocked(key: &str, now_ms: i64) -> Option<AccountRefreshFailure> {
+    let backoffs = refresh_backoffs()
+        .lock()
+        .expect("refresh backoff registry poisoned");
+    let state = backoffs.get(key)?;
+    if now_ms < state.blocked_until_ms {
+        let retry_after_ms = state.blocked_until_ms.saturating_sub(now_ms);
+        return Some(AccountRefreshFailure::rate_limited(format!(
+            "OAuth refresh temporarily blocked for {retry_after_ms}ms after recent failure"
+        )));
+    }
+    None
+}
+
+fn clear_refresh_backoff(key: &str) {
+    refresh_backoffs()
+        .lock()
+        .expect("refresh backoff registry poisoned")
+        .remove(key);
+}
+
+fn remember_refresh_failure(key: &str, now_ms: i64, error: &AccountRefreshFailure) {
+    if !refresh_failure_should_backoff(error) {
+        return;
+    }
+    let mut backoffs = refresh_backoffs()
+        .lock()
+        .expect("refresh backoff registry poisoned");
+    let previous_delay = backoffs
+        .get(key)
+        .map(|state| state.next_delay_ms)
+        .unwrap_or(REFRESH_INITIAL_BACKOFF_MS);
+    let delay = if error.kind == OAuthErrorKind::InvalidGrant {
+        REFRESH_MAX_BACKOFF_MS
+    } else {
+        previous_delay.clamp(REFRESH_INITIAL_BACKOFF_MS, REFRESH_MAX_BACKOFF_MS)
+    };
+    let next_delay = delay.saturating_mul(2).min(REFRESH_MAX_BACKOFF_MS);
+    backoffs.insert(
+        key.to_string(),
+        RefreshBackoffState {
+            blocked_until_ms: now_ms.saturating_add(delay),
+            next_delay_ms: next_delay,
+        },
+    );
+}
+
+fn refresh_failure_should_backoff(error: &AccountRefreshFailure) -> bool {
+    error.retryable
+        || matches!(
+            error.kind,
+            OAuthErrorKind::InvalidGrant
+                | OAuthErrorKind::RateLimited
+                | OAuthErrorKind::ExpiredToken
+                | OAuthErrorKind::Network
+        )
 }
 
 pub async fn execute_oauth_token_request(
@@ -482,11 +703,13 @@ mod tests {
             profile: None,
             raw: None,
             subscription_level: None,
+            entitlement_status: None,
             quota_percent: None,
             quota: None,
             quota_refreshed_at: None,
             quota_next_refresh_at: None,
             expires_at,
+            rate_limited_until: None,
             last_refresh_error: None,
         }
     }

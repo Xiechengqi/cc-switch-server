@@ -35,6 +35,81 @@ pub(in crate::api) struct AccountImportTemplatesResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportClaudeCredentialsRequest {
+    pub(in crate::api) credentials: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportClaudeCredentialsResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) account: AccountLoginAccountSummary,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportGrokAuthJsonRequest {
+    pub(in crate::api) auth_json: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportGrokAuthJsonResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) account: AccountLoginAccountSummary,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportKiroCredentialsRequest {
+    pub(in crate::api) credentials: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportKiroLocalCredentialsRequest {
+    #[serde(default)]
+    pub(in crate::api) path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportKiroApiKeyRequest {
+    pub(in crate::api) api_key: String,
+    #[serde(default)]
+    pub(in crate::api) region: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportKiroCredentialsResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) account: AccountLoginAccountSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) source: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportCursorLocalAuthResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) account: AccountLoginAccountSummary,
+    pub(in crate::api) source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) profile_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ExportClaudeCredentialsResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) credentials: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(in crate::api) struct StartAccountLoginRequest {
     pub(in crate::api) provider_type: crate::domain::providers::model::ProviderType,
     #[serde(default)]
@@ -89,6 +164,10 @@ pub(in crate::api) struct StartKiroDeviceLoginRequest {
     pub(in crate::api) region: Option<String>,
     #[serde(default)]
     pub(in crate::api) start_url: Option<String>,
+    #[serde(default)]
+    pub(in crate::api) issuer_url: Option<String>,
+    #[serde(default)]
+    pub(in crate::api) login_provider: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +271,8 @@ pub(in crate::api) struct AccountLoginAccountSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) subscription_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) entitlement_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) expires_at: Option<i64>,
     pub(in crate::api) has_access_token: bool,
     pub(in crate::api) has_refresh_token: bool,
@@ -205,6 +286,7 @@ impl AccountLoginAccountSummary {
             provider_type: account.provider_type,
             email: account.email.clone(),
             subscription_level: account.subscription_level.clone(),
+            entitlement_status: account.entitlement_status.clone(),
             expires_at: account.expires_at,
             has_access_token: account
                 .access_token

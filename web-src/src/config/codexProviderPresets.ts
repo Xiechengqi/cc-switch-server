@@ -36,6 +36,7 @@ export interface CodexProviderPreset {
   // 特殊供应商类型
   providerType?:
     | "codex_oauth"
+    | "grok_oauth"
     | "cursor_oauth"
     | "cursor_apikey"
     | "ollama_cloud";
@@ -181,6 +182,32 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     },
     icon: "openai",
     iconColor: "#00A67E",
+  },
+  {
+    name: "Grok OAuth",
+    websiteUrl: "https://x.ai",
+    isOfficial: true,
+    category: "official",
+    auth: {},
+    config: generateThirdPartyConfig("Grok", "https://api.x.ai/v1", "grok-4.3"),
+    providerType: "grok_oauth",
+    requiresOAuth: true,
+    modelCatalog: modelCatalog([
+      "grok-4.3",
+      "grok-4.20-multi-agent",
+      "grok-3-mini",
+    ]),
+    testConfig: {
+      enabled: true,
+      testModel: "grok-4.3",
+    },
+    theme: {
+      icon: "codex",
+      backgroundColor: "#111827",
+      textColor: "#FFFFFF",
+    },
+    icon: "grok",
+    iconColor: "#111827",
   },
   {
     name: "Cursor API Key",

@@ -44,6 +44,7 @@ pub(crate) struct KiroAccountData {
     pub start_url: Option<String>,
     pub auth_method: Option<String>,
     pub provider: Option<String>,
+    pub endpoint: Option<String>,
     pub authenticated_at: i64,
 }
 
@@ -122,6 +123,11 @@ impl KiroAccountData {
                 .unwrap_or_else(|| "us-east-1".to_string()),
             api_region: string_at(profile, &["/apiRegion", "/api_region"])
                 .or_else(|| string_at(raw, &["/apiRegion", "/api_region"]))
+                .or_else(|| {
+                    let profile_arn = string_at(profile, &["/profileArn", "/profile_arn"])
+                        .or_else(|| string_at(raw, &["/resolvedProfileArn", "/profileArn"]));
+                    region_from_profile_arn(profile_arn.as_deref())
+                })
                 .unwrap_or_else(|| "us-east-1".to_string()),
             machine_id: string_at(profile, &["/machineId", "/machine_id"])
                 .or_else(|| string_at(raw, &["/machineId", "/machine_id"]))
@@ -137,6 +143,8 @@ impl KiroAccountData {
             auth_method: string_at(profile, &["/authMethod", "/auth_method"])
                 .or_else(|| string_at(raw, &["/authMethod", "/auth_method"])),
             provider: string_at(profile, &["/provider"]).or_else(|| string_at(raw, &["/provider"])),
+            endpoint: string_at(raw, &["/endpoint", "/runtimeEndpoint"])
+                .or_else(|| string_at(profile, &["/endpoint", "/runtimeEndpoint"])),
             authenticated_at: raw
                 .and_then(|value| value.pointer("/importedAtMs"))
                 .and_then(Value::as_i64)
@@ -163,11 +171,10 @@ pub(crate) fn prepare_kiro_request(
     let account_data = KiroAccountData::from_account(account)?;
     let access_token = account_data.access_token(account)?;
     let request = anthropic_to_kiro_request(body, &account_data)?;
-    let region = if account_data.api_region.trim().is_empty() {
-        "us-east-1"
-    } else {
-        account_data.api_region.as_str()
-    };
+    let region = (!account_data.api_region.trim().is_empty())
+        .then(|| account_data.api_region.clone())
+        .or_else(|| region_from_profile_arn(account_data.profile_arn.as_deref()))
+        .unwrap_or_else(|| "us-east-1".to_string());
     let host = format!("q.{region}.amazonaws.com");
     let machine_id = account_data
         .machine_id
@@ -177,24 +184,86 @@ pub(crate) fn prepare_kiro_request(
     let user_agent = format!(
         "aws-sdk-js/1.0.34 ua/2.1 os/{DEFAULT_SYSTEM_VERSION} lang/js md/nodejs#22.22.0 api/codewhispererstreaming#1.0.34 m/E KiroIDE-2.3.0-{machine_id}"
     );
+    let endpoint = account_data
+        .endpoint
+        .as_deref()
+        .unwrap_or("ide")
+        .trim()
+        .to_ascii_lowercase();
+    let mut headers = vec![
+        (
+            "content-type",
+            if endpoint == "cli" {
+                "application/x-amz-json-1.0".to_string()
+            } else {
+                "application/json".to_string()
+            },
+        ),
+        ("connection", "close".to_string()),
+        ("x-amzn-codewhisperer-optout", "true".to_string()),
+        ("x-amzn-kiro-agent-mode", "vibe".to_string()),
+        ("x-amz-user-agent", x_amz_user_agent),
+        ("user-agent", user_agent),
+        ("host", host.clone()),
+        ("amz-sdk-invocation-id", next_uuid_like("kiro-invocation")),
+        ("amz-sdk-request", "attempt=1; max=3".to_string()),
+        ("authorization", format!("Bearer {access_token}")),
+    ];
+    if endpoint == "cli" {
+        headers.push((
+            "x-amz-target",
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse".to_string(),
+        ));
+        if let Some(profile_arn) = request.body.get("profileArn").and_then(Value::as_str) {
+            headers.push(("x-amzn-kiro-profile-arn", profile_arn.to_string()));
+        }
+    }
+    if let Some(token_type) = token_type_header(&account_data) {
+        headers.push(("tokentype", token_type.to_string()));
+    }
+    let body = if endpoint == "cli" {
+        cli_request_body(request.body)
+    } else {
+        request.body
+    };
     Ok(KiroPreparedRequest {
-        url: format!("https://{host}/generateAssistantResponse"),
+        url: if endpoint == "cli" {
+            format!("https://{host}/")
+        } else {
+            format!("https://{host}/generateAssistantResponse")
+        },
         host: host.clone(),
-        headers: vec![
-            ("content-type", "application/json".to_string()),
-            ("connection", "close".to_string()),
-            ("x-amzn-codewhisperer-optout", "true".to_string()),
-            ("x-amzn-kiro-agent-mode", "vibe".to_string()),
-            ("x-amz-user-agent", x_amz_user_agent),
-            ("user-agent", user_agent),
-            ("host", host),
-            ("amz-sdk-invocation-id", next_uuid_like("kiro-invocation")),
-            ("amz-sdk-request", "attempt=1; max=3".to_string()),
-            ("authorization", format!("Bearer {access_token}")),
-        ],
-        body: request.body,
+        headers,
+        body,
         tool_name_map: request.tool_name_map,
     })
+}
+
+fn token_type_header(account: &KiroAccountData) -> Option<&'static str> {
+    let method = account.auth_method.as_deref()?.trim().to_ascii_lowercase();
+    match method.as_str() {
+        "api_key" | "api-key" | "apikey" => Some("API_KEY"),
+        "external_idp" | "external-idp" | "externalidp" => Some("EXTERNAL_IDP"),
+        _ => None,
+    }
+}
+
+fn cli_request_body(mut body: Value) -> Value {
+    if let Some(state) = body
+        .get_mut("conversationState")
+        .and_then(Value::as_object_mut)
+    {
+        state.remove("agentContinuationId");
+        if let Some(current) = state
+            .get_mut("currentMessage")
+            .and_then(|value| value.pointer_mut("/userInputMessage"))
+            .and_then(Value::as_object_mut)
+        {
+            current.insert("origin".to_string(), Value::String("KIRO_CLI".to_string()));
+            current.remove("modelId");
+        }
+    }
+    body
 }
 
 fn anthropic_to_kiro_request(
@@ -301,12 +370,30 @@ fn additional_model_request_fields(body: &Value, model_id: &str) -> Option<Value
 }
 
 fn resolve_profile_arn(account: &KiroAccountData) -> String {
-    account
+    if let Some(profile_arn) = account
         .profile_arn
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default_profile_arn_for_builder_id())
-        .to_string()
+    {
+        return profile_arn.to_string();
+    }
+    default_profile_arn_for_auth_method(
+        account
+            .auth_method
+            .as_deref()
+            .or(account.provider.as_deref()),
+        &account.api_region,
+    )
+    .to_string()
+}
+
+fn region_from_profile_arn(profile_arn: Option<&str>) -> Option<String> {
+    let arn = profile_arn?;
+    let mut parts = arn.split(':');
+    (parts.next() == Some("arn")).then_some(())?;
+    (parts.next() == Some("aws")).then_some(())?;
+    (parts.next() == Some("codewhisperer")).then_some(())?;
+    parts.next().map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1084,8 +1171,24 @@ fn parse_frames(buffer: &mut BytesMut) -> Vec<KiroFrame> {
             buffer.advance(1);
             continue;
         }
+        let expected_prelude_crc =
+            u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
+        if crc32(&buffer[..8]) != expected_prelude_crc {
+            buffer.advance(1);
+            continue;
+        }
         if buffer.len() < total_length {
             break;
+        }
+        let expected_message_crc = u32::from_be_bytes([
+            buffer[total_length - 4],
+            buffer[total_length - 3],
+            buffer[total_length - 2],
+            buffer[total_length - 1],
+        ]);
+        if crc32(&buffer[..total_length - 4]) != expected_message_crc {
+            buffer.advance(1);
+            continue;
         }
         let frame = buffer.split_to(total_length);
         let headers_start = 12;
@@ -1098,6 +1201,18 @@ fn parse_frames(buffer: &mut BytesMut) -> Vec<KiroFrame> {
         frames.push(KiroFrame { headers, payload });
     }
     frames
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 fn parse_event_headers(mut bytes: &[u8]) -> HashMap<String, String> {
@@ -1371,6 +1486,7 @@ struct SseBuilder {
     tool_inputs: HashMap<String, String>,
     seen_tool_signatures: HashSet<String>,
     tool_leak_filter: ToolLeakFilter,
+    inline_thinking: bool,
     output_tokens: i32,
     usage: KiroUsageAccumulator,
 }
@@ -1406,8 +1522,14 @@ impl SseBuilder {
 
     fn assistant_delta(&mut self, text: &str) -> Vec<Bytes> {
         let mut out = Vec::new();
-        for visible in self.tool_leak_filter.push_text(text, false) {
-            out.extend(self.visible_assistant_delta(&visible));
+        for segment in split_inline_thinking(text, &mut self.inline_thinking) {
+            if segment.is_thinking {
+                out.extend(self.thinking_delta(&segment.text));
+            } else {
+                for visible in self.tool_leak_filter.push_text(&segment.text, false) {
+                    out.extend(self.visible_assistant_delta(&visible));
+                }
+            }
         }
         out
     }
@@ -1693,6 +1815,55 @@ impl SseBuilder {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineThinkingSegment {
+    is_thinking: bool,
+    text: String,
+}
+
+fn split_inline_thinking(text: &str, in_thinking: &mut bool) -> Vec<InlineThinkingSegment> {
+    let mut segments = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if *in_thinking {
+            if let Some(end) = rest.find("</thinking>") {
+                let chunk = &rest[..end];
+                if !chunk.is_empty() {
+                    segments.push(InlineThinkingSegment {
+                        is_thinking: true,
+                        text: chunk.to_string(),
+                    });
+                }
+                rest = &rest[end + "</thinking>".len()..];
+                *in_thinking = false;
+            } else {
+                segments.push(InlineThinkingSegment {
+                    is_thinking: true,
+                    text: rest.to_string(),
+                });
+                break;
+            }
+        } else if let Some(start) = rest.find("<thinking>") {
+            let visible = &rest[..start];
+            if !visible.is_empty() {
+                segments.push(InlineThinkingSegment {
+                    is_thinking: false,
+                    text: visible.to_string(),
+                });
+            }
+            rest = &rest[start + "<thinking>".len()..];
+            *in_thinking = true;
+        } else {
+            segments.push(InlineThinkingSegment {
+                is_thinking: false,
+                text: rest.to_string(),
+            });
+            break;
+        }
+    }
+    segments
+}
+
 pub(crate) fn kiro_event_stream_to_claude_sse(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     model: String,
@@ -1799,6 +1970,7 @@ fn kiro_event_bytes_to_anthropic_json(
     let mut buffer = BytesMut::from(bytes);
     let mut text = String::new();
     let mut thinking = String::new();
+    let mut inline_thinking = false;
     let mut thinking_signature = None;
     let mut redacted_thinking = Vec::new();
     let mut tools: HashMap<String, (String, String)> = HashMap::new();
@@ -1811,16 +1983,28 @@ fn kiro_event_bytes_to_anthropic_json(
             Some("assistantResponseEvent") => {
                 let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
                 if let Some(chunk) = payload.get("content").and_then(|v| v.as_str()) {
-                    for visible in tool_leak_filter.push_text(chunk, false) {
-                        text.push_str(&visible);
+                    for segment in split_inline_thinking(chunk, &mut inline_thinking) {
+                        if segment.is_thinking {
+                            thinking.push_str(&segment.text);
+                        } else {
+                            for visible in tool_leak_filter.push_text(&segment.text, false) {
+                                text.push_str(&visible);
+                            }
+                        }
                     }
                 }
             }
             Some("codeEvent") => {
                 let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
                 if let Some(chunk) = payload.get("content").and_then(|v| v.as_str()) {
-                    for visible in tool_leak_filter.push_text(chunk, false) {
-                        text.push_str(&visible);
+                    for segment in split_inline_thinking(chunk, &mut inline_thinking) {
+                        if segment.is_thinking {
+                            thinking.push_str(&segment.text);
+                        } else {
+                            for visible in tool_leak_filter.push_text(&segment.text, false) {
+                                text.push_str(&visible);
+                            }
+                        }
                     }
                 }
             }
@@ -2539,6 +2723,25 @@ fn default_profile_arn_for_builder_id() -> &'static str {
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 }
 
+fn default_profile_arn_for_auth_method(auth_method: Option<&str>, region: &str) -> String {
+    let method = auth_method.unwrap_or_default().trim().to_ascii_lowercase();
+    match method.as_str() {
+        "social" | "google" | "github" => {
+            "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK".to_string()
+        }
+        "enterprise" | "idc" | "iam_sso" | "iam-sso" | "external_idp" | "external-idp"
+        | "externalidp" => {
+            let region = if region.starts_with("eu-") {
+                "eu-central-1"
+            } else {
+                "us-east-1"
+            };
+            format!("arn:aws:codewhisperer:{region}:610548660232:profile/VNECVYCYYAWN")
+        }
+        _ => default_profile_arn_for_builder_id().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2558,6 +2761,7 @@ mod tests {
             start_url: None,
             auth_method: Some("builder-id".to_string()),
             provider: Some("BuilderId".to_string()),
+            endpoint: None,
             authenticated_at: 1,
         }
     }
@@ -2591,11 +2795,13 @@ mod tests {
                 "importedAtMs": 1000
             })),
             subscription_level: Some("Kiro Pro".to_string()),
+            entitlement_status: None,
             quota_percent: None,
             quota: None,
             quota_refreshed_at: None,
             quota_next_refresh_at: None,
             expires_at: Some(9_999_999),
+            rate_limited_until: None,
             last_refresh_error: None,
         }
     }
@@ -2657,6 +2863,51 @@ mod tests {
             Some(&json!("claude-sonnet-4.8"))
         );
         assert!(request.tool_name_map.is_empty());
+    }
+
+    #[test]
+    fn prepared_request_supports_cli_endpoint_and_api_key_token_type() {
+        let mut account = server_account();
+        account.access_token = Some("ksk_fixture".to_string());
+        account.refresh_token = Some("ksk_fixture".to_string());
+        account.profile = Some(json!({
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/profile-id",
+            "apiRegion": "us-east-1",
+            "authMethod": "api_key"
+        }));
+        account.raw = Some(json!({
+            "endpoint": "cli",
+            "authMethod": "api_key"
+        }));
+        let body = json!({
+            "model": "claude-sonnet-4-8",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let request = prepare_kiro_request(&account, &body).unwrap();
+
+        assert_eq!(request.url, "https://q.us-east-1.amazonaws.com/");
+        assert!(request.headers.iter().any(|(name, value)| {
+            *name == "content-type" && value == "application/x-amz-json-1.0"
+        }));
+        assert!(request.headers.iter().any(|(name, value)| {
+            *name == "x-amz-target"
+                && value == "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+        }));
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| *name == "tokentype" && value == "API_KEY"));
+        assert_eq!(
+            request
+                .body
+                .pointer("/conversationState/currentMessage/userInputMessage/origin"),
+            Some(&json!("KIRO_CLI"))
+        );
+        assert!(request
+            .body
+            .pointer("/conversationState/agentContinuationId")
+            .is_none());
     }
 
     #[test]
@@ -3237,6 +3488,52 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn inline_thinking_split_preserves_state_across_chunks() {
+        let mut state = false;
+        let first = split_inline_thinking("hello <thinking>secret", &mut state);
+        assert_eq!(
+            first,
+            vec![
+                InlineThinkingSegment {
+                    is_thinking: false,
+                    text: "hello ".to_string()
+                },
+                InlineThinkingSegment {
+                    is_thinking: true,
+                    text: "secret".to_string()
+                }
+            ]
+        );
+        assert!(state);
+        let second = split_inline_thinking(" more</thinking> visible", &mut state);
+        assert_eq!(
+            second,
+            vec![
+                InlineThinkingSegment {
+                    is_thinking: true,
+                    text: " more".to_string()
+                },
+                InlineThinkingSegment {
+                    is_thinking: false,
+                    text: " visible".to_string()
+                }
+            ]
+        );
+        assert!(!state);
+    }
+
+    #[test]
+    fn event_stream_crc_rejects_corrupt_frames() {
+        let mut bytes = BytesMut::from(
+            event_frame("assistantResponseEvent", json!({"content": "ok"})).as_slice(),
+        );
+        if let Some(last) = bytes.last_mut() {
+            *last ^= 0xff;
+        }
+        assert!(parse_frames(&mut bytes).is_empty());
+    }
+
     fn event_stream_bytes(events: Vec<(&str, Value)>) -> Vec<u8> {
         events
             .into_iter()
@@ -3252,10 +3549,12 @@ mod tests {
         let mut frame = Vec::with_capacity(total_len);
         frame.extend_from_slice(&(total_len as u32).to_be_bytes());
         frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&0u32.to_be_bytes());
+        let prelude_crc = crc32(&frame[..8]);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
         frame.extend_from_slice(&headers);
         frame.extend_from_slice(&payload);
-        frame.extend_from_slice(&0u32.to_be_bytes());
+        let message_crc = crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
         frame
     }
 

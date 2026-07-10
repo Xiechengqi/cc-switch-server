@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use serde::Serialize;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::domain::accounts::oauth::{
     build_refresh_request, oauth_provider_spec, token_expires_soon, OAuthHttpRequest,
@@ -157,63 +159,51 @@ pub struct CodexOAuthAccountManager {
 
 #[derive(Debug, Default)]
 pub struct AccountRefreshLocks {
-    active: Mutex<HashSet<String>>,
+    active: Mutex<BTreeMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 #[derive(Debug)]
-pub struct AccountRefreshGuard<'a> {
-    locks: &'a AccountRefreshLocks,
-    key: String,
-    active: bool,
+pub struct AccountRefreshGuard {
+    _guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl AccountRefreshLocks {
+    pub async fn lock(&self, provider_type: ProviderType, account_id: &str) -> AccountRefreshGuard {
+        let lock = self.lock_for(provider_type, account_id);
+        AccountRefreshGuard {
+            _guard: Some(lock.lock_owned().await),
+        }
+    }
+
     pub fn try_lock(
         &self,
         provider_type: ProviderType,
         account_id: &str,
-    ) -> Option<AccountRefreshGuard<'_>> {
-        let key = refresh_lock_key(provider_type, account_id);
-        let mut active = self.active.lock().ok()?;
-        if !active.insert(key.clone()) {
-            return None;
-        }
-        Some(AccountRefreshGuard {
-            locks: self,
-            key,
-            active: true,
+    ) -> Option<AccountRefreshGuard> {
+        let lock = self.lock_for(provider_type, account_id);
+        lock.try_lock_owned().ok().map(|guard| AccountRefreshGuard {
+            _guard: Some(guard),
         })
     }
 
     pub fn is_locked(&self, provider_type: ProviderType, account_id: &str) -> bool {
-        self.active
-            .lock()
-            .map(|active| active.contains(&refresh_lock_key(provider_type, account_id)))
-            .unwrap_or(false)
+        let lock = self.lock_for(provider_type, account_id);
+        lock.try_lock_owned().is_err()
     }
 
-    fn release(&self, key: &str) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(key);
-        }
-    }
-}
-
-impl Drop for AccountRefreshGuard<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            self.locks.release(&self.key);
-            self.active = false;
-        }
+    fn lock_for(&self, provider_type: ProviderType, account_id: &str) -> Arc<AsyncMutex<()>> {
+        let key = refresh_lock_key(provider_type, account_id);
+        let mut active = self.active.lock().expect("account refresh lock poisoned");
+        active
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 }
 
-impl AccountRefreshGuard<'_> {
+impl AccountRefreshGuard {
     pub fn release(mut self) {
-        if self.active {
-            self.locks.release(&self.key);
-            self.active = false;
-        }
+        self._guard.take();
     }
 }
 
@@ -227,7 +217,7 @@ impl CodexOAuthAccountManager {
         store: &AccountStore,
         account_id: &str,
         now_ms: i64,
-    ) -> Result<(AccountRefreshGuard<'_>, OAuthHttpRequest), AccountManagerError> {
+    ) -> Result<(AccountRefreshGuard, OAuthHttpRequest), AccountManagerError> {
         let account = store
             .accounts
             .iter()
@@ -426,10 +416,11 @@ pub fn account_import_templates() -> Vec<AccountImportTemplate> {
         .collect()
 }
 
-fn account_provider_types() -> [ProviderType; 14] {
+fn account_provider_types() -> [ProviderType; 15] {
     [
         ProviderType::ClaudeOAuth,
         ProviderType::CodexOAuth,
+        ProviderType::GrokOAuth,
         ProviderType::GeminiCli,
         ProviderType::GitHubCopilot,
         ProviderType::DeepSeekAccount,
@@ -463,6 +454,7 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
+            | ProviderType::GrokOAuth
     );
     AccountManagerCapability {
         provider_type,
@@ -592,7 +584,28 @@ fn account_import_template_for(provider_type: ProviderType) -> AccountImportTemp
                 "profileArn",
                 "kiroUsageLimits",
             ],
-            notes: "AWS Builder ID device flow import is available via /api/accounts/kiro/device/start|poll; native forwarding remains disabled until real Kiro proxy validation",
+            notes: "AWS Builder ID device flow import is available via /api/accounts/kiro/device/start|poll; Claude CodeWhisperer forwarding and server-native refresh are wired, with native capability still gated on real Kiro validation",
+        },
+        ProviderType::GrokOAuth => AccountImportTemplate {
+            provider_type,
+            credential_kind: "oauth_token",
+            required_fields: vec!["providerType", "accessToken or refreshToken"],
+            optional_fields: optional_oauth_fields.clone(),
+            profile_hints: vec![
+                "email",
+                "preferred_username",
+                "sub",
+                "team_id",
+                "tier",
+                "principal_type",
+            ],
+            raw_hints: vec![
+                "~/.grok/auth.json entry",
+                "xAI OAuth token response",
+                "xai-subscription-tier",
+                "xai-entitlement-status",
+            ],
+            notes: "xAI/Grok OAuth token import; native refresh is enabled when refreshToken is present",
         },
         _ => {
             let notes = if oauth_provider_spec(provider_type)
@@ -826,11 +839,13 @@ mod tests {
                     profile: None,
                     raw: None,
                     subscription_level: None,
+                    entitlement_status: None,
                     quota: None,
                     quota_percent: None,
                     quota_refreshed_at: None,
                     quota_next_refresh_at: None,
                     expires_at: Some(2000),
+                    rate_limited_until: None,
                     last_refresh_error: None,
                 },
             )
@@ -864,11 +879,13 @@ mod tests {
                     profile: None,
                     raw: None,
                     subscription_level: None,
+                    entitlement_status: None,
                     quota: None,
                     quota_percent: None,
                     quota_refreshed_at: None,
                     quota_next_refresh_at: None,
                     expires_at: Some(1000),
+                    rate_limited_until: None,
                     last_refresh_error: None,
                 },
             )
@@ -904,11 +921,13 @@ mod tests {
                     profile: None,
                     raw: None,
                     subscription_level: None,
+                    entitlement_status: None,
                     quota: None,
                     quota_percent: None,
                     quota_refreshed_at: None,
                     quota_next_refresh_at: None,
                     expires_at: Some(1000),
+                    rate_limited_until: None,
                     last_refresh_error: None,
                 },
             )
@@ -942,11 +961,13 @@ mod tests {
                     profile: None,
                     raw: None,
                     subscription_level: None,
+                    entitlement_status: None,
                     quota: None,
                     quota_percent: None,
                     quota_refreshed_at: None,
                     quota_next_refresh_at: None,
                     expires_at: Some(1_000),
+                    rate_limited_until: None,
                     last_refresh_error: None,
                 },
             )
@@ -990,11 +1011,13 @@ mod tests {
                     profile: None,
                     raw: None,
                     subscription_level: None,
+                    entitlement_status: None,
                     quota: None,
                     quota_percent: None,
                     quota_refreshed_at: None,
                     quota_next_refresh_at: None,
-                    expires_at: Some(120_000),
+                    expires_at: Some(300_000),
+                    rate_limited_until: None,
                     last_refresh_error: None,
                 },
             )

@@ -41,7 +41,7 @@
 - OpenClaw / Hermes / OMO / Claude Desktop profile
 - Tauri shell（托盘、更新器、deeplink、窗口控制）
 - WebDAV/S3 云同步、Speedtest、本地 CLI session 解析
-- `codex_responses_ws`、Codex OAuth 生图
+- `codex_responses_ws`
 
 ### 2.3 App 范围
 

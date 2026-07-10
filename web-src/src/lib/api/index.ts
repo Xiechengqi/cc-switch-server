@@ -63,6 +63,7 @@ export type {
   ManagedAuthAccount,
   ManagedAuthStatus,
   ManagedAuthDeviceCodeResponse,
+  ImportGrokAuthJsonResponse,
   DeepSeekAccount,
   DeepSeekAccountStatus,
 } from "./auth";

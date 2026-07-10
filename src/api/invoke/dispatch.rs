@@ -301,7 +301,7 @@ async fn web_invoke_dispatch(
         "delete_provider" => {
             let app = web_arg_app(&args)?;
             let id = web_arg_string(&args, "id")?;
-            let deleted = delete_provider_with_share_cascade(&state, app, &id).await?;
+            let deleted = delete_provider_with_share_cascade(state, app, &id).await?;
             Ok(json!(deleted))
         }
         "switch_provider" => {
@@ -567,7 +567,7 @@ async fn web_invoke_dispatch(
                                         for share in updated_shares {
                                             spawn_share_upsert_sync(state.clone(), share.clone());
                                             emit_share_event(
-                                                &state,
+                                                state,
                                                 "share.changed",
                                                 &share,
                                                 "owner_email_updated",
@@ -667,10 +667,10 @@ async fn web_invoke_dispatch(
                 web_available_providers_for_failover(state, app).await
             ))
         }
-        "get_proxy_status" => Ok(json!(web_proxy_status_json(&state).await)),
-        "get_proxy_takeover_status" => Ok(json!(web_proxy_takeover_status_json(&state).await)),
+        "get_proxy_status" => Ok(json!(web_proxy_status_json(state).await)),
+        "get_proxy_takeover_status" => Ok(json!(web_proxy_takeover_status_json(state).await)),
         "is_proxy_running" => Ok(json!(true)),
-        "is_live_takeover_active" => Ok(json!(web_is_live_takeover_active(&state).await)),
+        "is_live_takeover_active" => Ok(json!(web_is_live_takeover_active(state).await)),
         "update_global_proxy_config" => {
             let input = web_upstream_proxy_input(&args)?;
             let response =
@@ -829,6 +829,106 @@ async fn web_invoke_dispatch(
             web_managed_auth_set_default_account(state.clone(), headers.clone(), &args).await
         }
         "auth_logout" => web_managed_auth_logout(state.clone(), headers.clone(), &args).await,
+        "grok_import_auth_json" => {
+            let auth_json = args
+                .get("authJson")
+                .or_else(|| args.get("auth_json"))
+                .cloned()
+                .ok_or_else(|| ApiError::bad_request("authJson is required"))?;
+            let response = import_grok_auth_json(
+                State(state.clone()),
+                headers.clone(),
+                Json(ImportGrokAuthJsonRequest { auth_json }),
+            )
+            .await?
+            .0;
+            let account = web_managed_auth_account_by_id(
+                state,
+                &response.account.id,
+                managed_auth_provider_label(ProviderType::GrokOAuth),
+            )
+            .await?;
+            Ok(json!({
+                "ok": response.ok,
+                "account": account
+            }))
+        }
+        "kiro_import_credentials_json" => {
+            let credentials = args
+                .get("credentials")
+                .cloned()
+                .ok_or_else(|| ApiError::bad_request("credentials is required"))?;
+            let response = import_kiro_credentials_json(
+                State(state.clone()),
+                headers.clone(),
+                Json(ImportKiroCredentialsRequest { credentials }),
+            )
+            .await?
+            .0;
+            let account = web_managed_auth_account_by_id(
+                state,
+                &response.account.id,
+                managed_auth_provider_label(ProviderType::KiroOAuth),
+            )
+            .await?;
+            Ok(json!({ "ok": response.ok, "account": account, "source": response.source }))
+        }
+        "kiro_import_local_credentials" => {
+            let response = import_kiro_local_credentials(
+                State(state.clone()),
+                headers.clone(),
+                Json(ImportKiroLocalCredentialsRequest {
+                    path: web_optional_string_any(&args, &["path"]),
+                }),
+            )
+            .await?
+            .0;
+            let account = web_managed_auth_account_by_id(
+                state,
+                &response.account.id,
+                managed_auth_provider_label(ProviderType::KiroOAuth),
+            )
+            .await?;
+            Ok(json!({ "ok": response.ok, "account": account, "source": response.source }))
+        }
+        "kiro_import_api_key" => {
+            let api_key = web_arg_string_any(&args, &["apiKey", "api_key"])?;
+            let response = import_kiro_api_key(
+                State(state.clone()),
+                headers.clone(),
+                Json(ImportKiroApiKeyRequest {
+                    api_key,
+                    region: web_optional_string_any(&args, &["region"]),
+                }),
+            )
+            .await?
+            .0;
+            let account = web_managed_auth_account_by_id(
+                state,
+                &response.account.id,
+                managed_auth_provider_label(ProviderType::KiroOAuth),
+            )
+            .await?;
+            Ok(json!({ "ok": response.ok, "account": account, "source": response.source }))
+        }
+        "cursor_import_local_auth" => {
+            let response = import_cursor_local_auth(State(state.clone()), headers.clone())
+                .await?
+                .0;
+            let account = web_managed_auth_account_by_id(
+                state,
+                &response.account.id,
+                managed_auth_provider_label(ProviderType::CursorOAuth),
+            )
+            .await?;
+            Ok(json!({
+                "ok": response.ok,
+                "account": account,
+                "source": response.source,
+                "path": response.path,
+                "profileError": response.profile_error,
+            }))
+        }
         "auth_submit_oauth_code" => {
             let provider_type = web_auth_provider_type(&args)?;
             let provider_label = managed_auth_provider_label(provider_type);
@@ -862,15 +962,15 @@ async fn web_invoke_dispatch(
             web_managed_auth_account_by_id(state, account_id, provider_label).await
         }
         "refresh_oauth_quota" => Ok(web_cached_oauth_quota(
-            &state,
-            &headers,
+            state,
+            headers,
             &args,
             true,
             web_optional_bool(&args, &["force"]),
         )
         .await?),
         "get_cached_oauth_quota" => {
-            Ok(web_cached_oauth_quota(&state, &headers, &args, false, None).await?)
+            Ok(web_cached_oauth_quota(state, headers, &args, false, None).await?)
         }
         "get_claude_oauth_quota" => {
             let response =
@@ -1469,6 +1569,7 @@ async fn web_invoke_dispatch(
         }
         "fetch_models_for_config" => web_fetch_models_for_config(state, &args).await,
         "get_codex_oauth_models" | "get_antigravity_oauth_models" => Ok(json!([])),
+        "get_grok_oauth_models" => Ok(json!(grok_oauth_default_models())),
         "update_share_description" => {
             let payload = web_payload(&args, &["params", "input"]);
             let share = web_patch_share_settings(
@@ -1687,7 +1788,7 @@ async fn web_invoke_dispatch(
         "check_provider_limits" => Ok(json!({ "ok": true, "withinLimits": true })),
         "get_subscription_quota" => {
             let tool = web_arg_string_any(&args, &["tool"])?;
-            Ok(web_subscription_quota(&state, &headers, &tool).await?)
+            Ok(web_subscription_quota(state, headers, &tool).await?)
         }
         "get_default_cost_multiplier" => Ok(json!(1.0)),
         "set_default_cost_multiplier" => Ok(Value::Null),
@@ -1732,6 +1833,25 @@ async fn web_invoke_dispatch(
             "desktop invoke command '{command}' is registered but has no dispatcher"
         ))),
     }
+}
+
+fn grok_oauth_default_models() -> Vec<Value> {
+    [
+        ("grok-4.3", "Grok 4.3"),
+        ("grok-build-0.1", "Grok Build 0.1"),
+        ("grok-composer-2.5-fast", "Grok Composer 2.5 Fast"),
+        ("grok-4.20-0309-reasoning", "Grok 4.20 Reasoning"),
+        ("grok-4.20-0309-non-reasoning", "Grok 4.20 Non-Reasoning"),
+    ]
+    .into_iter()
+    .map(|(id, display_name)| {
+        json!({
+            "id": id,
+            "ownedBy": "xai",
+            "displayName": display_name,
+        })
+    })
+    .collect()
 }
 
 fn resolve_stream_check_probe_url(

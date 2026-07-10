@@ -57,12 +57,14 @@ export function useManagedAuth(
     mutationFn: (params?: {
       oauthFlowMode?: "web_paste" | "localhost" | "cli" | "device";
       codexCallbackUrl?: string | null;
+      kiroLoginProvider?: "google" | "github" | null;
     }) =>
       authApi.authStartLogin(
         authProvider,
         githubDomain,
         params?.oauthFlowMode,
         params?.codexCallbackUrl,
+        params?.kiroLoginProvider,
       ),
     onSuccess: async (response) => {
       setDeviceCode(response);
@@ -173,18 +175,42 @@ export function useManagedAuth(
     },
   });
 
+  const importCursorLocalMutation = useMutation({
+    mutationFn: () => authApi.importCursorLocalAuth(),
+    onSuccess: async () => {
+      setPollingState("idle");
+      setDeviceCode(null);
+      setError(null);
+      await refetchStatus();
+      await queryClient.invalidateQueries({ queryKey });
+    },
+    onError: (e) => {
+      console.error("[ManagedAuth] Failed to import local Cursor auth:", e);
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
   const startAuth = useCallback(
     (
       oauthFlowMode?: "web_paste" | "localhost" | "cli" | "device",
-      options?: { codexCallbackUrl?: string | null },
+      options?: {
+        codexCallbackUrl?: string | null;
+        kiroLoginProvider?: "google" | "github" | null;
+      },
     ) => {
       setPollingState("idle");
       setDeviceCode(null);
       setError(null);
       stopPolling();
       startLoginMutation.mutate(
-        oauthFlowMode || options?.codexCallbackUrl
-          ? { oauthFlowMode, codexCallbackUrl: options?.codexCallbackUrl }
+        oauthFlowMode ||
+          options?.codexCallbackUrl ||
+          options?.kiroLoginProvider
+          ? {
+              oauthFlowMode,
+              codexCallbackUrl: options?.codexCallbackUrl,
+              kiroLoginProvider: options?.kiroLoginProvider,
+            }
           : undefined,
       );
     },
@@ -224,6 +250,14 @@ export function useManagedAuth(
     [setDefaultAccountMutation],
   );
 
+  const importCursorLocalAuth = useCallback(() => {
+    setPollingState("idle");
+    setDeviceCode(null);
+    setError(null);
+    stopPolling();
+    importCursorLocalMutation.mutate();
+  }, [importCursorLocalMutation, stopPolling]);
+
   const accounts = authStatus?.accounts ?? [];
 
   return {
@@ -239,6 +273,7 @@ export function useManagedAuth(
     error,
     isPolling: pollingState === "polling",
     isAddingAccount: startLoginMutation.isPending || pollingState === "polling",
+    isImportingCursorLocalAuth: importCursorLocalMutation.isPending,
     isRemovingAccount: removeAccountMutation.isPending,
     isSettingDefaultAccount: setDefaultAccountMutation.isPending,
     startAuth: startDefaultAuth,
@@ -248,6 +283,7 @@ export function useManagedAuth(
     logout,
     removeAccount,
     setDefaultAccount,
+    importCursorLocalAuth,
     refetchStatus,
   };
 }

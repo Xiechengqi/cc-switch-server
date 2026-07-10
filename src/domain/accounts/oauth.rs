@@ -6,12 +6,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::domain::accounts::cursor_import::{
+    cursor_account_id_from_stable_subject, cursor_workos_user_id_from_access_token,
+};
 use crate::domain::accounts::store::{
     Account, AccountQuota, AccountQuotaTier, AccountRefreshUpdate, UpsertAccountInput,
 };
 use crate::domain::providers::model::ProviderType;
 
-const TOKEN_REFRESH_BUFFER_MS: i64 = 60_000;
+const TOKEN_REFRESH_BUFFER_MS: i64 = 180_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,6 +153,9 @@ pub struct OAuthIdentity {
     pub account_id: Option<String>,
     pub email: Option<String>,
     pub plan_type: Option<String>,
+    pub subscription_expires_at: Option<String>,
+    pub poid: Option<String>,
+    pub organizations: Option<Value>,
 }
 
 static CODEX_TOKEN_URLS: &[&str] = &["https://auth.openai.com/oauth/token"];
@@ -170,6 +176,10 @@ static CURSOR_POLL_URL: &str = "https://api2.cursor.sh/auth/poll";
 static CURSOR_USER_AGENT: &str = "Cursor/1.1.6 (cc-switch browser login)";
 static ANTIGRAVITY_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"];
 static ANTIGRAVITY_AUTHORIZE_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+static XAI_TOKEN_URLS: &[&str] = &["https://auth.x.ai/oauth2/token"];
+static XAI_AUTHORIZE_URL: &str = "https://auth.x.ai/oauth2/authorize";
+static XAI_AUTHORIZE_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+pub const XAI_LOOPBACK_REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
 
 pub fn claude_oauth_token_urls_for_redirect(redirect_uri: &str) -> Vec<&'static str> {
     if redirect_uri == CLAUDE_WEB_PASTE_REDIRECT_URI {
@@ -217,7 +227,7 @@ pub fn parse_claude_authorization_code_input(
     }
 
     let token_state = match state_from_code {
-        Some(state) if state.is_empty() => expected_state.to_string(),
+        Some("") => expected_state.to_string(),
         Some(state) => {
             if state != expected_state {
                 return Err(OAuthErrorClassification {
@@ -233,6 +243,76 @@ pub fn parse_claude_authorization_code_input(
     };
 
     Ok((code.to_string(), token_state))
+}
+
+pub fn parse_grok_authorization_code_input(
+    raw_input: &str,
+    expected_state: &str,
+) -> Result<(String, String), OAuthErrorClassification> {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return Err(OAuthErrorClassification {
+            kind: OAuthErrorKind::Unsupported,
+            message: "Grok authorization input is empty; paste the full callback URL, query string, or code".to_string(),
+            retryable: false,
+            refresh_token_may_have_rotated: false,
+        });
+    }
+
+    let parsed = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        reqwest::Url::parse(trimmed).ok()
+    } else if trimmed.starts_with('?') || trimmed.contains("code=") {
+        reqwest::Url::parse(&format!(
+            "http://127.0.0.1/callback?{}",
+            trimmed.trim_start_matches('?')
+        ))
+        .ok()
+    } else {
+        None
+    };
+
+    let (code, state_from_input) = if let Some(url) = parsed {
+        let mut code = None;
+        let mut state = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "code" => code = Some(value.into_owned()),
+                "state" => state = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        let code = code
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| OAuthErrorClassification {
+                kind: OAuthErrorKind::Unsupported,
+                message: "Grok callback URL/query is missing code".to_string(),
+                retryable: false,
+                refresh_token_may_have_rotated: false,
+            })?;
+        (code, state)
+    } else {
+        (trimmed.to_string(), None)
+    };
+
+    if let Some(state) = state_from_input
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if state != expected_state {
+            return Err(OAuthErrorClassification {
+                kind: OAuthErrorKind::Unsupported,
+                message: "Grok callback state does not match the login session".to_string(),
+                retryable: false,
+                refresh_token_may_have_rotated: false,
+            });
+        }
+    }
+
+    let token_state = state_from_input
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| expected_state.to_string());
+    Ok((code, token_state))
 }
 
 fn set_oauth_user_agent(
@@ -256,6 +336,51 @@ fn set_oauth_user_agent(
     }
 }
 
+fn validate_oauth_endpoint_url(
+    provider_type: ProviderType,
+    url: &str,
+) -> Result<(), OAuthErrorClassification> {
+    if provider_type != ProviderType::GrokOAuth
+        || std::env::var("XAI_ALLOW_UNSAFE_URL_OVERRIDES")
+            .ok()
+            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+    {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|error| OAuthErrorClassification {
+        kind: OAuthErrorKind::Unsupported,
+        retryable: false,
+        refresh_token_may_have_rotated: false,
+        message: format!("invalid xAI OAuth endpoint URL: {error}"),
+    })?;
+    let host = parsed.host_str().unwrap_or_default();
+    if parsed.scheme() == "https" && (host == "x.ai" || host.ends_with(".x.ai")) {
+        return Ok(());
+    }
+    Err(OAuthErrorClassification {
+        kind: OAuthErrorKind::Unsupported,
+        retryable: false,
+        refresh_token_may_have_rotated: false,
+        message: format!("xAI OAuth endpoint host is not allowed: {url}"),
+    })
+}
+
+fn grok_authorize_url() -> String {
+    std::env::var("CC_SWITCH_SERVER_XAI_AUTHORIZE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| XAI_AUTHORIZE_URL.to_string())
+}
+
+fn grok_token_url(default: &'static str) -> String {
+    std::env::var("CC_SWITCH_SERVER_XAI_TOKEN_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// OAuth quota UI hooks key accounts by this label (see `managed_auth_provider_label`).
 pub fn oauth_quota_auth_provider_label(provider_type: ProviderType) -> &'static str {
     match provider_type {
@@ -264,6 +389,7 @@ pub fn oauth_quota_auth_provider_label(provider_type: ProviderType) -> &'static 
         ProviderType::CodexOAuth => "codex_oauth",
         ProviderType::ClaudeOAuth => "claude_oauth",
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => "antigravity_oauth",
+        ProviderType::GrokOAuth => "grok_oauth",
         ProviderType::CursorOAuth => "cursor_oauth",
         ProviderType::CursorApiKey => "cursor_apikey",
         ProviderType::KiroOAuth => "kiro_oauth",
@@ -349,7 +475,7 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             client_secret: None,
             client_secret_env: None,
             refresh_scope: None,
-            user_agent: Some("cc-switch-server-cursor-oauth"),
+            user_agent: Some(CURSOR_USER_AGENT),
             profile_url: Some("https://cursor.com/api/auth/me"),
             profile_strategy: OAuthProfileStrategy::UserInfoEndpoint,
             quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
@@ -374,9 +500,44 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             profile_strategy: OAuthProfileStrategy::UserInfoEndpoint,
             quota_strategy: OAuthQuotaStrategy::ProviderSpecific,
         }),
+        ProviderType::GrokOAuth => Some(OAuthProviderSpec {
+            provider_type,
+            stage: OAuthSupportStage::NativeRefreshProfile,
+            authorize_url: Some(XAI_AUTHORIZE_URL),
+            authorize_flow: OAuthAuthorizeFlow::AuthorizationCodePkce,
+            authorize_scope: Some(XAI_AUTHORIZE_SCOPE),
+            token_urls: XAI_TOKEN_URLS,
+            token_body_format: OAuthRequestBodyFormat::Form,
+            client_id: Some("b1a00492-073a-47ea-816f-4c329264a828"),
+            client_id_env: Some("CC_SWITCH_SERVER_XAI_CLIENT_ID"),
+            client_secret: None,
+            client_secret_env: None,
+            refresh_scope: Some(XAI_AUTHORIZE_SCOPE),
+            user_agent: Some("cc-switch-server-grok-oauth"),
+            profile_url: None,
+            profile_strategy: OAuthProfileStrategy::JwtClaims,
+            quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
+        }),
+        ProviderType::KiroOAuth => Some(OAuthProviderSpec {
+            provider_type,
+            stage: OAuthSupportStage::NativeRefreshProfile,
+            authorize_url: None,
+            authorize_flow: OAuthAuthorizeFlow::Unsupported,
+            authorize_scope: None,
+            token_urls: &[],
+            token_body_format: OAuthRequestBodyFormat::Json,
+            client_id: None,
+            client_id_env: None,
+            client_secret: None,
+            client_secret_env: None,
+            refresh_scope: None,
+            user_agent: Some("cc-switch-server-kiro-oauth"),
+            profile_url: None,
+            profile_strategy: OAuthProfileStrategy::ProviderSpecific,
+            quota_strategy: OAuthQuotaStrategy::ProviderSpecific,
+        }),
         ProviderType::GitHubCopilot
         | ProviderType::DeepSeekAccount
-        | ProviderType::KiroOAuth
         | ProviderType::CursorApiKey
         | ProviderType::OllamaCloud
         | ProviderType::AwsBedrock
@@ -423,6 +584,7 @@ pub fn oauth_specs() -> Vec<OAuthProviderSpec> {
         ProviderType::AwsBedrock,
         ProviderType::Nvidia,
         ProviderType::DeepSeekApi,
+        ProviderType::GrokOAuth,
     ]
     .into_iter()
     .filter_map(oauth_provider_spec)
@@ -445,6 +607,7 @@ pub fn provider_token_exchange_available(provider_type: ProviderType) -> bool {
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
+            | ProviderType::GrokOAuth
     )
 }
 
@@ -458,6 +621,14 @@ pub fn build_authorize_url(
     let authorize_url = spec
         .authorize_url
         .ok_or_else(|| unsupported_login(provider_type))?;
+    let authorize_url_owned;
+    let authorize_url = if provider_type == ProviderType::GrokOAuth {
+        authorize_url_owned = grok_authorize_url();
+        authorize_url_owned.as_str()
+    } else {
+        authorize_url
+    };
+    validate_oauth_endpoint_url(provider_type, authorize_url)?;
     let client_id = resolve_spec_client_id(&spec)?;
 
     match spec.authorize_flow {
@@ -487,6 +658,12 @@ pub fn build_authorize_url(
                 }
                 ProviderType::ClaudeOAuth => {
                     params.insert(0, ("code", "true".to_string()));
+                    params.push(("prompt", "login".to_string()));
+                }
+                ProviderType::GrokOAuth => {
+                    params.push(("plan", "generic".to_string()));
+                    params.push(("referrer", "cc-switch-server".to_string()));
+                    params.push(("nonce", state.to_string()));
                 }
                 _ => {}
             }
@@ -541,14 +718,24 @@ pub fn build_authorization_code_request(
     ) {
         return Err(unsupported_login(provider_type));
     }
+    let token_url_owned;
     let token_url = if provider_type == ProviderType::ClaudeOAuth {
         claude_oauth_token_urls_for_redirect(redirect_uri)[0]
+    } else if provider_type == ProviderType::GrokOAuth {
+        let default = spec
+            .token_urls
+            .first()
+            .copied()
+            .ok_or_else(|| unsupported(provider_type))?;
+        token_url_owned = grok_token_url(default);
+        token_url_owned.as_str()
     } else {
         spec.token_urls
             .first()
             .copied()
             .ok_or_else(|| unsupported(provider_type))?
     };
+    validate_oauth_endpoint_url(provider_type, token_url)?;
     let client_id = resolve_spec_client_id(&spec)?;
     let client_secret = resolve_spec_client_secret(&spec);
 
@@ -626,11 +813,18 @@ pub fn build_refresh_request(
     account: &Account,
 ) -> Result<OAuthHttpRequest, OAuthErrorClassification> {
     let spec = oauth_provider_spec(provider_type).ok_or_else(|| unsupported(provider_type))?;
+    let token_url_owned;
     let token_url = spec
         .token_urls
         .first()
         .copied()
         .ok_or_else(|| unsupported(provider_type))?;
+    let token_url = if provider_type == ProviderType::GrokOAuth {
+        token_url_owned = grok_token_url(token_url);
+        token_url_owned.as_str()
+    } else {
+        token_url
+    };
     build_refresh_request_for_token_url(provider_type, account, token_url)
 }
 
@@ -640,6 +834,7 @@ pub fn build_refresh_request_for_token_url(
     token_url: &str,
 ) -> Result<OAuthHttpRequest, OAuthErrorClassification> {
     let spec = oauth_provider_spec(provider_type).ok_or_else(|| unsupported(provider_type))?;
+    validate_oauth_endpoint_url(provider_type, token_url)?;
     let refresh_token = account
         .refresh_token
         .as_deref()
@@ -684,6 +879,9 @@ pub fn build_profile_request(
     provider_type: ProviderType,
     access_token: &str,
 ) -> Option<OAuthHttpRequest> {
+    if provider_type == ProviderType::CursorOAuth {
+        return None;
+    }
     let spec = oauth_provider_spec(provider_type)?;
     let profile_url = spec.profile_url?;
     let mut headers = vec![
@@ -703,6 +901,39 @@ pub fn build_profile_request(
         method: "GET",
         url: profile_url.to_string(),
         headers,
+        body: Value::Null,
+        body_format: OAuthRequestBodyFormat::Json,
+    })
+}
+
+pub fn build_cursor_profile_request(
+    access_token: &str,
+    workos_user_id: &str,
+) -> Option<OAuthHttpRequest> {
+    let access_token = access_token.trim();
+    let workos_user_id = workos_user_id.trim();
+    if access_token.is_empty() || workos_user_id.is_empty() {
+        return None;
+    }
+    Some(OAuthHttpRequest {
+        method: "GET",
+        url: "https://cursor.com/api/auth/me".to_string(),
+        headers: vec![
+            (
+                "Cookie".to_string(),
+                format!("WorkosCursorSessionToken={workos_user_id}::{access_token}"),
+            ),
+            ("Origin".to_string(), "https://cursor.com".to_string()),
+            (
+                "Referer".to_string(),
+                "https://cursor.com/dashboard".to_string(),
+            ),
+            (
+                "Accept".to_string(),
+                "application/json, text/plain, */*".to_string(),
+            ),
+            ("User-Agent".to_string(), CURSOR_USER_AGENT.to_string()),
+        ],
         body: Value::Null,
         body_format: OAuthRequestBodyFormat::Json,
     })
@@ -769,6 +1000,8 @@ pub fn refresh_update_from_profile_response(
             "accountId": identity.account_id,
             "email": identity.email,
             "planType": identity.plan_type,
+            "subscriptionExpiresAt": identity.subscription_expires_at,
+            "subscription": {"expiresAt": identity.subscription_expires_at},
             "raw": raw
         })),
         subscription_level: identity.plan_type,
@@ -866,11 +1099,13 @@ pub fn upsert_input_from_login_response(
         profile: update.profile,
         raw: update.raw,
         subscription_level: update.subscription_level,
+        entitlement_status: update.entitlement_status,
         quota_percent: update.quota_percent,
         quota: update.quota,
         quota_refreshed_at: update.quota_refreshed_at,
         quota_next_refresh_at: update.quota_next_refresh_at,
         expires_at: update.expires_at,
+        rate_limited_until: None,
         last_refresh_error: None,
     })
 }
@@ -942,17 +1177,35 @@ pub fn identity_from_jwt(token: &str) -> Option<OAuthIdentity> {
         account_id: string_at(&claims, &["/chatgpt_account_id"])
             .or_else(|| string_at(&claims, &["/openai_auth/chatgpt_account_id"]))
             .or_else(|| string_at(&claims, &["/organizations/0/id"]))
+            .or_else(|| string_at(&claims, &["/user_id"]))
             .or_else(|| string_at(&claims, &["/sub"])),
-        email: string_at(&claims, &["/email"]),
-        plan_type: string_at(
+        email: string_at(&claims, &["/email", "/preferred_username"]),
+        plan_type: plan_type_at(
             &claims,
             &[
                 "/openai_auth/chatgpt_plan_type",
                 "/plan_type",
                 "/plan",
                 "/tier",
+                "/subscription_tier",
             ],
         ),
+        subscription_expires_at: string_or_integer_at(
+            &claims,
+            &[
+                "/subscription/expiresAt",
+                "/subscription/expires_at",
+                "/subscription/activeUntil",
+                "/subscription/active_until",
+                "/subscription_expires_at",
+                "/subscriptionExpiresAt",
+                "/openai_auth/subscription/expiresAt",
+                "/openai_auth/subscription/expires_at",
+                "/openaiAuth/subscription/expiresAt",
+            ],
+        ),
+        poid: string_at(&claims, &["/poid", "/openai_auth/poid"]),
+        organizations: claims.pointer("/organizations").cloned(),
     })
 }
 
@@ -976,7 +1229,7 @@ pub fn classify_oauth_error(status_code: Option<u16>, body: &str) -> OAuthErrorC
     let message_lower = json_message.to_ascii_lowercase();
     let haystack = format!("{body_lower}\n{message_lower}");
 
-    let kind = if haystack.contains("authorization_pending") {
+    let kind = if haystack.contains("authorization_pending") || haystack.contains("slow_down") {
         OAuthErrorKind::AuthorizationPending
     } else if haystack.contains("access_denied") {
         OAuthErrorKind::AccessDenied
@@ -1105,14 +1358,21 @@ fn profile_value(
     if identity == &OAuthIdentity::default() {
         return None;
     }
-    Some(json!({
+    let mut value = json!({
         "providerType": provider_type.as_str(),
         "accountId": identity.account_id,
         "email": identity.email,
         "planType": identity.plan_type,
+        "subscriptionExpiresAt": identity.subscription_expires_at,
+        "subscription": {"expiresAt": identity.subscription_expires_at},
+        "poid": identity.poid,
+        "organizations": identity.organizations,
         "source": "token_response",
         "rawKeys": raw.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()).unwrap_or_default()
-    }))
+    });
+    enrich_codex_profile_value(provider_type, identity, &mut value);
+    enrich_grok_profile_value(provider_type, raw, &mut value);
+    Some(value)
 }
 
 fn login_identity(
@@ -1131,7 +1391,21 @@ fn login_identity(
         }
     }
     if provider_type == ProviderType::CursorOAuth {
-        if let Some(refresh_token) = response
+        let stable_subject = cursor_workos_user_id_from_access_token(&response.access_token)
+            .or_else(|| {
+                response
+                    .id_token
+                    .as_deref()
+                    .and_then(cursor_workos_user_id_from_access_token)
+            })
+            .or_else(|| {
+                profile_raw.and_then(|value| string_at(value, &["/sub", "/user_id", "/id"]))
+            });
+        if let Some(account_id) =
+            stable_subject.and_then(|subject| cursor_account_id_from_stable_subject(&subject))
+        {
+            identity.account_id = Some(account_id);
+        } else if let Some(refresh_token) = response
             .refresh_token
             .as_deref()
             .filter(|value| !value.trim().is_empty())
@@ -1179,8 +1453,14 @@ fn login_profile_value(
         "accountId": identity.account_id,
         "email": identity.email,
         "planType": identity.plan_type,
+        "subscriptionExpiresAt": identity.subscription_expires_at,
+        "subscription": {"expiresAt": identity.subscription_expires_at},
+        "poid": identity.poid,
+        "organizations": identity.organizations,
         "tokenRawKeys": token_raw.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()).unwrap_or_default()
     });
+    enrich_codex_profile_value(provider_type, identity, &mut value);
+    enrich_grok_profile_value(provider_type, token_raw, &mut value);
     if let Some(profile_raw) = profile_raw {
         value["profileRaw"] = profile_raw.clone();
     }
@@ -1221,6 +1501,7 @@ fn identity_from_provider_value(value: &Value) -> Option<OAuthIdentity> {
                 "/account/email_address",
                 "/account/email",
                 "/account/uuid",
+                "/user_id",
                 "/user/email",
                 "/profile/email",
                 "/email",
@@ -1240,7 +1521,7 @@ fn identity_from_provider_value(value: &Value) -> Option<OAuthIdentity> {
                 "/email_address",
             ],
         ),
-        plan_type: string_at(
+        plan_type: plan_type_at(
             value,
             &[
                 "/plan",
@@ -1254,10 +1535,83 @@ fn identity_from_provider_value(value: &Value) -> Option<OAuthIdentity> {
                 "/user/plan",
                 "/profile/plan",
                 "/tier",
+                "/subscription_tier",
             ],
         ),
+        subscription_expires_at: string_or_integer_at(
+            value,
+            &[
+                "/subscription/expiresAt",
+                "/subscription/expires_at",
+                "/subscriptionExpiresAt",
+                "/subscription_expires_at",
+                "/subscriptionPeriodEnd",
+                "/account/subscription/expiresAt",
+                "/account/subscription/expires_at",
+                "/profile/subscription/expiresAt",
+            ],
+        ),
+        poid: string_at(value, &["/poid", "/openai_auth/poid", "/openaiAuth/poid"]),
+        organizations: value
+            .pointer("/organizations")
+            .or_else(|| value.pointer("/openai_auth/organizations"))
+            .or_else(|| value.pointer("/openaiAuth/organizations"))
+            .cloned(),
     };
     (identity != OAuthIdentity::default()).then_some(identity)
+}
+
+fn enrich_codex_profile_value(
+    provider_type: ProviderType,
+    identity: &OAuthIdentity,
+    value: &mut Value,
+) {
+    if provider_type != ProviderType::CodexOAuth {
+        return;
+    }
+    let Some(account_id) = identity.account_id.as_ref() else {
+        return;
+    };
+    value["chatgpt_account_id"] = Value::String(account_id.clone());
+    value["chatgptAccountId"] = Value::String(account_id.clone());
+}
+
+fn enrich_grok_profile_value(provider_type: ProviderType, token_raw: &Value, value: &mut Value) {
+    if provider_type != ProviderType::GrokOAuth {
+        return;
+    }
+    let claims = string_at(token_raw, &["/id_token", "/idToken"])
+        .and_then(|token| decode_jwt_claims(&token))
+        .or_else(|| {
+            string_at(token_raw, &["/access_token", "/accessToken", "/key"])
+                .and_then(|token| decode_jwt_claims(&token))
+        });
+    let Some(claims) = claims else {
+        return;
+    };
+    for (target, pointers) in [
+        ("sub", &["/sub"][..]),
+        ("userId", &["/user_id", "/userId"][..]),
+        (
+            "preferredUsername",
+            &["/preferred_username", "/preferredUsername"][..],
+        ),
+        ("teamId", &["/team_id", "/teamId"][..]),
+        (
+            "tier",
+            &["/tier", "/subscription_tier", "/subscriptionTier"][..],
+        ),
+        ("principalType", &["/principal_type", "/principalType"][..]),
+        (
+            "entitlementStatus",
+            &["/entitlement_status", "/entitlementStatus"][..],
+        ),
+    ] {
+        if let Some(item) = string_at(&claims, pointers) {
+            value[target] = Value::String(item);
+        }
+    }
+    value["claims"] = claims;
 }
 
 fn split_scopes(scope: &str) -> Vec<String> {
@@ -1278,6 +1632,39 @@ fn string_at(value: &Value, pointers: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+fn string_or_integer_at(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        let value = value.pointer(pointer)?;
+        if let Some(text) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(text.to_string());
+        }
+        value.as_i64().map(|number| number.to_string())
+    })
+}
+
+fn plan_type_at(value: &Value, pointers: &[&str]) -> Option<String> {
+    string_at(value, pointers).and_then(normalize_oauth_plan_type)
+}
+
+fn normalize_oauth_plan_type(value: String) -> Option<String> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "unknown" | "none" | "null" | "undefined" | "n/a" | "na"
+    ) {
+        return None;
+    }
+    Some(normalized.to_string())
 }
 
 fn integer_at(value: &Value, pointers: &[&str]) -> Option<i64> {
@@ -1398,11 +1785,13 @@ mod tests {
             profile: None,
             raw: None,
             subscription_level: None,
+            entitlement_status: None,
             quota: None,
             quota_percent: None,
             quota_refreshed_at: None,
             quota_next_refresh_at: None,
             expires_at: Some(1_100_000),
+            rate_limited_until: None,
             last_refresh_error: None,
         })
     }
@@ -1465,6 +1854,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_grok_authorization_code_input_accepts_callback_query_and_code() {
+        let (code, state) = parse_grok_authorization_code_input(
+            "http://127.0.0.1:56121/callback?code=auth-code&state=state-1",
+            "state-1",
+        )
+        .expect("callback URL should parse");
+        assert_eq!(code, "auth-code");
+        assert_eq!(state, "state-1");
+
+        let (code, state) =
+            parse_grok_authorization_code_input("?code=query-code&state=state-1", "state-1")
+                .expect("query string should parse");
+        assert_eq!(code, "query-code");
+        assert_eq!(state, "state-1");
+
+        let (code, state) =
+            parse_grok_authorization_code_input("?code=query-code&state=", "state-1")
+                .expect("empty state should fall back to session state");
+        assert_eq!(code, "query-code");
+        assert_eq!(state, "state-1");
+
+        let (code, state) =
+            parse_grok_authorization_code_input("bare-code", "state-1").expect("bare code");
+        assert_eq!(code, "bare-code");
+        assert_eq!(state, "state-1");
+    }
+
+    #[test]
+    fn parse_grok_authorization_code_input_rejects_state_mismatch() {
+        let error = parse_grok_authorization_code_input("?code=auth-code&state=other", "state-1")
+            .expect_err("state mismatch should fail");
+        assert_eq!(error.kind, OAuthErrorKind::Unsupported);
+    }
+
+    #[test]
     fn claude_refresh_request_keeps_api_and_platform_fallback_urls() {
         let spec = oauth_provider_spec(ProviderType::ClaudeOAuth).unwrap();
         assert_eq!(spec.token_urls.len(), 2);
@@ -1514,8 +1938,8 @@ mod tests {
     #[test]
     fn detects_expiring_tokens_with_refresh_buffer() {
         let account = account(ProviderType::CodexOAuth);
-        assert!(token_expires_soon(&account, 1_050_001));
-        assert!(!token_expires_soon(&account, 1_000));
+        assert!(token_expires_soon(&account, 920_001));
+        assert!(!token_expires_soon(&account, 919_999));
     }
 
     #[test]
@@ -1552,9 +1976,67 @@ mod tests {
     }
 
     #[test]
+    fn codex_identity_persists_subscription_expiry_and_ignores_unknown_plan() {
+        let id_token = jwt(
+            r#"{"chatgpt_account_id":"acc-123","email":"owner@example.com","openai_auth":{"chatgpt_plan_type":"unknown"},"subscription":{"expiresAt":"2026-08-01T00:00:00Z"}}"#,
+        );
+        let raw = json!({
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "id_token": id_token,
+            "token_type": "Bearer"
+        });
+        let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
+        let update = refresh_update_from_token_response(
+            ProviderType::CodexOAuth,
+            &response,
+            raw,
+            1_000,
+            30 * 60 * 1000,
+        );
+
+        assert_eq!(update.subscription_level, None);
+        let profile = update.profile.expect("profile");
+        assert_eq!(
+            profile
+                .pointer("/subscription/expiresAt")
+                .and_then(Value::as_str),
+            Some("2026-08-01T00:00:00Z")
+        );
+        assert_eq!(
+            profile.get("subscriptionExpiresAt").and_then(Value::as_str),
+            Some("2026-08-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn codex_profile_refresh_unknown_plan_preserves_existing_subscription_level() {
+        let update = refresh_update_from_profile_response(
+            ProviderType::CodexOAuth,
+            json!({
+                "chatgpt_account_id": "acc-123",
+                "email": "owner@example.com",
+                "planType": "unknown",
+                "subscription": {"expiresAt": "2026-08-01T00:00:00Z"}
+            }),
+            1_000,
+            30 * 60 * 1000,
+        );
+
+        assert_eq!(update.subscription_level, None);
+        let profile = update.profile.expect("profile");
+        assert_eq!(
+            profile
+                .pointer("/subscription/expiresAt")
+                .and_then(Value::as_str),
+            Some("2026-08-01T00:00:00Z")
+        );
+    }
+
+    #[test]
     fn codex_token_response_builds_account_import_input() {
         let id_token = jwt(
-            r#"{"chatgpt_account_id":"acc-123","email":"owner@example.com","openai_auth":{"chatgpt_plan_type":"pro"}}"#,
+            r#"{"chatgpt_account_id":"acc-123","email":"owner@example.com","poid":"poid-123","organizations":[{"id":"org-1"}],"openai_auth":{"chatgpt_plan_type":"pro"}}"#,
         );
         let raw = json!({
             "access_token": "access-new",
@@ -1576,6 +2058,11 @@ mod tests {
         assert_eq!(input.scopes, vec!["openid", "profile", "email"]);
         assert_eq!(input.subscription_level.as_deref(), Some("pro"));
         assert_eq!(input.expires_at, Some(3_601_000));
+        let profile = input.profile.as_ref().expect("profile");
+        assert_eq!(profile["chatgpt_account_id"], json!("acc-123"));
+        assert_eq!(profile["chatgptAccountId"], json!("acc-123"));
+        assert_eq!(profile["poid"], json!("poid-123"));
+        assert_eq!(profile["organizations"][0]["id"], json!("org-1"));
     }
 
     #[test]
@@ -1707,7 +2194,62 @@ mod tests {
     }
 
     #[test]
-    fn cursor_poll_response_import_uses_refresh_token_hash_id() {
+    fn cursor_poll_response_import_uses_workos_subject_hash_id() {
+        let access_token = jwt(r#"{"sub":"workos-subject","email":"cursor@example.com"}"#);
+        let raw = json!({
+            "accessToken": access_token,
+            "refreshToken": "refresh-new",
+            "email": "cursor@example.com"
+        });
+        let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
+        let input = upsert_input_from_login_response(
+            ProviderType::CursorOAuth,
+            &response,
+            raw,
+            None,
+            1_000,
+            30 * 60 * 1000,
+        )
+        .expect("account input");
+
+        assert_eq!(
+            input.id,
+            cursor_account_id_from_stable_subject("workos-subject")
+        );
+        assert_eq!(input.email.as_deref(), Some("cursor@example.com"));
+        assert_eq!(input.refresh_token.as_deref(), Some("refresh-new"));
+    }
+
+    #[test]
+    fn cursor_login_import_uses_profile_subject_when_tokens_have_no_subject() {
+        let raw = json!({
+            "accessToken": "access-new",
+            "refreshToken": "refresh-new",
+            "email": "cursor@example.com"
+        });
+        let profile = json!({
+            "sub": "profile-workos-subject",
+            "email": "cursor@example.com"
+        });
+        let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
+        let input = upsert_input_from_login_response(
+            ProviderType::CursorOAuth,
+            &response,
+            raw,
+            Some(profile),
+            1_000,
+            30 * 60 * 1000,
+        )
+        .expect("account input");
+
+        assert_eq!(
+            input.id,
+            cursor_account_id_from_stable_subject("profile-workos-subject")
+        );
+    }
+
+    #[test]
+    fn cursor_poll_response_import_falls_back_to_refresh_token_hash_id() {
         let id_token = jwt(r#"{"email":"cursor@example.com"}"#);
         let raw = json!({
             "accessToken": "access-new",
@@ -1780,6 +2322,10 @@ mod tests {
         let pending = classify_oauth_error(Some(400), r#"{"error":"authorization_pending"}"#);
         assert_eq!(pending.kind, OAuthErrorKind::AuthorizationPending);
         assert!(pending.retryable);
+
+        let slow_down = classify_oauth_error(Some(400), r#"{"error":"slow_down"}"#);
+        assert_eq!(slow_down.kind, OAuthErrorKind::AuthorizationPending);
+        assert!(slow_down.retryable);
     }
 
     #[test]
@@ -1808,13 +2354,13 @@ mod tests {
     #[test]
     fn profile_request_exists_only_for_endpoint_based_providers() {
         assert!(build_profile_request(ProviderType::CodexOAuth, "token").is_none());
-        let request = build_profile_request(ProviderType::CursorOAuth, "token").unwrap();
+        assert!(build_profile_request(ProviderType::CursorOAuth, "token").is_none());
+        let request = build_cursor_profile_request("token", "workos-user").unwrap();
         assert_eq!(request.method, "GET");
         assert_eq!(request.url, "https://cursor.com/api/auth/me");
-        assert_eq!(
-            request.headers[0],
-            ("Authorization".to_string(), "Bearer token".to_string())
-        );
+        assert!(request.headers.iter().any(|(name, value)| {
+            name == "Cookie" && value == "WorkosCursorSessionToken=workos-user::token"
+        }));
     }
 
     #[test]
@@ -1844,6 +2390,9 @@ mod tests {
         assert_eq!(cursor.body_format, OAuthRequestBodyFormat::Json);
         assert_eq!(cursor.body["client_id"], "cursor-client-fixture");
         assert!(cursor.body.get("client_secret").is_none());
+        assert!(cursor.headers.iter().any(|(name, value)| {
+            name == "User-Agent" && value == "Cursor/1.1.6 (cc-switch browser login)"
+        }));
 
         let antigravity = build_refresh_request(
             ProviderType::AntigravityOAuth,
@@ -1881,7 +2430,6 @@ mod tests {
         for provider_type in [
             ProviderType::GitHubCopilot,
             ProviderType::DeepSeekAccount,
-            ProviderType::KiroOAuth,
             ProviderType::CursorApiKey,
             ProviderType::OllamaCloud,
             ProviderType::AwsBedrock,
@@ -1892,6 +2440,10 @@ mod tests {
             assert_eq!(spec.stage, OAuthSupportStage::ManualImportOnly);
             assert!(spec.token_urls.is_empty());
         }
+
+        let kiro = oauth_provider_spec(ProviderType::KiroOAuth).unwrap();
+        assert_eq!(kiro.stage, OAuthSupportStage::NativeRefreshProfile);
+        assert!(kiro.token_urls.is_empty());
     }
 
     #[test]

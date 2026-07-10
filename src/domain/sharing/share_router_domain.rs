@@ -35,7 +35,7 @@ pub fn normalize_share_router_domain(input: &str) -> Result<String, String> {
         return Err("share.validation.invalidRouterDomain".to_string());
     }
 
-    let authority = value.to_ascii_lowercase();
+    let authority = normalize_known_share_router_alias(&value.to_ascii_lowercase());
     validate_share_router_authority(&authority)?;
     Ok(authority)
 }
@@ -110,6 +110,14 @@ fn validate_share_router_authority(authority: &str) -> Result<(), String> {
     }
     let _ = port;
     Ok(())
+}
+
+fn normalize_known_share_router_alias(authority: &str) -> String {
+    match authority {
+        "jp.tokenswitch.cc" => "jptokenswitch.cc".to_string(),
+        "sg.tokenswitch.cc" => "sgptokenswitch.cc".to_string(),
+        _ => authority.to_string(),
+    }
 }
 
 #[cfg(test)]
