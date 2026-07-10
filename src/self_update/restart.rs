@@ -72,9 +72,10 @@ fn render_restart_script(strategy: RestartStrategy) -> String {
              pkill -9 cc-switch-server 2>/dev/null || true; \
              if [ -f {staging} ]; then mv -f {staging} {bin}; fi; \
              chmod +x {bin} 2>/dev/null || true; \
-             nohup {bin} >/dev/null 2>&1 &",
+             nohup {bin} >> {log} 2>&1 &",
             staging = BINARY_STAGING_PATH,
             bin = BINARY_INSTALL_PATH,
+            log = crate::self_update::version::SERVICE_LOG_PATH,
         ),
     }
 }
@@ -85,8 +86,9 @@ fn render_rollback_restart_script(strategy: RestartStrategy) -> String {
         RestartStrategy::Nohup => format!(
             "sleep 3; \
              pkill -9 cc-switch-server 2>/dev/null || true; \
-             nohup {bin} >/dev/null 2>&1 &",
+             nohup {bin} >> {log} 2>&1 &",
             bin = BINARY_INSTALL_PATH,
+            log = crate::self_update::version::SERVICE_LOG_PATH,
         ),
     }
 }
@@ -149,6 +151,7 @@ mod tests {
         assert!(script.contains("pkill -9 cc-switch-server"));
         assert!(script.contains("mv -f /tmp/cc-switch-server /usr/local/bin/cc-switch-server"));
         assert!(script.contains("nohup /usr/local/bin/cc-switch-server"));
+        assert!(script.contains("/var/log/cc-switch-server.log"));
     }
 
     #[test]
@@ -156,5 +159,6 @@ mod tests {
         let script = render_rollback_restart_script(RestartStrategy::Nohup);
         assert!(script.contains("pkill -9 cc-switch-server"));
         assert!(script.contains("nohup /usr/local/bin/cc-switch-server"));
+        assert!(script.contains("/var/log/cc-switch-server.log"));
     }
 }

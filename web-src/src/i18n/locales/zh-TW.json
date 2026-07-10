@@ -506,7 +506,13 @@
           "info": "一般操作資訊（預設）",
           "debug": "詳細資訊，包含 SSE 串流與請求/回應詳情",
           "trace": "全部日誌，最詳細"
-        }
+        },
+        "apiEnabled": "啟用 API",
+        "apiEnabledDescription": "允許透過管理員 API 拉取最近日誌，便於遠端排查",
+        "apiTailLines": "API 預設行數",
+        "apiTailLinesDescription": "透過 API 取得日誌時預設回傳的最近行數（1-1000）",
+        "apiExampleTitle": "API 呼叫範例",
+        "apiClientUrlHint": "透過 client URL 存取時，請使用目前頁面的網域並攜帶登入 token。"
       }
     },
     "language": "介面語言",

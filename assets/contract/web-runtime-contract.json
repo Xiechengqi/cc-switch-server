@@ -957,7 +957,7 @@
       "support": "shim",
       "implemented": true,
       "feature": "settings",
-      "notes": "Persisted in ui-settings.json logConfig; defaults match desktop."
+      "notes": "Persisted in ui-settings.json logConfig; supports apiEnabled/apiTailLines and GET /web-api/admin/logs/tail."
     },
     {
       "name": "get_model_pricing",

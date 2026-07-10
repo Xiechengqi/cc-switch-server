@@ -605,7 +605,13 @@
           "info": "一般操作信息（默认）",
           "debug": "详细信息，包含 SSE 流和请求/响应详情",
           "trace": "全部日志，最详细"
-        }
+        },
+        "apiEnabled": "启用 API",
+        "apiEnabledDescription": "允许通过管理员 API 拉取最近日志，便于远程排查",
+        "apiTailLines": "API 默认行数",
+        "apiTailLinesDescription": "通过 API 获取日志时默认返回的最近行数（1-1000）",
+        "apiExampleTitle": "API 调用示例",
+        "apiClientUrlHint": "通过 client URL 访问时，请使用当前页面的域名并携带登录 token。"
       }
     },
     "language": "界面语言",

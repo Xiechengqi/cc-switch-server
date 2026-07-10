@@ -1981,6 +1981,62 @@ async fn web_invoke_get_providers_returns_desktop_record_shape() {
 }
 
 #[tokio::test]
+async fn admin_logs_tail_honors_api_enabled_gate() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let disabled = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/web-api/admin/logs/tail",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
+
+    let saved = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/set_log_config",
+            json!({
+                "config": {
+                    "enabled": true,
+                    "level": "info",
+                    "apiEnabled": true,
+                    "apiTailLines": 25
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+
+    let enabled = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/web-api/admin/logs/tail?lines=5",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), StatusCode::OK);
+    let body = json_body(enabled).await;
+    assert!(body["lines"].as_u64().is_some());
+    assert!(body["lines"].as_u64().unwrap() <= 5);
+    assert!(body["content"].is_string());
+    assert!(body["path"].is_string());
+    assert!(body["source"].is_string());
+}
+
+#[tokio::test]
 async fn payout_profile_admin_write_public_read_and_clear_contract() {
     let state = test_state();
     let app = app_router(state);
@@ -2066,14 +2122,20 @@ fn test_state() -> ServerState {
         .unwrap()
         .as_nanos();
     let config_dir = std::env::temp_dir().join(format!("cc-switch-server-http-test-{nanos}"));
-    ServerStateInner::load(Cli {
-        host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port: 0,
-        config_dir: Some(config_dir),
-        web_dist_dir: None,
-        log_level: "warn".to_string(),
-        command: None,
-    })
+    let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
+        cc_switch_server::logging::RING_BUFFER_CAPACITY,
+    ));
+    ServerStateInner::load(
+        Cli {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: Some(config_dir),
+            web_dist_dir: None,
+            log_level: "warn".to_string(),
+            command: None,
+        },
+        log_capture,
+    )
     .unwrap()
 }
 

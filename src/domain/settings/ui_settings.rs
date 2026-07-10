@@ -193,11 +193,52 @@ pub fn optimizer_config_for_frontend(store: &UiSettingsStore) -> Value {
     merge_json_values(default_optimizer_config(), stored)
 }
 
+pub const LOG_API_MAX_TAIL_LINES: usize = 1_000;
+pub const LOG_API_DEFAULT_TAIL_LINES: usize = 100;
+
 pub fn default_log_config() -> Value {
     json!({
         "enabled": true,
         "level": "info",
+        "apiEnabled": false,
+        "apiTailLines": LOG_API_DEFAULT_TAIL_LINES,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedLogConfig {
+    pub enabled: bool,
+    pub level: String,
+    pub api_enabled: bool,
+    pub api_tail_lines: usize,
+}
+
+pub fn parse_log_config(value: &Value) -> ParsedLogConfig {
+    let enabled = value
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let level = value
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("info")
+        .to_ascii_lowercase();
+    let api_enabled = value
+        .get("apiEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let api_tail_lines = value
+        .get("apiTailLines")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(100)
+        .clamp(1, LOG_API_MAX_TAIL_LINES);
+    ParsedLogConfig {
+        enabled,
+        level,
+        api_enabled,
+        api_tail_lines,
+    }
 }
 
 pub fn default_stream_check_config() -> Value {
@@ -400,7 +441,37 @@ mod tests {
         let log = log_config_for_frontend(&store);
         assert_eq!(log["enabled"], json!(true));
         assert_eq!(log["level"], json!("debug"));
+        assert_eq!(log["apiEnabled"], json!(false));
+        assert_eq!(log["apiTailLines"], json!(LOG_API_DEFAULT_TAIL_LINES));
+    }
 
+    #[test]
+    fn parse_log_config_clamps_api_tail_lines() {
+        let parsed = parse_log_config(&json!({
+            "enabled": false,
+            "level": "WARN",
+            "apiEnabled": true,
+            "apiTailLines": 5000
+        }));
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.level, "warn");
+        assert!(parsed.api_enabled);
+        assert_eq!(parsed.api_tail_lines, LOG_API_MAX_TAIL_LINES);
+
+        let parsed = parse_log_config(&json!({}));
+        assert!(parsed.enabled);
+        assert_eq!(parsed.level, "info");
+        assert!(!parsed.api_enabled);
+        assert_eq!(parsed.api_tail_lines, LOG_API_DEFAULT_TAIL_LINES);
+    }
+
+    #[test]
+    fn stream_check_config_merge_defaults() {
+        let store = UiSettingsStore {
+            value: json!({
+                "streamCheckConfig": { "timeoutSecs": 30, "claudeModel": "custom-model" }
+            }),
+        };
         let stream = stream_check_config_for_frontend(&store);
         assert_eq!(stream["timeoutSecs"], json!(30));
         assert_eq!(stream["claudeModel"], json!("custom-model"));

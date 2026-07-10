@@ -601,7 +601,13 @@
           "info": "General operation info (default)",
           "debug": "Detailed info including SSE stream and request/response",
           "trace": "All logs, most verbose"
-        }
+        },
+        "apiEnabled": "Enable API",
+        "apiEnabledDescription": "Allow fetching recent logs through the admin API for remote troubleshooting",
+        "apiTailLines": "Default API line count",
+        "apiTailLinesDescription": "Number of recent log lines returned by default (1-1000)",
+        "apiExampleTitle": "API example",
+        "apiClientUrlHint": "When using a client URL, call the endpoint on the current page origin with your login token."
       }
     },
     "language": "Language",

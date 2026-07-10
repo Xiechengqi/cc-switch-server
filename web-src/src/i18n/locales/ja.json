@@ -499,7 +499,13 @@
           "info": "一般的な操作情報（デフォルト）",
           "debug": "SSE ストリームとリクエスト/レスポンスを含む詳細情報",
           "trace": "すべてのログ、最も詳細"
-        }
+        },
+        "apiEnabled": "API を有効化",
+        "apiEnabledDescription": "管理者 API 経由で最近のログを取得し、リモートトラブルシューティングを可能にします",
+        "apiTailLines": "API 既定行数",
+        "apiTailLinesDescription": "API で取得する既定の最近行数（1-1000）",
+        "apiExampleTitle": "API 呼び出し例",
+        "apiClientUrlHint": "client URL からアクセスする場合は、現在のページのオリジンとログイントークンを使用してください。"
       }
     },
     "language": "言語",

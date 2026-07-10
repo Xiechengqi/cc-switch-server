@@ -10,6 +10,7 @@ pub(crate) mod control;
 pub(crate) mod error;
 pub(in crate::api) mod events;
 pub(crate) mod invoke;
+pub(in crate::api) mod logs;
 pub(in crate::api) mod models;
 pub(in crate::api) mod payout;
 pub(in crate::api) mod providers;
@@ -37,6 +38,7 @@ pub(crate) use error::{
 pub(in crate::api) use events::*;
 pub(in crate::api) use invoke::dispatch::web_invoke_compat;
 pub(in crate::api) use invoke::handlers::*;
+pub(in crate::api) use logs::*;
 pub(in crate::api) use models::*;
 pub(in crate::api) use payout::*;
 pub(in crate::api) use providers::*;
@@ -171,6 +173,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/admin/upgrade", post(admin_upgrade_start))
         .route("/api/admin/upgrade/stream", get(admin_upgrade_stream))
         .route("/api/admin/upgrade/status", get(admin_upgrade_status))
+        .route("/api/admin/logs/tail", get(admin_logs_tail))
         .route("/api/events", get(events))
         .route("/api/backup", get(list_backups).post(create_backup))
         .route("/api/backups", get(list_backups).post(create_backup))
@@ -412,6 +415,10 @@ pub fn app_router(state: ServerState) -> Router {
         .route(
             "/web-api/admin/upgrade/status",
             get(crate::api::self_update::admin_upgrade_status),
+        )
+        .route(
+            "/web-api/admin/logs/tail",
+            get(crate::api::logs::admin_logs_tail),
         )
         .route("/v1/models", get(proxy_models))
         .route("/models", get(proxy_models))

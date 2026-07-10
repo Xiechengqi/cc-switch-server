@@ -45,6 +45,7 @@ use crate::domain::sharing::shares::{
 };
 use crate::domain::usage::pricing::ModelPricingStore;
 use crate::domain::usage::store::{UsageLog, UsageStore};
+use crate::logging::{LogTailAccessError, LogTailResponse, SharedLogCapture};
 use crate::proxy::cursor::session::CursorSessionManager;
 
 #[derive(Debug)]
@@ -80,6 +81,7 @@ pub struct ServerStateInner {
     pub debounced_saves: Arc<DebouncedStoreSaves>,
     pub started_at: std::time::Instant,
     pub upgrade: crate::self_update::upgrade::SharedUpgradeRegistry,
+    pub(crate) log_capture: SharedLogCapture,
 }
 
 pub type ServerState = Arc<ServerStateInner>;
@@ -589,7 +591,7 @@ fn schedule_debounced_save(state: ServerState, kind: DebouncedStoreKind) {
 }
 
 impl ServerStateInner {
-    pub fn load(cli: Cli) -> anyhow::Result<ServerState> {
+    pub fn load(cli: Cli, log_capture: SharedLogCapture) -> anyhow::Result<ServerState> {
         let config_dir = cli.resolved_config_dir()?;
 
         std::fs::create_dir_all(&config_dir)
@@ -605,6 +607,10 @@ impl ServerStateInner {
         let usage = UsageStore::load_or_default(&config_dir)?;
         let shares = ShareStore::load_or_default(&config_dir)?;
         let ui_settings = UiSettingsStore::load_or_default(&config_dir)?;
+        log_capture.apply_config(
+            &ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&ui_settings)),
+            &config_dir,
+        );
         let bind_addr = SocketAddr::new(cli.host, cli.port);
         let http_client = build_http_client(&config, bind_addr)?;
         let (events, _) = broadcast::channel(256);
@@ -644,7 +650,35 @@ impl ServerStateInner {
             debounced_saves: Arc::new(DebouncedStoreSaves::default()),
             started_at: std::time::Instant::now(),
             upgrade: Arc::new(crate::self_update::upgrade::UpgradeRegistry::new()),
+            log_capture,
         }))
+    }
+
+    pub async fn sync_log_config_from_ui_settings(&self) {
+        let store = self.ui_settings.read().await;
+        let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
+        drop(store);
+        self.log_capture.apply_config(&config, &self.config_dir);
+        let level = if config.enabled {
+            config.level.as_str()
+        } else {
+            "off"
+        };
+        crate::logging::reload_log_level(level);
+    }
+
+    pub async fn read_admin_log_tail(
+        &self,
+        requested_lines: Option<usize>,
+    ) -> Result<LogTailResponse, LogTailAccessError> {
+        let store = self.ui_settings.read().await;
+        let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
+        drop(store);
+        if !config.enabled || !config.api_enabled {
+            return Err(LogTailAccessError::Disabled);
+        }
+        let lines = crate::logging::clamp_tail_lines(requested_lines, config.api_tail_lines);
+        Ok(self.log_capture.read_tail(&config, &self.config_dir, lines))
     }
 
     pub async fn replace_config(&self, config: ServerConfig) -> anyhow::Result<()> {
@@ -2793,14 +2827,20 @@ mod tests {
             .unwrap()
             .as_nanos();
         let config_dir = std::env::temp_dir().join(format!("cc-switch-server-state-test-{nanos}"));
-        ServerStateInner::load(Cli {
-            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 0,
-            config_dir: Some(config_dir),
-            web_dist_dir: None,
-            log_level: "warn".to_string(),
-            command: None,
-        })
+        let log_capture = Arc::new(crate::logging::LogCapture::new(
+            crate::logging::RING_BUFFER_CAPACITY,
+        ));
+        ServerStateInner::load(
+            Cli {
+                host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(config_dir),
+                web_dist_dir: None,
+                log_level: "warn".to_string(),
+                command: None,
+            },
+            log_capture,
+        )
         .unwrap()
     }
 

@@ -191,6 +191,7 @@ async fn web_invoke_dispatch(
                 .apply_ui_settings_patch_immediate(json!({ "logConfig": config }))
                 .await
                 .map_err(ApiError::internal)?;
+            state.sync_log_config_from_ui_settings().await;
             Ok(json!(true))
         }
         "get_stream_check_config" => {

@@ -1,14 +1,18 @@
+use std::sync::Arc;
+
 use anyhow::Context;
 use cc_switch_server::cli::{Cli, Command};
+use cc_switch_server::logging::{LogCapture, RING_BUFFER_CAPACITY};
 use cc_switch_server::state::ServerStateInner;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
-    init_tracing(&cli.log_level);
+    let log_capture = Arc::new(LogCapture::new(RING_BUFFER_CAPACITY));
+    init_tracing(&cli.log_level, log_capture.clone());
 
     match cli.effective_command() {
-        Command::Serve => serve(cli).await,
+        Command::Serve => serve(cli, log_capture).await,
         Command::Config { command } => cc_switch_server::admin::run_config_command(&cli, command),
         Command::Doctor { check_port } => cc_switch_server::admin::run_doctor(&cli, check_port),
         Command::Version { json } => print_version(json),
@@ -18,9 +22,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn serve(cli: Cli) -> anyhow::Result<()> {
+async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     cc_switch_server::metrics::init()?;
-    let state = ServerStateInner::load(cli.clone()).context("initialize server state")?;
+    let state =
+        ServerStateInner::load(cli.clone(), log_capture).context("initialize server state")?;
+    state.sync_log_config_from_ui_settings().await;
     cc_switch_server::state::restore_tunnels(state.clone()).await;
     cc_switch_server::state::spawn_periodic_backups(state.clone());
     cc_switch_server::state::spawn_account_quota_refresh(state.clone());
@@ -28,15 +34,8 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     cc_switch_server::api::serve(state).await
 }
 
-fn init_tracing(log_level: &str) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .or_else(|_| tracing_subscriber::EnvFilter::try_new(log_level))
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+fn init_tracing(log_level: &str, capture: Arc<LogCapture>) {
+    cc_switch_server::logging::init_tracing(log_level, capture);
 }
 
 fn print_version(json: bool) -> anyhow::Result<()> {
