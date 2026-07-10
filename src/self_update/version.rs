@@ -55,6 +55,14 @@ pub fn release_binary_url() -> &'static str {
     }
 }
 
+pub(crate) fn release_binary_url_for_commit(commit_id: &str) -> String {
+    format!(
+        "{}?cc-switch-commit={}",
+        release_binary_url(),
+        normalize_commit_id(commit_id)
+    )
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceManager {
@@ -357,8 +365,15 @@ pub fn backup_installed_binary() -> Result<(), SelfUpdateError> {
         .map_err(|err| SelfUpdateError::Internal(format!("sync rollback backup failed: {err}")))
 }
 
-pub async fn fetch_release_checksum(client: &reqwest::Client) -> Result<String, SelfUpdateError> {
-    let url = format!("{}.sha256", release_binary_url());
+pub async fn fetch_release_checksum(
+    client: &reqwest::Client,
+    commit_id: &str,
+) -> Result<String, SelfUpdateError> {
+    let url = format!(
+        "{}.sha256?cc-switch-commit={}",
+        release_binary_url(),
+        normalize_commit_id(commit_id)
+    );
     let response = client
         .get(&url)
         .timeout(Duration::from_secs(15))
@@ -492,6 +507,13 @@ mod tests {
             hash
         );
         assert!(parse_release_checksum("not-a-checksum").is_err());
+    }
+
+    #[test]
+    fn release_asset_urls_are_cache_busted_by_target_commit() {
+        let commit = "AABBCCDDEEFF00112233445566778899AABBCCDD";
+        assert!(release_binary_url_for_commit(commit)
+            .ends_with("?cc-switch-commit=aabbccddeeff00112233445566778899aabbccdd"));
     }
 
     #[test]

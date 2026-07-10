@@ -53,8 +53,9 @@ Run the checks manually at:
 - Payout clear requires confirmation; Router outage leaves the local save active and visibly reports pending/failed sync.
 - Desktop-only settings are absent.
 - Destructive actions have clear confirmation or disabled states.
-- Settings → General → Current Version can start an upgrade from both localhost and a Router Client Tunnel URL; progress logs stream without 404/401 responses and request URLs never contain access tokens.
+- Settings → General → Current Version can start an upgrade from both localhost and a Router Client Tunnel URL; progress logs stream without 404/401 responses before process replacement, request URLs never contain access tokens, and the UI recovers the persisted task after the expected tunnel interruption.
 - Closing/reopening the progress dialog or interrupting the stream preserves the task status; a service restart resumes at the persisted task and reports the running commit or a rollback failure instead of resetting to 0%.
+- Publish a new mutable `latest` release and upgrade immediately: the staged binary commit must match the release target before the old process exits; a stale asset must fail before restart, and a replacement rollback must surface its final task logs after the Client Tunnel reconnects.
 - Keep a Client Tunnel page and `/web-api/events` subscription open for at least two Router lease TTL periods; renewal must retain the same connection without periodic `404 unregistered-subdomain`, `503 connection-lost`, or HTTP/2 stream errors.
 - Container deployments show self-update as unavailable and direct operators to deploy a new image.
 

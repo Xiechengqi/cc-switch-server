@@ -333,7 +333,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
             ) : (
               <div className="flex items-center gap-2">
                 <a
-                  href="https://ccswitch.io"
+                  href="https://tokenswitch.org"
                   target="_blank"
                   rel="noreferrer"
                   className={cn(

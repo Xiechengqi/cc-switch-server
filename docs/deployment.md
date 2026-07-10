@@ -88,7 +88,9 @@ Web 管理端的一键升级使用同文件系统 staging 和持久 rollback：
 - rollback：`/usr/local/bin/cc-switch-server.bak`
 - 任务状态：`<config-dir>/upgrade-state.json`
 
-下载 binary 后必须通过 release `.sha256` 校验和 `--help` sanity check。systemd 部署通过独立 transient helper 原子替换 binary，重启后检查 `/version` 的 commit；检查失败会恢复 rollback。standalone 模式只终止当前 PID，不使用进程名全局 kill。容器内默认禁用一键升级，必须发布并部署新 image。
+release binary 和 checksum 下载请求使用目标 commit 作为 cache key。下载后必须通过 release `.sha256`、`--help` 和 staged binary `version --json` commit 校验，全部成功后才允许停止当前服务，避免 mutable `latest` CDN 返回上一版资产。systemd 部署通过独立 transient helper 原子替换 binary，重启后检查 `/version` 的 commit；检查失败会恢复 rollback。standalone 模式只终止当前 PID，不使用进程名全局 kill。容器内默认禁用一键升级，必须发布并部署新 image。
+
+replacement helper 会把最后一次本机 `/version` probe 的连接、HTTP、JSON 或 commit mismatch 原因和 rollback 结果写入任务日志。Client Tunnel 在进程替换期间可能短暂返回 Router 404/503；Web 会持续按原 task ID 恢复 status，只有 replacement commit 通过校验才 reload，回滚则显示 failed 和 helper 诊断。
 
 Client Tunnel 下所有非登录类 `/web-api/*` 都由 Router 先做 owner/admin 鉴权。SSE 使用带 `Authorization` 的 fetch stream，不允许把 access token 放入 query string。
 

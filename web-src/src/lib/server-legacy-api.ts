@@ -877,6 +877,7 @@ export interface AdminUpgradeStatus {
   taskId: string;
   status: "running" | "success" | "failed";
   restartPending: boolean;
+  targetCommitId?: string | null;
   logs: Array<{
     taskId?: string;
     step?: number;

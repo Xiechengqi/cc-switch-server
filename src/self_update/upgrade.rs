@@ -19,7 +19,7 @@ use tracing::warn;
 use crate::self_update::restart::schedule_upgrade_restart;
 use crate::self_update::version::{
     backup_installed_binary, commits_equal, fetch_latest_release_commit, fetch_release_checksum,
-    release_binary_url, SelfUpdateError, BINARY_ROLLBACK_PATH, BINARY_STAGING_PATH,
+    release_binary_url_for_commit, SelfUpdateError, BINARY_ROLLBACK_PATH, BINARY_STAGING_PATH,
 };
 
 const LOG_CHANNEL_CAPACITY: usize = 256;
@@ -342,7 +342,7 @@ async fn run_upgrade(
         .await;
         return Ok(UpgradeRunOutcome::Complete);
     }
-    let expected_checksum = match fetch_release_checksum(&client).await {
+    let expected_checksum = match fetch_release_checksum(&client, &target_commit).await {
         Ok(checksum) => checksum,
         Err(error) => {
             emit(
@@ -368,22 +368,18 @@ async fn run_upgrade(
     .await;
 
     let target = Path::new(BINARY_STAGING_PATH);
+    let binary_url = release_binary_url_for_commit(&target_commit);
     cleanup_tmp(target);
     emit(
         registry,
         handle,
         2,
         UpgradeLogLevel::Info,
-        format!(
-            "downloading {} to {}",
-            release_binary_url(),
-            target.display()
-        ),
+        format!("downloading {} to {}", binary_url, target.display()),
         Some(progress_pct(2, 0)),
     )
     .await;
-    if let Err(error) =
-        download_with_progress(&client, release_binary_url(), target, registry, handle).await
+    if let Err(error) = download_with_progress(&client, &binary_url, target, registry, handle).await
     {
         cleanup_tmp(target);
         emit(
@@ -458,11 +454,11 @@ async fn run_upgrade(
         handle,
         4,
         UpgradeLogLevel::Info,
-        "running staged binary sanity check (--help)",
+        "running staged binary sanity and version checks",
         Some(progress_pct(4, 40)),
     )
     .await;
-    if let Err(error) = sanity_exec(target).await {
+    if let Err(error) = sanity_exec(target, &target_commit).await {
         cleanup_tmp(target);
         emit(
             registry,
@@ -480,7 +476,7 @@ async fn run_upgrade(
         handle,
         4,
         UpgradeLogLevel::Success,
-        "staged binary passed sanity check",
+        format!("staged binary passed sanity check at commit {target_commit}"),
         Some(progress_pct(4, 100)),
     )
     .await;
@@ -653,7 +649,7 @@ fn chmod_exec(path: &Path) -> Result<(), SelfUpdateError> {
         .map_err(|err| SelfUpdateError::Internal(format!("chmod staged file failed: {err}")))
 }
 
-async fn sanity_exec(path: &Path) -> Result<(), SelfUpdateError> {
+async fn sanity_exec(path: &Path, expected_commit: &str) -> Result<(), SelfUpdateError> {
     let output = tokio::time::timeout(SANITY_TIMEOUT, Command::new(path).arg("--help").output())
         .await
         .map_err(|_| SelfUpdateError::Internal("sanity --help timed out".into()))?
@@ -662,6 +658,43 @@ async fn sanity_exec(path: &Path) -> Result<(), SelfUpdateError> {
         return Err(SelfUpdateError::Internal(format!(
             "sanity --help exited with status {}",
             output.status
+        )));
+    }
+    let output = tokio::time::timeout(
+        SANITY_TIMEOUT,
+        Command::new(path).args(["version", "--json"]).output(),
+    )
+    .await
+    .map_err(|_| SelfUpdateError::Internal("sanity version check timed out".into()))?
+    .map_err(|err| SelfUpdateError::Internal(format!("sanity version exec failed: {err}")))?;
+    if !output.status.success() {
+        return Err(SelfUpdateError::Internal(format!(
+            "sanity version check exited with status {}",
+            output.status
+        )));
+    }
+    validate_staged_version_output(&output.stdout, expected_commit)
+}
+
+fn validate_staged_version_output(
+    stdout: &[u8],
+    expected_commit: &str,
+) -> Result<(), SelfUpdateError> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).map_err(|err| {
+        SelfUpdateError::Internal(format!("parse staged binary version output failed: {err}"))
+    })?;
+    let actual_commit = value
+        .get("commitId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !commits_equal(actual_commit, expected_commit) {
+        return Err(SelfUpdateError::Internal(format!(
+            "staged binary commit mismatch: expected {expected_commit}, got {}",
+            if actual_commit.is_empty() {
+                "missing commitId"
+            } else {
+                actual_commit
+            }
         )));
     }
     Ok(())
@@ -852,6 +885,20 @@ mod tests {
             }
         }
         assert_eq!(last, 100);
+    }
+
+    #[test]
+    fn staged_version_must_match_release_target() {
+        let expected = "aabbccddeeff00112233445566778899aabbccdd";
+        let matching = serde_json::json!({ "commitId": expected });
+        validate_staged_version_output(matching.to_string().as_bytes(), expected).unwrap();
+
+        let stale = serde_json::json!({
+            "commitId": "bbbbbbbbbbbb00112233445566778899aabbccdd"
+        });
+        let error = validate_staged_version_output(stale.to_string().as_bytes(), expected)
+            .expect_err("stale release asset must be rejected before restart");
+        assert!(error.to_string().contains("staged binary commit mismatch"));
     }
 
     #[test]

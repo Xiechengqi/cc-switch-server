@@ -70,6 +70,7 @@ pub(in crate::api) struct AdminUpgradeStatusResponse {
     pub task_id: String,
     pub status: &'static str,
     pub restart_pending: bool,
+    pub target_commit_id: Option<String>,
     pub logs: Vec<UpgradeLogEntry>,
 }
 
@@ -240,6 +241,7 @@ pub(in crate::api) async fn admin_upgrade_status(
         task_id: snapshot.task_id,
         status: upgrade_status_label(snapshot.status),
         restart_pending: snapshot.restart_pending,
+        target_commit_id: snapshot.target_commit_id,
         logs: snapshot.logs,
     }))
 }

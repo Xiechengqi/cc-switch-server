@@ -85,6 +85,18 @@ function upgradeLogsIndicateRestartScheduled(logs: UpgradeLogEntry[]): boolean {
   });
 }
 
+function commitsMatch(left?: string | null, right?: string | null): boolean {
+  const normalizedLeft = left?.trim().toLowerCase() ?? "";
+  const normalizedRight = right?.trim().toLowerCase() ?? "";
+  if (!normalizedLeft || !normalizedRight) return false;
+  const prefixLength = Math.min(normalizedLeft.length, normalizedRight.length, 12);
+  return (
+    prefixLength >= 7 &&
+    normalizedLeft.slice(0, prefixLength) ===
+      normalizedRight.slice(0, prefixLength)
+  );
+}
+
 function upgradeLogKey(entry: UpgradeLogEntry): string {
   return [
     entry.taskId ?? "",
@@ -311,6 +323,7 @@ export function ServerVersionSettings() {
   const streamRef = useRef<AbortController | null>(null);
   const streamFinishedRef = useRef(false);
   const streamReconnectAttemptsRef = useRef(0);
+  const restartWaitAnnouncedRef = useRef(false);
   const upgradeLogsRef = useRef<UpgradeLogEntry[]>([]);
   const upgradeLogKeysRef = useRef(new Set<string>());
   const logEndRef = useRef<HTMLDivElement | null>(null);
@@ -462,15 +475,13 @@ export function ServerVersionSettings() {
     [closeUpgradeStream, refresh, t],
   );
 
-  const beginUpgradeRestartWait = useCallback(() => {
-    if (streamFinishedRef.current) return;
-    streamFinishedRef.current = true;
-    closeUpgradeStream();
+  const markUpgradeRestarting = useCallback(() => {
+    if (streamFinishedRef.current || restartWaitAnnouncedRef.current) return;
+    restartWaitAnnouncedRef.current = true;
     setBusy(null);
     setUpgradeOutcome("restarting");
     toast.success(t("settings.serverVersion.upgradeRestarting"));
-    void pollHealthAndReload();
-  }, [closeUpgradeStream, t]);
+  }, [t]);
 
   const resolveUpgradeAfterStreamLoss = useCallback(
     async (taskId: string, signal: AbortSignal) => {
@@ -484,6 +495,22 @@ export function ServerVersionSettings() {
             upgradeLogKeysRef.current = new Set(status.logs.map(upgradeLogKey));
           }
           if (status.status === "success") {
+            if (status.targetCommitId) {
+              const build = await loadBuildInfo();
+              if (!commitsMatch(build.commitId, status.targetCommitId)) {
+                appendUpgradeLog({
+                  taskId,
+                  step: 7,
+                  totalSteps: 7,
+                  level: "error",
+                  message: `replacement commit mismatch: expected ${status.targetCommitId}, got ${build.commitId}`,
+                  progress: null,
+                  at: new Date().toISOString(),
+                });
+                applyUpgradeDone({ status: "failed" });
+                return;
+              }
+            }
             applyUpgradeDone({
               status: "success",
               restartPending: status.restartPending,
@@ -500,14 +527,13 @@ export function ServerVersionSettings() {
             return;
           }
           if (upgradeLogsIndicateRestartScheduled(logs)) {
-            beginUpgradeRestartWait();
-            return;
+            markUpgradeRestarting();
           }
         }
         await abortableDelay(2000, signal).catch(() => undefined);
       }
     },
-    [applyUpgradeDone, beginUpgradeRestartWait],
+    [appendUpgradeLog, applyUpgradeDone, markUpgradeRestarting],
   );
 
   const streamUpgrade = useCallback(
@@ -576,6 +602,7 @@ export function ServerVersionSettings() {
       setUpgradeLogs([]);
       upgradeLogsRef.current = [];
       upgradeLogKeysRef.current.clear();
+      restartWaitAnnouncedRef.current = false;
       setUpgradeOutcome("running");
       setUpgradeLogOpen(true);
       try {

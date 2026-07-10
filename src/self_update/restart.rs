@@ -244,6 +244,14 @@ pub fn run_update_helper(spec_path: &Path) -> anyhow::Result<()> {
 }
 
 fn run_update_helper_inner(spec_path: &Path, spec: &UpdateHelperSpec) -> anyhow::Result<()> {
+    run_update_helper_inner_with_timeout(spec_path, spec, HEALTH_TIMEOUT)
+}
+
+fn run_update_helper_inner_with_timeout(
+    spec_path: &Path,
+    spec: &UpdateHelperSpec,
+    health_timeout: Duration,
+) -> anyhow::Result<()> {
     std::thread::sleep(Duration::from_secs(2));
 
     let rollback_source = match spec.mode {
@@ -265,13 +273,15 @@ fn run_update_helper_inner(spec_path: &Path, spec: &UpdateHelperSpec) -> anyhow:
         Err(error) => (None, Some(error)),
     };
 
-    if restart_error.is_none()
-        && wait_for_expected_version(
+    let replacement_result = match restart_error.as_ref() {
+        Some(error) => Err(format!("restart failed: {error}")),
+        None => wait_for_expected_version(
             spec.health_addr,
             spec.expected_commit.as_deref(),
-            HEALTH_TIMEOUT,
-        )
-    {
+            health_timeout,
+        ),
+    };
+    if replacement_result.is_ok() {
         if let Some(task_id) = spec.task_id.as_deref() {
             crate::self_update::upgrade::record_helper_outcome(
                 &spec.config_dir,
@@ -288,24 +298,37 @@ fn run_update_helper_inner(spec_path: &Path, spec: &UpdateHelperSpec) -> anyhow:
         let _ = child.kill();
         let _ = child.wait();
     }
-    if let Some(source) = rollback_source.as_deref().filter(|path| path.exists()) {
-        std::fs::copy(source, &spec.staging_path)?;
-        install_staged_binary(&spec.staging_path, &spec.install_path)?;
-        let _ = restart_process(spec)?;
-        let _ = wait_for_expected_version(spec.health_addr, None, HEALTH_TIMEOUT);
-    }
+    let replacement_error =
+        replacement_result.expect_err("failed replacement must carry probe or restart diagnostics");
     if let Some(task_id) = spec.task_id.as_deref() {
         crate::self_update::upgrade::record_helper_outcome(
             &spec.config_dir,
             task_id,
             false,
-            "new binary failed health/version checks; rollback was attempted",
+            &format!("replacement failed: {replacement_error}; attempting rollback"),
         )?;
     }
-    match restart_error {
-        Some(error) => anyhow::bail!("restart failed: {error}"),
-        None => anyhow::bail!("updated service did not pass health/version checks"),
+    let rollback_result = match rollback_source.as_deref().filter(|path| path.exists()) {
+        Some(source) => (|| -> anyhow::Result<()> {
+            std::fs::copy(source, &spec.staging_path)?;
+            install_staged_binary(&spec.staging_path, &spec.install_path)?;
+            let _ = restart_process(spec)?;
+            wait_for_expected_version(spec.health_addr, None, health_timeout)
+                .map_err(anyhow::Error::msg)
+        })()
+        .map(|_| "rollback passed health checks".to_string())
+        .unwrap_or_else(|error| format!("rollback failed: {error}")),
+        None => "rollback was not available".to_string(),
+    };
+    if let Some(task_id) = spec.task_id.as_deref() {
+        crate::self_update::upgrade::record_helper_outcome(
+            &spec.config_dir,
+            task_id,
+            false,
+            &format!("replacement failed: {replacement_error}; {rollback_result}"),
+        )?;
     }
+    anyhow::bail!(replacement_error)
 }
 
 fn restart_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::process::Child>> {
@@ -370,42 +393,63 @@ fn wait_for_expected_version(
     addr: SocketAddr,
     expected_commit: Option<&str>,
     timeout: Duration,
-) -> bool {
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
+    let mut last_error = "version endpoint did not respond".to_string();
     while Instant::now() < deadline {
-        if probe_version(addr, expected_commit).unwrap_or(false) {
-            return true;
+        match probe_version(addr, expected_commit) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    false
+    Err(format!(
+        "health/version checks timed out after {}s; last probe: {last_error}",
+        timeout.as_secs()
+    ))
 }
 
-fn probe_version(addr: SocketAddr, expected_commit: Option<&str>) -> std::io::Result<bool> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+fn probe_version(addr: SocketAddr, expected_commit: Option<&str>) -> Result<(), String> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|error| format!("connect {addr} failed: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set probe timeout failed: {error}"))?;
+    stream
+        .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .map_err(|error| format!("write version probe failed: {error}"))?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| format!("read version probe failed: {error}"))?;
     let response = String::from_utf8_lossy(&response);
     let Some((headers, body)) = response.split_once("\r\n\r\n") else {
-        return Ok(false);
+        return Err("version probe returned an invalid HTTP response".into());
     };
-    if !headers
-        .lines()
-        .next()
-        .is_some_and(|line| line.contains(" 200 "))
-    {
-        return Ok(false);
+    let status_line = headers.lines().next().unwrap_or_default();
+    if !status_line.contains(" 200 ") {
+        return Err(format!("version probe returned {status_line}"));
     }
     let Some(expected) = expected_commit else {
-        return Ok(true);
+        return Ok(());
     };
-    let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-    Ok(value
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("parse version response failed: {error}"))?;
+    let actual = value
         .get("commitId")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|actual| commits_match(actual, expected)))
+        .unwrap_or_default();
+    if !commits_match(actual, expected) {
+        return Err(format!(
+            "version commit mismatch: expected {expected}, got {}",
+            if actual.is_empty() {
+                "missing commitId"
+            } else {
+                actual
+            }
+        ));
+    }
+    Ok(())
 }
 
 fn commits_match(actual: &str, expected: &str) -> bool {
@@ -450,6 +494,8 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -518,7 +564,136 @@ mod tests {
             .unwrap();
         });
 
-        assert!(probe_version(addr, Some("c276bd37b4b6")).unwrap());
+        probe_version(addr, Some("c276bd37b4b6")).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn version_probe_reports_actual_commit_on_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request);
+            let body = r#"{"commitId":"aaaaaaaaaaaa"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let error = probe_version(addr, Some("bbbbbbbbbbbb"))
+            .expect_err("mismatched replacement must fail its version probe");
+        assert!(error.contains("expected bbbbbbbbbbbb, got aaaaaaaaaaaa"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn standalone_helper_rolls_back_mismatched_replacement_and_persists_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-helper-rollback-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let install_path = dir.join("cc-switch-server");
+        let staging_path = dir.join(".cc-switch-server.new");
+        let rollback_path = dir.join("cc-switch-server.bak");
+        let spec_path = dir.join(HELPER_SPEC_FILENAME);
+        let executable = b"#!/bin/sh\nexit 0\n";
+        for path in [&install_path, &staging_path, &rollback_path] {
+            std::fs::write(path, executable).unwrap();
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        let task_id = "rollback-diagnostics";
+        let snapshot = crate::self_update::upgrade::UpgradeStatusSnapshot {
+            task_id: task_id.into(),
+            status: crate::self_update::upgrade::UpgradeStatus::Running,
+            restart_pending: false,
+            logs: Vec::new(),
+            target_commit_id: Some("bbbbbbbbbbbb".into()),
+            restart_after: true,
+            updated_at: String::new(),
+        };
+        std::fs::write(
+            dir.join("upgrade-state.json"),
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let health_addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
+        let server = thread::spawn(move || {
+            while !stop_server.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0u8; 512];
+                        let _ = stream.read(&mut request);
+                        let body = r#"{"commitId":"aaaaaaaaaaaa"}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("health listener failed: {error}"),
+                }
+            }
+        });
+        let spec = UpdateHelperSpec {
+            task_id: Some(task_id.into()),
+            mode: HelperMode::InstallStaged,
+            strategy: RestartStrategy::Standalone,
+            parent_pid: u32::MAX,
+            health_addr,
+            expected_commit: Some("bbbbbbbbbbbb".into()),
+            config_dir: dir.clone(),
+            server_args: Vec::new(),
+            install_path: install_path.clone(),
+            staging_path,
+            rollback_path,
+            log_path: dir.join("server.log"),
+        };
+
+        let error =
+            run_update_helper_inner_with_timeout(&spec_path, &spec, Duration::from_millis(100))
+                .expect_err("mismatched replacement must roll back");
+        assert!(error.to_string().contains("version commit mismatch"));
+        let persisted: crate::self_update::upgrade::UpgradeStatusSnapshot =
+            serde_json::from_slice(&std::fs::read(dir.join("upgrade-state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            persisted.status,
+            crate::self_update::upgrade::UpgradeStatus::Failed
+        );
+        assert!(persisted.logs.iter().any(|entry| {
+            entry
+                .message
+                .contains("expected bbbbbbbbbbbb, got aaaaaaaaaaaa; rollback passed health checks")
+        }));
+        assert_eq!(std::fs::read(&install_path).unwrap(), executable);
+
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
