@@ -104,12 +104,11 @@ pub(crate) struct WebAdminPrincipal {
 pub(crate) async fn require_event_session(
     state: &ServerState,
     headers: &HeaderMap,
-    query_token: Option<&str>,
 ) -> Result<(), ApiError> {
     if resolve_web_admin_principal(state, headers).await?.is_some() {
         return Ok(());
     }
-    if let Some(token) = bearer_token(headers).or(query_token) {
+    if let Some(token) = bearer_token(headers) {
         if state
             .web_auth
             .authenticate_access_token(token)

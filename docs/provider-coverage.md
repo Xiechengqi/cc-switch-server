@@ -71,13 +71,6 @@ Note: server compatibility provider types are explicit cc-switch-server classifi
 | Antigravity CLI (agy) | `agy_oauth` |
 | OpenRouter |  |
 
-## universal presets
-
-| Name | providerType |
-| --- | --- |
-| NewAPI | `newapi` |
-| 自定义网关 | `custom_gateway` |
-
 ## Server parity notes
 
 ### `kiro_oauth` (Kiro OAuth)

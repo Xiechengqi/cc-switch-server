@@ -10,7 +10,6 @@ import { queryClient } from "@/lib/query/queryClient";
 import "./i18n";
 import "./desktop-theme.css";
 import "./styles.css";
-import "./styles/universal.css";
 import "./styles/modals.css";
 import "./styles/auth-accounts.css";
 import "./styles/providers.css";

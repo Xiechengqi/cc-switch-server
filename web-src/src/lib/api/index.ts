@@ -1,5 +1,5 @@
 export type { AppId } from "./types";
-export { providersApi, universalProvidersApi } from "./providers";
+export { providersApi } from "./providers";
 export { settingsApi } from "./settings";
 export { backupsApi } from "./settings";
 export { mcpApi } from "./mcp";
@@ -86,7 +86,7 @@ export {
 } from "./auth";
 export { failoverApi } from "./failover";
 export type { ProviderHealth } from "@/types/proxy";
-export type { Provider, UniversalProvider } from "@/types";
+export type { Provider } from "@/types";
 export type {
   AppKind,
   AccountRecord,
@@ -106,6 +106,4 @@ export type {
   ModelPricingEntry,
   UpdateModelPricingInput,
   UsageStatsFilter,
-  UniversalProviderPreset,
-  UniversalProviderSyncResult,
 } from "@/lib/server-legacy-api";

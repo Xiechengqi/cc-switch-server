@@ -491,15 +491,6 @@
   border-color: hsl(var(--warning) / 0.4);
   background: hsl(var(--warning) / 0.12);
   color: hsl(var(--foreground));
-}.universal-card .json-preview{
-  max-height: 180px;
-}.universal-form-modal .toggle-row{
-  min-height: 36px;
-  align-self: end;
-  border: 1px solid hsl(var(--border));
-  border-radius: 6px;
-  background: hsl(var(--subtle));
-  padding: 0 10px;
 }.inline-empty{
   min-height: 34px;
   flex: 1;

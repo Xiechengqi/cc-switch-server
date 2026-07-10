@@ -21,7 +21,6 @@ const presetFiles = {
   claude: path.join(presetSourceRoot, "src/config/claudeProviderPresets.ts"),
   codex: path.join(presetSourceRoot, "src/config/codexProviderPresets.ts"),
   gemini: path.join(presetSourceRoot, "src/config/geminiProviderPresets.ts"),
-  universal: path.join(presetSourceRoot, "src/config/universalProviderPresets.ts"),
 };
 
 const requiredProviderTypes = [
@@ -194,7 +193,6 @@ function buildCoverage() {
       claude: extractPresets(presetFiles.claude),
       codex: extractPresets(presetFiles.codex),
       gemini: extractPresets(presetFiles.gemini),
-      universal: extractPresets(presetFiles.universal),
     },
   };
 }
@@ -291,7 +289,7 @@ function toMarkdown(coverage) {
     );
   }
   lines.push("");
-  for (const key of ["claude", "codex", "gemini", "universal"]) {
+  for (const key of ["claude", "codex", "gemini"]) {
     lines.push(`## ${key} presets`);
     lines.push("");
     lines.push("| Name | providerType |");

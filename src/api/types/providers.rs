@@ -2,13 +2,9 @@ use crate::domain::failover::{FailoverAppConfig, FailoverSnapshot};
 use crate::domain::health::ProviderHealth;
 use crate::domain::providers::model::{AppKind, Provider, ProviderType};
 use crate::domain::providers::store::StoredProvider;
-use crate::domain::providers::universal::{
-    UniversalProvider, UniversalProviderPreset, UniversalProviderSyncResult,
-};
 use crate::proxy::adapters::AdapterSupport;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,67 +131,6 @@ pub(in crate::api) struct FetchProviderModelsResponse {
     pub(in crate::api) models: Vec<FetchedProviderModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api) provider: Option<StoredProvider>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct ListUniversalProvidersResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) providers: BTreeMap<String, UniversalProvider>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UniversalProviderPresetsResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) presets: Vec<UniversalProviderPreset>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct ExportUniversalProvidersResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) providers: Vec<UniversalProvider>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct ImportUniversalProvidersRequest {
-    pub(in crate::api) providers: Vec<UniversalProvider>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct ImportUniversalProvidersResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) imported: usize,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct GetUniversalProviderResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) provider: Option<UniversalProvider>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UpsertUniversalProviderRequest {
-    pub(in crate::api) provider: UniversalProvider,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UpsertUniversalProviderResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) provider: UniversalProvider,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct SyncUniversalProviderResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) result: UniversalProviderSyncResult,
 }
 
 #[derive(Debug, Clone, Deserialize)]

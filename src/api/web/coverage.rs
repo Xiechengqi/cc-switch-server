@@ -29,7 +29,6 @@ pub struct PresetCoverage {
     pub claude: Vec<PresetSummary>,
     pub codex: Vec<PresetSummary>,
     pub gemini: Vec<PresetSummary>,
-    pub universal: Vec<PresetSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

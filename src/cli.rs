@@ -69,6 +69,11 @@ pub enum Command {
         #[command(subcommand)]
         command: PasswordCommand,
     },
+    #[command(hide = true)]
+    SelfUpdateHelper {
+        #[arg(long)]
+        spec: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -201,6 +206,23 @@ mod tests {
         assert!(matches!(
             cli.effective_command(),
             Command::Version { json: false }
+        ));
+    }
+
+    #[test]
+    fn parses_internal_self_update_helper_subcommand() {
+        let cli = Cli::try_parse_from([
+            "cc-switch-server",
+            "self-update-helper",
+            "--spec",
+            "/tmp/upgrade-helper.json",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.effective_command(),
+            Command::SelfUpdateHelper { spec }
+                if spec.as_path() == std::path::Path::new("/tmp/upgrade-helper.json")
         ));
     }
 

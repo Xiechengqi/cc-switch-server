@@ -81,24 +81,6 @@ impl ProviderStore {
         stored
     }
 
-    pub fn upsert_merging_settings(
-        &mut self,
-        app: AppKind,
-        mut provider: Provider,
-    ) -> StoredProvider {
-        if let Some(existing) = self
-            .providers
-            .iter()
-            .find(|item| item.app == app && item.provider.id == provider.id)
-        {
-            let mut merged = existing.provider.settings_config.clone();
-            merge_json(&mut merged, &provider.settings_config);
-            provider.settings_config = merged;
-        }
-
-        self.upsert(app, provider)
-    }
-
     pub fn list(&self, app: Option<AppKind>) -> Vec<StoredProvider> {
         let mut providers = self
             .providers
@@ -140,25 +122,6 @@ impl ProviderStore {
         }
         changed
     }
-
-    pub fn remove_universal_derivative(&mut self, universal_id: &str, app: AppKind) -> bool {
-        let provider_id =
-            crate::domain::providers::universal::universal_provider_id(universal_id, app);
-        let before = self.providers.len();
-        self.providers.retain(|item| {
-            !(item.app == app
-                && item.provider.id == provider_id
-                && provider_has_universal_id(&item.provider, universal_id))
-        });
-        self.providers.len() != before
-    }
-
-    pub fn remove_universal_derivatives(&mut self, universal_id: &str) -> Vec<AppKind> {
-        [AppKind::Claude, AppKind::Codex, AppKind::Gemini]
-            .into_iter()
-            .filter(|app| self.remove_universal_derivative(universal_id, *app))
-            .collect()
-    }
 }
 
 pub fn provider_sort_index(provider: &StoredProvider) -> Option<usize> {
@@ -188,35 +151,6 @@ fn generate_provider_id(app: AppKind) -> String {
     rand::thread_rng().fill_bytes(&mut bytes);
     let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("{prefix}-{suffix}")
-}
-
-fn provider_has_universal_id(provider: &Provider, universal_id: &str) -> bool {
-    json_value_is_str(provider.extra.get("universalProviderId"), universal_id)
-        || provider.meta.as_ref().is_some_and(|meta| {
-            json_value_is_str(meta.extra.get("universalProviderId"), universal_id)
-        })
-}
-
-fn json_value_is_str(value: Option<&Value>, expected: &str) -> bool {
-    value.and_then(Value::as_str) == Some(expected)
-}
-
-fn merge_json(base: &mut Value, patch: &Value) {
-    match (base, patch) {
-        (Value::Object(base_map), Value::Object(patch_map)) => {
-            for (key, patch_value) in patch_map {
-                match base_map.get_mut(key) {
-                    Some(base_value) => merge_json(base_value, patch_value),
-                    None => {
-                        base_map.insert(key.clone(), patch_value.clone());
-                    }
-                }
-            }
-        }
-        (base_value, patch_value) => {
-            *base_value = patch_value.clone();
-        }
-    }
 }
 
 #[cfg(test)]

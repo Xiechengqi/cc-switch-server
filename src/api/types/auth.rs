@@ -81,13 +81,6 @@ pub(in crate::api) struct AuthMeResponse {
     pub(in crate::api) owner_email: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct EventQuery {
-    #[serde(default)]
-    pub(in crate::api) token: Option<String>,
-}
-
 fn default_password_method() -> String {
     "password".to_string()
 }

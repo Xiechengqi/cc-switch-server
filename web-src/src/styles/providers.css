@@ -280,8 +280,6 @@
   padding: 16px;
 }.wide-field{
   grid-column: 1 / -1;
-}.universal-form-modal .provider-form-grid{
-  grid-template-columns: repeat(3, minmax(0, 1fr));
 }.usage-filter-panel .segmented{
   width: 100%;
 }.desktop-shell .panel,.desktop-shell .provider-list{

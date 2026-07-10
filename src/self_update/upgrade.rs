@@ -1,5 +1,8 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,10 +16,10 @@ use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex};
 use tracing::warn;
 
-use crate::self_update::restart::{detect_restart_strategy, schedule_restart};
+use crate::self_update::restart::schedule_upgrade_restart;
 use crate::self_update::version::{
-    backup_installed_binary, release_binary_url, SelfUpdateError, BINARY_INSTALL_PATH,
-    BINARY_ROLLBACK_PATH, BINARY_STAGING_PATH,
+    backup_installed_binary, commits_equal, fetch_latest_release_commit, fetch_release_checksum,
+    release_binary_url, SelfUpdateError, BINARY_ROLLBACK_PATH, BINARY_STAGING_PATH,
 };
 
 const LOG_CHANNEL_CAPACITY: usize = 256;
@@ -24,6 +27,7 @@ const TOTAL_STEPS: usize = 7;
 const DOWNLOAD_BUFFER_TICK_BYTES: u64 = 256 * 1024;
 const SANITY_TIMEOUT: Duration = Duration::from_secs(5);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
+const STATE_FILENAME: &str = "upgrade-state.json";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,7 +51,7 @@ pub struct UpgradeLogEntry {
     pub at: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UpgradeStatus {
     Running,
@@ -55,13 +59,19 @@ pub enum UpgradeStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeStatusSnapshot {
     pub task_id: String,
     pub status: UpgradeStatus,
     pub restart_pending: bool,
     pub logs: Vec<UpgradeLogEntry>,
+    #[serde(default)]
+    pub target_commit_id: Option<String>,
+    #[serde(default)]
+    pub restart_after: bool,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 #[derive(Clone)]
@@ -71,16 +81,44 @@ pub struct UpgradeHandle {
     pub sender: broadcast::Sender<UpgradeLogEntry>,
     pub history: Arc<Mutex<Vec<UpgradeLogEntry>>>,
     pub restart_pending: Arc<Mutex<bool>>,
+    target_commit_id: Arc<Mutex<Option<String>>>,
+    restart_after: bool,
 }
 
-#[derive(Default)]
 pub struct UpgradeRegistry {
     inner: Mutex<Option<UpgradeHandle>>,
+    state_path: PathBuf,
 }
 
 impl UpgradeRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn load(config_dir: &Path) -> Result<Self, SelfUpdateError> {
+        let state_path = config_dir.join(STATE_FILENAME);
+        let handle = if state_path.exists() {
+            match std::fs::read(&state_path)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| {
+                    serde_json::from_slice::<UpgradeStatusSnapshot>(&bytes)
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(mut snapshot) => {
+                    reconcile_snapshot_with_running_binary(&mut snapshot);
+                    if let Err(error) = write_snapshot_atomic(&state_path, &snapshot) {
+                        warn!(error = %error, "persist reconciled upgrade state failed");
+                    }
+                    Some(handle_from_snapshot(snapshot))
+                }
+                Err(error) => {
+                    warn!(path = %state_path.display(), error = %error, "ignoring unreadable upgrade state");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            inner: Mutex::new(handle),
+            state_path,
+        })
     }
 
     pub async fn is_restart_pending(&self) -> bool {
@@ -91,40 +129,61 @@ impl UpgradeRegistry {
     }
 
     pub async fn start(
-        &self,
+        self: &Arc<Self>,
         client: reqwest::Client,
         actor: Option<String>,
         restart_after: bool,
+        health_addr: SocketAddr,
     ) -> Result<UpgradeHandle, SelfUpdateError> {
         let mut guard = self.inner.lock().await;
         if let Some(handle) = guard.as_ref() {
-            let status = *handle.status.lock().await;
-            if matches!(status, UpgradeStatus::Running) {
-                return Err(SelfUpdateError::Internal(
-                    "an upgrade is already in progress".into(),
-                ));
+            if matches!(*handle.status.lock().await, UpgradeStatus::Running) {
+                return Ok(handle.clone());
             }
         }
         let task_id = new_task_id();
-        let (tx, _rx) = broadcast::channel(LOG_CHANNEL_CAPACITY);
+        let (sender, _receiver) = broadcast::channel(LOG_CHANNEL_CAPACITY);
         let handle = UpgradeHandle {
-            task_id: task_id.clone(),
+            task_id,
             status: Arc::new(Mutex::new(UpgradeStatus::Running)),
-            sender: tx,
+            sender,
             history: Arc::new(Mutex::new(Vec::new())),
             restart_pending: Arc::new(Mutex::new(false)),
+            target_commit_id: Arc::new(Mutex::new(None)),
+            restart_after,
         };
         *guard = Some(handle.clone());
         drop(guard);
+        self.persist(&handle).await?;
 
-        let handle_for_task = handle.clone();
+        let registry = self.clone();
+        let task_handle = handle.clone();
         tokio::spawn(async move {
-            let outcome = run_upgrade(client, &handle_for_task, actor, restart_after).await;
-            let mut status_guard = handle_for_task.status.lock().await;
-            *status_guard = match outcome {
-                Ok(()) => UpgradeStatus::Success,
-                Err(_) => UpgradeStatus::Failed,
-            };
+            let result = run_upgrade(
+                &registry,
+                client,
+                &task_handle,
+                actor,
+                restart_after,
+                health_addr,
+            )
+            .await;
+            match result {
+                Ok(UpgradeRunOutcome::AwaitingRestart) => {}
+                Ok(UpgradeRunOutcome::Complete) => {
+                    *task_handle.status.lock().await = UpgradeStatus::Success;
+                    if let Err(error) = registry.persist(&task_handle).await {
+                        warn!(error = %error, "persist completed upgrade failed");
+                    }
+                }
+                Err(error) => {
+                    *task_handle.status.lock().await = UpgradeStatus::Failed;
+                    if let Err(persist_error) = registry.persist(&task_handle).await {
+                        warn!(error = %persist_error, "persist failed upgrade failed");
+                    }
+                    warn!(error = %error, "self-update task failed");
+                }
+            }
         });
         Ok(handle)
     }
@@ -134,22 +193,60 @@ impl UpgradeRegistry {
     }
 
     pub async fn status_snapshot(&self) -> Option<UpgradeStatusSnapshot> {
+        self.refresh_from_disk().await;
         let handle = self.inner.lock().await.clone()?;
-        let status = *handle.status.lock().await;
-        let restart_pending = *handle.restart_pending.lock().await;
-        let logs = handle.history.lock().await.clone();
-        Some(UpgradeStatusSnapshot {
-            task_id: handle.task_id.clone(),
-            status,
-            restart_pending,
-            logs,
-        })
+        Some(snapshot_from_handle(&handle).await)
+    }
+
+    pub async fn refresh_from_disk(&self) {
+        let bytes = match std::fs::read(&self.state_path) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let snapshot: UpgradeStatusSnapshot = match serde_json::from_slice(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(error = %error, "refresh persisted upgrade state failed");
+                return;
+            }
+        };
+        let Some(handle) = self.inner.lock().await.clone() else {
+            return;
+        };
+        if handle.task_id != snapshot.task_id {
+            return;
+        }
+        let new_entries = {
+            let mut history = handle.history.lock().await;
+            let entries = snapshot
+                .logs
+                .iter()
+                .skip(history.len())
+                .cloned()
+                .collect::<Vec<_>>();
+            history.extend(entries.iter().cloned());
+            entries
+        };
+        for entry in new_entries {
+            let _ = handle.sender.send(entry);
+        }
+        *handle.status.lock().await = snapshot.status;
+        *handle.restart_pending.lock().await = snapshot.restart_pending;
+        *handle.target_commit_id.lock().await = snapshot.target_commit_id;
     }
 
     pub async fn clear_restart_pending(&self) {
-        if let Some(handle) = self.inner.lock().await.as_ref() {
+        if let Some(handle) = self.inner.lock().await.clone() {
             *handle.restart_pending.lock().await = false;
+            if let Err(error) = self.persist(&handle).await {
+                warn!(error = %error, "persist restart-pending state failed");
+            }
         }
+    }
+
+    async fn persist(&self, handle: &UpgradeHandle) -> Result<(), SelfUpdateError> {
+        let snapshot = snapshot_from_handle(handle).await;
+        write_snapshot_atomic(&self.state_path, &snapshot)
     }
 }
 
@@ -157,8 +254,15 @@ pub type SharedUpgradeRegistry = Arc<UpgradeRegistry>;
 
 impl std::fmt::Debug for UpgradeRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UpgradeRegistry").finish_non_exhaustive()
+        f.debug_struct("UpgradeRegistry")
+            .field("state_path", &self.state_path)
+            .finish_non_exhaustive()
     }
+}
+
+enum UpgradeRunOutcome {
+    Complete,
+    AwaitingRestart,
 }
 
 fn new_task_id() -> String {
@@ -168,6 +272,7 @@ fn new_task_id() -> String {
 }
 
 async fn emit(
+    registry: &UpgradeRegistry,
     handle: &UpgradeHandle,
     step: usize,
     level: UpgradeLogLevel,
@@ -185,231 +290,296 @@ async fn emit(
     };
     handle.history.lock().await.push(entry.clone());
     let _ = handle.sender.send(entry);
+    if let Err(error) = registry.persist(handle).await {
+        warn!(error = %error, "persist upgrade log failed");
+    }
 }
 
 async fn run_upgrade(
+    registry: &UpgradeRegistry,
     client: reqwest::Client,
     handle: &UpgradeHandle,
     actor: Option<String>,
     restart_after: bool,
-) -> Result<(), SelfUpdateError> {
+    health_addr: SocketAddr,
+) -> Result<UpgradeRunOutcome, SelfUpdateError> {
     let actor = actor.unwrap_or_else(|| "unknown".to_string());
     emit(
+        registry,
         handle,
         1,
         UpgradeLogLevel::Info,
-        format!("upgrade requested by {actor}"),
+        format!("upgrade requested by {actor}; resolving release metadata"),
         Some(progress_pct(1, 0)),
     )
     .await;
-
-    let target = Path::new(BINARY_STAGING_PATH);
+    let target_commit = match fetch_latest_release_commit(&client).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            let error = SelfUpdateError::Internal(format!("release metadata failed: {error}"));
+            emit(
+                registry,
+                handle,
+                1,
+                UpgradeLogLevel::Error,
+                error.to_string(),
+                None,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    *handle.target_commit_id.lock().await = Some(target_commit.clone());
+    if commits_equal(&target_commit, crate::build_info::build_info().commit_id) {
+        emit(
+            registry,
+            handle,
+            7,
+            UpgradeLogLevel::Success,
+            format!("already running release {target_commit}; no upgrade needed"),
+            Some(100),
+        )
+        .await;
+        return Ok(UpgradeRunOutcome::Complete);
+    }
+    let expected_checksum = match fetch_release_checksum(&client).await {
+        Ok(checksum) => checksum,
+        Err(error) => {
+            emit(
+                registry,
+                handle,
+                1,
+                UpgradeLogLevel::Error,
+                error.to_string(),
+                None,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     emit(
+        registry,
         handle,
         1,
-        UpgradeLogLevel::Info,
-        format!("staging download at {}", target.display()),
+        UpgradeLogLevel::Success,
+        format!("release {target_commit} metadata and checksum verified"),
         Some(progress_pct(1, 100)),
     )
     .await;
 
-    let release_url = release_binary_url();
+    let target = Path::new(BINARY_STAGING_PATH);
+    cleanup_tmp(target);
     emit(
+        registry,
         handle,
         2,
         UpgradeLogLevel::Info,
-        format!("downloading {release_url}"),
+        format!(
+            "downloading {} to {}",
+            release_binary_url(),
+            target.display()
+        ),
         Some(progress_pct(2, 0)),
     )
     .await;
-    if let Err(err) = download_with_progress(&client, release_url, target, handle).await {
+    if let Err(error) =
+        download_with_progress(&client, release_binary_url(), target, registry, handle).await
+    {
         cleanup_tmp(target);
         emit(
+            registry,
             handle,
             2,
             UpgradeLogLevel::Error,
-            format!("download failed: {err}"),
+            format!("download failed: {error}"),
             None,
         )
         .await;
-        return Err(err);
+        return Err(error);
     }
 
-    emit(
-        handle,
-        3,
-        UpgradeLogLevel::Info,
-        "setting executable permissions",
-        Some(progress_pct(3, 0)),
-    )
-    .await;
-    if let Err(err) = chmod_exec(target) {
-        cleanup_tmp(target);
-        emit(
-            handle,
-            3,
-            UpgradeLogLevel::Error,
-            format!("chmod failed: {err}"),
-            None,
-        )
-        .await;
-        return Err(err);
-    }
-
-    emit(
-        handle,
-        3,
-        UpgradeLogLevel::Info,
-        "running sanity check (--help)",
-        Some(progress_pct(3, 50)),
-    )
-    .await;
-    if let Err(err) = sanity_exec(target).await {
-        cleanup_tmp(target);
-        emit(
-            handle,
-            3,
-            UpgradeLogLevel::Error,
-            format!("sanity check failed: {err}"),
-            None,
-        )
-        .await;
-        return Err(err);
-    }
-
-    let new_sha = match sha256_of_file(target) {
-        Ok(value) => value,
-        Err(err) => {
+    let downloaded_checksum = match sha256_of_file(target) {
+        Ok(checksum) => checksum,
+        Err(error) => {
             cleanup_tmp(target);
             emit(
+                registry,
                 handle,
-                4,
+                3,
                 UpgradeLogLevel::Error,
-                format!("sha256 failed: {err}"),
+                format!("checksum calculation failed: {error}"),
                 None,
             )
             .await;
-            return Err(err);
+            return Err(error);
         }
     };
-    let current_sha = sha256_of_file(Path::new(BINARY_INSTALL_PATH)).ok();
+    if downloaded_checksum != expected_checksum {
+        cleanup_tmp(target);
+        let error = SelfUpdateError::Internal(format!(
+            "release checksum mismatch: expected {expected_checksum}, got {downloaded_checksum}"
+        ));
+        emit(
+            registry,
+            handle,
+            3,
+            UpgradeLogLevel::Error,
+            error.to_string(),
+            None,
+        )
+        .await;
+        return Err(error);
+    }
     emit(
+        registry,
+        handle,
+        3,
+        UpgradeLogLevel::Success,
+        format!("sha256 verified: {downloaded_checksum}"),
+        Some(progress_pct(3, 100)),
+    )
+    .await;
+
+    if let Err(error) = chmod_exec(target) {
+        cleanup_tmp(target);
+        emit(
+            registry,
+            handle,
+            4,
+            UpgradeLogLevel::Error,
+            format!("make staged binary executable failed: {error}"),
+            None,
+        )
+        .await;
+        return Err(error);
+    }
+    emit(
+        registry,
         handle,
         4,
         UpgradeLogLevel::Info,
-        format!(
-            "new sha256: {new_sha}; current: {}",
-            current_sha.as_deref().unwrap_or("(missing)")
-        ),
+        "running staged binary sanity check (--help)",
+        Some(progress_pct(4, 40)),
+    )
+    .await;
+    if let Err(error) = sanity_exec(target).await {
+        cleanup_tmp(target);
+        emit(
+            registry,
+            handle,
+            4,
+            UpgradeLogLevel::Error,
+            format!("sanity check failed: {error}"),
+            None,
+        )
+        .await;
+        return Err(error);
+    }
+    emit(
+        registry,
+        handle,
+        4,
+        UpgradeLogLevel::Success,
+        "staged binary passed sanity check",
         Some(progress_pct(4, 100)),
     )
     .await;
-    if current_sha.as_deref() == Some(new_sha.as_str()) {
-        emit(
-            handle,
-            4,
-            UpgradeLogLevel::Warn,
-            "downloaded binary matches the running one; restart will still pick up env changes",
-            None,
-        )
-        .await;
-    }
 
-    let bak_path = BINARY_ROLLBACK_PATH;
-    if let Err(err) = backup_installed_binary() {
+    if let Err(error) = backup_installed_binary() {
         cleanup_tmp(target);
         emit(
+            registry,
             handle,
             5,
             UpgradeLogLevel::Error,
-            format!("backup failed: {err}"),
+            format!("backup failed: {error}"),
             None,
         )
         .await;
-        return Err(err);
+        return Err(error);
     }
     emit(
+        registry,
         handle,
         5,
         UpgradeLogLevel::Success,
-        format!(
-            "downloaded to {staging}; backup at {bak_path}",
-            staging = BINARY_STAGING_PATH
-        ),
+        format!("rollback backup saved at {BINARY_ROLLBACK_PATH}"),
         Some(progress_pct(5, 100)),
     )
     .await;
 
     if restart_after {
-        let strategy = detect_restart_strategy();
-        emit(
-            handle,
-            6,
-            UpgradeLogLevel::Info,
-            format!("triggering restart via {} mode", strategy.label()),
-            Some(progress_pct(6, 30)),
-        )
-        .await;
-        let restart_script = match schedule_restart(strategy) {
-            Ok(script) => script,
-            Err(err) => {
+        let command = registry
+            .state_path
+            .parent()
+            .ok_or_else(|| SelfUpdateError::Internal("upgrade state path has no parent".into()))
+            .and_then(|config_dir| {
+                schedule_upgrade_restart(&handle.task_id, &target_commit, config_dir, health_addr)
+            });
+        let command = match command {
+            Ok(command) => command,
+            Err(error) => {
+                cleanup_tmp(target);
                 emit(
+                    registry,
                     handle,
                     6,
                     UpgradeLogLevel::Error,
-                    format!("restart spawn failed: {err}"),
+                    format!("schedule restart failed: {error}"),
                     None,
                 )
                 .await;
-                return Err(err);
+                return Err(error);
             }
         };
-        *handle.restart_pending.lock().await = false;
         emit(
+            registry,
             handle,
             6,
             UpgradeLogLevel::Success,
-            format!("restart scheduled: {restart_script}"),
+            format!("restart helper scheduled: {command}"),
             Some(progress_pct(6, 100)),
         )
         .await;
         emit(
-            handle,
-            7,
-            UpgradeLogLevel::Success,
-            "process will restart shortly; reload once /health succeeds",
-            Some(progress_pct(7, 100)),
-        )
-        .await;
-    } else {
-        *handle.restart_pending.lock().await = true;
-        emit(
-            handle,
-            6,
-            UpgradeLogLevel::Success,
-            format!(
-                "upgrade package ready at {staging}; restart to install",
-                staging = BINARY_STAGING_PATH
-            ),
-            Some(progress_pct(6, 100)),
-        )
-        .await;
-        emit(
+            registry,
             handle,
             7,
             UpgradeLogLevel::Info,
-            "use the pending-restart action when you are ready to apply the upgrade",
-            Some(progress_pct(7, 100)),
+            "waiting for the replacement process to pass health and version checks",
+            Some(95),
         )
         .await;
+        Ok(UpgradeRunOutcome::AwaitingRestart)
+    } else {
+        *handle.restart_pending.lock().await = true;
+        emit(
+            registry,
+            handle,
+            6,
+            UpgradeLogLevel::Success,
+            format!("upgrade staged at {BINARY_STAGING_PATH}; restart is pending"),
+            Some(progress_pct(6, 100)),
+        )
+        .await;
+        emit(
+            registry,
+            handle,
+            7,
+            UpgradeLogLevel::Success,
+            "upgrade package is ready to install",
+            Some(100),
+        )
+        .await;
+        Ok(UpgradeRunOutcome::Complete)
     }
-    Ok(())
 }
 
 async fn download_with_progress(
     client: &reqwest::Client,
     url: &str,
     target: &Path,
+    registry: &UpgradeRegistry,
     handle: &UpgradeHandle,
 ) -> Result<u64, SelfUpdateError> {
     let response = client
@@ -427,49 +597,60 @@ async fn download_with_progress(
     let total = response.content_length();
     let mut file = tokio::fs::File::create(target)
         .await
-        .map_err(|err| SelfUpdateError::Internal(format!("open tmp file failed: {err}")))?;
+        .map_err(|err| SelfUpdateError::Internal(format!("open staged file failed: {err}")))?;
     let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let mut next_tick: u64 = DOWNLOAD_BUFFER_TICK_BYTES;
+    let mut downloaded = 0u64;
+    let mut next_tick = DOWNLOAD_BUFFER_TICK_BYTES;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
             .map_err(|err| SelfUpdateError::Internal(format!("download chunk failed: {err}")))?;
         file.write_all(&chunk)
             .await
-            .map_err(|err| SelfUpdateError::Internal(format!("write tmp failed: {err}")))?;
+            .map_err(|err| SelfUpdateError::Internal(format!("write staged file failed: {err}")))?;
         downloaded += chunk.len() as u64;
         if downloaded >= next_tick {
             next_tick = downloaded + DOWNLOAD_BUFFER_TICK_BYTES;
-            let pct = match total {
-                Some(total_bytes) if total_bytes > 0 => {
-                    Some(((downloaded as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0) as u8)
-                }
-                _ => None,
-            };
-            let msg = match total {
-                Some(total_bytes) => format!(
-                    "downloaded {:.1} MiB / {:.1} MiB",
-                    downloaded as f64 / 1024.0 / 1024.0,
-                    total_bytes as f64 / 1024.0 / 1024.0
-                ),
-                None => format!("downloaded {:.1} MiB", downloaded as f64 / 1024.0 / 1024.0),
-            };
-            emit(handle, 2, UpgradeLogLevel::Progress, msg, pct).await;
+            let within_step = total
+                .filter(|value| *value > 0)
+                .map(|value| ((downloaded as f64 / value as f64) * 100.0).clamp(0.0, 100.0) as u8)
+                .unwrap_or(0);
+            let message = total.map_or_else(
+                || format!("downloaded {:.1} MiB", downloaded as f64 / 1024.0 / 1024.0),
+                |value| {
+                    format!(
+                        "downloaded {:.1} MiB / {:.1} MiB",
+                        downloaded as f64 / 1024.0 / 1024.0,
+                        value as f64 / 1024.0 / 1024.0
+                    )
+                },
+            );
+            emit(
+                registry,
+                handle,
+                2,
+                UpgradeLogLevel::Progress,
+                message,
+                Some(progress_pct(2, within_step)),
+            )
+            .await;
         }
     }
     file.flush()
         .await
-        .map_err(|err| SelfUpdateError::Internal(format!("flush tmp failed: {err}")))?;
+        .map_err(|err| SelfUpdateError::Internal(format!("flush staged file failed: {err}")))?;
+    file.sync_all()
+        .await
+        .map_err(|err| SelfUpdateError::Internal(format!("sync staged file failed: {err}")))?;
     Ok(downloaded)
 }
 
 fn chmod_exec(path: &Path) -> Result<(), SelfUpdateError> {
-    let mut perms = std::fs::metadata(path)
-        .map_err(|err| SelfUpdateError::Internal(format!("stat tmp failed: {err}")))?
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|err| SelfUpdateError::Internal(format!("stat staged file failed: {err}")))?
         .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)
-        .map_err(|err| SelfUpdateError::Internal(format!("chmod failed: {err}")))
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|err| SelfUpdateError::Internal(format!("chmod staged file failed: {err}")))
 }
 
 async fn sanity_exec(path: &Path) -> Result<(), SelfUpdateError> {
@@ -492,25 +673,165 @@ fn sha256_of_file(path: &Path) -> Result<String, SelfUpdateError> {
         .map_err(|err| SelfUpdateError::Internal(format!("open for sha256 failed: {err}")))?;
     std::io::copy(&mut file, &mut hasher)
         .map_err(|err| SelfUpdateError::Internal(format!("read for sha256 failed: {err}")))?;
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn cleanup_tmp(file: &Path) {
-    if let Err(err) = std::fs::remove_file(file) {
-        if !matches!(err.kind(), std::io::ErrorKind::NotFound) {
-            warn!(path = %file.display(), error = %err, "cleanup tmp upgrade file failed");
+    if let Err(error) = std::fs::remove_file(file) {
+        if !matches!(error.kind(), std::io::ErrorKind::NotFound) {
+            warn!(path = %file.display(), error = %error, "cleanup staged upgrade file failed");
         }
     }
 }
 
 fn progress_pct(step: usize, within_step: u8) -> u8 {
-    let base = (step.saturating_sub(1) * 100 / TOTAL_STEPS) as u32;
-    let inc = (within_step as u32) * 100 / (TOTAL_STEPS as u32) / 100;
-    base.saturating_add(inc).min(100) as u8
+    let completed_steps = step.saturating_sub(1) as u32;
+    let scaled = completed_steps * 100 + within_step as u32;
+    (scaled / TOTAL_STEPS as u32).min(100) as u8
+}
+
+async fn snapshot_from_handle(handle: &UpgradeHandle) -> UpgradeStatusSnapshot {
+    UpgradeStatusSnapshot {
+        task_id: handle.task_id.clone(),
+        status: *handle.status.lock().await,
+        restart_pending: *handle.restart_pending.lock().await,
+        logs: handle.history.lock().await.clone(),
+        target_commit_id: handle.target_commit_id.lock().await.clone(),
+        restart_after: handle.restart_after,
+        updated_at: Utc::now().to_rfc3339(),
+    }
+}
+
+fn handle_from_snapshot(snapshot: UpgradeStatusSnapshot) -> UpgradeHandle {
+    let (sender, _receiver) = broadcast::channel(LOG_CHANNEL_CAPACITY);
+    UpgradeHandle {
+        task_id: snapshot.task_id,
+        status: Arc::new(Mutex::new(snapshot.status)),
+        sender,
+        history: Arc::new(Mutex::new(snapshot.logs)),
+        restart_pending: Arc::new(Mutex::new(snapshot.restart_pending)),
+        target_commit_id: Arc::new(Mutex::new(snapshot.target_commit_id)),
+        restart_after: snapshot.restart_after,
+    }
+}
+
+fn reconcile_snapshot_with_running_binary(snapshot: &mut UpgradeStatusSnapshot) {
+    let running = crate::build_info::build_info().commit_id;
+    let target_matches = snapshot
+        .target_commit_id
+        .as_deref()
+        .is_some_and(|target| crate::self_update::version::commits_equal(target, running));
+    if target_matches && !snapshot.restart_pending {
+        snapshot.status = UpgradeStatus::Success;
+        snapshot.restart_pending = false;
+        append_recovery_log(
+            snapshot,
+            UpgradeLogLevel::Success,
+            "replacement binary started successfully",
+        );
+    } else if snapshot.status == UpgradeStatus::Running {
+        snapshot.status = UpgradeStatus::Failed;
+        append_recovery_log(
+            snapshot,
+            UpgradeLogLevel::Error,
+            "upgrade was interrupted before the replacement binary became healthy",
+        );
+    } else if snapshot.status == UpgradeStatus::Success
+        && snapshot.target_commit_id.is_some()
+        && !snapshot.restart_pending
+        && !target_matches
+    {
+        snapshot.status = UpgradeStatus::Failed;
+        append_recovery_log(
+            snapshot,
+            UpgradeLogLevel::Error,
+            "running binary does not match the completed upgrade target",
+        );
+    }
+    snapshot.updated_at = Utc::now().to_rfc3339();
+}
+
+fn append_recovery_log(
+    snapshot: &mut UpgradeStatusSnapshot,
+    level: UpgradeLogLevel,
+    message: &str,
+) {
+    if snapshot
+        .logs
+        .last()
+        .is_some_and(|entry| entry.message == message)
+    {
+        return;
+    }
+    snapshot.logs.push(UpgradeLogEntry {
+        task_id: snapshot.task_id.clone(),
+        step: TOTAL_STEPS,
+        total_steps: TOTAL_STEPS,
+        level,
+        message: message.to_string(),
+        progress: Some(if matches!(level, UpgradeLogLevel::Success) {
+            100
+        } else {
+            95
+        }),
+        at: Utc::now().to_rfc3339(),
+    });
+}
+
+fn write_snapshot_atomic(
+    path: &Path,
+    snapshot: &UpgradeStatusSnapshot,
+) -> Result<(), SelfUpdateError> {
+    let bytes = serde_json::to_vec_pretty(snapshot).map_err(|err| {
+        SelfUpdateError::Internal(format!("serialize upgrade state failed: {err}"))
+    })?;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp)
+        .map_err(|err| SelfUpdateError::Internal(format!("write upgrade state failed: {err}")))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|err| SelfUpdateError::Internal(format!("flush upgrade state failed: {err}")))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|err| SelfUpdateError::Internal(format!("commit upgrade state failed: {err}")))?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    }
+    Ok(())
+}
+
+pub fn record_helper_outcome(
+    config_dir: &Path,
+    task_id: &str,
+    success: bool,
+    message: &str,
+) -> anyhow::Result<()> {
+    let path = config_dir.join(STATE_FILENAME);
+    let bytes = std::fs::read(&path)?;
+    let mut snapshot: UpgradeStatusSnapshot = serde_json::from_slice(&bytes)?;
+    if snapshot.task_id != task_id {
+        anyhow::bail!("upgrade helper task id does not match persisted task");
+    }
+    snapshot.status = if success {
+        UpgradeStatus::Success
+    } else {
+        UpgradeStatus::Failed
+    };
+    snapshot.restart_pending = false;
+    append_recovery_log(
+        &mut snapshot,
+        if success {
+            UpgradeLogLevel::Success
+        } else {
+            UpgradeLogLevel::Error
+        },
+        message,
+    );
+    snapshot.updated_at = Utc::now().to_rfc3339();
+    write_snapshot_atomic(&path, &snapshot).map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]
@@ -518,14 +839,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn progress_pct_monotonic() {
+    fn progress_pct_is_monotonic_and_finishes_at_100() {
         let mut last = 0u8;
         for step in 1..=TOTAL_STEPS {
-            for pct in [0u8, 50, 100] {
-                let value = progress_pct(step, pct);
-                assert!(value >= last, "step {step} pct {pct}: {value} < {last}");
+            for percent in [0u8, 50, 100] {
+                let value = progress_pct(step, percent);
+                assert!(
+                    value >= last,
+                    "step {step} percent {percent}: {value} < {last}"
+                );
                 last = value;
             }
         }
+        assert_eq!(last, 100);
+    }
+
+    #[test]
+    fn persisted_snapshot_round_trips() {
+        let dir = std::env::temp_dir().join(format!("cc-switch-upgrade-test-{}", new_task_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(STATE_FILENAME);
+        let snapshot = UpgradeStatusSnapshot {
+            task_id: "task-1".into(),
+            status: UpgradeStatus::Success,
+            restart_pending: true,
+            logs: Vec::new(),
+            target_commit_id: Some("abc1234".into()),
+            restart_after: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_snapshot_atomic(&path, &snapshot).unwrap();
+        let loaded: UpgradeStatusSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(loaded.task_id, snapshot.task_id);
+        assert_eq!(loaded.status, UpgradeStatus::Success);
+        assert!(loaded.restart_pending);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_reconciles_upgrade_against_running_commit() {
+        let mut applied = UpgradeStatusSnapshot {
+            task_id: "applied".into(),
+            status: UpgradeStatus::Running,
+            restart_pending: false,
+            logs: Vec::new(),
+            target_commit_id: Some(crate::build_info::build_info().commit_id.to_string()),
+            restart_after: true,
+            updated_at: String::new(),
+        };
+        reconcile_snapshot_with_running_binary(&mut applied);
+        assert_eq!(applied.status, UpgradeStatus::Success);
+        assert_eq!(applied.logs.last().unwrap().progress, Some(100));
+
+        let mut staged = UpgradeStatusSnapshot {
+            task_id: "staged".into(),
+            status: UpgradeStatus::Success,
+            restart_pending: true,
+            logs: Vec::new(),
+            target_commit_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            restart_after: false,
+            updated_at: String::new(),
+        };
+        reconcile_snapshot_with_running_binary(&mut staged);
+        assert_eq!(staged.status, UpgradeStatus::Success);
+        assert!(staged.restart_pending);
+
+        let mut interrupted = UpgradeStatusSnapshot {
+            task_id: "interrupted".into(),
+            status: UpgradeStatus::Running,
+            restart_pending: false,
+            logs: Vec::new(),
+            target_commit_id: None,
+            restart_after: true,
+            updated_at: String::new(),
+        };
+        reconcile_snapshot_with_running_binary(&mut interrupted);
+        assert_eq!(interrupted.status, UpgradeStatus::Failed);
+    }
+
+    #[test]
+    fn unreadable_upgrade_state_does_not_block_server_startup() {
+        let dir = std::env::temp_dir().join(format!("cc-switch-upgrade-corrupt-{}", new_task_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(STATE_FILENAME), b"{not-json").unwrap();
+        assert!(UpgradeRegistry::load(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

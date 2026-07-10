@@ -32,7 +32,6 @@ use crate::domain::accounts::store::{Account, AccountRefreshUpdate, AccountStore
 use crate::domain::failover::FailoverStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
-use crate::domain::providers::universal::UniversalProviderStore;
 use crate::domain::settings::config::{
     mask_proxy_url, PayoutProfile, PayoutProfileState, ServerConfig,
 };
@@ -56,7 +55,6 @@ pub struct ServerStateInner {
     pub provider_coverage: ProviderCoverage,
     pub(crate) config: RwLock<ServerConfig>,
     pub(crate) providers: RwLock<ProviderStore>,
-    pub(crate) universal_providers: RwLock<UniversalProviderStore>,
     pub(crate) accounts: RwLock<AccountStore>,
     pub(crate) failover: RwLock<FailoverStore>,
     pub(crate) pricing: RwLock<ModelPricingStore>,
@@ -134,7 +132,6 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::settings::config::config_path(config_dir),
         crate::clients::router::email_auth::email_auth_path(config_dir),
         crate::domain::providers::store::providers_path(config_dir),
-        crate::domain::providers::universal::universal_providers_path(config_dir),
         crate::domain::accounts::store::accounts_path(config_dir),
         crate::domain::accounts::store::accounts_key_path(config_dir),
         crate::domain::failover::failover_path(config_dir),
@@ -599,8 +596,8 @@ impl ServerStateInner {
 
         let provider_coverage = ProviderCoverage::load_embedded()?;
         let config = ServerConfig::load_or_default(&config_dir)?;
+        crate::domain::providers::migrate::migrate_remove_universal_layer(&config_dir)?;
         let providers = ProviderStore::load_or_default(&config_dir)?;
-        let universal_providers = UniversalProviderStore::load_or_default(&config_dir)?;
         let accounts = AccountStore::load_or_default(&config_dir)?;
         let failover = FailoverStore::load_or_default(&config_dir)?;
         let pricing = ModelPricingStore::load_or_default(&config_dir)?;
@@ -617,6 +614,9 @@ impl ServerStateInner {
 
         let tunnels = TunnelSupervisor::load_or_default(&config_dir)?;
         let web_auth = crate::domain::web_auth::WebAuthStore::load(config_dir.clone());
+        let upgrade = Arc::new(crate::self_update::upgrade::UpgradeRegistry::load(
+            &config_dir,
+        )?);
 
         Ok(Arc::new(Self {
             bind_addr,
@@ -625,7 +625,6 @@ impl ServerStateInner {
             provider_coverage,
             config: RwLock::new(config),
             providers: RwLock::new(providers),
-            universal_providers: RwLock::new(universal_providers),
             accounts: RwLock::new(accounts),
             failover: RwLock::new(failover),
             pricing: RwLock::new(pricing),
@@ -649,7 +648,7 @@ impl ServerStateInner {
             web_auth,
             debounced_saves: Arc::new(DebouncedStoreSaves::default()),
             started_at: std::time::Instant::now(),
-            upgrade: Arc::new(crate::self_update::upgrade::UpgradeRegistry::new()),
+            upgrade,
             log_capture,
         }))
     }
@@ -743,7 +742,6 @@ impl ServerStateInner {
         let config = ServerConfig::load_or_default(&self.config_dir)?;
         let http_client = build_http_client(&config, self.bind_addr)?;
         let providers = ProviderStore::load_or_default(&self.config_dir)?;
-        let universal_providers = UniversalProviderStore::load_or_default(&self.config_dir)?;
         let accounts = AccountStore::load_or_default(&self.config_dir)?;
         let failover = FailoverStore::load_or_default(&self.config_dir)?;
         let pricing = ModelPricingStore::load_or_default(&self.config_dir)?;
@@ -754,7 +752,6 @@ impl ServerStateInner {
         *self.http_client.write().await = http_client;
         *self.config.write().await = config;
         *self.providers.write().await = providers;
-        *self.universal_providers.write().await = universal_providers;
         *self.accounts.write().await = accounts;
         *self.failover.write().await = failover;
         *self.pricing.write().await = pricing;
@@ -845,27 +842,6 @@ impl ServerStateInner {
             self.save_providers().await?;
         }
         Ok(result.map(|(value, _)| value))
-    }
-
-    pub async fn save_universal_providers(&self) -> anyhow::Result<()> {
-        self.universal_providers.read().await.save(&self.config_dir)
-    }
-
-    pub async fn mutate_universal_providers<R>(
-        &self,
-        mutate: impl FnOnce(&mut UniversalProviderStore) -> R,
-    ) -> R {
-        let mut universal_providers = self.universal_providers.write().await;
-        mutate(&mut universal_providers)
-    }
-
-    pub async fn mutate_universal_providers_immediate<R>(
-        &self,
-        mutate: impl FnOnce(&mut UniversalProviderStore) -> R,
-    ) -> anyhow::Result<R> {
-        let result = self.mutate_universal_providers(mutate).await;
-        self.save_universal_providers().await?;
-        Ok(result)
     }
 
     pub async fn save_accounts(&self) -> anyhow::Result<()> {

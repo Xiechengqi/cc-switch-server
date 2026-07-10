@@ -793,8 +793,7 @@ body{
   .owner-change-flow,
   .owner-change-steps,
   .auth-center-grid,
-  .auth-center-metrics,
-  .universal-form-modal .provider-form-grid{
+  .auth-center-metrics{
     grid-template-columns: 1fr;
   }.usage-pricing-card .provider-actions{
     justify-content: flex-start;

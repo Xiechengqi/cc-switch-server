@@ -15,7 +15,7 @@ import {
 import { AnimatePresence, motion } from "framer-motion";
 import { AlertTriangle, Search, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
@@ -214,44 +214,6 @@ export function ProviderList({
     [testProvider],
   );
 
-  // Import current live config as default provider
-  const queryClient = useQueryClient();
-  const importMutation = useMutation({
-    mutationFn: async (): Promise<boolean> => {
-      if (appId === "opencode") {
-        const count = await providersApi.importOpenCodeFromLive();
-        return count > 0;
-      }
-      if (appId === "openclaw") {
-        const count = await providersApi.importOpenClawFromLive();
-        return count > 0;
-      }
-      if (appId === "hermes") {
-        const count = await providersApi.importHermesFromLive();
-        return count > 0;
-      }
-      if (appId === "claude-desktop") {
-        const count = await providersApi.importClaudeDesktopFromClaude();
-        return count > 0;
-      }
-      return providersApi.importDefault(appId);
-    },
-    onSuccess: (imported) => {
-      if (imported) {
-        queryClient.invalidateQueries({ queryKey: ["providers", appId] });
-        if (appId === "claude-desktop") {
-          queryClient.invalidateQueries({ queryKey: ["claudeDesktopStatus"] });
-        }
-        toast.success(t("provider.importCurrentDescription"));
-      } else {
-        toast.info(t("provider.noProviders"));
-      }
-    },
-    onError: (error: Error) => {
-      toast.error(error.message);
-    },
-  });
-
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
@@ -368,11 +330,7 @@ export function ProviderList({
 
   if (sortedProviders.length === 0) {
     return (
-      <ProviderEmptyState
-        appId={appId}
-        onCreate={onCreate}
-        onImport={() => importMutation.mutate()}
-      />
+      <ProviderEmptyState appId={appId} onCreate={onCreate} />
     );
   }
 

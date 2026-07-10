@@ -1,6 +1,8 @@
 use super::super::*;
 use std::collections::BTreeMap;
 
+use crate::domain::providers::current_provider;
+
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch,
@@ -131,7 +133,7 @@ pub(in crate::api) async fn web_proxy_target_provider_ids(
     use std::collections::HashSet;
     let mut ids = HashSet::new();
     let ui_settings = state.ui_settings.read().await.for_frontend();
-    if let Some(current) = live_import::read_current_provider_id(&ui_settings, app) {
+    if let Some(current) = current_provider::read_current_provider_id(&ui_settings, app) {
         ids.insert(current);
     }
     let failover = state.failover.read().await;
@@ -1408,7 +1410,7 @@ pub(in crate::api) async fn web_proxy_takeover_status_json(state: &ServerState) 
         app: AppKind,
     ) -> (bool, bool) {
         let has_provider =
-            live_import::resolve_current_provider_id(providers, ui_settings, app).is_some();
+            current_provider::resolve_current_provider_id(providers, ui_settings, app).is_some();
         // Server-native routing is always on for the three core apps.
         (has_provider, !has_provider)
     }
@@ -1443,7 +1445,7 @@ pub(in crate::api) async fn web_proxy_status_json(state: &ServerState) -> Value 
     let mut active_targets = Vec::new();
     for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
         let Some(provider_id) =
-            live_import::resolve_current_provider_id(&providers, &ui_settings, app)
+            current_provider::resolve_current_provider_id(&providers, &ui_settings, app)
         else {
             continue;
         };

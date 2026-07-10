@@ -20,7 +20,6 @@ if (outDirIndex >= 0 && !outDir) usage();
 const payload = JSON.parse(fs.readFileSync(inputPath, "utf8"));
 const bundle = {
   providers: normalizeProviders(payload),
-  universalProviders: normalizeArray(firstDefined(payload.universalProviders, payload.universal_providers, payload.universal)),
   accounts: normalizeArray(firstDefined(payload.accounts, payload.authAccounts, payload.oauthAccounts)),
   shares: normalizeArray(firstDefined(payload.shares, payload.shareConfigs)),
   warnings: [],
@@ -32,7 +31,6 @@ if (!bundle.shares.length) bundle.warnings.push("no shares found in desktop expo
 
 const summary = {
   providers: bundle.providers.length,
-  universalProviders: bundle.universalProviders.length,
   accounts: bundle.accounts.length,
   shares: bundle.shares.length,
   warnings: bundle.warnings,
@@ -41,7 +39,6 @@ const summary = {
 if (outDir) {
   fs.mkdirSync(outDir, {recursive: true});
   writeJson(path.join(outDir, "providers-import.json"), {providers: bundle.providers});
-  writeJson(path.join(outDir, "universal-providers-import.json"), {providers: bundle.universalProviders});
   writeJson(path.join(outDir, "accounts-import.json"), {accounts: bundle.accounts});
   writeJson(path.join(outDir, "shares-import.json"), {shares: bundle.shares});
   writeJson(path.join(outDir, "migration-summary.json"), summary);

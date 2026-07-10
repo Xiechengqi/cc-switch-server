@@ -16,8 +16,8 @@ pub enum SelfUpdateError {
 pub const SERVICE_UNIT: &str = "cc-switch-server.service";
 pub const SERVICE_NAME: &str = "cc-switch-server";
 pub const BINARY_INSTALL_PATH: &str = "/usr/local/bin/cc-switch-server";
-pub const BINARY_STAGING_PATH: &str = "/tmp/cc-switch-server";
-pub const BINARY_ROLLBACK_PATH: &str = "/tmp/cc-switch-server.bak";
+pub const BINARY_STAGING_PATH: &str = "/usr/local/bin/.cc-switch-server.new";
+pub const BINARY_ROLLBACK_PATH: &str = "/usr/local/bin/cc-switch-server.bak";
 pub const SERVICE_LOG_PATH: &str = "/var/log/cc-switch-server.log";
 const GITHUB_LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/Xiechengqi/cc-switch-server/releases/tags/latest";
@@ -73,16 +73,18 @@ pub struct ServiceStatus {
 }
 
 pub fn service_cc_switch_started() -> bool {
-    let output = match Command::new("service")
-        .args([SERVICE_NAME, "status"])
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return false,
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    stdout.contains("started") || stderr.contains("started")
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", SERVICE_UNIT])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+        || Command::new("service")
+            .args([SERVICE_NAME, "status"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 pub fn detect_service_status() -> ServiceStatus {
@@ -181,7 +183,9 @@ pub async fn fetch_latest_release_meta(client: &reqwest::Client) -> LatestReleas
     meta
 }
 
-async fn fetch_latest_release_commit(client: &reqwest::Client) -> Result<String, String> {
+pub(crate) async fn fetch_latest_release_commit(
+    client: &reqwest::Client,
+) -> Result<String, String> {
     let release = fetch_latest_release(client).await?;
     if is_commit_sha(&release.target_commitish) {
         return Ok(normalize_commit_id(&release.target_commitish));
@@ -343,17 +347,68 @@ pub fn backup_installed_binary() -> Result<(), SelfUpdateError> {
     if !install.exists() {
         return Ok(());
     }
-    std::fs::copy(install, BINARY_ROLLBACK_PATH)
-        .map_err(|err| {
-            SelfUpdateError::Internal(format!(
-                "backup {BINARY_INSTALL_PATH} to {BINARY_ROLLBACK_PATH} failed: {err}"
-            ))
-        })
-        .map(|_| ())
+    std::fs::copy(install, BINARY_ROLLBACK_PATH).map_err(|err| {
+        SelfUpdateError::Internal(format!(
+            "backup {BINARY_INSTALL_PATH} to {BINARY_ROLLBACK_PATH} failed: {err}"
+        ))
+    })?;
+    std::fs::File::open(BINARY_ROLLBACK_PATH)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| SelfUpdateError::Internal(format!("sync rollback backup failed: {err}")))
+}
+
+pub async fn fetch_release_checksum(client: &reqwest::Client) -> Result<String, SelfUpdateError> {
+    let url = format!("{}.sha256", release_binary_url());
+    let response = client
+        .get(&url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|err| SelfUpdateError::Internal(format!("checksum request failed: {err}")))?;
+    if !response.status().is_success() {
+        return Err(SelfUpdateError::Internal(format!(
+            "checksum HTTP {}",
+            response.status()
+        )));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|err| SelfUpdateError::Internal(format!("read checksum failed: {err}")))?;
+    parse_release_checksum(&body)
+}
+
+fn parse_release_checksum(body: &str) -> Result<String, SelfUpdateError> {
+    let checksum = body.split_whitespace().next().unwrap_or_default();
+    if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SelfUpdateError::Internal(
+            "release checksum is missing or invalid".into(),
+        ));
+    }
+    Ok(checksum.to_ascii_lowercase())
+}
+
+pub fn is_containerized() -> bool {
+    if std::env::var("CC_SWITCH_SERVER_ALLOW_CONTAINER_SELF_UPDATE").as_deref() == Ok("1") {
+        return false;
+    }
+    std::path::Path::new("/.dockerenv").exists()
+        || std::fs::read_to_string("/proc/1/cgroup")
+            .map(|value| {
+                value.contains("/docker/")
+                    || value.contains("/kubepods/")
+                    || value.contains("/containerd/")
+            })
+            .unwrap_or(false)
 }
 
 pub fn ensure_binary_writable() -> Result<(), SelfUpdateError> {
     use std::os::unix::fs::PermissionsExt;
+    if is_containerized() {
+        return Err(SelfUpdateError::Forbidden(
+            "self-update is disabled in containers; deploy a new image instead".into(),
+        ));
+    }
     let staging_parent = std::path::Path::new(BINARY_STAGING_PATH)
         .parent()
         .ok_or_else(|| SelfUpdateError::Internal("staging path has no parent".into()))?;
@@ -375,6 +430,17 @@ pub fn ensure_binary_writable() -> Result<(), SelfUpdateError> {
             install_parent.display()
         ))
     })?;
+    let probe = install_parent.join(format!(
+        ".cc-switch-server-write-probe-{}",
+        std::process::id()
+    ));
+    std::fs::write(&probe, b"").map_err(|err| {
+        SelfUpdateError::Forbidden(format!(
+            "install directory {} is not writable: {err}",
+            install_parent.display()
+        ))
+    })?;
+    let _ = std::fs::remove_file(probe);
     let metadata = match std::fs::metadata(BINARY_INSTALL_PATH) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -416,6 +482,16 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ));
+    }
+
+    #[test]
+    fn release_checksum_parser_accepts_sha256sum_format() {
+        let hash = "a".repeat(64);
+        assert_eq!(
+            parse_release_checksum(&format!("{hash}  cc-switch-server-linux-amd64\n")).unwrap(),
+            hash
+        );
+        assert!(parse_release_checksum("not-a-checksum").is_err());
     }
 
     #[test]

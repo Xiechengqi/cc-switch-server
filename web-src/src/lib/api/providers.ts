@@ -1,11 +1,7 @@
 import { invokeCommand } from "@/lib/runtime";
 import { isTauriRuntime } from "@/lib/runtime";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import type {
-  Provider,
-  UniversalProvider,
-  UniversalProvidersMap,
-} from "@/types";
+import type { Provider } from "@/types";
 import type { AppId } from "./types";
 
 export interface ProviderSortUpdate {
@@ -94,14 +90,6 @@ export const providersApi = {
 
   async clearCurrent(appId: AppId): Promise<SwitchResult> {
     return await invokeCommand("clear_current_provider", { app: appId });
-  },
-
-  async importDefault(appId: AppId): Promise<boolean> {
-    return await invokeCommand("import_default_config", { app: appId });
-  },
-
-  async importClaudeDesktopFromClaude(): Promise<number> {
-    return await invokeCommand("import_claude_desktop_providers_from_claude");
   },
 
   async ensureClaudeDesktopOfficialProvider(): Promise<boolean> {
@@ -204,46 +192,5 @@ export const providersApi = {
    */
   async importHermesFromLive(): Promise<number> {
     return await invokeCommand("import_hermes_providers_from_live");
-  },
-};
-
-// ============================================================================
-// 统一供应商（Universal Provider）API
-// ============================================================================
-
-export const universalProvidersApi = {
-  /**
-   * 获取所有统一供应商
-   */
-  async getAll(): Promise<UniversalProvidersMap> {
-    return await invokeCommand("get_universal_providers");
-  },
-
-  /**
-   * 获取单个统一供应商
-   */
-  async get(id: string): Promise<UniversalProvider | null> {
-    return await invokeCommand("get_universal_provider", { id });
-  },
-
-  /**
-   * 添加或更新统一供应商
-   */
-  async upsert(provider: UniversalProvider): Promise<boolean> {
-    return await invokeCommand("upsert_universal_provider", { provider });
-  },
-
-  /**
-   * 删除统一供应商
-   */
-  async delete(id: string): Promise<boolean> {
-    return await invokeCommand("delete_universal_provider", { id });
-  },
-
-  /**
-   * 手动同步统一供应商到各应用
-   */
-  async sync(id: string): Promise<boolean> {
-    return await invokeCommand("sync_universal_provider", { id });
   },
 };

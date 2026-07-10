@@ -360,20 +360,6 @@
         "apiFormat": null,
         "baseUrl": "https://openrouter.ai/api"
       }
-    ],
-    "universal": [
-      {
-        "name": "NewAPI",
-        "providerType": "newapi",
-        "apiFormat": null,
-        "baseUrl": null
-      },
-      {
-        "name": "自定义网关",
-        "providerType": "custom_gateway",
-        "apiFormat": null,
-        "baseUrl": null
-      }
     ]
   },
   "fixtures": {

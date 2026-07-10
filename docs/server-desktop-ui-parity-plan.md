@@ -4,9 +4,11 @@
 > **技术策略**：**同源移植** desktop React 组件，仅在 runtime 边界适配；禁止继续扩写 server-local 等价 Dashboard。  
 > **关联文档**：`assets/contract/web-runtime-contract.json`（功能边界）、`docs/manual-ui-checklist.md`（人工验收门禁）。本地-only 历史笔记（不提交）：`UI_PARITY_PLAN.md`、`DESKTOP_ALIGNMENT_TASKS.md`、`docs/remaining-work-index.md`。
 
-**文档版本**：2026-07-05  
+**文档版本**：2026-07-05（2026-07-10 更新：Universal Providers 与「导入当前配置」已从 token server 移除，见 `web-runtime-contract.json` `excludedFeatures`）  
 **Desktop 基线仓库**：`/data/projects/cc-switch`  
 **Server 前端目录**：`/data/projects/cc-switch-server/web-src/`
+
+> **2026-07-10 范围收缩**：下列计划中涉及 Universal Providers、Settings/universal tab、`components/universal/**`、`universalProviderPresets.ts`、以及 Provider「导入当前配置」的条目均已 **作废**；server 以 per-app `providers.json` 为唯一配置源，启动时自动孤儿化历史 universal 派生项。
 
 ---
 

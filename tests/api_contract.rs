@@ -2037,6 +2037,48 @@ async fn admin_logs_tail_honors_api_enabled_gate() {
 }
 
 #[tokio::test]
+async fn client_web_streams_require_authorization_headers() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let query_token = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/web-api/events?token={token}"),
+            json!(null),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(query_token.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/web-api/events",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+
+    let upgrade_status = app
+        .oneshot(json_request(
+            Method::GET,
+            "/web-api/admin/upgrade/status?taskId=missing",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upgrade_status.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn payout_profile_admin_write_public_read_and_clear_contract() {
     let state = test_state();
     let app = app_router(state);

@@ -91,10 +91,10 @@ git diff --check -- ':(exclude)web-dist'
 
 echo "== state write discipline =="
 state_write_paths=(src/api src/clients src/domain src/proxy src/infra tests)
-if rg -n -U 'state\s*\.\s*(config|providers|universal_providers|accounts|failover|pricing|usage|shares|ui_settings|sessions|oauth_logins)\s*\.\s*write\s*\(\s*\)\s*\.\s*await' "${state_write_paths[@]}"; then
+if rg -n -U 'state\s*\.\s*(config|providers|accounts|failover|pricing|usage|shares|ui_settings|sessions|oauth_logins)\s*\.\s*write\s*\(\s*\)\s*\.\s*await' "${state_write_paths[@]}"; then
   echo 'state store writes must go through ServerStateInner domain methods'; exit 1
 fi
-if rg -n -U 'state\s*\.\s*save_(providers|universal_providers|accounts|failover|pricing|usage|ui_settings)\s*\(\s*\)\s*\.\s*await|save_(accounts|shares)_debounced\s*\(' "${state_write_paths[@]}"; then
+if rg -n -U 'state\s*\.\s*save_(providers|accounts|failover|pricing|usage|ui_settings)\s*\(\s*\)\s*\.\s*await|save_(accounts|shares)_debounced\s*\(' "${state_write_paths[@]}"; then
   echo 'state store persistence must stay encapsulated in ServerStateInner domain methods'; exit 1
 fi
 

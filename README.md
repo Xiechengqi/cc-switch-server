@@ -274,7 +274,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 主要本地 store：
 
 - `server.json`：owner、公开收款资料及同步状态、password hash、router、client tunnel subdomain 和 installation identity。
-- `providers.json` / `universal-providers.json`：provider 和 Universal Provider 配置。
+- `providers.json`：Claude / Codex / Gemini 供应商配置（按应用维度管理）。
 - `accounts.json`：账号 token、profile、quota、raw snapshot；token 字段用 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 做 XChaCha20Poly1305 加密。
 - `accounts.key`：本机生成的账号 token 加密密钥；备份/迁移时必须和 `accounts.json` 一起保留。
 - `shares.json` / `tunnels.json`：share、binding、ACL、market grant 和 tunnel runtime。

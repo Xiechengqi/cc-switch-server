@@ -67,8 +67,6 @@ const MODULES = {
         /\.modal-inline-footer/.test(s) ||
         /\.owner-change-form/.test(s),
     ),
-  "universal.css": (selectors) =>
-    selectors.some((s) => /\.universal-/.test(s)),
 };
 
 function collectSourceText(dir, excludedPaths) {

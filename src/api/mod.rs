@@ -99,16 +99,12 @@ use crate::domain::accounts::store::{
     Account, AccountRefreshUpdate, AccountStore, UpsertAccountInput,
 };
 use crate::domain::failover::UpdateFailoverAppInput;
-use crate::domain::providers::live_import;
+use crate::domain::providers::current_provider;
 use crate::domain::providers::model::{
     classify_provider_response, AppKind, Provider, ProviderType, ProviderTypeRequest,
     ProviderTypeResponse,
 };
 use crate::domain::providers::store::{ProviderSortUpdate, StoredProvider};
-use crate::domain::providers::universal::{
-    provider_from_universal, universal_provider_presets, UniversalProvider,
-    UniversalProviderSyncResult,
-};
 use crate::domain::settings::config::{
     ServerConfig, SetupInput, UpdateClientTunnelInput, UpdateRouterConfigInput,
     UpdateUpstreamProxyInput,
@@ -197,30 +193,6 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/providers", get(list_providers).post(create_provider))
         .route("/api/providers/export", get(export_providers))
         .route("/api/providers/import", post(import_providers))
-        .route(
-            "/api/universal-providers",
-            get(list_universal_providers).post(upsert_universal_provider),
-        )
-        .route(
-            "/api/universal-providers/export",
-            get(export_universal_providers),
-        )
-        .route(
-            "/api/universal-providers/import",
-            post(import_universal_providers),
-        )
-        .route(
-            "/api/universal-providers/:id",
-            get(get_universal_provider).delete(delete_universal_provider),
-        )
-        .route(
-            "/api/universal-providers/:id/sync",
-            post(sync_universal_provider),
-        )
-        .route(
-            "/api/universal-provider-presets",
-            get(universal_provider_presets_route),
-        )
         .route("/api/providers/health", get(provider_health))
         .route("/api/failover", get(failover_snapshot))
         .route("/api/failover/apps/:app", put(update_failover_app))

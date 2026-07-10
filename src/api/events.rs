@@ -3,9 +3,8 @@ use super::*;
 pub(in crate::api) async fn events(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Query(query): Query<EventQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    require_event_session(&state, &headers, query.token.as_deref()).await?;
+    require_event_session(&state, &headers).await?;
     let receiver = state.subscribe_events();
     let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
         loop {

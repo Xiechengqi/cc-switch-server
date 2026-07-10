@@ -7,8 +7,8 @@ scripts, or automated click flows.
 ## Scope
 
 - Compare the server Web UI against `/data/projects/cc-switch` desktop UI for the token server main path only.
-- Retained pages: Providers, Shares, Usage/Pricing, Settings/Auth/Router/Backup, Universal Providers, Accounts/OAuth/quota.
-- Hidden or excluded areas must not appear in navigation or primary actions: skills, MCP, OpenClaw workspace/tools/agents, Hermes, OMO, Tauri shell, updater, deeplink, Claude Desktop profile writing, WebDAV/S3 sync, speedtest, local CLI session parsing, `codex_responses_ws`.
+- Retained pages: Providers, Shares, Usage/Pricing, Settings/Auth/Router/Backup, Accounts/OAuth/quota.
+- Excluded from server (must not appear): Universal Providers, import-current-CLI-config, skills, MCP, OpenClaw workspace/tools/agents, Hermes, OMO, Tauri shell, updater, deeplink, Claude Desktop profile writing, WebDAV/S3 sync, speedtest, local CLI session parsing, `codex_responses_ws`.
 
 ## Viewports
 
@@ -53,11 +53,9 @@ Run the checks manually at:
 - Payout clear requires confirmation; Router outage leaves the local save active and visibly reports pending/failed sync.
 - Desktop-only settings are absent.
 - Destructive actions have clear confirmation or disabled states.
-
-## Universal Providers
-
-- Universal provider list, model catalog, model mapping, app enablement, sync, import, and export are reachable.
-- Derived provider cleanup behavior is represented in the UI wording or action result.
+- Settings → General → Current Version can start an upgrade from both localhost and a Router Client Tunnel URL; progress logs stream without 404/401 responses and request URLs never contain access tokens.
+- Closing/reopening the progress dialog or interrupting the stream preserves the task status; a service restart resumes at the persisted task and reports the running commit or a rollback failure instead of resetting to 0%.
+- Container deployments show self-update as unavailable and direct operators to deploy a new image.
 
 ## Accounts, OAuth, Quota
 

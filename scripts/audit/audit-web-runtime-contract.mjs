@@ -25,6 +25,25 @@ if (contract.uiAutomationAllowed !== false) {
   fail("uiAutomationAllowed must be false");
 }
 
+const transport = contract.clientWebTransport || {};
+if (transport.privatePrefix !== "/web-api/") {
+  fail("clientWebTransport.privatePrefix must be /web-api/");
+}
+if (transport.authentication !== "authorization_header") {
+  fail("client web transport must use Authorization headers");
+}
+if (transport.queryTokensAllowed !== false) {
+  fail("client web transport must reject query-string tokens");
+}
+for (const requiredPath of [
+  "/web-api/events",
+  "/web-api/admin/upgrade/stream",
+]) {
+  if (!(transport.streamPaths || []).includes(requiredPath)) {
+    fail(`client web stream contract is missing ${requiredPath}`);
+  }
+}
+
 const retained = contract.retainedFeatures || [];
 const hidden = contract.hiddenFeatures || [];
 const excluded = contract.excludedFeatures || [];
@@ -139,10 +158,35 @@ if (fs.existsSync(webSrc)) {
   const pattern = /invokeCommand(?:<[^>]+>)?\(\s*["']([^"']+)["']/g;
   for (const file of files) {
     const source = fs.readFileSync(file, "utf8");
+    if (source.includes("new EventSource(")) {
+      fail(`${file} must use authenticated fetch streaming instead of EventSource`);
+    }
+    if (/web-api\/(?:events|admin\/upgrade\/stream)[^"'`]*[?&](?:token|accessToken)=/.test(source)) {
+      fail(`${file} leaks a client web token through an SSE URL`);
+    }
     for (const match of source.matchAll(pattern)) {
       if (!registered.has(match[1])) {
         fail(`${file} invokes unregistered command ${match[1]}`);
       }
+    }
+  }
+}
+
+const routerDir = process.env.CC_SWITCH_ROUTER_DIR || "../cc-switch-router";
+const routerProxy = path.join(routerDir, "src/proxy.rs");
+if (fs.existsSync(routerProxy)) {
+  const source = fs.readFileSync(routerProxy, "utf8");
+  for (const marker of [
+    'path.starts_with("/web-api/")',
+    "!is_public_client_web_path(path)",
+    '"/web-api/admin/upgrade/stream"',
+    '"/web-api/admin/upgrade/status"',
+    '"/web-api/admin/logs/tail"',
+    "has_client_web_query_token",
+    '"query-token-not-allowed"',
+  ]) {
+    if (!source.includes(marker)) {
+      fail(`router client web policy is missing ${marker}`);
     }
   }
 }

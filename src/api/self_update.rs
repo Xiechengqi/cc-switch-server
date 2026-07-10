@@ -55,10 +55,6 @@ pub(in crate::api) fn start_upgrade_request(restart_after: bool) -> StartUpgrade
 pub(in crate::api) struct UpgradeStreamQuery {
     #[serde(default)]
     task_id: Option<String>,
-    #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,7 +105,10 @@ pub(in crate::api) async fn admin_restart(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_session(&state, &headers).await?;
-    let script = map_self_update_error(restart_from_detected_service())?;
+    let script = map_self_update_error(restart_from_detected_service(
+        &state.config_dir,
+        state.bind_addr,
+    ))?;
     state.upgrade.clear_restart_pending().await;
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -122,7 +121,11 @@ pub(in crate::api) async fn admin_rollback(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_session(&state, &headers).await?;
-    let script = map_self_update_error(rollback_from_backup_and_restart())?;
+    map_self_update_error(ensure_binary_writable())?;
+    let script = map_self_update_error(rollback_from_backup_and_restart(
+        &state.config_dir,
+        state.bind_addr,
+    ))?;
     state.upgrade.clear_restart_pending().await;
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -144,7 +147,12 @@ pub(in crate::api) async fn admin_upgrade_start(
     let handle = map_self_update_error(
         state
             .upgrade
-            .start(client, Some("web-admin".to_string()), input.restart_after)
+            .start(
+                client,
+                Some("web-admin".to_string()),
+                input.restart_after,
+                state.bind_addr,
+            )
             .await,
     )?;
     Ok(Json(serde_json::json!({
@@ -158,8 +166,7 @@ pub(in crate::api) async fn admin_upgrade_stream(
     headers: HeaderMap,
     Query(query): Query<UpgradeStreamQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let query_token = query.access_token.as_deref().or(query.token.as_deref());
-    require_event_session(&state, &headers, query_token).await?;
+    require_event_session(&state, &headers).await?;
 
     let handle = state
         .upgrade
@@ -172,10 +179,13 @@ pub(in crate::api) async fn admin_upgrade_stream(
         }
     }
 
-    let history: Vec<UpgradeLogEntry> = handle.history.lock().await.clone();
+    let history_guard = handle.history.lock().await;
     let receiver = handle.sender.subscribe();
+    let history: Vec<UpgradeLogEntry> = history_guard.clone();
+    drop(history_guard);
     let status = handle.status.clone();
     let restart_pending = handle.restart_pending.clone();
+    let registry = state.upgrade.clone();
     let stream = async_stream::stream! {
         for entry in history {
             yield Ok(sse_event_from_entry(&entry));
@@ -197,6 +207,7 @@ pub(in crate::api) async fn admin_upgrade_stream(
                 }
                 Err(_) => {}
             }
+            registry.refresh_from_disk().await;
             if let Some(event) = emit_done_if_finished(&status, &restart_pending).await {
                 while let Ok(entry) = rx.try_recv() {
                     yield Ok(sse_event_from_entry(&entry));

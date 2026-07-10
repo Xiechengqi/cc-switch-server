@@ -1,8 +1,0 @@
-.universal-app-badge.active{
-  border-color: hsl(var(--primary) / 0.35);
-  background: hsl(var(--primary) / 0.12);
-  color: hsl(var(--primary));
-}.universal-app-config.active{
-  border-color: hsl(var(--primary) / 0.35);
-  background: hsl(var(--primary) / 0.12);
-}

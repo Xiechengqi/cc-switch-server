@@ -32,7 +32,7 @@ export const defaultPaths = [
   "components/ui",
   "components/providers/forms",
   "components/providers/AddProviderDialog.tsx",
-  "components/providers/EditProviderDialog.tsx",
+  "components/providers/ProviderEmptyState.tsx",
   "components/providers/ProviderList.tsx",
   "components/providers/ProviderCard.tsx",
   "components/providers/ProviderActions.tsx",
@@ -56,7 +56,6 @@ export const defaultPaths = [
   "components/settings/ThemeSettings.tsx",
   "components/share",
   "components/usage",
-  "components/universal",
   "lib/utils.ts",
   "lib/query/queryClient.ts",
 ];
@@ -74,6 +73,7 @@ export const serverLocalOverrides = [
   "components/providers/forms/KiroOAuthSection.tsx",
   "components/providers/forms/hooks/useManagedAuth.ts",
   "components/providers/forms/ProviderForm.tsx",
+  "components/providers/forms/ProviderPresetSelector.tsx",
   "components/providers/ProviderShareSection.tsx",
   "components/ConfirmDialog.tsx",
   "components/common/FullScreenPanel.tsx",
@@ -87,14 +87,14 @@ export const serverLocalOverrides = [
   "components/share/ShareEmptyState.tsx",
   "components/share/ShareExportModal.tsx",
   "components/share/SharePage.tsx",
-  "components/universal/UniversalEmptyState.tsx",
-  "components/universal/UniversalListToolbar.tsx",
   "components/usage/UsageMiniMetric.tsx",
   "components/usage/UsageTabs.tsx",
   "components/usage/index.ts",
 ];
 
 export const serverExcludedFromSync = [
+  "components/universal",
+  "config/universalProviderPresets.ts",
   "components/share/ShareOwnerChangeEmailDialog.tsx",
   "components/share/ShareOwnerLoginDialog.tsx",
   "components/share/ShareRouterBar.tsx",

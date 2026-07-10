@@ -2,6 +2,33 @@
   "version": 1,
   "product": "cc-switch desktop server version",
   "uiAutomationAllowed": false,
+  "clientWebTransport": {
+    "privatePrefix": "/web-api/",
+    "publicPaths": [
+      "/web-api/auth/methods",
+      "/web-api/auth/email/request-code",
+      "/web-api/auth/email/verify-code",
+      "/web-api/auth/session/refresh",
+      "/web-api/auth/password/setup",
+      "/web-api/auth/password/login",
+      "/web-api/auth/password/refresh",
+      "/web-api/auth/initial-setup",
+      "/web-api/oauth/claude-cli/callback",
+      "/web-api/oauth/openai-cli/callback"
+    ],
+    "streamPaths": [
+      "/web-api/events",
+      "/web-api/admin/upgrade/stream"
+    ],
+    "deniedPrefixes": [
+      "/api/",
+      "/v1/",
+      "/_ctl/",
+      "/_share-router/"
+    ],
+    "authentication": "authorization_header",
+    "queryTokensAllowed": false
+  },
   "retainedFeatures": [
     {
       "id": "providers",
@@ -18,10 +45,6 @@
     {
       "id": "settings",
       "label": "Settings, auth, router, backup"
-    },
-    {
-      "id": "universalProviders",
-      "label": "Universal providers"
     },
     {
       "id": "accounts",
@@ -112,6 +135,16 @@
       "id": "codexImages",
       "label": "Codex OAuth image generation",
       "reason": "Out of current text/code-agent proxy scope"
+    },
+    {
+      "id": "universalProviders",
+      "label": "Universal providers",
+      "reason": "Removed from token server; per-app providers are the source of truth"
+    },
+    {
+      "id": "importCurrentConfig",
+      "label": "Import current CLI config",
+      "reason": "Desktop onboarding only; not applicable to remote token server"
     }
   ],
   "commands": [
@@ -530,11 +563,10 @@
     },
     {
       "name": "delete_universal_provider",
-      "support": "native",
-      "implemented": true,
+      "support": "excluded",
+      "implemented": false,
       "feature": "universalProviders",
-      "endpoint": "DELETE /api/universal-providers/:id",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "notes": "Removed from token server; per-app providers are the source of truth."
     },
     {
       "name": "disable_share",
@@ -1147,19 +1179,17 @@
     },
     {
       "name": "get_universal_provider",
-      "support": "native",
-      "implemented": true,
+      "support": "excluded",
+      "implemented": false,
       "feature": "universalProviders",
-      "endpoint": "GET /api/universal-providers/:id",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "notes": "Removed from token server; per-app providers are the source of truth."
     },
     {
       "name": "get_universal_providers",
-      "support": "native",
-      "implemented": true,
+      "support": "excluded",
+      "implemented": false,
       "feature": "universalProviders",
-      "endpoint": "GET /api/universal-providers",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "notes": "Removed from token server; per-app providers are the source of truth."
     },
     {
       "name": "get_usage_data_sources",
@@ -1215,10 +1245,10 @@
     },
     {
       "name": "import_default_config",
-      "support": "shim",
-      "implemented": true,
-      "feature": "settings",
-      "notes": "Imports Claude/Codex/Gemini live config into a default provider from configured or home config dirs."
+      "support": "excluded",
+      "implemented": false,
+      "feature": "importCurrentConfig",
+      "notes": "Desktop onboarding only; not applicable to remote token server."
     },
     {
       "name": "import_hermes_providers_from_live",
@@ -1756,11 +1786,10 @@
     },
     {
       "name": "sync_universal_provider",
-      "support": "native",
-      "implemented": true,
+      "support": "excluded",
+      "implemented": false,
       "feature": "universalProviders",
-      "endpoint": "POST /api/universal-providers/:id/sync",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "notes": "Removed from token server; per-app providers are the source of truth."
     },
     {
       "name": "test_proxy_url",
@@ -1932,11 +1961,10 @@
     },
     {
       "name": "upsert_universal_provider",
-      "support": "native",
-      "implemented": true,
+      "support": "excluded",
+      "implemented": false,
       "feature": "universalProviders",
-      "endpoint": "POST /api/universal-providers",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "notes": "Removed from token server; per-app providers are the source of truth."
     },
     {
       "name": "webdav_sync_download",
@@ -1973,5 +2001,6 @@
       "feature": "cloudSync",
       "notes": "Server web runtime shim for desktop-synced settings UI."
     }
-  ]
+  ],
+  "invokeCommands": []
 }

@@ -274,30 +274,10 @@ async fn web_invoke_dispatch(
             };
             let providers = state.providers.read().await;
             let ui_settings = state.ui_settings.read().await.for_frontend();
-            let current = live_import::resolve_current_provider_id(&providers, &ui_settings, app)
-                .unwrap_or_default();
+            let current =
+                current_provider::resolve_current_provider_id(&providers, &ui_settings, app)
+                    .unwrap_or_default();
             Ok(json!(current))
-        }
-        "import_default_config" => {
-            let app = web_arg_app(&args).or_else(|_| web_arg_app_type(&args))?;
-            let ui_settings = state.ui_settings.read().await.for_frontend();
-            let imported = state
-                .try_mutate_providers_immediate_if_changed(|providers| {
-                    let imported = live_import::import_default_config(providers, app, &ui_settings)
-                        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-                    Ok((imported, imported))
-                })
-                .await
-                .map_err(ApiError::internal)??;
-            if imported {
-                state
-                    .apply_ui_settings_patch_immediate(json!({
-                        live_import::current_provider_settings_key(app): "default"
-                    }))
-                    .await
-                    .map_err(ApiError::internal)?;
-            }
-            Ok(json!(imported))
         }
         "add_provider" | "update_provider" => {
             let app = web_arg_app(&args)?;
@@ -344,7 +324,7 @@ async fn web_invoke_dispatch(
             }
             state
                 .apply_ui_settings_patch_immediate(json!({
-                    live_import::current_provider_settings_key(app): id
+                    current_provider::current_provider_settings_key(app): id
                 }))
                 .await
                 .map_err(ApiError::internal)?;
@@ -354,7 +334,7 @@ async fn web_invoke_dispatch(
             let app = web_arg_app(&args)?;
             state
                 .apply_ui_settings_patch_immediate(json!({
-                    live_import::current_provider_settings_key(app): ""
+                    current_provider::current_provider_settings_key(app): ""
                 }))
                 .await
                 .map_err(ApiError::internal)?;
@@ -367,47 +347,6 @@ async fn web_invoke_dispatch(
             let key = format!("{}:{provider_id}", app.as_str());
             let breaker = failover.breakers.get(&key);
             Ok(json!(web_provider_health_json(app, &provider_id, breaker)))
-        }
-        "get_universal_providers" => {
-            let providers = state.universal_providers.read().await.providers.clone();
-            Ok(json!(providers))
-        }
-        "get_universal_provider" => {
-            let id = web_arg_string(&args, "id")?;
-            let provider = state
-                .universal_providers
-                .read()
-                .await
-                .providers
-                .get(&id)
-                .cloned();
-            Ok(json!(provider))
-        }
-        "upsert_universal_provider" => {
-            let provider: UniversalProvider = web_arg_value_any(&args, &["provider"])?;
-            let response = upsert_universal_provider(
-                State(state.clone()),
-                headers.clone(),
-                Json(UpsertUniversalProviderRequest { provider }),
-            )
-            .await?
-            .0;
-            Ok(json!(response.provider))
-        }
-        "delete_universal_provider" => {
-            let id = web_arg_string(&args, "id")?;
-            let response =
-                delete_universal_provider(State(state.clone()), headers.clone(), Path(id))
-                    .await?
-                    .0;
-            Ok(json!(response.deleted))
-        }
-        "sync_universal_provider" => {
-            let id = web_arg_string(&args, "id")?;
-            let response = sync_universal_provider(State(state.clone()), headers.clone(), Path(id))
-                .await?
-                .0;
-            Ok(json!(response.result))
         }
         "list_shares" | "export_all_shares" => {
             let shares = state.shares.read().await.shares.clone();

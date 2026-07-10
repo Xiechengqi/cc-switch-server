@@ -33,7 +33,12 @@ import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { settingsApi } from "@/lib/api";
-import { getWebRuntimeContext, readWebSessionToken } from "@/lib/runtime";
+import { getWebRuntimeContext } from "@/lib/runtime";
+import {
+  abortableDelay,
+  consumeAuthenticatedSse,
+  isAbortError,
+} from "@/lib/sse";
 import {
   loadAdminVersionInfo,
   loadBuildInfo,
@@ -70,25 +75,29 @@ type UpgradeDonePayload = {
 
 function upgradeLogsIndicateRestartScheduled(logs: UpgradeLogEntry[]): boolean {
   return logs.some((entry) => {
-    if ((entry.step ?? 0) >= 6) {
-      return true;
-    }
+    if (normalizeUpgradeLogLevel(entry.level) === "error") return false;
     const message = (entry.message ?? "").toLowerCase();
     return (
+      message.includes("restart helper scheduled") ||
       message.includes("restart scheduled") ||
       message.includes("process will restart")
     );
   });
 }
 
+function upgradeLogKey(entry: UpgradeLogEntry): string {
+  return [
+    entry.taskId ?? "",
+    entry.at ?? "",
+    entry.step ?? "",
+    entry.level ?? "",
+    entry.progress ?? "",
+    entry.message ?? "",
+  ].join("\u0000");
+}
+
 function buildUpgradeStreamParams(taskId: string): string {
-  const params = new URLSearchParams({ taskId });
-  const token = readWebSessionToken();
-  if (token) {
-    params.set("accessToken", token);
-    params.set("token", token);
-  }
-  return params.toString();
+  return new URLSearchParams({ taskId }).toString();
 }
 
 function formatVersionDetails(info: AdminVersionInfo): string {
@@ -175,7 +184,8 @@ function computeUpgradeProgress(
 ): number {
   if (outcome === "success") return 100;
   if (outcome === "restarting") {
-    const base = logs.length > 0 ? computeUpgradeProgress(logs, "running", true) : 90;
+    const base =
+      logs.length > 0 ? computeUpgradeProgress(logs, "running", true) : 90;
     return Math.max(base, 95);
   }
   if (logs.length === 0) {
@@ -195,9 +205,7 @@ function UpgradeLogRow({ entry }: { entry: UpgradeLogEntry }) {
   const level = normalizeUpgradeLogLevel(entry.level);
   const time = formatUpgradeLogTime(entry.at);
   const stepLabel =
-    entry.step && entry.totalSteps
-      ? `${entry.step}/${entry.totalSteps}`
-      : null;
+    entry.step && entry.totalSteps ? `${entry.step}/${entry.totalSteps}` : null;
 
   return (
     <div className="group flex items-start gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-muted/40">
@@ -218,7 +226,12 @@ function UpgradeLogRow({ entry }: { entry: UpgradeLogEntry }) {
           {stepLabel}
         </span>
       ) : null}
-      <p className={cn("min-w-0 flex-1 break-all text-xs leading-5", upgradeLogLevelClass(entry.level))}>
+      <p
+        className={cn(
+          "min-w-0 flex-1 break-all text-xs leading-5",
+          upgradeLogLevelClass(entry.level),
+        )}
+      >
         {entry.message || ""}
       </p>
     </div>
@@ -228,7 +241,9 @@ function UpgradeLogRow({ entry }: { entry: UpgradeLogEntry }) {
 function formatBytes(bytes?: number | null): string {
   if (!bytes) return "--";
   const mib = bytes / 1024 / 1024;
-  return mib >= 1 ? `${mib.toFixed(1)} MiB` : `${(bytes / 1024).toFixed(1)} KiB`;
+  return mib >= 1
+    ? `${mib.toFixed(1)} MiB`
+    : `${(bytes / 1024).toFixed(1)} KiB`;
 }
 
 function formatCommitLabel(
@@ -293,10 +308,11 @@ export function ServerVersionSettings() {
   const [upgradeOutcome, setUpgradeOutcome] = useState<UpgradeOutcome>(null);
   const [usingBuildInfoFallback, setUsingBuildInfoFallback] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const streamRef = useRef<EventSource | null>(null);
+  const streamRef = useRef<AbortController | null>(null);
   const streamFinishedRef = useRef(false);
   const streamReconnectAttemptsRef = useRef(0);
   const upgradeLogsRef = useRef<UpgradeLogEntry[]>([]);
+  const upgradeLogKeysRef = useRef(new Set<string>());
   const logEndRef = useRef<HTMLDivElement | null>(null);
 
   const refresh = useCallback(async () => {
@@ -349,7 +365,7 @@ export function ServerVersionSettings() {
       void refresh();
     }
     return () => {
-      streamRef.current?.close();
+      streamRef.current?.abort();
       streamRef.current = null;
     };
   }, [refresh]);
@@ -404,11 +420,14 @@ export function ServerVersionSettings() {
   }, [latestStepLabel, t, upgradeLogs, upgradeOutcome, upgradeRunning]);
 
   const closeUpgradeStream = useCallback(() => {
-    streamRef.current?.close();
+    streamRef.current?.abort();
     streamRef.current = null;
   }, []);
 
   const appendUpgradeLog = useCallback((entry: UpgradeLogEntry) => {
+    const key = upgradeLogKey(entry);
+    if (upgradeLogKeysRef.current.has(key)) return;
+    upgradeLogKeysRef.current.add(key);
     setUpgradeLogs((prev) => {
       const next = [...prev, entry];
       upgradeLogsRef.current = next;
@@ -454,59 +473,41 @@ export function ServerVersionSettings() {
   }, [closeUpgradeStream, t]);
 
   const resolveUpgradeAfterStreamLoss = useCallback(
-    async (taskId: string) => {
-      const logs = upgradeLogsRef.current;
-      try {
-        const status = await loadUpgradeStatus(taskId);
-        if (status.logs.length > 0) {
-          setUpgradeLogs(status.logs);
-          upgradeLogsRef.current = status.logs;
+    async (taskId: string, signal: AbortSignal) => {
+      while (!signal.aborted) {
+        const logs = upgradeLogsRef.current;
+        try {
+          const status = await loadUpgradeStatus(taskId);
+          if (status.logs.length > 0) {
+            setUpgradeLogs(status.logs);
+            upgradeLogsRef.current = status.logs;
+            upgradeLogKeysRef.current = new Set(status.logs.map(upgradeLogKey));
+          }
+          if (status.status === "success") {
+            applyUpgradeDone({
+              status: "success",
+              restartPending: status.restartPending,
+            });
+            return;
+          }
+          if (status.status === "failed") {
+            applyUpgradeDone({ status: "failed" });
+            return;
+          }
+        } catch {
+          if (upgradeLogsIndicateHardFailure(logs)) {
+            applyUpgradeDone({ status: "failed" });
+            return;
+          }
+          if (upgradeLogsIndicateRestartScheduled(logs)) {
+            beginUpgradeRestartWait();
+            return;
+          }
         }
-        if (status.status === "success") {
-          applyUpgradeDone({
-            status: "success",
-            restartPending: status.restartPending,
-          });
-          return;
-        }
-        if (status.status === "failed") {
-          applyUpgradeDone({ status: "failed" });
-          return;
-        }
-      } catch {
-        // status endpoint may be unavailable while the service is restarting
+        await abortableDelay(2000, signal).catch(() => undefined);
       }
-
-      if (upgradeLogsIndicateRestartScheduled(logs)) {
-        beginUpgradeRestartWait();
-        return;
-      }
-      if (upgradeLogsIndicateHardFailure(logs)) {
-        streamFinishedRef.current = true;
-        closeUpgradeStream();
-        setBusy(null);
-        setUpgradeOutcome("failed");
-        toast.error(t("settings.serverVersion.upgradeFailed"));
-        return;
-      }
-
-      streamFinishedRef.current = true;
-      closeUpgradeStream();
-      setBusy(null);
-      appendUpgradeLog({
-        level: "error",
-        message: t("settings.serverVersion.streamDisconnected"),
-      });
-      setUpgradeOutcome("failed");
-      toast.error(t("settings.serverVersion.upgradeFailed"));
     },
-    [
-      appendUpgradeLog,
-      applyUpgradeDone,
-      beginUpgradeRestartWait,
-      closeUpgradeStream,
-      t,
-    ],
+    [applyUpgradeDone, beginUpgradeRestartWait],
   );
 
   const streamUpgrade = useCallback(
@@ -515,57 +516,56 @@ export function ServerVersionSettings() {
       streamFinishedRef.current = false;
       streamReconnectAttemptsRef.current = 0;
 
-      const connect = () => {
-        const source = new EventSource(
-          `/web-api/admin/upgrade/stream?${buildUpgradeStreamParams(taskId)}`,
-        );
-        streamRef.current = source;
-
-        source.addEventListener("log", (event) => {
-          streamReconnectAttemptsRef.current = 0;
-          appendUpgradeLog(parseUpgradeLogEntry((event as MessageEvent).data));
-        });
-
-        source.addEventListener("done", (event) => {
+      const controller = new AbortController();
+      streamRef.current = controller;
+      void (async () => {
+        while (
+          !controller.signal.aborted &&
+          !streamFinishedRef.current &&
+          streamReconnectAttemptsRef.current < 5
+        ) {
           try {
-            const payload = JSON.parse(
-              (event as MessageEvent).data,
-            ) as UpgradeDonePayload;
-            applyUpgradeDone(payload);
-          } catch {
-            applyUpgradeDone({ status: "success" });
+            await consumeAuthenticatedSse(
+              `/web-api/admin/upgrade/stream?${buildUpgradeStreamParams(taskId)}`,
+              {
+                signal: controller.signal,
+                onEvent: (event) => {
+                  if (event.event === "log") {
+                    appendUpgradeLog(parseUpgradeLogEntry(event.data));
+                  } else if (event.event === "done") {
+                    try {
+                      applyUpgradeDone(
+                        JSON.parse(event.data) as UpgradeDonePayload,
+                      );
+                    } catch {
+                      applyUpgradeDone({ status: "success" });
+                    }
+                  }
+                },
+              },
+            );
+            if (streamFinishedRef.current) return;
+          } catch (error) {
+            if (controller.signal.aborted || isAbortError(error)) return;
           }
-        });
-
-        source.onerror = () => {
-          if (streamFinishedRef.current) return;
-          if (source.readyState === EventSource.CONNECTING) return;
-
-          if (
-            source.readyState === EventSource.CLOSED &&
-            streamReconnectAttemptsRef.current < 5
-          ) {
-            closeUpgradeStream();
-            streamReconnectAttemptsRef.current += 1;
-            window.setTimeout(() => {
-              if (!streamFinishedRef.current) {
-                connect();
-              }
-            }, 400 * streamReconnectAttemptsRef.current);
-            return;
-          }
-
-          void resolveUpgradeAfterStreamLoss(taskId);
-        };
-      };
-
-      connect();
+          streamReconnectAttemptsRef.current += 1;
+          await abortableDelay(
+            400 * streamReconnectAttemptsRef.current,
+            controller.signal,
+          ).catch(() => undefined);
+        }
+        if (!controller.signal.aborted && !streamFinishedRef.current) {
+          toast.warning(t("settings.serverVersion.streamDisconnected"));
+          await resolveUpgradeAfterStreamLoss(taskId, controller.signal);
+        }
+      })();
     },
     [
       appendUpgradeLog,
       applyUpgradeDone,
       closeUpgradeStream,
       resolveUpgradeAfterStreamLoss,
+      t,
     ],
   );
 
@@ -575,6 +575,7 @@ export function ServerVersionSettings() {
       setBusy("upgrade");
       setUpgradeLogs([]);
       upgradeLogsRef.current = [];
+      upgradeLogKeysRef.current.clear();
       setUpgradeOutcome("running");
       setUpgradeLogOpen(true);
       try {
@@ -793,7 +794,9 @@ export function ServerVersionSettings() {
                 variant="outline"
                 size="sm"
                 className="h-9 gap-1.5 text-xs"
-                onClick={() => void settingsApi.openExternal(SERVER_OFFICIAL_WEBSITE)}
+                onClick={() =>
+                  void settingsApi.openExternal(SERVER_OFFICIAL_WEBSITE)
+                }
               >
                 <Globe className="h-3.5 w-3.5" />
                 {t("settings.officialWebsite")}
@@ -949,98 +952,98 @@ export function ServerVersionSettings() {
               <X className="h-4 w-4" />
             </Button>
 
-          <div className="border-b bg-muted/20 px-6 py-5 pr-14">
-            <DialogHeader className="space-y-4 text-left">
-              <div className="flex items-start gap-4">
-                <div
-                  className={cn(
-                    "flex h-11 w-11 shrink-0 items-center justify-center rounded-xl ring-1 ring-border/60",
-                    upgradeStatusVisual.ring,
-                  )}
-                >
-                  <UpgradeStatusIcon
-                    className={cn(
-                      "h-5 w-5",
-                      upgradeStatusVisual.spin && "animate-spin",
-                    )}
-                  />
-                </div>
-                <div className="min-w-0 flex-1 space-y-1">
-                  <DialogTitle className="text-base">
-                    {t("settings.serverVersion.upgradeLogTitle")}
-                  </DialogTitle>
-                  <DialogDescription className="text-sm leading-6">
-                    {upgradeStatusMessage}
-                  </DialogDescription>
-                </div>
-                <div className="shrink-0 text-right">
-                  <div className="font-mono text-2xl font-semibold tabular-nums leading-none">
-                    {upgradeProgress}%
-                  </div>
-                  {latestStepLabel ? (
-                    <Badge variant="outline" className="mt-2 text-[10px]">
-                      {latestStepLabel}
-                    </Badge>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <div className="h-2 overflow-hidden rounded-full bg-muted">
+            <div className="border-b bg-muted/20 px-6 py-5 pr-14">
+              <DialogHeader className="space-y-4 text-left">
+                <div className="flex items-start gap-4">
                   <div
                     className={cn(
-                      "h-full rounded-full transition-all duration-500 ease-out",
-                      upgradeStatusVisual.bar,
-                      upgradeActive && upgradeProgress < 8
-                        ? "animate-pulse"
-                        : "",
+                      "flex h-11 w-11 shrink-0 items-center justify-center rounded-xl ring-1 ring-border/60",
+                      upgradeStatusVisual.ring,
                     )}
-                    style={{
-                      width: `${Math.max(upgradeProgress, upgradeActive ? 4 : 0)}%`,
-                    }}
-                  />
+                  >
+                    <UpgradeStatusIcon
+                      className={cn(
+                        "h-5 w-5",
+                        upgradeStatusVisual.spin && "animate-spin",
+                      )}
+                    />
+                  </div>
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <DialogTitle className="text-base">
+                      {t("settings.serverVersion.upgradeLogTitle")}
+                    </DialogTitle>
+                    <DialogDescription className="text-sm leading-6">
+                      {upgradeStatusMessage}
+                    </DialogDescription>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <div className="font-mono text-2xl font-semibold tabular-nums leading-none">
+                      {upgradeProgress}%
+                    </div>
+                    {latestStepLabel ? (
+                      <Badge variant="outline" className="mt-2 text-[10px]">
+                        {latestStepLabel}
+                      </Badge>
+                    ) : null}
+                  </div>
                 </div>
-              </div>
-            </DialogHeader>
-          </div>
 
-          <ScrollArea className="h-[min(24rem,52vh)]">
-            <div className="space-y-0.5 p-3">
-              {upgradeLogs.length > 0 ? (
-                upgradeLogs.map((entry, index) => (
-                  <UpgradeLogRow
-                    key={`${index}-${entry.at || entry.message || index}`}
-                    entry={entry}
-                  />
-                ))
-              ) : (
-                <div className="flex min-h-40 items-center justify-center px-4 text-sm text-muted-foreground">
-                  {upgradeActive ? (
-                    <span className="inline-flex items-center gap-2">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      {upgradeOutcome === "restarting"
-                        ? t("settings.serverVersion.upgradeRestarting")
-                        : t("settings.serverVersion.waitingLogs")}
-                    </span>
-                  ) : (
-                    t("settings.serverVersion.waitingLogs")
-                  )}
+                <div className="space-y-2">
+                  <div className="h-2 overflow-hidden rounded-full bg-muted">
+                    <div
+                      className={cn(
+                        "h-full rounded-full transition-all duration-500 ease-out",
+                        upgradeStatusVisual.bar,
+                        upgradeActive && upgradeProgress < 8
+                          ? "animate-pulse"
+                          : "",
+                      )}
+                      style={{
+                        width: `${Math.max(upgradeProgress, upgradeActive ? 4 : 0)}%`,
+                      }}
+                    />
+                  </div>
                 </div>
-              )}
-              <div ref={logEndRef} />
+              </DialogHeader>
             </div>
-          </ScrollArea>
 
-          <div className="flex justify-end border-t bg-muted/10 px-6 py-3">
-            <Button
-              type="button"
-              variant="outline"
-              disabled={busy === "upgrade"}
-              onClick={() => setUpgradeLogOpen(false)}
-            >
-              {t("common.close")}
-            </Button>
-          </div>
+            <ScrollArea className="h-[min(24rem,52vh)]">
+              <div className="space-y-0.5 p-3">
+                {upgradeLogs.length > 0 ? (
+                  upgradeLogs.map((entry, index) => (
+                    <UpgradeLogRow
+                      key={`${index}-${entry.at || entry.message || index}`}
+                      entry={entry}
+                    />
+                  ))
+                ) : (
+                  <div className="flex min-h-40 items-center justify-center px-4 text-sm text-muted-foreground">
+                    {upgradeActive ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        {upgradeOutcome === "restarting"
+                          ? t("settings.serverVersion.upgradeRestarting")
+                          : t("settings.serverVersion.waitingLogs")}
+                      </span>
+                    ) : (
+                      t("settings.serverVersion.waitingLogs")
+                    )}
+                  </div>
+                )}
+                <div ref={logEndRef} />
+              </div>
+            </ScrollArea>
+
+            <div className="flex justify-end border-t bg-muted/10 px-6 py-3">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={busy === "upgrade"}
+                onClick={() => setUpgradeLogOpen(false)}
+              >
+                {t("common.close")}
+              </Button>
+            </div>
           </div>
         </DialogContent>
       </Dialog>

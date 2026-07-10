@@ -82,6 +82,16 @@ sudo journalctl -u cc-switch-server -f
 3. 安装新 binary 并启动：`sudo install -m 0755 target/release/cc-switch-server /usr/local/bin/cc-switch-server && sudo systemctl start cc-switch-server`
 4. 如需回滚：`sudo cp /usr/local/bin/cc-switch-server.bak /usr/local/bin/cc-switch-server && sudo systemctl restart cc-switch-server`
 
+Web 管理端的一键升级使用同文件系统 staging 和持久 rollback：
+
+- staging：`/usr/local/bin/.cc-switch-server.new`
+- rollback：`/usr/local/bin/cc-switch-server.bak`
+- 任务状态：`<config-dir>/upgrade-state.json`
+
+下载 binary 后必须通过 release `.sha256` 校验和 `--help` sanity check。systemd 部署通过独立 transient helper 原子替换 binary，重启后检查 `/version` 的 commit；检查失败会恢复 rollback。standalone 模式只终止当前 PID，不使用进程名全局 kill。容器内默认禁用一键升级，必须发布并部署新 image。
+
+Client Tunnel 下所有非登录类 `/web-api/*` 都由 Router 先做 owner/admin 鉴权。SSE 使用带 `Authorization` 的 fetch stream，不允许把 access token 放入 query string。
+
 ## Docker
 
 示例：
