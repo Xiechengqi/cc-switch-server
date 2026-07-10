@@ -35,7 +35,6 @@ import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { settingsApi } from "@/lib/api";
-import { getWebRuntimeContext } from "@/lib/runtime";
 import {
   abortableDelay,
   consumeAuthenticatedSse,
@@ -44,6 +43,7 @@ import {
 import {
   loadAdminVersionInfo,
   loadBuildInfo,
+  loadRuntimeVersionInfo,
   loadUpgradeStatus,
   readAdminVersionInfoCache,
   restartServerService,
@@ -303,19 +303,27 @@ function buildVersionCardSubtitle(
   });
 }
 
-async function pollHealthAndReload(maxAttempts = 60) {
+async function pollReplacementAndReload(
+  previousProcessId: number,
+  maxAttempts = 60,
+): Promise<boolean> {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
     try {
-      const context = await getWebRuntimeContext(false);
-      if (context.mode === "local-admin") {
+      const runtime = await loadRuntimeVersionInfo();
+      if (
+        runtime.processId > 0 &&
+        previousProcessId > 0 &&
+        runtime.processId !== previousProcessId
+      ) {
         window.location.reload();
-        return;
+        return true;
       }
     } catch {
       // service may be restarting
     }
   }
+  return false;
 }
 
 export function ServerVersionSettings() {
@@ -501,7 +509,13 @@ export function ServerVersionSettings() {
           void refresh();
         } else {
           toast.success(t("settings.serverVersion.upgradeSucceeded"));
-          void pollHealthAndReload();
+          const previousProcessId = info?.processId ?? 0;
+          void pollReplacementAndReload(previousProcessId).then((replaced) => {
+            if (!replaced) {
+              toast.error(t("settings.serverVersion.restartNotObserved"));
+              void refresh();
+            }
+          });
         }
         return;
       }
@@ -512,7 +526,7 @@ export function ServerVersionSettings() {
       }
       void refresh();
     },
-    [closeUpgradeStream, refresh, t],
+    [closeUpgradeStream, info?.processId, refresh, t],
   );
 
   const markUpgradeRestarting = useCallback(() => {
@@ -659,29 +673,49 @@ export function ServerVersionSettings() {
 
   const handleRestart = useCallback(async () => {
     setRestartConfirmOpen(false);
+    const previousProcessId = info?.processId ?? 0;
+    if (previousProcessId <= 0) {
+      toast.error(t("settings.serverVersion.restartNotObserved"));
+      return;
+    }
     setBusy("restart");
     try {
       await restartServerService();
       toast.success(t("settings.serverVersion.restartScheduled"));
-      void pollHealthAndReload();
+      const replaced = await pollReplacementAndReload(previousProcessId);
+      if (!replaced) {
+        toast.error(t("settings.serverVersion.restartNotObserved"));
+        setBusy(null);
+        void refresh();
+      }
     } catch (reason) {
       toast.error(reason instanceof Error ? reason.message : String(reason));
       setBusy(null);
     }
-  }, [t]);
+  }, [info?.processId, refresh, t]);
 
   const handleRollback = useCallback(async () => {
     setRollbackConfirmOpen(false);
+    const previousProcessId = info?.processId ?? 0;
+    if (previousProcessId <= 0) {
+      toast.error(t("settings.serverVersion.restartNotObserved"));
+      return;
+    }
     setBusy("rollback");
     try {
       await rollbackServerService();
       toast.success(t("settings.serverVersion.rollbackScheduled"));
-      void pollHealthAndReload();
+      const replaced = await pollReplacementAndReload(previousProcessId);
+      if (!replaced) {
+        toast.error(t("settings.serverVersion.restartNotObserved"));
+        setBusy(null);
+        void refresh();
+      }
     } catch (reason) {
       toast.error(reason instanceof Error ? reason.message : String(reason));
       setBusy(null);
     }
-  }, [t]);
+  }, [info?.processId, refresh, t]);
 
   const restartPending = info?.restartPending ?? false;
   const rollbackAvailable = info?.rollbackAvailable ?? false;
@@ -931,7 +965,7 @@ export function ServerVersionSettings() {
                 variant={restartPending ? "default" : "outline"}
                 size="sm"
                 className="h-9"
-                disabled={busy !== null}
+                disabled={busy !== null || !info?.processId}
                 onClick={() => setRestartConfirmOpen(true)}
               >
                 {busy === "restart" ? (

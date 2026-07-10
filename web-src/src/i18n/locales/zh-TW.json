@@ -410,7 +410,8 @@
       "streamDisconnected": "升級日誌串流已斷開",
       "upgradePendingRestart": "升級完成，請點擊「待重啟」套用新版本",
       "upgradeFailed": "升級失敗，請查看升級日誌",
-      "restartScheduled": "已安排重啟，正在等待服務恢復…"
+      "restartScheduled": "已安排重啟，正在等待服務恢復…",
+      "restartNotObserved": "重啟失敗：服務仍由原程序 PID 提供，未完成程序替換。"
     },
     "advanced": {
       "configDir": {

@@ -738,6 +738,10 @@ export interface BuildInfo {
   dirty: boolean;
 }
 
+export interface RuntimeVersionInfo extends BuildInfo {
+  processId: number;
+}
+
 export interface AdminVersionInfo extends BuildInfo {
   binaryPath: string;
   rollbackPath: string;
@@ -850,6 +854,10 @@ export interface FetchModelsResult {
 
 export async function loadBuildInfo(): Promise<BuildInfo> {
   return invokeCommand<BuildInfo>("get_build_info");
+}
+
+export async function loadRuntimeVersionInfo(): Promise<RuntimeVersionInfo> {
+  return invokeCommand<RuntimeVersionInfo>("get_build_info");
 }
 
 export async function loadAdminVersionInfo(): Promise<AdminVersionInfo> {

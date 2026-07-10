@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::self_update::version::{
-    is_containerized, service_cc_switch_started, SelfUpdateError, BINARY_INSTALL_PATH,
-    BINARY_ROLLBACK_PATH, BINARY_STAGING_PATH, SERVICE_LOG_PATH, SERVICE_UNIT,
+    is_containerized, SelfUpdateError, BINARY_INSTALL_PATH, BINARY_ROLLBACK_PATH,
+    BINARY_STAGING_PATH, SERVICE_LOG_PATH, SERVICE_UNIT,
 };
 
 const HELPER_SPEC_FILENAME: &str = "upgrade-helper.json";
@@ -45,6 +45,8 @@ struct UpdateHelperSpec {
     task_id: Option<String>,
     mode: HelperMode,
     strategy: RestartStrategy,
+    #[serde(default)]
+    service_unit: Option<String>,
     parent_pid: u32,
     health_addr: SocketAddr,
     expected_commit: Option<String>,
@@ -57,11 +59,47 @@ struct UpdateHelperSpec {
 }
 
 pub fn detect_restart_strategy() -> RestartStrategy {
-    if service_cc_switch_started() {
+    if current_service_unit().is_some() {
         RestartStrategy::Service
     } else {
         RestartStrategy::Standalone
     }
+}
+
+fn current_service_unit() -> Option<String> {
+    std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|cgroup| service_unit_from_cgroup(&cgroup))
+        .or_else(|| {
+            service_main_pid(SERVICE_UNIT)
+                .is_some_and(|pid| pid == std::process::id())
+                .then(|| SERVICE_UNIT.to_string())
+        })
+}
+
+fn service_unit_from_cgroup(cgroup: &str) -> Option<String> {
+    cgroup
+        .lines()
+        .filter_map(|line| line.rsplit_once(':').map(|(_, path)| path))
+        .filter_map(|path| path.rsplit('/').find(|component| !component.is_empty()))
+        .find(|component| component.ends_with(".service"))
+        .map(str::to_string)
+}
+
+fn service_main_pid(unit: &str) -> Option<u32> {
+    let output = Command::new("systemctl")
+        .args(["show", "--property=MainPID", "--value", unit])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
 }
 
 pub fn schedule_upgrade_restart(
@@ -70,10 +108,16 @@ pub fn schedule_upgrade_restart(
     config_dir: &Path,
     health_addr: SocketAddr,
 ) -> Result<String, SelfUpdateError> {
+    let service_unit = current_service_unit();
     launch_helper(UpdateHelperSpec {
         task_id: Some(task_id.to_string()),
         mode: HelperMode::InstallStaged,
-        strategy: detect_restart_strategy(),
+        strategy: if service_unit.is_some() {
+            RestartStrategy::Service
+        } else {
+            RestartStrategy::Standalone
+        },
+        service_unit,
         parent_pid: std::process::id(),
         health_addr: loopback_health_addr(health_addr),
         expected_commit: Some(target_commit.to_string()),
@@ -96,6 +140,7 @@ pub fn restart_from_detected_service(
         ));
     }
     let pending = pending_upgrade(config_dir);
+    let service_unit = current_service_unit();
     launch_helper(UpdateHelperSpec {
         task_id: pending.as_ref().map(|value| value.0.clone()),
         mode: if pending.is_some() {
@@ -103,7 +148,12 @@ pub fn restart_from_detected_service(
         } else {
             HelperMode::RestartOnly
         },
-        strategy: detect_restart_strategy(),
+        strategy: if service_unit.is_some() {
+            RestartStrategy::Service
+        } else {
+            RestartStrategy::Standalone
+        },
+        service_unit,
         parent_pid: std::process::id(),
         health_addr: loopback_health_addr(health_addr),
         expected_commit: pending
@@ -138,10 +188,16 @@ pub fn rollback_from_backup_and_restart(
             "rollback backup not found at {BINARY_ROLLBACK_PATH}"
         )));
     }
+    let service_unit = current_service_unit();
     launch_helper(UpdateHelperSpec {
         task_id: None,
         mode: HelperMode::Rollback,
-        strategy: detect_restart_strategy(),
+        strategy: if service_unit.is_some() {
+            RestartStrategy::Service
+        } else {
+            RestartStrategy::Standalone
+        },
+        service_unit,
         parent_pid: std::process::id(),
         health_addr: loopback_health_addr(health_addr),
         expected_commit: None,
@@ -278,6 +334,7 @@ fn run_update_helper_inner_with_timeout(
         None => wait_for_expected_version(
             spec.health_addr,
             spec.expected_commit.as_deref(),
+            Some(spec.parent_pid),
             health_timeout,
         ),
     };
@@ -313,7 +370,7 @@ fn run_update_helper_inner_with_timeout(
             std::fs::copy(source, &spec.staging_path)?;
             install_staged_binary(&spec.staging_path, &spec.install_path)?;
             let _ = restart_process(spec)?;
-            wait_for_expected_version(spec.health_addr, None, health_timeout)
+            wait_for_expected_version(spec.health_addr, None, None, health_timeout)
                 .map_err(anyhow::Error::msg)
         })()
         .map(|_| "rollback passed health checks".to_string())
@@ -334,9 +391,11 @@ fn run_update_helper_inner_with_timeout(
 fn restart_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::process::Child>> {
     match spec.strategy {
         RestartStrategy::Service => {
-            let status = Command::new("systemctl")
-                .args(["restart", SERVICE_UNIT])
-                .status()?;
+            let unit = spec
+                .service_unit
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("systemd restart target is missing"))?;
+            let status = Command::new("systemctl").args(["restart", unit]).status()?;
             anyhow::ensure!(status.success(), "systemctl restart exited with {status}");
             Ok(None)
         }
@@ -392,12 +451,13 @@ fn install_staged_binary(staging: &Path, install: &Path) -> anyhow::Result<()> {
 fn wait_for_expected_version(
     addr: SocketAddr,
     expected_commit: Option<&str>,
+    replaced_pid: Option<u32>,
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let mut last_error = "version endpoint did not respond".to_string();
     while Instant::now() < deadline {
-        match probe_version(addr, expected_commit) {
+        match probe_version(addr, expected_commit, replaced_pid) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = error,
         }
@@ -409,7 +469,11 @@ fn wait_for_expected_version(
     ))
 }
 
-fn probe_version(addr: SocketAddr, expected_commit: Option<&str>) -> Result<(), String> {
+fn probe_version(
+    addr: SocketAddr,
+    expected_commit: Option<&str>,
+    replaced_pid: Option<u32>,
+) -> Result<(), String> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .map_err(|error| format!("connect {addr} failed: {error}"))?;
     stream
@@ -430,24 +494,35 @@ fn probe_version(addr: SocketAddr, expected_commit: Option<&str>) -> Result<(), 
     if !status_line.contains(" 200 ") {
         return Err(format!("version probe returned {status_line}"));
     }
-    let Some(expected) = expected_commit else {
-        return Ok(());
-    };
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|error| format!("parse version response failed: {error}"))?;
-    let actual = value
-        .get("commitId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if !commits_match(actual, expected) {
-        return Err(format!(
-            "version commit mismatch: expected {expected}, got {}",
-            if actual.is_empty() {
-                "missing commitId"
-            } else {
-                actual
-            }
-        ));
+    if let Some(replaced_pid) = replaced_pid {
+        let actual_pid = value
+            .get("processId")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .ok_or_else(|| "version response is missing processId".to_string())?;
+        if actual_pid == replaced_pid {
+            return Err(format!(
+                "version endpoint is still served by previous process {replaced_pid}"
+            ));
+        }
+    }
+    if let Some(expected) = expected_commit {
+        let actual = value
+            .get("commitId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !commits_match(actual, expected) {
+            return Err(format!(
+                "version commit mismatch: expected {expected}, got {}",
+                if actual.is_empty() {
+                    "missing commitId"
+                } else {
+                    actual
+                }
+            ));
+        }
     }
     Ok(())
 }
@@ -517,6 +592,24 @@ mod tests {
     }
 
     #[test]
+    fn service_unit_is_read_from_current_process_cgroup() {
+        assert_eq!(
+            service_unit_from_cgroup("0::/system.slice/cc-switch-server.service\n"),
+            Some("cc-switch-server.service".into())
+        );
+        assert_eq!(
+            service_unit_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            None
+        );
+        assert_eq!(
+            service_unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/session.slice/app.scope\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn staged_install_renames_on_same_filesystem() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -554,7 +647,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 512];
             let _ = stream.read(&mut request);
-            let body = r#"{"commitId":"c276bd37b4b6a31bd0d41e99c9b1feef388faf8f"}"#;
+            let body = r#"{"commitId":"c276bd37b4b6a31bd0d41e99c9b1feef388faf8f","processId":456}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -564,7 +657,7 @@ mod tests {
             .unwrap();
         });
 
-        probe_version(addr, Some("c276bd37b4b6")).unwrap();
+        probe_version(addr, Some("c276bd37b4b6"), Some(123)).unwrap();
         server.join().unwrap();
     }
 
@@ -586,9 +679,33 @@ mod tests {
             .unwrap();
         });
 
-        let error = probe_version(addr, Some("bbbbbbbbbbbb"))
+        let error = probe_version(addr, Some("bbbbbbbbbbbb"), None)
             .expect_err("mismatched replacement must fail its version probe");
         assert!(error.contains("expected bbbbbbbbbbbb, got aaaaaaaaaaaa"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn version_probe_rejects_previous_process_pid() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request);
+            let body = r#"{"commitId":"c276bd37b4b6","processId":123}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let error = probe_version(addr, Some("c276bd37b4b6"), Some(123))
+            .expect_err("the previous process must not satisfy restart health checks");
+        assert!(error.contains("still served by previous process 123"));
         server.join().unwrap();
     }
 
@@ -643,7 +760,7 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let mut request = [0u8; 512];
                         let _ = stream.read(&mut request);
-                        let body = r#"{"commitId":"aaaaaaaaaaaa"}"#;
+                        let body = r#"{"commitId":"aaaaaaaaaaaa","processId":42}"#;
                         write!(
                             stream,
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -663,6 +780,7 @@ mod tests {
             task_id: Some(task_id.into()),
             mode: HelperMode::InstallStaged,
             strategy: RestartStrategy::Standalone,
+            service_unit: None,
             parent_pid: u32::MAX,
             health_addr,
             expected_commit: Some("bbbbbbbbbbbb".into()),

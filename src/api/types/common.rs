@@ -12,7 +12,13 @@ pub(in crate::api) struct HealthResponse {
     pub(in crate::api) unix_ms: u128,
 }
 
-pub(in crate::api) type VersionResponse = BuildInfo;
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct VersionResponse {
+    #[serde(flatten)]
+    pub(in crate::api) build: BuildInfo,
+    pub(in crate::api) process_id: u32,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

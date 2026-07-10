@@ -548,7 +548,10 @@ async fn prometheus_metrics() -> impl IntoResponse {
 }
 
 async fn version() -> Json<VersionResponse> {
-    Json(build_info())
+    Json(VersionResponse {
+        build: build_info(),
+        process_id: std::process::id(),
+    })
 }
 
 async fn provider_coverage(State(state): State<ServerState>) -> Json<ProviderCoverage> {

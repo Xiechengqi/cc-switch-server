@@ -24,7 +24,8 @@ use crate::self_update::version::{
 
 const LOG_CHANNEL_CAPACITY: usize = 256;
 const TOTAL_STEPS: usize = 7;
-const DOWNLOAD_BUFFER_TICK_BYTES: u64 = 256 * 1024;
+const DOWNLOAD_PROGRESS_PERCENT_STEP: u8 = 20;
+const DOWNLOAD_PROGRESS_UNKNOWN_BYTES: u64 = 8 * 1024 * 1024;
 const SANITY_TIMEOUT: Duration = Duration::from_secs(5);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 const STATE_FILENAME: &str = "upgrade-state.json";
@@ -379,20 +380,35 @@ async fn run_upgrade(
         Some(progress_pct(2, 0)),
     )
     .await;
-    if let Err(error) = download_with_progress(&client, &binary_url, target, registry, handle).await
-    {
-        cleanup_tmp(target);
-        emit(
-            registry,
-            handle,
-            2,
-            UpgradeLogLevel::Error,
-            format!("download failed: {error}"),
-            None,
-        )
-        .await;
-        return Err(error);
-    }
+    let downloaded_bytes =
+        match download_with_progress(&client, &binary_url, target, registry, handle).await {
+            Ok(downloaded) => downloaded,
+            Err(error) => {
+                cleanup_tmp(target);
+                emit(
+                    registry,
+                    handle,
+                    2,
+                    UpgradeLogLevel::Error,
+                    format!("download failed: {error}"),
+                    None,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+    emit(
+        registry,
+        handle,
+        2,
+        UpgradeLogLevel::Success,
+        format!(
+            "download complete: {:.1} MiB",
+            downloaded_bytes as f64 / 1024.0 / 1024.0
+        ),
+        Some(progress_pct(2, 100)),
+    )
+    .await;
 
     let downloaded_checksum = match sha256_of_file(target) {
         Ok(checksum) => checksum,
@@ -596,7 +612,8 @@ async fn download_with_progress(
         .map_err(|err| SelfUpdateError::Internal(format!("open staged file failed: {err}")))?;
     let mut stream = response.bytes_stream();
     let mut downloaded = 0u64;
-    let mut next_tick = DOWNLOAD_BUFFER_TICK_BYTES;
+    let mut next_percent = DOWNLOAD_PROGRESS_PERCENT_STEP;
+    let mut next_unknown_bytes = DOWNLOAD_PROGRESS_UNKNOWN_BYTES;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
             .map_err(|err| SelfUpdateError::Internal(format!("download chunk failed: {err}")))?;
@@ -604,12 +621,12 @@ async fn download_with_progress(
             .await
             .map_err(|err| SelfUpdateError::Internal(format!("write staged file failed: {err}")))?;
         downloaded += chunk.len() as u64;
-        if downloaded >= next_tick {
-            next_tick = downloaded + DOWNLOAD_BUFFER_TICK_BYTES;
-            let within_step = total
-                .filter(|value| *value > 0)
-                .map(|value| ((downloaded as f64 / value as f64) * 100.0).clamp(0.0, 100.0) as u8)
-                .unwrap_or(0);
+        if let Some(within_step) = download_progress_milestone(
+            downloaded,
+            total,
+            &mut next_percent,
+            &mut next_unknown_bytes,
+        ) {
             let message = total.map_or_else(
                 || format!("downloaded {:.1} MiB", downloaded as f64 / 1024.0 / 1024.0),
                 |value| {
@@ -638,6 +655,32 @@ async fn download_with_progress(
         .await
         .map_err(|err| SelfUpdateError::Internal(format!("sync staged file failed: {err}")))?;
     Ok(downloaded)
+}
+
+fn download_progress_milestone(
+    downloaded: u64,
+    total: Option<u64>,
+    next_percent: &mut u8,
+    next_unknown_bytes: &mut u64,
+) -> Option<u8> {
+    if let Some(total) = total.filter(|value| *value > 0) {
+        let percent = ((downloaded.saturating_mul(100) / total).min(100)) as u8;
+        if percent >= 100 || *next_percent >= 100 || percent < *next_percent {
+            return None;
+        }
+        while *next_percent <= percent {
+            *next_percent = next_percent.saturating_add(DOWNLOAD_PROGRESS_PERCENT_STEP);
+        }
+        return Some(percent);
+    }
+
+    if downloaded < *next_unknown_bytes {
+        return None;
+    }
+    while *next_unknown_bytes <= downloaded {
+        *next_unknown_bytes = next_unknown_bytes.saturating_add(DOWNLOAD_PROGRESS_UNKNOWN_BYTES);
+    }
+    Some(0)
 }
 
 fn chmod_exec(path: &Path) -> Result<(), SelfUpdateError> {
@@ -885,6 +928,38 @@ mod tests {
             }
         }
         assert_eq!(last, 100);
+    }
+
+    #[test]
+    fn download_progress_is_reduced_to_coarse_milestones() {
+        let total = 28 * 1024 * 1024;
+        let mut next_percent = DOWNLOAD_PROGRESS_PERCENT_STEP;
+        let mut next_unknown_bytes = DOWNLOAD_PROGRESS_UNKNOWN_BYTES;
+        let milestones = (1..=112)
+            .filter_map(|chunk| {
+                download_progress_milestone(
+                    chunk * 256 * 1024,
+                    Some(total),
+                    &mut next_percent,
+                    &mut next_unknown_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(milestones, vec![20, 40, 60, 80]);
+
+        let mut next_percent = DOWNLOAD_PROGRESS_PERCENT_STEP;
+        let mut next_unknown_bytes = DOWNLOAD_PROGRESS_UNKNOWN_BYTES;
+        let unknown_milestones = (1..=28)
+            .filter_map(|mib| {
+                download_progress_milestone(
+                    mib * 1024 * 1024,
+                    None,
+                    &mut next_percent,
+                    &mut next_unknown_bytes,
+                )
+            })
+            .count();
+        assert_eq!(unknown_milestones, 3);
     }
 
     #[test]

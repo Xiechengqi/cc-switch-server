@@ -497,6 +497,7 @@
       "upgradePendingRestart": "Upgrade complete. Click \"Restart Pending\" to apply the new version.",
       "upgradeFailed": "Upgrade failed. Check the upgrade logs.",
       "restartScheduled": "Restart scheduled. Waiting for the service to come back…",
+      "restartNotObserved": "Restart failed: the server is still running with the previous process PID.",
       "checkUpdateAvailable": "Current version is {{current}}, latest version is {{latest}}. Click Upgrade to install ({{size}}).",
       "versionCardUpToDate": "Already on the latest version {{current}}",
       "versionCardUpdateAvailable": "Current version {{current}} -> latest version {{latest}}",

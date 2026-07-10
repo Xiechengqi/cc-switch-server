@@ -43,7 +43,11 @@ async fn web_invoke_dispatch(
     args: Value,
 ) -> Result<Value, ApiError> {
     match command {
-        "get_build_info" => Ok(json!(build_info())),
+        "get_build_info" => {
+            let mut response = json!(build_info());
+            response["processId"] = json!(std::process::id());
+            Ok(response)
+        }
         "get_admin_version_info" => Ok(json!(
             crate::api::self_update::build_admin_version_response(state).await
         )),

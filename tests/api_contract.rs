@@ -1859,6 +1859,20 @@ async fn web_invoke_registry_returns_stable_errors() {
         .clone()
         .oneshot(json_request(
             Method::POST,
+            "/web-api/invoke/get_build_info",
+            json!({}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["processId"].as_u64(), Some(std::process::id() as u64));
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
             "/web-api/invoke/apply_claude_plugin_config",
             json!({ "official": true }),
             Some(&token),
