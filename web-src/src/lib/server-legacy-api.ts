@@ -740,6 +740,7 @@ export interface BuildInfo {
 
 export interface RuntimeVersionInfo extends BuildInfo {
   processId: number;
+  processInstanceId: string;
 }
 
 export interface AdminVersionInfo extends BuildInfo {
@@ -747,6 +748,7 @@ export interface AdminVersionInfo extends BuildInfo {
   rollbackPath: string;
   rollbackAvailable: boolean;
   processId: number;
+  processInstanceId: string;
   uptimeSecs: number;
   restartPending: boolean;
   upgradeCapable: boolean;
@@ -786,7 +788,7 @@ export function readAdminVersionInfoCache(): AdminVersionInfo | null {
       return null;
     }
     const parsed = JSON.parse(raw) as AdminVersionInfoCacheEntry;
-    if (!parsed?.info?.commitId) {
+    if (!parsed?.info?.commitId || !parsed.info.processInstanceId) {
       return null;
     }
     return parsed.info;

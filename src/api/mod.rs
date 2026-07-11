@@ -547,10 +547,11 @@ async fn prometheus_metrics() -> impl IntoResponse {
     )
 }
 
-async fn version() -> Json<VersionResponse> {
+async fn version(State(state): State<ServerState>) -> Json<VersionResponse> {
     Json(VersionResponse {
         build: build_info(),
         process_id: std::process::id(),
+        process_instance_id: state.process_instance_id.clone(),
     })
 }
 

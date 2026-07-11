@@ -18,6 +18,7 @@ pub(in crate::api) struct VersionResponse {
     #[serde(flatten)]
     pub(in crate::api) build: BuildInfo,
     pub(in crate::api) process_id: u32,
+    pub(in crate::api) process_instance_id: String,
 }
 
 #[derive(Debug, Serialize)]

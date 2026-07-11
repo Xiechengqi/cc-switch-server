@@ -140,14 +140,21 @@ pub fn restart_from_detected_service(
         ));
     }
     let pending = pending_upgrade(config_dir);
+    if pending.is_none() {
+        if let Some(unit) = current_service_unit() {
+            return schedule_systemd_restart(&unit).or_else(|systemd_error| {
+                schedule_exec_restart().map(|command| {
+                    format!("{command}; systemd scheduling fallback: {systemd_error}")
+                })
+            });
+        }
+        return schedule_exec_restart();
+    }
+
     let service_unit = current_service_unit();
     launch_helper(UpdateHelperSpec {
         task_id: pending.as_ref().map(|value| value.0.clone()),
-        mode: if pending.is_some() {
-            HelperMode::InstallStaged
-        } else {
-            HelperMode::RestartOnly
-        },
+        mode: HelperMode::InstallStaged,
         strategy: if service_unit.is_some() {
             RestartStrategy::Service
         } else {
@@ -156,9 +163,7 @@ pub fn restart_from_detected_service(
         service_unit,
         parent_pid: std::process::id(),
         health_addr: loopback_health_addr(health_addr),
-        expected_commit: pending
-            .map(|value| value.1)
-            .or_else(|| Some(crate::build_info::build_info().commit_id.to_string())),
+        expected_commit: pending.map(|value| value.1),
         config_dir: config_dir.to_path_buf(),
         server_args: std::env::args().skip(1).collect(),
         install_path: BINARY_INSTALL_PATH.into(),
@@ -166,6 +171,66 @@ pub fn restart_from_detected_service(
         rollback_path: BINARY_ROLLBACK_PATH.into(),
         log_path: SERVICE_LOG_PATH.into(),
     })
+}
+
+fn schedule_systemd_restart(unit: &str) -> Result<String, SelfUpdateError> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let transient_unit = format!("cc-switch-server-restart-{}-{nonce}", std::process::id());
+    let status = systemd_restart_command(unit, &transient_unit)
+        .status()
+        .map_err(|error| {
+            SelfUpdateError::Internal(format!("schedule systemd restart failed: {error}"))
+        })?;
+    if !status.success() {
+        return Err(SelfUpdateError::Internal(format!(
+            "systemd-run restart scheduling exited with {status}"
+        )));
+    }
+    Ok(format!(
+        "systemd-run --unit {transient_unit} --on-active=1s systemctl restart --no-block {unit}"
+    ))
+}
+
+fn systemd_restart_command(unit: &str, transient_unit: &str) -> Command {
+    let mut command = Command::new("systemd-run");
+    command
+        .arg("--quiet")
+        .arg("--collect")
+        .arg("--unit")
+        .arg(transient_unit)
+        .arg("--on-active=1s")
+        .arg("systemctl")
+        .arg("restart")
+        .arg("--no-block")
+        .arg(unit);
+    command
+}
+
+fn schedule_exec_restart() -> Result<String, SelfUpdateError> {
+    let current_exe = std::env::current_exe().map_err(|error| {
+        SelfUpdateError::Internal(format!("resolve current executable failed: {error}"))
+    })?;
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let command_label = format!("{} [current arguments] (exec)", current_exe.display());
+    std::thread::Builder::new()
+        .name("cc-switch-server-restart".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(750));
+            use std::os::unix::process::CommandExt;
+            let error = Command::new(&current_exe).args(&args).exec();
+            tracing::error!(
+                executable = %current_exe.display(),
+                error = %error,
+                "exec restart failed"
+            );
+        })
+        .map_err(|error| {
+            SelfUpdateError::Internal(format!("schedule exec restart failed: {error}"))
+        })?;
+    Ok(command_label)
 }
 
 fn pending_upgrade(config_dir: &Path) -> Option<(String, String)> {
@@ -606,6 +671,30 @@ mod tests {
                 "0::/user.slice/user-1000.slice/user@1000.service/session.slice/app.scope\n"
             ),
             None
+        );
+    }
+
+    #[test]
+    fn systemd_restart_is_delayed_and_non_blocking() {
+        let command =
+            systemd_restart_command("cc-switch-server.service", "cc-switch-server-restart-test");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--quiet",
+                "--collect",
+                "--unit",
+                "cc-switch-server-restart-test",
+                "--on-active=1s",
+                "systemctl",
+                "restart",
+                "--no-block",
+                "cc-switch-server.service",
+            ]
         );
     }
 

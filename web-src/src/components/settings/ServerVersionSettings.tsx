@@ -304,7 +304,7 @@ function buildVersionCardSubtitle(
 }
 
 async function pollReplacementAndReload(
-  previousProcessId: number,
+  previous: { processId: number; processInstanceId: string },
   maxAttempts = 60,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -312,9 +312,11 @@ async function pollReplacementAndReload(
     try {
       const runtime = await loadRuntimeVersionInfo();
       if (
-        runtime.processId > 0 &&
-        previousProcessId > 0 &&
-        runtime.processId !== previousProcessId
+        (runtime.processInstanceId &&
+          runtime.processInstanceId !== previous.processInstanceId) ||
+        (runtime.processId > 0 &&
+          previous.processId > 0 &&
+          runtime.processId !== previous.processId)
       ) {
         window.location.reload();
         return true;
@@ -376,6 +378,7 @@ export function ServerVersionSettings() {
           rollbackPath: "",
           rollbackAvailable: false,
           processId: 0,
+          processInstanceId: "",
           uptimeSecs: 0,
           restartPending: false,
           upgradeCapable: false,
@@ -509,8 +512,11 @@ export function ServerVersionSettings() {
           void refresh();
         } else {
           toast.success(t("settings.serverVersion.upgradeSucceeded"));
-          const previousProcessId = info?.processId ?? 0;
-          void pollReplacementAndReload(previousProcessId).then((replaced) => {
+          const previous = {
+            processId: info?.processId ?? 0,
+            processInstanceId: info?.processInstanceId ?? "",
+          };
+          void pollReplacementAndReload(previous).then((replaced) => {
             if (!replaced) {
               toast.error(t("settings.serverVersion.restartNotObserved"));
               void refresh();
@@ -526,7 +532,13 @@ export function ServerVersionSettings() {
       }
       void refresh();
     },
-    [closeUpgradeStream, info?.processId, refresh, t],
+    [
+      closeUpgradeStream,
+      info?.processId,
+      info?.processInstanceId,
+      refresh,
+      t,
+    ],
   );
 
   const markUpgradeRestarting = useCallback(() => {
@@ -673,16 +685,19 @@ export function ServerVersionSettings() {
 
   const handleRestart = useCallback(async () => {
     setRestartConfirmOpen(false);
-    const previousProcessId = info?.processId ?? 0;
-    if (previousProcessId <= 0) {
-      toast.error(t("settings.serverVersion.restartNotObserved"));
-      return;
-    }
     setBusy("restart");
     try {
+      const runtime = await loadRuntimeVersionInfo();
+      const previous = {
+        processId: runtime.processId,
+        processInstanceId: runtime.processInstanceId,
+      };
+      if (!previous.processInstanceId) {
+        throw new Error(t("settings.serverVersion.restartNotObserved"));
+      }
       await restartServerService();
       toast.success(t("settings.serverVersion.restartScheduled"));
-      const replaced = await pollReplacementAndReload(previousProcessId);
+      const replaced = await pollReplacementAndReload(previous);
       if (!replaced) {
         toast.error(t("settings.serverVersion.restartNotObserved"));
         setBusy(null);
@@ -692,20 +707,23 @@ export function ServerVersionSettings() {
       toast.error(reason instanceof Error ? reason.message : String(reason));
       setBusy(null);
     }
-  }, [info?.processId, refresh, t]);
+  }, [refresh, t]);
 
   const handleRollback = useCallback(async () => {
     setRollbackConfirmOpen(false);
-    const previousProcessId = info?.processId ?? 0;
-    if (previousProcessId <= 0) {
-      toast.error(t("settings.serverVersion.restartNotObserved"));
-      return;
-    }
     setBusy("rollback");
     try {
+      const runtime = await loadRuntimeVersionInfo();
+      const previous = {
+        processId: runtime.processId,
+        processInstanceId: runtime.processInstanceId,
+      };
+      if (!previous.processInstanceId) {
+        throw new Error(t("settings.serverVersion.restartNotObserved"));
+      }
       await rollbackServerService();
       toast.success(t("settings.serverVersion.rollbackScheduled"));
-      const replaced = await pollReplacementAndReload(previousProcessId);
+      const replaced = await pollReplacementAndReload(previous);
       if (!replaced) {
         toast.error(t("settings.serverVersion.restartNotObserved"));
         setBusy(null);
@@ -715,7 +733,7 @@ export function ServerVersionSettings() {
       toast.error(reason instanceof Error ? reason.message : String(reason));
       setBusy(null);
     }
-  }, [info?.processId, refresh, t]);
+  }, [refresh, t]);
 
   const restartPending = info?.restartPending ?? false;
   const rollbackAvailable = info?.rollbackAvailable ?? false;
@@ -965,7 +983,7 @@ export function ServerVersionSettings() {
                 variant={restartPending ? "default" : "outline"}
                 size="sm"
                 className="h-9"
-                disabled={busy !== null || !info?.processId}
+                disabled={busy !== null || loading || !info?.processInstanceId}
                 onClick={() => setRestartConfirmOpen(true)}
               >
                 {busy === "restart" ? (

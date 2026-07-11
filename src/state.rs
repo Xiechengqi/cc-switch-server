@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use futures_util::StreamExt;
+use rand::RngCore;
 use serde_json::Value;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration};
@@ -78,6 +79,7 @@ pub struct ServerStateInner {
     pub web_auth: crate::domain::web_auth::WebAuthStore,
     pub debounced_saves: Arc<DebouncedStoreSaves>,
     pub started_at: std::time::Instant,
+    pub process_instance_id: String,
     pub upgrade: crate::self_update::upgrade::SharedUpgradeRegistry,
     pub(crate) log_capture: SharedLogCapture,
 }
@@ -648,6 +650,7 @@ impl ServerStateInner {
             web_auth,
             debounced_saves: Arc::new(DebouncedStoreSaves::default()),
             started_at: std::time::Instant::now(),
+            process_instance_id: new_process_instance_id(),
             upgrade,
             log_capture,
         }))
@@ -1487,6 +1490,12 @@ impl ServerStateInner {
         let mut oauth_logins = self.oauth_logins.write().await;
         mutate(&mut oauth_logins)
     }
+}
+
+fn new_process_instance_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 pub fn build_provider_http_client(

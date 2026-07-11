@@ -90,6 +90,8 @@ Web 管理端的一键升级使用同文件系统 staging 和持久 rollback：
 
 release binary 和 checksum 下载请求使用目标 commit 作为 cache key。下载后必须通过 release `.sha256`、`--help` 和 staged binary `version --json` commit 校验，全部成功后才允许停止当前服务，避免 mutable `latest` CDN 返回上一版资产。systemd 部署通过独立 transient helper 原子替换 binary，重启后检查 `/version` 的 commit；检查失败会恢复 rollback。standalone 模式只终止当前 PID，不使用进程名全局 kill。容器内默认禁用一键升级，必须发布并部署新 image。
 
+普通重启与升级替换分开执行：systemd 部署通过延迟 transient unit 调用 `systemctl restart --no-block`，standalone 部署延迟 `exec` 当前 binary 并保留原启动参数。standalone `exec` 会重建应用运行时并重置 uptime，但 Linux PID 可以保持不变；管理页以 `processInstanceId` 判断重启完成。
+
 replacement helper 会把最后一次本机 `/version` probe 的连接、HTTP、JSON 或 commit mismatch 原因和 rollback 结果写入任务日志。Client Tunnel 在进程替换期间可能短暂返回 Router 404/503；Web 会持续按原 task ID 恢复 status，只有 replacement commit 通过校验才 reload，回滚则显示 failed 和 helper 诊断。
 
 Client Tunnel 下所有非登录类 `/web-api/*` 都由 Router 先做 owner/admin 鉴权。SSE 使用带 `Authorization` 的 fetch stream，不允许把 access token 放入 query string。

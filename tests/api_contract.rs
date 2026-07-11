@@ -1868,6 +1868,7 @@ async fn web_invoke_registry_returns_stable_errors() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     assert_eq!(body["processId"].as_u64(), Some(std::process::id() as u64));
+    assert_eq!(body["processInstanceId"].as_str().map(str::len), Some(32));
 
     let response = app
         .clone()

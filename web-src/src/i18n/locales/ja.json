@@ -404,7 +404,7 @@
       "upgradePendingRestart": "アップグレード完了。「再起動待ち」をクリックして新バージョンを適用してください。",
       "upgradeFailed": "アップグレードに失敗しました。ログを確認してください。",
       "restartScheduled": "再起動をスケジュールしました。サービスの復旧を待機中…",
-      "restartNotObserved": "再起動に失敗しました。サーバーは以前のプロセス PID で動作しています。"
+      "restartNotObserved": "再起動に失敗しました。サーバーは以前のプロセスインスタンスで動作しています。"
     },
     "advanced": {
       "configDir": {

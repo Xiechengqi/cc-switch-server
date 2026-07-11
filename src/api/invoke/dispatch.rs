@@ -46,6 +46,7 @@ async fn web_invoke_dispatch(
         "get_build_info" => {
             let mut response = json!(build_info());
             response["processId"] = json!(std::process::id());
+            response["processInstanceId"] = json!(state.process_instance_id.clone());
             Ok(response)
         }
         "get_admin_version_info" => Ok(json!(
