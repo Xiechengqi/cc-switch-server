@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::self_update::version::{
     is_containerized, SelfUpdateError, BINARY_INSTALL_PATH, BINARY_ROLLBACK_PATH,
-    BINARY_STAGING_PATH, SERVICE_LOG_PATH, SERVICE_UNIT,
+    BINARY_STAGING_PATH, SERVICE_UNIT,
 };
 
 const HELPER_SPEC_FILENAME: &str = "upgrade-helper.json";
@@ -126,7 +126,7 @@ pub fn schedule_upgrade_restart(
         install_path: BINARY_INSTALL_PATH.into(),
         staging_path: BINARY_STAGING_PATH.into(),
         rollback_path: BINARY_ROLLBACK_PATH.into(),
-        log_path: SERVICE_LOG_PATH.into(),
+        log_path: config_dir.join("server.log"),
     })
 }
 
@@ -148,7 +148,7 @@ pub fn restart_from_detected_service(
                 })
             });
         }
-        return schedule_exec_restart();
+        return schedule_standalone_restart(config_dir, health_addr);
     }
 
     let service_unit = current_service_unit();
@@ -169,7 +169,31 @@ pub fn restart_from_detected_service(
         install_path: BINARY_INSTALL_PATH.into(),
         staging_path: BINARY_STAGING_PATH.into(),
         rollback_path: BINARY_ROLLBACK_PATH.into(),
-        log_path: SERVICE_LOG_PATH.into(),
+        log_path: config_dir.join("server.log"),
+    })
+}
+
+fn schedule_standalone_restart(
+    config_dir: &Path,
+    health_addr: SocketAddr,
+) -> Result<String, SelfUpdateError> {
+    let current_exe = std::env::current_exe().map_err(|error| {
+        SelfUpdateError::Internal(format!("resolve current executable failed: {error}"))
+    })?;
+    launch_helper(UpdateHelperSpec {
+        task_id: None,
+        mode: HelperMode::RestartOnly,
+        strategy: RestartStrategy::Standalone,
+        service_unit: None,
+        parent_pid: std::process::id(),
+        health_addr: loopback_health_addr(health_addr),
+        expected_commit: Some(crate::build_info::build_info().commit_id.to_string()),
+        config_dir: config_dir.to_path_buf(),
+        server_args: std::env::args().skip(1).collect(),
+        install_path: current_exe,
+        staging_path: BINARY_STAGING_PATH.into(),
+        rollback_path: BINARY_ROLLBACK_PATH.into(),
+        log_path: config_dir.join("server.log"),
     })
 }
 
@@ -234,13 +258,22 @@ fn schedule_exec_restart() -> Result<String, SelfUpdateError> {
 }
 
 fn pending_upgrade(config_dir: &Path) -> Option<(String, String)> {
-    if !Path::new(BINARY_STAGING_PATH).is_file() {
+    pending_upgrade_at(config_dir, Path::new(BINARY_STAGING_PATH))
+}
+
+fn pending_upgrade_at(config_dir: &Path, staging_path: &Path) -> Option<(String, String)> {
+    if !staging_path.is_file() {
         return None;
     }
-    let value: serde_json::Value =
+    let snapshot: crate::self_update::upgrade::UpgradeStatusSnapshot =
         serde_json::from_slice(&std::fs::read(config_dir.join("upgrade-state.json")).ok()?).ok()?;
-    let task_id = value.get("taskId")?.as_str()?.to_string();
-    let target_commit = value.get("targetCommitId")?.as_str()?.to_string();
+    if snapshot.status != crate::self_update::upgrade::UpgradeStatus::Success
+        || !snapshot.restart_pending
+    {
+        return None;
+    }
+    let task_id = snapshot.task_id;
+    let target_commit = snapshot.target_commit_id?;
     (!task_id.is_empty() && !target_commit.is_empty()).then_some((task_id, target_commit))
 }
 
@@ -271,7 +304,7 @@ pub fn rollback_from_backup_and_restart(
         install_path: BINARY_INSTALL_PATH.into(),
         staging_path: BINARY_STAGING_PATH.into(),
         rollback_path: BINARY_ROLLBACK_PATH.into(),
-        log_path: SERVICE_LOG_PATH.into(),
+        log_path: config_dir.join("server.log"),
     })
 }
 
@@ -466,7 +499,7 @@ fn restart_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::proces
         }
         RestartStrategy::Standalone => {
             let parent_proc = PathBuf::from(format!("/proc/{}", spec.parent_pid));
-            if parent_proc.exists() {
+            if process_is_active(&parent_proc) {
                 let status = Command::new("kill")
                     .args(["-TERM", &spec.parent_pid.to_string()])
                     .status()?;
@@ -476,11 +509,11 @@ fn restart_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::proces
                 );
             }
             let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline && parent_proc.exists() {
+            while Instant::now() < deadline && process_is_active(&parent_proc) {
                 std::thread::sleep(Duration::from_millis(200));
             }
             anyhow::ensure!(
-                !parent_proc.exists(),
+                !process_is_active(&parent_proc),
                 "current server process did not exit after SIGTERM"
             );
             let log = OpenOptions::new()
@@ -497,6 +530,20 @@ fn restart_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::proces
             Ok(Some(child))
         }
     }
+}
+
+fn process_is_active(proc_dir: &Path) -> bool {
+    match std::fs::read_to_string(proc_dir.join("stat")) {
+        Ok(stat) => process_stat_is_active(&stat),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => proc_dir.exists(),
+    }
+}
+
+fn process_stat_is_active(stat: &str) -> bool {
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.chars().next())
+        .is_some_and(|state| !matches!(state, 'Z' | 'X' | 'x'))
 }
 
 fn install_staged_binary(staging: &Path, install: &Path) -> anyhow::Result<()> {
@@ -696,6 +743,53 @@ mod tests {
                 "cc-switch-server.service",
             ]
         );
+    }
+
+    #[test]
+    fn process_state_treats_zombies_as_stopped() {
+        assert!(process_stat_is_active("123 (cc-switch-server) S 1 2 3"));
+        assert!(!process_stat_is_active("123 (cc-switch-server) Z 1 2 3"));
+        assert!(!process_stat_is_active("123 (cc-switch-server) X 1 2 3"));
+    }
+
+    #[test]
+    fn pending_upgrade_requires_success_and_restart_pending() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-pending-upgrade-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let staging = dir.join("cc-switch-server.new");
+        std::fs::write(&staging, b"staged").unwrap();
+        let mut snapshot = crate::self_update::upgrade::UpgradeStatusSnapshot {
+            task_id: "pending-task".into(),
+            status: crate::self_update::upgrade::UpgradeStatus::Failed,
+            restart_pending: true,
+            logs: Vec::new(),
+            target_commit_id: Some("abcdef012345".into()),
+            restart_after: false,
+            updated_at: String::new(),
+        };
+        let state_path = dir.join("upgrade-state.json");
+        std::fs::write(&state_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(pending_upgrade_at(&dir, &staging), None);
+
+        snapshot.status = crate::self_update::upgrade::UpgradeStatus::Success;
+        snapshot.restart_pending = false;
+        std::fs::write(&state_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(pending_upgrade_at(&dir, &staging), None);
+
+        snapshot.restart_pending = true;
+        std::fs::write(&state_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(
+            pending_upgrade_at(&dir, &staging),
+            Some(("pending-task".into(), "abcdef012345".into()))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
