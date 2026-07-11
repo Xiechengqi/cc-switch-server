@@ -1996,7 +1996,7 @@ async fn web_invoke_get_providers_returns_desktop_record_shape() {
 }
 
 #[tokio::test]
-async fn admin_logs_tail_honors_api_enabled_gate() {
+async fn admin_logs_tail_honors_api_management_gate() {
     let state = test_state();
     let app = app_router(state);
     let token = setup_and_login(&app).await;
@@ -2017,13 +2017,14 @@ async fn admin_logs_tail_honors_api_enabled_gate() {
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/web-api/invoke/set_log_config",
+            "/web-api/invoke/set_api_management",
             json!({
                 "config": {
-                    "enabled": true,
-                    "level": "info",
-                    "apiEnabled": true,
-                    "apiTailLines": 25
+                    "diagnosticsEnabled": true,
+                    "logEnabled": true,
+                    "restartEnabled": false,
+                    "upgradeEnabled": false,
+                    "logTailLines": 25
                 }
             }),
             Some(&token),
@@ -2049,6 +2050,100 @@ async fn admin_logs_tail_honors_api_enabled_gate() {
     assert!(body["content"].is_string());
     assert!(body["path"].is_string());
     assert!(body["source"].is_string());
+}
+
+#[tokio::test]
+async fn debug_api_uses_scoped_expiring_token_without_admin_session() {
+    let state = test_state();
+    let app = app_router(state);
+    let admin_token = setup_and_login(&app).await;
+
+    let configured = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/set_api_management",
+            json!({
+                "config": {
+                    "diagnosticsEnabled": true,
+                    "logEnabled": true,
+                    "restartEnabled": false,
+                    "upgradeEnabled": false,
+                    "logTailLines": 10
+                }
+            }),
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(configured.status(), StatusCode::OK);
+
+    let generated = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/generate_debug_token",
+            json!({ "ttlHours": 1 }),
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(generated.status(), StatusCode::OK);
+    let debug_token = json_body(generated).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let anonymous = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/web-api/debug/runtime",
+            json!(null),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let runtime = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/web-api/debug/runtime",
+            json!(null),
+            Some(&debug_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(runtime.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(runtime).await["processId"].as_u64(),
+        Some(std::process::id() as u64)
+    );
+
+    let revoked = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/revoke_debug_token",
+            json!({}),
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+
+    let after_revoke = app
+        .oneshot(json_request(
+            Method::GET,
+            "/web-api/debug/runtime",
+            json!(null),
+            Some(&debug_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after_revoke.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

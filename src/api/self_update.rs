@@ -110,14 +110,15 @@ pub(in crate::api) async fn admin_restart(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_session(&state, &headers).await?;
-    let script = map_self_update_error(restart_from_detected_service(
+    let schedule = map_self_update_error(restart_from_detected_service(
         &state.config_dir,
         state.bind_addr,
     ))?;
     state.upgrade.clear_restart_pending().await;
     Ok(Json(serde_json::json!({
         "ok": true,
-        "script": script,
+        "script": schedule.command,
+        "operationId": schedule.operation_id,
     })))
 }
 
@@ -144,6 +145,18 @@ pub(in crate::api) async fn admin_upgrade_start(
     Json(input): Json<StartUpgradeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_session(&state, &headers).await?;
+    let task_id = start_upgrade_for_actor(&state, input.restart_after, "web-admin").await?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "taskId": task_id,
+    })))
+}
+
+pub(crate) async fn start_upgrade_for_actor(
+    state: &ServerState,
+    restart_after: bool,
+    actor: &str,
+) -> Result<String, ApiError> {
     map_self_update_error(ensure_binary_writable())?;
     let client = reqwest::Client::builder()
         .user_agent("cc-switch-server/0.1 upgrade")
@@ -154,16 +167,13 @@ pub(in crate::api) async fn admin_upgrade_start(
             .upgrade
             .start(
                 client,
-                Some("web-admin".to_string()),
-                input.restart_after,
+                Some(actor.to_string()),
+                restart_after,
                 state.bind_addr,
             )
             .await,
     )?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "taskId": handle.task_id,
-    })))
+    Ok(handle.task_id)
 }
 
 pub(in crate::api) async fn admin_upgrade_stream(

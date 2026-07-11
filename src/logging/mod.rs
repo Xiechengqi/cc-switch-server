@@ -72,6 +72,54 @@ pub fn parsed_log_config_from_store(
     ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(store))
 }
 
+pub fn redact_sensitive_text(input: &str) -> String {
+    const KEYS: &[&str] = &[
+        "authorization",
+        "bearer",
+        "api_key",
+        "apikey",
+        "api-key",
+        "token",
+        "access_token",
+        "refresh_token",
+        "cookie",
+        "password",
+        "secret",
+    ];
+    input
+        .lines()
+        .map(|line| redact_sensitive_line(line, KEYS))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redact_sensitive_line(line: &str, keys: &[&str]) -> String {
+    let lower = line.to_ascii_lowercase();
+    if let Some(start) = lower.find("bearer ") {
+        return format!("{}Bearer [REDACTED]", &line[..start]);
+    }
+    for key in keys.iter().filter(|key| **key != "bearer") {
+        let Some(start) = lower.find(key) else {
+            continue;
+        };
+        let after_key = start + key.len();
+        let suffix = &line[after_key..];
+        // Only treat a key name as a secret field when its assignment marker
+        // immediately follows it. Ordinary product terms such as "token
+        // router" remain useful in diagnostics.
+        let Some(relative_separator) = suffix
+            .char_indices()
+            .find(|(index, ch)| *index <= 3 && matches!(ch, ':' | '='))
+            .map(|(index, _)| index)
+        else {
+            continue;
+        };
+        let end = after_key + relative_separator + 1;
+        return format!("{} [REDACTED]", line[..end].trim_end());
+    }
+    line.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +139,20 @@ mod tests {
         let (merged, source) = merge_tail_lines(buffer, file, 3);
         assert_eq!(merged, vec!["f1", "b1", "b2"]);
         assert_eq!(source, LogTailSource::BufferAndFile);
+    }
+
+    #[test]
+    fn redacts_common_secret_fields() {
+        let redacted = redact_sensitive_text("authorization: Bearer abc\nnormal line\napi_key=xyz");
+        assert_eq!(
+            redacted,
+            "authorization: Bearer [REDACTED]\nnormal line\napi_key= [REDACTED]"
+        );
+        assert!(!redacted.contains("abc"));
+        assert!(!redacted.contains("xyz"));
+        assert_eq!(
+            redact_sensitive_text("token router connected"),
+            "token router connected"
+        );
     }
 }

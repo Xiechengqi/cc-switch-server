@@ -32,6 +32,10 @@ pub struct AuthConfig {
     pub password_hash: Option<String>,
     #[serde(default)]
     pub api_token_hash: Option<String>,
+    #[serde(default)]
+    pub debug_token_hash: Option<String>,
+    #[serde(default)]
+    pub debug_token_expires_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -315,6 +319,35 @@ impl ServerConfig {
         verify_secret(hash, api_token)
     }
 
+    pub fn verify_debug_token(&self, token: &str, now_ms: i64) -> bool {
+        let Some(hash) = self.auth.debug_token_hash.as_deref() else {
+            return false;
+        };
+        let Some(expires_at) = self.auth.debug_token_expires_at_ms else {
+            return false;
+        };
+        if expires_at <= now_ms {
+            return false;
+        }
+        let expected = hash.strip_prefix("keccak256:").unwrap_or_default();
+        let actual = hex::encode(Keccak256::digest(token.as_bytes()));
+        constant_time_eq(expected.as_bytes(), actual.as_bytes())
+    }
+
+    pub fn set_debug_token(&mut self, token: &str, expires_at_ms: i64) -> anyhow::Result<()> {
+        self.auth.debug_token_hash = Some(format!(
+            "keccak256:{}",
+            hex::encode(Keccak256::digest(token.as_bytes()))
+        ));
+        self.auth.debug_token_expires_at_ms = Some(expires_at_ms);
+        Ok(())
+    }
+
+    pub fn revoke_debug_token(&mut self) {
+        self.auth.debug_token_hash = None;
+        self.auth.debug_token_expires_at_ms = None;
+    }
+
     pub fn set_api_token(&mut self, api_token: &str) -> anyhow::Result<()> {
         self.auth.api_token_hash = Some(hash_secret(api_token, 16)?);
         Ok(())
@@ -348,6 +381,8 @@ impl ServerConfig {
             auth: AuthConfig {
                 password_hash: Some(hash_secret(&input.password, 8)?),
                 api_token_hash: None,
+                debug_token_hash: None,
+                debug_token_expires_at_ms: None,
             },
             owner: OwnerConfig {
                 email: Some(owner_email),
@@ -465,6 +500,16 @@ impl ServerConfig {
         self.owner.payout_profile_sync.last_error = None;
         Ok(self.owner.payout_profile.clone())
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -829,5 +874,16 @@ mod tests {
             mask_proxy_url("socks5h://127.0.0.1:1080"),
             "socks5h://127.0.0.1:1080"
         );
+    }
+
+    #[test]
+    fn debug_token_expires_and_can_be_revoked() {
+        let mut config = ServerConfig::empty();
+        config.set_debug_token("temporary-secret", 2_000).unwrap();
+        assert!(config.verify_debug_token("temporary-secret", 1_999));
+        assert!(!config.verify_debug_token("wrong-secret", 1_999));
+        assert!(!config.verify_debug_token("temporary-secret", 2_000));
+        config.revoke_debug_token();
+        assert!(!config.verify_debug_token("temporary-secret", 1_000));
     }
 }

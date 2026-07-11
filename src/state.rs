@@ -675,11 +675,14 @@ impl ServerStateInner {
     ) -> Result<LogTailResponse, LogTailAccessError> {
         let store = self.ui_settings.read().await;
         let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
+        let api_config = ui_settings::parse_api_management_config(
+            &ui_settings::api_management_config_for_frontend(&store),
+        );
         drop(store);
-        if !config.enabled || !config.api_enabled {
+        if !config.enabled || !api_config.log_enabled {
             return Err(LogTailAccessError::Disabled);
         }
-        let lines = crate::logging::clamp_tail_lines(requested_lines, config.api_tail_lines);
+        let lines = crate::logging::clamp_tail_lines(requested_lines, api_config.log_tail_lines);
         Ok(self.log_capture.read_tail(&config, &self.config_dir, lines))
     }
 
@@ -693,6 +696,18 @@ impl ServerStateInner {
 
     pub async fn config_snapshot(&self) -> ServerConfig {
         self.config.read().await.clone()
+    }
+
+    pub async fn set_debug_token(&self, token: &str, expires_at_ms: i64) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        config.set_debug_token(token, expires_at_ms)?;
+        config.save(&self.config_dir)
+    }
+
+    pub async fn revoke_debug_token(&self) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        config.revoke_debug_token();
+        config.save(&self.config_dir)
     }
 
     pub async fn update_owner_payout_profile(

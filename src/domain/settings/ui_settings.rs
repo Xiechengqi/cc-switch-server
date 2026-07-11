@@ -150,6 +150,7 @@ pub fn default_ui_settings() -> Value {
         "rectifierConfig": default_rectifier_config(),
         "optimizerConfig": default_optimizer_config(),
         "logConfig": default_log_config(),
+        "apiManagement": default_api_management_config(),
         "streamCheckConfig": default_stream_check_config(),
     })
 }
@@ -203,6 +204,76 @@ pub fn default_log_config() -> Value {
         "apiEnabled": false,
         "apiTailLines": LOG_API_DEFAULT_TAIL_LINES,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedApiManagementConfig {
+    pub log_enabled: bool,
+    pub restart_enabled: bool,
+    pub upgrade_enabled: bool,
+    pub diagnostics_enabled: bool,
+    pub log_tail_lines: usize,
+}
+
+pub fn default_api_management_config() -> Value {
+    json!({
+        "logEnabled": false,
+        "restartEnabled": false,
+        "upgradeEnabled": false,
+        "diagnosticsEnabled": true,
+        "logTailLines": LOG_API_DEFAULT_TAIL_LINES,
+    })
+}
+
+pub fn api_management_config_for_frontend(store: &UiSettingsStore) -> Value {
+    let mut stored = store
+        .value
+        .get("apiManagement")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    // Read the legacy log API settings until every existing installation has
+    // saved the new API Management form at least once.
+    if store.value.get("apiManagement").is_none() {
+        if let Some(log) = store.value.get("logConfig") {
+            if let Value::Object(ref mut map) = stored {
+                if let Some(value) = log.get("apiEnabled") {
+                    map.insert("logEnabled".into(), value.clone());
+                }
+                if let Some(value) = log.get("apiTailLines") {
+                    map.insert("logTailLines".into(), value.clone());
+                }
+            }
+        }
+    }
+    merge_json_values(default_api_management_config(), stored)
+}
+
+pub fn parse_api_management_config(value: &Value) -> ParsedApiManagementConfig {
+    ParsedApiManagementConfig {
+        log_enabled: value
+            .get("logEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        restart_enabled: value
+            .get("restartEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        upgrade_enabled: value
+            .get("upgradeEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        diagnostics_enabled: value
+            .get("diagnosticsEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        log_tail_lines: value
+            .get("logTailLines")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(LOG_API_DEFAULT_TAIL_LINES)
+            .clamp(1, LOG_API_MAX_TAIL_LINES),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +534,31 @@ mod tests {
         assert_eq!(parsed.level, "info");
         assert!(!parsed.api_enabled);
         assert_eq!(parsed.api_tail_lines, LOG_API_DEFAULT_TAIL_LINES);
+    }
+
+    #[test]
+    fn api_management_migrates_legacy_log_api_settings() {
+        let legacy = UiSettingsStore {
+            value: json!({
+                "logConfig": { "apiEnabled": true, "apiTailLines": 250 }
+            }),
+        };
+        let migrated = api_management_config_for_frontend(&legacy);
+        let parsed = parse_api_management_config(&migrated);
+        assert!(parsed.log_enabled);
+        assert_eq!(parsed.log_tail_lines, 250);
+        assert!(!parsed.restart_enabled);
+        assert!(!parsed.upgrade_enabled);
+
+        let explicit = UiSettingsStore {
+            value: json!({
+                "logConfig": { "apiEnabled": true, "apiTailLines": 250 },
+                "apiManagement": { "logEnabled": false, "logTailLines": 20 }
+            }),
+        };
+        let parsed = parse_api_management_config(&api_management_config_for_frontend(&explicit));
+        assert!(!parsed.log_enabled);
+        assert_eq!(parsed.log_tail_lines, 20);
     }
 
     #[test]

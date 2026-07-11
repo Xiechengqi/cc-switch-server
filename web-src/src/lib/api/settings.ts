@@ -342,6 +342,24 @@ export const settingsApi = {
   async setLogConfig(config: LogConfig): Promise<boolean> {
     return await invokeCommand("set_log_config", { config });
   },
+
+  async getApiManagement(): Promise<ApiManagementConfig> {
+    return await invokeCommand("get_api_management");
+  },
+
+  async setApiManagement(
+    config: ApiManagementConfig,
+  ): Promise<ApiManagementConfig> {
+    return await invokeCommand("set_api_management", { config });
+  },
+
+  async generateDebugToken(ttlHours: number): Promise<GeneratedDebugToken> {
+    return await invokeCommand("generate_debug_token", { ttlHours });
+  },
+
+  async revokeDebugToken(): Promise<{ ok: boolean }> {
+    return await invokeCommand("revoke_debug_token");
+  },
 };
 
 /** 单处工具安装的诊断信息（多处安装冲突检测）。字段对应后端 ToolInstallation。 */
@@ -382,8 +400,22 @@ export interface OptimizerConfig {
 export interface LogConfig {
   enabled: boolean;
   level: "error" | "warn" | "info" | "debug" | "trace";
-  apiEnabled?: boolean;
-  apiTailLines?: number;
+}
+
+export interface ApiManagementConfig {
+  diagnosticsEnabled: boolean;
+  logEnabled: boolean;
+  restartEnabled: boolean;
+  upgradeEnabled: boolean;
+  logTailLines: number;
+  tokenConfigured?: boolean;
+  tokenExpiresAtMs?: number | null;
+}
+
+export interface GeneratedDebugToken {
+  token: string;
+  expiresAtMs: number;
+  ttlHours: number;
 }
 
 export interface BackupEntry {

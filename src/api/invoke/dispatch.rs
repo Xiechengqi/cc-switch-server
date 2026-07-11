@@ -199,6 +199,16 @@ async fn web_invoke_dispatch(
             state.sync_log_config_from_ui_settings().await;
             Ok(json!(true))
         }
+        "get_api_management" => Ok(crate::api::debug::api_management_snapshot(state).await),
+        "set_api_management" => {
+            let config: Value = web_arg_value(&args, "config")?;
+            crate::api::debug::save_api_management(state, config).await
+        }
+        "generate_debug_token" => {
+            let ttl_hours = args.get("ttlHours").and_then(Value::as_u64);
+            crate::api::debug::generate_debug_token(state, ttl_hours).await
+        }
+        "revoke_debug_token" => crate::api::debug::revoke_debug_token(state).await,
         "get_stream_check_config" => {
             let store = state.ui_settings.read().await;
             Ok(ui_settings::stream_check_config_for_frontend(&store))

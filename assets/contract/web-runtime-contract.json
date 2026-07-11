@@ -14,11 +14,20 @@
       "/web-api/auth/password/refresh",
       "/web-api/auth/initial-setup",
       "/web-api/oauth/claude-cli/callback",
-      "/web-api/oauth/openai-cli/callback"
+      "/web-api/oauth/openai-cli/callback",
+      "/web-api/debug/runtime",
+      "/web-api/debug/diagnostics",
+      "/web-api/debug/logs/tail",
+      "/web-api/debug/restart",
+      "/web-api/debug/operations/{operationId}",
+      "/web-api/debug/upgrade",
+      "/web-api/debug/upgrade/status",
+      "/web-api/debug/upgrade/stream"
     ],
     "streamPaths": [
       "/web-api/events",
-      "/web-api/admin/upgrade/stream"
+      "/web-api/admin/upgrade/stream",
+      "/web-api/debug/upgrade/stream"
     ],
     "deniedPrefixes": [
       "/api/",
@@ -989,7 +998,35 @@
       "support": "shim",
       "implemented": true,
       "feature": "settings",
-      "notes": "Persisted in ui-settings.json logConfig; supports apiEnabled/apiTailLines and GET /web-api/admin/logs/tail."
+      "notes": "Persisted in ui-settings.json logConfig; remote API controls live in apiManagement."
+    },
+    {
+      "name": "get_api_management",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Returns scoped remote-debug API switches and token metadata."
+    },
+    {
+      "name": "set_api_management",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persists scoped remote-debug API switches in ui-settings.json."
+    },
+    {
+      "name": "generate_debug_token",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Rotates the temporary remote-debug bearer token."
+    },
+    {
+      "name": "revoke_debug_token",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Revokes the temporary remote-debug bearer token."
     },
     {
       "name": "get_model_pricing",

@@ -7,6 +7,7 @@ pub mod web;
 pub(in crate::api) mod accounts;
 pub(in crate::api) mod backup;
 pub(crate) mod control;
+pub(in crate::api) mod debug;
 pub(crate) mod error;
 pub(in crate::api) mod events;
 pub(crate) mod invoke;
@@ -30,6 +31,7 @@ pub(crate) use control::{
     share_router_model_health, share_router_request_logs, share_router_runtime,
 };
 pub use control::{control_signature, refresh_share_usage_items, ControlRefreshShareUsageItem};
+pub(in crate::api) use debug::*;
 pub use error::ApiError;
 pub(crate) use error::{
     map_codex_device_error, map_copilot_device_error, map_email_auth_error, map_kiro_device_error,
@@ -380,6 +382,17 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/web-api/context", get(web_runtime_context))
         .route("/web-api/invoke/*command", post(web_invoke_compat))
         .route("/web-api/events", get(events))
+        .route("/web-api/debug/runtime", get(debug_runtime))
+        .route("/web-api/debug/diagnostics", get(debug_diagnostics))
+        .route("/web-api/debug/logs/tail", get(debug_logs_tail))
+        .route("/web-api/debug/restart", post(debug_restart))
+        .route(
+            "/web-api/debug/operations/:operation_id",
+            get(debug_restart_status),
+        )
+        .route("/web-api/debug/upgrade", post(debug_upgrade_start))
+        .route("/web-api/debug/upgrade/status", get(debug_upgrade_status))
+        .route("/web-api/debug/upgrade/stream", get(debug_upgrade_stream))
         .route(
             "/web-api/admin/upgrade/stream",
             get(crate::api::self_update::admin_upgrade_stream),

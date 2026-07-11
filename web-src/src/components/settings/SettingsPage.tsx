@@ -17,6 +17,7 @@ import {
   ScrollText,
   HardDriveDownload,
   FlaskConical,
+  ShieldCheck,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -51,6 +52,7 @@ import { ProxyTabContent } from "@/components/settings/ProxyTabContent";
 import { ModelTestConfigPanel } from "@/components/usage/ModelTestConfigPanel";
 import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
+import { ApiManagementPanel } from "@/components/settings/ApiManagementPanel";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySettings";
@@ -65,18 +67,14 @@ import type { SettingsFormState } from "@/hooks/useSettings";
 import { isServerWebRuntime } from "@/lib/runtime";
 
 export type SettingsTab =
-  | "general"
-  | "proxy"
-  | "auth"
-  | "share"
-  | "advanced"
-  | "usage";
+  "general" | "proxy" | "auth" | "share" | "advanced" | "usage";
 
 interface SettingsDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onImportSuccess?: () => void | Promise<void>;
-  defaultTab?: SettingsTab | "router" | "diagnostics" | "tunnel" | "failover" | "backup";
+  defaultTab?:
+    SettingsTab | "router" | "diagnostics" | "tunnel" | "failover" | "backup";
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
 }
 
@@ -123,7 +121,9 @@ export function SettingsPage({
   } = useImportExport({ onImportSuccess });
 
   const serverMode = isServerWebRuntime();
-  const { data: installedSkills } = useInstalledSkills({ enabled: !serverMode });
+  const { data: installedSkills } = useInstalledSkills({
+    enabled: !serverMode,
+  });
 
   const [activeTab, setActiveTab] = useState<string>("general");
   const [showRestartPrompt, setShowRestartPrompt] = useState(false);
@@ -575,6 +575,30 @@ export function SettingsPage({
                         </AccordionTrigger>
                         <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
                           <LogConfigPanel />
+                        </AccordionContent>
+                      </AccordionItem>
+
+                      <AccordionItem
+                        value="apiManagement"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
+                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                          <div className="flex items-center gap-3">
+                            <ShieldCheck className="h-5 w-5 text-amber-500" />
+                            <div className="text-left">
+                              <h3 className="text-base font-semibold">
+                                {t("settings.advanced.apiManagement.title")}
+                              </h3>
+                              <p className="text-sm text-muted-foreground font-normal">
+                                {t(
+                                  "settings.advanced.apiManagement.description",
+                                )}
+                              </p>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                          <ApiManagementPanel />
                         </AccordionContent>
                       </AccordionItem>
                     </Accordion>

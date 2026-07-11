@@ -59,6 +59,12 @@ Run the checks manually at:
 - Publish a new mutable `latest` release and upgrade immediately: the staged binary commit must match the release target before the old process exits; a stale asset must fail before restart, and a replacement rollback must surface its final task logs after the Client Tunnel reconnects.
 - Keep a Client Tunnel page and `/web-api/events` subscription open for at least two Router lease TTL periods; renewal must retain the same connection without periodic `404 unregistered-subdomain`, `503 connection-lost`, or HTTP/2 stream errors.
 - Container deployments show self-update as unavailable and direct operators to deploy a new image.
+- Settings → Advanced → API Management owns the log, restart, upgrade, and runtime-diagnostics API switches; Log Management no longer contains remote API controls.
+- A generated debug token is displayed once, expires within the selected 1-24 hour window, can be rotated/revoked, and never appears in `server.json` or API responses as plaintext.
+- Through a Router Client Tunnel URL, exact `/web-api/debug/*` endpoints accept the debug Bearer token without a Web admin session; `/web-api/invoke/*`, `/web-api/admin/*`, unknown debug paths, malformed operation IDs, and query-string tokens remain protected or rejected.
+- Debug log responses redact authorization, API-key, token, cookie, password, and secret assignments and do not disclose the host log path.
+- Remote restart returns an operation ID before the old process exits. After reconnect, its persisted status reports old/new PID, strategy, stage, timestamp, and a health/version success or actionable failure message.
+- Remote upgrade status and stream survive the expected process/tunnel interruption by reading persisted state; disabling a capability immediately rejects new requests made with an otherwise valid debug token.
 
 ## Accounts, OAuth, Quota
 
