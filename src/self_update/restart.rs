@@ -197,6 +197,10 @@ pub fn restart_from_detected_service(
         ));
     }
     let pending = pending_upgrade(config_dir);
+    let current_exe = std::env::current_exe().map_err(|error| {
+        SelfUpdateError::Internal(format!("resolve current executable failed: {error}"))
+    })?;
+    let install_path = restart_install_path(pending.is_some(), current_exe);
     let service_unit = current_service_unit();
     let operation_id = new_operation_id();
     let command = launch_helper(UpdateHelperSpec {
@@ -220,7 +224,7 @@ pub fn restart_from_detected_service(
             .or_else(|| Some(crate::build_info::build_info().commit_id.to_string())),
         config_dir: config_dir.to_path_buf(),
         server_args: std::env::args().skip(1).collect(),
-        install_path: BINARY_INSTALL_PATH.into(),
+        install_path,
         staging_path: BINARY_STAGING_PATH.into(),
         rollback_path: BINARY_ROLLBACK_PATH.into(),
         log_path: config_dir.join("server.log"),
@@ -229,6 +233,14 @@ pub fn restart_from_detected_service(
         operation_id,
         command,
     })
+}
+
+fn restart_install_path(has_pending_upgrade: bool, current_exe: PathBuf) -> PathBuf {
+    if has_pending_upgrade {
+        PathBuf::from(BINARY_INSTALL_PATH)
+    } else {
+        current_exe
+    }
 }
 
 #[cfg(test)]
@@ -372,34 +384,57 @@ fn spawn_detached_helper(
             }
         }
         RestartStrategy::Standalone => {
-            let spawned = Command::new("setsid")
-                .args(["-f"])
-                .arg(current_exe)
+            use std::os::unix::process::CommandExt;
+
+            let helper_log_path = spec.config_dir.join("restart-helper.log");
+            let helper_log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&helper_log_path)
+                .map_err(|err| {
+                    SelfUpdateError::Internal(format!(
+                        "open restart helper log {} failed: {err}",
+                        helper_log_path.display()
+                    ))
+                })?;
+            let helper_error_log = helper_log.try_clone().map_err(|err| {
+                SelfUpdateError::Internal(format!("clone restart helper log failed: {err}"))
+            })?;
+            let mut child = Command::new(current_exe)
                 .arg("self-update-helper")
                 .arg("--spec")
                 .arg(spec_path)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-            if let Err(err) = spawned {
-                if err.kind() != std::io::ErrorKind::NotFound {
+                .stdout(Stdio::from(helper_log))
+                .stderr(Stdio::from(helper_error_log))
+                .process_group(0)
+                .spawn()
+                .map_err(|err| {
+                    SelfUpdateError::Internal(format!("spawn update helper failed: {err}"))
+                })?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if read_restart_operation(&spec.config_dir).is_some_and(|operation| {
+                    operation.operation_id == spec.operation_id
+                        && operation.stage != "helper_spawning"
+                }) {
+                    return Ok(());
+                }
+                if let Some(status) = child.try_wait().map_err(|err| {
+                    SelfUpdateError::Internal(format!("inspect update helper failed: {err}"))
+                })? {
                     return Err(SelfUpdateError::Internal(format!(
-                        "launch standalone update helper failed: {err}"
+                        "update helper exited before startup confirmation with {status}; see {}",
+                        helper_log_path.display()
                     )));
                 }
-                Command::new(current_exe)
-                    .arg("self-update-helper")
-                    .arg("--spec")
-                    .arg(spec_path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .map_err(|err| {
-                        SelfUpdateError::Internal(format!("spawn update helper failed: {err}"))
-                    })?;
+                std::thread::sleep(Duration::from_millis(25));
             }
+            let _ = child.kill();
+            return Err(SelfUpdateError::Internal(format!(
+                "update helper did not confirm startup within 2s; see {}",
+                helper_log_path.display()
+            )));
         }
     }
     Ok(())
@@ -886,6 +921,16 @@ mod tests {
             Some(("pending-task".into(), "abcdef012345".into()))
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn manual_restart_reexecutes_the_running_binary_path() {
+        let running = PathBuf::from("/root/cc-switch-server");
+        assert_eq!(restart_install_path(false, running.clone()), running);
+        assert_eq!(
+            restart_install_path(true, PathBuf::from("/tmp/dev-binary")),
+            PathBuf::from(BINARY_INSTALL_PATH)
+        );
     }
 
     #[test]
