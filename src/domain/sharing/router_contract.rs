@@ -9,7 +9,7 @@ use crate::domain::health;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
-use crate::domain::sharing::shares::{Share, ShareMarketGrantStatus};
+use crate::domain::sharing::shares::{share_router_for_sale_label, Share, ShareMarketGrantStatus};
 use crate::domain::usage::store::UsageStore;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -99,6 +99,8 @@ pub struct ShareDescriptor {
     pub app_availability: ShareAppAvailability,
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -462,12 +464,12 @@ pub fn descriptor_for_share_with_accounts_and_usage(
                 .get(app)
                 .cloned()
                 .unwrap_or_else(|| ShareAppSettings {
-                    for_sale: if share.for_sale { "Yes" } else { "No" }.to_string(),
+                    for_sale: share_router_for_sale_label(share),
                     sale_market_kind: share.sale_market_kind.clone(),
                     market_access_mode: market_access_mode.clone(),
                     shared_with_emails: shared_with_emails.clone(),
                     token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
-                    parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(3),
+                    parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(-1),
                     expires_at: share_expires_at_rfc3339(share.expires_at),
                 });
         app_settings.insert(app.clone(), app_setting);
@@ -533,7 +535,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
             .clone(),
         description: share.description.clone(),
         market_grant: share.market_grant.clone(),
-        for_sale: if share.for_sale { "Yes" } else { "No" }.to_string(),
+        for_sale: share_router_for_sale_label(share),
         sale_market_kind: share.sale_market_kind.clone(),
         subdomain: share
             .tunnel_subdomain
@@ -543,7 +545,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         provider_id: Some(share.provider_id.clone()),
         bindings,
         token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
-        parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(3),
+        parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(-1),
         tokens_used: share.tokens_used as i64,
         requests_count: share.requests_count as i64,
         share_status: share.status.clone(),
@@ -555,6 +557,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         app_providers,
         app_availability,
         model_health,
+        auto_start: share.auto_start,
     }
 }
 
@@ -844,7 +847,7 @@ fn unix_ms_to_rfc3339(ms: i64) -> Option<String> {
         .map(|value| value.to_rfc3339())
 }
 
-const UNLIMITED_SHARE_EXPIRES_AT: &str = "2100-01-01T00:00:00Z";
+const UNLIMITED_SHARE_EXPIRES_AT: &str = "2099-12-31T23:59:59Z";
 
 fn share_timestamp_to_rfc3339(value: i64) -> Option<String> {
     if value <= 0 {
@@ -969,7 +972,7 @@ fn default_sale_market_kind() -> String {
 }
 
 fn default_parallel_limit() -> i64 {
-    3
+    -1
 }
 
 fn default_share_for_sale() -> String {
@@ -987,6 +990,45 @@ mod tests {
     use crate::domain::providers::model::{Provider, ProviderType};
     use crate::domain::sharing::shares::{ShareAcl, ShareBinding};
     use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
+
+    #[test]
+    fn descriptor_maps_free_for_sale_label() {
+        let mut share = test_share(ProviderType::OllamaCloud, None);
+        share.free_access = true;
+        share.for_sale = false;
+        let providers = ProviderStore {
+            providers: vec![test_provider(ProviderType::OllamaCloud)],
+        };
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+        assert_eq!(descriptor.for_sale, "Free");
+        for settings in descriptor.app_settings.values() {
+            assert_eq!(settings.for_sale, "Free");
+        }
+    }
+
+    #[test]
+    fn descriptor_maps_unlimited_expiry_to_shared_permanent_constant() {
+        let share = test_share(ProviderType::OllamaCloud, None);
+        let providers = ProviderStore {
+            providers: vec![test_provider(ProviderType::OllamaCloud)],
+        };
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+        assert_eq!(descriptor.expires_at, UNLIMITED_SHARE_EXPIRES_AT);
+    }
+
+    #[test]
+    fn descriptor_maps_unlimited_parallel_limit_to_negative_one() {
+        let share = test_share(ProviderType::OllamaCloud, None);
+        let providers = ProviderStore {
+            providers: vec![test_provider(ProviderType::OllamaCloud)],
+        };
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+
+        assert_eq!(descriptor.parallel_limit, -1);
+        for settings in descriptor.app_settings.values() {
+            assert_eq!(settings.parallel_limit, -1);
+        }
+    }
 
     #[test]
     fn descriptor_omits_quota_percent_when_share_has_no_percent() {
@@ -1231,6 +1273,7 @@ mod tests {
             expires_at: None,
             created_at_ms: 0,
             for_sale: false,
+            free_access: false,
             sale_market_kind: "token".to_string(),
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),

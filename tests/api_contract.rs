@@ -2657,6 +2657,7 @@ fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) ->
         parallel_limit: None,
         expires_at: None,
         for_sale: None,
+        free_access: None,
         sale_market_kind: None,
         access_by_app: BTreeMap::new(),
         app_settings: BTreeMap::new(),

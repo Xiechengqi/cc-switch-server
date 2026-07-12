@@ -528,6 +528,7 @@ mod tests {
             expires_at: None,
             created_at_ms: 0,
             for_sale: false,
+            free_access: false,
             sale_market_kind: "token".to_string(),
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),

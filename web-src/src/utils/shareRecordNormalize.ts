@@ -97,6 +97,7 @@ export function normalizeShareBindings(raw: RawRecord): ShareBindings {
 function normalizeForSale(raw: RawRecord): ShareRecord["forSale"] {
   const value = raw.forSale ?? raw.for_sale;
   if (value === "Free") return "Free";
+  if (raw.freeAccess === true || raw.free_access === true) return "Free";
   if (value === "Yes" || value === true) return "Yes";
   return "No";
 }

@@ -71,6 +71,8 @@ pub struct Share {
     pub created_at_ms: u128,
     #[serde(default)]
     pub for_sale: bool,
+    #[serde(default)]
+    pub free_access: bool,
     #[serde(default = "default_sale_market_kind")]
     pub sale_market_kind: String,
     #[serde(default)]
@@ -165,6 +167,8 @@ pub struct UpsertShareInput {
     pub expires_at: Option<i64>,
     #[serde(default)]
     pub for_sale: Option<bool>,
+    #[serde(default)]
+    pub free_access: Option<bool>,
     #[serde(default)]
     pub sale_market_kind: Option<String>,
     #[serde(default)]
@@ -317,6 +321,7 @@ impl ShareStore {
             expires_at: input.expires_at,
             created_at_ms,
             for_sale: input.for_sale.unwrap_or(false),
+            free_access: input.free_access.unwrap_or(false),
             sale_market_kind: input
                 .sale_market_kind
                 .unwrap_or_else(default_sale_market_kind),
@@ -700,7 +705,7 @@ impl ShareStore {
             share.description = description.map(|value| value.trim().to_string());
         }
         if let Some(for_sale) = patch.for_sale {
-            share.for_sale = parse_router_bool(&for_sale);
+            apply_router_for_sale_patch(share, &for_sale);
         }
         if let Some(sale_market_kind) = patch.sale_market_kind {
             share.sale_market_kind = normalize_non_empty(sale_market_kind, "token");
@@ -1061,11 +1066,39 @@ fn parse_share_expiration(value: &str) -> Result<Option<i64>, SharePatchError> {
         .map_err(|_| SharePatchError::Invalid("expiresAt must be a timestamp or RFC3339".into()))
 }
 
-fn parse_router_bool(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "yes" | "true" | "1" | "share"
-    )
+pub(crate) fn share_router_for_sale_label(share: &Share) -> String {
+    if share.free_access {
+        "Free".to_string()
+    } else if share.for_sale {
+        "Yes".to_string()
+    } else {
+        "No".to_string()
+    }
+}
+
+pub(crate) fn apply_router_for_sale_patch(share: &mut Share, value: &str) {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "free" => {
+            share.free_access = true;
+            share.for_sale = false;
+        }
+        "yes" | "true" | "1" | "share" => {
+            share.free_access = false;
+            share.for_sale = true;
+        }
+        _ => {
+            share.free_access = false;
+            share.for_sale = false;
+        }
+    }
+}
+
+pub(crate) fn normalize_router_for_sale_setting(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "free" => "Free".to_string(),
+        "yes" | "true" | "1" | "share" => "Yes".to_string(),
+        _ => "No".to_string(),
+    }
 }
 
 fn normalize_non_empty(value: String, fallback: &str) -> String {
@@ -1181,11 +1214,7 @@ fn normalize_app_settings(
         if app.is_empty() {
             continue;
         }
-        setting.for_sale = if parse_router_bool(&setting.for_sale) {
-            "Yes".to_string()
-        } else {
-            "No".to_string()
-        };
+        setting.for_sale = normalize_router_for_sale_setting(&setting.for_sale);
         setting.sale_market_kind = normalize_non_empty(setting.sale_market_kind, "token");
         setting.market_access_mode = normalize_non_empty(setting.market_access_mode, "selected");
         setting.shared_with_emails = normalize_email_list(&setting.shared_with_emails, owner_email);
@@ -1217,6 +1246,7 @@ mod tests {
             parallel_limit: None,
             expires_at: None,
             for_sale: Some(true),
+            free_access: None,
             sale_market_kind: Some("share".to_string()),
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),
@@ -1248,6 +1278,26 @@ mod tests {
     }
 
     #[test]
+    fn apply_settings_patch_persists_free_for_sale_mode() {
+        let mut store = ShareStore::default();
+        let share = store
+            .upsert(codex_share_input("share-free"))
+            .expect("upsert");
+        let updated = store
+            .apply_settings_patch(
+                &share.id,
+                ShareSettingsPatch {
+                    for_sale: Some("Free".to_string()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .expect("apply free");
+        assert!(updated.free_access);
+        assert!(!updated.for_sale);
+        assert_eq!(share_router_for_sale_label(&updated), "Free");
+    }
+
+    #[test]
     fn upsert_share_defaults_binding_and_status() {
         let mut store = ShareStore::default();
         let share = store
@@ -1269,6 +1319,7 @@ mod tests {
                 parallel_limit: Some(2),
                 expires_at: None,
                 for_sale: Some(true),
+                free_access: None,
                 sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
@@ -1404,6 +1455,7 @@ mod tests {
                 parallel_limit: None,
                 expires_at: None,
                 for_sale: None,
+                free_access: None,
                 sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
@@ -1444,6 +1496,7 @@ mod tests {
                 parallel_limit: None,
                 expires_at: None,
                 for_sale: None,
+                free_access: None,
                 sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
@@ -1510,6 +1563,7 @@ mod tests {
             expires_at: None,
             created_at_ms: 0,
             for_sale: false,
+            free_access: false,
             sale_market_kind: "token".to_string(),
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),
@@ -1567,6 +1621,7 @@ mod tests {
                 parallel_limit: None,
                 expires_at: None,
                 for_sale: Some(true),
+                free_access: None,
                 sale_market_kind: Some("share".to_string()),
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
@@ -1648,6 +1703,7 @@ mod tests {
                 parallel_limit: None,
                 expires_at: None,
                 for_sale: None,
+                free_access: None,
                 sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
@@ -1753,6 +1809,7 @@ mod tests {
                 parallel_limit: None,
                 expires_at: None,
                 for_sale: None,
+                free_access: None,
                 sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
@@ -1804,6 +1861,7 @@ mod tests {
                 parallel_limit: None,
                 expires_at: None,
                 for_sale: None,
+                free_access: None,
                 sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
@@ -1889,6 +1947,7 @@ mod tests {
                 parallel_limit: None,
                 expires_at: None,
                 for_sale: None,
+                free_access: None,
                 sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
@@ -2140,6 +2199,7 @@ mod tests {
                 parallel_limit: None,
                 expires_at: None,
                 for_sale: None,
+                free_access: None,
                 sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
@@ -2318,6 +2378,7 @@ mod tests {
                 parallel_limit: None,
                 expires_at: None,
                 for_sale: None,
+                free_access: None,
                 sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),

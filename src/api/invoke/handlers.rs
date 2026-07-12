@@ -488,7 +488,14 @@ pub(in crate::api) async fn web_share_upsert_input(
         token_limit: web_optional_u64(value, &["tokenLimit", "token_limit"]),
         parallel_limit: web_optional_u32(value, &["parallelLimit", "parallel_limit"]),
         expires_at,
-        for_sale: web_optional_share_for_sale(value),
+        for_sale: {
+            let (for_sale, _) = web_share_for_sale_flags(value);
+            for_sale
+        },
+        free_access: {
+            let (_, free_access) = web_share_for_sale_flags(value);
+            free_access
+        },
         sale_market_kind: web_optional_string_any(value, &["saleMarketKind", "sale_market_kind"]),
         access_by_app,
         app_settings,
@@ -1763,16 +1770,18 @@ where
         .map_err(ApiError::bad_request)
 }
 
-pub(in crate::api) fn web_optional_share_for_sale(args: &Value) -> Option<bool> {
-    if let Some(value) = web_optional_bool(args, &["forSale", "for_sale"]) {
-        return Some(value);
+pub(in crate::api) fn web_share_for_sale_flags(args: &Value) -> (Option<bool>, Option<bool>) {
+    if let Some(value) = web_optional_string_any(args, &["forSale", "for_sale"]) {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "free" => (Some(false), Some(true)),
+            "yes" | "true" | "1" | "share" => (Some(true), Some(false)),
+            _ => (Some(false), Some(false)),
+        };
     }
-    web_optional_string_any(args, &["forSale", "for_sale"]).map(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "yes" | "true" | "1" | "free"
-        )
-    })
+    if let Some(value) = web_optional_bool(args, &["forSale", "for_sale"]) {
+        return (Some(value), Some(false));
+    }
+    (None, None)
 }
 
 pub(in crate::api) fn web_optional_auth_provider_type(
