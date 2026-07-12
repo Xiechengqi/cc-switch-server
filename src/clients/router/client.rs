@@ -734,6 +734,34 @@ pub async fn push_share_ops(
         .identity
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let response = send_share_ops_request(http, &api_base, identity, ops.clone()).await?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if should_retry_legacy_share_sync(status, &body, &ops) {
+        tracing::warn!(
+            "router rejected versioned share sync signature; retrying legacy signed payload"
+        );
+        let response =
+            send_share_ops_request(http, &api_base, identity, legacy_share_sync_ops(ops)).await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("router legacy share batch sync failed: {status}: {body}");
+    }
+    bail!("router share batch sync failed: {status}: {body}");
+}
+
+async fn send_share_ops_request(
+    http: &reqwest::Client,
+    api_base: &str,
+    identity: &RouterIdentity,
+    ops: Vec<ShareSyncOperation>,
+) -> anyhow::Result<reqwest::Response> {
     let timestamp_ms = now_ms();
     let nonce = nonce();
     let signature = sign_payload(identity, "share_batch_sync", &ops, timestamp_ms, &nonce)?;
@@ -744,18 +772,34 @@ pub async fn push_share_ops(
         signature,
         ops,
     };
-    let response = http
-        .post(format!("{api_base}/v1/shares/batch-sync"))
+    http.post(format!("{api_base}/v1/shares/batch-sync"))
         .json(&request)
         .send()
         .await
-        .context("send router share batch sync")?;
-    if response.status().is_success() {
-        return Ok(());
+        .context("send router share batch sync")
+}
+
+fn should_retry_legacy_share_sync(
+    status: reqwest::StatusCode,
+    body: &str,
+    ops: &[ShareSyncOperation],
+) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        && body.contains("signature verification failed")
+        && ops.iter().any(|op| {
+            op.share
+                .as_ref()
+                .is_some_and(|share| share.config_revision > 0)
+        })
+}
+
+fn legacy_share_sync_ops(mut ops: Vec<ShareSyncOperation>) -> Vec<ShareSyncOperation> {
+    for op in &mut ops {
+        if let Some(share) = op.share.as_mut() {
+            share.config_revision = 0;
+        }
     }
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    bail!("router share batch sync failed: {status}: {body}");
+    ops
 }
 
 pub async fn notify_runtime_refresh(
@@ -1167,6 +1211,53 @@ mod tests {
         let second = sign_payload(&identity, "share_delete", &payload, 123, "nonce-2").unwrap();
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn legacy_share_sync_omits_config_revision_from_signed_payload() {
+        let ops = vec![ShareSyncOperation {
+            kind: "upsert".to_string(),
+            share_id: None,
+            share: Some(ShareDescriptor {
+                config_revision: 7,
+                ..ShareDescriptor::default()
+            }),
+        }];
+        assert!(serde_json::to_string(&ops)
+            .unwrap()
+            .contains("configRevision"));
+
+        let legacy = legacy_share_sync_ops(ops);
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("configRevision"));
+    }
+
+    #[test]
+    fn legacy_share_sync_retry_is_limited_to_versioned_signature_failures() {
+        let ops = vec![ShareSyncOperation {
+            kind: "upsert".to_string(),
+            share_id: None,
+            share: Some(ShareDescriptor {
+                config_revision: 1,
+                ..ShareDescriptor::default()
+            }),
+        }];
+        assert!(should_retry_legacy_share_sync(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"message":"signature verification failed"}"#,
+            &ops,
+        ));
+        assert!(!should_retry_legacy_share_sync(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"message":"installation not found"}"#,
+            &ops,
+        ));
+        assert!(!should_retry_legacy_share_sync(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"message":"signature verification failed"}"#,
+            &ops,
+        ));
     }
 
     #[test]
