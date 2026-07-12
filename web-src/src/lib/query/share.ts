@@ -377,7 +377,10 @@ function useShareActionMutation<TVariables>(
       await invalidateShareDetail(queryClient, shareId);
       toast.success(buildMessages(messages).success);
     },
-    onError: (error: Error) => {
+    onError: async (error: Error, variables) => {
+      const shareId = getShareId(variables);
+      await queryClient.invalidateQueries({ queryKey: shareKeys.list() });
+      await invalidateShareDetail(queryClient, shareId);
       toast.error(buildMessages(messages, extractErrorMessage(error)).error);
     },
   });

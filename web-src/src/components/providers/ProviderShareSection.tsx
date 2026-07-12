@@ -206,6 +206,9 @@ export function ProviderShareSection({
   const shareableApp = isShareableApp(appId) ? appId : null;
   const shareExists = Boolean(share);
   const shareRunning = share ? isShareRunning(share) : false;
+  const routerSyncPending = Boolean(
+    share && share.routerSyncedRevision < share.configRevision,
+  );
   const marketsQueryEnabled = shareExists && isShareOpen;
   const { data: markets = [], isLoading: marketsLoading, error: marketsError, refetch: refetchMarkets } =
     useShareMarketsQuery(marketsQueryEnabled);
@@ -1046,6 +1049,25 @@ export function ProviderShareSection({
                   </>
                 )}
               </div>
+              {share && (share.routerLastSyncError || routerSyncPending) ? (
+                <p
+                  className={cn(
+                    "text-xs",
+                    share.routerLastSyncError
+                      ? "text-destructive"
+                      : "text-muted-foreground",
+                  )}
+                >
+                  {share.routerLastSyncError
+                    ? t("provider.share.routerSyncFailed", {
+                        defaultValue: "Router 同步失败：{{error}}",
+                        error: share.routerLastSyncError,
+                      })
+                    : t("provider.share.routerSyncPending", {
+                        defaultValue: "正在同步到 Router",
+                      })}
+                </p>
+              ) : null}
             </>
           )}
         </div>

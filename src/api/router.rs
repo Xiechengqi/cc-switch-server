@@ -382,22 +382,29 @@ pub(in crate::api) async fn router_pull_share_edits(
 
 pub(in crate::api) fn spawn_share_upsert_sync(state: ServerState, share: Share) {
     tokio::spawn(async move {
-        let providers = state.providers.read().await.clone();
-        let accounts = state.accounts.read().await.clone();
-        let usage = state.usage.read().await.clone();
-        let descriptor = descriptor_for_share_with_accounts_and_usage(
-            &share,
-            &providers,
-            Some(&accounts),
-            Some(&usage),
-        );
-        let op = ShareSyncOperation {
-            kind: "upsert".to_string(),
-            share_id: None,
-            share: Some(descriptor),
-        };
-        sync_share_ops(state, vec![op]).await;
+        let _ = sync_share_upsert(state, share).await;
     });
+}
+
+pub(in crate::api) async fn sync_share_upsert(
+    state: ServerState,
+    share: Share,
+) -> Result<(), String> {
+    let providers = state.providers.read().await.clone();
+    let accounts = state.accounts.read().await.clone();
+    let usage = state.usage.read().await.clone();
+    let descriptor = descriptor_for_share_with_accounts_and_usage(
+        &share,
+        &providers,
+        Some(&accounts),
+        Some(&usage),
+    );
+    let op = ShareSyncOperation {
+        kind: "upsert".to_string(),
+        share_id: None,
+        share: Some(descriptor),
+    };
+    sync_share_ops(state, vec![op]).await
 }
 
 pub(in crate::api) fn spawn_share_delete_sync(state: ServerState, share_id: String) {
@@ -407,18 +414,21 @@ pub(in crate::api) fn spawn_share_delete_sync(state: ServerState, share_id: Stri
             share_id: Some(share_id),
             share: None,
         };
-        sync_share_ops(state, vec![op]).await;
+        let _ = sync_share_ops(state, vec![op]).await;
     });
 }
 
-pub(in crate::api) async fn sync_share_ops(state: ServerState, ops: Vec<ShareSyncOperation>) {
-    let synced_share_ids = ops
+pub(in crate::api) async fn sync_share_ops(
+    state: ServerState,
+    ops: Vec<ShareSyncOperation>,
+) -> Result<(), String> {
+    let synced_shares = ops
         .iter()
         .filter_map(|op| {
             op.share
                 .as_ref()
-                .map(|share| share.share_id.clone())
-                .or_else(|| op.share_id.clone())
+                .map(|share| (share.share_id.clone(), share.config_revision))
+                .or_else(|| op.share_id.clone().map(|share_id| (share_id, 0)))
         })
         .collect::<Vec<_>>();
     let refresh_targets = ops
@@ -432,7 +442,16 @@ pub(in crate::api) async fn sync_share_ops(state: ServerState, ops: Vec<ShareSyn
         .collect::<Vec<_>>();
     let config = state.config.read().await.clone();
     if config.router.identity.is_none() {
-        return;
+        let message = "router installation is not registered".to_string();
+        state
+            .mutate_shares_debounced(|store| {
+                store.last_router_error = Some(message.clone());
+                for (share_id, revision) in &synced_shares {
+                    store.mark_router_sync(share_id, *revision, None, Err(message.clone()));
+                }
+            })
+            .await;
+        return Err(message);
     }
     let router_base = config.router_api_base().map(str::to_string);
     let http_client = state.http_client().await;
@@ -445,11 +464,12 @@ pub(in crate::api) async fn sync_share_ops(state: ServerState, ops: Vec<ShareSyn
                 .mutate_shares_debounced(|store| {
                     store.router_registered = true;
                     store.last_router_error = refresh_error.clone();
-                    for share_id in &synced_share_ids {
-                        store.mark_router_sync(share_id, router_base.clone(), Ok(now));
+                    for (share_id, revision) in &synced_shares {
+                        store.mark_router_sync(share_id, *revision, router_base.clone(), Ok(now));
                     }
                 })
                 .await;
+            Ok(())
         }
         Err(error) => {
             tracing::warn!(error = %error, "router share sync failed");
@@ -457,11 +477,17 @@ pub(in crate::api) async fn sync_share_ops(state: ServerState, ops: Vec<ShareSyn
             state
                 .mutate_shares_debounced(|store| {
                     store.last_router_error = Some(message.clone());
-                    for share_id in &synced_share_ids {
-                        store.mark_router_sync(share_id, router_base.clone(), Err(message.clone()));
+                    for (share_id, revision) in &synced_shares {
+                        store.mark_router_sync(
+                            share_id,
+                            *revision,
+                            router_base.clone(),
+                            Err(message.clone()),
+                        );
                     }
                 })
                 .await;
+            Err(message)
         }
     }
 }

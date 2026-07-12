@@ -32,6 +32,7 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     state.sync_log_config_from_ui_settings().await;
     cc_switch_server::state::restore_tunnels(state.clone()).await;
     cc_switch_server::state::spawn_periodic_backups(state.clone());
+    cc_switch_server::state::spawn_periodic_share_sync_retry(state.clone());
     cc_switch_server::state::spawn_account_quota_refresh(state.clone());
     cc_switch_server::state::spawn_share_edit_event_listener(state.clone());
     cc_switch_server::api::serve(state).await

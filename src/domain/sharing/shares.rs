@@ -11,8 +11,8 @@ use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareAppAccess, ShareAppSettings,
-    ShareSettingsPatch,
+    descriptor_for_share_with_accounts_and_usage, share_expires_at_rfc3339, ShareAppAccess,
+    ShareAppSettings, ShareSettingsPatch,
 };
 use crate::domain::usage::store::UsageStore;
 use crate::infra::time::now_ms;
@@ -103,6 +103,10 @@ pub struct Share {
     pub router_last_sync_error: Option<String>,
     #[serde(default)]
     pub router_url: Option<String>,
+    #[serde(default)]
+    pub config_revision: u64,
+    #[serde(default)]
+    pub router_synced_revision: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -280,6 +284,8 @@ impl ShareStore {
                     existing.router_last_sync_error.clone(),
                     existing.router_url.clone(),
                     existing.last_error.clone(),
+                    existing.config_revision,
+                    existing.router_synced_revision,
                 )
             });
 
@@ -293,7 +299,9 @@ impl ShareStore {
             router_last_sync_error,
             router_url,
             last_error,
-        ) = preserved.unwrap_or((0, 0, Vec::new(), 0, None, None, None, None));
+            config_revision,
+            router_synced_revision,
+        ) = preserved.unwrap_or((0, 0, Vec::new(), 0, None, None, None, None, 0, 0));
         let created_at_ms = if created_at_ms > 0 {
             created_at_ms
         } else {
@@ -339,7 +347,12 @@ impl ShareStore {
             router_last_synced_at_ms,
             router_last_sync_error,
             router_url,
+            config_revision: config_revision.saturating_add(1).max(1),
+            router_synced_revision,
         };
+
+        let mut share = share;
+        share.router_last_sync_error = None;
 
         if let Some(existing) = self.shares.iter_mut().find(|item| item.id == share.id) {
             *existing = share.clone();
@@ -372,6 +385,7 @@ impl ShareStore {
         let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
         share.enabled = false;
         share.status = "paused".to_string();
+        mark_share_config_pending(share);
         Some(share.clone())
     }
 
@@ -380,6 +394,7 @@ impl ShareStore {
         share.enabled = true;
         share.status = "active".to_string();
         share.last_error = None;
+        mark_share_config_pending(share);
         Some(share.clone())
     }
 
@@ -399,6 +414,7 @@ impl ShareStore {
                 object.insert("requestsCount".to_string(), json!(share.requests_count));
             }
         }
+        mark_share_config_pending(share);
         Some(share.clone())
     }
 
@@ -533,12 +549,15 @@ impl ShareStore {
             changed_at_ms: now_ms(),
         });
 
+        mark_share_config_pending(share);
+
         Some(share.clone()).ok_or(ShareUpdateError::NotFound)
     }
 
     pub fn replace_acl(&mut self, share_id: &str, acl: ShareAcl) -> Option<Share> {
         let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
         share.acl = acl;
+        mark_share_config_pending(share);
         Some(share.clone())
     }
 
@@ -560,6 +579,7 @@ impl ShareStore {
                 object.insert("subdomain".to_string(), json!(subdomain));
             }
         }
+        mark_share_config_pending(share);
         Ok(share.clone())
     }
 
@@ -571,6 +591,7 @@ impl ShareStore {
         let mut updated = Vec::new();
         for share in &mut self.shares {
             if bind_share_to_client_owner(share, &owner_email) {
+                mark_share_config_pending(share);
                 updated.push(share.clone());
             }
         }
@@ -648,6 +669,7 @@ impl ShareStore {
                 object.insert("appSettings".to_string(), json!(share.app_settings));
             }
         }
+        mark_share_config_pending(share);
         Ok(share.clone())
     }
 
@@ -673,6 +695,7 @@ impl ShareStore {
                 }
             }
         }
+        mark_share_config_pending(share);
         Some(share.clone())
     }
 
@@ -741,6 +764,48 @@ impl ShareStore {
             share.auto_start = auto_start;
         }
 
+        mark_share_config_pending(share);
+
+        Ok(share.clone())
+    }
+
+    pub fn canonicalize_primary_app_settings(
+        &mut self,
+        share_id: &str,
+    ) -> Result<Share, SharePatchError> {
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|item| item.id == share_id)
+            .ok_or(SharePatchError::NotFound)?;
+        let app = share.app.as_str().to_string();
+        let market_access_mode = share
+            .acl
+            .market_access_mode
+            .clone()
+            .unwrap_or_else(|| "selected".to_string());
+        let shared_with_emails = share.acl.shared_with_emails.clone();
+        share.access_by_app.clear();
+        share.access_by_app.insert(
+            app.clone(),
+            ShareAppAccess {
+                shared_with_emails: shared_with_emails.clone(),
+                market_access_mode: market_access_mode.clone(),
+            },
+        );
+        share.app_settings.clear();
+        share.app_settings.insert(
+            app,
+            ShareAppSettings {
+                for_sale: share_router_for_sale_label(share),
+                sale_market_kind: share.sale_market_kind.clone(),
+                market_access_mode,
+                shared_with_emails,
+                token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
+                parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(-1),
+                expires_at: share_expires_at_rfc3339(share.expires_at),
+            },
+        );
         Ok(share.clone())
     }
 
@@ -796,17 +861,27 @@ impl ShareStore {
         error: Option<String>,
     ) -> Option<Share> {
         let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
+        let enabled = status == "active";
+        let changed =
+            share.status != status || share.enabled != enabled || share.last_error != error;
         share.status = status.to_string();
-        share.enabled = status == "active";
+        share.enabled = enabled;
         share.last_error = error;
+        if changed {
+            mark_share_config_pending(share);
+        }
         Some(share.clone())
     }
 
     pub fn restore_auto_start(&mut self) -> Vec<Share> {
         for share in self.shares.iter_mut().filter(|item| item.auto_start) {
+            let changed = share.status != "active" || !share.enabled || share.last_error.is_some();
             share.status = "active".to_string();
             share.enabled = true;
             share.last_error = None;
+            if changed {
+                mark_share_config_pending(share);
+            }
         }
         self.shares.clone()
     }
@@ -828,6 +903,7 @@ impl ShareStore {
     pub fn mark_router_sync(
         &mut self,
         share_id: &str,
+        revision: u64,
         router_url: Option<String>,
         result: Result<u128, String>,
     ) {
@@ -836,12 +912,17 @@ impl ShareStore {
         };
         match result {
             Ok(now) => {
+                share.router_synced_revision = share.router_synced_revision.max(revision);
                 share.router_last_synced_at_ms = Some(now);
-                share.router_last_sync_error = None;
+                if share.router_synced_revision >= share.config_revision {
+                    share.router_last_sync_error = None;
+                }
                 share.router_url = router_url;
             }
             Err(error) => {
-                share.router_last_sync_error = Some(error);
+                if revision >= share.config_revision && share.router_synced_revision < revision {
+                    share.router_last_sync_error = Some(error);
+                }
             }
         }
     }
@@ -1038,6 +1119,11 @@ pub fn default_share_subdomain(owner_email: &str) -> String {
 
 fn default_share_status() -> String {
     "active".to_string()
+}
+
+fn mark_share_config_pending(share: &mut Share) {
+    share.config_revision = share.config_revision.saturating_add(1).max(1);
+    share.router_last_sync_error = None;
 }
 
 fn default_sale_market_kind() -> String {
@@ -1579,6 +1665,8 @@ mod tests {
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_url: None,
+            config_revision: 0,
+            router_synced_revision: 0,
         };
         assert_eq!(store.import_shares(vec![share]), 1);
         let updated = store
@@ -1823,7 +1911,13 @@ mod tests {
             })
             .unwrap();
 
-        store.mark_router_sync("s1", Some("https://router.example".to_string()), Ok(123));
+        let revision = store.get("s1").unwrap().config_revision;
+        store.mark_router_sync(
+            "s1",
+            revision,
+            Some("https://router.example".to_string()),
+            Ok(123),
+        );
         let share = store.shares.iter().find(|share| share.id == "s1").unwrap();
         assert_eq!(share.router_last_synced_at_ms, Some(123));
         assert_eq!(share.router_url.as_deref(), Some("https://router.example"));
@@ -1831,12 +1925,25 @@ mod tests {
 
         store.mark_router_sync(
             "s1",
+            revision,
             Some("https://router.example".to_string()),
             Err("failed".to_string()),
         );
         let share = store.shares.iter().find(|share| share.id == "s1").unwrap();
         assert_eq!(share.router_last_synced_at_ms, Some(123));
-        assert_eq!(share.router_last_sync_error.as_deref(), Some("failed"));
+        assert_eq!(share.router_last_sync_error, None);
+
+        let newer = store.pause("s1").unwrap();
+        store.mark_router_sync(
+            "s1",
+            newer.config_revision,
+            Some("https://router.example".to_string()),
+            Err("failed".to_string()),
+        );
+        assert_eq!(
+            store.get("s1").unwrap().router_last_sync_error.as_deref(),
+            Some("failed")
+        );
     }
 
     #[test]

@@ -548,6 +548,8 @@ mod tests {
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_url: None,
+            config_revision: 0,
+            router_synced_revision: 0,
         }
     }
 

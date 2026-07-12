@@ -947,7 +947,7 @@ pub(in crate::api) async fn web_save_provider_share(
     staged
         .update_subdomain(&share_id, subdomain)
         .map_err(map_share_patch_error)?;
-    let candidate = staged
+    staged
         .apply_settings_patch(
             &share_id,
             ShareSettingsPatch {
@@ -964,6 +964,9 @@ pub(in crate::api) async fn web_save_provider_share(
                 ..ShareSettingsPatch::default()
             },
         )
+        .map_err(map_share_patch_error)?;
+    let candidate = staged
+        .canonicalize_primary_app_settings(&share_id)
         .map_err(map_share_patch_error)?;
     staged
         .replace_configured_share(candidate.clone())
@@ -1001,7 +1004,20 @@ pub(in crate::api) async fn web_save_provider_share(
         crate::state::stop_share_tunnel(state, &share_id).await;
         crate::state::start_share_tunnel(state.clone(), share_id.clone()).await;
     }
-    spawn_share_upsert_sync(state.clone(), saved.clone());
+    crate::api::router::sync_share_upsert(state.clone(), saved.clone())
+        .await
+        .map_err(|error| {
+            ApiError::bad_gateway(format!(
+                "share was saved locally but router sync is pending: {error}"
+            ))
+        })?;
+    let saved = state
+        .shares
+        .read()
+        .await
+        .get(&share_id)
+        .cloned()
+        .unwrap_or(saved);
     emit_share_event(
         state,
         "share.changed",

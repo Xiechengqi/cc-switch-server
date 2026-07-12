@@ -101,6 +101,8 @@ pub struct ShareDescriptor {
     pub model_health: ShareModelHealthSummary,
     #[serde(default)]
     pub auto_start: bool,
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -558,6 +560,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         app_availability,
         model_health,
         auto_start: share.auto_start,
+        config_revision: share.config_revision,
     }
 }
 
@@ -861,7 +864,7 @@ fn share_timestamp_to_rfc3339(value: i64) -> Option<String> {
     unix_ms_to_rfc3339(ms)
 }
 
-fn share_expires_at_rfc3339(expires_at: Option<i64>) -> String {
+pub(crate) fn share_expires_at_rfc3339(expires_at: Option<i64>) -> String {
     expires_at
         .and_then(share_timestamp_to_rfc3339)
         .unwrap_or_else(|| UNLIMITED_SHARE_EXPIRES_AT.to_string())
@@ -1293,6 +1296,8 @@ mod tests {
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_url: None,
+            config_revision: 0,
+            router_synced_revision: 0,
         }
     }
 

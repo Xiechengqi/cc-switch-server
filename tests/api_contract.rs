@@ -1700,9 +1700,31 @@ async fn automatic_router_reconcile_replaces_installation_shares() {
 
 #[tokio::test]
 async fn provider_share_settings_are_saved_atomically() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route(
+            "/v1/shares/claim-subdomain",
+            post(|| async { StatusCode::OK }),
+        )
+        .route("/v1/shares/batch-sync", post(|| async { StatusCode::OK }));
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
+    let mut config = state.config_snapshot().await;
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-provider-save".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
 
     let mut input = test_share_input("share-provider-save", "provider-save", ProviderType::Codex);
     input.tunnel_subdomain = Some("before-save".to_string());
@@ -1751,8 +1773,9 @@ async fn provider_share_settings_are_saved_atomically() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let saved = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "response body: {saved}");
     assert_eq!(saved["ownerEmail"].as_str(), Some("owner@example.com"));
     assert_eq!(saved["tunnelSubdomain"].as_str(), Some("after-save"));
     assert_eq!(saved["description"].as_str(), Some("Provider-scoped share"));
@@ -1772,8 +1795,14 @@ async fn provider_share_settings_are_saved_atomically() {
     );
     assert_eq!(
         saved["appSettings"]["codex"]["expiresAt"].as_str(),
-        Some("2030-01-01T00:00:00Z")
+        Some("2030-01-01T00:00:00+00:00")
     );
+    let stored = state
+        .mutate_shares(|store| store.get("share-provider-save").cloned())
+        .await
+        .unwrap();
+    assert_eq!(stored.router_synced_revision, stored.config_revision);
+    assert!(stored.router_last_sync_error.is_none());
 }
 
 #[tokio::test]

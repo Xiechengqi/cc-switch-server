@@ -1656,6 +1656,35 @@ pub fn spawn_periodic_backups(state: ServerState) {
     });
 }
 
+pub fn spawn_periodic_share_sync_retry(state: ServerState) {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(30)).await;
+            let config = state.config.read().await.clone();
+            if config.router.identity.is_none() {
+                continue;
+            }
+            let pending_ids = state
+                .shares
+                .read()
+                .await
+                .shares
+                .iter()
+                .filter(|share| {
+                    share.router_synced_revision < share.config_revision
+                        || share.router_last_sync_error.is_some()
+                })
+                .map(|share| share.id.clone())
+                .collect::<Vec<_>>();
+            for share_id in pending_ids {
+                if let Err(error) = sync_one_share_to_router(&state, &config, &share_id).await {
+                    tracing::warn!(share_id = %share_id, error = %error, "periodic router share sync retry failed");
+                }
+            }
+        }
+    });
+}
+
 pub fn spawn_share_edit_event_listener(state: ServerState) {
     tokio::spawn(async move {
         share_edit_event_loop(state).await;
@@ -2313,12 +2342,17 @@ async fn sync_one_share_to_router(
             Ok(()) => {
                 store.router_registered = true;
                 store.last_router_error = None;
-                store.mark_router_sync(share_id, router_base, Ok(crate::infra::time::now_ms()));
+                store.mark_router_sync(
+                    share_id,
+                    share.config_revision,
+                    router_base,
+                    Ok(crate::infra::time::now_ms()),
+                );
             }
             Err(error) => {
                 let message = error.to_string();
                 store.last_router_error = Some(message.clone());
-                store.mark_router_sync(share_id, router_base, Err(message));
+                store.mark_router_sync(share_id, share.config_revision, router_base, Err(message));
             }
         }
     }
@@ -2366,14 +2400,24 @@ pub async fn reconcile_all_shares_to_router(state: ServerState) -> anyhow::Resul
                 store.router_registered = true;
                 store.last_router_error = None;
                 for share in &shares {
-                    store.mark_router_sync(&share.id, router_base.clone(), Ok(now));
+                    store.mark_router_sync(
+                        &share.id,
+                        share.config_revision,
+                        router_base.clone(),
+                        Ok(now),
+                    );
                 }
             }
             Err(error) => {
                 let message = error.to_string();
                 store.last_router_error = Some(message.clone());
                 for share in &shares {
-                    store.mark_router_sync(&share.id, router_base.clone(), Err(message.clone()));
+                    store.mark_router_sync(
+                        &share.id,
+                        share.config_revision,
+                        router_base.clone(),
+                        Err(message.clone()),
+                    );
                 }
             }
         })
@@ -3020,6 +3064,8 @@ mod tests {
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_url: None,
+            config_revision: 0,
+            router_synced_revision: 0,
         }
     }
 }

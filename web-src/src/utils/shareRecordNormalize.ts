@@ -213,6 +213,12 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
       new Date().toISOString(),
     lastUsedAt:
       readString(record, "lastUsedAt", "last_used_at") ?? null,
+    configRevision:
+      readNumber(record, "configRevision", "config_revision") ?? 0,
+    routerSyncedRevision:
+      readNumber(record, "routerSyncedRevision", "router_synced_revision") ?? 0,
+    routerLastSyncError:
+      readString(record, "routerLastSyncError", "router_last_sync_error") ?? null,
   };
 }
 

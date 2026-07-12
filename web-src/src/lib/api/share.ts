@@ -61,6 +61,9 @@ export interface ShareRecord {
   autoStart: boolean;
   createdAt: string;
   lastUsedAt?: string | null;
+  configRevision: number;
+  routerSyncedRevision: number;
+  routerLastSyncError?: string | null;
 }
 
 export interface CreateShareParams {
