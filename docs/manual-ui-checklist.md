@@ -37,6 +37,7 @@ Run the checks manually at:
 ## Shares
 
 - Share status, owner, tunnel/subdomain, provider binding, ACL, limits, market/grant, pending edits, and connect info are visible.
+- Share Owner is read-only and always displays Client Owner; Provider Share create/save requests do not submit an independent owner. Changing Client Owner through verified email ownership updates every Share and preserves a valid previous owner as shared access.
 - Pause/resume/binding/tunnel actions are disabled or gated consistently with server state.
 - Share connect info can be inspected without exposing hidden desktop-only features.
 
@@ -49,6 +50,7 @@ Run the checks manually at:
 ## Settings, Auth, Router, Backup
 
 - First setup, password login, API token, email code flow, router config, client tunnel, upstream proxy, and backup/restore are reachable.
+- Client Tunnel Owner is read-only; saving tunnel settings changes only tunnel fields and cannot bypass verified Client Owner change.
 - Settings → Share → Payout Information persists one EVM address, explicit USDC/USDT selection, and one or more BSC/Base/Arbitrum One networks; warnings prohibit secrets and identify the address as public/self-declared.
 - Payout clear requires confirmation; Router outage leaves the local save active and visibly reports pending/failed sync.
 - Desktop-only settings are absent.

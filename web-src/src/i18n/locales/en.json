@@ -126,7 +126,9 @@
       "openShareSettings": "Open share settings",
       "saveSuccess": "Share settings saved",
       "saveError": "Failed to save share settings: {{error}}",
-      "routerFromSettingsHint": "New shares use the default router from Settings → Share."
+      "routerFromSettingsHint": "New shares use the default router from Settings → Share.",
+      "ownerNotConfigured": "Configure Client Owner first",
+      "ownerManagedHint": "Share Owner always matches Client Owner and can only change after email ownership verification."
     },
     "inUse": "In Use",
     "clickToClearCurrent": "Click to disable",

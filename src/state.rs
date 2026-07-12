@@ -604,7 +604,19 @@ impl ServerStateInner {
         let failover = FailoverStore::load_or_default(&config_dir)?;
         let pricing = ModelPricingStore::load_or_default(&config_dir)?;
         let usage = UsageStore::load_or_default(&config_dir)?;
-        let shares = ShareStore::load_or_default(&config_dir)?;
+        let mut shares = ShareStore::load_or_default(&config_dir)?;
+        if let Some(owner_email) = config.owner.email.as_deref() {
+            let migrated = shares
+                .bind_all_to_client_owner(owner_email)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if !migrated.is_empty() {
+                shares.save(&config_dir)?;
+                tracing::info!(
+                    migrated_shares = migrated.len(),
+                    "bound historical share owners to the client owner"
+                );
+            }
+        }
         let ui_settings = UiSettingsStore::load_or_default(&config_dir)?;
         log_capture.apply_config(
             &ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&ui_settings)),

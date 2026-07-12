@@ -24,13 +24,30 @@ pub(in crate::api) async fn export_shares(
 pub(in crate::api) async fn import_shares(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<ImportSharesRequest>,
+    Json(mut input): Json<ImportSharesRequest>,
 ) -> Result<Json<ImportSharesResponse>, ApiError> {
     require_session(&state, &headers).await?;
     for share in &input.shares {
         crate::domain::sharing::invariants::validate_share_import(share)
             .map_err(map_share_patch_error)?;
     }
+    let owner_email = state
+        .config
+        .read()
+        .await
+        .owner
+        .email
+        .clone()
+        .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?;
+    let mut imported_store = ShareStore {
+        shares: std::mem::take(&mut input.shares),
+        ..ShareStore::default()
+    };
+    let owner_normalized = imported_store
+        .bind_all_to_client_owner(&owner_email)
+        .map_err(map_share_patch_error)?
+        .len();
+    input.shares = imported_store.shares;
     let imported = state
         .mutate_shares_immediate(|store| store.import_shares(input.shares))
         .await
@@ -38,7 +55,11 @@ pub(in crate::api) async fn import_shares(
     state.emit_event(
         ServerEvent::new("share.imported", "share").message(format!("imported {imported} shares")),
     );
-    Ok(Json(ImportSharesResponse { ok: true, imported }))
+    Ok(Json(ImportSharesResponse {
+        ok: true,
+        imported,
+        owner_normalized,
+    }))
 }
 
 pub(in crate::api) async fn upsert_share(
@@ -47,9 +68,16 @@ pub(in crate::api) async fn upsert_share(
     Json(mut input): Json<UpsertShareInput>,
 ) -> Result<Json<UpsertShareResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    if input.owner_email.is_none() {
-        input.owner_email = state.config.read().await.owner.email.clone();
-    }
+    input.owner_email = Some(
+        state
+            .config
+            .read()
+            .await
+            .owner
+            .email
+            .clone()
+            .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?,
+    );
     let share = state
         .mutate_shares_immediate(|store| store.upsert(input))
         .await

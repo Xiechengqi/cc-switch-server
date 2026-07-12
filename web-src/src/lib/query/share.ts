@@ -678,34 +678,6 @@ export function useUpdateShareExpirationMutation() {
   );
 }
 
-export function useUpdateShareOwnerEmailMutation() {
-  return useShareActionMutation(
-    ({ shareId, ownerEmail }: { shareId: string; ownerEmail: string }) =>
-      shareApi.updateOwnerEmail({ shareId, ownerEmail }),
-    {
-      successKey: "share.toast.updateOwnerEmailSuccess",
-      successDefault: "Owner Email 已更新",
-      errorKey: "share.toast.updateOwnerEmailError",
-      errorDefault: "更新 Owner Email 失败: {{error}}",
-    },
-    ({ shareId }) => shareId,
-  );
-}
-
-export function useTransferShareOwnerMutation() {
-  return useShareActionMutation(
-    ({ shareId, targetEmail }: { shareId: string; targetEmail: string }) =>
-      shareApi.transferOwner({ shareId, targetEmail }),
-    {
-      successKey: "share.toast.transferOwnerSuccess",
-      successDefault: "Owner 已转移",
-      errorKey: "share.toast.transferOwnerError",
-      errorDefault: "转移 Owner 失败: {{error}}",
-    },
-    ({ shareId }) => shareId,
-  );
-}
-
 export function useUpdateShareAclMutation() {
   return useShareActionMutation(
     ({

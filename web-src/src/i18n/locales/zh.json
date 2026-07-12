@@ -130,7 +130,9 @@
       "openShareSettings": "前往设置修改",
       "saveSuccess": "分享配置已保存",
       "saveError": "保存分享配置失败：{{error}}",
-      "routerFromSettingsHint": "使用设置 → 分享中的默认 Router 节点创建 share。"
+      "routerFromSettingsHint": "使用设置 → 分享中的默认 Router 节点创建 share。",
+      "ownerNotConfigured": "请先配置 Client Owner",
+      "ownerManagedHint": "Share Owner 与 Client Owner 保持一致，只能通过验证邮箱所有权后修改。"
     },
     "inUse": "使用中",
     "clickToClearCurrent": "点击取消启用",

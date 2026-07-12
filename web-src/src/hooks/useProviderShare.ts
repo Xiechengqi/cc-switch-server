@@ -38,12 +38,8 @@ export function getProviderShareState(
 
 export function resolveShareOwnerEmail(
   clientOwnerEmail: string | null | undefined,
-  shares: ShareRecord[],
 ): string {
-  const fromTunnel = clientOwnerEmail?.trim();
-  if (fromTunnel) return fromTunnel;
-  const fromShare = shares.find((share) => share.ownerEmail?.trim())?.ownerEmail;
-  return fromShare?.trim() ?? "";
+  return clientOwnerEmail?.trim() ?? "";
 }
 
 export function useProviderShare(

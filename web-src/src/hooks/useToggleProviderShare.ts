@@ -8,7 +8,6 @@ import {
   useDeleteShareMutation,
   useDisableShareMutation,
   useEnableShareMutation,
-  useSharesQuery,
 } from "@/lib/query";
 import {
   isShareableApp,
@@ -35,7 +34,6 @@ export function useToggleProviderShare(
   const providerShare = useProviderShare(appId, providerId);
   const { share, state } = providerShare;
   const { data: clientTunnel } = useClientTunnelQuery();
-  const { data: shares = [] } = useSharesQuery();
   const createMutation = useCreateShareMutation();
   const enableMutation = useEnableShareMutation();
   const disableMutation = useDisableShareMutation();
@@ -53,8 +51,8 @@ export function useToggleProviderShare(
     deleteMutation.isPending;
 
   const ownerEmail = useMemo(
-    () => resolveShareOwnerEmail(clientTunnel?.config?.ownerEmail, shares),
-    [clientTunnel?.config?.ownerEmail, shares],
+    () => resolveShareOwnerEmail(clientTunnel?.config?.ownerEmail),
+    [clientTunnel?.config?.ownerEmail],
   );
 
   const enableShare = async () => {
@@ -77,7 +75,6 @@ export function useToggleProviderShare(
       }
 
       await createMutation.mutateAsync({
-        ownerEmail,
         bindings: { [appId]: providerId },
         forSale: "Yes",
         saleMarketKind: "token",

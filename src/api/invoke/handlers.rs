@@ -511,14 +511,14 @@ pub(in crate::api) async fn web_update_share_owner_email(
     let value = web_payload(args, &["params", "input"]);
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
     let owner_email = web_arg_string_any(value, &["ownerEmail", "owner_email"])?;
-    let share = state
-        .try_mutate_shares_immediate(|store| store.update_owner_email(&share_id, &owner_email))
+    web_require_client_owner_target(state, &owner_email).await?;
+    state
+        .shares
+        .read()
         .await
-        .map_err(ApiError::internal)?
-        .map_err(map_share_patch_error)?;
-    spawn_share_upsert_sync(state.clone(), share.clone());
-    emit_share_event(state, "share.changed", &share, "owner_email_updated");
-    Ok(share)
+        .get(&share_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("share not found"))
 }
 
 pub(in crate::api) async fn web_transfer_share_owner(
@@ -530,14 +530,36 @@ pub(in crate::api) async fn web_transfer_share_owner(
     let value = web_payload(args, &["params", "input"]);
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
     let target_email = web_arg_string_any(value, &["targetEmail", "target_email"])?;
-    let share = state
-        .try_mutate_shares_immediate(|store| store.transfer_owner_email(&share_id, &target_email))
+    web_require_client_owner_target(state, &target_email).await?;
+    state
+        .shares
+        .read()
         .await
-        .map_err(ApiError::internal)?
-        .map_err(map_share_patch_error)?;
-    spawn_share_upsert_sync(state.clone(), share.clone());
-    emit_share_event(state, "share.changed", &share, "owner_transferred");
-    Ok(share)
+        .get(&share_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("share not found"))
+}
+
+async fn web_require_client_owner_target(
+    state: &ServerState,
+    target: &str,
+) -> Result<String, ApiError> {
+    let target =
+        crate::domain::settings::config::normalize_email(target).map_err(ApiError::bad_request)?;
+    let owner = state
+        .config
+        .read()
+        .await
+        .owner
+        .email
+        .clone()
+        .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?;
+    if !owner.eq_ignore_ascii_case(&target) {
+        return Err(ApiError::conflict(
+            "share owner is managed by the client owner",
+        ));
+    }
+    Ok(owner)
 }
 
 pub(in crate::api) async fn web_email_auth_request_code(
@@ -656,9 +678,7 @@ pub(in crate::api) async fn web_email_auth_change_owner_email(
         .map_err(ApiError::internal)?;
 
     let updated_shares = state
-        .try_mutate_shares_immediate(|store| {
-            store.change_owner_email_for_all(&current_email, &new_email)
-        })
+        .try_mutate_shares_immediate(|store| store.bind_all_to_client_owner(&new_email))
         .await
         .map_err(ApiError::internal)?
         .map_err(map_share_patch_error)?;
@@ -893,7 +913,6 @@ pub(in crate::api) async fn web_save_provider_share(
 ) -> Result<Share, ApiError> {
     let value = web_payload(args, &["params", "input"]);
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
-    let owner_email = web_arg_string_any(value, &["ownerEmail", "owner_email"])?;
     let subdomain = web_arg_string_any(value, &["subdomain"])?;
     let description = web_optional_string_any(value, &["description"]);
     let for_sale = web_arg_string_any(value, &["forSale", "for_sale"])?;
@@ -918,9 +937,6 @@ pub(in crate::api) async fn web_save_provider_share(
     let subdomain_changed = current.tunnel_subdomain.as_deref() != Some(subdomain.as_str());
     let was_running = current.enabled && current.status == "active";
 
-    staged
-        .update_owner_email(&share_id, &owner_email)
-        .map_err(map_share_patch_error)?;
     staged
         .update_subdomain(&share_id, subdomain)
         .map_err(map_share_patch_error)?;

@@ -109,6 +109,10 @@
     "noProvidersDescriptionSnippet": "除 API Key 和請求位址外的資料（如外掛程式設定）會被儲存至通用設定片段，用於在不同供應商之間共用",
     "currentlyUsing": "目前使用",
     "enable": "啟用",
+    "share": {
+      "ownerNotConfigured": "請先設定 Client Owner",
+      "ownerManagedHint": "Share Owner 與 Client Owner 保持一致，只能在驗證電子郵件所有權後變更。"
+    },
     "inUse": "使用中",
     "blockedByProxyHint": "代理接管模式下無法切換至官方供應商",
     "editProvider": "編輯供應商",

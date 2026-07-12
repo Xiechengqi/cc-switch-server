@@ -1718,7 +1718,7 @@ async fn provider_share_settings_are_saved_atomically() {
             json!({
                 "params": {
                     "shareId": "share-provider-save",
-                    "ownerEmail": "owner@example.com",
+                    "ownerEmail": "forged@example.com",
                     "subdomain": "after-save",
                     "description": "Provider-scoped share",
                     "forSale": "Yes",
@@ -1753,6 +1753,7 @@ async fn provider_share_settings_are_saved_atomically() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let saved = json_body(response).await;
+    assert_eq!(saved["ownerEmail"].as_str(), Some("owner@example.com"));
     assert_eq!(saved["tunnelSubdomain"].as_str(), Some("after-save"));
     assert_eq!(saved["description"].as_str(), Some("Provider-scoped share"));
     assert_eq!(saved["forSale"].as_bool(), Some(true));
@@ -2347,7 +2348,7 @@ async fn spawn_broken_chunked_upstream() -> std::net::SocketAddr {
 }
 
 #[tokio::test]
-async fn web_invoke_direct_owner_update_succeeds_with_admin_session() {
+async fn web_invoke_direct_owner_update_is_compatibility_noop_only() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
@@ -2363,6 +2364,7 @@ async fn web_invoke_direct_owner_update_succeeds_with_admin_session() {
         .unwrap();
 
     let response = app
+        .clone()
         .oneshot(json_request(
             Method::POST,
             "/web-api/invoke/update_share_owner_email",
@@ -2377,9 +2379,25 @@ async fn web_invoke_direct_owner_update_succeeds_with_admin_session() {
         .await
         .unwrap();
 
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/update_share_owner_email",
+            json!({
+                "params": {
+                    "shareId": "share-owner-gate",
+                    "ownerEmail": "owner@example.com"
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
-    assert_eq!(body["ownerEmail"].as_str(), Some("new-owner@example.com"));
+    assert_eq!(body["ownerEmail"].as_str(), Some("owner@example.com"));
 }
 
 #[tokio::test]

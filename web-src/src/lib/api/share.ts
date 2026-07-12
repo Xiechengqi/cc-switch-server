@@ -64,7 +64,6 @@ export interface ShareRecord {
 }
 
 export interface CreateShareParams {
-  ownerEmail: string;
   /** 单 binding：仅允许当前 app 的一个 provider id。 */
   bindings: ShareBindings;
   description?: string;
@@ -171,7 +170,6 @@ export interface UpdateShareAclParams {
 /** Complete settings payload saved atomically from a Provider edit page. */
 export interface SaveProviderShareParams {
   shareId: string;
-  ownerEmail: string;
   subdomain: string;
   description?: string;
   forSale: "Yes" | "No" | "Free";
@@ -220,16 +218,6 @@ export interface UpdateShareExpirationParams {
   expiresAt: string;
 }
 
-export interface UpdateShareOwnerEmailParams {
-  shareId: string;
-  ownerEmail: string;
-}
-
-export interface TransferShareOwnerParams {
-  shareId: string;
-  targetEmail: string;
-}
-
 export interface TunnelInfo {
   tunnelUrl: string;
   subdomain: string;
@@ -266,7 +254,6 @@ export interface ClientTunnelState {
 }
 
 export interface ClientTunnelUpdateParams {
-  ownerEmail: string;
   subdomain: string;
   enabled: boolean;
   autoStart: boolean;
@@ -391,18 +378,6 @@ async function updateExpiration(
   params: UpdateShareExpirationParams,
 ): Promise<ShareRecord> {
   return invokeShareRecord("update_share_expiration", { params });
-}
-
-async function updateOwnerEmail(
-  params: UpdateShareOwnerEmailParams,
-): Promise<ShareRecord> {
-  return invokeShareRecord("update_share_owner_email", { params });
-}
-
-async function transferOwner(
-  params: TransferShareOwnerParams,
-): Promise<ShareRecord> {
-  return invokeShareRecord("transfer_share_owner", { params });
 }
 
 async function updateAcl(params: UpdateShareAclParams): Promise<ShareRecord> {
@@ -583,8 +558,6 @@ export const shareApi = {
   updateForSale,
   updateForSaleOfficialPricePercent,
   updateExpiration,
-  updateOwnerEmail,
-  transferOwner,
   updateAcl,
   saveProviderShare,
   exportAll,

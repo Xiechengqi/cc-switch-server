@@ -24,14 +24,7 @@ export function ClientTunnelSettingsPanel({
   const startMutation = useStartClientTunnelMutation();
   const stopMutation = useStopClientTunnelMutation();
 
-  const [ownerEmailInput, setOwnerEmailInput] = useState("");
   const [subdomainInput, setSubdomainInput] = useState("");
-
-  useEffect(() => {
-    if (clientTunnel?.config?.ownerEmail) {
-      setOwnerEmailInput(clientTunnel.config.ownerEmail);
-    }
-  }, [clientTunnel?.config?.ownerEmail]);
 
   useEffect(() => {
     if (clientTunnel?.config?.subdomain) {
@@ -39,18 +32,17 @@ export function ClientTunnelSettingsPanel({
     }
   }, [clientTunnel?.config?.subdomain]);
 
-  const normalizedOwnerEmail = ownerEmailInput.trim().toLowerCase();
+  const ownerEmail = clientTunnel?.config?.ownerEmail?.trim() ?? "";
   const isSaving = claimMutation.isPending;
 
   const handleSave = useCallback(async () => {
-    if (!subdomainInput.trim() || !normalizedOwnerEmail) return;
+    if (!subdomainInput.trim() || !ownerEmail) return;
     await claimMutation.mutateAsync({
-      ownerEmail: normalizedOwnerEmail,
       subdomain: subdomainInput.trim(),
       enabled: true,
       autoStart: true,
     });
-  }, [claimMutation, normalizedOwnerEmail, subdomainInput]);
+  }, [claimMutation, ownerEmail, subdomainInput]);
 
   const statusLabel = clientTunnel?.status?.info
     ? t("settings.share.clientTunnel.running", { defaultValue: "运行中" })
@@ -73,10 +65,10 @@ export function ClientTunnelSettingsPanel({
           <Input
             className="h-9"
             type="email"
-            value={ownerEmailInput}
+            value={ownerEmail}
             placeholder="owner@example.com"
-            disabled={isLoading || isSaving}
-            onChange={(event) => setOwnerEmailInput(event.target.value)}
+            disabled
+            readOnly
           />
         </div>
         <div className="space-y-2">
@@ -122,7 +114,7 @@ export function ClientTunnelSettingsPanel({
           variant="outline"
           size="sm"
           disabled={
-            !subdomainInput.trim() || !normalizedOwnerEmail || isSaving
+            !subdomainInput.trim() || !ownerEmail || isSaving
           }
           onClick={() => void handleSave()}
         >

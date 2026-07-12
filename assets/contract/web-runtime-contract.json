@@ -329,7 +329,7 @@
       "implemented": true,
       "feature": "router",
       "endpoint": "POST /api/router/client-tunnel/claim",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "notes": "Claims or updates the Client Tunnel subdomain. Owner is read-only and derived from the verified Client Owner."
     },
     {
       "name": "clear_claude_onboarding_skip",
@@ -495,7 +495,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /api/shares",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "notes": "Creates a Share with owner derived from the configured Client Owner; payload owner values are ignored."
     },
     {
       "name": "deepseek_account_add",
@@ -597,7 +597,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/email_auth_change_owner_email",
-      "notes": "Verifies the new owner email code, calls router change-owner-email, then updates local owner config and shares."
+      "notes": "Verifies the new Client Owner email, updates the Router Installation Owner, then rebinds every local Share while preserving each previous owner as shared access."
     },
     {
       "name": "email_auth_get_status",
@@ -1639,7 +1639,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/save_provider_share",
-      "notes": "Atomically persists the complete share configuration from a Provider edit page."
+      "notes": "Atomically persists Provider Share configuration while keeping Share Owner derived from Client Owner."
     },
     {
       "name": "set_auto_launch",
@@ -1855,7 +1855,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/transfer_share_owner",
-      "notes": "Compatibility shim; target owner must already match verified email-auth owner state. New owner changes use email_auth_change_owner_email."
+      "notes": "Compatibility no-op; target must equal Client Owner. Independent Share Owner transfer is rejected."
     },
     {
       "name": "update_circuit_breaker_config",
@@ -1966,7 +1966,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/update_share_owner_email",
-      "notes": "Compatibility shim; target owner must already match verified email-auth owner state. New owner changes use email_auth_change_owner_email."
+      "notes": "Compatibility no-op; target must equal Client Owner. Independent Share Owner changes are rejected."
     },
     {
       "name": "update_share_parallel_limit",

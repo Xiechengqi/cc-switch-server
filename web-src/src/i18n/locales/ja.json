@@ -111,6 +111,10 @@
     "noProvidersDescriptionSnippet": "API キーとリクエスト URL 以外のデータ（プラグインなど）は共通設定スニペットに保存され、プロバイダー間で共有できます",
     "currentlyUsing": "現在使用中",
     "enable": "有効化",
+    "share": {
+      "ownerNotConfigured": "先に Client Owner を設定してください",
+      "ownerManagedHint": "Share Owner は常に Client Owner と一致し、メール所有権の確認後にのみ変更できます。"
+    },
     "inUse": "使用中",
     "editProvider": "プロバイダーを編集",
     "editProviderHint": "保存すると現在のプロバイダーにすぐ反映されます。",

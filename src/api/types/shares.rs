@@ -21,6 +21,7 @@ pub(in crate::api) struct ImportSharesRequest {
 pub(in crate::api) struct ImportSharesResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) imported: usize,
+    pub(in crate::api) owner_normalized: usize,
 }
 
 #[derive(Debug, Serialize)]

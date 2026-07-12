@@ -162,7 +162,7 @@ export function ProviderShareSection({
   onOpenShareSettings,
 }: ProviderShareSectionProps) {
   const { t } = useTranslation();
-  const { share, state, data: shares = [] } = useProviderShare(appId, providerId);
+  const { share, state } = useProviderShare(appId, providerId);
   const { data: clientTunnel } = useClientTunnelQuery();
   const { data: settings } = useSettingsQuery();
   const tunnelConfig = useMemo(
@@ -181,7 +181,6 @@ export function ProviderShareSection({
   const [isShareOpen, setIsShareOpen] = useState(false);
   const [confirmFreeOpen, setConfirmFreeOpen] = useState(false);
 
-  const [ownerEmailInput, setOwnerEmailInput] = useState("");
   const [subdomainInput, setSubdomainInput] = useState("");
   const [descriptionInput, setDescriptionInput] = useState("");
   const [forSaleValue, setForSaleValue] = useState<"Yes" | "No" | "Free">("Yes");
@@ -233,8 +232,8 @@ export function ProviderShareSection({
   );
 
   const ownerEmail = useMemo(
-    () => resolveShareOwnerEmail(clientTunnel?.config?.ownerEmail, shares),
-    [clientTunnel?.config?.ownerEmail, shares],
+    () => resolveShareOwnerEmail(clientTunnel?.config?.ownerEmail),
+    [clientTunnel?.config?.ownerEmail],
   );
 
   const routerConsoleUrl = useMemo(() => {
@@ -255,8 +254,6 @@ export function ProviderShareSection({
     parallelLimitTouchedRef.current = false;
     expiresTouchedRef.current = false;
 
-    const resolvedOwner = share?.ownerEmail?.trim() || ownerEmail;
-    setOwnerEmailInput(resolvedOwner);
     setDescriptionInput(share?.description?.trim() ?? "");
     setForSaleValue(share?.forSale ?? "Yes");
     setSaleMarketKind(share?.saleMarketKind ?? "token");
@@ -303,9 +300,9 @@ export function ProviderShareSection({
   ]);
 
   useEffect(() => {
-    if (!shareExists || subdomainManualRef.current || share) return;
-    setSubdomainInput(deriveSubdomainFromEmail(ownerEmailInput));
-  }, [shareExists, ownerEmailInput, share]);
+    if (shareExists || subdomainManualRef.current || share) return;
+    setSubdomainInput(deriveSubdomainFromEmail(ownerEmail));
+  }, [shareExists, ownerEmail, share]);
 
   const busy =
     createMutation.isPending ||
@@ -320,7 +317,7 @@ export function ProviderShareSection({
     return null;
   }
 
-  const normalizedOwnerEmail = ownerEmailInput.trim().toLowerCase();
+  const normalizedOwnerEmail = ownerEmail.trim().toLowerCase();
   const ownerEmailInvalid =
     !normalizedOwnerEmail || !isValidShareEmail(normalizedOwnerEmail);
   const shareToInvalid = shareToEmails.some(
@@ -421,7 +418,6 @@ export function ProviderShareSection({
       resolveExpiresAt(),
     );
     const created = await createMutation.mutateAsync({
-      ownerEmail: normalizedOwnerEmail,
       bindings: { [shareableApp]: providerId },
       forSale: forSaleValue,
       saleMarketKind,
@@ -461,7 +457,6 @@ export function ProviderShareSection({
     );
     await saveMutation.mutateAsync({
       shareId: share.id,
-      ownerEmail: normalizedOwnerEmail,
       subdomain: subdomainInput.trim(),
       description: descriptionInput.trim() || undefined,
       forSale: forSaleValue,
@@ -626,12 +621,20 @@ export function ProviderShareSection({
                   <Input
                     id="provider-share-owner-email"
                     type="email"
-                    value={ownerEmailInput}
-                    disabled={busy}
-                    onChange={(event) => setOwnerEmailInput(event.target.value)}
-                    placeholder="owner@example.com"
+                    value={ownerEmail}
+                    disabled
+                    readOnly
+                    placeholder={t("provider.share.ownerNotConfigured", {
+                      defaultValue: "请先配置 Client Owner",
+                    })}
                   />
-                  {ownerEmailInput.trim() && ownerEmailInvalid ? (
+                  <p className="text-xs text-muted-foreground">
+                    {t("provider.share.ownerManagedHint", {
+                      defaultValue:
+                        "Share Owner 与 Client Owner 保持一致，只能通过验证邮箱所有权后修改。",
+                    })}
+                  </p>
+                  {ownerEmail && ownerEmailInvalid ? (
                     <p className="text-xs text-destructive">
                       {t("share.validation.invalidEmail", {
                         defaultValue: "邮箱格式无效",

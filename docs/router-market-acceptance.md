@@ -100,7 +100,7 @@ share-market grant 会在 router 中转成 pending share edit。server 侧通过
 处理流程：
 
 1. 用 installation identity 签名请求 `/v1/shares/pending-edits`。
-2. 将 `ShareSettingsPatch` 应用到本地 share 的 owner、ACL、appSettings、forSale、price、limits、expiresAt、autoStart。
+2. 将 `ShareSettingsPatch` 应用到本地 share 的 ACL、appSettings、forSale、price、limits、expiresAt、autoStart；`ownerEmail` patch 必须由 router 和 server 双方拒绝。
 3. 同步更新后的 share descriptor 到 router。
 4. 回写 `/v1/shares/edit-ack` 为 `applied` 或 `rejected`。
 5. 更新本地 `marketGrant.status/grantId/lastError/updatedAtMs`，供 Web Share 页和 router descriptor 展示。
@@ -118,6 +118,8 @@ scripts/smoke/share-market-grant-smoke.sh
 - router client 表中 0 share client 也显示在线/健康。
 - `clientSubdomain.routerDomain` 能打开 server Web。
 - router share 表字段与 server runtime snapshot 一致。
+- router 强制每个 Share Owner 等于 Installation Owner；不匹配的单条/批量同步被拒绝，已验证的 Installation Owner 变更会原子重绑全部 Share 并保留旧 owner 的共享访问。
+- Client Tunnel claim/update 只能携带当前 Installation Owner，不能借由 tunnel payload 创建或修改 Installation Owner。
 - market admin Shares 页能看到 app runtime、provider、model、quota、health。
 - direct share URL 和 market api URL 都能命中正确 binding。
 - request log 国家/IP/source 不丢，direct/market 不重复。

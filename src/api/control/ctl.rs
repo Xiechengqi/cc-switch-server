@@ -11,6 +11,21 @@ pub(crate) async fn control_apply_share_settings(
     verify_control_request(&state, APPLY_SHARE_SETTINGS_PATH, &headers, &body).await?;
     let input: ControlApplyShareSettingsInput =
         serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    if let Some(requested_owner) = input.patch.owner_email.as_deref() {
+        let configured_owner = state
+            .config
+            .read()
+            .await
+            .owner
+            .email
+            .clone()
+            .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?;
+        if !configured_owner.eq_ignore_ascii_case(requested_owner.trim()) {
+            return Err(ApiError::conflict(
+                "share owner is managed by the client owner",
+            ));
+        }
+    }
     let share = state
         .mutate_shares_immediate(|shares| {
             shares

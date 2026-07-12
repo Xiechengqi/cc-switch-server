@@ -558,143 +558,16 @@ impl ShareStore {
         Ok(share.clone())
     }
 
-    pub fn update_owner_email(
+    pub fn bind_all_to_client_owner(
         &mut self,
-        share_id: &str,
         owner_email: &str,
-    ) -> Result<Share, SharePatchError> {
-        let share = self
-            .shares
-            .iter_mut()
-            .find(|item| item.id == share_id)
-            .ok_or(SharePatchError::NotFound)?;
-        let owner_email = normalize_verified_email(owner_email)?;
-        let shared_with_emails =
-            normalize_email_list(&share.acl.shared_with_emails, Some(&owner_email));
-        share.owner_email = Some(owner_email.clone());
-        share.acl.shared_with_emails = shared_with_emails;
-        share.acl.market_access_mode = Some(normalize_non_empty(
-            share
-                .acl
-                .market_access_mode
-                .clone()
-                .unwrap_or_else(|| "selected".to_string()),
-            "selected",
-        ));
-        share.access_by_app =
-            normalize_access_by_app(share.access_by_app.clone(), Some(&owner_email));
-        share.app_settings = normalize_app_settings(share.app_settings.clone(), Some(&owner_email));
-        Self::sync_owner_email_snapshot(share, &owner_email);
-        Ok(share.clone())
-    }
-
-    pub fn transfer_owner_email(
-        &mut self,
-        share_id: &str,
-        target_email: &str,
-    ) -> Result<Share, SharePatchError> {
-        let share = self
-            .shares
-            .iter_mut()
-            .find(|item| item.id == share_id)
-            .ok_or(SharePatchError::NotFound)?;
-        let old_owner_email = share
-            .owner_email
-            .clone()
-            .ok_or_else(|| SharePatchError::Invalid("share has no owner email".to_string()))?;
-        let old_owner_email = normalize_verified_email(&old_owner_email)?;
-        let target_email = normalize_verified_email(target_email)?;
-        if old_owner_email.eq_ignore_ascii_case(&target_email) {
-            return Err(SharePatchError::Invalid(
-                "target owner email must differ from current owner email".to_string(),
-            ));
-        }
-        let current_shared_with =
-            normalize_email_list(&share.acl.shared_with_emails, Some(&old_owner_email));
-        if !current_shared_with
-            .iter()
-            .any(|email| email.eq_ignore_ascii_case(&target_email))
-        {
-            return Err(SharePatchError::Invalid(
-                "target email must already be in the share ACL".to_string(),
-            ));
-        }
-        let mut next_shared_with = current_shared_with
-            .into_iter()
-            .filter(|email| !email.eq_ignore_ascii_case(&target_email))
-            .collect::<Vec<_>>();
-        if !next_shared_with
-            .iter()
-            .any(|email| email.eq_ignore_ascii_case(&old_owner_email))
-        {
-            next_shared_with.push(old_owner_email.clone());
-        }
-        let next_shared_with = normalize_email_list(&next_shared_with, Some(&target_email));
-        share.owner_email = Some(target_email.clone());
-        share.acl.shared_with_emails = next_shared_with;
-        share.acl.market_access_mode = Some(normalize_non_empty(
-            share
-                .acl
-                .market_access_mode
-                .clone()
-                .unwrap_or_else(|| "selected".to_string()),
-            "selected",
-        ));
-        for access in share.access_by_app.values_mut() {
-            access
-                .shared_with_emails
-                .retain(|email| !email.eq_ignore_ascii_case(&target_email));
-            if !access
-                .shared_with_emails
-                .iter()
-                .any(|email| email.eq_ignore_ascii_case(&old_owner_email))
-            {
-                access.shared_with_emails.push(old_owner_email.clone());
-            }
-            access.shared_with_emails =
-                normalize_email_list(&access.shared_with_emails, Some(&target_email));
-        }
-        share.access_by_app =
-            normalize_access_by_app(share.access_by_app.clone(), Some(&target_email));
-        Self::sync_owner_email_snapshot(share, &target_email);
-        Ok(share.clone())
-    }
-
-    pub fn change_owner_email_for_all(
-        &mut self,
-        old_email: &str,
-        new_email: &str,
     ) -> Result<Vec<Share>, SharePatchError> {
-        let old_email = normalize_verified_email(old_email)?;
-        let new_email = normalize_verified_email(new_email)?;
-        if old_email.eq_ignore_ascii_case(&new_email) {
-            return Err(SharePatchError::Invalid(
-                "new owner email must differ from current owner email".to_string(),
-            ));
-        }
-
+        let owner_email = normalize_verified_email(owner_email)?;
         let mut updated = Vec::new();
         for share in &mut self.shares {
-            if !share
-                .owner_email
-                .as_deref()
-                .is_some_and(|email| email.eq_ignore_ascii_case(&old_email))
-            {
-                continue;
+            if bind_share_to_client_owner(share, &owner_email) {
+                updated.push(share.clone());
             }
-            share.owner_email = Some(new_email.clone());
-            share.acl.shared_with_emails =
-                normalize_email_list(&share.acl.shared_with_emails, Some(&new_email));
-            share.access_by_app =
-                normalize_access_by_app(share.access_by_app.clone(), Some(&new_email));
-            share.app_settings =
-                normalize_app_settings(share.app_settings.clone(), Some(&new_email));
-            Self::sync_owner_email_snapshot(share, &new_email);
-            updated.push(share.clone());
-        }
-
-        if updated.is_empty() {
-            return Err(SharePatchError::NotFound);
         }
         Ok(updated)
     }
@@ -812,16 +685,14 @@ impl ShareStore {
         if let Some(owner_email) = patch.owner_email {
             let owner_email = normalize_optional_email(Some(owner_email))
                 .ok_or_else(|| SharePatchError::Invalid("ownerEmail is empty".to_string()))?;
-            let old_owner = share.owner_email.clone();
-            if old_owner.as_deref() != Some(owner_email.as_str()) {
-                if let Some(old_owner) = old_owner {
-                    insert_email(&mut share.acl.shared_with_emails, old_owner);
-                }
-                share
-                    .acl
-                    .shared_with_emails
-                    .retain(|email| !email.eq_ignore_ascii_case(&owner_email));
-                share.owner_email = Some(owner_email);
+            if !share
+                .owner_email
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(&owner_email))
+            {
+                return Err(SharePatchError::Invalid(
+                    "share owner is managed by the client owner".to_string(),
+                ));
             }
         }
 
@@ -969,6 +840,37 @@ impl ShareStore {
             }
         }
     }
+}
+
+fn bind_share_to_client_owner(share: &mut Share, owner_email: &str) -> bool {
+    if share
+        .owner_email
+        .as_deref()
+        .is_some_and(|current| current == owner_email)
+    {
+        return false;
+    }
+    let previous_owner = share
+        .owner_email
+        .as_deref()
+        .and_then(|email| normalize_verified_email(email).ok())
+        .filter(|email| !email.eq_ignore_ascii_case(owner_email));
+    if let Some(previous_owner) = previous_owner {
+        insert_email(&mut share.acl.shared_with_emails, previous_owner.clone());
+        for access in share.access_by_app.values_mut() {
+            insert_email(&mut access.shared_with_emails, previous_owner.clone());
+        }
+        for settings in share.app_settings.values_mut() {
+            insert_email(&mut settings.shared_with_emails, previous_owner.clone());
+        }
+    }
+    share.owner_email = Some(owner_email.to_string());
+    share.acl.shared_with_emails =
+        normalize_email_list(&share.acl.shared_with_emails, Some(owner_email));
+    share.access_by_app = normalize_access_by_app(share.access_by_app.clone(), Some(owner_email));
+    share.app_settings = normalize_app_settings(share.app_settings.clone(), Some(owner_email));
+    ShareStore::sync_owner_email_snapshot(share, owner_email);
+    true
 }
 
 fn runtime_snapshot_for_share(
@@ -2210,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn update_owner_email_renormalizes_acl_without_verification() {
+    fn bind_owner_renormalizes_acl() {
         let mut store = ShareStore::default();
         store
             .upsert(UpsertShareInput {
@@ -2252,8 +2154,9 @@ mod tests {
             .unwrap();
 
         let updated = store
-            .update_owner_email("s1", "new-owner@example.com")
+            .bind_all_to_client_owner("new-owner@example.com")
             .unwrap();
+        let updated = &updated[0];
         assert_eq!(
             updated.owner_email.as_deref(),
             Some("new-owner@example.com")
@@ -2268,7 +2171,66 @@ mod tests {
     }
 
     #[test]
-    fn change_owner_email_for_all_updates_matching_owner_shares() {
+    fn bind_all_to_client_owner_preserves_previous_owner_access_and_is_idempotent() {
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("owner-bind");
+        input.owner_email = Some("previous@example.com".to_string());
+        input.access_by_app.insert(
+            "codex".to_string(),
+            ShareAppAccess {
+                shared_with_emails: vec!["buyer@example.com".to_string()],
+                market_access_mode: "selected".to_string(),
+            },
+        );
+        input.app_settings = codex_app_settings(vec!["buyer@example.com"]);
+        store.upsert(input).unwrap();
+
+        let updated = store
+            .bind_all_to_client_owner("client@example.com")
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+        let share = store.get("owner-bind").unwrap();
+        assert_eq!(share.owner_email.as_deref(), Some("client@example.com"));
+        assert!(share
+            .acl
+            .shared_with_emails
+            .iter()
+            .any(|email| email == "previous@example.com"));
+        assert!(share.access_by_app["codex"]
+            .shared_with_emails
+            .iter()
+            .any(|email| email == "previous@example.com"));
+        assert!(share.app_settings["codex"]
+            .shared_with_emails
+            .iter()
+            .any(|email| email == "previous@example.com"));
+        assert!(store
+            .bind_all_to_client_owner("client@example.com")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn bind_all_to_client_owner_discards_invalid_previous_owner() {
+        let mut store = ShareStore::default();
+        store
+            .upsert(codex_share_input("invalid-owner-bind"))
+            .unwrap();
+        store.shares[0].owner_email = Some("invalid-owner".to_string());
+        store
+            .bind_all_to_client_owner("client@example.com")
+            .unwrap();
+        let share = store.get("invalid-owner-bind").unwrap();
+        assert_eq!(share.owner_email.as_deref(), Some("client@example.com"));
+        assert!(!share
+            .acl
+            .shared_with_emails
+            .iter()
+            .any(|email| email == "invalid-owner"));
+    }
+
+    #[test]
+    fn bind_owner_updates_all_shares() {
         let mut store = ShareStore::default();
         let mut first = codex_share_input("s1");
         first.acl = Some(ShareAcl {
@@ -2290,17 +2252,17 @@ mod tests {
         let _ = store.upsert(other).unwrap();
 
         let updated = store
-            .change_owner_email_for_all("OWNER@example.com", "New-Owner@Example.com")
+            .bind_all_to_client_owner("New-Owner@Example.com")
             .unwrap();
 
-        assert_eq!(updated.len(), 2);
+        assert_eq!(updated.len(), 3);
         assert_eq!(
             store
                 .shares
                 .iter()
                 .filter(|share| share.owner_email.as_deref() == Some("new-owner@example.com"))
                 .count(),
-            2
+            3
         );
         assert_eq!(
             store
@@ -2308,24 +2270,30 @@ mod tests {
                 .iter()
                 .find(|share| share.id == "s3")
                 .and_then(|share| share.owner_email.as_deref()),
-            Some("other@example.com")
+            Some("new-owner@example.com")
         );
         let first = store.shares.iter().find(|share| share.id == "s1").unwrap();
         assert_eq!(
             first.acl.shared_with_emails,
-            vec!["buyer@example.com".to_string()]
+            vec![
+                "buyer@example.com".to_string(),
+                "owner@example.com".to_string()
+            ]
         );
         assert_eq!(
             first
                 .app_settings
                 .get("codex")
                 .map(|settings| settings.shared_with_emails.clone()),
-            Some(vec!["buyer@example.com".to_string()])
+            Some(vec![
+                "buyer@example.com".to_string(),
+                "owner@example.com".to_string()
+            ])
         );
     }
 
     #[test]
-    fn transfer_owner_email_requires_existing_acl_member() {
+    fn binding_owner_demotes_previous_owner() {
         let mut store = ShareStore::default();
         store
             .upsert(UpsertShareInput {
@@ -2363,9 +2331,8 @@ mod tests {
             })
             .unwrap();
 
-        let updated = store
-            .transfer_owner_email("s1", "buyer@example.com")
-            .unwrap();
+        let updated = store.bind_all_to_client_owner("buyer@example.com").unwrap();
+        let updated = &updated[0];
         assert_eq!(updated.owner_email.as_deref(), Some("buyer@example.com"));
         assert!(updated
             .acl
