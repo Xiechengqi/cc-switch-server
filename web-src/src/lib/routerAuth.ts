@@ -1,8 +1,10 @@
 const AUTH_KEY = "cc_switch_router_auth_v1";
 const SERVER_PASSWORD_KEY = "cc_switch_server_password";
+export const SERVER_AUTH_EXPIRED_EVENT = "cc-switch-server-auth-expired";
 
 let refreshInFlight: { promise: Promise<boolean> | null } = { promise: null };
 let reloginInFlight: { promise: Promise<boolean> | null } = { promise: null };
+let authExpiryNotified = false;
 
 export interface RouterAuthState {
   authProvider?: "router" | "apiToken" | "password" | null;
@@ -294,6 +296,7 @@ async function reloginWithCachedWebPassword(): Promise<boolean> {
       await loginWithWebPassword(password);
       return true;
     } catch {
+      localStorage.removeItem(SERVER_PASSWORD_KEY);
       return false;
     } finally {
       reloginInFlight.promise = null;
@@ -472,7 +475,19 @@ export async function routerAuthFetch(
   if (response.status === 401 && (await reloginWithCachedWebPassword())) {
     response = await fetchWithAuth(input, init);
   }
+  if (response.status === 401) {
+    notifyServerAuthExpired();
+  } else {
+    authExpiryNotified = false;
+  }
   return response;
+}
+
+function notifyServerAuthExpired(): void {
+  if (authExpiryNotified) return;
+  authExpiryNotified = true;
+  clearRouterSessionTokens();
+  window.dispatchEvent(new CustomEvent(SERVER_AUTH_EXPIRED_EVENT));
 }
 
 export async function getRouterSessionStatus(): Promise<RouterSessionStatus> {

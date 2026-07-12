@@ -88,6 +88,16 @@ export interface WebRuntimeContext {
   };
 }
 
+export class HttpResponseError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "HttpResponseError";
+  }
+}
+
 const TOKEN_KEY = "cc_switch_server_token";
 const PASSWORD_KEY = "cc_switch_server_password";
 
@@ -131,7 +141,10 @@ export async function loginWithPassword(password: string): Promise<string> {
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.error || data?.message || `HTTP ${response.status}`);
+    throw new HttpResponseError(
+      data?.error || data?.message || `HTTP ${response.status}`,
+      response.status,
+    );
   }
   const token = String(data?.token ?? "");
   if (!token) {
@@ -200,7 +213,10 @@ export async function jsonFetch<T>(
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.error || data?.message || `HTTP ${response.status}`);
+    throw new HttpResponseError(
+      data?.error || data?.message || `HTTP ${response.status}`,
+      response.status,
+    );
   }
   return data as T;
 }

@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 import { Network } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 
 import ServerDesktopApp from "@/ServerDesktopApp";
 import { ClientWebLoginPage } from "@/components/ClientWebLoginPage";
 import { LoginPanel } from "@/components/LoginPanel";
 import { isRemoteWebMode } from "@/lib/api/auth";
 import { getWebRuntimeContext, WebRuntimeContext } from "@/lib/runtime";
+import { SERVER_AUTH_EXPIRED_EVENT } from "@/lib/routerAuth";
 import { useI18n } from "@/lib/i18n";
 
 function App() {
   const { t } = useI18n();
+  const queryClient = useQueryClient();
   const [context, setContext] = useState<WebRuntimeContext | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -34,6 +37,17 @@ function App() {
       active = false;
     };
   }, [refreshContext]);
+
+  useEffect(() => {
+    const handleAuthExpired = () => {
+      queryClient.clear();
+      setError(null);
+      setLoading(false);
+      setContext({ mode: "client-login", status: "auth-required" });
+    };
+    window.addEventListener(SERVER_AUTH_EXPIRED_EVENT, handleAuthExpired);
+    return () => window.removeEventListener(SERVER_AUTH_EXPIRED_EVENT, handleAuthExpired);
+  }, [queryClient]);
 
   if (!context || loading) {
     return <EmptyState title={t("common.loading")} value={t("server.common.runtime")} />;
