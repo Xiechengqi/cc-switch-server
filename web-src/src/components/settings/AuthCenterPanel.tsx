@@ -84,7 +84,7 @@ function AuthProviderAccordionItem({
   );
 }
 
-export function AuthCenterPanel() {
+export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { data: settings } = useSettingsQuery();
@@ -237,10 +237,15 @@ export function AuthCenterPanel() {
           <CollapsibleContent>
             <div className="space-y-5 border-t border-border/50 px-4 pb-4 pt-4">
               <p className="text-sm text-muted-foreground">
-                {t("settings.authCenter.description", {
-                  defaultValue:
-                    "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
-                })}
+                {serverMode
+                  ? t("settings.authCenter.serverDescription", {
+                      defaultValue:
+                        "管理用于反代上游的官方 OAuth 账号。用量刷新仅作用于当前激活的供应商。",
+                    })
+                  : t("settings.authCenter.description", {
+                      defaultValue:
+                        "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
+                    })}
               </p>
 
               <div className="grid gap-4 md:grid-cols-2">
@@ -338,6 +343,7 @@ export function AuthCenterPanel() {
           <ClaudeOAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
 
+        {!serverMode ? (
         <AuthProviderAccordionItem
           value="copilot"
           icon={<Github className="h-5 w-5" />}
@@ -348,6 +354,7 @@ export function AuthCenterPanel() {
         >
           <CopilotAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
+        ) : null}
 
         <AuthProviderAccordionItem
           value="codex"
@@ -360,6 +367,8 @@ export function AuthCenterPanel() {
           <CodexOAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
 
+        {!serverMode ? (
+          <>
         <AuthProviderAccordionItem
           value="grok"
           icon={<ProviderIcon icon="grok" name="Grok" size={24} />}
@@ -392,6 +401,8 @@ export function AuthCenterPanel() {
         >
           <CursorOAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
+          </>
+        ) : null}
 
         <AuthProviderAccordionItem
           value="gemini"
@@ -404,6 +415,8 @@ export function AuthCenterPanel() {
           <GeminiOAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
 
+        {!serverMode ? (
+          <>
         <AuthProviderAccordionItem
           value="antigravity"
           icon={<SparklesIcon className="h-5 w-5" />}
@@ -425,6 +438,8 @@ export function AuthCenterPanel() {
         >
           <DeepSeekAccountSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
+          </>
+        ) : null}
       </Accordion>
     </motion.div>
   );

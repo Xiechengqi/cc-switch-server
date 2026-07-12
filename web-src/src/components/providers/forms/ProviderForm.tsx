@@ -13,6 +13,7 @@ import {
   formatRequestOverrideObject,
 } from "@/lib/requestOverrides";
 import { providersApi, settingsApi, type AppId } from "@/lib/api";
+import { isServerWebRuntime } from "@/lib/runtime";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import type {
   ProviderCategory,
@@ -336,12 +337,15 @@ function ProviderFormFull({
   }
 
   const { t } = useTranslation();
+  const serverWeb = isServerWebRuntime();
   const isEditMode = Boolean(initialData);
   const queryClient = useQueryClient();
   const { data: settingsData } = useSettingsQuery();
   const { data: sharesForProviderPricing = [] } = useSharesQuery();
   const showCommonConfigNotice =
-    settingsData != null && settingsData.commonConfigConfirmed !== true;
+    !serverWeb &&
+    settingsData != null &&
+    settingsData.commonConfigConfirmed !== true;
   const isDarkMode = useDarkMode();
 
   const handleCommonConfigConfirm = async () => {
@@ -3241,6 +3245,7 @@ function ProviderFormFull({
                 isProxyTakeover={isProxyTakeover}
                 onAuthChange={setCodexAuth}
                 onConfigChange={handleCodexConfigChange}
+                hideCommonConfig={serverWeb}
                 useCommonConfig={useCodexCommonConfigFlag}
                 onCommonConfigToggle={handleCodexCommonConfigToggle}
                 commonConfigSnippet={codexCommonConfigSnippet}
@@ -3263,6 +3268,7 @@ function ProviderFormFull({
                 configValue={geminiConfig}
                 onEnvChange={handleGeminiEnvChange}
                 onConfigChange={handleGeminiConfigChange}
+                hideCommonConfig={serverWeb}
                 useCommonConfig={useGeminiCommonConfigFlag}
                 onCommonConfigToggle={handleGeminiCommonConfigToggle}
                 commonConfigSnippet={geminiCommonConfigSnippet}
@@ -3384,6 +3390,7 @@ function ProviderFormFull({
             </>
           ) : (
             <>
+              {!serverWeb ? (
               <CommonConfigEditor
                 value={form.getValues("settingsConfig")}
                 onChange={(value) => form.setValue("settingsConfig", value)}
@@ -3401,6 +3408,23 @@ function ProviderFormFull({
                 onExtract={handleClaudeExtract}
                 isExtracting={isClaudeExtracting}
               />
+              ) : (
+              <div className="space-y-2">
+                <Label htmlFor="settingsConfig">
+                  {t("provider.advancedConfigJson", {
+                    defaultValue: "高级配置JSON",
+                  })}
+                </Label>
+                <JsonEditor
+                  value={form.getValues("settingsConfig")}
+                  onChange={(config) => form.setValue("settingsConfig", config)}
+                  rows={14}
+                  showValidation={true}
+                  language="json"
+                  darkMode={isDarkMode}
+                />
+              </div>
+              )}
               {settingsConfigErrorField}
             </>
           )}

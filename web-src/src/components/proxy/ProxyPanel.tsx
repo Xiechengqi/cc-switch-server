@@ -27,7 +27,11 @@ import type { ProxyStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
 
-export function ProxyPanel() {
+interface ProxyPanelProps {
+  serverMode?: boolean;
+}
+
+export function ProxyPanel({ serverMode = false }: ProxyPanelProps) {
   const { t } = useTranslation();
   const { status, isRunning } = useProxyStatus();
 
@@ -202,7 +206,7 @@ export function ProxyPanel() {
           </span>
         </div>
 
-        {/* [2] App takeover state — always enabled for supported apps */}
+        {/* Routing readiness (server) or app takeover (desktop) */}
         <AnimatePresence>
           {(isRunning || takeoverStatus) && (
             <motion.div
@@ -214,9 +218,13 @@ export function ProxyPanel() {
             >
               <div className="rounded-xl border-2 border-primary/20 bg-primary/5 p-4 space-y-3">
                 <p className="text-xs font-medium text-primary">
-                  {t("proxyConfig.appTakeover", {
-                    defaultValue: "应用接管",
-                  })}
+                  {serverMode
+                    ? t("proxyConfig.apiRouting", {
+                        defaultValue: "API 路由状态",
+                      })
+                    : t("proxyConfig.appTakeover", {
+                        defaultValue: "应用接管",
+                      })}
                 </p>
                 <div className="grid gap-2 sm:grid-cols-3">
                   {(["claude", "codex", "gemini"] as const).map((appType) => {
@@ -237,17 +245,25 @@ export function ProxyPanel() {
                       : isPending
                         ? "bg-amber-500/10 text-amber-700 dark:text-amber-300"
                         : "bg-yellow-500/10 text-yellow-700 dark:text-yellow-300";
-                    const label = isActive
-                      ? t("proxy.takeover.alwaysEnabled", {
-                          defaultValue: "已启用",
-                        })
-                      : isPending
-                        ? t("proxy.takeover.pendingProvider", {
-                            defaultValue: "待 provider",
+                    const label = serverMode
+                      ? isActive
+                        ? t("proxy.routing.ready", {
+                            defaultValue: "已路由",
                           })
-                        : t("proxy.takeover.recovering", {
-                            defaultValue: "恢复中",
-                          });
+                        : t("proxy.routing.needsProvider", {
+                            defaultValue: "待配置",
+                          })
+                      : isActive
+                        ? t("proxy.takeover.alwaysEnabled", {
+                            defaultValue: "已启用",
+                          })
+                        : isPending
+                          ? t("proxy.takeover.pendingProvider", {
+                              defaultValue: "待 provider",
+                            })
+                          : t("proxy.takeover.recovering", {
+                              defaultValue: "恢复中",
+                            });
                     return (
                       <div
                         key={appType}
@@ -266,21 +282,38 @@ export function ProxyPanel() {
                   })}
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  {t("proxy.takeover.hint", {
-                    defaultValue:
-                      "Claude、Codex、Gemini 的请求默认通过本地路由转发，并由系统保持启用",
-                  })}
+                  {serverMode
+                    ? t("proxy.routing.hint", {
+                        defaultValue:
+                          "Token server 始终对外提供 Claude / Codex / Gemini API；为每个通道配置当前供应商后即可转发。",
+                      })
+                    : t("proxy.takeover.hint", {
+                        defaultValue:
+                          "Claude、Codex、Gemini 的请求默认通过本地路由转发，并由系统保持启用",
+                      })}
                 </p>
-                {(takeoverStatus?.claude_pending ||
-                  takeoverStatus?.codex_pending ||
-                  takeoverStatus?.gemini_pending) && (
-                  <p className="text-xs text-amber-700 dark:text-amber-300">
-                    {t("proxy.takeover.pendingHint", {
-                      defaultValue:
-                        "代理已就绪，但部分应用还没有 provider。添加 provider 后会自动启用接管。",
-                    })}
-                  </p>
-                )}
+                {!serverMode &&
+                  (takeoverStatus?.claude_pending ||
+                    takeoverStatus?.codex_pending ||
+                    takeoverStatus?.gemini_pending) && (
+                    <p className="text-xs text-amber-700 dark:text-amber-300">
+                      {t("proxy.takeover.pendingHint", {
+                        defaultValue:
+                          "代理已就绪，但部分应用还没有 provider。添加 provider 后会自动启用接管。",
+                      })}
+                    </p>
+                  )}
+                {serverMode &&
+                  (takeoverStatus?.claude_pending ||
+                    takeoverStatus?.codex_pending ||
+                    takeoverStatus?.gemini_pending) && (
+                    <p className="text-xs text-amber-700 dark:text-amber-300">
+                      {t("proxy.routing.pendingHint", {
+                        defaultValue:
+                          "部分 API 通道尚未配置供应商，相关请求将无法路由。",
+                      })}
+                    </p>
+                  )}
               </div>
             </motion.div>
           )}
@@ -320,9 +353,14 @@ export function ProxyPanel() {
                   </Button>
                 </div>
                 <p className="text-xs text-muted-foreground mt-2">
-                  {t("proxy.settings.restartRequired", {
-                    defaultValue: "修改监听地址/端口需要先停止代理服务",
-                  })}
+                  {serverMode
+                    ? t("proxy.settings.bindFromCli", {
+                        defaultValue:
+                          "监听地址与端口由 server 进程启动参数决定，修改后需重启服务。",
+                      })
+                    : t("proxy.settings.restartRequired", {
+                        defaultValue: "修改监听地址/端口需要先停止代理服务",
+                      })}
                 </p>
               </div>
 
@@ -476,7 +514,9 @@ export function ProxyPanel() {
           </div>
         ) : (
           <div className="space-y-6">
-            {/* [8] Basic settings — address/port (only when stopped) */}
+            {/* Basic settings — address/port (desktop only; server is always running) */}
+            {!serverMode ? (
+            <>
             <div className="rounded-lg border border-border bg-muted/40 p-4 space-y-4">
               <div>
                 <h4 className="text-sm font-semibold">
@@ -580,6 +620,8 @@ export function ProxyPanel() {
                 })}
               </p>
             </div>
+            </>
+            ) : null}
           </div>
         )}
       </section>

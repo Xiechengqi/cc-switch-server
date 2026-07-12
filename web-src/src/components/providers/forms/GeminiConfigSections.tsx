@@ -11,6 +11,7 @@ interface GeminiEnvSectionProps {
   onCommonConfigToggle: (checked: boolean) => void;
   onEditCommonConfig: () => void;
   commonConfigError?: string;
+  hideCommonConfig?: boolean;
 }
 
 /**
@@ -25,6 +26,7 @@ export const GeminiEnvSection: React.FC<GeminiEnvSectionProps> = ({
   onCommonConfigToggle,
   onEditCommonConfig,
   commonConfigError,
+  hideCommonConfig = false,
 }) => {
   const { t } = useTranslation();
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -61,6 +63,7 @@ export const GeminiEnvSection: React.FC<GeminiEnvSectionProps> = ({
           {t("geminiConfig.envFile", { defaultValue: "环境变量 (.env)" })}
         </label>
 
+        {!hideCommonConfig ? (
         <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
           <input
             type="checkbox"
@@ -72,8 +75,10 @@ export const GeminiEnvSection: React.FC<GeminiEnvSectionProps> = ({
             defaultValue: "应用通用配置",
           })}
         </label>
+        ) : null}
       </div>
 
+      {!hideCommonConfig ? (
       <div className="flex items-center justify-end">
         <button
           type="button"
@@ -85,8 +90,9 @@ export const GeminiEnvSection: React.FC<GeminiEnvSectionProps> = ({
           })}
         </button>
       </div>
+      ) : null}
 
-      {commonConfigError && (
+      {!hideCommonConfig && commonConfigError && (
         <p className="text-xs text-red-500 dark:text-red-400 text-right">
           {commonConfigError}
         </p>

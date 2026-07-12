@@ -14,6 +14,7 @@ import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
+import { isServerWebRuntime } from "@/lib/runtime";
 
 interface FailoverToggleProps {
   className?: string;
@@ -25,7 +26,9 @@ export function FailoverToggle({ className, activeApp }: FailoverToggleProps) {
   const { data: isEnabled = false, isLoading } =
     useAutoFailoverEnabled(activeApp);
   const setEnabled = useSetAutoFailoverEnabled();
-  const { isRunning } = useProxyStatus();
+  const { isRunning: proxyRunning } = useProxyStatus();
+  const serverWeb = isServerWebRuntime();
+  const isRunning = serverWeb || proxyRunning;
 
   const handleToggle = (checked: boolean) => {
     if (checked && !isRunning) return;

@@ -57,7 +57,7 @@ import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySettings";
 import { ServerVersionSettings } from "@/components/settings/ServerVersionSettings";
-import { LocalEnvCheckSettings } from "@/components/settings/LocalEnvCheckSettings";
+import { ServerConfigDirSettings } from "@/components/settings/ServerConfigDirSettings";
 import { ShareSettingsTab } from "@/components/settings/ShareSettingsTab";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
@@ -292,10 +292,12 @@ export function SettingsPage({
                       onChange={(lang) => handleAutoSave({ language: lang })}
                     />
                     <ThemeSettings />
-                    <AppVisibilitySettings
-                      settings={settings}
-                      onChange={handleAutoSave}
-                    />
+                    {!serverMode && (
+                      <AppVisibilitySettings
+                        settings={settings}
+                        onChange={handleAutoSave}
+                      />
+                    )}
                     {!serverMode && (
                       <>
                         <SkillStorageLocationSettings
@@ -323,15 +325,16 @@ export function SettingsPage({
                         />
                       </>
                     )}
-                    <CodexAuthSettings
-                      settings={settings}
-                      onChange={handleAutoSave}
-                    />
+                    {!serverMode && (
+                      <CodexAuthSettings
+                        settings={settings}
+                        onChange={handleAutoSave}
+                      />
+                    )}
                     {serverMode && (
                       <>
                         <ServerSecuritySettings onSignOut={onSignOut} />
                         <ServerVersionSettings />
-                        <LocalEnvCheckSettings />
                         {onSignOut ? (
                           <div className="flex justify-end">
                             <Button
@@ -363,6 +366,7 @@ export function SettingsPage({
                   <ProxyTabContent
                     settings={settings}
                     onAutoSave={handleAutoSave}
+                    serverMode={serverMode}
                   />
                 ) : null}
               </TabsContent>
@@ -374,7 +378,7 @@ export function SettingsPage({
                   transition={{ duration: 0.3 }}
                   className="space-y-6"
                 >
-                  <AuthCenterPanel />
+                  <AuthCenterPanel serverMode={serverMode} />
                 </motion.div>
               </TabsContent>
 
@@ -412,31 +416,50 @@ export function SettingsPage({
                             <FolderSearch className="h-5 w-5 text-primary" />
                             <div className="text-left">
                               <h3 className="text-base font-semibold">
-                                {t("settings.advanced.configDir.title")}
+                                {serverMode
+                                  ? t("settings.serverConfigDir.title", {
+                                      defaultValue: "Server 配置目录",
+                                    })
+                                  : t("settings.advanced.configDir.title")}
                               </h3>
                               <p className="text-sm text-muted-foreground font-normal">
-                                {t("settings.advanced.configDir.description")}
+                                {serverMode
+                                  ? t("settings.serverConfigDir.description", {
+                                      defaultValue:
+                                        "持久化数据目录（监听地址由启动参数配置）",
+                                    })
+                                  : t("settings.advanced.configDir.description")}
                               </p>
                             </div>
                           </div>
                         </AccordionTrigger>
                         <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-                          <DirectorySettings
-                            appConfigDir={appConfigDir}
-                            resolvedDirs={resolvedDirs}
-                            onAppConfigChange={updateAppConfigDir}
-                            onBrowseAppConfig={browseAppConfigDir}
-                            onResetAppConfig={resetAppConfigDir}
-                            claudeDir={settings.claudeConfigDir}
-                            codexDir={settings.codexConfigDir}
-                            geminiDir={settings.geminiConfigDir}
-                            opencodeDir={settings.opencodeConfigDir}
-                            openclawDir={settings.openclawConfigDir}
-                            hermesDir={settings.hermesConfigDir}
-                            onDirectoryChange={updateDirectory}
-                            onBrowseDirectory={browseDirectory}
-                            onResetDirectory={resetDirectory}
-                          />
+                          {serverMode ? (
+                            <ServerConfigDirSettings
+                              configDir={
+                                appConfigDir ??
+                                resolvedDirs.appConfig ??
+                                ""
+                              }
+                            />
+                          ) : (
+                            <DirectorySettings
+                              appConfigDir={appConfigDir}
+                              resolvedDirs={resolvedDirs}
+                              onAppConfigChange={updateAppConfigDir}
+                              onBrowseAppConfig={browseAppConfigDir}
+                              onResetAppConfig={resetAppConfigDir}
+                              claudeDir={settings.claudeConfigDir}
+                              codexDir={settings.codexConfigDir}
+                              geminiDir={settings.geminiConfigDir}
+                              opencodeDir={settings.opencodeConfigDir}
+                              openclawDir={settings.openclawConfigDir}
+                              hermesDir={settings.hermesConfigDir}
+                              onDirectoryChange={updateDirectory}
+                              onBrowseDirectory={browseDirectory}
+                              onResetDirectory={resetDirectory}
+                            />
+                          )}
                         </AccordionContent>
                       </AccordionItem>
 
@@ -507,6 +530,7 @@ export function SettingsPage({
                         </AccordionContent>
                       </AccordionItem>
 
+                      {!serverMode ? (
                       <AccordionItem
                         value="cloudSync"
                         className="rounded-xl glass-card overflow-hidden"
@@ -533,6 +557,7 @@ export function SettingsPage({
                           />
                         </AccordionContent>
                       </AccordionItem>
+                      ) : null}
 
                       <AccordionItem
                         value="test"

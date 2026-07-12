@@ -43,6 +43,8 @@ interface CodexConfigEditorProps {
   onExtract?: () => void;
 
   isExtracting?: boolean;
+
+  hideCommonConfig?: boolean;
 }
 
 const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
@@ -65,6 +67,7 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
   configError,
   onExtract,
   isExtracting,
+  hideCommonConfig = false,
 }) => {
   const { t } = useTranslation();
   const [isCommonConfigModalOpen, setIsCommonConfigModalOpen] = useState(false);
@@ -115,6 +118,7 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
         onChange={onConfigChange}
         providerName={providerName}
         showRemoteCompaction={showRemoteCompaction}
+        hideCommonConfig={hideCommonConfig}
         useCommonConfig={useCommonConfig}
         onCommonConfigToggle={onCommonConfigToggle}
         onEditCommonConfig={() => setIsCommonConfigModalOpen(true)}
@@ -147,6 +151,7 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
       </div>
 
       {/* Common Config Modal */}
+      {!hideCommonConfig ? (
       <CodexCommonConfigModal
         isOpen={isCommonConfigModalOpen}
         onClose={handleCloseCommonConfigModal}
@@ -156,6 +161,7 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
         onExtract={onExtract}
         isExtracting={isExtracting}
       />
+      ) : null}
     </div>
   );
 };

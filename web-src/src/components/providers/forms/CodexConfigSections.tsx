@@ -114,6 +114,7 @@ interface CodexConfigSectionProps {
   commonConfigError?: string;
   configError?: string;
   isProxyTakeover?: boolean;
+  hideCommonConfig?: boolean;
 }
 
 /**
@@ -130,6 +131,7 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
   commonConfigError,
   configError,
   isProxyTakeover = false,
+  hideCommonConfig = false,
 }) => {
   const { t } = useTranslation();
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -303,6 +305,7 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
             </label>
           )}
 
+          {!hideCommonConfig ? (
           <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
             <input
               type="checkbox"
@@ -312,9 +315,11 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
             />
             {t("codexConfig.writeCommonConfig")}
           </label>
+          ) : null}
         </div>
       </div>
 
+      {!hideCommonConfig ? (
       <div className="flex items-center justify-end">
         <button
           type="button"
@@ -324,8 +329,9 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
           {t("codexConfig.editCommonConfig")}
         </button>
       </div>
+      ) : null}
 
-      {commonConfigError && (
+      {!hideCommonConfig && commonConfigError && (
         <p className="text-xs text-red-500 dark:text-red-400 text-right">
           {commonConfigError}
         </p>

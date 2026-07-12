@@ -14,6 +14,8 @@ const APP_BADGE_ICON: Partial<
 interface AppSwitcherProps {
   activeApp: AppId;
   onSwitch: (app: AppId) => void;
+  /** When set, only these apps are shown (server uses claude/codex/gemini). */
+  apps?: AppId[];
   visibleApps?: VisibleApps;
   compact?: boolean;
 }
@@ -32,6 +34,7 @@ const STORAGE_KEY = "cc-switch-last-app";
 export function AppSwitcher({
   activeApp,
   onSwitch,
+  apps,
   visibleApps,
   compact,
 }: AppSwitcherProps) {
@@ -60,8 +63,8 @@ export function AppSwitcher({
     hermes: "Hermes",
   };
 
-  // Filter apps based on visibility settings.
-  const appsToShow = ALL_APPS.filter((app) => {
+  // Filter apps based on an explicit list or visibility settings.
+  const appsToShow = (apps ?? ALL_APPS).filter((app) => {
     if (!visibleApps) return true;
     return visibleApps[app];
   });

@@ -23,11 +23,13 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 interface ProxyTabContentProps {
   settings: SettingsFormState;
   onAutoSave: (updates: Partial<SettingsFormState>) => Promise<boolean | void>;
+  serverMode?: boolean;
 }
 
 export function ProxyTabContent({
   settings,
   onAutoSave,
+  serverMode = false,
 }: ProxyTabContentProps) {
   const { t } = useTranslation();
   const [showFailoverConfirm, setShowFailoverConfirm] = useState(false);
@@ -89,7 +91,7 @@ export function ProxyTabContent({
             </div>
           </AccordionTrigger>
           <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-            <ProxyPanel />
+            <ProxyPanel serverMode={serverMode} />
           </AccordionContent>
         </AccordionItem>
 
@@ -123,7 +125,7 @@ export function ProxyTabContent({
                 onCheckedChange={handleFailoverToggleChange}
               />
 
-              {!isRunning && (
+              {!serverMode && !isRunning && (
                 <div className="p-4 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
                   <p className="text-sm text-yellow-600 dark:text-yellow-400">
                     {t("proxy.failover.proxyRequired", {
@@ -140,7 +142,7 @@ export function ProxyTabContent({
                   <TabsTrigger value="gemini">Gemini</TabsTrigger>
                 </TabsList>
                 {(["claude", "codex", "gemini"] as const).map((appType) => {
-                  const failoverDisabled = !isRunning;
+                  const failoverDisabled = !serverMode && !isRunning;
                   return (
                     <TabsContent
                       key={appType}
@@ -175,7 +177,8 @@ export function ProxyTabContent({
           </AccordionContent>
         </AccordionItem>
 
-        {/* Rectifier */}
+        {/* Rectifier — desktop local proxy tuning; not wired on token server */}
+        {!serverMode ? (
         <AccordionItem
           value="rectifier"
           className="rounded-xl glass-card overflow-hidden"
@@ -197,6 +200,7 @@ export function ProxyTabContent({
             <RectifierConfigPanel />
           </AccordionContent>
         </AccordionItem>
+        ) : null}
 
         {/* Global Outbound Proxy */}
         <AccordionItem

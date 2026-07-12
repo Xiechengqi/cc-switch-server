@@ -35,7 +35,7 @@ import {
 import { SharePage } from "@/components/share/SharePage";
 import { FailoverToggle } from "@/components/proxy/FailoverToggle";
 import { Button } from "@/components/ui/button";
-import type { VisibleApps } from "@/types";
+import { SERVER_MAIN_APPS } from "@/lib/serverApps";
 
 type View = "providers" | "shares" | "settings";
 
@@ -89,16 +89,6 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
   useEffect(() => {
     localStorage.setItem(APP_STORAGE_KEY, activeApp);
   }, [activeApp]);
-
-  const visibleApps: VisibleApps = {
-    claude: true,
-    "claude-desktop": false,
-    codex: true,
-    gemini: true,
-    opencode: false,
-    openclaw: false,
-    hermes: false,
-  };
 
   const needsProviderData =
     currentView === "providers" || currentView === "shares";
@@ -392,7 +382,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                   <AppSwitcher
                     activeApp={activeApp}
                     onSwitch={setActiveApp}
-                    visibleApps={visibleApps}
+                    apps={SERVER_MAIN_APPS}
                   />
                   <Button
                     onClick={() => setIsAddOpen(true)}

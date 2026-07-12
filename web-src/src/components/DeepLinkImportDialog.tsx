@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
+import { isServerWebRuntime } from "@/lib/runtime";
 import { PromptConfirmation } from "./deeplink/PromptConfirmation";
 import { McpConfirmation } from "./deeplink/McpConfirmation";
 import { SkillConfirmation } from "./deeplink/SkillConfirmation";
@@ -26,6 +27,7 @@ interface DeeplinkError {
 export function DeepLinkImportDialog() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const serverWeb = isServerWebRuntime();
   const [request, setRequest] = useState<DeepLinkImportRequest | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
@@ -49,6 +51,9 @@ export function DeepLinkImportDialog() {
   };
 
   useEffect(() => {
+    if (serverWeb) {
+      return;
+    }
     // Listen for deep link import events
     const unlistenImport = listen<DeepLinkImportRequest>(
       "deeplink-import",
@@ -89,7 +94,11 @@ export function DeepLinkImportDialog() {
       unlistenImport.then((fn) => fn());
       unlistenError.then((fn) => fn());
     };
-  }, [t]);
+  }, [t, serverWeb]);
+
+  if (serverWeb) {
+    return null;
+  }
 
   const handleImport = async () => {
     if (!request) return;
