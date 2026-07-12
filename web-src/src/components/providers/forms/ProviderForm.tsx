@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -89,6 +89,7 @@ import {
 import {
   ProviderSharePlaceholder,
   ProviderShareSection,
+  type ProviderShareSaveHandler,
 } from "@/components/providers/ProviderShareSection";
 import { isShareableApp } from "@/hooks/useProviderShare";
 import {
@@ -502,6 +503,13 @@ function ProviderFormFull({
     mode: "onSubmit",
   });
   const { isSubmitting } = form.formState;
+  const providerShareSaveRef = useRef<ProviderShareSaveHandler | null>(null);
+  const handleProviderShareSaveChange = useCallback(
+    (handler: ProviderShareSaveHandler | null) => {
+      providerShareSaveRef.current = handler;
+    },
+    [],
+  );
 
   const handleSettingsConfigChange = useCallback(
     (config: string) => {
@@ -2324,6 +2332,8 @@ function ProviderFormFull({
 
     payload.meta = nextMeta;
 
+    const shareSaved = await providerShareSaveRef.current?.();
+    if (shareSaved === false) return;
     await onSubmit(payload);
   };
 
@@ -3414,6 +3424,7 @@ function ProviderFormFull({
               providerId={providerId}
               providerName={form.watch("name") || providerId}
               onOpenShareSettings={onOpenShareSettings}
+              onSaveHandlerChange={handleProviderShareSaveChange}
             />
           ) : isShareableApp(appId) ? (
             <ProviderSharePlaceholder />

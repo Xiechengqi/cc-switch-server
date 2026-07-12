@@ -6,10 +6,7 @@ import {
   Copy,
   ExternalLink,
   Loader2,
-  Pause,
-  Play,
   Share2,
-  Trash2,
   X,
 } from "lucide-react";
 import type { AppId, PublicMarket, ShareSaleMarketKind } from "@/lib/api";
@@ -35,11 +32,8 @@ import { cn } from "@/lib/utils";
 import {
   useClientTunnelQuery,
   useCreateShareMutation,
-  useDeleteShareMutation,
   useDisableShareMutation,
   useEnableShareMutation,
-  usePauseShareMutation,
-  useResumeShareMutation,
   useSaveProviderShareMutation,
   useSettingsQuery,
   useShareMarketsQuery,
@@ -121,7 +115,10 @@ interface ProviderShareSectionProps {
   providerId: string;
   providerName: string;
   onOpenShareSettings?: () => void;
+  onSaveHandlerChange?: (handler: ProviderShareSaveHandler | null) => void;
 }
+
+export type ProviderShareSaveHandler = () => Promise<boolean>;
 
 function shareStateLabel(
   state: ProviderShareState,
@@ -160,6 +157,7 @@ export function ProviderShareSection({
   providerId,
   providerName,
   onOpenShareSettings,
+  onSaveHandlerChange,
 }: ProviderShareSectionProps) {
   const { t } = useTranslation();
   const { share, state } = useProviderShare(appId, providerId);
@@ -171,15 +169,13 @@ export function ProviderShareSection({
   );
 
   const createMutation = useCreateShareMutation();
-  const deleteMutation = useDeleteShareMutation();
   const enableMutation = useEnableShareMutation();
   const disableMutation = useDisableShareMutation();
-  const pauseMutation = usePauseShareMutation();
-  const resumeMutation = useResumeShareMutation();
   const saveMutation = useSaveProviderShareMutation();
 
   const [isShareOpen, setIsShareOpen] = useState(false);
   const [confirmFreeOpen, setConfirmFreeOpen] = useState(false);
+  const [shareDraftDirty, setShareDraftDirty] = useState(false);
 
   const [subdomainInput, setSubdomainInput] = useState("");
   const [descriptionInput, setDescriptionInput] = useState("");
@@ -202,6 +198,14 @@ export function ProviderShareSection({
   const tokenLimitTouchedRef = useRef(false);
   const parallelLimitTouchedRef = useRef(false);
   const expiresTouchedRef = useRef(false);
+  const providerSaveHandlerRef = useRef<ProviderShareSaveHandler>(async () => true);
+
+  useEffect(() => {
+    if (!onSaveHandlerChange) return;
+    const handler: ProviderShareSaveHandler = () => providerSaveHandlerRef.current();
+    onSaveHandlerChange(handler);
+    return () => onSaveHandlerChange(null);
+  }, [onSaveHandlerChange]);
 
   const shareableApp = isShareableApp(appId) ? appId : null;
   const shareExists = Boolean(share);
@@ -256,6 +260,7 @@ export function ProviderShareSection({
     tokenLimitTouchedRef.current = false;
     parallelLimitTouchedRef.current = false;
     expiresTouchedRef.current = false;
+    setShareDraftDirty(false);
 
     setDescriptionInput(share?.description?.trim() ?? "");
     setForSaleValue(share?.forSale ?? "Yes");
@@ -309,11 +314,8 @@ export function ProviderShareSection({
 
   const busy =
     createMutation.isPending ||
-    deleteMutation.isPending ||
     enableMutation.isPending ||
     disableMutation.isPending ||
-    pauseMutation.isPending ||
-    resumeMutation.isPending ||
     saveMutation.isPending;
 
   if (!shareableApp) {
@@ -439,9 +441,23 @@ export function ProviderShareSection({
     return created;
   };
 
-  const handleSave = async () => {
-    if (!share) return;
-    if (ownerEmailInvalid || shareToInvalid || marketInvalid) return;
+  const handleSave = async (): Promise<boolean> => {
+    if (busy) return false;
+    if (!share || !shareDraftDirty) return true;
+    if (ownerEmailInvalid) {
+      toast.error(
+        t("share.validation.invalidEmail", { defaultValue: "邮箱格式无效" }),
+      );
+      return false;
+    }
+    if (shareToInvalid || marketInvalid) {
+      toast.error(
+        t("provider.share.invalidConfiguration", {
+          defaultValue: "请修正远程分享配置后再保存",
+        }),
+      );
+      return false;
+    }
 
     const tokenLimit = resolveTokenLimitForSave();
     const parallelLimit = resolveParallelLimitForSave();
@@ -449,7 +465,7 @@ export function ProviderShareSection({
       toast.error(
         t("provider.share.invalidNumber", { defaultValue: "请输入有效数字" }),
       );
-      return;
+      return false;
     }
 
     const nextExpiresAt = resolveExpiresAtForSave();
@@ -472,7 +488,11 @@ export function ProviderShareSection({
       parallelLimit,
       expiresAt: nextExpiresAt,
     });
+    setShareDraftDirty(false);
+    return true;
   };
+
+  providerSaveHandlerRef.current = handleSave;
 
   const handleShareToggle = async (checked: boolean) => {
     if (busy) return;
@@ -658,6 +678,7 @@ export function ProviderShareSection({
                     onChange={(event) => {
                       subdomainManualRef.current = true;
                       setSubdomainInput(event.target.value);
+                      setShareDraftDirty(true);
                     }}
                   />
                 </div>
@@ -673,7 +694,10 @@ export function ProviderShareSection({
                     value={descriptionInput}
                     placeholder={providerName}
                     disabled={busy}
-                    onChange={(event) => setDescriptionInput(event.target.value)}
+                    onChange={(event) => {
+                      setDescriptionInput(event.target.value);
+                      setShareDraftDirty(true);
+                    }}
                   />
                 </div>
 
@@ -690,6 +714,7 @@ export function ProviderShareSection({
                         setConfirmFreeOpen(true);
                       } else {
                         setForSaleValue(next);
+                        setShareDraftDirty(true);
                       }
                     }}
                   >
@@ -733,6 +758,7 @@ export function ProviderShareSection({
                           disabled={marketDisabled || busy}
                           onChange={() => {
                             setSaleMarketKind(value);
+                            setShareDraftDirty(true);
                             if (value === "token") {
                               setMarketAccessMode("all");
                               setSelectedMarketEmails([]);
@@ -769,8 +795,14 @@ export function ProviderShareSection({
                     marketsLoading={marketsLoading}
                     marketsError={marketsErrorMessage}
                     onRetryMarkets={() => void refetchMarkets()}
-                    onMarketAccessModeChange={setMarketAccessMode}
-                    onSelectedMarketEmailsChange={setSelectedMarketEmails}
+                    onMarketAccessModeChange={(value) => {
+                      setMarketAccessMode(value);
+                      setShareDraftDirty(true);
+                    }}
+                    onSelectedMarketEmailsChange={(emails) => {
+                      setSelectedMarketEmails(emails);
+                      setShareDraftDirty(true);
+                    }}
                     onMarketSelectKeyChange={setMarketSelectKey}
                   />
                 ) : (
@@ -781,7 +813,10 @@ export function ProviderShareSection({
                     marketsLoading={marketsLoading}
                     marketsError={marketsErrorMessage}
                     onRetryMarkets={() => void refetchMarkets()}
-                    onSelectedShareMarketEmailChange={setSelectedShareMarketEmail}
+                    onSelectedShareMarketEmailChange={(email) => {
+                      setSelectedShareMarketEmail(email);
+                      setShareDraftDirty(true);
+                    }}
                     invalid={marketInvalid}
                   />
                 )}
@@ -800,7 +835,10 @@ export function ProviderShareSection({
                     value={shareToEmails}
                     invalid={shareToInvalid}
                     disabled={busy}
-                    onChange={setShareToEmails}
+                    onChange={(emails) => {
+                      setShareToEmails(emails);
+                      setShareDraftDirty(true);
+                    }}
                     placeholder={t("share.sharedWithEmailsPlaceholder", {
                       defaultValue: "friend@example.com",
                     })}
@@ -821,6 +859,7 @@ export function ProviderShareSection({
                     onChange={(event) => {
                       tokenLimitTouchedRef.current = true;
                       setTokenLimitInput(event.target.value);
+                      setShareDraftDirty(true);
                     }}
                   />
                   <div className="flex flex-wrap gap-1.5">
@@ -833,6 +872,7 @@ export function ProviderShareSection({
                       onClick={() => {
                         tokenLimitTouchedRef.current = true;
                         setTokenLimitInput("");
+                        setShareDraftDirty(true);
                       }}
                     >
                       {t("share.unlimited", { defaultValue: "无上限" })}
@@ -848,6 +888,7 @@ export function ProviderShareSection({
                         onClick={() => {
                           tokenLimitTouchedRef.current = true;
                           setTokenLimitInput(String(preset));
+                          setShareDraftDirty(true);
                         }}
                       >
                         {preset.toLocaleString()}
@@ -870,6 +911,7 @@ export function ProviderShareSection({
                     onChange={(event) => {
                       parallelLimitTouchedRef.current = true;
                       setParallelLimitInput(event.target.value);
+                      setShareDraftDirty(true);
                     }}
                   />
                   <div className="flex flex-wrap gap-1.5">
@@ -882,6 +924,7 @@ export function ProviderShareSection({
                       onClick={() => {
                         parallelLimitTouchedRef.current = true;
                         setParallelLimitInput("");
+                        setShareDraftDirty(true);
                       }}
                     >
                       {t("share.unlimited", { defaultValue: "无上限" })}
@@ -895,6 +938,7 @@ export function ProviderShareSection({
                       onClick={() => {
                         parallelLimitTouchedRef.current = true;
                         setParallelLimitInput(String(DEFAULT_PARALLEL_LIMIT));
+                        setShareDraftDirty(true);
                       }}
                     >
                       {DEFAULT_PARALLEL_LIMIT}
@@ -914,6 +958,7 @@ export function ProviderShareSection({
                     onChange={(event) => {
                       expiresTouchedRef.current = true;
                       setExpiresInSecsInput(event.target.value);
+                      setShareDraftDirty(true);
                     }}
                   />
                   <div className="flex flex-wrap gap-1.5">
@@ -928,6 +973,7 @@ export function ProviderShareSection({
                         onClick={() => {
                           expiresTouchedRef.current = true;
                           setExpiresInSecsInput(String(preset.value));
+                          setShareDraftDirty(true);
                         }}
                       >
                         {t(preset.labelKey)}
@@ -941,6 +987,7 @@ export function ProviderShareSection({
                       disabled={busy}
                       onCheckedChange={(checked) => {
                         expiresTouchedRef.current = true;
+                        setShareDraftDirty(true);
                         const next = checked === true;
                         setIsPermanent(next);
                         if (next) {
@@ -974,81 +1021,6 @@ export function ProviderShareSection({
                 </div>
               ) : null}
 
-              <div className="flex flex-wrap gap-2">
-                {!share ? (
-                  <Button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void handleCreate()}
-                  >
-                    <Play className="mr-2 h-4 w-4" />
-                    {t("provider.share.createAndEnable", {
-                      defaultValue: "创建并启用分享",
-                    })}
-                  </Button>
-                ) : (
-                  <>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={busy}
-                      onClick={() => void handleSave()}
-                    >
-                      {t("common.save", { defaultValue: "保存" })}
-                    </Button>
-                    {share.status === "active" ? (
-                      <Button
-                        type="button"
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() => void pauseMutation.mutateAsync(share.id)}
-                      >
-                        <Pause className="mr-2 h-4 w-4" />
-                        {t("share.pause", { defaultValue: "暂停" })}
-                      </Button>
-                    ) : (
-                      <Button
-                        type="button"
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() => void resumeMutation.mutateAsync(share.id)}
-                      >
-                        <Play className="mr-2 h-4 w-4" />
-                        {t("share.resume", { defaultValue: "恢复" })}
-                      </Button>
-                    )}
-                    {share.tunnelUrl ? (
-                      <Button
-                        type="button"
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() => void disableMutation.mutateAsync(share.id)}
-                      >
-                        {t("share.disable", { defaultValue: "关闭隧道" })}
-                      </Button>
-                    ) : (
-                      <Button
-                        type="button"
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() => void enableMutation.mutateAsync(share.id)}
-                      >
-                        {t("share.enable", { defaultValue: "开启隧道" })}
-                      </Button>
-                    )}
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      className="text-destructive hover:text-destructive"
-                      disabled={busy}
-                      onClick={() => void deleteMutation.mutateAsync(share.id)}
-                    >
-                      <Trash2 className="mr-2 h-4 w-4" />
-                      {t("share.delete", { defaultValue: "删除分享" })}
-                    </Button>
-                  </>
-                )}
-              </div>
               {share && (share.routerLastSyncError || routerSyncPending) ? (
                 <p
                   className={cn(
@@ -1084,6 +1056,7 @@ export function ProviderShareSection({
         variant="info"
         onConfirm={() => {
           setForSaleValue("Free");
+          setShareDraftDirty(true);
           setConfirmFreeOpen(false);
         }}
         onCancel={() => setConfirmFreeOpen(false)}
