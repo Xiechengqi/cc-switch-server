@@ -99,7 +99,7 @@ pub struct ShareDescriptor {
     pub app_availability: ShareAppAvailability,
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub auto_start: bool,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
@@ -107,6 +107,10 @@ pub struct ShareDescriptor {
 
 fn is_zero_revision(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

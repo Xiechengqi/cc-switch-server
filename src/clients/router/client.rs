@@ -796,6 +796,7 @@ fn should_retry_legacy_share_sync(
 fn legacy_share_sync_ops(mut ops: Vec<ShareSyncOperation>) -> Vec<ShareSyncOperation> {
     for op in &mut ops {
         if let Some(share) = op.share.as_mut() {
+            share.auto_start = false;
             share.config_revision = 0;
         }
     }
@@ -1214,23 +1215,24 @@ mod tests {
     }
 
     #[test]
-    fn legacy_share_sync_omits_config_revision_from_signed_payload() {
+    fn legacy_share_sync_omits_versioned_fields_from_signed_payload() {
         let ops = vec![ShareSyncOperation {
             kind: "upsert".to_string(),
             share_id: None,
             share: Some(ShareDescriptor {
+                auto_start: true,
                 config_revision: 7,
                 ..ShareDescriptor::default()
             }),
         }];
-        assert!(serde_json::to_string(&ops)
-            .unwrap()
-            .contains("configRevision"));
+        let serialized = serde_json::to_string(&ops).unwrap();
+        assert!(serialized.contains("autoStart"));
+        assert!(serialized.contains("configRevision"));
 
         let legacy = legacy_share_sync_ops(ops);
-        assert!(!serde_json::to_string(&legacy)
-            .unwrap()
-            .contains("configRevision"));
+        let serialized = serde_json::to_string(&legacy).unwrap();
+        assert!(!serialized.contains("autoStart"));
+        assert!(!serialized.contains("configRevision"));
     }
 
     #[test]
