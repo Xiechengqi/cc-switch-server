@@ -343,7 +343,6 @@ export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }
           <ClaudeOAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
 
-        {!serverMode ? (
         <AuthProviderAccordionItem
           value="copilot"
           icon={<Github className="h-5 w-5" />}
@@ -354,7 +353,6 @@ export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }
         >
           <CopilotAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
-        ) : null}
 
         <AuthProviderAccordionItem
           value="codex"
@@ -367,8 +365,6 @@ export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }
           <CodexOAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
 
-        {!serverMode ? (
-          <>
         <AuthProviderAccordionItem
           value="grok"
           icon={<ProviderIcon icon="grok" name="Grok" size={24} />}
@@ -401,8 +397,6 @@ export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }
         >
           <CursorOAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
-          </>
-        ) : null}
 
         <AuthProviderAccordionItem
           value="gemini"
@@ -415,8 +409,6 @@ export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }
           <GeminiOAuthSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
 
-        {!serverMode ? (
-          <>
         <AuthProviderAccordionItem
           value="antigravity"
           icon={<SparklesIcon className="h-5 w-5" />}
@@ -438,8 +430,6 @@ export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }
         >
           <DeepSeekAccountSection showLoggedInAccounts />
         </AuthProviderAccordionItem>
-          </>
-        ) : null}
       </Accordion>
     </motion.div>
   );
