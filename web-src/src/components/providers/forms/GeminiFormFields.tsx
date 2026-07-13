@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import EndpointSpeedTest from "./EndpointSpeedTest";
 import { AntigravityOAuthSection } from "./AntigravityOAuthSection";
 import GeminiOAuthSection from "./GeminiOAuthSection";
+import { GrokOAuthSection } from "./GrokOAuthSection";
 import { ApiKeySection, EndpointField } from "./shared";
 import { SingleModelMappingField } from "./SingleModelMappingField";
 import {
@@ -43,6 +44,9 @@ interface GeminiFormFieldsProps {
   isAntigravityOauthAuthenticated?: boolean;
   selectedAntigravityAccountId?: string | null;
   onAntigravityAccountSelect?: (accountId: string | null) => void;
+  isGrokOauthPreset?: boolean;
+  selectedGrokAccountId?: string | null;
+  onGrokAccountSelect?: (accountId: string | null) => void;
 
   // Base URL
   shouldShowSpeedTest: boolean;
@@ -81,6 +85,9 @@ export function GeminiFormFields({
   isAntigravityOauthAuthenticated = false,
   selectedAntigravityAccountId,
   onAntigravityAccountSelect,
+  isGrokOauthPreset = false,
+  selectedGrokAccountId,
+  onGrokAccountSelect,
   shouldShowSpeedTest,
   baseUrl,
   onBaseUrlChange,
@@ -138,10 +145,18 @@ export function GeminiFormFields({
   // Official OAuth presets are identified explicitly by providerType metadata.
   const isGoogleOfficial = isGeminiOfficialPreset;
   const isAntigravityOfficial = isAntigravityOauthPreset;
-  const usesManagedOAuth = isGoogleOfficial || isAntigravityOfficial;
+  const usesManagedOAuth = isGoogleOfficial || isAntigravityOfficial || isGrokOauthPreset;
 
   return (
     <>
+      {isGrokOauthPreset && (
+        <GrokOAuthSection
+          selectedAccountId={selectedGrokAccountId}
+          onAccountSelect={onGrokAccountSelect}
+          allowDefaultAccountOption={false}
+        />
+      )}
+
       {/* Google OAuth 提示 */}
       {isGoogleOfficial && (
         <>

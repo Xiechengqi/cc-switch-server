@@ -32,6 +32,7 @@ import { CodexOAuthSection } from "./CodexOAuthSection";
 import { ClaudeOAuthSection } from "./ClaudeOAuthSection";
 import { AntigravityOAuthSection } from "./AntigravityOAuthSection";
 import { CursorOAuthSection } from "./CursorOAuthSection";
+import { GrokOAuthSection } from "./GrokOAuthSection";
 import { KiroOAuthSection } from "./KiroOAuthSection";
 import { DeepSeekAccountSection } from "./DeepSeekAccountSection";
 import { SingleModelMappingField } from "./SingleModelMappingField";
@@ -106,6 +107,10 @@ interface ClaudeFormFieldsProps {
   onAntigravityAccountSelect?: (accountId: string | null) => void;
 
   // Kiro OAuth
+  isGrokOauthPreset?: boolean;
+  selectedGrokAccountId?: string | null;
+  onGrokAccountSelect?: (accountId: string | null) => void;
+
   isCursorOauthPreset?: boolean;
   isCursorApiKeyPreset?: boolean;
   selectedCursorAccountId?: string | null;
@@ -202,6 +207,9 @@ export function ClaudeFormFields({
   isCursorApiKeyPreset,
   selectedCursorAccountId,
   onCursorAccountSelect,
+  isGrokOauthPreset,
+  selectedGrokAccountId,
+  onGrokAccountSelect,
   isKiroOauthPreset,
   selectedKiroAccountId,
   onKiroAccountSelect,
@@ -654,6 +662,14 @@ export function ClaudeFormFields({
         <CursorOAuthSection
           selectedAccountId={selectedCursorAccountId}
           onAccountSelect={onCursorAccountSelect}
+        />
+      )}
+
+      {isGrokOauthPreset && (
+        <GrokOAuthSection
+          selectedAccountId={selectedGrokAccountId}
+          onAccountSelect={onGrokAccountSelect}
+          allowDefaultAccountOption={false}
         />
       )}
 

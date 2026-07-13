@@ -80,7 +80,6 @@ import { ClaudeFormFields } from "./ClaudeFormFields";
 import { ClaudeDesktopProviderForm } from "./ClaudeDesktopProviderForm";
 import { CodexFormFields } from "./CodexFormFields";
 import { GeminiFormFields } from "./GeminiFormFields";
-import { GrokOAuthSection } from "./GrokOAuthSection";
 import { OmoFormFields } from "./OmoFormFields";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
 import {
@@ -734,6 +733,10 @@ function ProviderFormFull({
     (selectedCodexPresetProviderType || initialData?.meta?.providerType) !==
       PROVIDER_TYPES.CURSOR_APIKEY &&
     (selectedCodexPresetProviderType || initialData?.meta?.providerType) !==
+      PROVIDER_TYPES.GROK_OAUTH &&
+    (selectedCodexPresetProviderType || initialData?.meta?.providerType) !==
+      "grok_oauth" &&
+    (selectedCodexPresetProviderType || initialData?.meta?.providerType) !==
       PROVIDER_TYPES.OLLAMA_CLOUD;
 
   useEffect(() => {
@@ -1047,6 +1050,7 @@ function ProviderFormFull({
       isAntigravityFamilyType(currentProviderType) ||
       isCursorProvider ||
       currentProviderType === PROVIDER_TYPES.KIRO_OAUTH ||
+      isGrokOauthProviderType(currentProviderType) ||
       currentProviderType === PROVIDER_TYPES.DEEPSEEK_ACCOUNT);
   const excludesQuotaDispatchLimit =
     currentProviderType === PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH ||
@@ -1068,6 +1072,7 @@ function ProviderFormFull({
     currentProviderType === PROVIDER_TYPES.CURSOR_OAUTH ||
     currentProviderType === PROVIDER_TYPES.CURSOR_APIKEY ||
     currentProviderType === PROVIDER_TYPES.KIRO_OAUTH ||
+    isGrokOauthProviderType(currentProviderType) ||
     currentProviderType === PROVIDER_TYPES.DEEPSEEK_ACCOUNT ||
     isCodexOfficialPreset;
 
@@ -2967,6 +2972,13 @@ function ProviderFormFull({
                 templatePreset?.providerType === "cursor_oauth" ||
                 initialData?.meta?.providerType === "cursor_oauth"
               }
+              isGrokOauthPreset={
+                isGrokOauthProviderType(templatePreset?.providerType) ||
+                isGrokOauthProviderType(initialData?.meta?.providerType) ||
+                isGrokOauthProviderType(currentProviderType)
+              }
+              selectedGrokAccountId={selectedGrokAccountId}
+              onGrokAccountSelect={setSelectedGrokAccountId}
               isCursorApiKeyPreset={isCursorApiKeyPreset}
               isDeepSeekAccountPreset={
                 templatePreset?.providerType === "deepseek_account" ||
@@ -3065,8 +3077,13 @@ function ProviderFormFull({
               selectedCodexAccountId={selectedCodexAccountId}
               onCodexAccountSelect={setSelectedCodexAccountId}
               isCursorOauthPreset={
-                currentProviderType === PROVIDER_TYPES.CURSOR_OAUTH
+                currentProviderType === PROVIDER_TYPES.CURSOR_OAUTH ||
+                templatePreset?.providerType === "cursor_oauth" ||
+                initialData?.meta?.providerType === "cursor_oauth"
               }
+              isGrokOauthPreset={isGrokOauthProvider}
+              selectedGrokAccountId={selectedGrokAccountId}
+              onGrokAccountSelect={setSelectedGrokAccountId}
               isCursorApiKeyPreset={isCursorApiKeyPreset}
               selectedCursorAccountId={selectedCursorAccountId}
               onCursorAccountSelect={setSelectedCursorAccountId}
@@ -3122,6 +3139,9 @@ function ProviderFormFull({
               isAntigravityOauthAuthenticated={isAntigravityOauthAuthenticated}
               selectedAntigravityAccountId={selectedAntigravityAccountId}
               onAntigravityAccountSelect={setSelectedAntigravityAccountId}
+              isGrokOauthPreset={isGrokOauthProvider}
+              selectedGrokAccountId={selectedGrokAccountId}
+              onGrokAccountSelect={setSelectedGrokAccountId}
               shouldShowSpeedTest={shouldShowSpeedTest}
               baseUrl={geminiBaseUrl}
               onBaseUrlChange={handleGeminiBaseUrlChange}
@@ -3136,14 +3156,6 @@ function ProviderFormFull({
               model={geminiModel}
               onModelChange={handleGeminiModelChange}
               speedTestEndpoints={speedTestEndpoints}
-            />
-          )}
-
-          {isGrokOauthProvider && (
-            <GrokOAuthSection
-              selectedAccountId={selectedGrokAccountId}
-              onAccountSelect={setSelectedGrokAccountId}
-              allowDefaultAccountOption={false}
             />
           )}
 

@@ -20,6 +20,7 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import EndpointSpeedTest from "./EndpointSpeedTest";
 import { CodexOAuthSection } from "./CodexOAuthSection";
 import { CursorOAuthSection } from "./CursorOAuthSection";
+import { GrokOAuthSection } from "./GrokOAuthSection";
 import { SingleModelMappingField } from "./SingleModelMappingField";
 import { ApiKeySection, EndpointField } from "./shared";
 import {
@@ -57,9 +58,12 @@ interface CodexFormFieldsProps {
   codexImageGenerationEnabled?: boolean;
   onCodexImageGenerationChange?: (enabled: boolean) => void;
   isCursorOauthPreset?: boolean;
+  isGrokOauthPreset?: boolean;
   isCursorApiKeyPreset?: boolean;
   selectedCursorAccountId?: string | null;
   onCursorAccountSelect?: (accountId: string | null) => void;
+  selectedGrokAccountId?: string | null;
+  onGrokAccountSelect?: (accountId: string | null) => void;
 
   // Base URL
   shouldShowSpeedTest: boolean;
@@ -112,9 +116,12 @@ export function CodexFormFields({
   codexImageGenerationEnabled,
   onCodexImageGenerationChange,
   isCursorOauthPreset = false,
+  isGrokOauthPreset = false,
   isCursorApiKeyPreset = false,
   selectedCursorAccountId,
   onCursorAccountSelect,
+  selectedGrokAccountId,
+  onGrokAccountSelect,
   shouldShowSpeedTest,
   codexBaseUrl,
   onBaseUrlChange,
@@ -234,9 +241,11 @@ export function CodexFormFields({
       .finally(() => setIsFetchingModels(false));
   }, [codexBaseUrl, codexApiKey, isFullUrl, customUserAgent, t]);
 
+  const usesManagedOauthAuth = isCursorOauthPreset || isGrokOauthPreset;
+
   return (
     <>
-      {isCodexOfficialPreset && !isCursorOauthPreset && (
+      {isCodexOfficialPreset && !usesManagedOauthAuth && (
         <CodexOAuthSection
           selectedAccountId={selectedCodexAccountId}
           onAccountSelect={onCodexAccountSelect}
@@ -254,8 +263,16 @@ export function CodexFormFields({
         />
       )}
 
+      {isGrokOauthPreset && (
+        <GrokOAuthSection
+          selectedAccountId={selectedGrokAccountId}
+          onAccountSelect={onGrokAccountSelect}
+          allowDefaultAccountOption={false}
+        />
+      )}
+
       {/* Codex API Key 输入框 */}
-      {!isCursorOauthPreset && (
+      {!usesManagedOauthAuth && (
         <ApiKeySection
           id="codexApiKey"
           label="API Key"
@@ -278,7 +295,7 @@ export function CodexFormFields({
       )}
 
       {isCodexOfficialPreset &&
-        !isCursorOauthPreset &&
+        !usesManagedOauthAuth &&
         !isCodexOauthAuthenticated && (
           <p className="text-xs text-destructive">
             {t("codexOauth.loginRequired", {
@@ -306,7 +323,7 @@ export function CodexFormFields({
       {/* 高级选项 —— 本地路由映射/模型映射/思考能力/自定义 UA；预设供应商通常无需展开 */}
       {(category !== "official" ||
         isCursorApiKeyPreset ||
-        isCursorOauthPreset) && (
+        usesManagedOauthAuth) && (
         <Collapsible
           open={advancedExpanded}
           onOpenChange={setAdvancedExpanded}
@@ -341,7 +358,7 @@ export function CodexFormFields({
             {/* 本地路由映射开关 —— 沿用 shouldShowSpeedTest 门控，cloud_provider 保持不可切换 */}
             {(shouldShowSpeedTest ||
               isCursorApiKeyPreset ||
-              isCursorOauthPreset) && (
+              usesManagedOauthAuth) && (
               <div className="flex items-center justify-between gap-4">
                 <div className="space-y-1">
                   <FormLabel>
