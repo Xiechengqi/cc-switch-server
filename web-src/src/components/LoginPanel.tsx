@@ -3,6 +3,7 @@ import { KeyRound, Loader2, Mail, Shield } from "lucide-react";
 
 import { AuthLanguageSwitcher } from "@/components/AuthLanguageSwitcher";
 import { AuthPasswordInput } from "@/components/AuthPasswordInput";
+import { ShareRouterSelector } from "@/components/share/ShareRouterSelector";
 import {
   completeServerSetup,
   loginWithApiToken,
@@ -12,6 +13,10 @@ import {
 import { DEFAULT_SHARE_ROUTER_DOMAIN } from "@/config/shareRegions";
 import { useI18n } from "@/lib/i18n";
 import { loginWithPassword, readCachedPassword, WebRuntimeContext, writeToken } from "@/lib/runtime";
+import {
+  normalizeShareRouterDomain,
+  shareRouterUrlFromDomain,
+} from "@/utils/shareRouter";
 
 type LoginMethod = "password" | "email" | "apiToken";
 
@@ -39,11 +44,17 @@ function isSetupAlreadyCompleteError(error: unknown): boolean {
 async function saveSetupConfig(input: {
   password: string;
   ownerEmail: string;
-  routerUrl: string;
+  routerDomain: string;
   clientTunnelSubdomain?: string;
 }) {
+  const routerUrl = shareRouterUrlFromDomain(input.routerDomain);
   try {
-    await completeServerSetup(input);
+    await completeServerSetup({
+      password: input.password,
+      ownerEmail: input.ownerEmail,
+      routerUrl,
+      clientTunnelSubdomain: input.clientTunnelSubdomain,
+    });
   } catch (error) {
     if (!isSetupAlreadyCompleteError(error)) {
       throw error;
@@ -67,9 +78,8 @@ export function LoginPanel({
   );
   const [password, setPassword] = useState(() => readCachedPassword() ?? "");
   const [ownerEmail, setOwnerEmail] = useState(context.auth?.ownerEmail ?? "");
-  const [routerUrl, setRouterUrl] = useState(
-    () => `https://${DEFAULT_SHARE_ROUTER_DOMAIN}`,
-  );
+  const [routerDomain, setRouterDomain] = useState(DEFAULT_SHARE_ROUTER_DOMAIN);
+  const [routerDomainError, setRouterDomainError] = useState<string | null>(null);
   const [clientTunnelSubdomain, setClientTunnelSubdomain] = useState("");
   const [verificationCode, setVerificationCode] = useState("");
   const [apiToken, setApiToken] = useState("");
@@ -107,6 +117,7 @@ export function LoginPanel({
   async function submitPassword(event?: FormEvent) {
     event?.preventDefault();
     setError(null);
+    setRouterDomainError(null);
     setBusy("password");
     try {
       if (setupRequired) {
@@ -118,10 +129,20 @@ export function LoginPanel({
             }),
           );
         }
+        let normalizedRouterDomain: string;
+        try {
+          normalizedRouterDomain = normalizeShareRouterDomain(routerDomain);
+        } catch (reason) {
+          const key = errorMessage(reason);
+          setRouterDomainError(
+            t(key, { defaultValue: "Router 域名无效" }),
+          );
+          return;
+        }
         await saveSetupConfig({
           password,
           ownerEmail,
-          routerUrl,
+          routerDomain: normalizedRouterDomain,
           clientTunnelSubdomain: clientTunnelSubdomain.trim() || undefined,
         });
         const login = await verifyEmailLoginCode({
@@ -158,13 +179,24 @@ export function LoginPanel({
     const email = (setupRequired ? ownerEmail : loginOwnerEmail).trim();
     if (!email) return;
     setError(null);
+    setRouterDomainError(null);
     setBusy("requestCode");
     try {
       if (setupRequired) {
+        let normalizedRouterDomain: string;
+        try {
+          normalizedRouterDomain = normalizeShareRouterDomain(routerDomain);
+        } catch (reason) {
+          const key = errorMessage(reason);
+          setRouterDomainError(
+            t(key, { defaultValue: "Router 域名无效" }),
+          );
+          return;
+        }
         await saveSetupConfig({
           password,
           ownerEmail: email,
-          routerUrl,
+          routerDomain: normalizedRouterDomain,
           clientTunnelSubdomain: clientTunnelSubdomain.trim() || undefined,
         });
       }
@@ -311,11 +343,20 @@ export function LoginPanel({
                   autoComplete="email"
                 />
               </label>
-              <label>
-                <span>{t("server.auth.routerUrl")}</span>
-                <input
-                  value={routerUrl}
-                  onChange={(event) => setRouterUrl(event.target.value)}
+              <label className="auth-grid-span-2">
+                <span>
+                  {t("share.tunnel.region", { defaultValue: "路由节点" })}
+                </span>
+                <ShareRouterSelector
+                  value={routerDomain}
+                  onChange={(value) => {
+                    setRouterDomain(value);
+                    setRouterDomainError(null);
+                  }}
+                  selectId="setup-share-router"
+                  customInputId="setup-share-router-custom"
+                  disabled={busy !== null}
+                  error={routerDomainError}
                 />
               </label>
               <label className="auth-grid-span-2">
@@ -351,7 +392,7 @@ export function LoginPanel({
                   type="button"
                   disabled={
                     !ownerEmail.trim() ||
-                    !routerUrl.trim() ||
+                    !routerDomain.trim() ||
                     !password ||
                     busy !== null ||
                     resendCooldown > 0
@@ -480,7 +521,7 @@ export function LoginPanel({
                 !password ||
                 (setupRequired &&
                   (!ownerEmail.trim() ||
-                    !routerUrl.trim() ||
+                    !routerDomain.trim() ||
                     !verificationCode.trim()))
               }
             >

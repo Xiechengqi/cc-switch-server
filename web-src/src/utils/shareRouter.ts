@@ -110,3 +110,17 @@ function validateShareRouterAuthority(authority: string) {
     }
   }
 }
+
+export function shareRouterUrlFromDomain(domain: string): string {
+  const authority = normalizeShareRouterDomain(domain);
+  const host = authority.split(":")[0] ?? authority;
+  if (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "0.0.0.0" ||
+    /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host)
+  ) {
+    return `http://${authority}`;
+  }
+  return `https://${authority}`;
+}
