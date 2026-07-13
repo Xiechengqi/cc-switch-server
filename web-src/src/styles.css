@@ -79,9 +79,9 @@
   background: hsl(var(--background));
 }.auth-language-switch{
   position: absolute;
-  top: 20px;
-  right: 20px;
-  z-index: 20;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
   display: inline-flex;
   overflow: hidden;
   border: 1px solid hsl(var(--border));
@@ -89,12 +89,13 @@
   background: hsl(var(--panel));
   box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
 }.auth-language-switch button{
-  min-width: 52px;
-  min-height: 32px;
+  min-width: 40px;
+  min-height: 24px;
+  padding: 0 8px;
   border: none;
   background: transparent;
   color: hsl(var(--muted-foreground));
-  font-size: 0.78rem;
+  font-size: 0.68rem;
   font-weight: 600;
   cursor: pointer;
 }.auth-language-switch button.active{
@@ -103,14 +104,28 @@
 }.auth-language-switch button:not(.active):hover{
   color: hsl(var(--foreground));
 }.auth-shell-card{
+  position: relative;
   width: min(100%, 560px);
+}.auth-shell-card--compact{
+  width: min(100%, 384px);
+}.auth-client-card{
+  width: 100%;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--panel));
+  box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
+  padding: 20px 18px 18px;
+}.auth-client-card-header{
+  padding-right: 72px;
 }.auth-shell .auth-panel{
   width: 100%;
   max-width: none;
   margin: 0;
+  padding-top: 22px;
 }.auth-panel-header{
   display: grid;
   gap: 8px;
+  padding-right: 72px;
 }.auth-panel-brand{
   display: grid;
   grid-template-columns: 40px minmax(0, 1fr);
@@ -217,6 +232,36 @@ to{
 }.password-field-toggle:focus-visible{
   border-radius: 6px;
   outline: 2px solid hsl(var(--primary) / 0.18);
+}.subdomain-field{
+  position: relative;
+  display: grid;
+}.subdomain-field-input{
+  padding-right: 36px;
+}.subdomain-field-action{
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: inline-flex;
+  width: 36px;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+}.subdomain-field-action:hover:not(:disabled){
+  color: hsl(var(--foreground));
+}.subdomain-field-action:disabled{
+  opacity: 0.45;
+  cursor: not-allowed;
+}.subdomain-field-action:focus-visible{
+  border-radius: 6px;
+  outline: 2px solid hsl(var(--primary) / 0.18);
+}.auth-panel-footer{
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
 }input.auth-readonly-input{
   background: hsl(var(--subtle));
   color: hsl(var(--muted-foreground));

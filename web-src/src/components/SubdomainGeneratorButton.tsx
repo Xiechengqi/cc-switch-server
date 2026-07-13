@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { useTranslation } from "react-i18next";
-import { Button } from "@/components/ui/button";
+import { Loader2, Shuffle } from "lucide-react";
+
+import { useI18n } from "@/lib/i18n";
 
 export interface SubdomainSuggestion {
   subdomain: string;
@@ -11,23 +12,24 @@ export interface SubdomainSuggestion {
 
 interface SubdomainGeneratorButtonProps {
   disabled?: boolean;
+  embedded?: boolean;
+  className?: string;
   onGenerated: (subdomain: string) => void;
   onError?: (message: string) => void;
   suggest: () => Promise<SubdomainSuggestion>;
-  size?: "default" | "sm" | "lg" | "icon";
-  variant?: "default" | "outline" | "secondary" | "ghost";
 }
 
 export function SubdomainGeneratorButton({
   disabled = false,
+  embedded = true,
+  className = "",
   onGenerated,
   onError,
   suggest,
-  size = "sm",
-  variant = "outline",
 }: SubdomainGeneratorButtonProps) {
-  const { t } = useTranslation();
+  const { t } = useI18n();
   const [busy, setBusy] = useState(false);
+  const label = t("server.auth.generateSubdomain");
 
   async function handleClick() {
     if (disabled || busy) return;
@@ -41,9 +43,7 @@ export function SubdomainGeneratorButton({
           ? reason.message
           : typeof reason === "string"
             ? reason
-            : t("server.auth.generateSubdomainFailed", {
-                defaultValue: "随机生成子域名失败",
-              });
+            : t("server.auth.generateSubdomainFailed");
       onError?.(message);
     } finally {
       setBusy(false);
@@ -51,16 +51,19 @@ export function SubdomainGeneratorButton({
   }
 
   return (
-    <Button
+    <button
       type="button"
-      variant={variant}
-      size={size}
+      className={
+        embedded
+          ? `subdomain-field-action${className ? ` ${className}` : ""}`
+          : `icon-button subdomain-generate-button${className ? ` ${className}` : ""}`
+      }
       disabled={disabled || busy}
+      aria-label={label}
+      title={label}
       onClick={() => void handleClick()}
     >
-      {busy
-        ? t("server.auth.subdomainGenerating", { defaultValue: "生成中…" })
-        : t("server.auth.generateSubdomain", { defaultValue: "随机生成" })}
-    </Button>
+      {busy ? <Loader2 size={15} className="spin" /> : <Shuffle size={15} />}
+    </button>
   );
 }

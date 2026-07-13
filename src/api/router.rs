@@ -201,7 +201,7 @@ pub(in crate::api) async fn web_client_tunnel_subdomain_check(
         .identity
         .as_ref()
         .map(|identity| identity.installation_id.as_str());
-    let availability = crate::client_tunnel_provision::check_subdomain_for_router(
+    let availability = crate::client_tunnel_provision::check_subdomain_for_router_outcome(
         &state,
         router_url,
         &subdomain,
@@ -211,6 +211,7 @@ pub(in crate::api) async fn web_client_tunnel_subdomain_check(
     Ok(Json(SetupSubdomainCheckResponse {
         ok: true,
         available: availability.available,
+        checked: availability.checked,
         reason: availability.reason,
     }))
 }

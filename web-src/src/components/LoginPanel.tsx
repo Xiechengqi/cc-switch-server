@@ -111,11 +111,7 @@ export function LoginPanel({
     const trimmed = clientTunnelSubdomain.trim();
     if (!trimmed) {
       setSubdomainStatus("idle");
-      setSubdomainHint(
-        t("server.auth.clientSubdomainAuto", {
-          defaultValue: "留空将自动生成随机单词子域名",
-        }),
-      );
+      setSubdomainHint(t("server.auth.clientSubdomainAuto"));
       return;
     }
     let active = true;
@@ -130,20 +126,15 @@ export function LoginPanel({
             subdomain: trimmed,
           });
           if (!active) return;
-          if (response.available) {
+          if (!response.checked) {
+            setSubdomainStatus("idle");
+            setSubdomainHint(t("server.auth.subdomainUnchecked"));
+          } else if (response.available) {
             setSubdomainStatus("available");
-            setSubdomainHint(
-              t("server.auth.clientSubdomainAvailable", {
-                defaultValue: "子域名可用",
-              }),
-            );
+            setSubdomainHint(t("server.auth.clientSubdomainAvailable"));
           } else {
             setSubdomainStatus("unavailable");
-            setSubdomainHint(
-              t("server.auth.clientSubdomainTaken", {
-                defaultValue: "子域名已被占用，请更换或使用随机生成",
-              }),
-            );
+            setSubdomainHint(t("server.auth.clientSubdomainTaken"));
           }
         } catch (reason) {
           if (!active) return;
@@ -213,11 +204,7 @@ export function LoginPanel({
     setError(null);
     setRouterDomainError(null);
     if (setupRequired && subdomainStatus === "unavailable") {
-      setError(
-        t("server.auth.clientSubdomainTaken", {
-          defaultValue: "子域名已被占用，请更换或使用随机生成",
-        }),
-      );
+      setError(t("server.auth.clientSubdomainTaken"));
       return;
     }
     setBusy("password");
@@ -326,8 +313,8 @@ export function LoginPanel({
 
   return (
     <div className="auth-shell">
-      <AuthLanguageSwitcher />
       <div className="auth-shell-card">
+        <AuthLanguageSwitcher />
         <form className="auth-panel" onSubmit={handleSubmit}>
           <div className="auth-panel-header">
             <div className="auth-panel-brand">
@@ -434,9 +421,9 @@ export function LoginPanel({
               </label>
               <label>
                 <span>{t("server.auth.clientSubdomain")}</span>
-                <div className="flex items-center gap-2">
+                <div className="subdomain-field">
                   <input
-                    className="min-w-0 flex-1"
+                    className="subdomain-field-input"
                     value={clientTunnelSubdomain}
                     autoComplete="off"
                     disabled={busy !== null}
@@ -465,9 +452,7 @@ export function LoginPanel({
                 </div>
                 {routerReachable === false ? (
                   <span className="text-xs text-muted-foreground">
-                    {t("server.auth.routerUnreachableForSubdomain", {
-                      defaultValue: "Router 不可达，无法随机生成子域名",
-                    })}
+                    {t("server.auth.routerUnreachableForSubdomain")}
                   </span>
                 ) : null}
                 {subdomainHint ? (
@@ -577,61 +562,63 @@ export function LoginPanel({
 
           {error ? <div className="form-error">{error}</div> : null}
 
-          {setupRequired || activeMethod === "password" ? (
-            <button
-              className="primary-button"
-              type="submit"
-              disabled={
-                busy !== null ||
-                !password ||
-                (setupRequired &&
-                  (!ownerEmail.trim() || !routerDomain.trim()))
-              }
-            >
-              {busy === "password" ? (
-                <Loader2 size={16} className="spin" />
-              ) : (
-                <KeyRound size={16} />
-              )}
-              <span>
-                {setupRequired
-                  ? t("server.common.setup")
-                  : t("server.common.login")}
-              </span>
-            </button>
-          ) : null}
+          <div className="auth-panel-footer">
+            {setupRequired || activeMethod === "password" ? (
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={
+                  busy !== null ||
+                  !password ||
+                  (setupRequired &&
+                    (!ownerEmail.trim() || !routerDomain.trim()))
+                }
+              >
+                {busy === "password" ? (
+                  <Loader2 size={16} className="spin" />
+                ) : (
+                  <KeyRound size={16} />
+                )}
+                <span>
+                  {setupRequired
+                    ? t("server.common.setup")
+                    : t("server.common.login")}
+                </span>
+              </button>
+            ) : null}
 
-          {!setupRequired && activeMethod === "email" ? (
-            <button
-              className="primary-button"
-              type="submit"
-              disabled={
-                busy !== null || !loginOwnerEmail || !verificationCode.trim()
-              }
-            >
-              {busy === "email" ? (
-                <Loader2 size={16} className="spin" />
-              ) : (
-                <Shield size={16} />
-              )}
-              <span>{t("server.settings.verify")}</span>
-            </button>
-          ) : null}
+            {!setupRequired && activeMethod === "email" ? (
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={
+                  busy !== null || !loginOwnerEmail || !verificationCode.trim()
+                }
+              >
+                {busy === "email" ? (
+                  <Loader2 size={16} className="spin" />
+                ) : (
+                  <Shield size={16} />
+                )}
+                <span>{t("server.settings.verify")}</span>
+              </button>
+            ) : null}
 
-          {!setupRequired && activeMethod === "apiToken" ? (
-            <button
-              className="primary-button"
-              type="submit"
-              disabled={busy !== null || !apiToken.trim()}
-            >
-              {busy === "apiToken" ? (
-                <Loader2 size={16} className="spin" />
-              ) : (
-                <KeyRound size={16} />
-              )}
-              <span>{t("server.common.login")}</span>
-            </button>
-          ) : null}
+            {!setupRequired && activeMethod === "apiToken" ? (
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={busy !== null || !apiToken.trim()}
+              >
+                {busy === "apiToken" ? (
+                  <Loader2 size={16} className="spin" />
+                ) : (
+                  <KeyRound size={16} />
+                )}
+                <span>{t("server.common.login")}</span>
+              </button>
+            ) : null}
+          </div>
         </form>
       </div>
     </div>

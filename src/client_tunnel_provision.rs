@@ -22,6 +22,30 @@ pub(crate) struct SuggestSubdomainOutcome {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RouterReachabilityOutcome {
     pub reachable: bool,
+    pub subdomain_check_supported: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SubdomainCheckOutcome {
+    pub available: bool,
+    pub checked: bool,
+    pub reason: Option<String>,
+}
+
+pub(crate) fn is_subdomain_availability_api_missing_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("404")
+        || lower.contains("unregistered-subdomain")
+        || lower.contains("subdomain availability check failed") && lower.contains("not found")
+}
+
+pub(crate) fn is_subdomain_availability_api_missing_error(error: &anyhow::Error) -> bool {
+    is_subdomain_availability_api_missing_message(&error.to_string())
+}
+
+fn is_subdomain_availability_api_missing_api_error(error: &ApiError) -> bool {
+    error.status == StatusCode::BAD_GATEWAY
+        && is_subdomain_availability_api_missing_message(&error.message)
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +86,29 @@ pub(crate) async fn check_subdomain_for_router(
     .map_err(|error| ApiError::bad_gateway(format!("router subdomain check failed: {error}")))
 }
 
+pub(crate) async fn check_subdomain_for_router_outcome(
+    state: &ServerState,
+    router_url: &str,
+    subdomain: &str,
+    installation_id: Option<&str>,
+) -> Result<SubdomainCheckOutcome, ApiError> {
+    match check_subdomain_for_router(state, router_url, subdomain, installation_id).await {
+        Ok(availability) => Ok(SubdomainCheckOutcome {
+            available: availability.available,
+            checked: true,
+            reason: availability.reason,
+        }),
+        Err(error) if is_subdomain_availability_api_missing_api_error(&error) => {
+            Ok(SubdomainCheckOutcome {
+                available: true,
+                checked: false,
+                reason: Some("router_subdomain_api_unavailable".to_string()),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn check_router_reachable(
     state: &ServerState,
     router_url: &str,
@@ -73,7 +120,25 @@ pub(crate) async fn check_router_reachable(
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     };
-    Ok(RouterReachabilityOutcome { reachable })
+    let subdomain_check_supported = if reachable {
+        match client::check_client_tunnel_subdomain_available(
+            &http_client,
+            router_url,
+            "zzzzprobe",
+            None,
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(error) => !is_subdomain_availability_api_missing_error(&error),
+        }
+    } else {
+        false
+    };
+    Ok(RouterReachabilityOutcome {
+        reachable,
+        subdomain_check_supported,
+    })
 }
 
 pub(crate) async fn suggest_client_tunnel_subdomain(
@@ -87,6 +152,7 @@ pub(crate) async fn suggest_client_tunnel_subdomain(
     }
 
     let mut last_subdomain = String::new();
+    let mut availability_api_supported = reachability.subdomain_check_supported;
 
     for attempt in 0..SUGGEST_MAX_ATTEMPTS {
         let candidate = generate_candidate(&mut rand::thread_rng(), attempt);
@@ -94,15 +160,35 @@ pub(crate) async fn suggest_client_tunnel_subdomain(
             continue;
         }
         last_subdomain = candidate.clone();
-        let availability =
-            check_subdomain_for_router(state, router_url, &candidate, installation_id).await?;
-        if availability.available {
+
+        if !availability_api_supported {
             return Ok(SuggestSubdomainOutcome {
                 subdomain: candidate,
-                available: true,
-                checked: true,
+                available: false,
+                checked: false,
                 attempts: attempt as u32 + 1,
             });
+        }
+
+        match check_subdomain_for_router(state, router_url, &candidate, installation_id).await {
+            Ok(availability) if availability.available => {
+                return Ok(SuggestSubdomainOutcome {
+                    subdomain: candidate,
+                    available: true,
+                    checked: true,
+                    attempts: attempt as u32 + 1,
+                });
+            }
+            Ok(_) => {}
+            Err(error) if is_subdomain_availability_api_missing_api_error(&error) => {
+                return Ok(SuggestSubdomainOutcome {
+                    subdomain: candidate,
+                    available: false,
+                    checked: false,
+                    attempts: attempt as u32 + 1,
+                });
+            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -433,6 +519,13 @@ pub(crate) fn derive_client_tunnel_connectivity_status(
 mod tests {
     use super::*;
     use crate::domain::settings::config::ServerConfig;
+
+    #[test]
+    fn detects_missing_subdomain_availability_api_from_router_proxy_error() {
+        let message =
+            "router subdomain availability check failed: 404 Not Found: unregistered-subdomain";
+        assert!(is_subdomain_availability_api_missing_message(message));
+    }
 
     #[test]
     fn derive_claim_status_marks_conflict_from_router_error() {

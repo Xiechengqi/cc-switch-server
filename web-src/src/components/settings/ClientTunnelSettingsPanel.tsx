@@ -151,9 +151,7 @@ export function ClientTunnelSettingsPanel({
           </div>
           {routerReachable === false ? (
             <p className="text-xs text-muted-foreground">
-              {t("server.auth.routerUnreachableForSubdomain", {
-                defaultValue: "Router 不可达，无法随机生成子域名",
-              })}
+              {t("server.auth.routerUnreachableForSubdomain")}
             </p>
           ) : null}
         </div>

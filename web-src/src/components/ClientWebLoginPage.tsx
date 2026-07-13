@@ -185,9 +185,10 @@ export function ClientWebLoginPage({
 
   return (
     <div className="auth-shell">
-      <AuthLanguageSwitcher />
-      <div className="w-full max-w-sm rounded-lg border border-border bg-card p-5 shadow-sm">
-        <div className="mb-5 text-center">
+      <div className="auth-shell-card auth-shell-card--compact">
+        <AuthLanguageSwitcher />
+        <div className="auth-client-card">
+        <div className="mb-5 text-center auth-client-card-header">
           <img
             src="./favicon.png"
             alt="cc-switch"
@@ -249,12 +250,14 @@ export function ClientWebLoginPage({
                 setSetupPasswordValue(event.currentTarget.value)
               }
             />
-            <Button
-              type="submit"
-              disabled={busy || setupPasswordValue.length < 8}
-            >
-              设置并登录
-            </Button>
+            <div className="auth-panel-footer">
+              <Button
+                type="submit"
+                disabled={busy || setupPasswordValue.length < 8}
+              >
+                设置并登录
+              </Button>
+            </div>
           </form>
         ) : mode === "email" && canUseEmail ? (
           <form className="grid gap-3" onSubmit={handleEmailSubmit}>
@@ -276,9 +279,11 @@ export function ClientWebLoginPage({
                 onChange={(event) => setCode(event.currentTarget.value)}
               />
             ) : null}
-            <Button type="submit" disabled={busy || !ownerEmail}>
-              {codeSent ? "验证并登录" : "发送验证码"}
-            </Button>
+            <div className="auth-panel-footer">
+              <Button type="submit" disabled={busy || !ownerEmail}>
+                {codeSent ? "验证并登录" : "发送验证码"}
+              </Button>
+            </div>
           </form>
         ) : mode === "token" && canUseToken ? (
           <form className="grid gap-3" onSubmit={handleTokenSubmit}>
@@ -289,9 +294,11 @@ export function ClientWebLoginPage({
               disabled={busy}
               onChange={(event) => setApiToken(event.currentTarget.value)}
             />
-            <Button type="submit" disabled={busy || !apiToken.trim()}>
-              登录
-            </Button>
+            <div className="auth-panel-footer">
+              <Button type="submit" disabled={busy || !apiToken.trim()}>
+                登录
+              </Button>
+            </div>
           </form>
         ) : (
           <form className="grid gap-3" onSubmit={handlePasswordSubmit}>
@@ -302,9 +309,11 @@ export function ClientWebLoginPage({
               disabled={busy}
               onChange={(event) => setPassword(event.currentTarget.value)}
             />
-            <Button type="submit" disabled={busy || !password}>
-              登录
-            </Button>
+            <div className="auth-panel-footer">
+              <Button type="submit" disabled={busy || !password}>
+                登录
+              </Button>
+            </div>
           </form>
         )}
         {error ? (
@@ -312,6 +321,7 @@ export function ClientWebLoginPage({
             {error}
           </div>
         ) : null}
+        </div>
       </div>
     </div>
   );

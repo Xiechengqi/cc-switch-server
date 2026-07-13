@@ -912,7 +912,12 @@ export async function loadUpgradeStatus(
 export async function checkSetupSubdomain(input: {
   routerUrl: string;
   subdomain: string;
-}): Promise<{ ok: boolean; available: boolean; reason?: string | null }> {
+}): Promise<{
+  ok: boolean;
+  available: boolean;
+  checked: boolean;
+  reason?: string | null;
+}> {
   return jsonFetch("/api/setup/check-subdomain", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -925,7 +930,7 @@ export async function checkSetupSubdomain(input: {
 
 export async function checkSetupRouter(input: {
   routerUrl: string;
-}): Promise<{ reachable: boolean }> {
+}): Promise<{ reachable: boolean; subdomainCheckSupported: boolean }> {
   return jsonFetch("/api/setup/check-router", {
     method: "POST",
     headers: { "content-type": "application/json" },

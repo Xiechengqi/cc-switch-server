@@ -3,7 +3,7 @@ use super::*;
 use serde::{Deserialize, Serialize};
 
 use crate::client_tunnel_provision::{
-    check_router_reachable, check_subdomain_for_router, suggest_client_tunnel_subdomain,
+    check_router_reachable, check_subdomain_for_router_outcome, suggest_client_tunnel_subdomain,
     RouterReachabilityOutcome, SuggestSubdomainOutcome,
 };
 use crate::domain::settings::config::{ServerConfig, SetupInput, SetupOptions};
@@ -19,6 +19,7 @@ pub(in crate::api) struct SetupSubdomainCheckRequest {
 pub(in crate::api) struct SetupSubdomainCheckResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) available: bool,
+    pub(in crate::api) checked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api) reason: Option<String>,
 }
@@ -81,10 +82,12 @@ pub(in crate::api) async fn setup_check_subdomain(
         ServerConfig::preview_client_subdomain(&input.subdomain).map_err(ApiError::bad_request)?;
     let router_url =
         ServerConfig::preview_router_url(&input.router_url).map_err(ApiError::bad_request)?;
-    let availability = check_subdomain_for_router(&state, &router_url, &subdomain, None).await?;
+    let availability =
+        check_subdomain_for_router_outcome(&state, &router_url, &subdomain, None).await?;
     Ok(Json(SetupSubdomainCheckResponse {
         ok: true,
         available: availability.available,
+        checked: availability.checked,
         reason: availability.reason,
     }))
 }
