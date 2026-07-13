@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
+import { AuthLanguageSwitcher } from "@/components/AuthLanguageSwitcher";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SecretInput } from "@/components/ui/secret-input";
@@ -183,7 +184,8 @@ export function ClientWebLoginPage({
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background px-4 py-10 text-foreground">
+    <div className="auth-shell">
+      <AuthLanguageSwitcher />
       <div className="w-full max-w-sm rounded-lg border border-border bg-card p-5 shadow-sm">
         <div className="mb-5 text-center">
           <img

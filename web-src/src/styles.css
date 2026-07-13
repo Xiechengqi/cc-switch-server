@@ -71,11 +71,37 @@
   margin: 24px;
   padding: 18px;
 }.auth-shell{
+  position: relative;
   display: grid;
   min-height: 100vh;
   place-items: center;
   padding: 24px;
   background: hsl(var(--background));
+}.auth-language-switch{
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 20;
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--panel));
+  box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
+}.auth-language-switch button{
+  min-width: 52px;
+  min-height: 32px;
+  border: none;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}.auth-language-switch button.active{
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground, #fff));
+}.auth-language-switch button:not(.active):hover{
+  color: hsl(var(--foreground));
 }.auth-shell-card{
   width: min(100%, 560px);
 }.auth-shell .auth-panel{

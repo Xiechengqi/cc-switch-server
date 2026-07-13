@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { KeyRound, Loader2, Mail, Shield } from "lucide-react";
 
+import { AuthLanguageSwitcher } from "@/components/AuthLanguageSwitcher";
 import { AuthPasswordInput } from "@/components/AuthPasswordInput";
 import {
   completeServerSetup,
@@ -171,6 +172,7 @@ export function LoginPanel({
 
   return (
     <div className="auth-shell">
+      <AuthLanguageSwitcher />
       <div className="auth-shell-card">
         <form className="auth-panel" onSubmit={handleSubmit}>
           <div className="auth-panel-header">
@@ -200,9 +202,7 @@ export function LoginPanel({
                 ? t("server.auth.setupSubtitle", {
                     defaultValue: "设置 Owner 邮箱、Router 与管理员密码。",
                   })
-                : t("server.auth.loginSubtitlePasswordOnly", {
-                    defaultValue: "使用 Web 密码登录。",
-                  })}
+                : t("server.auth.loginSubtitlePasswordOnly")}
             </p>
           </div>
 
