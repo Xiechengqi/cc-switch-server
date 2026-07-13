@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::domain::accounts::store::{Account, AccountQuotaTier, AccountStore};
 use crate::domain::health;
-use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::model::{classify_provider, AppKind, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::{share_router_for_sale_label, Share, ShareMarketGrantStatus};
@@ -594,11 +594,13 @@ fn upstream_provider(
     let available = health
         .as_ref()
         .map(|health| health.healthy && quota_blocked != Some(true));
+    let resolved_provider_type = classify_provider(provider.app, &provider.provider);
+    let provider_type_id = resolved_provider_type.as_str().to_string();
     ShareUpstreamProvider {
-        kind: provider.provider_type_id.clone(),
+        kind: provider_type_id.clone(),
         app: app.to_string(),
         provider_name: Some(provider.provider.name.clone()),
-        provider_type: Some(provider.provider_type_id.clone()),
+        provider_type: Some(provider_type_id.clone()),
         account_email: account_context.account_email,
         subscription_level: account_context.subscription_level,
         subscription_expires_at: account_context.subscription_expires_at,
@@ -628,12 +630,14 @@ fn app_provider(
     let available = health
         .as_ref()
         .map(|health| health.healthy && quota_blocked != Some(true));
+    let resolved_provider_type = classify_provider(provider.app, &provider.provider);
+    let provider_type_id = resolved_provider_type.as_str().to_string();
     ShareAppProvider {
         id: provider.provider.id.clone(),
         name: provider.provider.name.clone(),
         app: app.to_string(),
-        kind: Some(provider.provider_type_id.clone()),
-        provider_type: Some(provider.provider_type_id.clone()),
+        kind: Some(provider_type_id.clone()),
+        provider_type: Some(provider_type_id),
         is_current,
         enabled: true,
         account_email: account_context.account_email,

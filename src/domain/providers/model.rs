@@ -384,6 +384,43 @@ fn app_base_url(provider: &Provider, app: AppKind) -> Option<&str> {
             return Some(value);
         }
     }
+
+    if app == AppKind::Codex {
+        if let Some(value) = provider
+            .settings_config
+            .pointer("/config/base_url")
+            .and_then(Value::as_str)
+        {
+            return Some(value);
+        }
+        if let Some(value) = provider
+            .settings_config
+            .get("config")
+            .and_then(Value::as_str)
+            .and_then(extract_codex_toml_base_url)
+        {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+fn extract_codex_toml_base_url(config: &str) -> Option<&str> {
+    for marker in ["base_url = \"", "base_url = '"] {
+        let Some(start) = config.find(marker) else {
+            continue;
+        };
+        let quote = marker.chars().last()?;
+        let rest = &config[start + marker.len()..];
+        let Some(end) = rest.find(quote) else {
+            continue;
+        };
+        let value = rest[..end].trim();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
     None
 }
 
@@ -631,6 +668,15 @@ mod tests {
         assert_eq!(
             classify_provider(AppKind::Codex, &copilot),
             ProviderType::GitHubCopilot
+        );
+
+        let mut nvidia = provider(None);
+        nvidia.settings_config = json!({
+            "config": "model_provider = \"custom\"\nmodel = \"moonshotai/kimi-k2.5\"\n\n[model_providers.custom]\nname = \"nvidia\"\nbase_url = \"https://integrate.api.nvidia.com/v1\"\n"
+        });
+        assert_eq!(
+            classify_provider(AppKind::Codex, &nvidia),
+            ProviderType::Nvidia
         );
     }
 
