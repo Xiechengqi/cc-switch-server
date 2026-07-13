@@ -24,17 +24,10 @@ import {
 
 type LoginMethod = "password" | "email" | "apiToken";
 
-function normalizeMethods(context: WebRuntimeContext): LoginMethod[] {
-  // LoginPanel is only rendered for direct server access (IP/loopback:15721).
-  // Router-backed API Token login stays on ClientWebLoginPage (tunnel URL).
-  if (context.status === "setup-required" || context.auth?.setupRequired) {
-    return ["password"];
-  }
-  const methods: LoginMethod[] = ["password"];
-  if (context.auth?.ownerEmail?.trim()) {
-    methods.push("email");
-  }
-  return methods;
+function normalizeMethods(): LoginMethod[] {
+  // Direct server access (IP/loopback:15721) supports password login only.
+  // Email/API Token login stays on ClientWebLoginPage (client tunnel URL).
+  return ["password"];
 }
 
 function errorMessage(error: unknown): string {
@@ -84,7 +77,7 @@ export function LoginPanel({
   const { t } = useI18n();
   const setupRequired =
     context.status === "setup-required" || context.auth?.setupRequired;
-  const availableMethods = useMemo(() => normalizeMethods(context), [context]);
+  const availableMethods = useMemo(() => normalizeMethods(), []);
   const [activeMethod, setActiveMethod] = useState<LoginMethod>(
     availableMethods[0] ?? "password",
   );
