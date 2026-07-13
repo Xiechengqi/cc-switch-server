@@ -920,14 +920,27 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
                             .and_then(Value::as_str),
                         Some("claude-sonnet-4.8")
                     );
-                    seen.fetch_add(1, Ordering::SeqCst);
+                    let request_index = seen.fetch_add(1, Ordering::SeqCst);
+                    let events = if request_index == 0 {
+                        vec![(
+                            "assistantResponseEvent",
+                            json!({"content": "hello from kiro"}),
+                        )]
+                    } else {
+                        vec![(
+                            "toolUseEvent",
+                            json!({
+                                "toolUseId": "toolu_incomplete",
+                                "name": "Read",
+                                "input": "{\"file_path\":",
+                                "stop": false
+                            }),
+                        )]
+                    };
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "application/vnd.amazon.eventstream")
-                        .body(Body::from(event_stream_bytes(vec![(
-                            "assistantResponseEvent",
-                            json!({"content": "hello from kiro"}),
-                        )])))
+                        .body(Body::from(event_stream_bytes(events)))
                         .unwrap()
                 },
             ),
@@ -1005,6 +1018,7 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
         .unwrap();
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -1032,6 +1046,46 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
     assert_eq!(body["content"][0]["text"].as_str(), Some("hello from kiro"));
     assert_eq!(body["stop_reason"].as_str(), Some("end_turn"));
     assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("x-cc-provider-id", "kiro-managed")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "claude-sonnet-4-8",
+                        "max_tokens": 64,
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "incomplete tool"}]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["code"].as_str(), Some("TOOL_JSON_INCOMPLETE"));
+    assert_eq!(body["type"].as_str(), Some("upstream_tool_json_error"));
+    assert_eq!(body["retryable"].as_bool(), Some(false));
+    assert_eq!(seen.load(Ordering::SeqCst), 2);
+
+    let usage = state.usage_snapshot().await;
+    let status_codes = usage
+        .logs
+        .iter()
+        .filter(|log| log.provider_id == "kiro-managed")
+        .map(|log| log.status_code)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        status_codes,
+        vec![StatusCode::OK.as_u16(), StatusCode::BAD_GATEWAY.as_u16()]
+    );
 }
 
 #[tokio::test]

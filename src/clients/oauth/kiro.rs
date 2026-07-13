@@ -656,7 +656,7 @@ fn classify_kiro_refresh_error(status: StatusCode, body: &str) -> OAuthErrorKind
 }
 
 fn extract_error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
+    let message = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|value| {
             value
@@ -666,7 +666,8 @@ fn extract_error_message(body: &str) -> String {
                 .or_else(|| value.get("error").and_then(Value::as_str))
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| body.to_string())
+        .unwrap_or_else(|| body.to_string());
+    crate::logging::mask_kiro_api_keys(&message)
 }
 
 fn validate_external_idp_endpoint(url: &str) -> Result<(), AccountRefreshFailure> {

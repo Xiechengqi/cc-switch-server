@@ -161,7 +161,7 @@ impl KiroDeviceError {
     fn remote(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
-            message: message.into(),
+            message: crate::logging::mask_kiro_api_keys(&message.into()),
         }
     }
 }

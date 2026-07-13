@@ -2095,18 +2095,51 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             },
         )
         .await;
-        record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
+        if kiro::is_client_validation_error(&bytes) {
+            tracing::warn!(
+                provider_id = %stored.provider.id,
+                status_code,
+                "Kiro request rejected by terminal client validation; skipping failover accounting"
+            );
+        } else {
+            record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code))
+                .await;
+        }
         let mut response = Response::new(Body::from(bytes));
         *response.status_mut() = status;
         return Ok(response);
     }
 
-    let message = kiro::kiro_event_bytes_to_claude_json(
+    let message = match kiro::kiro_event_bytes_to_claude_json(
         &bytes,
         &model,
         &prepared.tool_name_map,
         &request_body,
-    );
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            let proxy_error = ProxyError::kiro_tool_json(error);
+            log_usage(
+                &state,
+                &stored,
+                proxy_error.status.as_u16(),
+                started.elapsed().as_millis(),
+                claude_kiro_model_metadata(&model),
+                TokenUsage::default(),
+                UsageLogContext {
+                    is_streaming: false,
+                    ..request_context
+                },
+            )
+            .await;
+            tracing::warn!(
+                provider_id = %stored.provider.id,
+                error_code = proxy_error.error_code(),
+                "Kiro non-stream response contained invalid or incomplete tool JSON"
+            );
+            return Err(proxy_error);
+        }
+    };
     let usage = crate::domain::usage::store::usage_from_json(&message);
     let response_bytes = serde_json::to_vec(&message)
         .map(Bytes::from)

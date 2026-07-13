@@ -86,11 +86,41 @@ pub fn redact_sensitive_text(input: &str) -> String {
         "password",
         "secret",
     ];
+    let input = mask_kiro_api_keys(input);
     input
         .lines()
         .map(|line| redact_sensitive_line(line, KEYS))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub fn mask_kiro_api_keys(input: &str) -> String {
+    const PREFIX: &str = "ksk_";
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = input[cursor..].find(PREFIX) {
+        let start = cursor + relative_start;
+        output.push_str(&input[cursor..start]);
+        let mut end = start + PREFIX.len();
+        while end < input.len() {
+            let byte = input.as_bytes()[end];
+            if !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) {
+                break;
+            }
+            end += 1;
+        }
+        let token = &input[start..end];
+        if token.len() > 8 {
+            output.push_str(&token[..4]);
+            output.push_str("...");
+            output.push_str(&token[token.len() - 4..]);
+        } else {
+            output.push_str("[REDACTED_KIRO_API_KEY]");
+        }
+        cursor = end;
+    }
+    output.push_str(&input[cursor..]);
+    output
 }
 
 fn redact_sensitive_line(line: &str, keys: &[&str]) -> String {
@@ -153,6 +183,18 @@ mod tests {
         assert_eq!(
             redact_sensitive_text("token router connected"),
             "token router connected"
+        );
+    }
+
+    #[test]
+    fn masks_kiro_api_keys_without_hiding_surrounding_error() {
+        assert_eq!(
+            mask_kiro_api_keys("upstream rejected ksk_abcdefghijklmnop; retry denied"),
+            "upstream rejected ksk_...mnop; retry denied"
+        );
+        assert_eq!(
+            redact_sensitive_text("error: invalid ksk_1234567890"),
+            "error: invalid ksk_...7890"
         );
     }
 }

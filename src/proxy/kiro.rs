@@ -590,11 +590,16 @@ fn normalize_schema(schema: Value) -> Value {
     };
 
     obj.remove("$schema");
-    if obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .is_none_or(|s| s.is_empty())
-    {
+    strip_top_level_combinators(&mut obj);
+
+    let current_type = obj.get("type").and_then(|v| v.as_str()).map(str::to_string);
+    if current_type.as_deref() != Some("object") {
+        if let Some(original_type) = current_type {
+            tracing::warn!(
+                original_type = %original_type,
+                "Kiro tool inputSchema top-level type normalized to object"
+            );
+        }
         obj.insert("type".to_string(), json!("object"));
     }
 
@@ -627,6 +632,36 @@ fn normalize_schema(schema: Value) -> Value {
     }
 
     Value::Object(obj)
+}
+
+fn strip_top_level_combinators(obj: &mut serde_json::Map<String, Value>) {
+    let had_properties = obj.contains_key("properties");
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        let Some(Value::Array(variants)) = obj.remove(combinator) else {
+            continue;
+        };
+        if had_properties || obj.contains_key("properties") {
+            continue;
+        }
+        let Some(variant) = variants.into_iter().find_map(|variant| {
+            let Value::Object(variant) = variant else {
+                return None;
+            };
+            (variant.get("type").and_then(Value::as_str) == Some("object")).then_some(variant)
+        }) else {
+            continue;
+        };
+        for key in [
+            "properties",
+            "required",
+            "additionalProperties",
+            "description",
+        ] {
+            if let Some(value) = variant.get(key) {
+                obj.entry(key.to_string()).or_insert_with(|| value.clone());
+            }
+        }
+    }
 }
 
 fn normalize_property_schema(schema: Value) -> Value {
@@ -1821,6 +1856,118 @@ struct InlineThinkingSegment {
     text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KiroToolJsonError {
+    Invalid {
+        tool_use_id: String,
+        name: String,
+        message: String,
+    },
+    Incomplete {
+        tool_use_id: String,
+        name: String,
+        bytes: usize,
+    },
+}
+
+impl KiroToolJsonError {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid { .. } => "TOOL_JSON_INVALID",
+            Self::Incomplete { .. } => "TOOL_JSON_INCOMPLETE",
+        }
+    }
+}
+
+impl std::fmt::Display for KiroToolJsonError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid {
+                tool_use_id,
+                name,
+                message,
+            } => write!(
+                formatter,
+                "upstream returned invalid JSON for tool_use {tool_use_id} ({name}): {message}"
+            ),
+            Self::Incomplete {
+                tool_use_id,
+                name,
+                bytes,
+            } => write!(
+                formatter,
+                "upstream ended before completing tool_use {tool_use_id} ({name}) JSON input; buffered {bytes} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for KiroToolJsonError {}
+
+#[derive(Default)]
+struct ToolJsonAccumulator {
+    pending: HashMap<String, (String, String)>,
+}
+
+impl ToolJsonAccumulator {
+    fn push(
+        &mut self,
+        tool_use_id: &str,
+        name: &str,
+        input: &str,
+        stop: bool,
+        tool_name_map: &HashMap<String, String>,
+    ) -> Result<Option<(String, String, Value)>, KiroToolJsonError> {
+        let entry = self
+            .pending
+            .entry(tool_use_id.to_string())
+            .or_insert_with(|| (name.to_string(), String::new()));
+        if entry.0.is_empty() {
+            entry.0 = name.to_string();
+        }
+        entry.1.push_str(input);
+        if !stop {
+            return Ok(None);
+        }
+
+        let (kiro_name, input) = self
+            .pending
+            .remove(tool_use_id)
+            .unwrap_or_else(|| (name.to_string(), input.to_string()));
+        let parsed = if input.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str::<Value>(&input).map_err(|error| KiroToolJsonError::Invalid {
+                tool_use_id: tool_use_id.to_string(),
+                name: kiro_name.clone(),
+                message: error.to_string(),
+            })?
+        };
+        Ok(Some((
+            tool_use_id.to_string(),
+            original_tool_name(&kiro_name, tool_name_map),
+            parsed,
+        )))
+    }
+
+    fn finish(&mut self) -> Result<(), KiroToolJsonError> {
+        let pending = self
+            .pending
+            .iter()
+            .max_by_key(|(_, (_, input))| input.len())
+            .map(|(id, (name, input))| (id.clone(), name.clone(), input.len()));
+        let Some((tool_use_id, name, bytes)) = pending else {
+            return Ok(());
+        };
+        self.pending.remove(&tool_use_id);
+        Err(KiroToolJsonError::Incomplete {
+            tool_use_id,
+            name,
+            bytes,
+        })
+    }
+}
+
 fn split_inline_thinking(text: &str, in_thinking: &mut bool) -> Vec<InlineThinkingSegment> {
     let mut segments = Vec::new();
     let mut rest = text;
@@ -1956,7 +2103,7 @@ pub(crate) fn kiro_event_bytes_to_claude_json(
     model: &str,
     tool_name_map: &HashMap<String, String>,
     request_body: &Value,
-) -> Value {
+) -> Result<Value, KiroToolJsonError> {
     let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body);
     kiro_event_bytes_to_anthropic_json(bytes, model, tool_name_map, prompt_cache_usage)
 }
@@ -1966,14 +2113,15 @@ fn kiro_event_bytes_to_anthropic_json(
     model: &str,
     tool_name_map: &HashMap<String, String>,
     prompt_cache_usage: KiroPromptCacheUsage,
-) -> Value {
+) -> Result<Value, KiroToolJsonError> {
     let mut buffer = BytesMut::from(bytes);
     let mut text = String::new();
     let mut thinking = String::new();
     let mut inline_thinking = false;
     let mut thinking_signature = None;
     let mut redacted_thinking = Vec::new();
-    let mut tools: HashMap<String, (String, String)> = HashMap::new();
+    let mut tools = Vec::new();
+    let mut tool_accumulator = ToolJsonAccumulator::default();
     let mut seen_tool_signatures = HashSet::new();
     let mut tool_leak_filter = ToolLeakFilter::default();
     let mut usage = KiroUsageAccumulator::default();
@@ -2032,22 +2180,20 @@ fn kiro_event_bytes_to_anthropic_json(
                     .and_then(|v| v.as_str())
                     .unwrap_or("tool")
                     .to_string();
-                let name = original_tool_name(&name, tool_name_map);
                 let input = payload
                     .get("input")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let entry = tools.entry(id).or_insert((name, String::new()));
-                entry.1.push_str(&input);
-                if payload
+                let stop = payload
                     .get("stop")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if let Some((id, name, parsed_input)) =
+                    tool_accumulator.push(&id, &name, &input, stop, tool_name_map)?
                 {
-                    if let Ok(parsed_input) = serde_json::from_str::<Value>(&entry.1) {
-                        seen_tool_signatures.insert(tool_signature(&entry.0, &parsed_input));
-                    }
+                    seen_tool_signatures.insert(tool_signature(&name, &parsed_input));
+                    tools.push((id, name, parsed_input));
                 }
             }
             Some("contextUsageEvent")
@@ -2062,6 +2208,7 @@ fn kiro_event_bytes_to_anthropic_json(
             _ => {}
         }
     }
+    tool_accumulator.finish()?;
     for visible in tool_leak_filter.push_text("", true) {
         text.push_str(&visible);
     }
@@ -2080,9 +2227,8 @@ fn kiro_event_bytes_to_anthropic_json(
     if !text.is_empty() {
         content.push(json!({"type":"text","text":text}));
     }
-    for (id, (name, input)) in tools {
-        let parsed_input = serde_json::from_str::<Value>(&input).unwrap_or_else(|_| json!({}));
-        content.push(json!({"type":"tool_use","id":id,"name":name,"input":parsed_input}));
+    for (id, name, input) in tools {
+        content.push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
     }
     for leaked in tool_leak_filter.take_deduped(&mut seen_tool_signatures) {
         content.push(json!({
@@ -2102,7 +2248,7 @@ fn kiro_event_bytes_to_anthropic_json(
     };
     let fallback_output_tokens = estimate_tokens(&format!("{thinking}{text}"));
     let usage = usage.final_usage(fallback_output_tokens);
-    json!({
+    Ok(json!({
         "id": next_message_id(),
         "type": "message",
         "role": "assistant",
@@ -2116,7 +2262,7 @@ fn kiro_event_bytes_to_anthropic_json(
             "cache_read_input_tokens": usage.cache_read_tokens,
             "cache_creation_input_tokens": usage.cache_creation_tokens
         }
-    })
+    }))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2718,6 +2864,30 @@ fn is_account_throttled(status: reqwest::StatusCode, body: &str) -> bool {
         && body.contains("temporary limits")
 }
 
+pub(crate) fn is_client_validation_error(body: &[u8]) -> bool {
+    const TERMINAL_REASONS: &[&str] = &["TOOL_USE_RESULT_MISMATCH", "TOOL_SCHEMA_INVALID"];
+    const MESSAGE_MARKERS: &[&str] = &["Expected toolResult blocks"];
+
+    let body = String::from_utf8_lossy(body);
+    if TERMINAL_REASONS.iter().any(|reason| body.contains(reason)) {
+        match serde_json::from_str::<Value>(&body) {
+            Ok(value) => {
+                let top_level = value.get("reason").and_then(Value::as_str);
+                let nested = value.pointer("/error/reason").and_then(Value::as_str);
+                if [top_level, nested]
+                    .into_iter()
+                    .flatten()
+                    .any(|reason| TERMINAL_REASONS.contains(&reason))
+                {
+                    return true;
+                }
+            }
+            Err(_) => return true,
+        }
+    }
+    MESSAGE_MARKERS.iter().any(|marker| body.contains(marker))
+}
+
 #[allow(dead_code)]
 fn default_profile_arn_for_builder_id() -> &'static str {
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
@@ -3205,7 +3375,8 @@ mod tests {
             "claude-opus-4-6",
             &HashMap::new(),
             KiroPromptCacheUsage::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(message.pointer("/content/0/type"), Some(&json!("thinking")));
         assert_eq!(
             message.pointer("/content/0/thinking"),
@@ -3233,7 +3404,8 @@ mod tests {
             "claude-opus-4-6",
             &HashMap::new(),
             KiroPromptCacheUsage::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             message.pointer("/content/0/signature"),
             Some(&json!(THINKING_SIGNATURE_FALLBACK))
@@ -3258,7 +3430,8 @@ mod tests {
             "claude-sonnet-4-8",
             &HashMap::new(),
             KiroPromptCacheUsage::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             message.pointer("/content/0/text"),
             Some(&json!("before  after"))
@@ -3284,7 +3457,8 @@ mod tests {
             "claude-opus-4-6",
             &HashMap::new(),
             KiroPromptCacheUsage::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             message.pointer("/content/0/type"),
             Some(&json!("redacted_thinking"))
@@ -3487,6 +3661,134 @@ mod tests {
         assert!(is_account_throttled(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             "Due to suspicious activity, we are imposing temporary limits"
+        ));
+    }
+
+    #[test]
+    fn schema_normalization_forces_object_and_recovers_top_level_variant() {
+        let normalized = normalize_schema(json!({
+            "type": "array",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["paths"],
+                    "additionalProperties": false
+                },
+                {"type": "string"}
+            ]
+        }));
+        assert_eq!(normalized.get("type"), Some(&json!("object")));
+        assert!(normalized.get("oneOf").is_none());
+        assert_eq!(
+            normalized.pointer("/properties/paths/type"),
+            Some(&json!("array"))
+        );
+        assert_eq!(normalized.get("required"), Some(&json!(["paths"])));
+        assert_eq!(normalized.get("additionalProperties"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn schema_normalization_strips_combinator_without_object_variant() {
+        let normalized = normalize_schema(json!({
+            "anyOf": [{"type": "string"}, {"type": "number"}]
+        }));
+        assert_eq!(normalized.get("type"), Some(&json!("object")));
+        assert!(normalized.get("anyOf").is_none());
+        assert_eq!(normalized.get("properties"), Some(&json!({})));
+    }
+
+    #[test]
+    fn non_streaming_tool_json_requires_valid_stopped_input() {
+        let valid = event_stream_bytes(vec![
+            (
+                "toolUseEvent",
+                json!({
+                    "toolUseId": "toolu_1",
+                    "name": "Read",
+                    "input": "{\"file_",
+                    "stop": false
+                }),
+            ),
+            (
+                "toolUseEvent",
+                json!({
+                    "toolUseId": "toolu_1",
+                    "name": "Read",
+                    "input": "path\":\"Cargo.toml\"}",
+                    "stop": true
+                }),
+            ),
+        ]);
+        let message = kiro_event_bytes_to_anthropic_json(
+            &valid,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            message.pointer("/content/0/input/file_path"),
+            Some(&json!("Cargo.toml"))
+        );
+
+        let invalid = event_stream_bytes(vec![(
+            "toolUseEvent",
+            json!({
+                "toolUseId": "toolu_invalid",
+                "name": "Read",
+                "input": "{\"file_path\":",
+                "stop": true
+            }),
+        )]);
+        let error = kiro_event_bytes_to_anthropic_json(
+            &invalid,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "TOOL_JSON_INVALID");
+
+        let incomplete = event_stream_bytes(vec![(
+            "toolUseEvent",
+            json!({
+                "toolUseId": "toolu_incomplete",
+                "name": "Read",
+                "input": "{\"file_path\":",
+                "stop": false
+            }),
+        )]);
+        let error = kiro_event_bytes_to_anthropic_json(
+            &incomplete,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "TOOL_JSON_INCOMPLETE");
+        assert!(!error.to_string().contains("file_path"));
+    }
+
+    #[test]
+    fn detects_terminal_kiro_client_validation_reasons() {
+        assert!(is_client_validation_error(
+            br#"{"reason":"TOOL_SCHEMA_INVALID"}"#
+        ));
+        assert!(is_client_validation_error(
+            br#"{"error":{"reason":"TOOL_USE_RESULT_MISMATCH"}}"#
+        ));
+        assert!(is_client_validation_error(
+            b"upstream error: TOOL_USE_RESULT_MISMATCH"
+        ));
+        assert!(is_client_validation_error(
+            b"Expected toolResult blocks for the previous toolUse blocks"
+        ));
+        assert!(!is_client_validation_error(
+            br#"{"message":"documentation mentions TOOL_SCHEMA_INVALID"}"#
+        ));
+        assert!(!is_client_validation_error(
+            br#"{"__type":"ValidationException","message":"temporary"}"#
         ));
     }
 

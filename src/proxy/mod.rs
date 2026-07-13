@@ -10,7 +10,7 @@ pub(crate) mod cursor;
 mod deepseek;
 mod forwarder;
 mod grok;
-mod kiro;
+pub(crate) mod kiro;
 mod request_governance;
 mod responses_wire;
 mod router;
@@ -46,6 +46,9 @@ impl std::fmt::Display for ProxyError {
 impl std::error::Error for ProxyError {}
 
 impl ProxyError {
+    const TOOL_JSON_INVALID_PREFIX: &'static str = "[TOOL_JSON_INVALID] ";
+    const TOOL_JSON_INCOMPLETE_PREFIX: &'static str = "[TOOL_JSON_INCOMPLETE] ";
+
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::BAD_REQUEST,
@@ -74,7 +77,27 @@ impl ProxyError {
         }
     }
 
+    pub(super) fn kiro_tool_json(error: kiro::KiroToolJsonError) -> Self {
+        Self {
+            status: axum::http::StatusCode::BAD_GATEWAY,
+            message: format!("[{}] {error}", error.code()),
+        }
+    }
+
+    pub fn client_message(&self) -> &str {
+        self.message
+            .strip_prefix(Self::TOOL_JSON_INVALID_PREFIX)
+            .or_else(|| self.message.strip_prefix(Self::TOOL_JSON_INCOMPLETE_PREFIX))
+            .unwrap_or(&self.message)
+    }
+
     pub fn error_code(&self) -> &'static str {
+        if self.message.starts_with(Self::TOOL_JSON_INVALID_PREFIX) {
+            return "TOOL_JSON_INVALID";
+        }
+        if self.message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX) {
+            return "TOOL_JSON_INCOMPLETE";
+        }
         match self.status {
             axum::http::StatusCode::BAD_REQUEST => "cc_switch_invalid_request",
             axum::http::StatusCode::UNAUTHORIZED => "cc_switch_auth_error",
@@ -94,6 +117,11 @@ impl ProxyError {
     }
 
     pub fn error_type(&self) -> &'static str {
+        if self.message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
+            || self.message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
+        {
+            return "upstream_tool_json_error";
+        }
         match self.status {
             axum::http::StatusCode::BAD_REQUEST => "invalid_request_error",
             axum::http::StatusCode::UNAUTHORIZED => "authentication_error",
@@ -111,6 +139,11 @@ impl ProxyError {
     }
 
     pub fn retryable(&self) -> bool {
+        if self.message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
+            || self.message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
+        {
+            return false;
+        }
         matches!(
             self.status,
             axum::http::StatusCode::TOO_MANY_REQUESTS

@@ -113,9 +113,10 @@ impl ApiError {
         let code = error.error_code();
         let error_type = error.error_type();
         let retryable = error.retryable();
+        let message = error.client_message().to_string();
         Self {
             status: error.status,
-            message: error.message,
+            message,
             code: Some(code),
             error_type: Some(error_type),
             retryable: Some(retryable),
@@ -217,6 +218,24 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn kiro_tool_json_error_exposes_terminal_code_without_internal_prefix() {
+        let error = crate::proxy::kiro::KiroToolJsonError::Incomplete {
+            tool_use_id: "toolu_1".to_string(),
+            name: "Read".to_string(),
+            bytes: 17,
+        };
+        let response =
+            ApiError::proxy(crate::proxy::ProxyError::kiro_tool_json(error)).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = json_body(response).await;
+
+        assert_eq!(body["code"].as_str(), Some("TOOL_JSON_INCOMPLETE"));
+        assert_eq!(body["type"].as_str(), Some("upstream_tool_json_error"));
+        assert_eq!(body["retryable"].as_bool(), Some(false));
+        assert!(!body["error"].as_str().unwrap().starts_with('['));
     }
 
     async fn json_body(response: axum::response::Response) -> serde_json::Value {
