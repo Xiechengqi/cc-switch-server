@@ -13,7 +13,7 @@ export const SERVER_DEFAULT_SETTINGS: Settings = {
   proxyConfirmed: true,
   usageConfirmed: true,
   streamCheckConfirmed: true,
-  enableFailoverToggle: true,
+  enableFailoverToggle: false,
   preserveCodexOfficialAuthOnSwitch: false,
   unifyCodexSessionHistory: false,
   unifyCodexMigrateExisting: false,

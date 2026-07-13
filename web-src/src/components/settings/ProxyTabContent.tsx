@@ -121,7 +121,7 @@ export function ProxyTabContent({
                 description={t(
                   "settings.advanced.proxy.enableFailoverToggleDescription",
                 )}
-                checked={settings?.enableFailoverToggle ?? true}
+                checked={settings?.enableFailoverToggle ?? false}
                 onCheckedChange={handleFailoverToggleChange}
               />
 

@@ -36,6 +36,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
 import { settingsApi } from "@/lib/api";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
@@ -239,7 +240,7 @@ export function SettingsPage({
   const isBusy = useMemo(() => isLoading && !settings, [isLoading, settings]);
 
   return (
-    <div className="flex flex-col h-full overflow-hidden px-6">
+    <div className={cn("flex flex-col h-full overflow-hidden", PAGE_SHELL_PADDING_X)}>
       {isBusy ? (
         <div className="flex flex-1 items-center justify-center">
           <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -647,7 +648,7 @@ export function SettingsPage({
                 className="flex-shrink-0 pt-4 border-t border-border-default"
                 style={{ backgroundColor: "hsl(var(--background))" }}
               >
-                <div className="px-6 flex items-center justify-end gap-3">
+                <div className="flex items-center justify-end gap-3">
                   <Button onClick={handleSave} disabled={isSaving}>
                     {isSaving ? (
                       <span className="inline-flex items-center gap-2">

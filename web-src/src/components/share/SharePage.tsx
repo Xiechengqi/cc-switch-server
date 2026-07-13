@@ -25,6 +25,7 @@ import {
   getTunnelConfigFromSettings,
   isTunnelConfigured,
 } from "@/utils/shareUtils";
+import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
 import { ShareList } from "./ShareList";
 import {
   getProviderAccountLabel,
@@ -32,6 +33,7 @@ import {
   type ManagedAuthStatusByProvider,
 } from "./providerOptions";
 import type { Provider } from "@/types";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -240,8 +242,8 @@ export function SharePage({
   };
 
   return (
-    <div className="px-6 py-4">
-      <div className="flex flex-col gap-5 pb-10">
+    <div className={cn(PAGE_SHELL_PADDING_X, "py-2 sm:py-3")}>
+      <div className="flex flex-col gap-5 pb-8 sm:pb-10">
         {shareScoped ? (
           <ShareOwnerAuthBar
             share={primaryShare}

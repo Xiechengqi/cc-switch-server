@@ -4,10 +4,10 @@ import { AnimatePresence, motion } from "framer-motion";
 import { toast } from "sonner";
 import {
   ArrowLeft,
-  BarChart2,
   Plus,
   Settings,
   Share2,
+  ShieldCheck,
 } from "lucide-react";
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
@@ -22,7 +22,12 @@ import { cn } from "@/lib/utils";
 import { isRemoteWebMode } from "@/lib/api/auth";
 import { clearRouterSessionTokens } from "@/lib/routerAuth";
 import { writeCachedPassword, writeToken } from "@/lib/runtime";
-import { PAGE_SHELL_CLASS } from "@/lib/layout";
+import {
+  APP_VIEWPORT_PADDING_Y,
+  PAGE_HEADER_CONTENT_GAP,
+  PAGE_SHELL_CLASS,
+  PAGE_SHELL_PADDING_X,
+} from "@/lib/layout";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
@@ -236,7 +241,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
           activeApp !== "gemini"
         ) {
           return (
-            <div className="px-6 pt-6 text-sm text-muted-foreground">
+            <div className={cn(PAGE_SHELL_PADDING_X, "pt-2 text-sm text-muted-foreground")}>
               {t("share.unsupportedApp", {
                 defaultValue:
                   "{{app}} 暂不支持 share；请切换到 Claude / Codex / Gemini tab 后再创建 share。",
@@ -256,8 +261,8 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
         );
       default:
         return (
-          <div className="px-6 flex flex-col flex-1 min-h-0 overflow-hidden">
-            <div className="flex-1 overflow-y-auto overflow-x-hidden pb-12 px-1">
+          <div className={cn(PAGE_SHELL_PADDING_X, "flex flex-col flex-1 min-h-0 overflow-hidden")}>
+            <div className="flex-1 overflow-y-auto overflow-x-hidden pb-10 sm:pb-12">
               <AnimatePresence mode="wait">
                 <motion.div
                   key={activeApp}
@@ -296,12 +301,19 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
   })();
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-background text-foreground selection:bg-primary/30 pb-4">
-      <header className="sticky top-0 z-50 w-full bg-background/80 backdrop-blur-md">
+    <div
+      className={cn(
+        "flex flex-col h-screen overflow-hidden bg-background text-foreground selection:bg-primary/30",
+        APP_VIEWPORT_PADDING_Y,
+        PAGE_HEADER_CONTENT_GAP,
+      )}
+    >
+      <header className="sticky top-0 z-50 w-full shrink-0 bg-background/80 backdrop-blur-md">
         <div
           className={cn(
             PAGE_SHELL_CLASS,
-            "flex h-14 items-center justify-between gap-2 px-6",
+            PAGE_SHELL_PADDING_X,
+            "flex min-h-14 items-center justify-between gap-2",
           )}
         >
           <div className="flex min-w-0 items-center gap-2">
@@ -349,11 +361,11 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                     <Button
                       variant="ghost"
                       size="icon"
-                      onClick={() => openSettings("usage")}
-                      title={t("usage.title", { defaultValue: "使用统计" })}
+                      onClick={() => openSettings("auth")}
+                      title={t("settings.tabAuth", { defaultValue: "认证" })}
                       className="hover:bg-black/5 dark:hover:bg-white/5"
                     >
-                      <BarChart2 className="w-4 h-4" />
+                      <ShieldCheck className="w-4 h-4" />
                     </Button>
                     <Button
                       variant="ghost"
@@ -372,7 +384,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
 
           {isProviderHome && (
             <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
-              {settingsData?.enableFailoverToggle !== false && (
+              {settingsData?.enableFailoverToggle === true && (
                 <div className="flex shrink-0 items-center gap-1.5">
                   <FailoverToggle activeApp={activeApp} />
                 </div>

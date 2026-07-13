@@ -125,7 +125,7 @@ pub fn default_ui_settings() -> Value {
         "proxyConfirmed": true,
         "usageConfirmed": true,
         "streamCheckConfirmed": true,
-        "enableFailoverToggle": true,
+        "enableFailoverToggle": false,
         "preserveCodexOfficialAuthOnSwitch": false,
         "unifyCodexSessionHistory": false,
         "unifyCodexMigrateExisting": false,
@@ -458,7 +458,7 @@ mod tests {
         };
         let frontend = store.for_frontend();
         assert_eq!(frontend["commonConfigConfirmed"], json!(true));
-        assert_eq!(frontend["enableFailoverToggle"], json!(true));
+        assert_eq!(frontend["enableFailoverToggle"], json!(false));
         assert!(frontend.get("visibleApps").is_some());
     }
 
