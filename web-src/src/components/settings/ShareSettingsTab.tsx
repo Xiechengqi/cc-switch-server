@@ -1,8 +1,7 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Activity, Laptop, Network, WalletCards } from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
-import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import {
   Accordion,
@@ -10,19 +9,40 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { ClientTunnelSettingsPanel } from "@/components/settings/ClientTunnelSettingsPanel";
-import { PayoutProfileSettingsPanel } from "@/components/settings/PayoutProfileSettingsPanel";
+import {
+  ClientTunnelSettingsPanel,
+  type ClientTunnelFormState,
+} from "@/components/settings/ClientTunnelSettingsPanel";
+import {
+  PayoutProfileSettingsPanel,
+  type PayoutProfileFormState,
+} from "@/components/settings/PayoutProfileSettingsPanel";
 import {
   formatShareHealthOverview,
   ShareHealthStatusPanel,
 } from "@/components/settings/ShareHealthStatusPanel";
 import { ShareRouterSelector } from "@/components/share/ShareRouterSelector";
-import { useConfigureTunnelMutation, useClientTunnelQuery, useSettingsQuery, useShareHealthQuery } from "@/lib/query";
+import {
+  useConfigureTunnelMutation,
+  useClientTunnelQuery,
+  useSettingsQuery,
+  useShareHealthQuery,
+} from "@/lib/query";
 import {
   formatShareRouterDisplay,
   normalizeShareRouterDomain,
 } from "@/utils/shareRouter";
 import { getTunnelConfigFromSettings } from "@/utils/shareUtils";
+
+export interface ShareSettingsSaveState {
+  canSave: boolean;
+  isSaving: boolean;
+  save: () => Promise<void>;
+}
+
+interface ShareSettingsTabProps {
+  onSaveStateChange?: (state: ShareSettingsSaveState | null) => void;
+}
 
 interface ShareSettingsAccordionItemProps {
   value: string;
@@ -64,7 +84,7 @@ function ShareSettingsAccordionItem({
   );
 }
 
-export function ShareSettingsTab() {
+export function ShareSettingsTab({ onSaveStateChange }: ShareSettingsTabProps) {
   const { t } = useTranslation();
   const { data: settings } = useSettingsQuery();
   const { data: clientTunnel } = useClientTunnelQuery();
@@ -80,6 +100,10 @@ export function ShareSettingsTab() {
   const [routerDomainError, setRouterDomainError] = useState<string | null>(
     null,
   );
+  const [clientFormState, setClientFormState] =
+    useState<ClientTunnelFormState | null>(null);
+  const [payoutFormState, setPayoutFormState] =
+    useState<PayoutProfileFormState | null>(null);
 
   useEffect(() => {
     setRouterDomain(tunnelConfig.domain);
@@ -101,22 +125,63 @@ export function ShareSettingsTab() {
         })
       : t("settings.share.clientTunnel.stopped", { defaultValue: "未运行" });
 
-  const handleSaveRouter = async () => {
-    try {
-      const normalized = normalizeShareRouterDomain(routerDomain);
-      setRouterDomainError(null);
-      await configureTunnelMutation.mutateAsync({ domain: normalized });
-      setRouterDomain(normalized);
-    } catch (error) {
-      const key =
-        error instanceof Error
-          ? error.message
-          : "share.validation.invalidRouterDomain";
-      setRouterDomainError(
-        t(key, { defaultValue: "Router 域名无效" }),
+  const handleSaveRouter = useCallback(async () => {
+    const normalized = normalizeShareRouterDomain(routerDomain);
+    setRouterDomainError(null);
+    await configureTunnelMutation.mutateAsync({ domain: normalized });
+    setRouterDomain(normalized);
+  }, [configureTunnelMutation, routerDomain]);
+
+  const saveAll = useCallback(async () => {
+    const tasks: Promise<void>[] = [];
+    if (routerDirty) {
+      tasks.push(
+        handleSaveRouter().catch((error) => {
+          const key =
+            error instanceof Error
+              ? error.message
+              : "share.validation.invalidRouterDomain";
+          setRouterDomainError(
+            t(key, { defaultValue: "Router 域名无效" }),
+          );
+          throw error;
+        }),
       );
     }
-  };
+    if (clientFormState?.dirty && clientFormState.canSave) {
+      tasks.push(clientFormState.save());
+    }
+    if (payoutFormState?.dirty && payoutFormState.canSave) {
+      tasks.push(Promise.resolve(payoutFormState.save()));
+    }
+    await Promise.all(tasks);
+  }, [
+    clientFormState,
+    handleSaveRouter,
+    payoutFormState,
+    routerDirty,
+    t,
+  ]);
+
+  const canSave =
+    routerDirty ||
+    (clientFormState?.dirty === true && clientFormState.canSave) ||
+    (payoutFormState?.dirty === true && payoutFormState.canSave);
+
+  const isSaving =
+    configureTunnelMutation.isPending ||
+    clientFormState?.isSaving === true ||
+    payoutFormState?.isSaving === true;
+
+  useEffect(() => {
+    if (!onSaveStateChange) return;
+    onSaveStateChange({
+      canSave,
+      isSaving,
+      save: saveAll,
+    });
+    return () => onSaveStateChange(null);
+  }, [canSave, isSaving, onSaveStateChange, saveAll]);
 
   return (
     <motion.div
@@ -138,7 +203,11 @@ export function ShareSettingsTab() {
             status: clientStatusLabel,
           })}
         >
-          <ClientTunnelSettingsPanel embedded />
+          <ClientTunnelSettingsPanel
+            embedded
+            hideSaveButton
+            onFormStateChange={setClientFormState}
+          />
         </ShareSettingsAccordionItem>
 
         <ShareSettingsAccordionItem
@@ -151,7 +220,10 @@ export function ShareSettingsTab() {
             defaultValue: "配置公开的 EVM 收款地址、Token 与支持网络。",
           })}
         >
-          <PayoutProfileSettingsPanel />
+          <PayoutProfileSettingsPanel
+            hideSaveButton
+            onFormStateChange={setPayoutFormState}
+          />
         </ShareSettingsAccordionItem>
 
         <ShareSettingsAccordionItem
@@ -189,18 +261,6 @@ export function ShareSettingsTab() {
                 disabled={configureTunnelMutation.isPending}
                 error={routerDomainError}
               />
-            </div>
-
-            <div className="flex justify-end">
-              <Button
-                type="button"
-                disabled={!routerDirty || configureTunnelMutation.isPending}
-                onClick={() => void handleSaveRouter()}
-              >
-                {t("settings.share.defaultRouter.save", {
-                  defaultValue: "保存默认节点",
-                })}
-              </Button>
             </div>
           </div>
         </ShareSettingsAccordionItem>

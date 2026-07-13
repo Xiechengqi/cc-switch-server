@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { CloudOff, ShieldAlert } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -28,7 +28,22 @@ const NETWORKS: ReadonlyArray<{ id: PayoutNetwork; label: string }> = [
   { id: "eip155:42161", label: "Arbitrum One" },
 ];
 
-export function PayoutProfileSettingsPanel() {
+export interface PayoutProfileFormState {
+  dirty: boolean;
+  canSave: boolean;
+  isSaving: boolean;
+  save: () => void;
+}
+
+interface PayoutProfileSettingsPanelProps {
+  hideSaveButton?: boolean;
+  onFormStateChange?: (state: PayoutProfileFormState | null) => void;
+}
+
+export function PayoutProfileSettingsPanel({
+  hideSaveButton = false,
+  onFormStateChange,
+}: PayoutProfileSettingsPanelProps) {
   const { t } = useTranslation();
   const { data, isLoading } = usePayoutProfileQuery();
   const saveMutation = useSavePayoutProfileMutation();
@@ -76,15 +91,26 @@ export function PayoutProfileSettingsPanel() {
     );
   };
 
-  const handleSave = () => {
+  const handleSave = useCallback(() => {
     if (!canSave || !token) return;
     saveMutation.mutate({ address, token, networks });
-  };
+  }, [address, canSave, networks, saveMutation, token]);
 
   const handleClear = () => {
     setClearOpen(false);
     clearMutation.mutate();
   };
+
+  useEffect(() => {
+    if (!onFormStateChange) return;
+    onFormStateChange({
+      dirty,
+      canSave,
+      isSaving: pending,
+      save: handleSave,
+    });
+    return () => onFormStateChange(null);
+  }, [canSave, dirty, handleSave, onFormStateChange, pending]);
 
   if (isLoading && !data) {
     return <p className="text-sm text-muted-foreground">{t("common.loading")}</p>;
@@ -202,9 +228,11 @@ export function PayoutProfileSettingsPanel() {
               {t("settings.share.payout.clear", { defaultValue: "清除" })}
             </Button>
           ) : null}
-          <Button type="button" disabled={!canSave || !dirty || pending} onClick={handleSave}>
-            {t("settings.share.payout.save", { defaultValue: "保存收款信息" })}
-          </Button>
+          {!hideSaveButton ? (
+            <Button type="button" disabled={!canSave || !dirty || pending} onClick={handleSave}>
+              {t("settings.share.payout.save", { defaultValue: "保存收款信息" })}
+            </Button>
+          ) : null}
         </div>
       </div>
 

@@ -11,12 +11,23 @@ import {
 } from "@/lib/query";
 import { copyText } from "@/lib/clipboard";
 
+export interface ClientTunnelFormState {
+  dirty: boolean;
+  canSave: boolean;
+  isSaving: boolean;
+  save: () => Promise<void>;
+}
+
 interface ClientTunnelSettingsPanelProps {
   embedded?: boolean;
+  hideSaveButton?: boolean;
+  onFormStateChange?: (state: ClientTunnelFormState | null) => void;
 }
 
 export function ClientTunnelSettingsPanel({
   embedded = false,
+  hideSaveButton = false,
+  onFormStateChange,
 }: ClientTunnelSettingsPanelProps) {
   const { t } = useTranslation();
   const { data: clientTunnel, isLoading } = useClientTunnelQuery();
@@ -34,6 +45,11 @@ export function ClientTunnelSettingsPanel({
 
   const ownerEmail = clientTunnel?.config?.ownerEmail?.trim() ?? "";
   const isSaving = claimMutation.isPending;
+  const isRunning = Boolean(clientTunnel?.status?.info);
+  const isToggling = startMutation.isPending || stopMutation.isPending;
+  const dirty =
+    subdomainInput.trim() !== (clientTunnel?.config?.subdomain?.trim() ?? "");
+  const canSave = Boolean(subdomainInput.trim() && ownerEmail);
 
   const handleSave = useCallback(async () => {
     if (!subdomainInput.trim() || !ownerEmail) return;
@@ -44,7 +60,26 @@ export function ClientTunnelSettingsPanel({
     });
   }, [claimMutation, ownerEmail, subdomainInput]);
 
-  const statusLabel = clientTunnel?.status?.info
+  const handleToggleTunnel = useCallback(async () => {
+    if (isRunning) {
+      await stopMutation.mutateAsync();
+      return;
+    }
+    await startMutation.mutateAsync();
+  }, [isRunning, startMutation, stopMutation]);
+
+  useEffect(() => {
+    if (!onFormStateChange) return;
+    onFormStateChange({
+      dirty,
+      canSave,
+      isSaving,
+      save: handleSave,
+    });
+    return () => onFormStateChange(null);
+  }, [canSave, dirty, handleSave, isSaving, onFormStateChange]);
+
+  const statusLabel = isRunning
     ? t("settings.share.clientTunnel.running", { defaultValue: "运行中" })
     : clientTunnel?.status?.lastError
       ? t("settings.share.clientTunnel.failed", {
@@ -110,31 +145,25 @@ export function ClientTunnelSettingsPanel({
 
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-muted-foreground">{statusLabel}</span>
+        {!hideSaveButton ? (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!canSave || isSaving}
+            onClick={() => void handleSave()}
+          >
+            {t("common.save", { defaultValue: "保存" })}
+          </Button>
+        ) : null}
         <Button
           variant="outline"
           size="sm"
-          disabled={
-            !subdomainInput.trim() || !ownerEmail || isSaving
-          }
-          onClick={() => void handleSave()}
+          disabled={isToggling}
+          onClick={() => void handleToggleTunnel()}
         >
-          {t("common.save", { defaultValue: "保存" })}
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={startMutation.isPending}
-          onClick={() => void startMutation.mutateAsync()}
-        >
-          {t("settings.share.clientTunnel.start", { defaultValue: "启动" })}
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={!clientTunnel?.status?.info || stopMutation.isPending}
-          onClick={() => void stopMutation.mutateAsync()}
-        >
-          {t("settings.share.clientTunnel.stop", { defaultValue: "停止" })}
+          {isRunning
+            ? t("settings.share.clientTunnel.stop", { defaultValue: "停止" })
+            : t("settings.share.clientTunnel.start", { defaultValue: "启动" })}
         </Button>
       </div>
     </>

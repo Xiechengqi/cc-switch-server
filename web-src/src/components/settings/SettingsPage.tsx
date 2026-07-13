@@ -59,7 +59,7 @@ import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySettings";
 import { ServerVersionSettings } from "@/components/settings/ServerVersionSettings";
 import { ServerConfigDirSettings } from "@/components/settings/ServerConfigDirSettings";
-import { ShareSettingsTab } from "@/components/settings/ShareSettingsTab";
+import { ShareSettingsTab, type ShareSettingsSaveState } from "@/components/settings/ShareSettingsTab";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useImportExport } from "@/hooks/useImportExport";
@@ -105,6 +105,9 @@ export function SettingsPage({
     requiresRestart,
     acknowledgeRestart,
   } = useSettings();
+
+  const [shareSaveState, setShareSaveState] =
+    useState<ShareSettingsSaveState | null>(null);
 
   const {
     selectedFile,
@@ -336,20 +339,6 @@ export function SettingsPage({
                       <>
                         <ServerSecuritySettings onSignOut={onSignOut} />
                         <ServerVersionSettings />
-                        {onSignOut ? (
-                          <div className="flex justify-end">
-                            <Button
-                              type="button"
-                              className="bg-red-600 text-white hover:bg-red-700"
-                              onClick={() => onSignOut()}
-                            >
-                              <LogOut className="mr-2 h-4 w-4" />
-                              {t("settings.serverSecurity.signOut", {
-                                defaultValue: "登出",
-                              })}
-                            </Button>
-                          </div>
-                        ) : null}
                       </>
                     )}
                   </motion.div>
@@ -390,7 +379,7 @@ export function SettingsPage({
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ duration: 0.3 }}
                   >
-                    <ShareSettingsTab />
+                    <ShareSettingsTab onSaveStateChange={setShareSaveState} />
                   </motion.div>
                 </TabsContent>
               ) : null}
@@ -643,6 +632,50 @@ export function SettingsPage({
               </TabsContent>
             </div>
 
+            {activeTab === "general" && serverMode && onSignOut ? (
+              <div
+                className="flex-shrink-0 pt-4 border-t border-border-default"
+                style={{ backgroundColor: "hsl(var(--background))" }}
+              >
+                <div className="flex items-center justify-end gap-3">
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    onClick={() => onSignOut()}
+                  >
+                    <LogOut className="mr-2 h-4 w-4" />
+                    {t("settings.serverSecurity.signOut", {
+                      defaultValue: "登出",
+                    })}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+            {activeTab === "share" && shareSaveState ? (
+              <div
+                className="flex-shrink-0 pt-4 border-t border-border-default"
+                style={{ backgroundColor: "hsl(var(--background))" }}
+              >
+                <div className="flex items-center justify-end gap-3">
+                  <Button
+                    onClick={() => void shareSaveState.save()}
+                    disabled={!shareSaveState.canSave || shareSaveState.isSaving}
+                  >
+                    {shareSaveState.isSaving ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        {t("settings.saving")}
+                      </span>
+                    ) : (
+                      <>
+                        <Save className="mr-2 h-4 w-4" />
+                        {t("common.save")}
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
             {activeTab === "advanced" && settings && (
               <div
                 className="flex-shrink-0 pt-4 border-t border-border-default"
