@@ -151,6 +151,7 @@ pub(crate) fn map_email_auth_error(error: EmailAuthError) -> ApiError {
 pub(crate) fn map_web_auth_error(error: crate::domain::web_auth::WebAuthError) -> ApiError {
     let message = error.to_string();
     if message.contains("invalid password")
+        || message.contains("invalid current password")
         || message.contains("not configured")
         || message.contains("not found")
         || message.contains("expired")

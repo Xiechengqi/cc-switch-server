@@ -337,7 +337,7 @@ export function SettingsPage({
                     )}
                     {serverMode && (
                       <>
-                        <ServerSecuritySettings onSignOut={onSignOut} />
+                        <ServerSecuritySettings />
                         <ServerVersionSettings />
                       </>
                     )}

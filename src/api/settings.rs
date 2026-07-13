@@ -90,7 +90,7 @@ pub(in crate::api) async fn login(
     }
     match input.method.as_str() {
         "password" => {
-            if !config.verify_password(&input.password) {
+            if !config.verify_password(input.password.trim()) {
                 return Err(ApiError::unauthorized("invalid password"));
             }
         }

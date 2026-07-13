@@ -3212,6 +3212,51 @@ async fn web_password_login_authenticates_invoke() {
 }
 
 #[tokio::test]
+async fn web_password_change_updates_login_password() {
+    let app = app_router(test_state());
+    let token = setup_and_login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/auth/password/change",
+            json!({
+                "currentPassword": "password123",
+                "newPassword": "newpassword9"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/auth/login",
+            json!({"method": "password", "password": "newpassword9"}),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/auth/login",
+            json!({"method": "password", "password": "password123"}),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn router_identity_headers_authenticate_invoke() {
     let app = app_router(test_state());
     let _ = setup_and_login(&app).await;

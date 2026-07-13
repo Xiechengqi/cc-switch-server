@@ -1,4 +1,4 @@
-import { invokeCommand, jsonFetch, readCachedPassword } from "@/lib/runtime";
+import { invokeCommand, jsonFetch } from "@/lib/runtime";
 
 export type AppKind = "claude" | "codex" | "gemini";
 
@@ -931,12 +931,17 @@ export async function loginWithApiToken(apiToken: string): Promise<LoginResponse
   return invokeCommand<LoginResponse>("login_with_api_token", { apiToken });
 }
 
-export async function changeServerPassword(newPassword: string): Promise<void> {
-  const currentPassword = readCachedPassword()?.trim();
+export async function changeServerPassword(input: {
+  currentPassword: string;
+  newPassword: string;
+}): Promise<void> {
+  const currentPassword = input.currentPassword.trim();
+  const newPassword = input.newPassword.trim();
   if (!currentPassword) {
-    throw new Error(
-      "无法验证当前密码，请先退出后使用原密码重新登录再修改。",
-    );
+    throw new Error("请输入当前密码");
+  }
+  if (newPassword.length < 8) {
+    throw new Error("新密码至少 8 位");
   }
   await jsonFetch<{ ok: boolean }>("/web-api/auth/password/change", {
     method: "POST",

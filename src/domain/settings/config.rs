@@ -307,6 +307,10 @@ impl ServerConfig {
     }
 
     pub fn verify_password(&self, password: &str) -> bool {
+        let password = password.trim();
+        if password.is_empty() {
+            return false;
+        }
         let Some(hash) = self.auth.password_hash.as_deref() else {
             return false;
         };
@@ -357,7 +361,7 @@ impl ServerConfig {
     }
 
     pub fn set_password(&mut self, new_password: &str) -> anyhow::Result<()> {
-        self.auth.password_hash = Some(hash_secret(new_password, 8)?);
+        self.auth.password_hash = Some(hash_secret(new_password.trim(), 8)?);
         Ok(())
     }
 
