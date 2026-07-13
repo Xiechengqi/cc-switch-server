@@ -3,7 +3,9 @@
 pub mod adapters;
 mod cache_injector;
 pub(crate) mod claude_oauth;
+mod codex_identity;
 mod codex_instructions;
+pub(crate) mod codex_models;
 mod copilot_model_map;
 mod copilot_optimizer;
 pub(crate) mod cursor;
@@ -345,10 +347,10 @@ mod tests {
                 ("authorization", "Bearer token".to_string()),
                 ("chatgpt-account-id", "acct_123".to_string()),
                 ("originator", "codex_cli_rs".to_string()),
-                ("version", "0.125.0".to_string()),
+                ("version", "0.144.1".to_string()),
                 (
                     "user-agent",
-                    "codex_cli_rs/0.125.0 (Ubuntu 22.04.0; x86_64) xterm-256color".to_string()
+                    "codex_cli_rs/0.144.1 (Ubuntu 22.04.0; x86_64) xterm-256color".to_string()
                 ),
             ]
         );

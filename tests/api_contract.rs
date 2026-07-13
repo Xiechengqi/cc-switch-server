@@ -2,6 +2,7 @@
 // Extracted from src/api/mod.rs as part of R3.6/R3.7.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -9,7 +10,7 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::body::{to_bytes, Body};
+use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::Response;
@@ -25,6 +26,7 @@ use cc_switch_server::api::*;
 use cc_switch_server::api::{control_signature, refresh_share_usage_items};
 use cc_switch_server::cli::Cli;
 use cc_switch_server::domain::accounts::store::{AccountQuota, UpsertAccountInput};
+use cc_switch_server::domain::failover::UpdateFailoverAppInput;
 use cc_switch_server::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
 };
@@ -395,6 +397,105 @@ async fn auth_routes_cover_password_api_token_and_email_paths() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn oauth_login_cancel_is_authenticated_idempotent_and_terminal() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/login/start",
+            json!({
+                "providerType": "claude_oauth",
+                "redirectUri": "http://localhost:15721/api/accounts/login/callback"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let login = json_body(response).await["login"].clone();
+    let session_id = login["sessionId"].as_str().unwrap();
+    let state = login["state"].as_str().unwrap();
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/accounts/login/cancel",
+                json!({"sessionId": session_id, "state": state}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["login"]["status"], "cancelled");
+    }
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/login/finish",
+            json!({
+                "sessionId": session_id,
+                "state": state,
+                "code": "unused-auth-code",
+                "executeTokenExchange": true
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/login/cancel",
+            json!({"state": "unknown-oauth-state"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_start_login",
+            json!({"authProvider": "claude_oauth"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let device_code = json_body(response).await["device_code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_cancel_login",
+            json!({
+                "authProvider": "claude_oauth",
+                "deviceCode": device_code
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["cancelled"], true);
 }
 
 #[tokio::test]
@@ -1283,6 +1384,375 @@ async fn non_stream_proxy_timeout_records_bad_gateway() {
 }
 
 #[tokio::test]
+async fn claude_transport_failure_retries_unpinned_provider_before_response_commit() {
+    let closed_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let closed_addr = closed_listener.local_addr().unwrap();
+    drop(closed_listener);
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let upstream = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/json"),
+                    ("x-request-id", "req-failover"),
+                    ("anthropic-ratelimit-requests-remaining", "42"),
+                    ("set-cookie", "must-not-pass=1"),
+                ],
+                json!({
+                    "id": "msg-ok",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 2, "output_tokens": 1}
+                })
+                .to_string(),
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = test_state();
+    for (id, base_url) in [
+        ("claude-dead", format!("http://{closed_addr}")),
+        ("claude-live", format!("http://{upstream_addr}")),
+    ] {
+        upsert_test_provider(
+            &state,
+            AppKind::Claude,
+            Provider {
+                id: id.to_string(),
+                name: id.to_string(),
+                settings_config: json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": base_url,
+                        "ANTHROPIC_API_KEY": "sk-local-secret"
+                    }
+                }),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+        )
+        .await;
+    }
+    let providers = providers_snapshot(&state).await;
+    state
+        .mutate_failover(|failover| {
+            failover.update_app_config(
+                AppKind::Claude,
+                UpdateFailoverAppInput {
+                    enabled: Some(true),
+                    provider_queue: Some(vec![
+                        "claude-dead".to_string(),
+                        "claude-live".to_string(),
+                    ]),
+                    failure_threshold: Some(2),
+                    open_duration_ms: Some(60_000),
+                    half_open_max_probes: Some(1),
+                },
+                &providers,
+            );
+        })
+        .await;
+
+    let response = app_router(state.clone())
+        .oneshot(json_request(
+            Method::POST,
+            "/v1/messages",
+            json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": false
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-request-id").unwrap(),
+        "req-failover"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("anthropic-ratelimit-requests-remaining")
+            .unwrap(),
+        "42"
+    );
+    assert!(!response.headers().contains_key("set-cookie"));
+    let body = json_body(response).await;
+    assert_eq!(body["id"], "msg-ok");
+
+    let usage = state.usage_snapshot().await;
+    assert_eq!(usage.logs.len(), 1);
+    assert_eq!(usage.logs[0].provider_id, "claude-live");
+    assert_eq!(usage.logs[0].input_tokens, Some(2));
+}
+
+#[tokio::test]
+async fn claude_rate_limit_body_read_failure_retries_before_response_commit() {
+    let broken_addr =
+        spawn_broken_chunked_status_upstream("429 Too Many Requests", "application/json").await;
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let live_addr = listener.local_addr().unwrap();
+    let upstream = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                json!({
+                    "id": "msg-after-429-read-error",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 2, "output_tokens": 1}
+                })
+                .to_string(),
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = test_state();
+    for (id, base_url) in [
+        ("claude-broken-429", format!("http://{broken_addr}")),
+        ("claude-live-after-429", format!("http://{live_addr}")),
+    ] {
+        upsert_test_provider(
+            &state,
+            AppKind::Claude,
+            Provider {
+                id: id.to_string(),
+                name: id.to_string(),
+                settings_config: json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": base_url,
+                        "ANTHROPIC_API_KEY": "sk-local-secret"
+                    }
+                }),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+        )
+        .await;
+    }
+    let providers = providers_snapshot(&state).await;
+    state
+        .mutate_failover(|failover| {
+            failover.update_app_config(
+                AppKind::Claude,
+                UpdateFailoverAppInput {
+                    enabled: Some(true),
+                    provider_queue: Some(vec![
+                        "claude-broken-429".to_string(),
+                        "claude-live-after-429".to_string(),
+                    ]),
+                    failure_threshold: Some(2),
+                    open_duration_ms: Some(60_000),
+                    half_open_max_probes: Some(1),
+                },
+                &providers,
+            );
+        })
+        .await;
+
+    let response = app_router(state.clone())
+        .oneshot(json_request(
+            Method::POST,
+            "/v1/messages",
+            json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": false
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["id"], "msg-after-429-read-error");
+    let usage = state.usage_snapshot().await;
+    assert_eq!(usage.logs.len(), 1);
+    assert_eq!(usage.logs[0].provider_id, "claude-live-after-429");
+}
+
+#[tokio::test]
+async fn claude_split_first_error_event_retries_before_stream_commit() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let upstream = Router::new()
+        .route(
+            "/v1/messages",
+            post(|State(seen): State<Arc<AtomicUsize>>| async move {
+                let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                let chunks: Vec<Result<Bytes, Infallible>> = if attempt == 0 {
+                    vec![
+                        Ok(Bytes::from_static(
+                            b"event: error\ndata: {\"type\":\"overloaded_",
+                        )),
+                        Ok(Bytes::from_static(
+                            b"error\",\"message\":\"retry me\"}\n\n",
+                        )),
+                    ]
+                } else {
+                    vec![
+                        Ok(Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-ok\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n")),
+                        Ok(Bytes::from_static(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"success\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")),
+                    ]
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                    .unwrap()
+            }),
+        )
+        .with_state(seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = test_state();
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "claude-sse-retry".to_string(),
+            name: "Claude SSE Retry".to_string(),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": format!("http://{upstream_addr}"),
+                    "ANTHROPIC_API_KEY": "sk-local-secret"
+                }
+            }),
+            category: None,
+            meta: None,
+            extra: Default::default(),
+        },
+    )
+    .await;
+
+    let response = app_router(state.clone())
+        .oneshot(json_request(
+            Method::POST,
+            "/v1/messages",
+            json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": true
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(body.contains("success"));
+    assert!(!body.contains("retry me"));
+    assert_eq!(seen.load(Ordering::SeqCst), 2);
+
+    let usage = state.usage_snapshot().await;
+    assert_eq!(usage.logs.len(), 1);
+    assert_eq!(usage.logs[0].provider_id, "claude-sse-retry");
+}
+
+#[tokio::test]
+async fn native_claude_signature_error_does_not_run_oauth_body_retry() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let upstream = Router::new()
+        .route(
+            "/v1/messages",
+            post(|State(seen): State<Arc<AtomicUsize>>| async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(
+                        "event: error\ndata: {\"type\":\"invalid_request_error\",\"message\":\"invalid thinking signature\"}\n\n",
+                    ))
+                    .unwrap()
+            }),
+        )
+        .with_state(seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = test_state();
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "native-claude-signature-error".to_string(),
+            name: "Native Claude Signature Error".to_string(),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": format!("http://{upstream_addr}"),
+                    "ANTHROPIC_API_KEY": "sk-local-secret"
+                }
+            }),
+            category: None,
+            meta: None,
+            extra: Default::default(),
+        },
+    )
+    .await;
+
+    let response = app_router(state)
+        .oneshot(json_request(
+            Method::POST,
+            "/v1/messages",
+            json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": true
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response)
+        .await
+        .contains("invalid thinking signature"));
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn stream_proxy_marks_upstream_chunk_error() {
     let upstream_addr = spawn_broken_chunked_upstream().await;
     let state = test_state();
@@ -1935,6 +2405,43 @@ async fn web_runtime_context_treats_invalid_token_as_auth_required() {
 }
 
 #[tokio::test]
+async fn web_invoke_complete_server_setup_works_without_session_before_setup() {
+    let app = app_router(test_state());
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/complete_server_setup",
+            json!({
+                "password": "password123",
+                "ownerEmail": "owner@example.com",
+                "routerUrl": "http://127.0.0.1:9",
+                "clientTunnelSubdomain": "ownerabcde"
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/complete_server_setup",
+            json!({
+                "password": "password456",
+                "ownerEmail": "other@example.com",
+                "routerUrl": "http://127.0.0.1:10"
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn web_invoke_registry_returns_stable_errors() {
     let app = app_router(test_state());
     let token = setup_and_login(&app).await;
@@ -2411,6 +2918,13 @@ async fn setup_and_login(app: &Router) -> String {
 }
 
 async fn spawn_broken_chunked_upstream() -> std::net::SocketAddr {
+    spawn_broken_chunked_status_upstream("200 OK", "text/event-stream").await
+}
+
+async fn spawn_broken_chunked_status_upstream(
+    status: &'static str,
+    content_type: &'static str,
+) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -2419,12 +2933,10 @@ async fn spawn_broken_chunked_upstream() -> std::net::SocketAddr {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buffer = [0_u8; 2048];
         let _ = socket.read(&mut buffer).await;
-        socket
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nZZ\r\n",
-            )
-            .await
-            .unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nZZ\r\n"
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
         let _ = socket.shutdown().await;
     });
     addr

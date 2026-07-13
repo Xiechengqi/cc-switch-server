@@ -915,11 +915,15 @@ export async function completeServerSetup(input: {
   routerUrl: string;
   clientTunnelSubdomain?: string;
 }): Promise<void> {
-  await invokeCommand("complete_server_setup", {
-    password: input.password,
-    ownerEmail: input.ownerEmail,
-    routerUrl: input.routerUrl,
-    clientTunnelSubdomain: input.clientTunnelSubdomain,
+  await jsonFetch("/api/setup", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      password: input.password,
+      ownerEmail: input.ownerEmail,
+      routerUrl: input.routerUrl,
+      clientTunnelSubdomain: input.clientTunnelSubdomain,
+    }),
   });
 }
 

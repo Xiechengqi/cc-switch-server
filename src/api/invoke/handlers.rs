@@ -1890,6 +1890,10 @@ pub(in crate::api) fn map_managed_auth_account(
     provider_label: &str,
     default_account_id: Option<&str>,
 ) -> Value {
+    let workspaces = crate::domain::accounts::store::codex_workspace_options(account);
+    let selected_workspace_id =
+        crate::domain::accounts::store::selected_codex_workspace_id(account)
+            .or_else(|| workspaces.first().map(|workspace| workspace.id.clone()));
     json!({
         "id": account.id,
         "provider": provider_label,
@@ -1898,7 +1902,9 @@ pub(in crate::api) fn map_managed_auth_account(
         "avatar_url": Value::Null,
         "authenticated_at": account_authenticated_at(account),
         "is_default": default_account_id == Some(account.id.as_str()),
-        "github_domain": "github.com"
+        "github_domain": "github.com",
+        "workspaces": workspaces,
+        "selected_workspace_id": selected_workspace_id
     })
 }
 
@@ -2235,7 +2241,7 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 }
                 Err(OAuthLoginError::AlreadyConsumed) => return Ok(Value::Null),
                 Err(error) => return Err(oauth_login_api_error(error)),
-                Ok(OAuthSessionPollState::Ready) => {}
+                Ok(OAuthSessionPollState::Ready | OAuthSessionPollState::Completed) => {}
             }
 
             let finish_result = finish_account_login(
@@ -2272,6 +2278,50 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
             }
         }
     }
+}
+
+pub(in crate::api) async fn web_managed_auth_cancel_login(
+    state: ServerState,
+    headers: HeaderMap,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let provider_type = web_auth_provider_type(args)?;
+    let device_code = web_arg_string_any(args, &["deviceCode", "device_code"])?;
+    if provider_type == ProviderType::CodexOAuth && !device_code.starts_with("cli:") {
+        let response = cancel_codex_device_login(
+            State(state),
+            headers,
+            Json(CancelCodexDeviceLoginRequest { device_code }),
+        )
+        .await?
+        .0;
+        return Ok(json!(response));
+    }
+    if matches!(
+        provider_type,
+        ProviderType::GitHubCopilot | ProviderType::KiroOAuth
+    ) {
+        return Ok(json!({"ok": true, "cancelled": false}));
+    }
+    let oauth_state = device_code
+        .strip_prefix("cli:")
+        .unwrap_or(device_code.as_str())
+        .to_string();
+    let response = cancel_account_login(
+        State(state),
+        headers,
+        Json(CancelAccountLoginRequest {
+            session_id: None,
+            state: Some(oauth_state),
+        }),
+    )
+    .await?
+    .0;
+    Ok(json!({
+        "ok": response.ok,
+        "cancelled": response.login.status == OAuthLoginStatus::Cancelled,
+        "status": response.login.status,
+    }))
 }
 
 pub(in crate::api) async fn web_managed_auth_remove_account(
@@ -2322,6 +2372,34 @@ pub(in crate::api) async fn web_managed_auth_set_default_account(
         .await
         .map_err(ApiError::internal)??;
     Ok(Value::Null)
+}
+
+pub(in crate::api) async fn web_managed_auth_set_workspace(
+    state: ServerState,
+    headers: HeaderMap,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    require_session(&state, &headers).await?;
+    let provider_type = web_auth_provider_type(args)?;
+    if provider_type != ProviderType::CodexOAuth {
+        return Err(ApiError::bad_request(
+            "workspace selection is only available for codex_oauth accounts",
+        ));
+    }
+    let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
+    let workspace_id = web_arg_string_any(args, &["workspaceId", "workspace_id"])?;
+    let account = state
+        .try_mutate_accounts_immediate(|store| {
+            store.select_codex_workspace(&account_id, &workspace_id)
+        })
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::bad_request)?;
+    Ok(map_managed_auth_account(
+        &account,
+        managed_auth_provider_label(ProviderType::CodexOAuth),
+        None,
+    ))
 }
 
 pub(in crate::api) async fn web_managed_auth_logout(

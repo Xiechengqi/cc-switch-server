@@ -1,4 +1,4 @@
-use crate::domain::accounts::login::{OAuthLoginFinish, OAuthLoginStart};
+use crate::domain::accounts::login::{OAuthLoginCancellation, OAuthLoginFinish, OAuthLoginStart};
 use crate::domain::accounts::oauth::{OAuthHttpRequest, OAuthQuotaStrategy, OAuthSupportStage};
 use crate::domain::accounts::store::{Account, AccountQuota};
 use crate::domain::providers::model::ProviderType;
@@ -200,6 +200,19 @@ pub(in crate::api) struct PollCodexDeviceLoginRequest {
     pub(in crate::api) device_code: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelCodexDeviceLoginRequest {
+    pub(in crate::api) device_code: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelCodexDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) cancelled: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct PollCodexDeviceLoginResponse {
@@ -259,6 +272,22 @@ pub(in crate::api) struct FinishAccountLoginResponse {
     pub(in crate::api) login: OAuthLoginFinish,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) account: Option<AccountLoginAccountSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelAccountLoginRequest {
+    #[serde(default)]
+    pub(in crate::api) session_id: Option<String>,
+    #[serde(default)]
+    pub(in crate::api) state: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelAccountLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) login: OAuthLoginCancellation,
 }
 
 #[derive(Debug, Serialize)]

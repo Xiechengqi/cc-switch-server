@@ -168,6 +168,8 @@ export interface ProviderMeta {
   codexFastMode?: boolean;
   // Codex OAuth image generation via ChatGPT Codex backend
   codexImageGenerationEnabled?: boolean;
+  // Per-provider incident rollback for the Codex Responses WebSocket path
+  codexWebsocketEnabled?: boolean;
   // Codex Responses -> Chat Completions reasoning capability metadata
   codexChatReasoning?: CodexChatReasoning;
   // Custom User-Agent for local proxy routing. Only applied by the local proxy.

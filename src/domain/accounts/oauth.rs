@@ -1463,6 +1463,20 @@ fn login_profile_value(
     enrich_grok_profile_value(provider_type, token_raw, &mut value);
     if let Some(profile_raw) = profile_raw {
         value["profileRaw"] = profile_raw.clone();
+        if provider_type == ProviderType::ClaudeOAuth {
+            for key in [
+                "accountUUID",
+                "organizationUUID",
+                "organizationName",
+                "organizationType",
+                "organizationRateLimitTier",
+                "bootstrapRefreshedAt",
+            ] {
+                if let Some(field) = profile_raw.get(key) {
+                    value[key] = field.clone();
+                }
+            }
+        }
     }
     if matches!(
         provider_type,
@@ -1501,6 +1515,7 @@ fn identity_from_provider_value(value: &Value) -> Option<OAuthIdentity> {
                 "/account/email_address",
                 "/account/email",
                 "/account/uuid",
+                "/accountUUID",
                 "/user_id",
                 "/user/email",
                 "/profile/email",
@@ -2104,7 +2119,14 @@ mod tests {
             ProviderType::ClaudeOAuth,
             &response,
             raw,
-            None,
+            Some(json!({
+                "accountUUID": "claude-account-uuid",
+                "organizationUUID": "org-uuid",
+                "organizationName": "Example",
+                "organizationType": "team",
+                "organizationRateLimitTier": "tier-2",
+                "bootstrapRefreshedAt": 999
+            })),
             1_000,
             30 * 60 * 1000,
         )
@@ -2114,6 +2136,13 @@ mod tests {
         assert_eq!(input.email.as_deref(), Some("owner@example.com"));
         assert_eq!(input.refresh_token.as_deref(), Some("refresh-new"));
         assert_eq!(input.expires_at, Some(3_601_000));
+        assert_eq!(
+            input
+                .profile
+                .as_ref()
+                .and_then(|value| value["organizationUUID"].as_str()),
+            Some("org-uuid")
+        );
         assert_eq!(
             input
                 .profile

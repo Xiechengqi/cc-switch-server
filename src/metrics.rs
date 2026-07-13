@@ -100,6 +100,14 @@ pub fn record_claude_cli_version_gate() {
     metrics::counter!("cc_switch_claude_cli_version_gate_total").increment(1);
 }
 
+pub fn record_claude_bootstrap(result: &str) {
+    metrics::counter!(
+        "cc_switch_claude_bootstrap_total",
+        "result" => result.to_string()
+    )
+    .increment(1);
+}
+
 fn describe() {
     metrics::describe_gauge!(
         "cc_switch_account_inflight",
@@ -128,6 +136,10 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_claude_cli_version_gate_total",
         "Claude CLI version gate responses rewritten for administrators"
+    );
+    metrics::describe_counter!(
+        "cc_switch_claude_bootstrap_total",
+        "Best-effort Claude CLI bootstrap enrichment results"
     );
 }
 

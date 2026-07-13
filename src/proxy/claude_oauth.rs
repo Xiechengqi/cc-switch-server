@@ -23,11 +23,13 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const COMPUTER_USE_BETA: &str = "computer-use-2024-10-22";
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+const KNOWN_SAFE_CLIENT_BETAS: &[&str] = &[
+    "prompt-caching-2024-07-31",
+    "token-efficient-tools-2025-02-19",
+];
 const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
 const CLAUDE_CACHE_TTL_ENV: &str = "CC_SWITCH_CLAUDE_CACHE_TTL";
 const CLAUDE_CODE_PROMPT_MATCH_THRESHOLD: f64 = 0.5;
-pub(crate) const CLAUDE_BODY_RETRY_STAGE_HEADER: &str = "x-cc-switch-claude-body-retry";
-
 pub(crate) struct ClaudeForwardContract {
     pub headers: Vec<(&'static str, String)>,
     pub session_id: Option<String>,
@@ -48,22 +50,6 @@ impl ClaudeBodyRetryStage {
             Self::WebSearchHistory => "web_search_history",
         }
     }
-
-    pub(crate) fn from_header_value(value: &str) -> Option<Self> {
-        match value.trim() {
-            "thinking" => Some(Self::Thinking),
-            "signature_sensitive" => Some(Self::SignatureSensitive),
-            "web_search_history" => Some(Self::WebSearchHistory),
-            _ => None,
-        }
-    }
-
-    fn from_headers(headers: &HeaderMap) -> Option<Self> {
-        headers
-            .get(CLAUDE_BODY_RETRY_STAGE_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(Self::from_header_value)
-    }
 }
 
 pub(crate) fn apply_forward_contract(
@@ -71,9 +57,9 @@ pub(crate) fn apply_forward_contract(
     body: &mut Bytes,
     client_headers: &HeaderMap,
     identity_seed: &str,
+    retry_stage: Option<ClaudeBodyRetryStage>,
 ) -> Result<ClaudeForwardContract, ProxyError> {
     *url = ensure_claude_oauth_beta_query(url);
-    let retry_stage = ClaudeBodyRetryStage::from_headers(client_headers);
     let mut session_id = claude_session_id_from_headers(client_headers);
     let mut body_shape = None;
     if !body.is_empty() {
@@ -621,14 +607,28 @@ fn build_anthropic_beta_value(
         .get("anthropic-beta")
         .and_then(|value| value.to_str().ok())
     {
+        let mut dropped_count = 0_u32;
+        let mut first_dropped = None;
         for item in beta
             .split(',')
             .map(str::trim)
             .filter(|item| !item.is_empty())
         {
+            if is_claude_oauth && !is_known_safe_client_beta(item) {
+                dropped_count = dropped_count.saturating_add(1);
+                first_dropped.get_or_insert(item);
+                continue;
+            }
             if !betas.iter().any(|existing| existing == item) {
                 betas.push(item.to_string());
             }
+        }
+        if dropped_count > 0 {
+            tracing::debug!(
+                dropped_count,
+                first_beta = first_dropped.unwrap_or_default(),
+                "dropping unapproved client anthropic-beta values for Claude OAuth"
+            );
         }
     }
 
@@ -648,6 +648,18 @@ fn build_anthropic_beta_value(
     }
 
     betas.join(",")
+}
+
+fn is_known_safe_client_beta(beta: &str) -> bool {
+    matches!(
+        beta,
+        CLAUDE_CODE_BETA
+            | CLAUDE_OAUTH_BETA
+            | INTERLEAVED_THINKING_BETA
+            | FINE_GRAINED_TOOL_STREAMING_BETA
+            | COMPUTER_USE_BETA
+            | CONTEXT_MANAGEMENT_BETA
+    ) || KNOWN_SAFE_CLIENT_BETAS.contains(&beta)
 }
 
 fn push_beta(betas: &mut Vec<String>, beta: &str) {
@@ -1039,18 +1051,35 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_beta_for_claude_oauth_merges_existing_markers() {
+    fn anthropic_beta_for_claude_oauth_allows_only_known_safe_client_markers() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "anthropic-beta",
-            axum::http::HeaderValue::from_static("custom-beta,claude-code-20250219"),
+            axum::http::HeaderValue::from_static(
+                "custom-beta,prompt-caching-2024-07-31,prompt-caching-scope-2026-01-05,token-efficient-tools-2025-02-19,claude-code-20250219",
+            ),
         );
         let body = json!({"thinking": {"type": "enabled"}});
         let beta = build_anthropic_beta_value(&headers, Some(&body), true);
         assert_eq!(
             beta,
-            "claude-code-20250219,oauth-2025-04-20,custom-beta,interleaved-thinking-2025-05-14"
+            "claude-code-20250219,oauth-2025-04-20,prompt-caching-2024-07-31,token-efficient-tools-2025-02-19,interleaved-thinking-2025-05-14"
         );
+        assert!(!beta.contains("custom-beta"));
+        assert!(!beta.contains("prompt-caching-scope-2026-01-05"));
+    }
+
+    #[test]
+    fn anthropic_beta_non_oauth_path_preserves_client_markers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static("custom-beta"),
+        );
+
+        let beta = build_anthropic_beta_value(&headers, None, false);
+
+        assert_eq!(beta, "claude-code-20250219,custom-beta");
     }
 
     #[test]
@@ -1124,7 +1153,7 @@ mod tests {
         );
 
         let contract =
-            apply_forward_contract(&mut url, &mut body, &headers, "account-123").unwrap();
+            apply_forward_contract(&mut url, &mut body, &headers, "account-123", None).unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         let session_id = contract.session_id.as_deref().unwrap();
 
@@ -1172,7 +1201,7 @@ mod tests {
             br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":false}"#,
         );
 
-        apply_forward_contract(&mut url, &mut body, &headers, "account-123").unwrap();
+        apply_forward_contract(&mut url, &mut body, &headers, "account-123", None).unwrap();
         let text = std::str::from_utf8(&body).unwrap();
 
         assert!(text.find("\"model\"").unwrap() < text.find("\"max_tokens\"").unwrap());

@@ -33,6 +33,8 @@ export interface ManagedAuthAccount {
   authenticated_at: number;
   is_default: boolean;
   github_domain: string;
+  workspaces?: Array<{ id: string; name: string }>;
+  selected_workspace_id?: string | null;
 }
 
 export interface ManagedAuthStatus {
@@ -212,6 +214,16 @@ export async function authPollForAccount(
   });
 }
 
+export async function authCancelLogin(
+  authProvider: ManagedAuthProvider,
+  deviceCode: string,
+): Promise<void> {
+  await invokeCommand("auth_cancel_login", {
+    authProvider,
+    deviceCode,
+  });
+}
+
 export async function authListAccounts(
   authProvider: ManagedAuthProvider,
 ): Promise<ManagedAuthAccount[]> {
@@ -245,6 +257,18 @@ export async function authSetDefaultAccount(
   return invokeCommand("auth_set_default_account", {
     authProvider,
     accountId,
+  });
+}
+
+export async function authSetWorkspace(
+  authProvider: ManagedAuthProvider,
+  accountId: string,
+  workspaceId: string,
+): Promise<ManagedAuthAccount> {
+  return invokeCommand<ManagedAuthAccount>("auth_set_workspace", {
+    authProvider,
+    accountId,
+    workspaceId,
   });
 }
 
@@ -328,12 +352,14 @@ export async function deepseekAccountSetDefault(
 
 export const authApi = {
   authStartLogin,
+  authCancelLogin,
   authSubmitOauthCode,
   authPollForAccount,
   authListAccounts,
   authGetStatus,
   authRemoveAccount,
   authSetDefaultAccount,
+  authSetWorkspace,
   authLogout,
   importGrokAuthJson,
   importCursorLocalAuth,

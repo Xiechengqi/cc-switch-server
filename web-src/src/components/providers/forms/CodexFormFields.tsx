@@ -57,6 +57,8 @@ interface CodexFormFieldsProps {
   onCodexAccountSelect?: (accountId: string | null) => void;
   codexImageGenerationEnabled?: boolean;
   onCodexImageGenerationChange?: (enabled: boolean) => void;
+  codexWebsocketEnabled?: boolean;
+  onCodexWebsocketChange?: (enabled: boolean) => void;
   isCursorOauthPreset?: boolean;
   isGrokOauthPreset?: boolean;
   isCursorApiKeyPreset?: boolean;
@@ -115,6 +117,8 @@ export function CodexFormFields({
   onCodexAccountSelect,
   codexImageGenerationEnabled,
   onCodexImageGenerationChange,
+  codexWebsocketEnabled,
+  onCodexWebsocketChange,
   isCursorOauthPreset = false,
   isGrokOauthPreset = false,
   isCursorApiKeyPreset = false,
@@ -252,6 +256,8 @@ export function CodexFormFields({
           allowDefaultAccountOption={false}
           imageGenerationEnabled={codexImageGenerationEnabled}
           onImageGenerationChange={onCodexImageGenerationChange}
+          websocketEnabled={codexWebsocketEnabled}
+          onWebsocketChange={onCodexWebsocketChange}
           showBankedResetPanel
         />
       )}

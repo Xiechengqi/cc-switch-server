@@ -679,6 +679,9 @@ function ProviderFormFull({
     useState<boolean>(
       () => initialData?.meta?.codexImageGenerationEnabled ?? false,
     );
+  const [codexWebsocketEnabled, setCodexWebsocketEnabled] = useState<boolean>(
+    () => initialData?.meta?.codexWebsocketEnabled ?? true,
+  );
   const [codexChatReasoning, setCodexChatReasoning] =
     useState<CodexChatReasoning>(
       () => initialData?.meta?.codexChatReasoning ?? {},
@@ -2270,6 +2273,9 @@ function ProviderFormFull({
       codexImageGenerationEnabled: isCodexOfficialPreset
         ? codexImageGenerationEnabled
         : undefined,
+      codexWebsocketEnabled: isCodexOauthProvider
+        ? codexWebsocketEnabled
+        : undefined,
       codexChatReasoning:
         appId === "codex" &&
         (saveCategory !== "official" ||
@@ -2333,6 +2339,9 @@ function ProviderFormFull({
 
     if (!isCodexOfficialPreset && "codexImageGenerationEnabled" in nextMeta) {
       delete nextMeta.codexImageGenerationEnabled;
+    }
+    if (!isCodexOauthProvider && "codexWebsocketEnabled" in nextMeta) {
+      delete nextMeta.codexWebsocketEnabled;
     }
 
     if (!testConfig.enabled) {
@@ -3105,6 +3114,8 @@ function ProviderFormFull({
               onCodexChatReasoningChange={setCodexChatReasoning}
               codexImageGenerationEnabled={codexImageGenerationEnabled}
               onCodexImageGenerationChange={setCodexImageGenerationEnabled}
+              codexWebsocketEnabled={codexWebsocketEnabled}
+              onCodexWebsocketChange={setCodexWebsocketEnabled}
               singleUpstreamModel={codexSingleUpstreamModel}
               onSingleUpstreamModelChange={setCodexSingleUpstreamModel}
               speedTestEndpoints={speedTestEndpoints}

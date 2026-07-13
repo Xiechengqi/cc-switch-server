@@ -273,6 +273,7 @@ export function LoginPanel({
                 <span>{t("server.auth.clientSubdomain")}</span>
                 <input
                   value={clientTunnelSubdomain}
+                  autoComplete="off"
                   onChange={(event) =>
                     setClientTunnelSubdomain(event.target.value)
                   }

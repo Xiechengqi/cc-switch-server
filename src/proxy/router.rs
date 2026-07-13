@@ -1,4 +1,5 @@
 use axum::http::HeaderMap;
+use std::collections::BTreeSet;
 
 use crate::domain::accounts::store::AccountStore;
 use crate::domain::failover::{current_time_ms, FailoverStore};
@@ -58,6 +59,7 @@ struct ProviderSelectionOptions<'a> {
     provider_type_filter: Option<ProviderType>,
     provider_filter: Option<fn(&StoredProvider) -> bool>,
     account_in_flight: Option<&'a AccountInFlightSnapshot>,
+    excluded_provider_ids: Option<&'a BTreeSet<String>>,
 }
 
 const DEFAULT_CLAUDE_ACCOUNT_MAX_CONCURRENT: u32 = 8;
@@ -88,6 +90,29 @@ pub(super) fn select_provider_with_account_inflight(
         headers,
         None,
         Some(account_in_flight),
+    )
+}
+
+pub(super) fn select_provider_with_account_inflight_excluding(
+    store: &ProviderStore,
+    accounts: &AccountStore,
+    failover: &mut FailoverStore,
+    app: AppKind,
+    headers: &HeaderMap,
+    account_in_flight: &AccountInFlightSnapshot,
+    excluded_provider_ids: &BTreeSet<String>,
+) -> Result<ProviderRouteSelection, ProxyError> {
+    select_provider_with_optional_filter(
+        store,
+        accounts,
+        failover,
+        app,
+        headers,
+        ProviderSelectionOptions {
+            account_in_flight: Some(account_in_flight),
+            excluded_provider_ids: Some(excluded_provider_ids),
+            ..ProviderSelectionOptions::default()
+        },
     )
 }
 
@@ -185,6 +210,7 @@ fn select_provider_with_optional_filter(
         provider_type_filter,
         provider_filter,
         account_in_flight,
+        excluded_provider_ids,
     } = options;
     let now = current_time_ms();
     let provider_id = headers
@@ -246,7 +272,7 @@ fn select_provider_with_optional_filter(
         .copied()
         .filter(|item| provider_rate_limited_until(item, accounts, now).is_none())
         .collect::<Vec<_>>();
-    let candidates = rate_available_candidates
+    let available_candidates = rate_available_candidates
         .iter()
         .copied()
         .filter(|provider| {
@@ -255,6 +281,20 @@ fn select_provider_with_optional_filter(
                 .is_none_or(|selection| selection.current < selection.max_concurrent)
         })
         .collect::<Vec<_>>();
+    let non_excluded_candidates = available_candidates
+        .iter()
+        .copied()
+        .filter(|provider| {
+            excluded_provider_ids.is_none_or(|excluded| !excluded.contains(&provider.provider.id))
+        })
+        .collect::<Vec<_>>();
+    // If every available provider has already failed in this logical request,
+    // fall back to the normal candidate set and let the retry budget stop loops.
+    let candidates = if non_excluded_candidates.is_empty() {
+        available_candidates
+    } else {
+        non_excluded_candidates
+    };
     let has_matching_provider = !matching_candidates.is_empty();
     if candidates.is_empty() && !rate_available_candidates.is_empty() {
         return Err(ProxyError {
@@ -737,6 +777,42 @@ mod tests {
 
         assert_eq!(selected.provider.provider.id, "p2");
         assert!(!selected.failover_state_changed);
+    }
+
+    #[test]
+    fn logical_retry_excludes_failed_provider_but_preserves_explicit_pin() {
+        let store = provider_store();
+        let accounts = AccountStore::default();
+        let tracker = AccountInFlightTracker::default();
+        let snapshot = tracker.snapshot();
+        let mut failover = enabled_failover(&store);
+        let excluded = BTreeSet::from(["p1".to_string()]);
+
+        let selected = select_provider_with_account_inflight_excluding(
+            &store,
+            &accounts,
+            &mut failover,
+            AppKind::Codex,
+            &HeaderMap::new(),
+            &snapshot,
+            &excluded,
+        )
+        .unwrap();
+        assert_eq!(selected.provider.provider.id, "p2");
+
+        let mut pinned = HeaderMap::new();
+        pinned.insert("x-cc-provider-id", HeaderValue::from_static("p1"));
+        let selected = select_provider_with_account_inflight_excluding(
+            &store,
+            &accounts,
+            &mut failover,
+            AppKind::Codex,
+            &pinned,
+            &snapshot,
+            &excluded,
+        )
+        .unwrap();
+        assert_eq!(selected.provider.provider.id, "p1");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformError {
@@ -259,7 +260,7 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
             output.insert("reasoning_effort".to_string(), effort);
         }
     }
-    if let Some(tools) = openai_response_tools_to_chat(input.get("tools")) {
+    if let Some(tools) = openai_response_tools_to_chat(input)? {
         output.insert("tools".to_string(), tools);
     }
     if let Some(tool_choice) = input.get("tool_choice") {
@@ -385,7 +386,9 @@ pub fn openai_responses_response_to_anthropic(input: &Value) -> Result<Value, Tr
                             .extend(items.iter().filter_map(openai_response_output_to_anthropic));
                     }
                 }
-                Some("function_call") => content.push(openai_function_call_to_anthropic(item)),
+                Some("function_call") | Some("custom_tool_call") | Some("tool_search_call") => {
+                    content.push(openai_function_call_to_anthropic(item))
+                }
                 Some("reasoning") => {
                     if let Some(text) = item
                         .get("summary")
@@ -451,7 +454,7 @@ pub fn openai_responses_response_to_chat(input: &Value) -> Result<Value, Transfo
                         }
                     }
                 }
-                Some("function_call") => {
+                Some("function_call") | Some("custom_tool_call") | Some("tool_search_call") => {
                     if let Some(tool_call) = openai_response_function_call_to_chat(item) {
                         tool_calls.push(tool_call);
                     }
@@ -492,6 +495,13 @@ pub fn openai_responses_response_to_chat(input: &Value) -> Result<Value, Transfo
 }
 
 pub fn openai_chat_response_to_responses(input: &Value) -> Result<Value, TransformError> {
+    openai_chat_response_to_responses_with_custom_tools(input, &BTreeSet::new())
+}
+
+pub(crate) fn openai_chat_response_to_responses_with_custom_tools(
+    input: &Value,
+    custom_tool_names: &BTreeSet<String>,
+) -> Result<Value, TransformError> {
     let choices = input
         .get("choices")
         .and_then(Value::as_array)
@@ -524,7 +534,11 @@ pub fn openai_chat_response_to_responses(input: &Value) -> Result<Value, Transfo
         }
         if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
             for (index, tool_call) in tool_calls.iter().enumerate() {
-                if let Some(item) = openai_chat_tool_call_to_response_item(tool_call, index) {
+                if let Some(item) = openai_chat_tool_call_to_response_item_with_custom_tools(
+                    tool_call,
+                    index,
+                    custom_tool_names,
+                ) {
                     output.push(item);
                 }
             }
@@ -935,6 +949,13 @@ pub fn openai_responses_stream_to_chat(input: &Value) -> Vec<StreamFrame> {
 }
 
 pub fn openai_chat_stream_to_responses(input: &Value) -> Vec<StreamFrame> {
+    openai_chat_stream_to_responses_with_custom_tools(input, &BTreeSet::new())
+}
+
+pub(crate) fn openai_chat_stream_to_responses_with_custom_tools(
+    input: &Value,
+    custom_tool_names: &BTreeSet<String>,
+) -> Vec<StreamFrame> {
     if let Some(error) = input.get("error") {
         return vec![StreamFrame::json(json!({
             "type": "error",
@@ -967,13 +988,49 @@ pub fn openai_chat_stream_to_responses(input: &Value) -> Vec<StreamFrame> {
         .and_then(Value::as_array)
     {
         for tool_call in tool_calls {
+            let index = tool_call.get("index").cloned().unwrap_or_else(|| json!(0));
+            let name = tool_call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let call_id = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("call_0");
+            if tool_call.get("id").is_some() || !name.is_empty() {
+                let is_custom = custom_tool_names.contains(name);
+                frames.push(StreamFrame::json(json!({
+                    "type": "response.output_item.added",
+                    "output_index": index,
+                    "item": if is_custom {
+                        json!({
+                            "id": format!("ctc_{call_id}"),
+                            "type": "custom_tool_call",
+                            "status": "in_progress",
+                            "input": "",
+                            "call_id": call_id,
+                            "name": name,
+                            "cc_switch_custom_bridge": true
+                        })
+                    } else {
+                        json!({
+                            "id": format!("fc_{call_id}"),
+                            "type": "function_call",
+                            "status": "in_progress",
+                            "arguments": "",
+                            "call_id": call_id,
+                            "name": name
+                        })
+                    }
+                })));
+            }
             if let Some(arguments) = tool_call
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
             {
                 frames.push(StreamFrame::json(json!({
                     "type": "response.function_call_arguments.delta",
-                    "output_index": tool_call.get("index").cloned().unwrap_or_else(|| json!(0)),
+                    "output_index": index,
                     "delta": arguments
                 })));
             }
@@ -1717,6 +1774,14 @@ fn openai_chat_tool_choice_to_responses(tool_choice: &Value) -> Value {
 }
 
 fn openai_chat_tool_call_to_response_item(tool_call: &Value, index: usize) -> Option<Value> {
+    openai_chat_tool_call_to_response_item_with_custom_tools(tool_call, index, &BTreeSet::new())
+}
+
+fn openai_chat_tool_call_to_response_item_with_custom_tools(
+    tool_call: &Value,
+    index: usize,
+    custom_tool_names: &BTreeSet<String>,
+) -> Option<Value> {
     let function = tool_call.get("function")?;
     let name = function
         .get("name")
@@ -1728,14 +1793,37 @@ fn openai_chat_tool_call_to_response_item(tool_call: &Value, index: usize) -> Op
         .filter(|id| !id.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("call_{index}"));
+    let arguments = openai_tool_arguments_to_string(function.get("arguments"));
+    if custom_tool_names.contains(name) {
+        return Some(json!({
+            "id": format!("ctc_{call_id}"),
+            "type": "custom_tool_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "input": unwrap_custom_tool_input(&arguments)
+        }));
+    }
     Some(json!({
         "id": format!("fc_{call_id}"),
         "type": "function_call",
         "status": "completed",
         "call_id": call_id,
         "name": name,
-        "arguments": openai_tool_arguments_to_string(function.get("arguments"))
+        "arguments": arguments
     }))
+}
+
+fn unwrap_custom_tool_input(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("input")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| arguments.to_string())
 }
 
 fn openai_chat_legacy_function_call_to_response_item(function_call: &Value) -> Option<Value> {
@@ -1805,6 +1893,35 @@ fn append_response_input_item_to_chat_messages(item: &Value, messages: &mut Vec<
             "tool_call_id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
             "content": item.get("output").cloned().unwrap_or_else(|| json!(""))
         })),
+        Some("custom_tool_call") => {
+            if let Some(tool_call) = openai_response_function_call_to_chat(item) {
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [tool_call]
+                }));
+            }
+        }
+        Some("custom_tool_call_output") => messages.push(json!({
+            "role": "tool",
+            "tool_call_id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
+            "content": response_tool_output_text(item.get("output"))
+        })),
+        Some("tool_search_call") => {
+            if let Some(tool_call) = openai_response_function_call_to_chat(item) {
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [tool_call]
+                }));
+            }
+        }
+        Some("tool_search_output") => messages.push(json!({
+            "role": "tool",
+            "tool_call_id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
+            "content": response_tool_output_text(item.get("output"))
+        })),
+        Some("additional_tools") => {}
         Some("message") => {
             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
             messages.push(json!({
@@ -1886,20 +2003,177 @@ fn response_role_to_chat(role: &str) -> &'static str {
     }
 }
 
-fn openai_response_tools_to_chat(tools: Option<&Value>) -> Option<Value> {
-    let tools = tools?.as_array()?;
-    let chat_tools = tools
-        .iter()
-        .filter_map(openai_response_tool_to_chat_tool)
-        .collect::<Vec<_>>();
-    (!chat_tools.is_empty()).then_some(Value::Array(chat_tools))
+fn response_tool_output_text(output: Option<&Value>) -> String {
+    match output {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<String>(),
+        Some(Value::Null) | None => String::new(),
+        Some(value) => value.to_string(),
+    }
 }
 
-fn openai_response_tool_to_chat_tool(tool: &Value) -> Option<Value> {
-    if tool.get("type").and_then(Value::as_str) != Some("function") {
+pub(crate) fn responses_custom_tool_names(input: &Value) -> BTreeSet<String> {
+    response_tools_from_request(input)
+        .into_iter()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("custom"))
+        .filter_map(response_tool_name)
+        .collect()
+}
+
+pub(crate) fn responses_custom_tool_names_from_bytes(input: &[u8]) -> BTreeSet<String> {
+    serde_json::from_slice::<Value>(input)
+        .ok()
+        .map(|value| responses_custom_tool_names(&value))
+        .unwrap_or_default()
+}
+
+fn response_tools_from_request(input: &Value) -> Vec<&Value> {
+    let mut tools = input
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if let Some(items) = input.get("input").and_then(Value::as_array) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
+                tools.extend(
+                    item.get("tools")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten(),
+                );
+            }
+        }
+    }
+    tools
+}
+
+fn openai_response_tools_to_chat(input: &Value) -> Result<Option<Value>, TransformError> {
+    let tools = response_tools_from_request(input);
+    let named_tools = tools
+        .iter()
+        .filter(|tool| {
+            matches!(
+                tool.get("type").and_then(Value::as_str),
+                None | Some("") | Some("function") | Some("custom")
+            )
+        })
+        .filter_map(|tool| response_tool_name(tool))
+        .collect::<BTreeSet<_>>();
+    let has_tool_search = tools
+        .iter()
+        .any(|tool| tool.get("type").and_then(Value::as_str) == Some("tool_search"));
+    if has_tool_search && named_tools.contains("tool_search") {
+        return Err(TransformError::new(
+            "built-in tool_search conflicts with a declared tool named tool_search; rename the custom tool",
+        ));
+    }
+
+    let mut chat_tools = Vec::new();
+    let mut seen = BTreeSet::new();
+    for tool in tools {
+        for chat_tool in openai_response_tool_to_chat_tools(tool) {
+            let name = chat_tool
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if seen.insert(name) {
+                chat_tools.push(chat_tool);
+            }
+        }
+    }
+    Ok((!chat_tools.is_empty()).then_some(Value::Array(chat_tools)))
+}
+
+fn openai_response_tool_to_chat_tools(tool: &Value) -> Vec<Value> {
+    match tool
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("function")
+    {
+        "namespace" => {
+            let namespace = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+            return tool
+                .get("tools")
+                .or_else(|| tool.get("children"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|child| {
+                    let child_name = response_tool_name(child)?;
+                    let name = if namespace.is_empty()
+                        || child_name.starts_with(namespace)
+                        || child_name.starts_with("mcp__")
+                    {
+                        child_name
+                    } else {
+                        format!("{namespace}__{child_name}")
+                    };
+                    openai_response_function_tool_to_chat(child, &name)
+                })
+                .collect();
+        }
+        "custom" => {
+            let Some(name) = response_tool_name(tool) else {
+                return Vec::new();
+            };
+            return vec![json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"input": {"type": "string"}},
+                        "required": ["input"]
+                    }
+                }
+            })];
+        }
+        "tool_search" => {
+            return vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "description": "Search and load Codex tools or connectors for the current task.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            })];
+        }
+        "function" | "" => {}
+        _ => return Vec::new(),
+    }
+    response_tool_name(tool)
+        .and_then(|name| openai_response_function_tool_to_chat(tool, &name))
+        .into_iter()
+        .collect()
+}
+
+fn response_tool_name(tool: &Value) -> Option<String> {
+    tool.get("name")
+        .or_else(|| tool.pointer("/function/name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn openai_response_function_tool_to_chat(tool: &Value, name: &str) -> Option<Value> {
+    if name.is_empty() {
         return None;
     }
-    let name = tool.get("name").and_then(Value::as_str)?;
     let mut function = Map::new();
     function.insert("name".to_string(), json!(name));
     if let Some(description) = tool.get("description") {
@@ -1907,7 +2181,12 @@ fn openai_response_tool_to_chat_tool(tool: &Value) -> Option<Value> {
     }
     function.insert(
         "parameters".to_string(),
-        tool.get("parameters").cloned().unwrap_or_else(|| json!({})),
+        tool.get("parameters")
+            .or_else(|| tool.get("parametersJsonSchema"))
+            .or_else(|| tool.get("input_schema"))
+            .or_else(|| tool.pointer("/function/parameters"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
     );
     if let Some(strict) = tool.get("strict") {
         function.insert("strict".to_string(), strict.clone());
@@ -1925,6 +2204,14 @@ fn openai_response_tool_choice_to_chat(tool_choice: &Value) -> Value {
                 }
             })
         }
+        Value::Object(object)
+            if object.get("type").and_then(Value::as_str) == Some("tool_search") =>
+        {
+            json!({
+                "type": "function",
+                "function": {"name": "tool_search"}
+            })
+        }
         _ => tool_choice.clone(),
     }
 }
@@ -1936,12 +2223,41 @@ fn openai_response_function_call_to_chat(item: &Value) -> Option<Value> {
         .or_else(|| item.get("id"))
         .and_then(Value::as_str)
         .unwrap_or("call_0");
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("function_call");
+    let arguments = match item_type {
+        "custom_tool_call" => json!({
+            "input": item.get("input").and_then(Value::as_str).unwrap_or_default()
+        })
+        .to_string(),
+        "tool_search_call" => item
+            .get("arguments")
+            .cloned()
+            .or_else(|| item.get("query").map(|query| json!({"query": query})))
+            .map(|value| match value {
+                Value::String(text) => text,
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| "{}".to_string()),
+        _ => item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}")
+            .to_string(),
+    };
+    let name = if item_type == "tool_search_call" {
+        "tool_search"
+    } else {
+        name
+    };
     Some(json!({
         "id": call_id,
         "type": "function",
         "function": {
             "name": name,
-            "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or("{}")
+            "arguments": arguments
         }
     }))
 }
@@ -1962,9 +2278,12 @@ fn response_output_has_tool_calls(response: &Value) -> bool {
         .get("output")
         .and_then(Value::as_array)
         .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            items.iter().any(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call") | Some("custom_tool_call") | Some("tool_search_call")
+                )
+            })
         })
 }
 
@@ -2224,15 +2543,32 @@ fn openai_tool_call_to_anthropic(tool_call: &Value) -> Value {
 }
 
 fn openai_function_call_to_anthropic(item: &Value) -> Value {
-    let input = item
-        .get("arguments")
+    let item_type = item
+        .get("type")
         .and_then(Value::as_str)
-        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
-        .unwrap_or_else(|| item.get("arguments").cloned().unwrap_or_else(|| json!({})));
+        .unwrap_or("function_call");
+    let input = if item_type == "custom_tool_call" {
+        json!({"input": item.get("input").and_then(Value::as_str).unwrap_or_default()})
+    } else if item_type == "tool_search_call" {
+        item.get("arguments")
+            .cloned()
+            .or_else(|| item.get("query").map(|query| json!({"query": query})))
+            .unwrap_or_else(|| json!({}))
+    } else {
+        item.get("arguments")
+            .and_then(Value::as_str)
+            .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+            .unwrap_or_else(|| item.get("arguments").cloned().unwrap_or_else(|| json!({})))
+    };
+    let name = if item_type == "tool_search_call" {
+        "tool_search"
+    } else {
+        item.get("name").and_then(Value::as_str).unwrap_or("tool")
+    };
     json!({
         "type": "tool_use",
         "id": item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("tool"),
-        "name": item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+        "name": name,
         "input": input
     })
 }
@@ -2659,7 +2995,7 @@ fn gemini_function_call_to_anthropic_frames(function_call: &Value, index: u64) -
 }
 
 fn anthropic_usage_from_openai_usage(usage: Option<&Value>) -> Value {
-    let input_tokens = usage_number(
+    let inclusive_input_tokens = usage_number(
         usage,
         &[
             &["prompt_tokens"],
@@ -2677,17 +3013,36 @@ fn anthropic_usage_from_openai_usage(usage: Option<&Value>) -> Value {
             &["input_tokens_details", "cached_tokens"],
         ],
     );
+    let cache_creation = usage_number(
+        usage,
+        &[
+            &["cache_creation_input_tokens"],
+            &["input_tokens_details", "cache_creation_tokens"],
+            &["input_tokens_details", "cache_write_tokens"],
+            &["prompt_tokens_details", "cache_creation_tokens"],
+            &["prompt_tokens_details", "cache_write_tokens"],
+        ],
+    );
+    let input_tokens = inclusive_input_tokens
+        .saturating_sub(cache_read.unwrap_or(0))
+        .saturating_sub(cache_creation.unwrap_or(0));
     let mut output = Map::new();
     output.insert("input_tokens".to_string(), json!(input_tokens));
     output.insert("output_tokens".to_string(), json!(output_tokens));
     if let Some(cache_read) = cache_read {
         output.insert("cache_read_input_tokens".to_string(), json!(cache_read));
     }
+    if let Some(cache_creation) = cache_creation {
+        output.insert(
+            "cache_creation_input_tokens".to_string(),
+            json!(cache_creation),
+        );
+    }
     Value::Object(output)
 }
 
 fn anthropic_usage_from_gemini_usage(usage: Option<&Value>) -> Value {
-    let input_tokens =
+    let inclusive_input_tokens =
         usage_number(usage, &[&["promptTokenCount"], &["prompt_token_count"]]).unwrap_or(0);
     let output_tokens = usage_number(
         usage,
@@ -2701,6 +3056,7 @@ fn anthropic_usage_from_gemini_usage(usage: Option<&Value>) -> Value {
             &["cached_content_token_count"],
         ],
     );
+    let input_tokens = inclusive_input_tokens.saturating_sub(cache_read.unwrap_or(0));
     let mut output = Map::new();
     output.insert("input_tokens".to_string(), json!(input_tokens));
     output.insert("output_tokens".to_string(), json!(output_tokens));
@@ -2711,27 +3067,45 @@ fn anthropic_usage_from_gemini_usage(usage: Option<&Value>) -> Value {
 }
 
 fn openai_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
-    let input_tokens = usage_number(usage, &[&["input_tokens"]]).unwrap_or(0);
+    let fresh_input_tokens = usage_number(usage, &[&["input_tokens"]]).unwrap_or(0);
     let output_tokens = usage_number(usage, &[&["output_tokens"]]).unwrap_or(0);
     let cache_read = usage_number(usage, &[&["cache_read_input_tokens"]]);
-    json!({
+    let cache_creation = usage_number(usage, &[&["cache_creation_input_tokens"]]);
+    let input_tokens = fresh_input_tokens
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(cache_creation.unwrap_or(0));
+    let mut output = json!({
         "prompt_tokens": input_tokens,
         "completion_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
         "prompt_tokens_details": {"cached_tokens": cache_read.unwrap_or(0)}
-    })
+    });
+    if let Some(cache_creation) = cache_creation {
+        output["cache_creation_input_tokens"] = json!(cache_creation);
+        output["prompt_tokens_details"]["cached_creation_tokens"] = json!(cache_creation);
+    }
+    output
 }
 
 fn openai_responses_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
-    let input_tokens = usage_number(usage, &[&["input_tokens"]]).unwrap_or(0);
+    let fresh_input_tokens = usage_number(usage, &[&["input_tokens"]]).unwrap_or(0);
     let output_tokens = usage_number(usage, &[&["output_tokens"]]).unwrap_or(0);
     let cache_read = usage_number(usage, &[&["cache_read_input_tokens"]]);
-    json!({
+    let cache_creation = usage_number(usage, &[&["cache_creation_input_tokens"]]);
+    let input_tokens = fresh_input_tokens
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(cache_creation.unwrap_or(0));
+    let mut output = json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
         "input_tokens_details": {"cached_tokens": cache_read.unwrap_or(0)}
-    })
+    });
+    if let Some(cache_creation) = cache_creation {
+        output["cache_creation_input_tokens"] = json!(cache_creation);
+        output["input_tokens_details"]["cache_write_tokens"] = json!(cache_creation);
+    }
+    output
 }
 
 fn openai_chat_usage_from_responses_usage(usage: Option<&Value>) -> Value {
@@ -2757,6 +3131,20 @@ fn openai_chat_usage_from_responses_usage(usage: Option<&Value>) -> Value {
         "prompt_tokens_details".to_string(),
         json!({"cached_tokens": cached_tokens}),
     );
+    if let Some(cache_creation) = usage_number(
+        usage,
+        &[
+            &["cache_creation_input_tokens"],
+            &["input_tokens_details", "cache_creation_tokens"],
+            &["input_tokens_details", "cache_write_tokens"],
+        ],
+    ) {
+        output.insert(
+            "cache_creation_input_tokens".to_string(),
+            json!(cache_creation),
+        );
+        output["prompt_tokens_details"]["cached_creation_tokens"] = json!(cache_creation);
+    }
     if let Some(details) = usage
         .and_then(|usage| usage.get("output_tokens_details"))
         .or_else(|| usage.and_then(|usage| usage.get("completion_tokens_details")))
@@ -2789,6 +3177,21 @@ fn openai_responses_usage_from_chat_usage(usage: Option<&Value>) -> Value {
         "input_tokens_details".to_string(),
         json!({"cached_tokens": cached_tokens}),
     );
+    if let Some(cache_creation) = usage_number(
+        usage,
+        &[
+            &["cache_creation_input_tokens"],
+            &["prompt_tokens_details", "cached_creation_tokens"],
+            &["prompt_tokens_details", "cache_creation_tokens"],
+            &["prompt_tokens_details", "cache_write_tokens"],
+        ],
+    ) {
+        output.insert(
+            "cache_creation_input_tokens".to_string(),
+            json!(cache_creation),
+        );
+        output["input_tokens_details"]["cache_write_tokens"] = json!(cache_creation);
+    }
     if let Some(details) = usage
         .and_then(|usage| usage.get("completion_tokens_details"))
         .or_else(|| usage.and_then(|usage| usage.get("output_tokens_details")))
@@ -2822,9 +3225,13 @@ fn openai_usage_from_gemini_usage(usage: Option<&Value>) -> Value {
 }
 
 fn gemini_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
-    let input_tokens = usage_number(usage, &[&["input_tokens"]]).unwrap_or(0);
+    let fresh_input_tokens = usage_number(usage, &[&["input_tokens"]]).unwrap_or(0);
     let output_tokens = usage_number(usage, &[&["output_tokens"]]).unwrap_or(0);
     let cache_read = usage_number(usage, &[&["cache_read_input_tokens"]]);
+    let cache_creation = usage_number(usage, &[&["cache_creation_input_tokens"]]);
+    let input_tokens = fresh_input_tokens
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(cache_creation.unwrap_or(0));
     json!({
         "promptTokenCount": input_tokens,
         "candidatesTokenCount": output_tokens,
@@ -3499,7 +3906,7 @@ mod tests {
                 "totalTokenCount": 13
             }
         }));
-        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.input_tokens, Some(4));
         assert_eq!(usage.cache_read_tokens, Some(6));
         assert_eq!(usage.total_tokens, Some(13));
     }
@@ -3536,11 +3943,48 @@ mod tests {
                 "stop_reason": "end_turn",
                 "stop_sequence": Value::Null,
                 "usage": {
-                    "input_tokens": 100,
+                    "input_tokens": 40,
                     "output_tokens": 8,
                     "cache_read_input_tokens": 60
                 }
             })
+        );
+    }
+
+    #[test]
+    fn responses_anthropic_usage_round_trip_preserves_cache_creation() {
+        let responses_usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 8,
+            "cache_creation_input_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 60}
+        });
+        let anthropic = anthropic_usage_from_openai_usage(Some(&responses_usage));
+        assert_eq!(anthropic["input_tokens"], json!(20));
+        assert_eq!(anthropic["cache_read_input_tokens"], json!(60));
+        assert_eq!(anthropic["cache_creation_input_tokens"], json!(20));
+
+        let round_trip = openai_responses_usage_from_anthropic_usage(Some(&anthropic));
+        assert_eq!(round_trip["input_tokens"], json!(100));
+        assert_eq!(round_trip["total_tokens"], json!(108));
+        assert_eq!(
+            round_trip["input_tokens_details"]["cached_tokens"],
+            json!(60)
+        );
+        assert_eq!(round_trip["cache_creation_input_tokens"], json!(20));
+        assert_eq!(
+            round_trip["input_tokens_details"]["cache_write_tokens"],
+            json!(20)
+        );
+
+        let chat = openai_chat_usage_from_responses_usage(Some(&json!({
+            "input_tokens": 10,
+            "output_tokens": 1,
+            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 0}
+        })));
+        assert_eq!(
+            chat["prompt_tokens_details"]["cached_creation_tokens"],
+            json!(0)
         );
     }
 
@@ -4364,5 +4808,96 @@ mod tests {
                 }]
             }))
         );
+    }
+
+    #[test]
+    fn responses_lite_additional_custom_tools_and_history_convert_to_chat() {
+        let input = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "additional_tools", "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run a command"},
+                    {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+                ]},
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "pwd"},
+                {"type": "custom_tool_call_output", "call_id": "call_1", "output": [
+                    {"type": "input_text", "text": "/tmp"},
+                    {"type": "input_text", "text": "\n"}
+                ]}
+            ]
+        });
+        let output = openai_responses_to_chat(&input).unwrap();
+        assert_eq!(
+            output.pointer("/tools/0/function/name"),
+            Some(&json!("exec"))
+        );
+        assert_eq!(
+            output.pointer("/tools/0/function/parameters/properties/input/type"),
+            Some(&json!("string"))
+        );
+        assert_eq!(
+            output.pointer("/messages/0/tool_calls/0/function/arguments"),
+            Some(&json!(r#"{"input":"pwd"}"#))
+        );
+        assert_eq!(
+            output.pointer("/messages/1/content"),
+            Some(&json!("/tmp\n"))
+        );
+        assert_eq!(
+            responses_custom_tool_names(&input),
+            BTreeSet::from(["exec".to_string()])
+        );
+    }
+
+    #[test]
+    fn responses_tool_search_name_collision_is_rejected() {
+        let error = openai_responses_to_chat(&json!({
+            "model": "gpt-5.6-sol",
+            "input": "ping",
+            "tools": [
+                {"type": "tool_search"},
+                {"type": "custom", "name": "tool_search"}
+            ]
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("tool_search conflicts"));
+
+        let output = openai_responses_to_chat(&json!({
+            "model": "gpt-5.6-sol",
+            "input": "ping",
+            "tools": [{"type": "tool_search"}],
+            "tool_choice": {"type": "tool_search"}
+        }))
+        .unwrap();
+        assert_eq!(
+            output.pointer("/tool_choice/function/name"),
+            Some(&json!("tool_search"))
+        );
+    }
+
+    #[test]
+    fn chat_custom_tool_response_is_restored_to_responses_item() {
+        let custom_names = BTreeSet::from(["exec".to_string()]);
+        let output = openai_chat_response_to_responses_with_custom_tools(
+            &json!({
+                "id": "chatcmpl_1",
+                "model": "gpt-5.6-sol",
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": "{\"input\":\"pwd\"}"}
+                    }]}
+                }]
+            }),
+            &custom_names,
+        )
+        .unwrap();
+        assert_eq!(
+            output.pointer("/output/0/type"),
+            Some(&json!("custom_tool_call"))
+        );
+        assert_eq!(output.pointer("/output/0/input"), Some(&json!("pwd")));
     }
 }

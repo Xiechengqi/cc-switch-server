@@ -50,6 +50,10 @@ interface CodexOAuthSectionProps {
   imageGenerationEnabled?: boolean;
   /** 生成图片能力切换回调 */
   onImageGenerationChange?: (enabled: boolean) => void;
+  /** 是否启用 Codex Responses WebSocket，上游故障时可回退 SSE */
+  websocketEnabled?: boolean;
+  /** WebSocket 切换回调 */
+  onWebsocketChange?: (enabled: boolean) => void;
   /** 是否显示临时 Banked Reset 活动面板 */
   showBankedResetPanel?: boolean;
 }
@@ -70,6 +74,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   onFastModeChange,
   imageGenerationEnabled = false,
   onImageGenerationChange,
+  websocketEnabled = true,
+  onWebsocketChange,
   showBankedResetPanel = false,
 }) => {
   const { t } = useTranslation();
@@ -86,11 +92,13 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     isAddingAccount,
     isRemovingAccount,
     isSettingDefaultAccount,
+    isSettingWorkspace,
     defaultAccountId,
     cancelAuth,
     logout,
     removeAccount,
     setDefaultAccount,
+    setWorkspace,
     addAccountWithMode,
   } = useCodexOauth();
   const isRemoteClientWeb = isRemoteWebMode();
@@ -113,6 +121,10 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
       : undefined;
   const startCliLogin = () =>
     addAccountWithMode?.("cli", { codexCallbackUrl: codexCliCallbackUrl });
+  const activeAccount =
+    accounts.find((account) => account.id === selectedAccountId) ??
+    accounts.find((account) => account.id === defaultAccountId) ??
+    accounts[0];
 
   const copyUserCode = async () => {
     if (deviceCode?.user_code) {
@@ -201,6 +213,27 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             checked={imageGenerationEnabled}
             onCheckedChange={onImageGenerationChange}
             aria-label={t("codexOauth.imageGeneration", "生成图片")}
+          />
+        </div>
+      )}
+
+      {onWebsocketChange && (
+        <div className="flex items-center justify-between rounded-md border bg-muted/30 p-3">
+          <div className="space-y-1 pr-4">
+            <Label className="text-sm font-medium">
+              {t("codexOauth.websocket", "Responses WebSocket")}
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              {t("codexOauth.websocketDescription", {
+                defaultValue:
+                  "Keep enabled normally. Disable it to force clients onto POST /v1/responses SSE during an upstream WebSocket incident.",
+              })}
+            </p>
+          </div>
+          <Switch
+            checked={websocketEnabled}
+            onCheckedChange={onWebsocketChange}
+            aria-label={t("codexOauth.websocket", "Responses WebSocket")}
           />
         </div>
       )}
@@ -303,6 +336,43 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
               ))}
             </SelectContent>
           </Select>
+        </div>
+      )}
+
+      {activeAccount?.workspaces && activeAccount.workspaces.length > 1 && (
+        <div className="space-y-2">
+          <Label className="text-sm text-muted-foreground">
+            {t("codexOauth.workspace", "ChatGPT Workspace")}
+          </Label>
+          <Select
+            value={
+              activeAccount.selected_workspace_id ??
+              activeAccount.workspaces[0]?.id
+            }
+            onValueChange={(workspaceId) =>
+              setWorkspace(activeAccount.id, workspaceId)
+            }
+            disabled={isSettingWorkspace}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {activeAccount.workspaces.map((workspace) => (
+                <SelectItem key={workspace.id} value={workspace.id}>
+                  {workspace.name === workspace.id
+                    ? workspace.id
+                    : `${workspace.name} (${workspace.id})`}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">
+            {t("codexOauth.workspaceDescription", {
+              defaultValue:
+                "Only workspaces present in the verified OpenAI token claims can be selected.",
+            })}
+          </p>
         </div>
       )}
 

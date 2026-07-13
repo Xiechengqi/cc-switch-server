@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::cache_injector::{inject_prompt_cache, CacheInjectionConfig};
@@ -15,14 +16,12 @@ use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialK
 use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::StoredProvider;
-use crate::domain::usage::store::{usage_from_json, TokenUsage};
+use crate::domain::usage::store::{
+    usage_from_json_with_semantics, InputTokenSemantics, TokenUsage,
+};
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-
-const CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
-const CODEX_OAUTH_VERSION: &str = "0.125.0";
-const CODEX_OAUTH_USER_AGENT: &str = "codex_cli_rs/0.125.0 (Ubuntu 22.04.0; x86_64) xterm-256color";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,7 +77,7 @@ pub trait ProviderAdapter {
         stored: &StoredProvider,
         route: ProxyRoute,
     ) -> Result<Bytes, ProxyError>;
-    fn parse_usage(&self, body: &[u8]) -> TokenUsage;
+    fn parse_usage(&self, body: &[u8], stored: &StoredProvider, route: ProxyRoute) -> TokenUsage;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +101,7 @@ pub struct AdapterRequest {
     pub actual_model_source: Option<String>,
     pub pricing_model: Option<String>,
     pub stream_requested: bool,
+    pub custom_tool_names: BTreeSet<String>,
 }
 
 type CopilotPreflightResult = (Bytes, Vec<(&'static str, String)>, Option<&'static str>);
@@ -159,7 +159,12 @@ impl ProviderAdapter for GenericForwardingAdapter {
         stored: &StoredProvider,
         route: ProxyRoute,
     ) -> Result<Bytes, ProxyError> {
-        Ok(transform_response_for_downstream(body, stored, route))
+        Ok(transform_response_for_downstream(
+            body,
+            stored,
+            route,
+            &BTreeSet::new(),
+        ))
     }
 
     fn transform_stream_event(
@@ -168,13 +173,34 @@ impl ProviderAdapter for GenericForwardingAdapter {
         stored: &StoredProvider,
         route: ProxyRoute,
     ) -> Result<Bytes, ProxyError> {
-        Ok(transform_stream_event_for_downstream(chunk, stored, route))
+        Ok(transform_stream_event_for_downstream(
+            chunk,
+            stored,
+            route,
+            &BTreeSet::new(),
+        ))
     }
 
-    fn parse_usage(&self, body: &[u8]) -> TokenUsage {
+    fn parse_usage(&self, body: &[u8], stored: &StoredProvider, route: ProxyRoute) -> TokenUsage {
         serde_json::from_slice::<Value>(body)
-            .map(|value| usage_from_json(&value))
+            .map(|value| {
+                usage_from_json_with_semantics(&value, usage_input_semantics_for(stored, route))
+            })
             .unwrap_or_default()
+    }
+}
+
+pub(super) fn usage_input_semantics_for(
+    stored: &StoredProvider,
+    route: ProxyRoute,
+) -> InputTokenSemantics {
+    let format = upstream_format_for_route(stored, Some(route), &[])
+        .unwrap_or_else(|| downstream_format_for_route(route));
+    match format {
+        UpstreamFormat::AnthropicMessages => InputTokenSemantics::Exclusive,
+        UpstreamFormat::OpenAiChat
+        | UpstreamFormat::OpenAiResponses
+        | UpstreamFormat::GeminiNative => InputTokenSemantics::Inclusive,
     }
 }
 
@@ -186,6 +212,7 @@ impl GenericForwardingAdapter {
         route: Option<ProxyRoute>,
         copilot_metadata: Option<&CopilotRequestMetadata>,
     ) -> Result<AdapterRequest, ProxyError> {
+        let custom_tool_names = transforms::responses_custom_tool_names_from_bytes(&body);
         let downstream_stream_requested = is_stream_requested(&body);
         let cache_config = cache_injection_config(stored);
         let thinking_config = thinking_pipeline_config(stored);
@@ -230,6 +257,7 @@ impl GenericForwardingAdapter {
             pricing_model: model.pricing_model.or(model.actual_model),
             stream_requested,
             upstream_headers,
+            custom_tool_names,
         })
     }
 
@@ -297,6 +325,36 @@ impl GenericForwardingAdapter {
             &upstream_path_for_provider(stored, upstream_format, route, gemini_path, request),
         ))
     }
+
+    pub(super) fn transform_response_for_request(
+        &self,
+        body: Bytes,
+        stored: &StoredProvider,
+        route: ProxyRoute,
+        request: &AdapterRequest,
+    ) -> Result<Bytes, ProxyError> {
+        Ok(transform_response_for_downstream(
+            body,
+            stored,
+            route,
+            &request.custom_tool_names,
+        ))
+    }
+
+    pub(super) fn transform_stream_event_for_request(
+        &self,
+        chunk: Bytes,
+        stored: &StoredProvider,
+        route: ProxyRoute,
+        custom_tool_names: &BTreeSet<String>,
+    ) -> Result<Bytes, ProxyError> {
+        Ok(transform_stream_event_for_downstream(
+            chunk,
+            stored,
+            route,
+            custom_tool_names,
+        ))
+    }
 }
 
 pub(super) fn cursor_agentservice_request(
@@ -309,6 +367,7 @@ pub(super) fn cursor_agentservice_request(
     let downstream_stream_requested =
         is_stream_requested(&body) || route_implies_stream(route, gemini_path);
     let governance_config = request_governance_config(stored);
+    let custom_tool_names = transforms::responses_custom_tool_names_from_bytes(&body);
     let (body, model) = apply_request_preprocessors(body, stored, Some(route));
     let body = maybe_apply_request_governance(body, stored, &governance_config)?;
     let stream_requested = downstream_stream_requested || is_stream_requested(&body);
@@ -325,6 +384,7 @@ pub(super) fn cursor_agentservice_request(
         actual_model_source: model.actual_model_source,
         pricing_model: model.pricing_model.or(model.actual_model),
         stream_requested,
+        custom_tool_names,
     })
 }
 
@@ -874,6 +934,7 @@ fn transform_response_for_downstream(
     body: Bytes,
     stored: &StoredProvider,
     route: ProxyRoute,
+    custom_tool_names: &BTreeSet<String>,
 ) -> Bytes {
     let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &[]) else {
         return body;
@@ -909,7 +970,10 @@ fn transform_response_for_downstream(
             transforms::openai_responses_response_to_chat(&input)
         }
         (UpstreamFormat::OpenAiChat, UpstreamFormat::OpenAiResponses) => {
-            transforms::openai_chat_response_to_responses(&input)
+            transforms::openai_chat_response_to_responses_with_custom_tools(
+                &input,
+                custom_tool_names,
+            )
         }
         (UpstreamFormat::AnthropicMessages, UpstreamFormat::GeminiNative) => {
             transforms::anthropic_response_to_gemini(&input)
@@ -953,6 +1017,7 @@ fn transform_stream_event_for_downstream(
     chunk: Bytes,
     stored: &StoredProvider,
     route: ProxyRoute,
+    custom_tool_names: &BTreeSet<String>,
 ) -> Bytes {
     let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &[]) else {
         return chunk;
@@ -979,7 +1044,12 @@ fn transform_stream_event_for_downstream(
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             continue;
         };
-        let frames = transform_stream_value(upstream_format, downstream_format, &value);
+        let frames = transform_stream_value(
+            upstream_format,
+            downstream_format,
+            &value,
+            custom_tool_names,
+        );
         if frames.is_empty() {
             continue;
         }
@@ -998,6 +1068,7 @@ fn transform_stream_value(
     upstream_format: UpstreamFormat,
     downstream_format: UpstreamFormat,
     value: &Value,
+    custom_tool_names: &BTreeSet<String>,
 ) -> Vec<transforms::StreamFrame> {
     match (upstream_format, downstream_format) {
         (UpstreamFormat::OpenAiResponses, UpstreamFormat::AnthropicMessages) => {
@@ -1019,7 +1090,7 @@ fn transform_stream_value(
             transforms::openai_responses_stream_to_chat(value)
         }
         (UpstreamFormat::OpenAiChat, UpstreamFormat::OpenAiResponses) => {
-            transforms::openai_chat_stream_to_responses(value)
+            transforms::openai_chat_stream_to_responses_with_custom_tools(value, custom_tool_names)
         }
         (UpstreamFormat::AnthropicMessages, UpstreamFormat::GeminiNative) => {
             transforms::anthropic_stream_to_gemini(value)
@@ -2051,8 +2122,11 @@ fn apply_auth_headers(
                     )
                 })?;
                 headers.push(("chatgpt-account-id", account_id));
-                headers.push(("originator", CODEX_OAUTH_ORIGINATOR.to_string()));
-                headers.push(("version", CODEX_OAUTH_VERSION.to_string()));
+                headers.push((
+                    "originator",
+                    super::codex_identity::DEFAULT_CODEX_ORIGINATOR.to_string(),
+                ));
+                headers.push(("version", super::codex_identity::configured_version()));
             }
         }
         AppKind::Gemini => {
@@ -2076,6 +2150,14 @@ fn apply_auth_headers(
 fn codex_oauth_chatgpt_account_id(
     account: &crate::domain::accounts::store::Account,
 ) -> Option<String> {
+    if let Some(selected) = crate::domain::accounts::store::selected_codex_workspace_id(account) {
+        if crate::domain::accounts::store::codex_workspace_options(account)
+            .iter()
+            .any(|workspace| workspace.id == selected)
+        {
+            return Some(selected);
+        }
+    }
     account
         .profile
         .as_ref()
@@ -2126,8 +2208,9 @@ fn apply_common_provider_headers(
                 .and_then(|meta| meta.custom_user_agent.as_deref())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .unwrap_or(CODEX_OAUTH_USER_AGENT);
-            headers.push(("user-agent", user_agent.to_string()));
+                .map(str::to_string)
+                .unwrap_or_else(super::codex_identity::default_user_agent);
+            headers.push(("user-agent", user_agent));
         }
     } else if provider_type != ProviderType::GitHubCopilot {
         if let Some(user_agent) = provider
@@ -4687,6 +4770,8 @@ mod tests {
 
         let usage = adapter_for(AppKind::Codex, ProviderType::Codex).parse_usage(
             br#"{"usage":{"prompt_tokens":100,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":70}}}"#,
+            &stored,
+            ProxyRoute::CodexChatCompletions,
         );
         assert_eq!(usage.raw_input_tokens, Some(100));
         assert_eq!(usage.billed_input_tokens, Some(30));
@@ -5299,6 +5384,7 @@ mod tests {
             actual_model_source: None,
             pricing_model: None,
             stream_requested: true,
+            custom_tool_names: Default::default(),
         };
         let plan =
             bedrock_sigv4_request_plan(&stored, &request, "20260701", "20260701T000000Z").unwrap();
@@ -5367,6 +5453,7 @@ mod tests {
             actual_model_source: None,
             pricing_model: None,
             stream_requested: false,
+            custom_tool_names: Default::default(),
         };
 
         let signed =
@@ -5451,6 +5538,7 @@ mod tests {
             actual_model_source: None,
             pricing_model: None,
             stream_requested: false,
+            custom_tool_names: Default::default(),
         };
         let signed =
             bedrock_sigv4_signed_request_parts(&stored, &request, "20260701", "20260701T000000Z")
@@ -5558,6 +5646,7 @@ mod tests {
             actual_model_source: None,
             pricing_model: None,
             stream_requested: false,
+            custom_tool_names: Default::default(),
         };
 
         let plan =

@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::api::error::ApiError;
-use crate::domain::providers::model::AppKind;
+use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::StoredProvider;
 use crate::state::ServerState;
 
@@ -76,12 +76,37 @@ pub(in crate::api) fn openai_model_list(
             && provider_id.is_none_or(|id| provider.provider.id == id)
     }) {
         let owned_by = model_owner(provider);
-        for model_id in provider_model_ids(provider) {
+        let mut provider_models = provider_model_ids(provider);
+        if provider.app == AppKind::Codex && provider.provider_type == ProviderType::CodexOAuth {
+            provider_models.extend(
+                crate::proxy::codex_models::BUILTIN_CODEX_MODELS
+                    .iter()
+                    .map(|capability| capability.id.to_string()),
+            );
+        }
+        for model_id in dedupe_non_empty(provider_models) {
+            let capability = (provider.app == AppKind::Codex)
+                .then(|| crate::proxy::codex_models::capability_for_model(&model_id))
+                .flatten();
             let key = format!("{model_id}\u{0}{owned_by}");
             models.entry(key).or_insert(OpenAiModel {
                 id: model_id,
                 object: "model",
                 owned_by: owned_by.clone(),
+                reasoning_efforts: capability.map(|capability| {
+                    capability
+                        .reasoning_efforts
+                        .iter()
+                        .map(|effort| (*effort).to_string())
+                        .collect()
+                }),
+                input_modalities: capability.map(|capability| {
+                    capability
+                        .input_modalities
+                        .iter()
+                        .map(|modality| (*modality).to_string())
+                        .collect()
+                }),
             });
         }
     }
@@ -242,6 +267,8 @@ mod tests {
             id: "gemini-2.5-pro".to_string(),
             object: "model",
             owned_by: "gemini".to_string(),
+            reasoning_efforts: None,
+            input_modalities: None,
         });
 
         assert_eq!(model.name, "models/gemini-2.5-pro");

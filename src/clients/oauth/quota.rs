@@ -22,6 +22,7 @@ fn quota_request_timeout(timeout_ms: i64) -> Duration {
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+const CLAUDE_BOOTSTRAP_URL: &str = "https://api.anthropic.com/api/claude_cli/bootstrap";
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CHATGPT_ACCOUNTS_CHECK_URL: &str =
     "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
@@ -268,20 +269,126 @@ async fn refresh_claude_quota(
         .header(USER_AGENT, claude_cli_user_agent())
         .header("x-app", "cli")
         .timeout(request_timeout);
-    let (body, plan_label) = tokio::join!(
+    let (body, plan_label, bootstrap_profile) = tokio::join!(
         request_json(account.provider_type, usage_request, now_ms),
         fetch_claude_plan_label(http, access_token, request_timeout),
+        fetch_claude_bootstrap_profile_with_timeout(http, access_token, request_timeout, now_ms,),
     );
     let body = body?;
     let quota = parse_claude_quota(&body, plan_label, now_ms);
     let subscription_level = quota.credential_message.clone();
+    let profile = merge_profile_overlay(account.profile.as_ref(), bootstrap_profile);
     Ok(update_from_quota(
         quota,
         subscription_level,
-        None,
+        profile,
         now_ms,
         success_cooldown_ms,
     ))
+}
+
+pub async fn fetch_claude_bootstrap_profile(
+    http: &reqwest::Client,
+    access_token: &str,
+    request_timeout_ms: i64,
+    now_ms: i64,
+) -> Option<Value> {
+    fetch_claude_bootstrap_profile_with_timeout(
+        http,
+        access_token,
+        quota_request_timeout(request_timeout_ms),
+        now_ms,
+    )
+    .await
+}
+
+async fn fetch_claude_bootstrap_profile_with_timeout(
+    http: &reqwest::Client,
+    access_token: &str,
+    request_timeout: Duration,
+    now_ms: i64,
+) -> Option<Value> {
+    let response = match http
+        .get(CLAUDE_BOOTSTRAP_URL)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header(ACCEPT, "application/json")
+        .header("accept-language", "*")
+        .header(USER_AGENT, claude_cli_user_agent())
+        .header("x-app", "cli")
+        .timeout(request_timeout)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            crate::metrics::record_claude_bootstrap("network_error");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        crate::metrics::record_claude_bootstrap("http_error");
+        return None;
+    }
+    let body = match response.json::<Value>().await {
+        Ok(body) => body,
+        Err(_) => {
+            crate::metrics::record_claude_bootstrap("parse_error");
+            return None;
+        }
+    };
+    let profile = normalize_claude_bootstrap_profile(&body, now_ms);
+    crate::metrics::record_claude_bootstrap(if profile.is_some() {
+        "success"
+    } else {
+        "empty"
+    });
+    profile
+}
+
+fn normalize_claude_bootstrap_profile(body: &Value, now_ms: i64) -> Option<Value> {
+    let source = body
+        .get("oauth_account")
+        .or_else(|| body.get("account"))
+        .unwrap_or(body);
+    let mut profile = serde_json::Map::new();
+    let mappings = [
+        ("accountUUID", "account_uuid"),
+        ("email", "account_email"),
+        ("organizationUUID", "organization_uuid"),
+        ("organizationName", "organization_name"),
+        ("organizationType", "organization_type"),
+        ("organizationRateLimitTier", "organization_rate_limit_tier"),
+    ];
+    for (target, source_key) in mappings {
+        if let Some(value) = source
+            .get(source_key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            profile.insert(target.to_string(), Value::String(value.to_string()));
+        }
+    }
+    if profile.is_empty() {
+        return None;
+    }
+    profile.insert("bootstrapRefreshedAt".to_string(), json!(now_ms));
+    Some(Value::Object(profile))
+}
+
+fn merge_profile_overlay(existing: Option<&Value>, overlay: Option<Value>) -> Option<Value> {
+    let overlay = overlay?;
+    let mut merged = existing
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(overlay) = overlay.as_object() {
+        for (key, value) in overlay {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Some(Value::Object(merged))
 }
 
 async fn refresh_gemini_quota(
@@ -2323,6 +2430,40 @@ mod tests {
             Some("2026-07-10T00:00:00Z")
         );
         assert_eq!(status.get("readOnly").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn claude_bootstrap_profile_normalizes_only_operational_identity_fields() {
+        let profile = normalize_claude_bootstrap_profile(
+            &json!({
+                "oauth_account": {
+                    "account_uuid": "acct-1",
+                    "account_email": "owner@example.com",
+                    "organization_uuid": "org-1",
+                    "organization_name": "Example",
+                    "organization_type": "team",
+                    "organization_rate_limit_tier": "tier-2",
+                    "unexpected_secret": "do-not-copy"
+                }
+            }),
+            1234,
+        )
+        .unwrap();
+
+        assert_eq!(profile["accountUUID"], "acct-1");
+        assert_eq!(profile["email"], "owner@example.com");
+        assert_eq!(profile["organizationUUID"], "org-1");
+        assert_eq!(profile["organizationRateLimitTier"], "tier-2");
+        assert_eq!(profile["bootstrapRefreshedAt"], 1234);
+        assert!(profile.get("unexpected_secret").is_none());
+
+        let merged = merge_profile_overlay(
+            Some(&json!({"providerType": "claude_oauth", "accountUUID": "old"})),
+            Some(profile),
+        )
+        .unwrap();
+        assert_eq!(merged["providerType"], "claude_oauth");
+        assert_eq!(merged["accountUUID"], "acct-1");
     }
 
     fn imported_account(provider_type: ProviderType, raw: Value) -> Account {

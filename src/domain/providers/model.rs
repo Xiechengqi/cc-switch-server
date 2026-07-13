@@ -158,6 +158,8 @@ pub struct ProviderMeta {
     #[serde(default)]
     pub codex_image_generation_enabled: Option<bool>,
     #[serde(default)]
+    pub codex_websocket_enabled: Option<bool>,
+    #[serde(default)]
     pub codex_chat_reasoning: Option<Value>,
     #[serde(default)]
     pub local_proxy_request_overrides: Option<Value>,

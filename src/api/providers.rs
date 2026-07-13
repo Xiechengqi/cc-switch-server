@@ -351,6 +351,7 @@ pub(in crate::api) async fn test_provider_inner(
                 &mut adapter_request.body,
                 &axum::http::HeaderMap::new(),
                 &stored.provider.id,
+                None,
             )
             .map_err(ApiError::proxy)?;
             for (header_name, header_value) in contract.headers {

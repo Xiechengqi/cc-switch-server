@@ -21,22 +21,86 @@ const CODEX_USER_AGENT: &str = "cc-switch-server-codex-oauth";
 
 #[derive(Debug, Clone, Default)]
 pub struct CodexDeviceFlowStore {
-    pending: BTreeMap<String, PendingCodexDeviceFlow>,
+    pending: BTreeMap<String, CodexDeviceFlowEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexDeviceFlowEntry {
+    flow: PendingCodexDeviceFlow,
+    state: CodexDeviceFlowState,
+}
+
+#[derive(Debug, Clone)]
+enum CodexDeviceFlowState {
+    Pending,
+    Polling,
+    Completed(Box<CodexDevicePollResult>),
+}
+
+#[derive(Debug, Clone)]
+pub enum CodexDevicePollLease {
+    Ready(PendingCodexDeviceFlow),
+    InProgress,
+    Completed(Box<CodexDevicePollResult>),
 }
 
 impl CodexDeviceFlowStore {
     pub fn insert(&mut self, device_code: String, flow: PendingCodexDeviceFlow, now_ms: i64) {
-        self.pending.retain(|_, flow| flow.expires_at_ms > now_ms);
-        self.pending.insert(device_code, flow);
+        self.cleanup(now_ms);
+        self.pending.insert(
+            device_code,
+            CodexDeviceFlowEntry {
+                flow,
+                state: CodexDeviceFlowState::Pending,
+            },
+        );
     }
 
-    pub fn get(&mut self, device_code: &str, now_ms: i64) -> Option<PendingCodexDeviceFlow> {
-        self.pending.retain(|_, flow| flow.expires_at_ms > now_ms);
-        self.pending.get(device_code).cloned()
+    pub fn begin_poll(&mut self, device_code: &str, now_ms: i64) -> Option<CodexDevicePollLease> {
+        self.cleanup(now_ms);
+        let entry = self.pending.get_mut(device_code)?;
+        match &entry.state {
+            CodexDeviceFlowState::Pending => {
+                entry.state = CodexDeviceFlowState::Polling;
+                Some(CodexDevicePollLease::Ready(entry.flow.clone()))
+            }
+            CodexDeviceFlowState::Polling => Some(CodexDevicePollLease::InProgress),
+            CodexDeviceFlowState::Completed(result) => {
+                Some(CodexDevicePollLease::Completed(result.clone()))
+            }
+        }
     }
 
-    pub fn remove(&mut self, device_code: &str) {
-        self.pending.remove(device_code);
+    pub fn finish_poll(&mut self, device_code: &str, result: CodexDevicePollResult) -> bool {
+        let Some(entry) = self.pending.get_mut(device_code) else {
+            return false;
+        };
+        if !matches!(entry.state, CodexDeviceFlowState::Polling) {
+            return false;
+        }
+        entry.state = if result.pending {
+            CodexDeviceFlowState::Pending
+        } else {
+            CodexDeviceFlowState::Completed(Box::new(result))
+        };
+        true
+    }
+
+    pub fn fail_poll(&mut self, device_code: &str, terminal: bool) {
+        if terminal {
+            self.pending.remove(device_code);
+        } else if let Some(entry) = self.pending.get_mut(device_code) {
+            entry.state = CodexDeviceFlowState::Pending;
+        }
+    }
+
+    pub fn cancel(&mut self, device_code: &str) -> bool {
+        self.pending.remove(device_code).is_some()
+    }
+
+    fn cleanup(&mut self, now_ms: i64) {
+        self.pending
+            .retain(|_, entry| entry.flow.expires_at_ms > now_ms);
     }
 }
 
@@ -320,6 +384,65 @@ mod tests {
             10 + POLLING_SAFETY_MARGIN_SECS
         );
         assert_eq!(parse_interval(None), 5 + POLLING_SAFETY_MARGIN_SECS);
+    }
+
+    #[test]
+    fn device_flow_store_serializes_poll_and_caches_completion() {
+        let mut store = CodexDeviceFlowStore::default();
+        let flow = PendingCodexDeviceFlow {
+            user_code: "ABCD-EFGH".to_string(),
+            expires_at_ms: 10_000,
+        };
+        store.insert("device".to_string(), flow.clone(), 1_000);
+        assert!(matches!(
+            store.begin_poll("device", 1_001),
+            Some(CodexDevicePollLease::Ready(_))
+        ));
+        assert!(matches!(
+            store.begin_poll("device", 1_002),
+            Some(CodexDevicePollLease::InProgress)
+        ));
+        let completed = CodexDevicePollResult {
+            pending: false,
+            message: "done".to_string(),
+            retry_after_secs: None,
+            account_input: None,
+        };
+        assert!(store.finish_poll("device", completed));
+        assert!(matches!(
+            store.begin_poll("device", 1_003),
+            Some(CodexDevicePollLease::Completed(_))
+        ));
+        assert!(store.cancel("device"));
+        assert!(store.begin_poll("device", 1_004).is_none());
+    }
+
+    #[test]
+    fn cancelled_in_flight_poll_cannot_publish_completion() {
+        let mut store = CodexDeviceFlowStore::default();
+        store.insert(
+            "device".to_string(),
+            PendingCodexDeviceFlow {
+                user_code: "ABCD-EFGH".to_string(),
+                expires_at_ms: 2_000,
+            },
+            1_000,
+        );
+        assert!(matches!(
+            store.begin_poll("device", 1_001),
+            Some(CodexDevicePollLease::Ready(_))
+        ));
+        assert!(store.cancel("device"));
+        assert!(!store.finish_poll(
+            "device",
+            CodexDevicePollResult {
+                pending: false,
+                message: "done".to_string(),
+                retry_after_secs: None,
+                account_input: None,
+            }
+        ));
+        assert!(store.begin_poll("device", 1_002).is_none());
     }
 
     #[tokio::test]

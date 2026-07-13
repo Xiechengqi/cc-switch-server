@@ -126,6 +126,21 @@ OAuth refresh fixture 的最小验收顺序：
 4. 再跑同一 provider 的 non-stream 和 stream 短请求，记录 requestId、status、actualModel、usage 摘要。
 5. direct/market 入口只记录 URL、状态码、requestId 和脱敏账号，不记录 provider raw response。
 
+Codex OAuth 专项补充：
+
+1. Device Code 同一 `device_code` 并发 poll 时只允许一个上游 exchange，其余返回 pending；完成后重复 poll 返回同一账号结果，cancel 后必须失效。
+2. 新登录和 refresh 的 `id_token` 必须通过 OpenAI JWKS 的 RS256、issuer、audience、expiry/nbf 校验；轮换 `kid` 时应刷新缓存，未知 `kid` 必须 fail closed。
+3. 同一 refresh token 导入第二个账号必须拒绝；模拟 `refresh_token_reused` 时账号应立即进入 relogin，不等待普通 invalid-grant 阈值。
+4. 抓包确认 HTTP、WebSocket、Images 的 `originator` 与 User-Agent family 匹配，`version` 不低于 `0.144.0`；默认应为 `0.144.1`。
+5. 多 workspace 账号只能选择 token claims 中的 organization/Account-ID；修改后出站 `ChatGPT-Account-Id` 应随选择变化，伪造 ID 必须被控制面拒绝。
+6. Responses Lite 请求应覆盖 `additional_tools`、custom tool call/output continuation、tool_search forced choice 和同名冲突错误；Chat 上游回程应恢复 custom item，stream 完成事件包含非空 output。
+7. SSE 与 WebSocket 分别模拟空 `response.completed.response.output`，确认按 `output_index` 重建；已有非空 output 不覆盖，第二个 response 不得串入前一轮状态。
+8. provider 的 `codexWebsocketEnabled=false` 应使 GET WS 返回 503，并保持 POST Responses SSE 可用；恢复开关后再跑 text/binary WS 与 Windows reset 场景。
+9. GPT-5.6 Sol/Terra 接受 `ultra`，Luna 将 `ultra` 降为 `max`，旧 GPT 将 `max/ultra` 降为 `xhigh`；`/v1/models` 应返回 Sol/Terra/Luna。
+10. usage fixture 同时覆盖 nested `cache_write_tokens`、cache read、cache creation 显式零值和 Anthropic exclusive input，核对 fresh/read/write/output 四桶与费用。
+11. `/v1/images/generations` 使用短图片 prompt 验证既有 Codex bridge、身份头和账号冷却；不要把已有 Images 路由误报为未实现。
+12. server 不应自动读取或写入运行主机用户的 `~/.codex/auth.json`；只测试显式登录/导入。TLS/JA3 只有在 rustls 请求出现可重复的上游拒绝证据时才开启专项评估。
+
 Claude OAuth 专项补充：
 
 1. 同一 `claude_oauth` 账号并发触发多次 refresh 时，上游 token endpoint 不应收到重复风暴；失败后短窗口内应进入 per-token backoff。
@@ -141,6 +156,8 @@ Claude OAuth 专项补充：
 11. 若上游返回 Claude Code CLI 版本过期提示，响应体应替换为面向 cc-switch-server admin 的 `CC_SWITCH_CLI_UA_VERSION` / `CC_SWITCH_CLI_UA` 调整提示，并记录 error 日志。
 12. Claude OAuth 出站 JSON 不应被 key 字母序化；抓包时至少确认原始 `model` / `max_tokens` / `messages` 相对顺序被保留，缺省工具请求应补 `tools: []`。
 13. 上游响应含 `x-request-id` 时，下游客户端应能拿到同名 header，便于 Anthropic support 联合排查。
+14. Claude OAuth 客户端 header 中加入未知 beta（例如 `prompt-caching-scope-2026-01-05`）时，上游不得收到该 token；已审计的 `prompt-caching-2024-07-31` 与 `token-efficient-tools-2025-02-19` 应保留，server debug 日志应能定位被过滤事件但不得记录 token/account 身份。
+15. 同一 OAuth state 在多 tab 重复完成时应返回同一 completed/account 结果；Pending/preview session 可通过 `/api/accounts/login/cancel` 或 `auth_cancel_login` 幂等取消，取消后 finish/poll 必须终止，未知 state 必须拒绝。exchange 已开始后 cancel 应返回冲突，避免授权码已消费但账号未持久化。
 14. Claude OAuth 多账号并发时，应优先选择当前占用比例较低的账号；默认每账号上限为 8，provider 的 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS` 可覆盖，`CC_SWITCH_ACCOUNT_MAX_CONCURRENT=0` 可关闭。达到上限的账号应从自动选择中跳过，显式 provider/share 绑定应返回 429，SSE 结束或中断后容量必须释放。
 15. 如使用 `~/.claude/.credentials.json` 迁移，只通过显式 `POST /api/accounts/claude/credentials/import` / `GET /api/accounts/:id/claude/credentials` 操作；server 不自动扫描本机目录，也不写 Claude Desktop profile。
 16. 缺省 `max_tokens` / `temperature` 的请求应分别补为 `128000` / `1`；`thinking.type=enabled|adaptive` 时应补 `context_management.edits` 并携带 `context-management-2025-06-27` beta，客户端显式值不得被覆盖。

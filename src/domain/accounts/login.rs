@@ -37,12 +37,14 @@ struct OAuthLoginSession {
     expires_at_ms: i64,
     status: OAuthLoginStatus,
     authorization_code: Option<String>,
+    completed_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthSessionPollState {
     Pending,
     Ready,
+    Completed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -52,6 +54,7 @@ pub enum OAuthLoginStatus {
     TokenRequestPreviewed,
     TokenExchangeStarted,
     TokenExchanged,
+    Cancelled,
     Expired,
 }
 
@@ -86,9 +89,21 @@ pub struct OAuthLoginFinish {
     pub status: OAuthLoginStatus,
     pub token_exchange_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token_request: Option<OAuthHttpRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_import_hint: Option<Value>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthLoginCancellation {
+    pub provider_type: ProviderType,
+    pub session_id: String,
+    pub state: String,
+    pub status: OAuthLoginStatus,
     pub message: String,
 }
 
@@ -100,6 +115,8 @@ pub enum OAuthLoginError {
     StateMismatch,
     MissingCode,
     AlreadyConsumed,
+    Cancelled,
+    InvalidTransition,
     RequestShape(String),
 }
 
@@ -112,6 +129,10 @@ impl std::fmt::Display for OAuthLoginError {
             Self::StateMismatch => formatter.write_str("oauth login state does not match session"),
             Self::MissingCode => formatter.write_str("authorization code is required"),
             Self::AlreadyConsumed => formatter.write_str("oauth login session is already consumed"),
+            Self::Cancelled => formatter.write_str("oauth login session was cancelled"),
+            Self::InvalidTransition => {
+                formatter.write_str("oauth login session is not ready for this transition")
+            }
             Self::RequestShape(message) => formatter.write_str(message),
         }
     }
@@ -169,6 +190,7 @@ impl OAuthLoginStore {
             expires_at_ms,
             status: OAuthLoginStatus::Pending,
             authorization_code: None,
+            completed_account_id: None,
         };
         self.sessions.insert(session_id.clone(), session);
 
@@ -213,7 +235,22 @@ impl OAuthLoginStore {
             return Err(OAuthLoginError::Expired);
         }
         if session.status == OAuthLoginStatus::TokenExchanged {
-            return Err(OAuthLoginError::AlreadyConsumed);
+            return Ok(OAuthLoginFinish {
+                provider_type: session.provider_type,
+                method: "token_exchange_completed",
+                session_id: session.session_id.clone(),
+                state: session.state.clone(),
+                flow: session.flow,
+                status: session.status,
+                token_exchange_enabled: provider_token_exchange_available(session.provider_type),
+                account_id: session.completed_account_id.clone(),
+                token_request: None,
+                account_import_hint: None,
+                message: "oauth login session was already completed".to_string(),
+            });
+        }
+        if session.status == OAuthLoginStatus::Cancelled {
+            return Err(OAuthLoginError::Cancelled);
         }
         if session.status == OAuthLoginStatus::TokenExchangeStarted {
             return Err(OAuthLoginError::AlreadyConsumed);
@@ -291,6 +328,7 @@ impl OAuthLoginStore {
             flow: session.flow,
             status: session.status,
             token_exchange_enabled: provider_token_exchange_available(session.provider_type),
+            account_id: None,
             token_request,
             account_import_hint: Some(serde_json::json!({
                 "providerType": session.provider_type.as_str(),
@@ -310,13 +348,33 @@ impl OAuthLoginStore {
         })
     }
 
-    pub fn mark_exchanged(&mut self, session_id: &str) -> Result<(), OAuthLoginError> {
+    pub fn mark_exchanged(
+        &mut self,
+        session_id: &str,
+        account_id: &str,
+    ) -> Result<(), OAuthLoginError> {
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or(OAuthLoginError::NotFound)?;
-        session.status = OAuthLoginStatus::TokenExchanged;
-        Ok(())
+        match session.status {
+            OAuthLoginStatus::TokenExchangeStarted => {
+                session.status = OAuthLoginStatus::TokenExchanged;
+                session.completed_account_id = Some(account_id.to_string());
+                Ok(())
+            }
+            OAuthLoginStatus::TokenExchanged
+                if session.completed_account_id.as_deref() == Some(account_id) =>
+            {
+                Ok(())
+            }
+            OAuthLoginStatus::TokenExchanged => Err(OAuthLoginError::InvalidTransition),
+            OAuthLoginStatus::Cancelled => Err(OAuthLoginError::Cancelled),
+            OAuthLoginStatus::Expired => Err(OAuthLoginError::Expired),
+            OAuthLoginStatus::Pending | OAuthLoginStatus::TokenRequestPreviewed => {
+                Err(OAuthLoginError::InvalidTransition)
+            }
+        }
     }
 
     pub fn mark_exchange_failed(&mut self, session_id: &str) {
@@ -325,6 +383,41 @@ impl OAuthLoginStore {
                 session.status = OAuthLoginStatus::TokenRequestPreviewed;
             }
         }
+    }
+
+    pub fn cancel(
+        &mut self,
+        session_id: Option<&str>,
+        state: Option<&str>,
+        now_ms: i64,
+    ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
+        self.cleanup_expired(now_ms);
+        let session_key = self.session_key(session_id, state)?;
+        let session = self
+            .sessions
+            .get_mut(&session_key)
+            .ok_or(OAuthLoginError::NotFound)?;
+        if session.expires_at_ms <= now_ms {
+            session.status = OAuthLoginStatus::Expired;
+            return Err(OAuthLoginError::Expired);
+        }
+        match session.status {
+            OAuthLoginStatus::Pending | OAuthLoginStatus::TokenRequestPreviewed => {
+                session.status = OAuthLoginStatus::Cancelled;
+            }
+            OAuthLoginStatus::Cancelled => {}
+            OAuthLoginStatus::TokenExchangeStarted | OAuthLoginStatus::TokenExchanged => {
+                return Err(OAuthLoginError::AlreadyConsumed);
+            }
+            OAuthLoginStatus::Expired => return Err(OAuthLoginError::Expired),
+        }
+        Ok(OAuthLoginCancellation {
+            provider_type: session.provider_type,
+            session_id: session.session_id.clone(),
+            state: session.state.clone(),
+            status: session.status,
+            message: "oauth login session cancelled".to_string(),
+        })
     }
 
     pub fn poll_state_by_oauth_state(
@@ -342,7 +435,10 @@ impl OAuthLoginStore {
             return Err(OAuthLoginError::Expired);
         }
         if session.status == OAuthLoginStatus::TokenExchanged {
-            return Err(OAuthLoginError::AlreadyConsumed);
+            return Ok(OAuthSessionPollState::Completed);
+        }
+        if session.status == OAuthLoginStatus::Cancelled {
+            return Err(OAuthLoginError::Cancelled);
         }
         match session.flow {
             OAuthAuthorizeFlow::CursorDeepControl => {
@@ -654,9 +750,16 @@ mod tests {
             )
             .is_ok());
         store
-            .mark_exchanged(&login.session_id)
+            .mark_exchanged(&login.session_id, "account-1")
             .expect("mark exchanged");
-        assert!(store
+        store
+            .mark_exchanged(&login.session_id, "account-1")
+            .expect("mark exchanged remains idempotent");
+        assert!(matches!(
+            store.mark_exchanged(&login.session_id, "different-account"),
+            Err(OAuthLoginError::InvalidTransition)
+        ));
+        let completed = store
             .finish(
                 Some(&login.session_id),
                 Some(&login.state),
@@ -664,7 +767,52 @@ mod tests {
                 false,
                 2_003,
             )
-            .is_err());
+            .expect("completion is idempotent");
+        assert_eq!(completed.status, OAuthLoginStatus::TokenExchanged);
+        assert_eq!(completed.account_id.as_deref(), Some("account-1"));
+        assert!(matches!(
+            store.poll_state_by_oauth_state(&login.state, 2_004),
+            Ok(OAuthSessionPollState::Completed)
+        ));
+        assert!(matches!(
+            store.finish(None, Some("unknown-state"), None, false, 2_005),
+            Err(OAuthLoginError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn oauth_session_cancel_is_idempotent_and_terminal() {
+        let mut store = OAuthLoginStore::default();
+        let login = store
+            .start(
+                ProviderType::ClaudeOAuth,
+                Some("http://localhost:15721/api/accounts/login/callback".to_string()),
+                1_000,
+            )
+            .expect("login");
+
+        let cancelled = store
+            .cancel(Some(&login.session_id), Some(&login.state), 2_000)
+            .expect("cancel");
+        assert_eq!(cancelled.status, OAuthLoginStatus::Cancelled);
+        let cancelled_again = store
+            .cancel(None, Some(&login.state), 2_001)
+            .expect("cancel remains idempotent");
+        assert_eq!(cancelled_again.status, OAuthLoginStatus::Cancelled);
+        assert!(matches!(
+            store.finish(
+                Some(&login.session_id),
+                Some(&login.state),
+                Some("auth-code"),
+                true,
+                2_002,
+            ),
+            Err(OAuthLoginError::Cancelled)
+        ));
+        assert!(matches!(
+            store.poll_state_by_oauth_state(&login.state, 2_003),
+            Err(OAuthLoginError::Cancelled)
+        ));
     }
 
     #[test]

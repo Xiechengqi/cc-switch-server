@@ -225,6 +225,24 @@ async fn execute_native_account_refresh_inner(
                     "OAuth refresh response is missing token fields: {error}"
                 ))
             })?;
+        let verified_openai_claims = if account.provider_type == ProviderType::CodexOAuth {
+            if let Some(id_token) = token_response.id_token.as_deref() {
+                Some(
+                    crate::clients::oauth::openai_jwks::verify_openai_id_token(http, id_token)
+                        .await
+                        .map_err(|error| AccountRefreshFailure {
+                            status_code: 400,
+                            message: error.to_string(),
+                            kind: OAuthErrorKind::InvalidGrant,
+                            retryable: false,
+                        })?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut update = refresh_update_from_token_response(
             account.provider_type,
             &token_response,
@@ -246,6 +264,12 @@ async fn execute_native_account_refresh_inner(
                     quota_refresh_interval_ms,
                 )
                 .await,
+            );
+        }
+        if let Some(claims) = verified_openai_claims {
+            crate::domain::accounts::store::set_verified_openai_claims(
+                &mut update.profile,
+                Some(claims),
             );
         }
 

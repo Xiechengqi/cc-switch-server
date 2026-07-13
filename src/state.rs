@@ -13,7 +13,9 @@ use tokio::time::{sleep, Duration};
 
 use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::Cli;
-use crate::clients::oauth::codex_device::{CodexDeviceFlowStore, PendingCodexDeviceFlow};
+use crate::clients::oauth::codex_device::{
+    CodexDeviceFlowStore, CodexDevicePollLease, CodexDevicePollResult, PendingCodexDeviceFlow,
+};
 use crate::clients::oauth::copilot_device;
 use crate::clients::oauth::kiro_device::{
     KiroDeviceFlowStore, PendingKiroDeviceFlow, PendingKiroSocialDeviceFlow,
@@ -1284,19 +1286,37 @@ impl ServerStateInner {
             .insert(device_code, flow, now_ms);
     }
 
-    pub async fn get_codex_device_flow(
+    pub async fn begin_codex_device_poll(
         &self,
         device_code: &str,
         now_ms: i64,
-    ) -> Option<PendingCodexDeviceFlow> {
+    ) -> Option<CodexDevicePollLease> {
         self.codex_device_flows
             .write()
             .await
-            .get(device_code, now_ms)
+            .begin_poll(device_code, now_ms)
     }
 
-    pub async fn remove_codex_device_flow(&self, device_code: &str) {
-        self.codex_device_flows.write().await.remove(device_code);
+    pub async fn finish_codex_device_poll(
+        &self,
+        device_code: &str,
+        result: CodexDevicePollResult,
+    ) -> bool {
+        self.codex_device_flows
+            .write()
+            .await
+            .finish_poll(device_code, result)
+    }
+
+    pub async fn fail_codex_device_poll(&self, device_code: &str, terminal: bool) {
+        self.codex_device_flows
+            .write()
+            .await
+            .fail_poll(device_code, terminal);
+    }
+
+    pub async fn cancel_codex_device_flow(&self, device_code: &str) -> bool {
+        self.codex_device_flows.write().await.cancel(device_code)
     }
 
     pub async fn prepare_copilot_upstream_auth(

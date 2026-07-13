@@ -17,6 +17,8 @@ fn encode_json_event(value: &Value) -> Option<String> {
         "response.output_item.done" => encode_output_item_event(value),
         "response.output_text.delta" => encode_output_text_delta(value),
         "response.function_call_arguments.delta" => encode_function_call_delta(value),
+        "response.custom_tool_call_input.delta" => encode_custom_tool_call_delta(value),
+        "response.custom_tool_call_input.done" => encode_custom_tool_call_done(value),
         "response.completed" => encode_response_completed(value),
         _ => None,
     }
@@ -60,6 +62,31 @@ fn encode_function_call_delta(value: &Value) -> Option<String> {
     }
     fields.push(format!("\"output_index\":{output_index}"));
     fields.push(format!("\"delta\":{delta}"));
+    Some(format!("{{{}}}", fields.join(",")))
+}
+
+fn encode_custom_tool_call_delta(value: &Value) -> Option<String> {
+    encode_custom_tool_call_value(value, "delta")
+}
+
+fn encode_custom_tool_call_done(value: &Value) -> Option<String> {
+    encode_custom_tool_call_value(value, "input")
+}
+
+fn encode_custom_tool_call_value(value: &Value, payload_field: &str) -> Option<String> {
+    let event_type = json_string(value.get("type")?)?;
+    let output_index = integer_or_zero(value.get("output_index"));
+    let payload = json_string(
+        value
+            .get(payload_field)
+            .unwrap_or(&Value::String(String::new())),
+    )?;
+    let mut fields = vec![format!("\"type\":{event_type}")];
+    if let Some(item_id) = value.get("item_id") {
+        fields.push(format!("\"item_id\":{}", json_string(item_id)?));
+    }
+    fields.push(format!("\"output_index\":{output_index}"));
+    fields.push(format!("\"{payload_field}\":{payload}"));
     Some(format!("{{{}}}", fields.join(",")))
 }
 
@@ -130,6 +157,30 @@ mod tests {
         assert_eq!(
             data,
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+        );
+    }
+
+    #[test]
+    fn custom_tool_events_keep_required_zero_index() {
+        let delta = encode_json_event(&json!({
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "ctc_1",
+            "delta": "patch"
+        }))
+        .unwrap();
+        assert_eq!(
+            delta,
+            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","output_index":0,"delta":"patch"}"#
+        );
+        let done = encode_json_event(&json!({
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "ctc_1",
+            "input": "patch"
+        }))
+        .unwrap();
+        assert_eq!(
+            done,
+            r#"{"type":"response.custom_tool_call_input.done","item_id":"ctc_1","output_index":0,"input":"patch"}"#
         );
     }
 }

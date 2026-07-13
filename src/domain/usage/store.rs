@@ -945,7 +945,27 @@ pub struct TokenUsage {
     pub total_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputTokenSemantics {
+    /// The upstream input count already includes cache reads and cache writes,
+    /// as in OpenAI Responses/Chat and Gemini usage payloads.
+    Inclusive,
+    /// The upstream input count is fresh input only, as in Anthropic usage.
+    Exclusive,
+    /// Infer from protocol-specific field shapes. Callers on a known hot path
+    /// should prefer an explicit variant.
+    #[default]
+    Auto,
+}
+
 pub fn usage_from_json(value: &serde_json::Value) -> TokenUsage {
+    usage_from_json_with_semantics(value, InputTokenSemantics::Auto)
+}
+
+pub fn usage_from_json_with_semantics(
+    value: &serde_json::Value,
+    semantics: InputTokenSemantics,
+) -> TokenUsage {
     let usage = value
         .get("usage")
         .or_else(|| value.pointer("/message/usage"))
@@ -998,9 +1018,6 @@ pub fn usage_from_json(value: &serde_json::Value) -> TokenUsage {
             .pointer("/prompt_tokens_details/cached_tokens")
             .and_then(serde_json::Value::as_u64)
     });
-    let raw_input_tokens = input_tokens;
-    let billed_input_tokens =
-        input_tokens.map(|input| input.saturating_sub(cache_read_tokens.unwrap_or(0)));
     let cache_creation_tokens = first_u64(
         usage,
         &[
@@ -1021,13 +1038,45 @@ pub fn usage_from_json(value: &serde_json::Value) -> TokenUsage {
     })
     .or_else(|| {
         usage
+            .pointer("/input_tokens_details/cache_write_tokens")
+            .and_then(serde_json::Value::as_u64)
+    })
+    .or_else(|| {
+        usage
             .pointer("/prompt_tokens_details/cache_creation_tokens")
             .and_then(serde_json::Value::as_u64)
+    })
+    .or_else(|| {
+        usage
+            .pointer("/prompt_tokens_details/cached_creation_tokens")
+            .and_then(serde_json::Value::as_u64)
+    })
+    .or_else(|| {
+        usage
+            .pointer("/prompt_tokens_details/cache_write_tokens")
+            .and_then(serde_json::Value::as_u64)
     });
+    let semantics = match semantics {
+        InputTokenSemantics::Auto => infer_input_token_semantics(usage),
+        explicit => explicit,
+    };
+    let cache_total = cache_read_tokens
+        .unwrap_or(0)
+        .saturating_add(cache_creation_tokens.unwrap_or(0));
+    let (input_tokens, raw_input_tokens, billed_input_tokens) = match semantics {
+        InputTokenSemantics::Inclusive => {
+            let fresh = input_tokens.map(|input| input.saturating_sub(cache_total));
+            (fresh, input_tokens, fresh)
+        }
+        InputTokenSemantics::Exclusive | InputTokenSemantics::Auto => {
+            let raw = input_tokens.map(|input| input.saturating_add(cache_total));
+            (input_tokens, raw, input_tokens)
+        }
+    };
     let total_tokens = first_u64(usage, &["total_tokens", "totalTokens", "totalTokenCount"])
         .or_else(|| {
-            if input_tokens.is_some() || output_tokens.is_some() {
-                Some(input_tokens.unwrap_or(0) + output_tokens.unwrap_or(0))
+            if raw_input_tokens.is_some() || output_tokens.is_some() {
+                Some(raw_input_tokens.unwrap_or(0) + output_tokens.unwrap_or(0))
             } else if cache_read_tokens.is_some() || cache_creation_tokens.is_some() {
                 Some(cache_read_tokens.unwrap_or(0) + cache_creation_tokens.unwrap_or(0))
             } else {
@@ -1043,6 +1092,21 @@ pub fn usage_from_json(value: &serde_json::Value) -> TokenUsage {
         cache_read_tokens,
         cache_creation_tokens,
         total_tokens,
+    }
+}
+
+fn infer_input_token_semantics(usage: &serde_json::Value) -> InputTokenSemantics {
+    let has_inclusive_shape = usage.get("prompt_tokens").is_some()
+        || usage.get("promptTokens").is_some()
+        || usage.get("promptTokenCount").is_some()
+        || usage.get("inputTokenCount").is_some()
+        || usage.get("input_tokens_details").is_some()
+        || usage.get("prompt_tokens_details").is_some()
+        || usage.get("usageMetadata").is_some();
+    if has_inclusive_shape {
+        InputTokenSemantics::Inclusive
+    } else {
+        InputTokenSemantics::Exclusive
     }
 }
 
@@ -1611,8 +1675,75 @@ mod tests {
 
         assert_eq!(usage.cache_read_tokens, Some(50));
         assert_eq!(usage.cache_creation_tokens, Some(5));
-        assert_eq!(usage.raw_input_tokens, Some(100));
-        assert_eq!(usage.billed_input_tokens, Some(50));
+        assert_eq!(usage.raw_input_tokens, Some(155));
+        assert_eq!(usage.billed_input_tokens, Some(100));
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.total_tokens, Some(175));
+    }
+
+    #[test]
+    fn parses_nested_cache_write_and_preserves_explicit_zero() {
+        let written = usage_from_json_with_semantics(
+            &json!({
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 4,
+                    "input_tokens_details": {
+                        "cached_tokens": 60,
+                        "cache_write_tokens": 15
+                    }
+                }
+            }),
+            InputTokenSemantics::Inclusive,
+        );
+        assert_eq!(written.input_tokens, Some(25));
+        assert_eq!(written.cache_creation_tokens, Some(15));
+
+        let zero = usage_from_json_with_semantics(
+            &json!({
+                "usage": {
+                    "input_tokens": 10,
+                    "input_tokens_details": {"cache_write_tokens": 0}
+                }
+            }),
+            InputTokenSemantics::Inclusive,
+        );
+        assert_eq!(zero.cache_creation_tokens, Some(0));
+    }
+
+    #[test]
+    fn explicit_input_semantics_normalize_to_same_four_buckets() {
+        let inclusive = usage_from_json_with_semantics(
+            &json!({
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 8,
+                    "cache_read_input_tokens": 60,
+                    "cache_creation_input_tokens": 20
+                }
+            }),
+            InputTokenSemantics::Inclusive,
+        );
+        let exclusive = usage_from_json_with_semantics(
+            &json!({
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 8,
+                    "cache_read_input_tokens": 60,
+                    "cache_creation_input_tokens": 20
+                }
+            }),
+            InputTokenSemantics::Exclusive,
+        );
+
+        for usage in [inclusive, exclusive] {
+            assert_eq!(usage.input_tokens, Some(20));
+            assert_eq!(usage.raw_input_tokens, Some(100));
+            assert_eq!(usage.billed_input_tokens, Some(20));
+            assert_eq!(usage.cache_read_tokens, Some(60));
+            assert_eq!(usage.cache_creation_tokens, Some(20));
+            assert_eq!(usage.total_tokens, Some(108));
+        }
     }
 
     #[test]
@@ -1627,7 +1758,8 @@ mod tests {
             }
         }));
         assert_eq!(claude.input_tokens, Some(100));
-        assert_eq!(claude.billed_input_tokens, Some(40));
+        assert_eq!(claude.raw_input_tokens, Some(160));
+        assert_eq!(claude.billed_input_tokens, Some(100));
         assert_eq!(claude.output_tokens, Some(20));
 
         let codex = usage_from_json(&json!({
@@ -1642,7 +1774,7 @@ mod tests {
                 }
             }
         }));
-        assert_eq!(codex.input_tokens, Some(80));
+        assert_eq!(codex.input_tokens, Some(50));
         assert_eq!(codex.cache_read_tokens, Some(30));
         assert_eq!(codex.billed_input_tokens, Some(50));
     }
@@ -1658,7 +1790,7 @@ mod tests {
             }
         }));
 
-        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.input_tokens, Some(8));
         assert_eq!(usage.output_tokens, Some(8));
         assert_eq!(usage.cache_read_tokens, Some(4));
         assert_eq!(usage.total_tokens, Some(20));
@@ -1680,7 +1812,8 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(9));
         assert_eq!(usage.cache_read_tokens, Some(70));
         assert_eq!(usage.cache_creation_tokens, Some(3));
-        assert_eq!(usage.billed_input_tokens, Some(50));
+        assert_eq!(usage.billed_input_tokens, Some(120));
+        assert_eq!(usage.raw_input_tokens, Some(193));
     }
 
     #[test]
@@ -1696,7 +1829,7 @@ mod tests {
             }
         }));
 
-        assert_eq!(usage.input_tokens, Some(40));
+        assert_eq!(usage.input_tokens, Some(15));
         assert_eq!(usage.output_tokens, Some(6));
         assert_eq!(usage.cache_read_tokens, Some(25));
         assert_eq!(usage.billed_input_tokens, Some(15));
@@ -1924,7 +2057,7 @@ mod tests {
         }));
 
         assert_eq!(usage.raw_input_tokens, Some(156_605));
-        assert_eq!(usage.input_tokens, Some(156_605));
+        assert_eq!(usage.input_tokens, Some(6_605));
         assert_eq!(usage.cache_read_tokens, Some(150_000));
         assert_eq!(usage.billed_input_tokens, Some(6_605));
         assert_eq!(usage.output_tokens, Some(18));

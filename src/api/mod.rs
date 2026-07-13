@@ -249,6 +249,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/accounts/login/start", post(start_account_login))
         .route("/api/accounts/login/callback", get(account_login_callback))
         .route("/api/accounts/login/finish", post(finish_account_login))
+        .route("/api/accounts/login/cancel", post(cancel_account_login))
         .route(
             "/web-api/oauth/claude-cli/callback",
             get(claude_cli_oauth_callback),
@@ -276,6 +277,10 @@ pub fn app_router(state: ServerState) -> Router {
         .route(
             "/api/accounts/codex/device/poll",
             post(poll_codex_device_login),
+        )
+        .route(
+            "/api/accounts/codex/device/cancel",
+            post(cancel_codex_device_login),
         )
         .route("/api/accounts/:id", delete(delete_account))
         .route(
@@ -885,9 +890,10 @@ fn oauth_login_api_error(error: OAuthLoginError) -> ApiError {
         error @ (OAuthLoginError::MissingCode | OAuthLoginError::StateMismatch) => {
             ApiError::bad_request(error)
         }
-        error @ (OAuthLoginError::Expired | OAuthLoginError::AlreadyConsumed) => {
-            ApiError::conflict(error.to_string())
-        }
+        error @ (OAuthLoginError::Expired
+        | OAuthLoginError::AlreadyConsumed
+        | OAuthLoginError::Cancelled
+        | OAuthLoginError::InvalidTransition) => ApiError::conflict(error.to_string()),
         OAuthLoginError::NotFound => ApiError::not_found(error.to_string()),
     }
 }

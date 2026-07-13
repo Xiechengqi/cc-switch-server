@@ -23,7 +23,9 @@ pub(in crate::api) async fn web_invoke_compat(
         )));
     }
 
-    require_session(&state, &headers).await?;
+    if web_invoke_requires_session(&state, &command).await {
+        require_session(&state, &headers).await?;
+    }
     if !command_def.implemented {
         return Err(ApiError::web_invoke_not_wired(format!(
             "desktop invoke command '{command}' is registered as {} but is not bridged yet",
@@ -34,6 +36,13 @@ pub(in crate::api) async fn web_invoke_compat(
     web_invoke_dispatch(&state, &headers, &command, args)
         .await
         .map(Json)
+}
+
+async fn web_invoke_requires_session(state: &ServerState, command: &str) -> bool {
+    match command {
+        "complete_server_setup" => state.config.read().await.is_setup_complete(),
+        _ => true,
+    }
 }
 
 async fn web_invoke_dispatch(
@@ -771,11 +780,17 @@ async fn web_invoke_dispatch(
         "auth_poll_for_account" => {
             web_managed_auth_poll_for_account(state.clone(), headers.clone(), &args).await
         }
+        "auth_cancel_login" => {
+            web_managed_auth_cancel_login(state.clone(), headers.clone(), &args).await
+        }
         "auth_remove_account" => {
             web_managed_auth_remove_account(state.clone(), headers.clone(), &args).await
         }
         "auth_set_default_account" => {
             web_managed_auth_set_default_account(state.clone(), headers.clone(), &args).await
+        }
+        "auth_set_workspace" => {
+            web_managed_auth_set_workspace(state.clone(), headers.clone(), &args).await
         }
         "auth_logout" => web_managed_auth_logout(state.clone(), headers.clone(), &args).await,
         "grok_import_auth_json" => {

@@ -1,6 +1,6 @@
 # Transform/Streaming Coverage Tracker
 
-Date: 2026-07-07
+Date: 2026-07-13
 
 This tracker follows Phase X / X7. It records server-side test coverage against the desktop transform and streaming suites without importing desktop-only behavior.
 
@@ -42,6 +42,25 @@ This tracker follows Phase X / X7. It records server-side test coverage against 
 | SSE line buffer across chunk boundaries | Covered | `sse_line_buffer_*`, `deepseek_stream_fixture_emits_claude_sse_across_chunk_boundaries` |
 | DeepSeek Account Claude protocol bridge | Covered | `proxy/deepseek.rs`, `forward_claude_deepseek`, `clients/deepseek/client.rs` mock upstream test |
 | Bedrock converse tool_use + inferenceConfig | Covered | `bedrock_converse_body_maps_tool_use_and_inference_config_from_anthropic` |
+
+## Claude cache usage hardening
+
+| Area | Status | Server evidence |
+| --- | --- | --- |
+| Anthropic cache-exclusive input -> normalized four buckets | Covered | `explicit_input_semantics_normalize_to_same_four_buckets`, `parses_claude_message_start_usage` |
+| OpenAI/Gemini cache-inclusive input -> normalized four buckets | Covered | `parses_cache_usage_shapes`, `parses_openai_stream_usage_line`, `parses_gemini_stream_usage_metadata` |
+| Responses -> Anthropic cache creation, stream and non-stream | Covered | `responses_anthropic_usage_round_trip_preserves_cache_creation`, `stream_snapshots_convert_between_sse_formats` |
+| Anthropic -> Responses/Chat inclusive input restoration | Covered | `responses_anthropic_usage_round_trip_preserves_cache_creation`, `response_snapshots_convert_anthropic_to_openai_responses_and_chat` |
+
+## Codex v2 protocol hardening
+
+| Area | Status | Server evidence |
+| --- | --- | --- |
+| Responses Lite `additional_tools` and custom history | Covered | `responses_lite_additional_custom_tools_and_history_convert_to_chat` |
+| Custom tool non-stream and stream response restoration | Covered | `chat_custom_tool_response_is_restored_to_responses_item`, `custom_tool_stream_bridge_restores_freeform_events_and_completed_output` |
+| Built-in `tool_search` downgrade and collision rejection | Covered | `responses_tool_search_name_collision_is_rejected` |
+| Responses wire required zero fields | Covered | `custom_tool_events_keep_required_zero_index`, `deltas_keep_required_zero_fields` |
+| Invalid continuation message IDs | Covered | `normalize_codex_oauth_gates_reasoning_and_strips_invalid_message_ids` |
 
 ## Remaining X7 Work
 

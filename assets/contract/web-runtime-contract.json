@@ -194,6 +194,14 @@
       "notes": "Server web runtime shim for desktop-synced UI."
     },
     {
+      "name": "auth_cancel_login",
+      "support": "shim",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/codex/device/cancel",
+      "notes": "Cancels a pending server-native Codex device authorization session."
+    },
+    {
       "name": "auth_get_status",
       "support": "shim",
       "implemented": true,
@@ -238,6 +246,13 @@
       "implemented": true,
       "feature": "accounts",
       "notes": "Reorders provider accounts so the selected account is treated as default."
+    },
+    {
+      "name": "auth_set_workspace",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Selects a Codex ChatGPT Account-ID only from organizations verified in the account token claims."
     },
     {
       "name": "auth_start_login",

@@ -1,4 +1,6 @@
-use crate::domain::usage::store::{usage_from_json, TokenUsage};
+use crate::domain::usage::store::{
+    usage_from_json_with_semantics, InputTokenSemantics, TokenUsage,
+};
 
 #[derive(Debug, Default)]
 pub struct SseLineBuffer {
@@ -33,10 +35,17 @@ impl SseLineBuffer {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StreamUsageAccumulator {
     buffer: String,
     usage: TokenUsage,
+    input_semantics: InputTokenSemantics,
+}
+
+impl Default for StreamUsageAccumulator {
+    fn default() -> Self {
+        Self::new(InputTokenSemantics::Auto)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -44,6 +53,7 @@ pub struct ClaudeSseErrorDetector {
     lines: SseLineBuffer,
     current_event: Option<String>,
     current_data: Vec<String>,
+    non_error_event_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +72,10 @@ impl ClaudeSseErrorDetector {
         None
     }
 
+    pub fn prelude_ready(&self) -> bool {
+        self.non_error_event_ready
+    }
+
     fn push_line(&mut self, line: &str) -> Option<ClaudeSseError> {
         if let Some(event) = line.strip_prefix("event:").map(str::trim) {
             self.flush_event();
@@ -70,6 +84,9 @@ impl ClaudeSseErrorDetector {
         }
         if let Some(data) = line.strip_prefix("data:").map(str::trim) {
             self.current_data.push(data.to_string());
+            if self.current_event.as_deref() != Some("error") {
+                self.non_error_event_ready = true;
+            }
             return self.flush_if_error_event();
         }
         None
@@ -105,6 +122,14 @@ impl ClaudeSseErrorDetector {
 }
 
 impl StreamUsageAccumulator {
+    pub fn new(input_semantics: InputTokenSemantics) -> Self {
+        Self {
+            buffer: String::new(),
+            usage: TokenUsage::default(),
+            input_semantics,
+        }
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> TokenUsage {
         let text = String::from_utf8_lossy(chunk);
         self.buffer.push_str(&text);
@@ -138,7 +163,10 @@ impl StreamUsageAccumulator {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
             return;
         };
-        merge_usage(&mut self.usage, usage_from_json(&value));
+        merge_usage(
+            &mut self.usage,
+            usage_from_json_with_semantics(&value, self.input_semantics),
+        );
     }
 }
 
@@ -174,8 +202,18 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
         && !next_has_input
         && (target.input_tokens.is_some() || target.output_tokens.is_some())
     {
-        target.total_tokens =
-            Some(target.input_tokens.unwrap_or(0) + target.output_tokens.unwrap_or(0));
+        target.total_tokens = Some(
+            target
+                .raw_input_tokens
+                .unwrap_or_else(|| {
+                    target
+                        .input_tokens
+                        .unwrap_or(0)
+                        .saturating_add(target.cache_read_tokens.unwrap_or(0))
+                        .saturating_add(target.cache_creation_tokens.unwrap_or(0))
+                })
+                .saturating_add(target.output_tokens.unwrap_or(0)),
+        );
     }
 }
 
@@ -262,6 +300,17 @@ data: {"type":"message_delta","delta":{"text":"hi"}}
     }
 
     #[test]
+    fn claude_sse_prelude_waits_for_complete_data_line_across_chunks() {
+        let mut detector = ClaudeSseErrorDetector::default();
+        assert!(detector
+            .push(b"event: message_start\ndata: {\"type\":\"mess")
+            .is_none());
+        assert!(!detector.prelude_ready());
+        assert!(detector.push(b"age_start\"}\n\n").is_none());
+        assert!(detector.prelude_ready());
+    }
+
+    #[test]
     fn parses_openai_stream_usage_line() {
         let mut parser = StreamUsageAccumulator::default();
         parser.push(
@@ -288,9 +337,10 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         let usage = parser.finish();
 
         assert_eq!(usage.input_tokens, Some(11));
-        assert_eq!(usage.raw_input_tokens, Some(11));
-        assert_eq!(usage.billed_input_tokens, Some(6));
+        assert_eq!(usage.raw_input_tokens, Some(16));
+        assert_eq!(usage.billed_input_tokens, Some(11));
         assert_eq!(usage.cache_read_tokens, Some(5));
+        assert_eq!(usage.total_tokens, Some(16));
     }
 
     #[test]
@@ -302,7 +352,7 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         );
         let usage = parser.finish();
 
-        assert_eq!(usage.input_tokens, Some(21));
+        assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.billed_input_tokens, Some(12));
         assert_eq!(usage.output_tokens, Some(6));
         assert_eq!(usage.cache_read_tokens, Some(9));
@@ -332,7 +382,7 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         );
         let usage = parser.finish();
 
-        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.input_tokens, Some(8));
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.cache_read_tokens, Some(3));
         assert_eq!(usage.total_tokens, Some(16));
@@ -354,8 +404,9 @@ data: {"type":"message_delta","usage":{"input_tokens":140,"output_tokens":8,"cac
         assert_eq!(usage.output_tokens, Some(8));
         assert_eq!(usage.cache_read_tokens, Some(90));
         assert_eq!(usage.cache_creation_tokens, Some(4));
-        assert_eq!(usage.billed_input_tokens, Some(50));
-        assert_eq!(usage.total_tokens, Some(148));
+        assert_eq!(usage.billed_input_tokens, Some(140));
+        assert_eq!(usage.raw_input_tokens, Some(234));
+        assert_eq!(usage.total_tokens, Some(242));
     }
 
     #[test]
@@ -406,7 +457,7 @@ data: {"type":"message_delta","usage":{"output_tokens":8}}
                         $cache
                     )
                     .as_bytes(),
-                    Some($input),
+                    Some(($input as u64).saturating_sub($cache as u64)),
                     Some($output),
                     Some($cache),
                     None,
@@ -433,7 +484,7 @@ data: {"type":"message_delta","usage":{"output_tokens":8}}
                     Some($output),
                     Some($cache),
                     Some($write),
-                    Some($input + $output),
+                    Some($input + $cache + $write + $output),
                 );
             }
         };
@@ -452,7 +503,7 @@ data: {"type":"message_delta","usage":{"output_tokens":8}}
                         $cache
                     )
                     .as_bytes(),
-                    Some($input),
+                    Some(($input as u64).saturating_sub($cache as u64)),
                     Some($output),
                     Some($cache),
                     None,
@@ -475,7 +526,7 @@ data: {"type":"message_delta","usage":{"output_tokens":8}}
                         $input + $output
                     )
                     .as_bytes(),
-                    Some($input),
+                    Some(($input as u64).saturating_sub($cache as u64)),
                     Some($output),
                     Some($cache),
                     None,

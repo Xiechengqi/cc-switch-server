@@ -23,6 +23,10 @@ pub(in crate::api) struct OpenAiModel {
     pub(in crate::api) id: String,
     pub(in crate::api) object: &'static str,
     pub(in crate::api) owned_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) reasoning_efforts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) input_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

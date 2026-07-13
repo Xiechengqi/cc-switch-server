@@ -12,6 +12,7 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::oauth::{oauth_provider_spec, OAuthErrorKind};
 use crate::domain::providers::model::ProviderType;
@@ -177,6 +178,29 @@ pub struct AccountRefreshUpdate {
     pub last_refresh_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexWorkspace {
+    pub id: String,
+    pub name: String,
+}
+
+const VERIFIED_OPENAI_CLAIMS_KEY: &str = "verifiedOpenAiClaims";
+
+pub fn set_verified_openai_claims(profile: &mut Option<Value>, claims: Option<Value>) {
+    if !profile.as_ref().is_some_and(Value::is_object) {
+        *profile = Some(Value::Object(Map::new()));
+    }
+    let object = profile
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("Codex profile was normalized to an object");
+    object.remove(VERIFIED_OPENAI_CLAIMS_KEY);
+    if let Some(claims) = claims {
+        object.insert(VERIFIED_OPENAI_CLAIMS_KEY.to_string(), claims);
+    }
+}
+
 impl AccountStore {
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
         let path = accounts_path(config_dir);
@@ -209,7 +233,7 @@ impl AccountStore {
     }
 
     pub fn upsert(&mut self, input: UpsertAccountInput) -> Account {
-        let account = Account {
+        let mut account = Account {
             id: input.id.unwrap_or_else(generate_account_id),
             provider_type: input.provider_type,
             email: input.email,
@@ -235,6 +259,11 @@ impl AccountStore {
         };
 
         if let Some(existing) = self.accounts.iter_mut().find(|item| item.id == account.id) {
+            if account.provider_type == ProviderType::CodexOAuth {
+                if let Some(profile) = account.profile.as_mut() {
+                    preserve_codex_profile_selection(existing.profile.as_ref(), profile);
+                }
+            }
             *existing = account.clone();
         } else {
             self.accounts.push(account.clone());
@@ -255,6 +284,63 @@ impl AccountStore {
         self.accounts
             .iter()
             .find(|item| item.provider_type == provider_type)
+    }
+
+    pub fn refresh_token_owner(
+        &self,
+        provider_type: ProviderType,
+        refresh_token: &str,
+        except_account_id: Option<&str>,
+    ) -> Option<&Account> {
+        let fingerprint = refresh_token_fingerprint(refresh_token)?;
+        self.accounts.iter().find(|account| {
+            account.provider_type == provider_type
+                && except_account_id != Some(account.id.as_str())
+                && account
+                    .refresh_token
+                    .as_deref()
+                    .and_then(refresh_token_fingerprint)
+                    .is_some_and(|candidate| candidate == fingerprint)
+        })
+    }
+
+    pub fn select_codex_workspace(
+        &mut self,
+        account_id: &str,
+        workspace_id: &str,
+    ) -> Result<Account, String> {
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|account| {
+                account.id == account_id && account.provider_type == ProviderType::CodexOAuth
+            })
+            .ok_or_else(|| "codex account not found".to_string())?;
+        let workspace_id = workspace_id.trim();
+        let options = codex_workspace_options(account);
+        let selected = options
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| {
+                "workspace is not present in the verified OpenAI account claims".to_string()
+            })?;
+        let mut profile = account
+            .profile
+            .take()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        if let Some(object) = profile.as_object_mut() {
+            object.insert(
+                "selectedChatgptAccountId".to_string(),
+                Value::String(selected.id.clone()),
+            );
+            object.insert(
+                "selectedWorkspace".to_string(),
+                serde_json::to_value(selected).unwrap_or(Value::Null),
+            );
+        }
+        account.profile = Some(profile);
+        Ok(account.clone())
     }
 
     pub fn delete(&mut self, account_id: &str) -> bool {
@@ -314,7 +400,10 @@ impl AccountStore {
         if let Some(value) = update.scopes {
             account.scopes = value;
         }
-        if let Some(value) = update.profile {
+        if let Some(mut value) = update.profile {
+            if account.provider_type == ProviderType::CodexOAuth {
+                preserve_codex_profile_state(account.profile.as_ref(), &mut value);
+            }
             account.profile = Some(value);
         }
         if let Some(value) = update.raw {
@@ -463,12 +552,161 @@ impl AccountStore {
         if kind == OAuthErrorKind::InvalidGrant {
             account.refresh_consecutive_failures =
                 account.refresh_consecutive_failures.saturating_add(1);
-            if account.refresh_consecutive_failures >= threshold.max(1) {
+            if invalid_grant_requires_immediate_relogin(
+                account.last_refresh_error.as_deref().unwrap_or_default(),
+            ) || account.refresh_consecutive_failures >= threshold.max(1)
+            {
                 account.needs_relogin = true;
             }
         }
         Some(account.clone())
     }
+}
+
+pub fn selected_codex_workspace_id(account: &Account) -> Option<String> {
+    let selected = account
+        .profile
+        .as_ref()
+        .and_then(|value| value.get("selectedChatgptAccountId"))
+        .or_else(|| {
+            account
+                .raw
+                .as_ref()
+                .and_then(|value| value.get("selectedChatgptAccountId"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)?;
+    codex_workspace_options(account)
+        .iter()
+        .any(|workspace| workspace.id == selected)
+        .then_some(selected)
+}
+
+pub fn codex_workspace_options(account: &Account) -> Vec<CodexWorkspace> {
+    let mut workspaces = std::collections::BTreeMap::<String, String>::new();
+    if let Some(value) = account
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.get(VERIFIED_OPENAI_CLAIMS_KEY))
+    {
+        if let Some(id) = codex_account_id_from_value(value) {
+            workspaces.entry(id.clone()).or_insert(id);
+        }
+        for pointer in [
+            "/organizations",
+            "/openai_auth/organizations",
+            "/openaiAuth/organizations",
+            "/token/organizations",
+            "/token/openai_auth/organizations",
+        ] {
+            if let Some(items) = value.pointer(pointer).and_then(Value::as_array) {
+                for item in items {
+                    let Some(id) = [
+                        "id",
+                        "account_id",
+                        "accountId",
+                        "organization_id",
+                        "organizationId",
+                    ]
+                    .into_iter()
+                    .find_map(|key| item.get(key).and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty()) else {
+                        continue;
+                    };
+                    let name = ["name", "title", "display_name", "displayName"]
+                        .into_iter()
+                        .find_map(|key| item.get(key).and_then(Value::as_str))
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(id);
+                    workspaces
+                        .entry(id.to_string())
+                        .or_insert_with(|| name.to_string());
+                }
+            }
+        }
+    }
+    workspaces
+        .into_iter()
+        .map(|(id, name)| CodexWorkspace { id, name })
+        .collect()
+}
+
+fn preserve_codex_profile_state(existing: Option<&Value>, incoming: &mut Value) {
+    let (Some(existing), Some(incoming)) = (
+        existing.and_then(Value::as_object),
+        incoming.as_object_mut(),
+    ) else {
+        return;
+    };
+    for key in [
+        VERIFIED_OPENAI_CLAIMS_KEY,
+        "selectedChatgptAccountId",
+        "selectedWorkspace",
+    ] {
+        if !incoming.contains_key(key) {
+            if let Some(value) = existing.get(key) {
+                incoming.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+}
+
+fn preserve_codex_profile_selection(existing: Option<&Value>, incoming: &mut Value) {
+    let (Some(existing), Some(incoming)) = (
+        existing.and_then(Value::as_object),
+        incoming.as_object_mut(),
+    ) else {
+        return;
+    };
+    for key in ["selectedChatgptAccountId", "selectedWorkspace"] {
+        if !incoming.contains_key(key) {
+            if let Some(value) = existing.get(key) {
+                incoming.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+}
+
+fn codex_account_id_from_value(value: &Value) -> Option<String> {
+    [
+        "/chatgpt_account_id",
+        "/chatgptAccountId",
+        "/openai_auth/chatgpt_account_id",
+        "/openaiAuth/chatgptAccountId",
+        "/accountId",
+        "/account_id",
+        "/token/chatgpt_account_id",
+        "/token/openai_auth/chatgpt_account_id",
+    ]
+    .into_iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string)
+}
+
+fn refresh_token_fingerprint(refresh_token: &str) -> Option<[u8; 32]> {
+    let refresh_token = refresh_token.trim();
+    if refresh_token.is_empty() {
+        return None;
+    }
+    Some(Sha256::digest(refresh_token.as_bytes()).into())
+}
+
+fn invalid_grant_requires_immediate_relogin(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "refresh_token_reused",
+        "refresh token reused",
+        "refresh token already used",
+        "refresh token has already been used",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 fn native_refresh_failure_threshold() -> u32 {
@@ -671,6 +909,31 @@ fn generate_account_id() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn fixture_input(provider_type: ProviderType) -> UpsertAccountInput {
+        UpsertAccountInput {
+            id: None,
+            provider_type,
+            email: None,
+            access_token: None,
+            refresh_token: None,
+            id_token: None,
+            token_type: None,
+            api_key: None,
+            scopes: Vec::new(),
+            profile: None,
+            raw: None,
+            subscription_level: None,
+            entitlement_status: None,
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at: None,
+            rate_limited_until: None,
+            last_refresh_error: None,
+        }
+    }
 
     #[test]
     fn upserts_and_finds_account_by_provider_type() {
@@ -876,6 +1139,114 @@ mod tests {
     }
 
     #[test]
+    fn codex_workspace_selection_only_accepts_verified_claim_options() {
+        let mut store = AccountStore::default();
+        store.upsert(UpsertAccountInput {
+            id: Some("acct-1".to_string()),
+            provider_type: ProviderType::CodexOAuth,
+            email: Some("owner@example.com".to_string()),
+            access_token: Some("access".to_string()),
+            refresh_token: Some("refresh".to_string()),
+            id_token: None,
+            token_type: Some("Bearer".to_string()),
+            api_key: None,
+            scopes: Vec::new(),
+            profile: Some(json!({
+                "chatgpt_account_id": "account-default",
+                "verifiedOpenAiClaims": {
+                    "chatgpt_account_id": "account-default",
+                    "organizations": [
+                        {"id": "account-team", "name": "Team"},
+                        {"id": "account-enterprise", "name": "Enterprise"}
+                    ]
+                },
+                "organizations": [
+                    {"id": "account-team", "name": "Team"},
+                    {"id": "account-enterprise", "name": "Enterprise"}
+                ]
+            })),
+            raw: None,
+            subscription_level: None,
+            entitlement_status: None,
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at: None,
+            rate_limited_until: None,
+            last_refresh_error: None,
+        });
+
+        let account = store
+            .select_codex_workspace("acct-1", "account-team")
+            .unwrap();
+        assert_eq!(
+            selected_codex_workspace_id(&account).as_deref(),
+            Some("account-team")
+        );
+        assert_eq!(codex_workspace_options(&account).len(), 3);
+        assert!(store
+            .select_codex_workspace("acct-1", "attacker-account")
+            .is_err());
+    }
+
+    #[test]
+    fn codex_workspace_selection_ignores_unverified_profile_fields() {
+        let mut store = AccountStore::default();
+        let account = store.upsert(UpsertAccountInput {
+            id: Some("acct-unverified".to_string()),
+            provider_type: ProviderType::CodexOAuth,
+            profile: Some(json!({
+                "chatgpt_account_id": "attacker-account",
+                "organizations": [{"id": "attacker-team"}]
+            })),
+            ..fixture_input(ProviderType::CodexOAuth)
+        });
+        assert!(codex_workspace_options(&account).is_empty());
+        assert!(store
+            .select_codex_workspace("acct-unverified", "attacker-team")
+            .is_err());
+    }
+
+    #[test]
+    fn codex_refresh_preserves_verified_workspace_state_without_new_id_token() {
+        let mut store = AccountStore::default();
+        let mut profile = Some(json!({"chatgpt_account_id": "account-default"}));
+        set_verified_openai_claims(
+            &mut profile,
+            Some(json!({
+                "chatgpt_account_id": "account-default",
+                "organizations": [{"id": "account-team"}]
+            })),
+        );
+        store.upsert(UpsertAccountInput {
+            id: Some("acct-refresh".to_string()),
+            provider_type: ProviderType::CodexOAuth,
+            profile,
+            ..fixture_input(ProviderType::CodexOAuth)
+        });
+        store
+            .select_codex_workspace("acct-refresh", "account-team")
+            .unwrap();
+
+        let refreshed = store
+            .mark_native_refresh_success(
+                "acct-refresh",
+                AccountRefreshUpdate {
+                    access_token: Some("new-access".to_string()),
+                    profile: Some(json!({"chatgpt_account_id": "account-default"})),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            selected_codex_workspace_id(&refreshed).as_deref(),
+            Some("account-team")
+        );
+        assert_eq!(codex_workspace_options(&refreshed).len(), 2);
+    }
+
+    #[test]
     fn native_refresh_invalid_grants_require_relogin_after_threshold() {
         let mut store = AccountStore::default();
         store.upsert(UpsertAccountInput {
@@ -932,6 +1303,16 @@ mod tests {
             .unwrap();
         assert_eq!(second.refresh_consecutive_failures, 2);
         assert!(second.needs_relogin);
+
+        let replay_rejected = store
+            .mark_native_refresh_failure_with_threshold(
+                "acct-1",
+                "invalid_grant: refresh_token_reused".to_string(),
+                OAuthErrorKind::InvalidGrant,
+                20,
+            )
+            .unwrap();
+        assert!(replay_rejected.needs_relogin);
 
         let recovered = store
             .mark_native_refresh_success(

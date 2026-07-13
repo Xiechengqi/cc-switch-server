@@ -17,9 +17,10 @@ pub(in crate::api) async fn list_accounts(
 pub(in crate::api) async fn upsert_account(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<UpsertAccountInput>,
+    Json(mut input): Json<UpsertAccountInput>,
 ) -> Result<Json<UpsertAccountResponse>, ApiError> {
     require_session(&state, &headers).await?;
+    verify_and_mark_codex_account_input(&state, &mut input).await?;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             let manager = manager_for(input.provider_type);
@@ -257,6 +258,25 @@ pub(in crate::api) async fn start_account_login(
     Ok(Json(StartAccountLoginResponse { ok: true, login }))
 }
 
+pub(in crate::api) async fn cancel_account_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CancelAccountLoginRequest>,
+) -> Result<Json<CancelAccountLoginResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let login = state
+        .mutate_oauth_logins(|store| {
+            store.cancel(
+                input.session_id.as_deref(),
+                input.state.as_deref(),
+                now_ms() as i64,
+            )
+        })
+        .await
+        .map_err(oauth_login_api_error)?;
+    Ok(Json(CancelAccountLoginResponse { ok: true, login }))
+}
+
 pub(in crate::api) async fn account_login_callback(
     State(state): State<ServerState>,
     Query(query): Query<AccountLoginCallbackQuery>,
@@ -351,6 +371,17 @@ async fn cli_oauth_callback(
                 finish.provider_type.as_str(),
                 expected_provider_type.as_str()
             ),
+        )));
+    }
+    if finish.status == OAuthLoginStatus::TokenExchanged {
+        let account = finish
+            .account_id
+            .as_deref()
+            .unwrap_or("the existing account");
+        return Ok(Html(oauth_callback_html(
+            label,
+            true,
+            &format!("{label} OAuth login was already completed for {account}"),
         )));
     }
     let account = execute_account_login_token_exchange(&state, &mut finish).await?;
@@ -728,7 +759,19 @@ pub(in crate::api) async fn finish_account_login(
         .await
         .map_err(oauth_login_api_error)?;
     let account = if input.execute_token_exchange.unwrap_or(false) {
-        Some(execute_account_login_token_exchange(&state, &mut finish).await?)
+        if finish.status == OAuthLoginStatus::TokenExchanged {
+            let account_id = finish
+                .account_id
+                .as_deref()
+                .ok_or_else(|| ApiError::conflict("completed oauth login has no account id"))?;
+            let account = state
+                .find_account_by_id(account_id)
+                .await
+                .ok_or_else(|| ApiError::not_found("completed oauth account not found"))?;
+            Some(AccountLoginAccountSummary::from_account(&account))
+        } else {
+            Some(execute_account_login_token_exchange(&state, &mut finish).await?)
+        }
     } else {
         None
     };
@@ -960,29 +1003,62 @@ pub(in crate::api) async fn poll_codex_device_login(
 ) -> Result<Json<PollCodexDeviceLoginResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let now = now_ms() as i64;
-    let flow = state
-        .get_codex_device_flow(&input.device_code, now)
+    let lease = state
+        .begin_codex_device_poll(&input.device_code, now)
         .await
         .ok_or_else(|| ApiError::unauthorized("codex device flow is expired or unknown"))?;
-    let http_client = state.http_client().await;
-    let result = match crate::clients::oauth::codex_device::poll_device_flow(
-        &http_client,
-        &input.device_code,
-        &flow,
-        now,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            if matches!(
-                error.status,
-                StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
-            ) {
-                state.remove_codex_device_flow(&input.device_code).await;
+    let result = match lease {
+        crate::clients::oauth::codex_device::CodexDevicePollLease::Ready(flow) => {
+            let http_client = state.http_client().await;
+            match crate::clients::oauth::codex_device::poll_device_flow(
+                &http_client,
+                &input.device_code,
+                &flow,
+                now,
+            )
+            .await
+            {
+                Ok(mut result) => {
+                    if let Some(account_input) = result.account_input.as_mut() {
+                        if let Err(error) =
+                            verify_and_mark_codex_account_input(&state, account_input).await
+                        {
+                            state.fail_codex_device_poll(&input.device_code, true).await;
+                            return Err(error);
+                        }
+                    }
+                    if !state
+                        .finish_codex_device_poll(&input.device_code, result.clone())
+                        .await
+                    {
+                        return Err(ApiError::unauthorized(
+                            "codex device flow was cancelled while polling",
+                        ));
+                    }
+                    result
+                }
+                Err(error) => {
+                    let terminal = matches!(
+                        error.status,
+                        StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
+                    );
+                    state
+                        .fail_codex_device_poll(&input.device_code, terminal)
+                        .await;
+                    return Err(map_codex_device_error(error));
+                }
             }
-            return Err(map_codex_device_error(error));
         }
+        crate::clients::oauth::codex_device::CodexDevicePollLease::InProgress => {
+            return Ok(Json(PollCodexDeviceLoginResponse {
+                ok: true,
+                pending: true,
+                message: "poll_in_progress".to_string(),
+                retry_after_secs: Some(1),
+                account: None,
+            }));
+        }
+        crate::clients::oauth::codex_device::CodexDevicePollLease::Completed(result) => *result,
     };
     if result.pending {
         return Ok(Json(PollCodexDeviceLoginResponse {
@@ -993,9 +1069,9 @@ pub(in crate::api) async fn poll_codex_device_login(
             account: None,
         }));
     }
-    state.remove_codex_device_flow(&input.device_code).await;
     let account_input = result
         .account_input
+        .clone()
         .ok_or_else(|| ApiError::bad_gateway("codex device flow completed without account"))?;
     let provider_type = account_input.provider_type;
     let account = state
@@ -1012,6 +1088,19 @@ pub(in crate::api) async fn poll_codex_device_login(
         message: result.message,
         retry_after_secs: None,
         account: Some(AccountLoginAccountSummary::from_account(&account)),
+    }))
+}
+
+pub(in crate::api) async fn cancel_codex_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CancelCodexDeviceLoginRequest>,
+) -> Result<Json<CancelCodexDeviceLoginResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let cancelled = state.cancel_codex_device_flow(&input.device_code).await;
+    Ok(Json(CancelCodexDeviceLoginResponse {
+        ok: true,
+        cancelled,
     }))
 }
 
@@ -1038,6 +1127,23 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
             return Err(account_refresh_api_error(error));
         }
     };
+    let verified_openai_claims = if finish.provider_type == ProviderType::CodexOAuth {
+        if let Some(id_token) = token_response.id_token.as_deref() {
+            match crate::clients::oauth::openai_jwks::verify_openai_id_token(&http_client, id_token)
+                .await
+            {
+                Ok(claims) => Some(claims),
+                Err(error) => {
+                    mark_account_login_exchange_failed(state, &finish.session_id).await;
+                    return Err(ApiError::bad_request(error));
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let profile_raw = match execute_account_login_profile_request(
         state,
         finish.provider_type,
@@ -1053,7 +1159,7 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
         }
     };
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-    let input = match upsert_input_from_login_response(
+    let mut input = match upsert_input_from_login_response(
         finish.provider_type,
         &token_response,
         raw,
@@ -1067,6 +1173,12 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
             return Err(ApiError::bad_request(error.message));
         }
     };
+    if finish.provider_type == ProviderType::CodexOAuth {
+        crate::domain::accounts::store::set_verified_openai_claims(
+            &mut input.profile,
+            verified_openai_claims,
+        );
+    }
 
     let account_result = match state
         .try_mutate_accounts_immediate(|store| {
@@ -1088,11 +1200,12 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
         }
     };
     state
-        .mutate_oauth_logins(|store| store.mark_exchanged(&finish.session_id))
+        .mutate_oauth_logins(|store| store.mark_exchanged(&finish.session_id, &account.id))
         .await
         .map_err(oauth_login_api_error)?;
 
     finish.status = OAuthLoginStatus::TokenExchanged;
+    finish.account_id = Some(account.id.clone());
     finish.method = "token_exchange_completed";
     finish.token_request = None;
     finish.account_import_hint = None;
@@ -1104,12 +1217,51 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
     Ok(AccountLoginAccountSummary::from_account(&account))
 }
 
+async fn verify_and_mark_codex_account_input(
+    state: &ServerState,
+    input: &mut UpsertAccountInput,
+) -> Result<(), ApiError> {
+    if input.provider_type != ProviderType::CodexOAuth {
+        return Ok(());
+    }
+    let id_token = input
+        .id_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let claims = match id_token {
+        Some(id_token) => Some(
+            crate::clients::oauth::openai_jwks::verify_openai_id_token(
+                &state.http_client().await,
+                id_token,
+            )
+            .await
+            .map_err(ApiError::bad_request)?,
+        ),
+        None => None,
+    };
+    crate::domain::accounts::store::set_verified_openai_claims(&mut input.profile, claims);
+    Ok(())
+}
+
 pub(in crate::api) async fn execute_account_login_profile_request(
     state: &ServerState,
     provider_type: ProviderType,
     flow: OAuthAuthorizeFlow,
     access_token: &str,
 ) -> Result<Option<serde_json::Value>, AccountRefreshFailure> {
+    if provider_type == ProviderType::ClaudeOAuth {
+        let http_client = state.http_client().await;
+        return Ok(
+            crate::clients::oauth::quota::fetch_claude_bootstrap_profile(
+                &http_client,
+                access_token,
+                state.oauth_quota_refresh_timeout_ms().await,
+                now_ms() as i64,
+            )
+            .await,
+        );
+    }
     if flow == OAuthAuthorizeFlow::CursorDeepControl {
         return match execute_cursor_profile_request(state, access_token, None).await {
             Ok(profile) => Ok(profile),

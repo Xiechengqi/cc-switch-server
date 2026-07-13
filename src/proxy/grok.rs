@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use axum::http::{HeaderMap, StatusCode};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;

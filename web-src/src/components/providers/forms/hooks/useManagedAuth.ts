@@ -175,6 +175,23 @@ export function useManagedAuth(
     },
   });
 
+  const setWorkspaceMutation = useMutation({
+    mutationFn: (params: { accountId: string; workspaceId: string }) =>
+      authApi.authSetWorkspace(
+        authProvider,
+        params.accountId,
+        params.workspaceId,
+      ),
+    onSuccess: async () => {
+      await refetchStatus();
+      await queryClient.invalidateQueries({ queryKey });
+    },
+    onError: (e) => {
+      console.error("[ManagedAuth] Failed to set workspace:", e);
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
   const importCursorLocalMutation = useMutation({
     mutationFn: () => authApi.importCursorLocalAuth(),
     onSuccess: async () => {
@@ -226,11 +243,17 @@ export function useManagedAuth(
   }, [startLoginMutation, stopPolling]);
 
   const cancelAuth = useCallback(() => {
+    const activeDeviceCode = deviceCode?.device_code;
     stopPolling();
     setPollingState("idle");
     setDeviceCode(null);
     setError(null);
-  }, [stopPolling]);
+    if (activeDeviceCode) {
+      void authApi.authCancelLogin(authProvider, activeDeviceCode).catch((e) => {
+        console.warn("[ManagedAuth] Failed to cancel remote auth session:", e);
+      });
+    }
+  }, [authProvider, deviceCode?.device_code, stopPolling]);
 
   const logout = useCallback(() => {
     logoutMutation.mutate();
@@ -248,6 +271,13 @@ export function useManagedAuth(
       setDefaultAccountMutation.mutate(accountId);
     },
     [setDefaultAccountMutation],
+  );
+
+  const setWorkspace = useCallback(
+    (accountId: string, workspaceId: string) => {
+      setWorkspaceMutation.mutate({ accountId, workspaceId });
+    },
+    [setWorkspaceMutation],
   );
 
   const importCursorLocalAuth = useCallback(() => {
@@ -276,6 +306,7 @@ export function useManagedAuth(
     isImportingCursorLocalAuth: importCursorLocalMutation.isPending,
     isRemovingAccount: removeAccountMutation.isPending,
     isSettingDefaultAccount: setDefaultAccountMutation.isPending,
+    isSettingWorkspace: setWorkspaceMutation.isPending,
     startAuth: startDefaultAuth,
     addAccount: startDefaultAuth,
     addAccountWithMode: startAuth,
@@ -283,6 +314,7 @@ export function useManagedAuth(
     logout,
     removeAccount,
     setDefaultAccount,
+    setWorkspace,
     importCursorLocalAuth,
     refetchStatus,
   };

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use serde::Serialize;
+use serde_json::{Map, Value};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::domain::accounts::oauth::{
@@ -285,8 +286,43 @@ impl AccountManager for ManualTokenAccountManager {
     fn finish_login(
         &self,
         store: &mut AccountStore,
-        input: UpsertAccountInput,
+        mut input: UpsertAccountInput,
     ) -> Result<Account, AccountManagerError> {
+        if input.provider_type == ProviderType::CodexOAuth {
+            if let Some(refresh_token) = input
+                .refresh_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if let Some(owner) = store.refresh_token_owner(
+                    ProviderType::CodexOAuth,
+                    refresh_token,
+                    input.id.as_deref(),
+                ) {
+                    return Err(AccountManagerError::CredentialUnavailable(format!(
+                        "codex oauth refresh token is already managed by account {}; use the existing account or start a new device login",
+                        owner.id
+                    )));
+                }
+            }
+            let mut raw = input
+                .raw
+                .take()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| Value::Object(Map::new()));
+            if let Some(object) = raw.as_object_mut() {
+                object.insert(
+                    "tokenAuthority".to_string(),
+                    Value::String("cc-switch-server".to_string()),
+                );
+                object.insert(
+                    "refreshOwnership".to_string(),
+                    Value::String("exclusive".to_string()),
+                );
+            }
+            input.raw = Some(raw);
+        }
         Ok(store.upsert(input))
     }
 
@@ -636,6 +672,31 @@ fn refresh_lock_key(provider_type: ProviderType, account_id: &str) -> String {
 mod tests {
     use super::*;
 
+    fn codex_account_input(id: &str, refresh_token: &str) -> UpsertAccountInput {
+        UpsertAccountInput {
+            id: Some(id.to_string()),
+            provider_type: ProviderType::CodexOAuth,
+            email: None,
+            access_token: Some(format!("access-{id}")),
+            refresh_token: Some(refresh_token.to_string()),
+            id_token: None,
+            token_type: Some("Bearer".to_string()),
+            api_key: None,
+            scopes: Vec::new(),
+            profile: None,
+            raw: None,
+            subscription_level: None,
+            entitlement_status: None,
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at: None,
+            rate_limited_until: None,
+            last_refresh_error: None,
+        }
+    }
+
     #[test]
     fn account_capabilities_claim_refresh_without_browser_login() {
         let capability = capability_for(ProviderType::CodexOAuth);
@@ -817,6 +878,34 @@ mod tests {
         codex.release();
         assert!(!locks.is_locked(ProviderType::CodexOAuth, "acct-1"));
         assert!(locks.try_lock(ProviderType::CodexOAuth, "acct-1").is_some());
+    }
+
+    #[test]
+    fn codex_refresh_tokens_have_exclusive_server_authority() {
+        let manager = manager_for(ProviderType::CodexOAuth);
+        let mut store = AccountStore::default();
+        let first = manager
+            .finish_login(&mut store, codex_account_input("acct-1", "refresh-shared"))
+            .unwrap();
+        assert_eq!(
+            first.raw.as_ref().unwrap()["tokenAuthority"],
+            "cc-switch-server"
+        );
+        assert_eq!(first.raw.as_ref().unwrap()["refreshOwnership"], "exclusive");
+
+        let duplicate = manager
+            .finish_login(&mut store, codex_account_input("acct-2", "refresh-shared"))
+            .unwrap_err();
+        assert!(matches!(
+            duplicate,
+            AccountManagerError::CredentialUnavailable(_)
+        ));
+
+        let updated = manager
+            .finish_login(&mut store, codex_account_input("acct-1", "refresh-shared"))
+            .unwrap();
+        assert_eq!(updated.id, "acct-1");
+        assert_eq!(store.accounts.len(), 1);
     }
 
     #[test]

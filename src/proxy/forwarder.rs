@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -16,6 +16,7 @@ use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::CapacityError;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
@@ -32,7 +33,7 @@ use crate::state::{
 };
 
 use super::adapters::{self, ProviderAdapter};
-use super::claude_oauth::{ClaudeBodyRetryStage, CLAUDE_BODY_RETRY_STAGE_HEADER};
+use super::claude_oauth::ClaudeBodyRetryStage;
 use super::cursor;
 use super::deepseek;
 use super::kiro;
@@ -41,7 +42,7 @@ use super::request_governance::{
 };
 use super::router::{
     account_concurrency_for_provider, select_provider, select_provider_for_codex_image_generation,
-    select_provider_with_account_inflight, ProxyRoute,
+    select_provider_with_account_inflight_excluding, ProxyRoute,
 };
 use super::streaming::{ClaudeSseErrorDetector, StreamUsageAccumulator};
 use super::usage::{log_usage, update_stream_usage};
@@ -49,10 +50,48 @@ use super::{setting, ProxyError};
 
 const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const CODEX_IMAGES_DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
-const CLAUDE_SSE_RETRY_HEADER: &str = "x-cc-switch-claude-sse-retry";
-const CLAUDE_RETRY_STARTED_AT_HEADER: &str = "x-cc-switch-claude-retry-started-at-ms";
 const MAX_CLAUDE_RETRY_ATTEMPTS: u32 = 3;
 const MAX_CLAUDE_RETRY_ELAPSED_MS: u128 = 10_000;
+
+#[derive(Debug, Clone)]
+struct ForwardAttemptContext {
+    attempt: u32,
+    started_at_ms: u128,
+    body_retry_stage: Option<ClaudeBodyRetryStage>,
+    excluded_provider_ids: BTreeSet<String>,
+}
+
+impl Default for ForwardAttemptContext {
+    fn default() -> Self {
+        Self {
+            attempt: 0,
+            started_at_ms: current_time_ms(),
+            body_retry_stage: None,
+            excluded_provider_ids: BTreeSet::new(),
+        }
+    }
+}
+
+impl ForwardAttemptContext {
+    fn retry_allowed(&self) -> bool {
+        self.attempt < MAX_CLAUDE_RETRY_ATTEMPTS
+            && current_time_ms().saturating_sub(self.started_at_ms) < MAX_CLAUDE_RETRY_ELAPSED_MS
+    }
+
+    fn next(
+        &self,
+        failed_provider_id: Option<&str>,
+        body_retry_stage: Option<ClaudeBodyRetryStage>,
+    ) -> Self {
+        let mut next = self.clone();
+        next.attempt = next.attempt.saturating_add(1);
+        next.body_retry_stage = body_retry_stage;
+        if let Some(provider_id) = failed_provider_id {
+            next.excluded_provider_ids.insert(provider_id.to_string());
+        }
+        next
+    }
+}
 
 pub async fn forward(
     state: ServerState,
@@ -61,20 +100,34 @@ pub async fn forward(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
+    forward_with_attempt(
+        state,
+        route,
+        gemini_path,
+        headers,
+        body,
+        ForwardAttemptContext::default(),
+    )
+    .await
+}
+
+async fn forward_with_attempt(
+    state: ServerState,
+    route: ProxyRoute,
+    gemini_path: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+    attempt_context: ForwardAttemptContext,
+) -> Result<Response, ProxyError> {
     let raw_body_for_retry = body.clone();
     let body = decode_request_body_for_proxy(&headers, body)?;
     let app = route.app();
     let retry_gemini_path = gemini_path.clone();
-    let claude_retry_attempt = optional_header(&headers, CLAUDE_SSE_RETRY_HEADER)
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
-    let claude_retry_started_at_ms = optional_header(&headers, CLAUDE_RETRY_STARTED_AT_HEADER)
-        .and_then(|value| value.parse::<u128>().ok())
-        .unwrap_or_else(current_time_ms);
-    let claude_body_retry_stage = optional_header(&headers, CLAUDE_BODY_RETRY_STAGE_HEADER)
-        .and_then(|value| ClaudeBodyRetryStage::from_header_value(&value));
+    let claude_body_retry_stage = attempt_context.body_retry_stage;
     let mut request_context = request_context_from_headers(&headers);
     request_context.session_id = session_id_from_request(route, &headers, &body);
+    let provider_failover_allowed =
+        request_context.share_id.is_none() && !headers.contains_key("x-cc-provider-id");
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(&state, &share_id).await?;
         request_context.share_name = Some(share_name);
@@ -100,13 +153,14 @@ pub async fn forward(
                 .try_mutate_failover_best_effort_if_changed(
                     "failover selection state",
                     |failover| {
-                        select_provider_with_account_inflight(
+                        select_provider_with_account_inflight_excluding(
                             &providers,
                             &accounts_for_selection,
                             failover,
                             app,
                             &headers,
                             &snapshot,
+                            &attempt_context.excluded_provider_ids,
                         )
                         .map(|selected| {
                             let changed = selected.failover_state_changed;
@@ -257,6 +311,7 @@ pub async fn forward(
             &mut adapter_request.body,
             &headers,
             &claude_oauth_identity_seed(&stored),
+            claude_body_retry_stage,
         )?;
         if request_context.session_id.is_none() {
             request_context.session_id = contract.session_id.clone();
@@ -272,6 +327,9 @@ pub async fn forward(
             "authorization",
             format!("Bearer {}", auth.token),
         );
+    }
+    if stored.provider_type == ProviderType::CodexOAuth {
+        super::codex_identity::finalize_headers(&mut target_headers);
     }
 
     let http_client = forward_http_client(&state, &stored).await?;
@@ -299,6 +357,24 @@ pub async fn forward(
                 Ok(result) => result,
                 Err(_) => {
                     record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                    if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
+                        crate::metrics::record_claude_retry("transport", "send_timeout");
+                        let next_attempt = attempt_context.next(
+                            provider_failover_allowed.then_some(stored.provider.id.as_str()),
+                            claude_body_retry_stage,
+                        );
+                        drop(account_in_flight_guard);
+                        drop(share_invocation_guard);
+                        return Box::pin(forward_with_attempt(
+                            state,
+                            route,
+                            retry_gemini_path,
+                            headers,
+                            raw_body_for_retry,
+                            next_attempt,
+                        ))
+                        .await;
+                    }
                     return Err(ProxyError {
                         status: StatusCode::GATEWAY_TIMEOUT,
                         message: format!(
@@ -317,6 +393,24 @@ pub async fn forward(
         Ok(upstream) => upstream,
         Err(error) => {
             record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
+                crate::metrics::record_claude_retry("transport", "send_error");
+                let next_attempt = attempt_context.next(
+                    provider_failover_allowed.then_some(stored.provider.id.as_str()),
+                    claude_body_retry_stage,
+                );
+                drop(account_in_flight_guard);
+                drop(share_invocation_guard);
+                return Box::pin(forward_with_attempt(
+                    state,
+                    route,
+                    retry_gemini_path,
+                    headers,
+                    raw_body_for_retry,
+                    next_attempt,
+                ))
+                .await;
+            }
             return Err(ProxyError::bad_gateway(error));
         }
     };
@@ -336,13 +430,36 @@ pub async fn forward(
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
             Err(error) => {
-                record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                record_provider_outcome(
+                    &state,
+                    &stored,
+                    provider_outcome_from_status_and_headers(status_code, &response_headers),
+                )
+                .await;
+                if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
+                    crate::metrics::record_claude_retry("transport", "rate_limit_body_read_error");
+                    let next_attempt = attempt_context.next(
+                        provider_failover_allowed.then_some(stored.provider.id.as_str()),
+                        claude_body_retry_stage,
+                    );
+                    drop(account_in_flight_guard);
+                    drop(share_invocation_guard);
+                    return Box::pin(forward_with_attempt(
+                        state,
+                        route,
+                        retry_gemini_path,
+                        headers,
+                        raw_body_for_retry,
+                        next_attempt,
+                    ))
+                    .await;
+                }
                 return Err(ProxyError::bad_gateway(error));
             }
         };
         let decoded = decode_response_body_for_proxy(&response_headers, bytes);
         maybe_mark_codex_rate_limited(&state, &stored, &decoded.body).await;
-        let usage = adapter.parse_usage(&decoded.body);
+        let usage = adapter.parse_usage(&decoded.body, &stored, route);
         let share_id_for_record = request_context.share_id.clone();
         log_usage(
             &state,
@@ -379,7 +496,7 @@ pub async fn forward(
                 response.headers_mut().insert(CONTENT_ENCODING, value);
             }
         }
-        copy_upstream_request_id(&response_headers, &mut response);
+        copy_safe_upstream_response_headers(&response_headers, &mut response);
         return Ok(response);
     }
 
@@ -390,21 +507,43 @@ pub async fn forward(
         let mut sse_error_detector = claude_sse_error_detector_for(&stored, route);
         let mut sse_error_outcome_recorded = false;
         if sse_error_detector.is_some() {
-            let first_chunk = match timeouts.first_byte {
-                Some(timeout) => match tokio::time::timeout(timeout, inner.try_next()).await {
-                    Ok(result) => result.map_err(StreamReadError::Upstream),
-                    Err(_) => Err(StreamReadError::Timeout {
-                        kind: StreamTimeoutKind::FirstByte,
-                        timeout,
-                    }),
-                },
-                None => inner.try_next().await.map_err(StreamReadError::Upstream),
+            let mut prelude = Vec::new();
+            let mut detected_error = None;
+            let first_chunk = loop {
+                let (timeout, kind) = if prelude.is_empty() {
+                    (timeouts.first_byte, StreamTimeoutKind::FirstByte)
+                } else {
+                    (timeouts.idle, StreamTimeoutKind::Idle)
+                };
+                let next = match timeout {
+                    Some(timeout) => match tokio::time::timeout(timeout, inner.try_next()).await {
+                        Ok(result) => result.map_err(StreamReadError::Upstream),
+                        Err(_) => Err(StreamReadError::Timeout { kind, timeout }),
+                    },
+                    None => inner.try_next().await.map_err(StreamReadError::Upstream),
+                };
+                match next {
+                    Ok(Some(chunk)) => {
+                        prelude.extend_from_slice(&chunk);
+                        detected_error = sse_error_detector
+                            .as_mut()
+                            .and_then(|detector| detector.push(&chunk));
+                        let ready = detected_error.is_some()
+                            || sse_error_detector
+                                .as_ref()
+                                .is_some_and(ClaudeSseErrorDetector::prelude_ready)
+                            || prelude.len() >= 64 * 1024;
+                        if ready {
+                            break Ok(Some(Bytes::from(prelude)));
+                        }
+                    }
+                    Ok(None) => break Ok((!prelude.is_empty()).then(|| Bytes::from(prelude))),
+                    Err(error) => break Err(error),
+                }
             };
             match first_chunk {
                 Ok(Some(chunk)) => {
-                    let sse_error = sse_error_detector
-                        .as_mut()
-                        .and_then(|detector| detector.push(&chunk));
+                    let sse_error = detected_error;
                     let sse_error_outcome = sse_error.as_ref().and_then(|error| {
                         claude_sse_error_outcome(
                             &error.error_type,
@@ -413,56 +552,50 @@ pub async fn forward(
                     });
                     if let Some(outcome) = sse_error_outcome {
                         record_provider_outcome(&state, &stored, outcome).await;
-                        if claude_retry_allowed(claude_retry_attempt, claude_retry_started_at_ms) {
+                        if attempt_context.retry_allowed() {
                             crate::metrics::record_claude_retry("transport", "sse_error");
-                            let retry_headers = claude_retry_headers(
-                                &headers,
-                                claude_retry_attempt + 1,
-                                claude_retry_started_at_ms,
+                            let next_attempt = attempt_context.next(
+                                provider_failover_allowed.then_some(stored.provider.id.as_str()),
                                 claude_body_retry_stage,
                             );
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
-                            return Box::pin(forward(
+                            return Box::pin(forward_with_attempt(
                                 state,
                                 route,
                                 retry_gemini_path,
-                                retry_headers,
+                                headers,
                                 raw_body_for_retry,
+                                next_attempt,
                             ))
                             .await;
                         }
                         sse_error_outcome_recorded = true;
-                    } else if let Some(error) = sse_error {
-                        if let Some(next_stage) = claude_body_retry_stage_for_error_message(
-                            error.message.as_deref().unwrap_or(&error.error_type),
-                            claude_body_retry_stage,
-                            &adapter_request.body,
-                        ) {
-                            if claude_retry_allowed(
-                                claude_retry_attempt,
-                                claude_retry_started_at_ms,
+                    } else if stored.provider_type == ProviderType::ClaudeOAuth {
+                        if let Some(error) = sse_error {
+                            if let Some(next_stage) = claude_body_retry_stage_for_error_message(
+                                error.message.as_deref().unwrap_or(&error.error_type),
+                                claude_body_retry_stage,
+                                &adapter_request.body,
                             ) {
-                                crate::metrics::record_claude_retry(
-                                    next_stage.as_header_value(),
-                                    "sse_error",
-                                );
-                                let retry_headers = claude_retry_headers(
-                                    &headers,
-                                    claude_retry_attempt + 1,
-                                    claude_retry_started_at_ms,
-                                    Some(next_stage),
-                                );
-                                drop(account_in_flight_guard);
-                                drop(share_invocation_guard);
-                                return Box::pin(forward(
-                                    state,
-                                    route,
-                                    retry_gemini_path,
-                                    retry_headers,
-                                    raw_body_for_retry,
-                                ))
-                                .await;
+                                if attempt_context.retry_allowed() {
+                                    crate::metrics::record_claude_retry(
+                                        next_stage.as_header_value(),
+                                        "sse_error",
+                                    );
+                                    let next_attempt = attempt_context.next(None, Some(next_stage));
+                                    drop(account_in_flight_guard);
+                                    drop(share_invocation_guard);
+                                    return Box::pin(forward_with_attempt(
+                                        state,
+                                        route,
+                                        retry_gemini_path,
+                                        headers,
+                                        raw_body_for_retry,
+                                        next_attempt,
+                                    ))
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -472,6 +605,24 @@ pub async fn forward(
                 Ok(None) => {}
                 Err(error) => {
                     record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                    if attempt_context.retry_allowed() {
+                        crate::metrics::record_claude_retry("transport", "first_event_read");
+                        let next_attempt = attempt_context.next(
+                            provider_failover_allowed.then_some(stored.provider.id.as_str()),
+                            claude_body_retry_stage,
+                        );
+                        drop(account_in_flight_guard);
+                        drop(share_invocation_guard);
+                        return Box::pin(forward_with_attempt(
+                            state,
+                            route,
+                            retry_gemini_path,
+                            headers,
+                            raw_body_for_retry,
+                            next_attempt,
+                        ))
+                        .await;
+                    }
                     return Err(ProxyError {
                         status: StatusCode::from_u16(error.status_code())
                             .unwrap_or(StatusCode::BAD_GATEWAY),
@@ -510,11 +661,13 @@ pub async fn forward(
             started,
             first_token_ms: None,
             received_any_chunk: false,
-            usage: StreamUsageAccumulator::default(),
+            usage: StreamUsageAccumulator::new(adapters::usage_input_semantics_for(&stored, route)),
             codex_completed_output_patcher: CodexCompletedOutputPatcher::new(&stored, route),
             codex_pending_function_call_patcher: CodexPendingFunctionCallPatcher::new(
                 &stored, route,
             ),
+            codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher::default(),
+            custom_tool_names: adapter_request.custom_tool_names.clone(),
             timeouts,
             upstream_open_until_ms: reset_header_open_until_ms(&response_headers),
             pending_chunk,
@@ -596,8 +749,16 @@ pub async fn forward(
                     }
                     let transformed = stream_state
                         .adapter
-                        .transform_stream_event(chunk, &stream_state.stored, stream_state.route)
+                        .transform_stream_event_for_request(
+                            chunk,
+                            &stream_state.stored,
+                            stream_state.route,
+                            &stream_state.custom_tool_names,
+                        )
                         .map_err(std::io::Error::other)?;
+                    let transformed = stream_state
+                        .codex_custom_tool_stream_patcher
+                        .push(transformed);
                     Ok(Some((transformed, stream_state)))
                 }
                 Ok(None) => {
@@ -632,9 +793,21 @@ pub async fn forward(
                         }
                         let transformed = stream_state
                             .adapter
-                            .transform_stream_event(chunk, &stream_state.stored, stream_state.route)
+                            .transform_stream_event_for_request(
+                                chunk,
+                                &stream_state.stored,
+                                stream_state.route,
+                                &stream_state.custom_tool_names,
+                            )
                             .map_err(std::io::Error::other)?;
+                        let transformed = stream_state
+                            .codex_custom_tool_stream_patcher
+                            .push(transformed);
                         return Ok(Some((transformed, stream_state)));
+                    }
+                    let custom_tail = stream_state.codex_custom_tool_stream_patcher.finish();
+                    if !custom_tail.is_empty() {
+                        return Ok(Some((custom_tail, stream_state)));
                     }
                     let usage = std::mem::take(&mut stream_state.usage).finish();
                     update_stream_usage(
@@ -719,7 +892,7 @@ pub async fn forward(
                 response.headers_mut().insert(CONTENT_TYPE, value);
             }
         }
-        copy_upstream_request_id(&response_headers, &mut response);
+        copy_safe_upstream_response_headers(&response_headers, &mut response);
         return Ok(response);
     }
 
@@ -727,34 +900,53 @@ pub async fn forward(
         Ok(bytes) => bytes,
         Err(error) => {
             record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
+                crate::metrics::record_claude_retry("transport", "body_read_error");
+                let next_attempt = attempt_context.next(
+                    provider_failover_allowed.then_some(stored.provider.id.as_str()),
+                    claude_body_retry_stage,
+                );
+                drop(account_in_flight_guard);
+                drop(share_invocation_guard);
+                return Box::pin(forward_with_attempt(
+                    state,
+                    route,
+                    retry_gemini_path,
+                    headers,
+                    raw_body_for_retry,
+                    next_attempt,
+                ))
+                .await;
+            }
             return Err(ProxyError::bad_gateway(error));
         }
     };
     let decoded = decode_response_body_for_proxy(&response_headers, bytes);
     let mut preserve_content_encoding = decoded.preserve_content_encoding;
     let mut bytes = decoded.body;
-    if let Some(next_stage) = claude_non_stream_retry_stage(
-        status,
-        &bytes,
-        claude_body_retry_stage,
-        &adapter_request.body,
-    ) {
-        if claude_retry_allowed(claude_retry_attempt, claude_retry_started_at_ms) {
+    let next_body_retry_stage = if stored.provider_type == ProviderType::ClaudeOAuth {
+        claude_non_stream_retry_stage(
+            status,
+            &bytes,
+            claude_body_retry_stage,
+            &adapter_request.body,
+        )
+    } else {
+        None
+    };
+    if let Some(next_stage) = next_body_retry_stage {
+        if attempt_context.retry_allowed() {
             crate::metrics::record_claude_retry(next_stage.as_header_value(), "http_error");
-            let retry_headers = claude_retry_headers(
-                &headers,
-                claude_retry_attempt + 1,
-                claude_retry_started_at_ms,
-                Some(next_stage),
-            );
+            let next_attempt = attempt_context.next(None, Some(next_stage));
             drop(account_in_flight_guard);
             drop(share_invocation_guard);
-            return Box::pin(forward(
+            return Box::pin(forward_with_attempt(
                 state,
                 route,
                 retry_gemini_path,
-                retry_headers,
+                headers,
                 raw_body_for_retry,
+                next_attempt,
             ))
             .await;
         }
@@ -765,8 +957,8 @@ pub async fn forward(
     if version_gate_rewritten {
         preserve_content_encoding = false;
     }
-    let usage = adapter.parse_usage(&bytes);
-    let bytes = adapter.transform_response(bytes, &stored, route)?;
+    let usage = adapter.parse_usage(&bytes, &stored, route);
+    let bytes = adapter.transform_response_for_request(bytes, &stored, route, &adapter_request)?;
     let share_id_for_record = request_context.share_id.clone();
     log_usage(
         &state,
@@ -801,7 +993,7 @@ pub async fn forward(
             response.headers_mut().insert(CONTENT_ENCODING, value);
         }
     }
-    copy_upstream_request_id(&response_headers, &mut response);
+    copy_safe_upstream_response_headers(&response_headers, &mut response);
     Ok(response)
 }
 
@@ -833,6 +1025,12 @@ pub async fn forward_codex_responses_ws(
             "responses websocket is only available for codex_oauth or grok_oauth providers",
         ));
     }
+    if !codex_websocket_enabled(&stored) {
+        return Err(ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Codex Responses WebSocket is disabled for this provider; use POST /v1/responses (SSE) until the incident rollback is cleared".to_string(),
+        });
+    }
     validate_codex_allowed_client(&stored, route, &headers)?;
     refresh_managed_account_if_needed(&state, app, &stored).await?;
     let accounts = state.accounts_snapshot().await;
@@ -842,6 +1040,9 @@ pub async fn forward_codex_responses_ws(
         (stored.provider_type == ProviderType::GrokOAuth).then(super::grok::new_session_id)
     });
     append_codex_oauth_session_headers(&mut target_headers, session_id.as_deref());
+    if stored.provider_type == ProviderType::CodexOAuth {
+        super::codex_identity::finalize_headers(&mut target_headers);
+    }
     if stored.provider_type == ProviderType::GrokOAuth {
         if let Some(session_id) = session_id.as_deref() {
             replace_or_push_header(
@@ -877,6 +1078,16 @@ pub async fn forward_codex_responses_ws(
         }
     });
     Ok(response)
+}
+
+fn codex_websocket_enabled(stored: &StoredProvider) -> bool {
+    stored.provider_type != ProviderType::CodexOAuth
+        || stored
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_websocket_enabled)
+            .unwrap_or(true)
 }
 
 pub async fn forward_grok_media(
@@ -1067,7 +1278,7 @@ async fn forward_grok_media_with_stored(
             response.headers_mut().insert(CONTENT_ENCODING, value);
         }
     }
-    copy_upstream_request_id(&response_headers, &mut response);
+    copy_safe_upstream_response_headers(&response_headers, &mut response);
     tracing::debug!(
         provider_id = stored.provider.id,
         status = status_code,
@@ -1091,6 +1302,7 @@ async fn forward_codex_images_generations(
     let mut target_headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
     let session_id = codex_oauth_session_id_from_request(&headers, &body);
     append_codex_oauth_session_headers(&mut target_headers, session_id.as_deref());
+    super::codex_identity::finalize_headers(&mut target_headers);
     let adapter_request = adapters::AdapterRequest {
         body: prepared.body.clone(),
         upstream_endpoint: None,
@@ -1101,6 +1313,7 @@ async fn forward_codex_images_generations(
         actual_model_source: Some("codex_image_generation_bridge".to_string()),
         pricing_model: Some(prepared.tool_model.clone()),
         stream_requested: true,
+        custom_tool_names: Default::default(),
     };
     let url = adapter.resolve_endpoint_for_request(
         ProxyRoute::CodexResponses,
@@ -1161,7 +1374,7 @@ async fn forward_codex_images_generations(
                 response.headers_mut().insert(CONTENT_ENCODING, value);
             }
         }
-        copy_upstream_request_id(&response_headers, &mut response);
+        copy_safe_upstream_response_headers(&response_headers, &mut response);
         return Ok(response);
     }
     let image_response = codex_images_response_from_responses_body(
@@ -1195,7 +1408,7 @@ async fn forward_codex_images_generations(
         CONTENT_TYPE,
         HeaderValue::from_static(image_response.content_type),
     );
-    copy_upstream_request_id(&response_headers, &mut response);
+    copy_safe_upstream_response_headers(&response_headers, &mut response);
     Ok(response)
 }
 
@@ -1570,8 +1783,9 @@ async fn bridge_responses_websocket(
     };
 
     let upstream_to_client = async {
+        let mut output_patcher = CodexWebsocketOutputPatcher::default();
         while let Some(message) = upstream_read.next().await {
-            let message = match message {
+            let mut message = match message {
                 Ok(message) => message,
                 Err(error) if websocket_message_too_big(&error) => {
                     let body = websocket_message_too_big_error_body();
@@ -1583,8 +1797,12 @@ async fn bridge_responses_websocket(
                         message: body,
                     });
                 }
+                Err(error) if websocket_expected_reset(&error) => return Ok(()),
                 Err(error) => return Err(ProxyError::bad_gateway(error.to_string())),
             };
+            if matches!(mode, ResponsesWebsocketMode::Codex) {
+                output_patcher.patch_message(&mut message);
+            }
             let Some(message) = tungstenite_message_to_axum_ws(message) else {
                 break;
             };
@@ -1599,6 +1817,92 @@ async fn bridge_responses_websocket(
     tokio::select! {
         result = client_to_upstream => result,
         result = upstream_to_client => result,
+    }
+}
+
+#[derive(Debug, Default)]
+struct CodexWebsocketOutputPatcher {
+    output_items_by_index: BTreeMap<i64, Value>,
+    output_items_fallback: Vec<Value>,
+}
+
+impl CodexWebsocketOutputPatcher {
+    fn patch_message(&mut self, message: &mut TungsteniteMessage) {
+        let text = match message {
+            TungsteniteMessage::Text(text) => Some(text.to_string()),
+            TungsteniteMessage::Binary(bytes) => {
+                std::str::from_utf8(bytes).ok().map(str::to_string)
+            }
+            _ => None,
+        };
+        let Some(text) = text else {
+            return;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_item.done") => self.collect(&value),
+            Some("response.completed") => {
+                let patched = self.patch_completed(&mut value);
+                self.clear();
+                if patched {
+                    let Ok(text) = serde_json::to_string(&value) else {
+                        return;
+                    };
+                    match message {
+                        TungsteniteMessage::Text(value) => *value = text,
+                        TungsteniteMessage::Binary(value) => *value = text.into_bytes(),
+                        _ => {}
+                    }
+                }
+            }
+            Some("response.failed") | Some("response.incomplete") => self.clear(),
+            _ => {}
+        }
+    }
+
+    fn collect(&mut self, value: &Value) {
+        let Some(item) = value.get("item").filter(|item| item.is_object()).cloned() else {
+            return;
+        };
+        if let Some(index) = value.get("output_index").and_then(Value::as_i64) {
+            self.output_items_by_index.insert(index, item);
+        } else {
+            self.output_items_fallback.push(item);
+        }
+    }
+
+    fn patch_completed(&self, value: &mut Value) -> bool {
+        if self.output_items_by_index.is_empty() && self.output_items_fallback.is_empty() {
+            return false;
+        }
+        if value
+            .pointer("/response/output")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        {
+            return false;
+        }
+        let Some(response) = value.get_mut("response").and_then(Value::as_object_mut) else {
+            return false;
+        };
+        response.insert(
+            "output".to_string(),
+            Value::Array(
+                self.output_items_by_index
+                    .values()
+                    .cloned()
+                    .chain(self.output_items_fallback.iter().cloned())
+                    .collect(),
+            ),
+        );
+        true
+    }
+
+    fn clear(&mut self) {
+        self.output_items_by_index.clear();
+        self.output_items_fallback.clear();
     }
 }
 
@@ -1661,6 +1965,17 @@ fn websocket_message_too_big(error: &TungsteniteError) -> bool {
         error,
         TungsteniteError::Capacity(CapacityError::MessageTooLong { .. })
     ) || error.to_string().contains("1009")
+}
+
+fn websocket_expected_reset(error: &TungsteniteError) -> bool {
+    match error {
+        TungsteniteError::ConnectionClosed
+        | TungsteniteError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        TungsteniteError::Io(error) => {
+            matches!(error.raw_os_error(), Some(54 | 104 | 995 | 10053 | 10054))
+        }
+        _ => false,
+    }
 }
 
 fn websocket_message_too_big_error_body() -> String {
@@ -2553,33 +2868,6 @@ fn parse_reset_timestamp_ms(value: &str) -> Option<u128> {
         .and_then(|timestamp| u128::try_from(timestamp.timestamp_millis()).ok())
 }
 
-fn claude_retry_allowed(attempt: u32, started_at_ms: u128) -> bool {
-    attempt < MAX_CLAUDE_RETRY_ATTEMPTS
-        && current_time_ms().saturating_sub(started_at_ms) < MAX_CLAUDE_RETRY_ELAPSED_MS
-}
-
-fn claude_retry_headers(
-    headers: &HeaderMap,
-    next_attempt: u32,
-    started_at_ms: u128,
-    body_stage: Option<ClaudeBodyRetryStage>,
-) -> HeaderMap {
-    let mut retry_headers = headers.clone();
-    if let Ok(value) = HeaderValue::from_str(&next_attempt.to_string()) {
-        retry_headers.insert(CLAUDE_SSE_RETRY_HEADER, value);
-    }
-    if let Ok(value) = HeaderValue::from_str(&started_at_ms.to_string()) {
-        retry_headers.insert(CLAUDE_RETRY_STARTED_AT_HEADER, value);
-    }
-    if let Some(stage) = body_stage {
-        retry_headers.insert(
-            CLAUDE_BODY_RETRY_STAGE_HEADER,
-            HeaderValue::from_static(stage.as_header_value()),
-        );
-    }
-    retry_headers
-}
-
 fn claude_non_stream_retry_stage(
     status: StatusCode,
     body: &[u8],
@@ -2722,8 +3010,12 @@ fn claude_sse_error_detector_for(
     stored: &StoredProvider,
     route: ProxyRoute,
 ) -> Option<ClaudeSseErrorDetector> {
-    (route == ProxyRoute::ClaudeMessages && stored.provider_type == ProviderType::ClaudeOAuth)
-        .then(ClaudeSseErrorDetector::default)
+    (route == ProxyRoute::ClaudeMessages
+        && matches!(
+            stored.provider_type,
+            ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth
+        ))
+    .then(ClaudeSseErrorDetector::default)
 }
 
 fn claude_sse_error_outcome(
@@ -3109,6 +3401,30 @@ fn normalize_codex_oauth_responses_body(mut body: Value, prompt_cache_key: Optio
     body["store"] = Value::Bool(false);
     body["stream"] = Value::Bool(true);
 
+    if let (Some(model), Some(effort)) = (
+        model.as_deref(),
+        body.pointer("/reasoning/effort").and_then(Value::as_str),
+    ) {
+        let normalized = super::codex_models::normalize_reasoning_effort(model, effort);
+        body["reasoning"]["effort"] = Value::String(normalized);
+    }
+
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("message") {
+                let invalid_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.starts_with("msg"));
+                if invalid_id {
+                    if let Some(object) = item.as_object_mut() {
+                        object.remove("id");
+                    }
+                }
+            }
+        }
+    }
+
     if body.get("prompt_cache_key").is_none() {
         if let Some(key) = prompt_cache_key
             .map(str::trim)
@@ -3185,6 +3501,8 @@ struct StreamForwardState {
     usage: StreamUsageAccumulator,
     codex_completed_output_patcher: CodexCompletedOutputPatcher,
     codex_pending_function_call_patcher: CodexPendingFunctionCallPatcher,
+    codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher,
+    custom_tool_names: BTreeSet<String>,
     timeouts: StreamTimeoutConfig,
     upstream_open_until_ms: Option<u128>,
     pending_chunk: Option<Bytes>,
@@ -3536,6 +3854,186 @@ impl CodexPendingFunctionCallPatcher {
     }
 }
 
+#[derive(Debug, Default)]
+struct CodexCustomToolStreamPatcher {
+    buffer: String,
+    calls: BTreeMap<i64, PendingCustomToolCall>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCustomToolCall {
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+impl CodexCustomToolStreamPatcher {
+    fn push(&mut self, chunk: Bytes) -> Bytes {
+        if chunk.is_empty() {
+            return chunk;
+        }
+        let Ok(text) = std::str::from_utf8(&chunk) else {
+            return chunk;
+        };
+        self.buffer.push_str(text);
+        let mut output = String::new();
+        while let Some((event_end, delimiter_len)) = next_sse_event_boundary(&self.buffer) {
+            let delimiter = self.buffer[event_end..event_end + delimiter_len].to_string();
+            let event = self.buffer[..event_end].to_string();
+            self.buffer.drain(..event_end + delimiter_len);
+            output.push_str(&self.patch_event_block(&event));
+            output.push_str(&delimiter);
+        }
+        Bytes::from(output)
+    }
+
+    fn finish(&mut self) -> Bytes {
+        if self.buffer.is_empty() {
+            return Bytes::new();
+        }
+        let event = std::mem::take(&mut self.buffer);
+        Bytes::from(self.patch_event_block(&event))
+    }
+
+    fn patch_event_block(&mut self, event: &str) -> String {
+        let Some(payload) = first_sse_data_payload(event) else {
+            return event.to_string();
+        };
+        if payload == "[DONE]" || !payload.starts_with('{') {
+            return event.to_string();
+        }
+        let Ok(mut value) = serde_json::from_str::<Value>(payload) else {
+            return event.to_string();
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_item.added") => {
+                let bridged = value
+                    .pointer("/item/cc_switch_custom_bridge")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !bridged {
+                    return event.to_string();
+                }
+                let index = value
+                    .get("output_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let Some(item) = value.get_mut("item").and_then(Value::as_object_mut) else {
+                    return event.to_string();
+                };
+                item.remove("cc_switch_custom_bridge");
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("call_0")
+                    .to_string();
+                self.calls.insert(
+                    index,
+                    PendingCustomToolCall {
+                        item_id: item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("ctc_call_0")
+                            .to_string(),
+                        call_id,
+                        name: item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: String::new(),
+                    },
+                );
+                serde_json::to_string(&value)
+                    .map(|payload| replace_first_sse_data_payload(event, &payload))
+                    .unwrap_or_else(|_| event.to_string())
+            }
+            Some("response.function_call_arguments.delta") => {
+                let index = value
+                    .get("output_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let Some(call) = self.calls.get_mut(&index) else {
+                    return event.to_string();
+                };
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    call.arguments.push_str(delta);
+                }
+                String::new()
+            }
+            Some("response.completed") => {
+                if self.calls.is_empty() {
+                    return event.to_string();
+                }
+                let mut output = String::new();
+                let mut completed_items = Vec::new();
+                for (index, call) in &self.calls {
+                    let input = custom_tool_input_from_arguments(&call.arguments);
+                    output.push_str(&encode_sse_json_event(
+                        "response.custom_tool_call_input.done",
+                        &json!({
+                            "type": "response.custom_tool_call_input.done",
+                            "item_id": call.item_id,
+                            "output_index": index,
+                            "input": input
+                        }),
+                    ));
+                    let item = json!({
+                        "id": call.item_id,
+                        "type": "custom_tool_call",
+                        "status": "completed",
+                        "input": input,
+                        "call_id": call.call_id,
+                        "name": call.name
+                    });
+                    completed_items.push(item.clone());
+                    output.push_str(&encode_sse_json_event(
+                        "response.output_item.done",
+                        &json!({
+                            "type": "response.output_item.done",
+                            "output_index": index,
+                            "item": item
+                        }),
+                    ));
+                }
+                if let Some(response) = value.get_mut("response").and_then(Value::as_object_mut) {
+                    let response_output = response
+                        .entry("output")
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                    if let Some(items) = response_output.as_array_mut() {
+                        items.extend(completed_items);
+                    }
+                }
+                if let Ok(payload) = serde_json::to_string(&value) {
+                    output.push_str(&replace_first_sse_data_payload(event, &payload));
+                } else {
+                    output.push_str(event);
+                }
+                self.calls.clear();
+                output
+            }
+            Some("response.failed") | Some("response.incomplete") => {
+                self.calls.clear();
+                event.to_string()
+            }
+            _ => event.to_string(),
+        }
+    }
+}
+
+fn custom_tool_input_from_arguments(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("input")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| arguments.to_string())
+}
+
 fn function_call_event_key(value: &Value, item: &Value) -> Option<String> {
     value
         .get("output_index")
@@ -3777,10 +4275,21 @@ fn strip_hop_by_hop_response_headers(headers: &mut HeaderMap) {
     }
 }
 
-fn copy_upstream_request_id(headers: &HeaderMap, response: &mut Response) {
-    let name = HeaderName::from_static("x-request-id");
-    if let Some(value) = headers.get(&name).cloned() {
-        response.headers_mut().insert(name, value);
+fn copy_safe_upstream_response_headers(headers: &HeaderMap, response: &mut Response) {
+    const EXACT: &[&str] = &["x-request-id", "retry-after", "x-should-retry"];
+    const PREFIXES: &[&str] = &[
+        "anthropic-ratelimit-",
+        "anthropic-priority-",
+        "anthropic-fast-",
+    ];
+
+    for (name, value) in headers {
+        let normalized = name.as_str();
+        if EXACT.contains(&normalized)
+            || PREFIXES.iter().any(|prefix| normalized.starts_with(prefix))
+        {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
     }
 }
 
@@ -4009,6 +4518,18 @@ mod tests {
     use crate::domain::providers::model::{
         AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
     };
+
+    #[test]
+    fn retry_context_is_internal_and_tracks_failed_provider_and_body_stage() {
+        let context = ForwardAttemptContext::default();
+        assert_eq!(context.attempt, 0);
+        assert!(context.excluded_provider_ids.is_empty());
+
+        let next = context.next(Some("provider-a"), Some(ClaudeBodyRetryStage::Thinking));
+        assert_eq!(next.attempt, 1);
+        assert_eq!(next.body_retry_stage, Some(ClaudeBodyRetryStage::Thinking));
+        assert!(next.excluded_provider_ids.contains("provider-a"));
+    }
 
     use super::*;
 
@@ -4346,6 +4867,26 @@ mod tests {
     }
 
     #[test]
+    fn normalize_codex_oauth_gates_reasoning_and_strips_invalid_message_ids() {
+        let normalized = normalize_codex_oauth_responses_body(
+            json!({
+                "model": "gpt-5.6-luna",
+                "reasoning": {"effort": "ultra"},
+                "input": [
+                    {"type": "message", "id": "item_bad", "role": "user", "content": []},
+                    {"type": "message", "id": "msg_valid", "role": "assistant", "content": []},
+                    {"type": "function_call", "id": "item_call", "call_id": "call_1"}
+                ]
+            }),
+            None,
+        );
+        assert_eq!(normalized.pointer("/reasoning/effort"), Some(&json!("max")));
+        assert!(normalized.pointer("/input/0/id").is_none());
+        assert_eq!(normalized.pointer("/input/1/id"), Some(&json!("msg_valid")));
+        assert_eq!(normalized.pointer("/input/2/id"), Some(&json!("item_call")));
+    }
+
+    #[test]
     fn codex_oauth_chat_completions_body_gets_store_false_after_normalize() {
         let stored = stored_provider(
             AppKind::Codex,
@@ -4650,7 +5191,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         headers.insert(
             "user-agent",
             HeaderValue::from_static(
-                "codex_cli_rs/0.125.0 (Ubuntu 22.04.0; x86_64) xterm-256color",
+                "codex_cli_rs/0.144.1 (Ubuntu 22.04.0; x86_64) xterm-256color",
             ),
         );
         validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers).unwrap();
@@ -4751,14 +5292,27 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[test]
-    fn copies_upstream_x_request_id_to_downstream_response() {
+    fn copies_only_safe_upstream_headers_to_downstream_response() {
         let mut headers = HeaderMap::new();
         headers.insert("x-request-id", HeaderValue::from_static("req_123"));
+        headers.insert(
+            "anthropic-ratelimit-unified-reset",
+            HeaderValue::from_static("2026-07-13T12:00:00Z"),
+        );
+        headers.insert("retry-after", HeaderValue::from_static("30"));
+        headers.insert("set-cookie", HeaderValue::from_static("secret=value"));
+        headers.insert("server", HeaderValue::from_static("upstream"));
         let mut response = Response::new(Body::empty());
 
-        copy_upstream_request_id(&headers, &mut response);
+        copy_safe_upstream_response_headers(&headers, &mut response);
 
         assert_eq!(response.headers().get("x-request-id").unwrap(), "req_123");
+        assert_eq!(response.headers().get("retry-after").unwrap(), "30");
+        assert!(response
+            .headers()
+            .contains_key("anthropic-ratelimit-unified-reset"));
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert!(!response.headers().contains_key("server"));
     }
 
     #[test]
@@ -4830,5 +5384,122 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             }
             other => panic!("unexpected websocket message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn websocket_reset_classification_covers_windows_and_unix() {
+        for code in [54, 104, 995, 10053, 10054] {
+            assert!(websocket_expected_reset(&TungsteniteError::Io(
+                std::io::Error::from_raw_os_error(code)
+            )));
+        }
+        assert!(websocket_expected_reset(&TungsteniteError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
+    }
+
+    #[test]
+    fn codex_websocket_toggle_defaults_on_and_supports_incident_rollback() {
+        let enabled = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({}),
+            Some("acct-1"),
+        );
+        assert!(codex_websocket_enabled(&enabled));
+
+        let mut disabled = enabled;
+        disabled
+            .provider
+            .meta
+            .get_or_insert_default()
+            .codex_websocket_enabled = Some(false);
+        assert!(!codex_websocket_enabled(&disabled));
+    }
+
+    #[test]
+    fn websocket_completed_output_is_rebuilt_in_index_order_and_state_is_cleared() {
+        let mut patcher = CodexWebsocketOutputPatcher::default();
+        for raw in [
+            r#"{"type":"response.output_item.done","output_index":2,"item":{"id":"third"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"first"}}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"fallback"}}"#,
+        ] {
+            let mut message = TungsteniteMessage::Text(raw.to_string());
+            patcher.patch_message(&mut message);
+        }
+        let mut completed = TungsteniteMessage::Text(
+            r#"{"type":"response.completed","response":{"output":[]}}"#.to_string(),
+        );
+        patcher.patch_message(&mut completed);
+        let TungsteniteMessage::Text(completed) = completed else {
+            panic!("expected text frame");
+        };
+        let value: Value = serde_json::from_str(&completed).unwrap();
+        assert_eq!(
+            value.pointer("/response/output/0/id"),
+            Some(&json!("first"))
+        );
+        assert_eq!(
+            value.pointer("/response/output/1/id"),
+            Some(&json!("third"))
+        );
+        assert_eq!(
+            value.pointer("/response/output/2/id"),
+            Some(&json!("fallback"))
+        );
+
+        let mut next = TungsteniteMessage::Text(
+            r#"{"type":"response.completed","response":{"output":[]}}"#.to_string(),
+        );
+        patcher.patch_message(&mut next);
+        let TungsteniteMessage::Text(next) = next else {
+            panic!("expected text frame");
+        };
+        assert_eq!(
+            next,
+            r#"{"type":"response.completed","response":{"output":[]}}"#
+        );
+    }
+
+    #[test]
+    fn websocket_completed_output_preserves_existing_and_supports_binary_json() {
+        let mut patcher = CodexWebsocketOutputPatcher::default();
+        let mut collected = TungsteniteMessage::Binary(
+            br#"{"type":"response.output_item.done","output_index":0,"item":{"id":"collected"}}"#
+                .to_vec(),
+        );
+        patcher.patch_message(&mut collected);
+        let raw = r#"{"type":"response.completed","response":{"output":[{"id":"existing"}]}}"#;
+        let mut completed = TungsteniteMessage::Binary(raw.as_bytes().to_vec());
+        patcher.patch_message(&mut completed);
+        let TungsteniteMessage::Binary(completed) = completed else {
+            panic!("expected binary frame");
+        };
+        assert_eq!(completed, raw.as_bytes());
+    }
+
+    #[test]
+    fn custom_tool_stream_bridge_restores_freeform_events_and_completed_output() {
+        let mut patcher = CodexCustomToolStreamPatcher::default();
+        let chunk = Bytes::from_static(
+            br#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ctc_call_1","type":"custom_tool_call","status":"in_progress","input":"","call_id":"call_1","name":"exec","cc_switch_custom_bridge":true}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"input\":\"pwd\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","output":[]}}
+
+"#,
+        );
+        let output = String::from_utf8(patcher.push(chunk).to_vec()).unwrap();
+        assert!(!output.contains("cc_switch_custom_bridge"));
+        assert!(!output.contains("response.function_call_arguments.delta"));
+        assert!(output.contains("response.custom_tool_call_input.done"));
+        assert!(output.contains("\"input\":\"pwd\""));
+        assert!(output.contains("response.output_item.done"));
+        assert!(output.contains("\"output\":[{\"id\":\"ctc_call_1\""));
     }
 }
