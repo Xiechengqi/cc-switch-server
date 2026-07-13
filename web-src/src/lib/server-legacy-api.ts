@@ -948,15 +948,20 @@ export async function changeServerPassword(newPassword: string): Promise<void> {
 export async function requestEmailLoginCode(
   email: string,
 ): Promise<EmailCodeRequestResponse> {
-  return invokeCommand<EmailCodeRequestResponse>(
-    "request_admin_email_login_code",
-    { email },
-  );
+  return jsonFetch<EmailCodeRequestResponse>("/api/auth/email/request-code", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
 }
 
 export async function verifyEmailLoginCode(input: {
   email: string;
   code: string;
 }): Promise<LoginResponse> {
-  return invokeCommand<LoginResponse>("verify_admin_email_login_code", input);
+  return jsonFetch<LoginResponse>("/api/auth/email/verify-code", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
 }

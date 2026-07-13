@@ -44,10 +44,7 @@ impl UiSettingsStore {
 
     pub fn settings_for_frontend(&self, server_config: &ServerConfig) -> Value {
         let mut settings = self.for_frontend();
-        let stored_domain = self
-            .value
-            .get("shareRouterDomain")
-            .and_then(Value::as_str);
+        let stored_domain = self.value.get("shareRouterDomain").and_then(Value::as_str);
         let resolved_domain = resolve_share_router_domain(
             stored_domain,
             server_config.router.domain.as_deref(),

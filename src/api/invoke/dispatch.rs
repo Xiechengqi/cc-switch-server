@@ -41,6 +41,9 @@ pub(in crate::api) async fn web_invoke_compat(
 async fn web_invoke_requires_session(state: &ServerState, command: &str) -> bool {
     match command {
         "complete_server_setup" => state.config.read().await.is_setup_complete(),
+        "request_admin_email_login_code"
+        | "verify_admin_email_login_code"
+        | "login_with_api_token" => false,
         _ => true,
     }
 }

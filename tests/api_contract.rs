@@ -2442,6 +2442,45 @@ async fn web_invoke_complete_server_setup_works_without_session_before_setup() {
 }
 
 #[tokio::test]
+async fn web_invoke_email_auth_works_without_session_after_setup() {
+    let app = app_router(test_state());
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/setup",
+            json!({
+                "password": "password123",
+                "ownerEmail": "owner@example.com",
+                "routerUrl": "http://127.0.0.1:9",
+                "clientTunnelSubdomain": "ownerabcde"
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/request_admin_email_login_code",
+            json!({ "email": "owner@example.com" }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(response).await;
+    assert_ne!(
+        body["error"].as_str(),
+        Some("missing or invalid bearer token")
+    );
+}
+
+#[tokio::test]
 async fn web_invoke_registry_returns_stable_errors() {
     let app = app_router(test_state());
     let token = setup_and_login(&app).await;
