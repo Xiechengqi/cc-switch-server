@@ -84,6 +84,7 @@ export interface WebAuthMethods {
   passwordConfigured: boolean;
   setupTokenRequired: boolean;
   initialClientSetupRequired: boolean;
+  ownerEmail?: string | null;
   methods: Array<"email" | "apiToken" | "password" | "passwordSetup">;
 }
 

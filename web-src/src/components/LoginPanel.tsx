@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { KeyRound, Loader2, Mail, Shield } from "lucide-react";
 
+import { AuthPasswordInput } from "@/components/AuthPasswordInput";
 import {
   completeServerSetup,
   loginWithApiToken,
@@ -13,16 +14,10 @@ import { loginWithPassword, readCachedPassword, WebRuntimeContext, writeToken } 
 
 type LoginMethod = "password" | "email" | "apiToken";
 
-function normalizeMethods(context: WebRuntimeContext): LoginMethod[] {
-  const raw = context.auth?.methods ?? ["password"];
-  if (raw.includes("passwordSetup")) {
-    return ["password"];
-  }
-  const methods: LoginMethod[] = [];
-  if (raw.includes("password")) methods.push("password");
-  if (raw.includes("email")) methods.push("email");
-  if (raw.includes("apiToken")) methods.push("apiToken");
-  return methods.length > 0 ? methods : ["password"];
+function normalizeMethods(_context: WebRuntimeContext): LoginMethod[] {
+  // LoginPanel is only rendered for direct server access (IP/loopback:15721).
+  // Router-backed email / API Token login stays on ClientWebLoginPage (tunnel URL).
+  return ["password"];
 }
 
 function errorMessage(error: unknown): string {
@@ -49,13 +44,13 @@ export function LoginPanel({
     () => `https://${DEFAULT_SHARE_ROUTER_DOMAIN}`,
   );
   const [clientTunnelSubdomain, setClientTunnelSubdomain] = useState("");
-  const [email, setEmail] = useState(context.auth?.ownerEmail ?? "");
   const [verificationCode, setVerificationCode] = useState("");
   const [apiToken, setApiToken] = useState("");
   const [codeHint, setCodeHint] = useState<string | null>(null);
   const [resendCooldown, setResendCooldown] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const loginOwnerEmail = context.auth?.ownerEmail?.trim() ?? "";
 
   useEffect(() => {
     if (!availableMethods.includes(activeMethod)) {
@@ -66,7 +61,6 @@ export function LoginPanel({
   useEffect(() => {
     if (context.auth?.ownerEmail) {
       setOwnerEmail(context.auth.ownerEmail);
-      setEmail(context.auth.ownerEmail);
     }
   }, [context.auth?.ownerEmail]);
 
@@ -120,12 +114,11 @@ export function LoginPanel({
   }
 
   async function requestCode() {
-    const normalizedEmail = email.trim();
-    if (!normalizedEmail) return;
+    if (!loginOwnerEmail) return;
     setError(null);
     setBusy("requestCode");
     try {
-      const response = await requestEmailLoginCode(normalizedEmail);
+      const response = await requestEmailLoginCode(loginOwnerEmail);
       setCodeHint(
         t("server.auth.codeSentTo", {
           defaultValue: "验证码已发送至 {{destination}}",
@@ -142,14 +135,13 @@ export function LoginPanel({
 
   async function submitEmail(event?: FormEvent) {
     event?.preventDefault();
-    const normalizedEmail = email.trim();
     const normalizedCode = verificationCode.trim();
-    if (!normalizedEmail || !normalizedCode) return;
+    if (!loginOwnerEmail || !normalizedCode) return;
     setError(null);
     setBusy("email");
     try {
       const login = await verifyEmailLoginCode({
-        email: normalizedEmail,
+        email: loginOwnerEmail,
         code: normalizedCode,
       });
       await completeLogin(login.token);
@@ -208,8 +200,8 @@ export function LoginPanel({
                 ? t("server.auth.setupSubtitle", {
                     defaultValue: "设置 Owner 邮箱、Router 与管理员密码。",
                   })
-                : t("server.auth.loginSubtitle", {
-                    defaultValue: "使用密码、邮箱验证码或 API Token 登录。",
+                : t("server.auth.loginSubtitlePasswordOnly", {
+                    defaultValue: "使用 Web 密码登录。",
                   })}
             </p>
           </div>
@@ -286,28 +278,23 @@ export function LoginPanel({
                   }
                 />
               </label>
-              <label className="auth-grid-span-2">
-                <span>{t("server.common.password")}</span>
-                <input
-                  type="password"
-                  autoComplete="new-password"
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                />
-              </label>
+              <AuthPasswordInput
+                className="auth-grid-span-2"
+                label={t("server.common.password")}
+                autoComplete="new-password"
+                value={password}
+                onChange={setPassword}
+              />
             </div>
           ) : null}
 
           {!setupRequired && activeMethod === "password" ? (
-            <label>
-              <span>{t("server.common.password")}</span>
-              <input
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-              />
-            </label>
+            <AuthPasswordInput
+              label={t("server.common.password")}
+              autoComplete="current-password"
+              value={password}
+              onChange={setPassword}
+            />
           ) : null}
 
           {!setupRequired && activeMethod === "email" ? (
@@ -315,11 +302,9 @@ export function LoginPanel({
               <label className="auth-grid-span-2">
                 <span>{t("server.auth.ownerEmail")}</span>
                 <input
-                  type="email"
-                  autoComplete="email"
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  placeholder="owner@example.com"
+                  readOnly
+                  value={loginOwnerEmail}
+                  className="auth-readonly-input"
                 />
               </label>
               <label>
@@ -337,7 +322,7 @@ export function LoginPanel({
                   className="secondary-button"
                   type="button"
                   disabled={
-                    !email.trim() || busy !== null || resendCooldown > 0
+                    !loginOwnerEmail || busy !== null || resendCooldown > 0
                   }
                   onClick={() => void requestCode()}
                 >
@@ -370,16 +355,14 @@ export function LoginPanel({
 
           {!setupRequired && activeMethod === "apiToken" ? (
             <div className="auth-grid">
-              <label className="auth-grid-span-2">
-                <span>{t("server.auth.apiToken", { defaultValue: "API Token" })}</span>
-                <input
-                  type="password"
-                  autoComplete="off"
-                  value={apiToken}
-                  onChange={(event) => setApiToken(event.target.value)}
-                  placeholder="ccs_..."
-                />
-              </label>
+              <AuthPasswordInput
+                className="auth-grid-span-2"
+                label={t("server.auth.apiToken", { defaultValue: "API Token" })}
+                autoComplete="off"
+                placeholder="ccs_..."
+                value={apiToken}
+                onChange={setApiToken}
+              />
               <p className="auth-hint auth-grid-span-2">
                 {t("server.auth.apiTokenHint", {
                   defaultValue:
@@ -415,7 +398,7 @@ export function LoginPanel({
               className="primary-button"
               type="submit"
               disabled={
-                busy !== null || !email.trim() || !verificationCode.trim()
+                busy !== null || !loginOwnerEmail || !verificationCode.trim()
               }
             >
               {busy === "email" ? (

@@ -168,6 +168,36 @@ to{
   border-color: hsl(var(--primary));
   outline: 2px solid hsl(var(--primary) / 0.18);
   outline-offset: 0;
+}.password-field{
+  position: relative;
+  display: grid;
+}.password-field-input{
+  padding-right: 36px;
+}.password-field-toggle{
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: inline-flex;
+  width: 36px;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+}.password-field-toggle:hover{
+  color: hsl(var(--foreground));
+}.password-field-toggle:focus-visible{
+  border-radius: 6px;
+  outline: 2px solid hsl(var(--primary) / 0.18);
+}input.auth-readonly-input{
+  background: hsl(var(--subtle));
+  color: hsl(var(--muted-foreground));
+  cursor: default;
+}input.auth-readonly-input:focus{
+  border-color: hsl(var(--border));
+  outline: none;
 }.primary-button{
   width: fit-content;
   min-height: 36px;

@@ -32,6 +32,7 @@ pub struct AuthMethods {
     pub password_configured: bool,
     pub setup_token_required: bool,
     pub initial_client_setup_required: bool,
+    pub owner_email: Option<String>,
     pub methods: Vec<&'static str>,
 }
 
@@ -279,6 +280,13 @@ pub fn auth_methods(config: &ServerConfig) -> AuthMethods {
         password_configured,
         setup_token_required: false,
         initial_client_setup_required: false,
+        owner_email: config
+            .owner
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         methods,
     }
 }
@@ -458,6 +466,7 @@ mod tests {
         assert!(methods.methods.contains(&"email"));
         assert!(methods.methods.contains(&"apiToken"));
         assert!(methods.methods.contains(&"password"));
+        assert_eq!(methods.owner_email.as_deref(), Some("owner@example.com"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { SecretInput } from "@/components/ui/secret-input";
 import {
   clearRouterSessionTokens,
   getWebAuthMethods,
@@ -25,7 +26,6 @@ export function ClientWebLoginPage({
 }) {
   const [authMethods, setAuthMethods] = useState<WebAuthMethods | null>(null);
   const [mode, setMode] = useState<LoginMode>("password");
-  const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
   const [apiToken, setApiToken] = useState("");
   const [password, setPassword] = useState("");
@@ -67,16 +67,16 @@ export function ClientWebLoginPage({
     }
   }, [onAuthenticated]);
 
+  const ownerEmail = authMethods?.ownerEmail?.trim() ?? "";
+
   const sendCode = useCallback(async () => {
-    const normalized = email.trim().toLowerCase();
-    if (!normalized || busy) return;
+    if (!ownerEmail || busy) return;
     setBusy(true);
     setError("");
     try {
-      await requestRouterEmailCodeWithIdentityRetry(normalized, {
+      await requestRouterEmailCodeWithIdentityRetry(ownerEmail, {
         clientWeb: true,
       });
-      setEmail(normalized);
       setCode("");
       setCodeSent(true);
       toast.success("验证码已发送");
@@ -85,15 +85,14 @@ export function ClientWebLoginPage({
     } finally {
       setBusy(false);
     }
-  }, [busy, email]);
+  }, [busy, ownerEmail]);
 
   const verifyCode = useCallback(async () => {
-    const normalized = email.trim().toLowerCase();
-    if (!normalized || code.trim().length < 6 || busy) return;
+    if (!ownerEmail || code.trim().length < 6 || busy) return;
     setBusy(true);
     setError("");
     try {
-      await verifyRouterEmailCode(normalized, code.trim(), { clientWeb: true });
+      await verifyRouterEmailCode(ownerEmail, code.trim(), { clientWeb: true });
       await finishAuth();
       toast.success("已登录 client");
     } catch (err) {
@@ -101,7 +100,7 @@ export function ClientWebLoginPage({
     } finally {
       setBusy(false);
     }
-  }, [busy, code, email, finishAuth]);
+  }, [busy, code, finishAuth, ownerEmail]);
 
   const loginWithToken = useCallback(async () => {
     const token = apiToken.trim();
@@ -239,10 +238,9 @@ export function ClientWebLoginPage({
         ) : null}
         {needsPasswordSetup ? (
           <form className="grid gap-3" onSubmit={handleSetupSubmit}>
-            <Input
+            <SecretInput
               value={setupPasswordValue}
               placeholder="设置 Web 密码"
-              type="password"
               autoComplete="new-password"
               disabled={busy}
               onChange={(event) =>
@@ -258,13 +256,14 @@ export function ClientWebLoginPage({
           </form>
         ) : mode === "email" && canUseEmail ? (
           <form className="grid gap-3" onSubmit={handleEmailSubmit}>
-            <Input
-              type="email"
-              value={email}
-              placeholder="owner@example.com"
-              disabled={busy || codeSent}
-              onChange={(event) => setEmail(event.currentTarget.value)}
-            />
+            <label className="grid gap-2">
+              <span className="text-sm font-medium">Owner 邮箱</span>
+              <Input
+                readOnly
+                value={ownerEmail}
+                className="bg-muted text-muted-foreground"
+              />
+            </label>
             {codeSent ? (
               <Input
                 value={code}
@@ -275,29 +274,15 @@ export function ClientWebLoginPage({
                 onChange={(event) => setCode(event.currentTarget.value)}
               />
             ) : null}
-            <Button type="submit" disabled={busy || !email.trim()}>
+            <Button type="submit" disabled={busy || !ownerEmail}>
               {codeSent ? "验证并登录" : "发送验证码"}
             </Button>
-            {codeSent ? (
-              <Button
-                type="button"
-                variant="ghost"
-                disabled={busy}
-                onClick={() => {
-                  setCodeSent(false);
-                  setCode("");
-                }}
-              >
-                更换邮箱
-              </Button>
-            ) : null}
           </form>
         ) : mode === "token" && canUseToken ? (
           <form className="grid gap-3" onSubmit={handleTokenSubmit}>
-            <Input
+            <SecretInput
               value={apiToken}
               placeholder="ccrt_..."
-              type="password"
               autoComplete="off"
               disabled={busy}
               onChange={(event) => setApiToken(event.currentTarget.value)}
@@ -308,10 +293,9 @@ export function ClientWebLoginPage({
           </form>
         ) : (
           <form className="grid gap-3" onSubmit={handlePasswordSubmit}>
-            <Input
+            <SecretInput
               value={password}
               placeholder="Web 密码"
-              type="password"
               autoComplete="current-password"
               disabled={busy}
               onChange={(event) => setPassword(event.currentTarget.value)}
