@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::domain::accounts::store::{Account, AccountQuotaTier, AccountStore};
 use crate::domain::health;
-use crate::domain::providers::model::AppKind;
+use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::{share_router_for_sale_label, Share, ShareMarketGrantStatus};
@@ -893,27 +893,27 @@ fn share_created_at_rfc3339(share: &Share) -> String {
 }
 
 fn provider_models(provider: &StoredProvider) -> Vec<ShareUpstreamModel> {
-    let mut models = Vec::new();
-    if let Some(upstream_model) = provider
-        .provider
-        .settings_config
-        .pointer("/modelMapping/upstreamModel")
-        .and_then(serde_json::Value::as_str)
-        .filter(|model| !model.trim().is_empty())
-    {
-        models.push(ShareUpstreamModel {
-            slot: "default".to_string(),
-            actual_model: upstream_model.to_string(),
-        });
+    let settings = &provider.provider.settings_config;
+    if let Some(model) = single_upstream_model_from_settings(settings) {
+        return vec![ShareUpstreamModel {
+            slot: "model".to_string(),
+            actual_model: model,
+        }];
     }
-    if let Some(mapping) = provider
-        .provider
-        .settings_config
-        .get("modelMapping")
-        .and_then(serde_json::Value::as_object)
-    {
+
+    if provider.app == AppKind::Codex {
+        if let Some(model) = codex_model_from_settings(settings) {
+            return vec![ShareUpstreamModel {
+                slot: "model".to_string(),
+                actual_model: model,
+            }];
+        }
+    }
+
+    let mut models = Vec::new();
+    if let Some(mapping) = settings.get("modelMapping").and_then(Value::as_object) {
         for (slot, value) in mapping {
-            if slot == "upstreamModel" {
+            if is_model_mapping_metadata_key(slot) {
                 continue;
             }
             if let Some(actual_model) = value.as_str().filter(|model| !model.trim().is_empty()) {
@@ -924,18 +924,13 @@ fn provider_models(provider: &StoredProvider) -> Vec<ShareUpstreamModel> {
             }
         }
     }
-    if let Some(values) = provider
-        .provider
-        .settings_config
-        .get("models")
-        .and_then(serde_json::Value::as_array)
-    {
+    if let Some(values) = settings.get("models").and_then(Value::as_array) {
         for value in values {
             let model = value.as_str().or_else(|| {
                 value
                     .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| value.get("name").and_then(serde_json::Value::as_str))
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("name").and_then(Value::as_str))
             });
             if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
                 models.push(ShareUpstreamModel {
@@ -948,30 +943,153 @@ fn provider_models(provider: &StoredProvider) -> Vec<ShareUpstreamModel> {
     models
 }
 
+fn is_model_mapping_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "mode" | "type" | "upstreamModel" | "upstream_model" | "model"
+    )
+}
+
+fn single_upstream_model_from_settings(settings: &Value) -> Option<String> {
+    let mapping = settings.get("modelMapping")?;
+    let mode = mapping
+        .get("mode")
+        .or_else(|| mapping.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if mode != "single" {
+        return None;
+    }
+    mapping
+        .get("upstreamModel")
+        .or_else(|| mapping.get("upstream_model"))
+        .or_else(|| mapping.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_model_from_settings(settings: &Value) -> Option<String> {
+    settings
+        .get("model")
+        .and_then(Value::as_str)
+        .or_else(|| settings.pointer("/config/model").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            settings
+                .get("config")
+                .and_then(Value::as_str)
+                .and_then(extract_codex_toml_model)
+                .map(str::to_string)
+        })
+}
+
+fn extract_codex_toml_model(config: &str) -> Option<&str> {
+    for line in config.lines() {
+        let trimmed = line.split('#').next().unwrap_or(line).trim();
+        for marker in ["model = \"", "model = '"] {
+            let Some(rest) = trimmed.strip_prefix(marker) else {
+                continue;
+            };
+            let quote = marker.chars().last()?;
+            let Some(end) = rest.find(quote) else {
+                continue;
+            };
+            let value = rest[..end].trim();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn extract_codex_toml_base_url(config: &str) -> Option<&str> {
+    for marker in ["base_url = \"", "base_url = '"] {
+        let Some(start) = config.find(marker) else {
+            continue;
+        };
+        let quote = marker.chars().last()?;
+        let rest = &config[start + marker.len()..];
+        let Some(end) = rest.find(quote) else {
+            continue;
+        };
+        let value = rest[..end].trim();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn normalize_api_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn provider_api_url(provider: &StoredProvider) -> Option<String> {
-    let env = provider.provider.settings_config.get("env");
-    [
+    let settings = &provider.provider.settings_config;
+    let env = settings.get("env");
+    let app_env_keys: &[&str] = match provider.app {
+        AppKind::Claude => &["ANTHROPIC_BASE_URL", "BASE_URL"],
+        AppKind::Codex => &["OPENAI_BASE_URL", "CODEX_BASE_URL", "BASE_URL", "base_url"],
+        AppKind::Gemini => &["GOOGLE_GEMINI_BASE_URL", "GEMINI_BASE_URL", "BASE_URL"],
+    };
+    for key in app_env_keys {
+        if let Some(url) = settings
+            .pointer(&format!("/env/{key}"))
+            .and_then(Value::as_str)
+            .or_else(|| settings.get(*key).and_then(Value::as_str))
+        {
+            if let Some(url) = normalize_api_url(url) {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(url) = [
         "/env/ANTHROPIC_BASE_URL",
         "/env/OPENAI_BASE_URL",
+        "/env/GOOGLE_GEMINI_BASE_URL",
         "/env/GEMINI_BASE_URL",
-        "/ANTHROPIC_BASE_URL",
-        "/OPENAI_BASE_URL",
-        "/GEMINI_BASE_URL",
     ]
     .into_iter()
-    .find_map(|pointer| {
-        provider
-            .provider
-            .settings_config
-            .pointer(pointer)
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-    })
-    .or_else(|| {
-        env.and_then(|value| value.get("BASE_URL"))
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-    })
+    .find_map(|pointer| settings.pointer(pointer).and_then(Value::as_str))
+    .and_then(normalize_api_url)
+    {
+        return Some(url);
+    }
+    if provider.app == AppKind::Codex {
+        if let Some(url) = settings
+            .get("config")
+            .and_then(Value::as_str)
+            .and_then(extract_codex_toml_base_url)
+            .and_then(normalize_api_url)
+        {
+            return Some(url);
+        }
+    }
+    env.and_then(|value| value.get("BASE_URL"))
+        .and_then(Value::as_str)
+        .and_then(normalize_api_url)
+        .or_else(|| provider_type_default_api_url(provider.provider_type))
+}
+
+fn provider_type_default_api_url(provider_type: ProviderType) -> Option<String> {
+    let url = match provider_type {
+        ProviderType::Nvidia => "https://integrate.api.nvidia.com/v1",
+        ProviderType::DeepSeekApi => "https://api.deepseek.com",
+        ProviderType::OpenRouter => "https://openrouter.ai/api",
+        ProviderType::OllamaCloud => "https://ollama.com",
+        _ => return None,
+    };
+    Some(url.to_string())
 }
 
 fn default_market_access_mode() -> String {
@@ -1235,6 +1353,49 @@ mod tests {
         assert_eq!(availability.quota_blocked, Some(true));
         assert_eq!(provider.quota_percent, Some(100.0));
         assert_eq!(provider.quota_blocked, Some(true));
+    }
+
+    #[test]
+    fn descriptor_maps_nvidia_codex_api_url_and_single_model() {
+        let share = test_share(ProviderType::Nvidia, None);
+        let providers = ProviderStore {
+            providers: vec![StoredProvider {
+                app: AppKind::Codex,
+                provider: Provider {
+                    id: "p1".to_string(),
+                    name: "Nvidia".to_string(),
+                    settings_config: json!({
+                        "config": "model_provider = \"custom\"\nmodel = \"moonshotai/kimi-k2.5\"\n\n[model_providers.custom]\nname = \"nvidia\"\nbase_url = \"https://integrate.api.nvidia.com/v1\"\n",
+                        "modelMapping": {
+                            "mode": "single",
+                            "upstreamModel": "moonshotai/kimi-k2.5"
+                        }
+                    }),
+                    category: None,
+                    meta: None,
+                    extra: Default::default(),
+                },
+                provider_type: ProviderType::Nvidia,
+                provider_type_id: ProviderType::Nvidia.as_str().to_string(),
+            }],
+        };
+
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+        let provider = descriptor.app_providers.codex.first().unwrap();
+        let runtime = descriptor.app_runtimes.codex.as_ref().unwrap();
+
+        assert_eq!(
+            provider.api_url.as_deref(),
+            Some("https://integrate.api.nvidia.com/v1")
+        );
+        assert_eq!(
+            runtime.api_url.as_deref(),
+            Some("https://integrate.api.nvidia.com/v1")
+        );
+        assert_eq!(provider.models.len(), 1);
+        assert_eq!(provider.models[0].actual_model, "moonshotai/kimi-k2.5");
+        assert_eq!(runtime.models.len(), 1);
+        assert_eq!(runtime.models[0].actual_model, "moonshotai/kimi-k2.5");
     }
 
     fn test_provider(provider_type: ProviderType) -> StoredProvider {
