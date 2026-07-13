@@ -179,6 +179,15 @@ to{
   color: hsl(var(--foreground));
   font-size: 0.78rem;
   font-weight: 600;
+}.field-label-row{
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}.field-label-hint{
+  color: hsl(var(--muted-foreground));
+  font-size: 0.72rem;
+  font-weight: 500;
 }input{
   width: 100%;
   min-width: 0;

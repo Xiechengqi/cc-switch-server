@@ -111,7 +111,7 @@ export function LoginPanel({
     const trimmed = clientTunnelSubdomain.trim();
     if (!trimmed) {
       setSubdomainStatus("idle");
-      setSubdomainHint(t("server.auth.clientSubdomainAuto"));
+      setSubdomainHint(null);
       return;
     }
     let active = true;
@@ -420,7 +420,12 @@ export function LoginPanel({
                 />
               </label>
               <label>
-                <span>{t("server.auth.clientSubdomain")}</span>
+                <div className="field-label-row">
+                  <span>{t("server.auth.clientSubdomain")}</span>
+                  <span className="field-label-hint">
+                    {t("server.auth.clientSubdomainAuto")}
+                  </span>
+                </div>
                 <div className="subdomain-field">
                   <input
                     className="subdomain-field-input"
