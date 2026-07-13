@@ -121,14 +121,6 @@ export function LoginPanel({
     setBusy("password");
     try {
       if (setupRequired) {
-        const normalizedCode = verificationCode.trim();
-        if (!normalizedCode) {
-          throw new Error(
-            t("server.auth.setupVerificationRequired", {
-              defaultValue: "请先获取并填写 Owner 邮箱验证码。",
-            }),
-          );
-        }
         let normalizedRouterDomain: string;
         try {
           normalizedRouterDomain = normalizeShareRouterDomain(routerDomain);
@@ -145,11 +137,8 @@ export function LoginPanel({
           routerDomain: normalizedRouterDomain,
           clientTunnelSubdomain: clientTunnelSubdomain.trim() || undefined,
         });
-        const login = await verifyEmailLoginCode({
-          email: ownerEmail.trim(),
-          code: normalizedCode,
-        });
-        await completeLogin(login.token);
+        await loginWithPassword(password);
+        await onAuthenticated();
         return;
       }
       await loginWithPassword(password);
@@ -176,31 +165,11 @@ export function LoginPanel({
   }
 
   async function requestCode() {
-    const email = (setupRequired ? ownerEmail : loginOwnerEmail).trim();
-    if (!email) return;
+    if (!loginOwnerEmail) return;
     setError(null);
-    setRouterDomainError(null);
     setBusy("requestCode");
     try {
-      if (setupRequired) {
-        let normalizedRouterDomain: string;
-        try {
-          normalizedRouterDomain = normalizeShareRouterDomain(routerDomain);
-        } catch (reason) {
-          const key = errorMessage(reason);
-          setRouterDomainError(
-            t(key, { defaultValue: "Router 域名无效" }),
-          );
-          return;
-        }
-        await saveSetupConfig({
-          password,
-          ownerEmail: email,
-          routerDomain: normalizedRouterDomain,
-          clientTunnelSubdomain: clientTunnelSubdomain.trim() || undefined,
-        });
-      }
-      const response = await requestEmailLoginCode(email);
+      const response = await requestEmailLoginCode(loginOwnerEmail);
       setCodeHint(
         t("server.auth.codeSentTo", {
           defaultValue: "验证码已发送至 {{destination}}",
@@ -343,7 +312,7 @@ export function LoginPanel({
                   autoComplete="email"
                 />
               </label>
-              <label className="auth-grid-span-2">
+              <label>
                 <span>
                   {t("share.tunnel.region", { defaultValue: "路由节点" })}
                 </span>
@@ -359,7 +328,7 @@ export function LoginPanel({
                   error={routerDomainError}
                 />
               </label>
-              <label className="auth-grid-span-2">
+              <label>
                 <span>{t("server.auth.clientSubdomain")}</span>
                 <input
                   value={clientTunnelSubdomain}
@@ -370,59 +339,11 @@ export function LoginPanel({
                 />
               </label>
               <AuthPasswordInput
-                className="auth-grid-span-2"
                 label={t("server.common.password")}
                 autoComplete="new-password"
                 value={password}
                 onChange={setPassword}
               />
-              <label>
-                <span>{t("server.settings.verificationCode")}</span>
-                <input
-                  inputMode="numeric"
-                  autoComplete="one-time-code"
-                  value={verificationCode}
-                  onChange={(event) => setVerificationCode(event.target.value)}
-                  placeholder="123456"
-                />
-              </label>
-              <div className="auth-inline-actions">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  disabled={
-                    !ownerEmail.trim() ||
-                    !routerDomain.trim() ||
-                    !password ||
-                    busy !== null ||
-                    resendCooldown > 0
-                  }
-                  onClick={() => void requestCode()}
-                >
-                  {busy === "requestCode" ? (
-                    <Loader2 size={15} className="spin" />
-                  ) : (
-                    <Mail size={15} />
-                  )}
-                  <span>
-                    {resendCooldown > 0
-                      ? t("server.auth.resendIn", {
-                          defaultValue: "{{seconds}} 秒后可重发",
-                          seconds: resendCooldown,
-                        })
-                      : t("server.settings.requestCode")}
-                  </span>
-                </button>
-              </div>
-              {codeHint ? (
-                <p className="auth-hint auth-grid-span-2">{codeHint}</p>
-              ) : null}
-              <p className="auth-hint auth-grid-span-2">
-                {t("server.auth.setupEmailHint", {
-                  defaultValue:
-                    "Router 会向 Owner 邮箱发送验证码，用于绑定 Client Tunnel 所有权。",
-                })}
-              </p>
             </div>
           ) : null}
 
@@ -520,9 +441,7 @@ export function LoginPanel({
                 busy !== null ||
                 !password ||
                 (setupRequired &&
-                  (!ownerEmail.trim() ||
-                    !routerDomain.trim() ||
-                    !verificationCode.trim()))
+                  (!ownerEmail.trim() || !routerDomain.trim()))
               }
             >
               {busy === "password" ? (

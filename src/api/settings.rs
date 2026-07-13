@@ -47,6 +47,22 @@ pub(in crate::api) async fn setup(
                 );
             }
         }
+        if saved_config.router.identity.is_some() {
+            if let Some(owner_email) = saved_config.owner.email.as_deref() {
+                if let Err(error) = crate::clients::router::email_auth::bind_owner_email_at_setup(
+                    &http_client,
+                    &saved_config,
+                    owner_email,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %error.message,
+                        "router owner bootstrap bind during setup failed"
+                    );
+                }
+            }
+        }
     }
     if let Some(domain) = saved_config.router.domain.clone() {
         if let Err(error) = state

@@ -382,6 +382,46 @@ pub async fn bind_owner_email(
     handle_json_response(response).await
 }
 
+pub async fn bind_owner_email_at_setup(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    email: &str,
+) -> Result<BindOwnerEmailResponse, EmailAuthError> {
+    let email = normalize_email(email)?;
+    let identity = router_identity(config)?;
+    let payload = BindOwnerEmailSignaturePayload {
+        email: &email,
+        verification_token: None,
+    };
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let signature = crate::clients::router::client::sign_payload(
+        identity,
+        "bind_installation_owner_email",
+        &payload,
+        timestamp_ms,
+        &nonce,
+    )
+    .map_err(|error| EmailAuthError::internal(error.to_string()))?;
+    let api_base = router_api_base(config)?;
+    let response = http
+        .post(format!("{api_base}/v1/installations/bind-owner-email"))
+        .json(&json!({
+            "installationId": identity.installation_id.as_str(),
+            "email": email,
+            "verificationToken": null,
+            "timestampMs": timestamp_ms,
+            "nonce": nonce,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            EmailAuthError::bad_gateway(format!("bind installation owner email failed: {error}"))
+        })?;
+    handle_json_response(response).await
+}
+
 pub async fn change_owner_email(
     http: &reqwest::Client,
     config: &ServerConfig,
