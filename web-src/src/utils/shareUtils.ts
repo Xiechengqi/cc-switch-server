@@ -48,7 +48,6 @@ export function getProviderSharePhase(
 export const UNLIMITED_TOKEN_LIMIT = -1;
 export const UNLIMITED_PARALLEL_LIMIT = -1;
 export const DEFAULT_PARALLEL_LIMIT = 3;
-export const MIN_PARALLEL_LIMIT = 3;
 
 /** Legacy/client sentinel for "no limit" besides `-1`. */
 export const UNLIMITED_LIMIT_SENTINEL = Number.MAX_SAFE_INTEGER;

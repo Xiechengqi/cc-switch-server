@@ -51,7 +51,6 @@ import {
   formatShareLimitInput,
   getTunnelConfigFromSettings,
   isPermanentExpiry,
-  MIN_PARALLEL_LIMIT,
   normalizeShareLimitValue,
   PERMANENT_EXPIRES_AT,
   permanentExpiresInSecs,
@@ -904,7 +903,7 @@ export function ProviderShareSection({
                   <Input
                     id="provider-share-parallel-limit"
                     type="number"
-                    min={MIN_PARALLEL_LIMIT}
+                    min={1}
                     disabled={busy}
                     placeholder={t("share.unlimited", { defaultValue: "无上限" })}
                     value={parallelLimitInput}
