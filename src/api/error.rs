@@ -47,6 +47,16 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, error.to_string())
     }
 
+    pub(crate) fn bad_request_code(code: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: error.into(),
+            code: Some(code),
+            error_type: None,
+            retryable: None,
+        }
+    }
+
     pub(crate) fn unauthorized(error: impl Into<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, error.into())
     }
@@ -57,6 +67,16 @@ impl ApiError {
 
     pub(crate) fn conflict(error: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, error.into())
+    }
+
+    pub(crate) fn conflict_code(code: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: error.into(),
+            code: Some(code),
+            error_type: None,
+            retryable: None,
+        }
     }
 
     pub(crate) fn not_implemented(error: impl std::fmt::Display) -> Self {

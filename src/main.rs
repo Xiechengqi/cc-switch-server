@@ -19,6 +19,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Password { command } => {
             cc_switch_server::admin::run_password_command(&cli, command)
         }
+        Command::Init(args) => cc_switch_server::setup::run_cli_init(&cli, args).await,
         Command::SelfUpdateHelper { spec } => {
             cc_switch_server::self_update::restart::run_update_helper(&spec)
         }

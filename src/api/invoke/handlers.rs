@@ -1164,6 +1164,10 @@ fn share_health_level(
 }
 
 pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Value {
+    use crate::client_tunnel_provision::{
+        derive_client_tunnel_claim_status, derive_client_tunnel_connectivity_status,
+    };
+
     let config = state.config.read().await;
     let shares_store = state.shares.read().await;
     let ui_settings = state.ui_settings.read().await;
@@ -1185,7 +1189,11 @@ pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Valu
             .map(|status| (status.key.clone(), status))
             .collect();
 
-    let router_level = if shares_store.last_router_error.is_some() {
+    let router_last_error = shares_store
+        .last_router_error
+        .as_deref()
+        .or(config.router.last_register_error.as_deref());
+    let router_level = if router_last_error.is_some() {
         ShareHealthLevel::Unhealthy
     } else if shares_store.router_registered {
         ShareHealthLevel::Healthy
@@ -1194,37 +1202,41 @@ pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Valu
     };
 
     let client_subdomain = config.client.tunnel_subdomain.clone().unwrap_or_default();
-    let client_tunnel_url = client_runtime
+    let expected_tunnel_url = if client_subdomain.is_empty() || router_domain.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "https://{}.{}",
+            client_subdomain.trim(),
+            router_domain.trim()
+        ))
+    };
+    let active_tunnel_url = client_runtime
         .as_ref()
-        .and_then(|status| status.tunnel_url.clone())
-        .or_else(|| {
-            if client_subdomain.is_empty() || router_domain.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "https://{}.{}",
-                    client_subdomain.trim(),
-                    router_domain.trim()
-                ))
-            }
-        });
+        .and_then(|status| status.tunnel_url.clone());
     let client_last_error = client_runtime
         .as_ref()
-        .and_then(|status| status.last_error.clone());
-    let client_tunnel_level = if client_runtime
-        .as_ref()
-        .is_some_and(|status| status.status == "renewal_retrying")
-    {
-        ShareHealthLevel::Warning
-    } else if client_last_error.is_some() {
-        ShareHealthLevel::Unhealthy
-    } else if client_runtime
-        .as_ref()
-        .is_some_and(|status| tunnel_runtime_is_healthy(status.status.as_str()))
-    {
-        ShareHealthLevel::Healthy
-    } else {
-        ShareHealthLevel::Warning
+        .and_then(|status| status.last_error.clone())
+        .or_else(|| {
+            router_last_error
+                .filter(|_| !shares_store.router_registered)
+                .map(str::to_string)
+        });
+    let claim_status = derive_client_tunnel_claim_status(&config, router_last_error);
+    let connectivity_status = derive_client_tunnel_connectivity_status(
+        client_runtime.as_ref().map(|status| status.status.as_str()),
+        client_last_error.as_deref(),
+        claim_status,
+    );
+    let client_tunnel_level = match claim_status {
+        "conflict" | "error" => ShareHealthLevel::Unhealthy,
+        "unclaimed" => ShareHealthLevel::Warning,
+        "claimed" => match connectivity_status {
+            "connected" => ShareHealthLevel::Healthy,
+            "connecting" => ShareHealthLevel::Warning,
+            _ => ShareHealthLevel::Warning,
+        },
+        _ => ShareHealthLevel::Warning,
     };
 
     let mut share_items = Vec::new();
@@ -1293,12 +1305,16 @@ pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Valu
             "domain": router_domain,
             "registered": shares_store.router_registered,
             "lastHeartbeatMs": shares_store.last_router_heartbeat_ms,
-            "lastError": shares_store.last_router_error,
+            "lastError": router_last_error,
         },
         "clientTunnel": {
             "status": client_tunnel_level.as_str(),
             "subdomain": client_subdomain,
-            "tunnelUrl": client_tunnel_url,
+            "claimStatus": claim_status,
+            "connectivityStatus": connectivity_status,
+            "expectedUrl": expected_tunnel_url,
+            "activeUrl": active_tunnel_url,
+            "tunnelUrl": active_tunnel_url.clone().or(expected_tunnel_url.clone()),
             "lastError": client_last_error,
         },
         "shares": share_items,

@@ -108,8 +108,7 @@ use crate::domain::providers::model::{
 };
 use crate::domain::providers::store::{ProviderSortUpdate, StoredProvider};
 use crate::domain::settings::config::{
-    ServerConfig, SetupInput, UpdateClientTunnelInput, UpdateRouterConfigInput,
-    UpdateUpstreamProxyInput,
+    ServerConfig, UpdateClientTunnelInput, UpdateRouterConfigInput, UpdateUpstreamProxyInput,
 };
 use crate::domain::settings::ui_settings;
 use crate::domain::sharing::shares::{
@@ -124,6 +123,10 @@ use crate::state::{ServerEvent, ServerState, Session};
 pub const APPLY_SHARE_SETTINGS_PATH: &str = "/_ctl/apply_share_settings";
 pub const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
 pub async fn serve(state: ServerState) -> anyhow::Result<()> {
+    if !state.config.read().await.is_setup_complete() {
+        crate::setup::log_setup_required_hints(&state);
+    }
+
     let app = app_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(state.bind_addr)
@@ -155,6 +158,14 @@ pub fn app_router(state: ServerState) -> Router {
         )
         .route(REFRESH_SHARE_USAGE_PATH, post(control_refresh_share_usage))
         .route("/api/setup/status", get(setup_status))
+        .route("/api/setup/check-router", post(setup_check_router))
+        .route(
+            "/api/setup/suggest-subdomain",
+            post(setup_suggest_subdomain),
+        )
+        .route("/api/setup/check-subdomain", post(setup_check_subdomain))
+        .route("/api/setup/validate", post(setup_validate))
+        .route("/api/setup/bootstrap", post(setup_bootstrap))
         .route("/api/setup", post(setup))
         .route("/api/auth/login", post(login))
         .route("/api/auth/password", put(change_password))
@@ -354,6 +365,10 @@ pub fn app_router(state: ServerState) -> Router {
             post(issue_client_tunnel_lease),
         )
         .route("/api/router/client-tunnel/stop", post(stop_client_tunnel))
+        .route(
+            "/web-api/router/client-tunnel/subdomain-check",
+            get(web_client_tunnel_subdomain_check),
+        )
         .route("/api/router/tunnels", get(router_tunnels))
         .route("/api/router/heartbeat", post(router_heartbeat))
         .route("/api/router/status", get(router_status))

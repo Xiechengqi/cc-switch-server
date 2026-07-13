@@ -407,6 +407,47 @@ pub async fn claim_client_tunnel(
     bail!("router client tunnel claim failed: {status}: {body}");
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubdomainAvailability {
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub async fn check_client_tunnel_subdomain_available(
+    http: &reqwest::Client,
+    router_api_base: &str,
+    subdomain: &str,
+    installation_id: Option<&str>,
+) -> anyhow::Result<SubdomainAvailability> {
+    let api_base = router_api_base.trim_end_matches('/');
+    let mut url = reqwest::Url::parse(&format!(
+        "{api_base}/v1/client-tunnel/subdomain-availability"
+    ))
+    .context("parse router subdomain availability url")?;
+    url.query_pairs_mut()
+        .append_pair("subdomain", subdomain.trim());
+    if let Some(installation_id) = installation_id.filter(|value| !value.trim().is_empty()) {
+        url.query_pairs_mut()
+            .append_pair("installationId", installation_id.trim());
+    }
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .context("send router subdomain availability check")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("router subdomain availability check failed: {status}: {body}");
+    }
+    response
+        .json::<SubdomainAvailability>()
+        .await
+        .context("decode router subdomain availability response")
+}
+
 pub async fn get_client_tunnel(
     http: &reqwest::Client,
     config: &ServerConfig,

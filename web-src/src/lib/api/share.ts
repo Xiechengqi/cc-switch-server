@@ -271,6 +271,10 @@ export interface ShareHealthLink {
   lastHeartbeatMs?: number | null;
   lastError?: string | null;
   subdomain?: string;
+  claimStatus?: "unclaimed" | "claimed" | "conflict" | "error" | string;
+  connectivityStatus?: "disconnected" | "connecting" | "connected" | string;
+  expectedUrl?: string | null;
+  activeUrl?: string | null;
   tunnelUrl?: string | null;
 }
 
@@ -522,6 +526,25 @@ async function clearOwnerPayoutProfile(): Promise<PayoutProfileState> {
   return invokeCommand<PayoutProfileState>("clear_owner_payout_profile");
 }
 
+async function checkClientTunnelSubdomain(
+  subdomain: string,
+): Promise<{ ok: boolean; available: boolean; reason?: string | null }> {
+  return invokeCommand("check_client_tunnel_subdomain", { subdomain });
+}
+
+async function suggestClientTunnelSubdomain(): Promise<{
+  subdomain: string;
+  available: boolean;
+  checked: boolean;
+  attempts: number;
+}> {
+  return invokeCommand("suggest_client_tunnel_subdomain");
+}
+
+async function checkRouterReachable(): Promise<{ reachable: boolean }> {
+  return invokeCommand("check_router_reachable");
+}
+
 async function claimClientTunnel(
   params: ClientTunnelUpdateParams,
 ): Promise<ClientTunnelState> {
@@ -579,6 +602,9 @@ export const shareApi = {
   saveOwnerPayoutProfile,
   clearOwnerPayoutProfile,
   claimClientTunnel,
+  checkClientTunnelSubdomain,
+  checkRouterReachable,
+  suggestClientTunnelSubdomain,
   updateClientTunnel,
   startClientTunnel,
   stopClientTunnel,

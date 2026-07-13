@@ -311,7 +311,7 @@ fn check_setup(report: &mut DoctorReport, config: &ServerConfig) {
     } else {
         report.warn(
             "setup",
-            "setup is incomplete; Web/API setup is required before routing traffic".to_string(),
+            "setup is incomplete; open the web UI, run POST /api/setup/bootstrap, or use `cc-switch-server init`".to_string(),
         );
     }
 

@@ -4,10 +4,14 @@ import { KeyRound, Loader2, Mail, Shield } from "lucide-react";
 import { AuthLanguageSwitcher } from "@/components/AuthLanguageSwitcher";
 import { AuthPasswordInput } from "@/components/AuthPasswordInput";
 import { ShareRouterSelector } from "@/components/share/ShareRouterSelector";
+import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import {
+  checkSetupRouter,
+  checkSetupSubdomain,
   completeServerSetup,
   loginWithApiToken,
   requestEmailLoginCode,
+  suggestSetupSubdomain,
   verifyEmailLoginCode,
 } from "@/lib/server-legacy-api";
 import { DEFAULT_SHARE_ROUTER_DOMAIN } from "@/config/shareRegions";
@@ -39,6 +43,14 @@ function errorMessage(error: unknown): string {
 
 function isSetupAlreadyCompleteError(error: unknown): boolean {
   return errorMessage(error).toLowerCase().includes("already complete");
+}
+
+function formatSetupError(error: unknown): string {
+  const message = errorMessage(error);
+  if (message.includes("client_tunnel_subdomain_conflict")) {
+    return "该 Client 子域名已被其他安装占用，请更换或使用随机生成。";
+  }
+  return message;
 }
 
 async function saveSetupConfig(input: {
@@ -81,6 +93,11 @@ export function LoginPanel({
   const [routerDomain, setRouterDomain] = useState(DEFAULT_SHARE_ROUTER_DOMAIN);
   const [routerDomainError, setRouterDomainError] = useState<string | null>(null);
   const [clientTunnelSubdomain, setClientTunnelSubdomain] = useState("");
+  const [subdomainStatus, setSubdomainStatus] = useState<
+    "idle" | "checking" | "available" | "unavailable"
+  >("idle");
+  const [subdomainHint, setSubdomainHint] = useState<string | null>(null);
+  const [routerReachable, setRouterReachable] = useState<boolean | null>(null);
   const [verificationCode, setVerificationCode] = useState("");
   const [apiToken, setApiToken] = useState("");
   const [codeHint, setCodeHint] = useState<string | null>(null);
@@ -88,6 +105,83 @@ export function LoginPanel({
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const loginOwnerEmail = context.auth?.ownerEmail?.trim() ?? "";
+
+  useEffect(() => {
+    if (!setupRequired) return;
+    const trimmed = clientTunnelSubdomain.trim();
+    if (!trimmed) {
+      setSubdomainStatus("idle");
+      setSubdomainHint(
+        t("server.auth.clientSubdomainAuto", {
+          defaultValue: "留空将自动生成随机单词子域名",
+        }),
+      );
+      return;
+    }
+    let active = true;
+    setSubdomainStatus("checking");
+    setSubdomainHint(null);
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const normalizedRouterDomain = normalizeShareRouterDomain(routerDomain);
+          const response = await checkSetupSubdomain({
+            routerUrl: shareRouterUrlFromDomain(normalizedRouterDomain),
+            subdomain: trimmed,
+          });
+          if (!active) return;
+          if (response.available) {
+            setSubdomainStatus("available");
+            setSubdomainHint(
+              t("server.auth.clientSubdomainAvailable", {
+                defaultValue: "子域名可用",
+              }),
+            );
+          } else {
+            setSubdomainStatus("unavailable");
+            setSubdomainHint(
+              t("server.auth.clientSubdomainTaken", {
+                defaultValue: "子域名已被占用，请更换或使用随机生成",
+              }),
+            );
+          }
+        } catch (reason) {
+          if (!active) return;
+          setSubdomainStatus("idle");
+          setSubdomainHint(formatSetupError(reason));
+        }
+      })();
+    }, 400);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [clientTunnelSubdomain, routerDomain, setupRequired, t]);
+
+  useEffect(() => {
+    if (!setupRequired) return;
+    let active = true;
+    setRouterReachable(null);
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const normalizedRouterDomain = normalizeShareRouterDomain(routerDomain);
+          const response = await checkSetupRouter({
+            routerUrl: shareRouterUrlFromDomain(normalizedRouterDomain),
+          });
+          if (!active) return;
+          setRouterReachable(response.reachable);
+        } catch {
+          if (!active) return;
+          setRouterReachable(false);
+        }
+      })();
+    }, 400);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [routerDomain, setupRequired]);
 
   useEffect(() => {
     if (!availableMethods.includes(activeMethod)) {
@@ -118,6 +212,14 @@ export function LoginPanel({
     event?.preventDefault();
     setError(null);
     setRouterDomainError(null);
+    if (setupRequired && subdomainStatus === "unavailable") {
+      setError(
+        t("server.auth.clientSubdomainTaken", {
+          defaultValue: "子域名已被占用，请更换或使用随机生成",
+        }),
+      );
+      return;
+    }
     setBusy("password");
     try {
       if (setupRequired) {
@@ -144,7 +246,9 @@ export function LoginPanel({
       await loginWithPassword(password);
       await onAuthenticated();
     } catch (reason) {
-      setError(errorMessage(reason));
+      setError(
+        setupRequired ? formatSetupError(reason) : errorMessage(reason),
+      );
     } finally {
       setBusy(null);
     }
@@ -330,13 +434,53 @@ export function LoginPanel({
               </label>
               <label>
                 <span>{t("server.auth.clientSubdomain")}</span>
-                <input
-                  value={clientTunnelSubdomain}
-                  autoComplete="off"
-                  onChange={(event) =>
-                    setClientTunnelSubdomain(event.target.value)
-                  }
-                />
+                <div className="flex items-center gap-2">
+                  <input
+                    className="min-w-0 flex-1"
+                    value={clientTunnelSubdomain}
+                    autoComplete="off"
+                    disabled={busy !== null}
+                    onChange={(event) =>
+                      setClientTunnelSubdomain(event.target.value)
+                    }
+                  />
+                  <SubdomainGeneratorButton
+                    disabled={
+                      busy !== null ||
+                      routerReachable !== true ||
+                      !routerDomain.trim()
+                    }
+                    onGenerated={setClientTunnelSubdomain}
+                    onError={setError}
+                    suggest={async () => {
+                      const normalizedRouterDomain =
+                        normalizeShareRouterDomain(routerDomain);
+                      return suggestSetupSubdomain({
+                        routerUrl: shareRouterUrlFromDomain(
+                          normalizedRouterDomain,
+                        ),
+                      });
+                    }}
+                  />
+                </div>
+                {routerReachable === false ? (
+                  <span className="text-xs text-muted-foreground">
+                    {t("server.auth.routerUnreachableForSubdomain", {
+                      defaultValue: "Router 不可达，无法随机生成子域名",
+                    })}
+                  </span>
+                ) : null}
+                {subdomainHint ? (
+                  <span
+                    className={
+                      subdomainStatus === "unavailable"
+                        ? "text-xs text-red-600 dark:text-red-400"
+                        : "text-xs text-muted-foreground"
+                    }
+                  >
+                    {subdomainHint}
+                  </span>
+                ) : null}
               </label>
               <AuthPasswordInput
                 label={t("server.common.password")}

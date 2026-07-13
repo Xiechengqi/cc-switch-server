@@ -69,11 +69,44 @@ pub enum Command {
         #[command(subcommand)]
         command: PasswordCommand,
     },
+    /// Initialize server.json for first-time setup without starting HTTP.
+    Init(InitArgs),
     #[command(hide = true)]
     SelfUpdateHelper {
         #[arg(long)]
         spec: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct InitArgs {
+    /// Owner email for this server installation.
+    #[arg(long)]
+    pub owner_email: String,
+    /// Router API base URL, for example https://sgptokenswitch.cc
+    #[arg(long)]
+    pub router_url: String,
+    /// Client tunnel subdomain. Leave unset to auto-generate a memorable subdomain.
+    #[arg(long)]
+    pub client_subdomain: Option<String>,
+    /// Web admin password (at least 8 characters).
+    #[arg(long)]
+    pub password: Option<String>,
+    /// Read the web admin password from stdin.
+    #[arg(long)]
+    pub password_stdin: bool,
+    /// Validate input without writing server.json.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Continue when Router is unreachable.
+    #[arg(long, default_value_t = true)]
+    pub allow_offline: bool,
+    /// Write server.json but skip Router registration and client tunnel claim.
+    #[arg(long)]
+    pub skip_router_claim: bool,
+    /// Fail when setup is already complete instead of exiting successfully.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -245,6 +278,31 @@ mod tests {
                     stdin: false,
                 }
             } if value == "new-password-123"
+        ));
+    }
+
+    #[test]
+    fn parses_init_subcommand() {
+        let cli = Cli::try_parse_from([
+            "cc-switch-server",
+            "--config-dir",
+            "/tmp/cc-switch-server-init",
+            "init",
+            "--owner-email",
+            "owner@example.com",
+            "--router-url",
+            "https://sgptokenswitch.cc",
+            "--password",
+            "password123",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Init(args)
+                if args.owner_email == "owner@example.com"
+                && args.router_url == "https://sgptokenswitch.cc"
+                && args.password.as_deref() == Some("password123")
         ));
     }
 

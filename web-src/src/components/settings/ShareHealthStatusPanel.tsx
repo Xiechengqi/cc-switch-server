@@ -235,17 +235,43 @@ export function ShareHealthStatusPanel() {
         defaultValue: "未注册",
       });
 
-  const clientMeta = data.clientTunnel.tunnelUrl
-    ? t("settings.share.health.clientTunnel.running", {
+  const clientMeta = (() => {
+    const claimStatus = data.clientTunnel.claimStatus;
+    const connectivity = data.clientTunnel.connectivityStatus;
+    if (claimStatus === "conflict") {
+      return t("settings.share.health.clientTunnel.conflict", {
+        defaultValue: "子域名冲突，未在 Router 注册",
+      });
+    }
+    if (claimStatus === "error") {
+      return t("settings.share.health.clientTunnel.claimFailed", {
+        defaultValue: "Router 注册失败",
+      });
+    }
+    if (claimStatus === "unclaimed") {
+      return t("settings.share.health.clientTunnel.unclaimed", {
+        defaultValue: "已配置，未在 Router 注册",
+      });
+    }
+    if (connectivity === "connected") {
+      return t("settings.share.health.clientTunnel.running", {
         defaultValue: "隧道已连接",
-      })
-    : data.clientTunnel.subdomain
-      ? t("settings.share.health.clientTunnel.stopped", {
-          defaultValue: "已配置但未连接",
-        })
-      : t("settings.share.health.notConfigured", {
-          defaultValue: "未配置",
-        });
+      });
+    }
+    if (connectivity === "connecting") {
+      return t("settings.share.health.clientTunnel.connecting", {
+        defaultValue: "已注册，隧道连接中",
+      });
+    }
+    if (data.clientTunnel.expectedUrl || data.clientTunnel.subdomain) {
+      return t("settings.share.health.clientTunnel.stopped", {
+        defaultValue: "已注册但未连接",
+      });
+    }
+    return t("settings.share.health.notConfigured", {
+      defaultValue: "未配置",
+    });
+  })();
 
   const healthyShareCount = data.shares.filter(
     (share: ShareHealthItem) => share.status === "healthy",
@@ -324,7 +350,8 @@ export function ShareHealthStatusPanel() {
           })}
           level={data.clientTunnel.status}
           detail={
-            data.clientTunnel.tunnelUrl ||
+            data.clientTunnel.activeUrl ||
+            data.clientTunnel.expectedUrl ||
             (data.clientTunnel.subdomain
               ? `${data.clientTunnel.subdomain}.${data.router.domain}`
               : undefined)

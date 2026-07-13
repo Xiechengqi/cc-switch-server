@@ -9,13 +9,10 @@ use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::Argon2;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
 const CONFIG_FILE_NAME: &str = "server.json";
-const CLIENT_SUBDOMAIN_SUFFIX_LEN: usize = 5;
-const CLIENT_SUBDOMAIN_PREFIX_LEN: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -247,12 +244,42 @@ impl Default for UpstreamProxyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SetupOptions {
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default = "default_true")]
+    pub allow_offline: bool,
+    #[serde(default)]
+    pub issue_session_token: bool,
+    #[serde(default)]
+    pub issue_api_token: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SetupOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            allow_offline: true,
+            issue_session_token: false,
+            issue_api_token: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetupInput {
     pub password: String,
     pub owner_email: String,
     pub router_url: String,
     #[serde(default)]
     pub client_tunnel_subdomain: Option<String>,
+    #[serde(default)]
+    pub options: Option<SetupOptions>,
 }
 
 impl ServerConfig {
@@ -318,6 +345,14 @@ impl ServerConfig {
         verify_secret(hash, password)
     }
 
+    pub fn preview_client_subdomain(subdomain: &str) -> anyhow::Result<String> {
+        normalize_subdomain(subdomain)
+    }
+
+    pub fn preview_router_url(router_url: &str) -> anyhow::Result<String> {
+        normalize_router_url(router_url)
+    }
+
     pub fn verify_api_token(&self, api_token: &str) -> bool {
         let Some(hash) = self.auth.api_token_hash.as_deref() else {
             return false;
@@ -381,7 +416,9 @@ impl ServerConfig {
         let router = router_config_from_setup_url(&input.router_url)?;
         let tunnel_subdomain = match input.client_tunnel_subdomain {
             Some(value) if !value.trim().is_empty() => normalize_subdomain(&value)?,
-            _ => default_client_subdomain(&owner_email),
+            _ => crate::domain::subdomain_suggest::generate_memorable_subdomain(
+                &mut rand::thread_rng(),
+            ),
         };
 
         Ok(Self {
@@ -652,26 +689,6 @@ fn normalize_subdomain(subdomain: &str) -> anyhow::Result<String> {
     Ok(value)
 }
 
-fn default_client_subdomain(owner_email: &str) -> String {
-    let email_prefix = owner_email.split('@').next().unwrap_or("client");
-    let prefix = email_prefix
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(CLIENT_SUBDOMAIN_PREFIX_LEN)
-        .collect::<String>();
-    let prefix = if prefix.is_empty() {
-        "client".to_string()
-    } else {
-        prefix
-    };
-    let suffix: String = rand::thread_rng()
-        .sample_iter(rand::distributions::Uniform::new_inclusive(b'a', b'z'))
-        .take(CLIENT_SUBDOMAIN_SUFFIX_LEN)
-        .map(char::from)
-        .collect();
-    format!("{prefix}{suffix}")
-}
-
 fn verify_secret(hash: &str, secret: &str) -> bool {
     let Ok(parsed_hash) = PasswordHash::new(hash) else {
         return false;
@@ -699,12 +716,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setup_generates_default_subdomain_from_email() {
+    fn setup_generates_memorable_subdomain_when_blank() {
         let config = ServerConfig::from_setup(SetupInput {
             password: "password123".to_string(),
             owner_email: "Alice.Example@Example.COM".to_string(),
             router_url: "https://router.example.com/".to_string(),
             client_tunnel_subdomain: None,
+            options: None,
         })
         .unwrap();
 
@@ -718,8 +736,8 @@ mod tests {
         );
         assert_eq!(config.router.domain.as_deref(), Some("router.example.com"));
         let subdomain = config.client.tunnel_subdomain.as_deref().unwrap();
-        assert_eq!(subdomain.len(), 10);
-        assert!(subdomain.starts_with("alice"));
+        assert!(subdomain.len() >= 6);
+        assert!(subdomain.chars().all(|ch| ch.is_ascii_lowercase()));
         assert!(config.verify_password("password123"));
         assert!(!config.verify_password("wrong-password"));
     }
@@ -731,6 +749,7 @@ mod tests {
             owner_email: "owner@example.com".to_string(),
             router_url: "http://router.local".to_string(),
             client_tunnel_subdomain: Some("route-abc12".to_string()),
+            options: None,
         })
         .unwrap();
 
@@ -747,6 +766,7 @@ mod tests {
             owner_email: "owner@example.com".to_string(),
             router_url: "https://sgptokenswitch.cc/".to_string(),
             client_tunnel_subdomain: Some("us01".to_string()),
+            options: None,
         })
         .unwrap();
 
@@ -761,6 +781,7 @@ mod tests {
             owner_email: "not-an-email".to_string(),
             router_url: "https://router.example.com".to_string(),
             client_tunnel_subdomain: None,
+            options: None,
         });
 
         assert!(result.is_err());
@@ -773,6 +794,7 @@ mod tests {
             owner_email: "owner@example.com".to_string(),
             router_url: "https://router.example.com".to_string(),
             client_tunnel_subdomain: Some("owner".to_string()),
+            options: None,
         })
         .unwrap();
 

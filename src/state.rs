@@ -1071,7 +1071,7 @@ impl ServerStateInner {
         Ok(updated)
     }
 
-    async fn save_shares(&self) -> anyhow::Result<()> {
+    pub async fn save_shares(&self) -> anyhow::Result<()> {
         self.shares.read().await.save(&self.config_dir)
     }
 
@@ -2792,6 +2792,7 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
         record_router_error(&state, &config, error.to_string()).await;
         return Err(error);
     }
+    crate::client_tunnel_provision::mark_claim_success(&state, &mut config).await;
     let lease = match client::issue_client_web_lease(&http_client, &config, subdomain).await {
         Ok(lease) => lease,
         Err(error) => {
@@ -2803,7 +2804,6 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
     let mut next = config;
     next.client.tunnel_status = Some("connected".to_string());
     next.router.ssh_host = Some(lease.ssh_addr.clone());
-    next.router.last_register_error = None;
     state.replace_config(next).await?;
     Ok(lease)
 }

@@ -106,6 +106,7 @@ async fn web_invoke_dispatch(
                     owner_email,
                     router_url,
                     client_tunnel_subdomain,
+                    options: None,
                 }),
             )
             .await?;
@@ -522,42 +523,92 @@ async fn web_invoke_dispatch(
             Ok(web_client_tunnel_share_status(runtime))
         }
         "get_share_health_status" => Ok(web_share_health_status(state).await),
+        "check_client_tunnel_subdomain" => {
+            let subdomain = web_arg_string_any(&args, &["subdomain", "tunnelSubdomain"])?;
+            let config = state.config.read().await;
+            let subdomain = ServerConfig::preview_client_subdomain(&subdomain)
+                .map_err(ApiError::bad_request)?;
+            let router_url = config
+                .router_api_base()
+                .ok_or_else(|| ApiError::bad_request("router url is not configured"))?;
+            let installation_id = config
+                .router
+                .identity
+                .as_ref()
+                .map(|identity| identity.installation_id.as_str());
+            let availability = crate::client_tunnel_provision::check_subdomain_for_router(
+                &state,
+                router_url,
+                &subdomain,
+                installation_id,
+            )
+            .await?;
+            Ok(json!({
+                "ok": true,
+                "available": availability.available,
+                "reason": availability.reason,
+            }))
+        }
+        "suggest_client_tunnel_subdomain" => {
+            let config = state.config.read().await;
+            let router_url = config
+                .router_api_base()
+                .ok_or_else(|| ApiError::bad_request("router url is not configured"))?;
+            let installation_id = config
+                .router
+                .identity
+                .as_ref()
+                .map(|identity| identity.installation_id.as_str());
+            let outcome = crate::client_tunnel_provision::suggest_client_tunnel_subdomain(
+                &state,
+                router_url,
+                installation_id,
+            )
+            .await?;
+            Ok(json!(outcome))
+        }
+        "check_router_reachable" => {
+            let config = state.config.read().await;
+            let router_url = config
+                .router_api_base()
+                .ok_or_else(|| ApiError::bad_request("router url is not configured"))?;
+            let outcome =
+                crate::client_tunnel_provision::check_router_reachable(&state, router_url).await?;
+            Ok(json!(outcome))
+        }
         "claim_client_tunnel" => {
+            let mut config = state.config.read().await.clone();
             if web_has_payload(&args) {
                 let value = web_payload(&args, &["params", "input", "config"]);
                 let owner_email = web_optional_string_any(value, &["ownerEmail", "owner_email"]);
                 let subdomain = web_optional_string_any(value, &["tunnelSubdomain", "subdomain"]);
-                if owner_email.is_some() || subdomain.is_some() {
-                    let mut config = state.config.read().await.clone();
-                    if let Some(email) = owner_email {
-                        let email = crate::domain::settings::config::normalize_email(&email)
-                            .map_err(ApiError::bad_request)?;
-                        if !config
-                            .owner
-                            .email
-                            .as_deref()
-                            .is_some_and(|owner| owner.eq_ignore_ascii_case(&email))
-                        {
-                            return Err(ApiError::conflict(
-                                "client owner must be changed through verified email ownership",
-                            ));
-                        }
+                if let Some(email) = owner_email {
+                    let email = crate::domain::settings::config::normalize_email(&email)
+                        .map_err(ApiError::bad_request)?;
+                    if !config
+                        .owner
+                        .email
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(&email))
+                    {
+                        return Err(ApiError::conflict(
+                            "client owner must be changed through verified email ownership",
+                        ));
                     }
-                    if let Some(subdomain) = subdomain {
-                        config
-                            .update_client_tunnel(UpdateClientTunnelInput {
-                                tunnel_subdomain: Some(subdomain),
-                                tunnel_status: None,
-                            })
-                            .map_err(ApiError::bad_request)?;
-                    }
-                    state
-                        .replace_config(config)
-                        .await
-                        .map_err(ApiError::internal)?;
+                }
+                if let Some(subdomain) = subdomain {
+                    config
+                        .update_client_tunnel(UpdateClientTunnelInput {
+                            tunnel_subdomain: Some(subdomain),
+                            tunnel_status: None,
+                        })
+                        .map_err(ApiError::bad_request)?;
                 }
             }
-            let _ = claim_client_tunnel(State(state.clone()), headers.clone()).await?;
+            crate::client_tunnel_provision::claim_client_tunnel_config(&state, &config).await?;
+            if web_optional_bool(&args, &["autoStart", "auto_start"]).unwrap_or(true) {
+                crate::state::start_client_tunnel(state.clone()).await;
+            }
             Ok(web_client_tunnel_state(state).await)
         }
         "update_client_tunnel" => {

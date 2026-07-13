@@ -2442,6 +2442,93 @@ async fn web_invoke_complete_server_setup_works_without_session_before_setup() {
 }
 
 #[tokio::test]
+async fn setup_bootstrap_issues_session_token_without_prior_login() {
+    let app = app_router(test_state());
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/setup/bootstrap",
+            json!({
+                "password": "password123",
+                "ownerEmail": "owner@example.com",
+                "routerUrl": "http://127.0.0.1:9",
+                "clientTunnelSubdomain": "ownerabcde"
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    let body = json_body(response).await;
+    assert_eq!(body["ok"].as_bool(), Some(true));
+    assert!(body["sessionToken"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+}
+
+#[tokio::test]
+async fn setup_validate_is_dry_run_without_persisting_config() {
+    let app = app_router(test_state());
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/setup/validate",
+            json!({
+                "password": "password123",
+                "ownerEmail": "owner@example.com",
+                "routerUrl": "http://127.0.0.1:9",
+                "clientTunnelSubdomain": "ownerabcde"
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["dryRun"].as_bool(), Some(true));
+
+    let status = json_body(
+        app.oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/setup/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status["needsSetup"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn setup_rejects_repeat_initialization_with_code() {
+    let app = app_router(test_state());
+    let _ = setup_and_login(&app).await;
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/setup",
+            json!({
+                "password": "password456",
+                "ownerEmail": "other@example.com",
+                "routerUrl": "http://127.0.0.1:10"
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = json_body(response).await;
+    assert_eq!(body["code"].as_str(), Some("setup_already_complete"));
+}
+
+#[tokio::test]
 async fn web_invoke_email_auth_works_without_session_after_setup() {
     let app = app_router(test_state());
 

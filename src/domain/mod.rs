@@ -6,5 +6,6 @@ pub mod providers;
 pub mod settings;
 pub mod sharing;
 pub mod stream_check;
+pub mod subdomain_suggest;
 pub mod usage;
 pub mod web_auth;

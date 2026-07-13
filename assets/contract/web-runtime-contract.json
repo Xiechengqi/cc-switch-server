@@ -318,6 +318,13 @@
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
+      "name": "check_client_tunnel_subdomain",
+      "support": "native",
+      "implemented": true,
+      "feature": "router",
+      "notes": "Checks whether a Client Tunnel subdomain is available on the configured Router."
+    },
+    {
       "name": "check_env_conflicts",
       "support": "shim",
       "implemented": true,
@@ -337,6 +344,13 @@
       "implemented": true,
       "feature": "providers",
       "notes": "Server web runtime shim."
+    },
+    {
+      "name": "check_router_reachable",
+      "support": "native",
+      "implemented": true,
+      "feature": "router",
+      "notes": "Checks whether the configured Router health endpoint is reachable."
     },
     {
       "name": "claim_client_tunnel",
@@ -773,6 +787,13 @@
       "feature": "settings",
       "endpoint": "POST /api/admin/rollback",
       "notes": "Web invoke bridge for admin rollback to /tmp/cc-switch-server.bak and restart."
+    },
+    {
+      "name": "suggest_client_tunnel_subdomain",
+      "support": "native",
+      "implemented": true,
+      "feature": "router",
+      "notes": "Generates a memorable Client Tunnel subdomain and verifies availability on Router."
     },
     {
       "name": "start_admin_upgrade",

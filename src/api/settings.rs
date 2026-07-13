@@ -1,5 +1,94 @@
 use super::*;
 
+use serde::{Deserialize, Serialize};
+
+use crate::client_tunnel_provision::{
+    check_router_reachable, check_subdomain_for_router, suggest_client_tunnel_subdomain,
+    RouterReachabilityOutcome, SuggestSubdomainOutcome,
+};
+use crate::domain::settings::config::{ServerConfig, SetupInput, SetupOptions};
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct SetupSubdomainCheckRequest {
+    pub(in crate::api) router_url: String,
+    pub(in crate::api) subdomain: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct SetupSubdomainCheckResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct SetupRouterCheckRequest {
+    pub(in crate::api) router_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct SetupSuggestSubdomainRequest {
+    pub(in crate::api) router_url: String,
+}
+
+pub(in crate::api) async fn setup_check_router(
+    State(state): State<ServerState>,
+    Json(input): Json<SetupRouterCheckRequest>,
+) -> Result<Json<RouterReachabilityOutcome>, ApiError> {
+    if state.config.read().await.is_setup_complete() {
+        return Err(ApiError::conflict_code(
+            "setup_already_complete",
+            "server setup is already complete",
+        ));
+    }
+    let router_url =
+        ServerConfig::preview_router_url(&input.router_url).map_err(ApiError::bad_request)?;
+    let outcome = check_router_reachable(&state, &router_url).await?;
+    Ok(Json(outcome))
+}
+
+pub(in crate::api) async fn setup_suggest_subdomain(
+    State(state): State<ServerState>,
+    Json(input): Json<SetupSuggestSubdomainRequest>,
+) -> Result<Json<SuggestSubdomainOutcome>, ApiError> {
+    if state.config.read().await.is_setup_complete() {
+        return Err(ApiError::conflict_code(
+            "setup_already_complete",
+            "server setup is already complete",
+        ));
+    }
+    let router_url =
+        ServerConfig::preview_router_url(&input.router_url).map_err(ApiError::bad_request)?;
+    let outcome = suggest_client_tunnel_subdomain(&state, &router_url, None).await?;
+    Ok(Json(outcome))
+}
+
+pub(in crate::api) async fn setup_check_subdomain(
+    State(state): State<ServerState>,
+    Json(input): Json<SetupSubdomainCheckRequest>,
+) -> Result<Json<SetupSubdomainCheckResponse>, ApiError> {
+    if state.config.read().await.is_setup_complete() {
+        return Err(ApiError::conflict_code(
+            "setup_already_complete",
+            "server setup is already complete",
+        ));
+    }
+    let subdomain =
+        ServerConfig::preview_client_subdomain(&input.subdomain).map_err(ApiError::bad_request)?;
+    let router_url =
+        ServerConfig::preview_router_url(&input.router_url).map_err(ApiError::bad_request)?;
+    let availability = check_subdomain_for_router(&state, &router_url, &subdomain, None).await?;
+    Ok(Json(SetupSubdomainCheckResponse {
+        ok: true,
+        available: availability.available,
+        reason: availability.reason,
+    }))
+}
+
 pub(in crate::api) async fn setup_status(
     State(state): State<ServerState>,
 ) -> Json<SetupStatusResponse> {
@@ -7,77 +96,61 @@ pub(in crate::api) async fn setup_status(
     Json(SetupStatusResponse::from_config(&config))
 }
 
-// --- control helpers ---
+async fn run_setup(
+    state: &ServerState,
+    input: SetupInput,
+    exec: crate::setup::SetupExecution,
+) -> Result<Json<SetupResponse>, ApiError> {
+    let outcome = crate::setup::complete_setup(state, input, exec).await?;
+    Ok(Json(SetupResponse::from_outcome(outcome)))
+}
+
+pub(in crate::api) async fn setup_validate(
+    State(state): State<ServerState>,
+    Json(mut input): Json<SetupInput>,
+) -> Result<Json<SetupResponse>, ApiError> {
+    if state.config.read().await.is_setup_complete() {
+        return Err(ApiError::conflict_code(
+            "setup_already_complete",
+            "server setup is already complete",
+        ));
+    }
+    input.options = Some(SetupOptions {
+        dry_run: true,
+        ..input.options.unwrap_or_default()
+    });
+    run_setup(
+        &state,
+        input,
+        crate::setup::SetupExecution {
+            start_client_tunnel: false,
+            skip_router_claim: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub(in crate::api) async fn setup_bootstrap(
+    State(state): State<ServerState>,
+    Json(input): Json<SetupInput>,
+) -> Result<Json<SetupResponse>, ApiError> {
+    run_setup(
+        &state,
+        input,
+        crate::setup::SetupExecution {
+            issue_session_token: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
 
 pub(in crate::api) async fn setup(
     State(state): State<ServerState>,
     Json(input): Json<SetupInput>,
 ) -> Result<Json<SetupResponse>, ApiError> {
-    if state.config.read().await.is_setup_complete() {
-        return Err(ApiError::conflict("server setup is already complete"));
-    }
-
-    let config = ServerConfig::from_setup(input).map_err(ApiError::bad_request)?;
-    let response = SetupResponse::from_config(&config);
-    let mut saved_config = config.clone();
-    state
-        .replace_config(saved_config.clone())
-        .await
-        .map_err(ApiError::internal)?;
-    if saved_config.router_api_base().is_some() {
-        let mut registered_config = saved_config.clone();
-        let http_client = state.http_client().await;
-        match crate::clients::router::client::register_installation(
-            &http_client,
-            &mut registered_config,
-        )
-        .await
-        {
-            Ok(_) => {
-                state
-                    .replace_config(registered_config.clone())
-                    .await
-                    .map_err(ApiError::internal)?;
-                saved_config = registered_config;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "router installation register during setup failed"
-                );
-            }
-        }
-        if saved_config.router.identity.is_some() {
-            if let Some(owner_email) = saved_config.owner.email.as_deref() {
-                if let Err(error) = crate::clients::router::email_auth::bind_owner_email_at_setup(
-                    &http_client,
-                    &saved_config,
-                    owner_email,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        error = %error.message,
-                        "router owner bootstrap bind during setup failed"
-                    );
-                }
-            }
-        }
-    }
-    if let Some(domain) = saved_config.router.domain.clone() {
-        if let Err(error) = state
-            .apply_ui_settings_patch_immediate(json!({ "shareRouterDomain": domain }))
-            .await
-        {
-            tracing::warn!(
-                error = %error,
-                "persist share router domain during setup failed"
-            );
-        }
-    }
-    crate::state::start_client_tunnel(state.clone()).await;
-
-    Ok(Json(response))
+    run_setup(&state, input, crate::setup::SetupExecution::default()).await
 }
 
 pub(in crate::api) async fn login(
@@ -417,7 +490,7 @@ pub(in crate::api) fn require_configured_owner_email(
     Ok(email)
 }
 
-pub(in crate::api) async fn issue_login_response(state: &ServerState) -> LoginResponse {
+pub(crate) async fn issue_login_response(state: &ServerState) -> LoginResponse {
     let token = generate_session_token();
     state
         .push_session(Session {

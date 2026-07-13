@@ -1,5 +1,7 @@
 use super::*;
 
+use axum::extract::Query;
+
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, ShareSyncOperation,
 };
@@ -121,7 +123,7 @@ pub(in crate::api) async fn claim_client_tunnel(
         .ok_or_else(|| ApiError::bad_request("client tunnel subdomain is not configured"))?;
     let tunnel = crate::clients::router::client::ClientTunnelConfig {
         owner_email,
-        subdomain,
+        subdomain: subdomain.clone(),
         enabled: true,
     };
     let http_client = state.http_client().await;
@@ -138,13 +140,7 @@ pub(in crate::api) async fn claim_client_tunnel(
     }
     match crate::clients::router::client::claim_client_tunnel(&http_client, &config, tunnel).await {
         Ok(()) => {
-            let mut next = config;
-            next.client.tunnel_status = Some("claimed_remote".to_string());
-            next.router.last_register_error = None;
-            state
-                .replace_config(next)
-                .await
-                .map_err(ApiError::internal)?;
+            crate::client_tunnel_provision::mark_claim_success(&state, &mut config).await;
             emit_tunnel_event(&state, "tunnel.changed", "client", "claimed_remote");
             Ok(Json(ClientTunnelClaimResponse {
                 ok: true,
@@ -153,18 +149,70 @@ pub(in crate::api) async fn claim_client_tunnel(
             }))
         }
         Err(error) => {
+            let message = error.to_string();
             let mut next = config;
             next.client.tunnel_status = Some("claim_failed".to_string());
-            next.router.last_register_error = Some(error.to_string());
+            next.router.last_register_error = Some(message.clone());
             state
                 .replace_config(next)
                 .await
                 .map_err(ApiError::internal)?;
+            {
+                let mut shares = state.shares.write().await;
+                shares.router_registered = false;
+                shares.last_router_error = Some(message.clone());
+            }
+            if let Err(error) = state.save_shares().await {
+                tracing::warn!(error = %error, "persist router claim failure failed");
+            }
+            if crate::client_tunnel_provision::is_subdomain_conflict_error(&message) {
+                return Err(crate::client_tunnel_provision::subdomain_conflict_error(
+                    &subdomain,
+                    Some("already_claimed"),
+                ));
+            }
             Err(ApiError::bad_gateway(format!(
                 "router client tunnel claim failed: {error}"
             )))
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ClientTunnelSubdomainCheckQuery {
+    pub(in crate::api) subdomain: String,
+}
+
+pub(in crate::api) async fn web_client_tunnel_subdomain_check(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ClientTunnelSubdomainCheckQuery>,
+) -> Result<Json<SetupSubdomainCheckResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let config = state.config.read().await;
+    let subdomain =
+        ServerConfig::preview_client_subdomain(&query.subdomain).map_err(ApiError::bad_request)?;
+    let router_url = config
+        .router_api_base()
+        .ok_or_else(|| ApiError::bad_request("router url is not configured"))?;
+    let installation_id = config
+        .router
+        .identity
+        .as_ref()
+        .map(|identity| identity.installation_id.as_str());
+    let availability = crate::client_tunnel_provision::check_subdomain_for_router(
+        &state,
+        router_url,
+        &subdomain,
+        installation_id,
+    )
+    .await?;
+    Ok(Json(SetupSubdomainCheckResponse {
+        ok: true,
+        available: availability.available,
+        reason: availability.reason,
+    }))
 }
 
 pub(in crate::api) async fn issue_client_tunnel_lease(

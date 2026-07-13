@@ -56,6 +56,31 @@ cc-switch-server doctor
 cc-switch-server doctor --check-port
 ```
 
+## CLI 初始化
+
+服务未启动 HTTP 时，可直接写 `server.json`：
+
+```bash
+cc-switch-server init \
+  --owner-email owner@example.com \
+  --router-url https://sgptokenswitch.cc \
+  --password-stdin
+```
+
+远程 HTTP 初始化（无需鉴权）：
+
+```bash
+scripts/bootstrap/server-init-http.sh
+```
+
+本机 CLI 初始化：
+
+```bash
+scripts/bootstrap/server-init-local.sh
+```
+
+服务启动后若尚未 setup，日志会打印浏览器、curl bootstrap、CLI init 三种方式的完整示例命令。
+
 ## systemd
 
 参考 `deploy/cc-switch-server.service`。生产环境建议显式设置：

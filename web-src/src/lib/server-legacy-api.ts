@@ -909,6 +909,78 @@ export async function loadUpgradeStatus(
   );
 }
 
+export async function checkSetupSubdomain(input: {
+  routerUrl: string;
+  subdomain: string;
+}): Promise<{ ok: boolean; available: boolean; reason?: string | null }> {
+  return jsonFetch("/api/setup/check-subdomain", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      routerUrl: input.routerUrl,
+      subdomain: input.subdomain,
+    }),
+  });
+}
+
+export async function checkSetupRouter(input: {
+  routerUrl: string;
+}): Promise<{ reachable: boolean }> {
+  return jsonFetch("/api/setup/check-router", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      routerUrl: input.routerUrl,
+    }),
+  });
+}
+
+export async function suggestSetupSubdomain(input: {
+  routerUrl: string;
+}): Promise<{
+  subdomain: string;
+  available: boolean;
+  checked: boolean;
+  attempts: number;
+}> {
+  return jsonFetch("/api/setup/suggest-subdomain", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      routerUrl: input.routerUrl,
+    }),
+  });
+}
+
+export async function bootstrapServerSetup(input: {
+  password: string;
+  ownerEmail: string;
+  routerUrl: string;
+  clientTunnelSubdomain?: string;
+  options?: {
+    issueApiToken?: boolean;
+  };
+}): Promise<{
+  ok: boolean;
+  sessionToken?: string;
+  apiToken?: string;
+  clientTunnelSubdomain?: string;
+  clientTunnelClaimStatus?: string;
+  warnings?: string[];
+}> {
+  return jsonFetch("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      password: input.password,
+      ownerEmail: input.ownerEmail,
+      routerUrl: input.routerUrl,
+      clientTunnelSubdomain: input.clientTunnelSubdomain ?? "",
+      options: input.options,
+    }),
+  });
+}
+
 export async function completeServerSetup(input: {
   password: string;
   ownerEmail: string;

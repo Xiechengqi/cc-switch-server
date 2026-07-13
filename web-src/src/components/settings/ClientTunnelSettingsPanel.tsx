@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
+import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { shareApi } from "@/lib/api/share";
 import {
   useClaimClientTunnelMutation,
   useClientTunnelQuery,
@@ -36,11 +38,30 @@ export function ClientTunnelSettingsPanel({
   const stopMutation = useStopClientTunnelMutation();
 
   const [subdomainInput, setSubdomainInput] = useState("");
+  const [routerReachable, setRouterReachable] = useState<boolean | null>(null);
 
   useEffect(() => {
     if (clientTunnel?.config?.subdomain) {
       setSubdomainInput(clientTunnel.config.subdomain);
     }
+  }, [clientTunnel?.config?.subdomain]);
+
+  useEffect(() => {
+    let active = true;
+    setRouterReachable(null);
+    void (async () => {
+      try {
+        const response = await shareApi.checkRouterReachable();
+        if (!active) return;
+        setRouterReachable(response.reachable);
+      } catch {
+        if (!active) return;
+        setRouterReachable(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, [clientTunnel?.config?.subdomain]);
 
   const ownerEmail = clientTunnel?.config?.ownerEmail?.trim() ?? "";
@@ -112,12 +133,29 @@ export function ClientTunnelSettingsPanel({
               defaultValue: "Client Subdomain",
             })}
           </div>
-          <Input
-            className="h-9"
-            value={subdomainInput}
-            disabled={isLoading || isSaving}
-            onChange={(event) => setSubdomainInput(event.target.value)}
-          />
+          <div className="flex items-center gap-2">
+            <Input
+              className="h-9 min-w-0 flex-1"
+              value={subdomainInput}
+              disabled={isLoading || isSaving}
+              onChange={(event) => setSubdomainInput(event.target.value)}
+            />
+            <SubdomainGeneratorButton
+              disabled={
+                isLoading || isSaving || routerReachable !== true
+              }
+              onGenerated={setSubdomainInput}
+              onError={(message) => toast.error(message)}
+              suggest={() => shareApi.suggestClientTunnelSubdomain()}
+            />
+          </div>
+          {routerReachable === false ? (
+            <p className="text-xs text-muted-foreground">
+              {t("server.auth.routerUnreachableForSubdomain", {
+                defaultValue: "Router 不可达，无法随机生成子域名",
+              })}
+            </p>
+          ) : null}
         </div>
         <div className="space-y-2">
           <div className="text-xs font-medium text-muted-foreground">

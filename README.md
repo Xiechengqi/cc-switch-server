@@ -134,15 +134,31 @@ cargo run -- serve --host 0.0.0.0 --port 15721
 http://127.0.0.1:15721
 ```
 
-或直接调用 setup API：
+或直接调用 setup API（无需鉴权）：
 
 ```bash
-curl -X POST http://127.0.0.1:15721/api/setup \
+curl -fsS -X POST http://127.0.0.1:15721/api/setup/bootstrap \
   -H 'content-type: application/json' \
-  -d '{"password":"password123","ownerEmail":"owner@example.com","routerUrl":"https://router.example.com","clientTunnelSubdomain":""}'
+  -d '{"password":"password123","ownerEmail":"owner@example.com","routerUrl":"https://sgptokenswitch.cc","clientTunnelSubdomain":""}'
 ```
 
-`clientTunnelSubdomain` 为空时，server 会按 owner email 前缀最多 5 位加 5 位随机小写字母生成。
+`clientTunnelSubdomain` 留空时，server 会生成可读的随机单词子域名并尽量在 Router 上验证可用性。响应中的 `sessionToken` 可直接作为 Bearer token 使用。
+
+或使用 CLI 在启动 HTTP 前写本地配置：
+
+```bash
+cc-switch-server init \
+  --owner-email owner@example.com \
+  --router-url https://sgptokenswitch.cc \
+  --password password123
+```
+
+官方脚本：
+
+```bash
+scripts/bootstrap/server-init-http.sh
+scripts/bootstrap/server-init-local.sh
+```
 
 查看 binary 构建信息：
 
@@ -233,7 +249,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 
 1. 启动 server，打开 `http://server-host:15721` 完成 setup。
 2. Router URL 填 router API base，例如 `https://router.example.com`。
-3. setup 完成后 server 可执行 `register -> client tunnel claim -> lease -> SSH reverse tunnel`；失败不会影响本地 Web，可在 Router 页查看错误。
+3. setup 会同步执行 `register -> owner bind -> client tunnel claim`；子域名冲突会在初始化阶段直接报错。Router 不可达时允许完成本地 setup，但健康状态会提示隧道未注册。子域名留空时 server 会自动生成唯一名称。
 4. “设置 → 分享 → 收款信息”可配置一个公开 EVM 地址、USDC/USDT 及 BSC/Base/Arbitrum One 网络；本地保存独立成功，随后自动签名同步到 Router。公开资料可通过 `GET /.well-known/cc-switch/payout-profile` 获取，且仅表示 owner 自行声明，未验证钱包所有权。
 4. 添加 provider 或 account 后创建 share；未填写 share subdomain 时，server 会自动生成。
 5. 点击 share tunnel start 后，server 会 claim share subdomain、申请 `http` lease 并建立 SSH reverse tunnel。
@@ -291,6 +307,8 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 - `GET /metrics`
 - `GET /version`
 - `GET /api/setup/status`
+- `POST /api/setup/validate`
+- `POST /api/setup/bootstrap`
 - `POST /api/setup`
 - `POST /api/auth/login`
 - `GET /api/provider-coverage`
