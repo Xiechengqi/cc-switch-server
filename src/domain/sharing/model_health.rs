@@ -34,6 +34,7 @@ pub struct ShareModelHealthResult {
     pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(alias = "lastCheckedAt")]
     pub checked_at: i64,
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -587,5 +588,38 @@ mod tests {
             ..UsageLogContext::default()
         });
         log
+    }
+
+    #[test]
+    fn model_health_result_uses_checked_at_wire_name() {
+        let result = ShareModelHealthResult {
+            app_type: "codex".to_string(),
+            requested_model: "gpt-5".to_string(),
+            actual_model: "gpt-5".to_string(),
+            status: "healthy".to_string(),
+            recent_results: vec!["healthy".to_string()],
+            status_code: Some(200),
+            latency_ms: 120,
+            error_message: None,
+            checked_at: 1_783_917_271_880,
+            source: "health_check".to_string(),
+            provider_id: Some("provider-1".to_string()),
+            provider_name: Some("Provider".to_string()),
+        };
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(serialized.contains("\"checkedAt\":1783917271880"));
+        assert!(!serialized.contains("lastCheckedAt"));
+
+        let from_router: ShareModelHealthResult = serde_json::from_value(serde_json::json!({
+            "appType": "codex",
+            "requestedModel": "gpt-5",
+            "actualModel": "gpt-5",
+            "status": "healthy",
+            "latencyMs": 120,
+            "lastCheckedAt": 99,
+            "source": "health_check"
+        }))
+        .unwrap();
+        assert_eq!(from_router.checked_at, 99);
     }
 }

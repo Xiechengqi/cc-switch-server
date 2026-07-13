@@ -260,10 +260,12 @@ pub struct ShareAppProvider {
     pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub is_current: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub codex_image_generation_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -640,6 +642,12 @@ fn app_provider(
         provider_type: Some(provider_type_id),
         is_current,
         enabled: true,
+        codex_image_generation_enabled: provider
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_image_generation_enabled)
+            .unwrap_or(false),
         account_email: account_context.account_email,
         subscription_level: account_context.subscription_level,
         subscription_expires_at: account_context.subscription_expires_at,
