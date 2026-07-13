@@ -1606,7 +1606,50 @@ fn proxy_points_to_addr(value: &str, bind_addr: SocketAddr) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+pub async fn refresh_router_installation_registration(state: &ServerState) {
+    let mut config = state.config.read().await.clone();
+    if !config.is_setup_complete() || config.router_api_base().is_none() {
+        return;
+    }
+    if config.router.identity.is_none() {
+        return;
+    }
+
+    let http_client = state.http_client().await;
+    match client::register_installation(&http_client, &mut config).await {
+        Ok(registration) => {
+            if let Err(error) = state.replace_config(config).await {
+                tracing::warn!(error = %error, "persist router installation refresh failed");
+                return;
+            }
+            if let Err(error) = state
+                .mutate_shares_immediate(|shares| {
+                    shares.router_registered = true;
+                    shares.last_router_error = None;
+                })
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "mark router registered after installation refresh failed"
+                );
+                return;
+            }
+            tracing::info!(
+                installation_id = %registration.installation_id,
+                app_version = %crate::build_info::router_registration_version(),
+                "refreshed router installation registration"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "router installation registration refresh failed");
+        }
+    }
+}
+
 pub async fn restore_tunnels(state: ServerState) {
+    refresh_router_installation_registration(&state).await;
+
     if state.config.read().await.is_setup_complete()
         && should_restore_client_tunnel(
             state
