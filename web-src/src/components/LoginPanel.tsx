@@ -15,14 +15,40 @@ import { loginWithPassword, readCachedPassword, WebRuntimeContext, writeToken } 
 
 type LoginMethod = "password" | "email" | "apiToken";
 
-function normalizeMethods(_context: WebRuntimeContext): LoginMethod[] {
+function normalizeMethods(context: WebRuntimeContext): LoginMethod[] {
   // LoginPanel is only rendered for direct server access (IP/loopback:15721).
-  // Router-backed email / API Token login stays on ClientWebLoginPage (tunnel URL).
-  return ["password"];
+  // Router-backed API Token login stays on ClientWebLoginPage (tunnel URL).
+  if (context.status === "setup-required" || context.auth?.setupRequired) {
+    return ["password"];
+  }
+  const methods: LoginMethod[] = ["password"];
+  if (context.auth?.ownerEmail?.trim()) {
+    methods.push("email");
+  }
+  return methods;
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isSetupAlreadyCompleteError(error: unknown): boolean {
+  return errorMessage(error).toLowerCase().includes("already complete");
+}
+
+async function saveSetupConfig(input: {
+  password: string;
+  ownerEmail: string;
+  routerUrl: string;
+  clientTunnelSubdomain?: string;
+}) {
+  try {
+    await completeServerSetup(input);
+  } catch (error) {
+    if (!isSetupAlreadyCompleteError(error)) {
+      throw error;
+    }
+  }
 }
 
 export function LoginPanel({
@@ -84,12 +110,26 @@ export function LoginPanel({
     setBusy("password");
     try {
       if (setupRequired) {
-        await completeServerSetup({
+        const normalizedCode = verificationCode.trim();
+        if (!normalizedCode) {
+          throw new Error(
+            t("server.auth.setupVerificationRequired", {
+              defaultValue: "请先获取并填写 Owner 邮箱验证码。",
+            }),
+          );
+        }
+        await saveSetupConfig({
           password,
           ownerEmail,
           routerUrl,
           clientTunnelSubdomain: clientTunnelSubdomain.trim() || undefined,
         });
+        const login = await verifyEmailLoginCode({
+          email: ownerEmail.trim(),
+          code: normalizedCode,
+        });
+        await completeLogin(login.token);
+        return;
       }
       await loginWithPassword(password);
       await onAuthenticated();
@@ -115,11 +155,20 @@ export function LoginPanel({
   }
 
   async function requestCode() {
-    if (!loginOwnerEmail) return;
+    const email = (setupRequired ? ownerEmail : loginOwnerEmail).trim();
+    if (!email) return;
     setError(null);
     setBusy("requestCode");
     try {
-      const response = await requestEmailLoginCode(loginOwnerEmail);
+      if (setupRequired) {
+        await saveSetupConfig({
+          password,
+          ownerEmail: email,
+          routerUrl,
+          clientTunnelSubdomain: clientTunnelSubdomain.trim() || undefined,
+        });
+      }
+      const response = await requestEmailLoginCode(email);
       setCodeHint(
         t("server.auth.codeSentTo", {
           defaultValue: "验证码已发送至 {{destination}}",
@@ -286,6 +335,53 @@ export function LoginPanel({
                 value={password}
                 onChange={setPassword}
               />
+              <label>
+                <span>{t("server.settings.verificationCode")}</span>
+                <input
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  value={verificationCode}
+                  onChange={(event) => setVerificationCode(event.target.value)}
+                  placeholder="123456"
+                />
+              </label>
+              <div className="auth-inline-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={
+                    !ownerEmail.trim() ||
+                    !routerUrl.trim() ||
+                    !password ||
+                    busy !== null ||
+                    resendCooldown > 0
+                  }
+                  onClick={() => void requestCode()}
+                >
+                  {busy === "requestCode" ? (
+                    <Loader2 size={15} className="spin" />
+                  ) : (
+                    <Mail size={15} />
+                  )}
+                  <span>
+                    {resendCooldown > 0
+                      ? t("server.auth.resendIn", {
+                          defaultValue: "{{seconds}} 秒后可重发",
+                          seconds: resendCooldown,
+                        })
+                      : t("server.settings.requestCode")}
+                  </span>
+                </button>
+              </div>
+              {codeHint ? (
+                <p className="auth-hint auth-grid-span-2">{codeHint}</p>
+              ) : null}
+              <p className="auth-hint auth-grid-span-2">
+                {t("server.auth.setupEmailHint", {
+                  defaultValue:
+                    "Router 会向 Owner 邮箱发送验证码，用于绑定 Client Tunnel 所有权。",
+                })}
+              </p>
             </div>
           ) : null}
 
@@ -379,7 +475,14 @@ export function LoginPanel({
             <button
               className="primary-button"
               type="submit"
-              disabled={busy !== null || !password}
+              disabled={
+                busy !== null ||
+                !password ||
+                (setupRequired &&
+                  (!ownerEmail.trim() ||
+                    !routerUrl.trim() ||
+                    !verificationCode.trim()))
+              }
             >
               {busy === "password" ? (
                 <Loader2 size={16} className="spin" />

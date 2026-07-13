@@ -5,9 +5,7 @@ use anyhow::Context;
 use serde_json::{json, Value};
 
 use crate::domain::settings::config::ServerConfig;
-use crate::domain::sharing::share_router_domain::{
-    router_domain_from_url, DEFAULT_SHARE_ROUTER_DOMAIN,
-};
+use crate::domain::sharing::share_router_domain::resolve_share_router_domain;
 
 const UI_SETTINGS_FILE_NAME: &str = "ui-settings.json";
 pub const DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES: u64 = 30;
@@ -49,14 +47,12 @@ impl UiSettingsStore {
         let stored_domain = self
             .value
             .get("shareRouterDomain")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let resolved_domain = stored_domain
-            .or_else(|| server_config.router.domain.clone())
-            .or_else(|| router_domain_from_url(server_config.router.url.as_deref()))
-            .unwrap_or_else(|| DEFAULT_SHARE_ROUTER_DOMAIN.to_string());
+            .and_then(Value::as_str);
+        let resolved_domain = resolve_share_router_domain(
+            stored_domain,
+            server_config.router.domain.as_deref(),
+            server_config.router.url.as_deref(),
+        );
         if let Value::Object(ref mut map) = settings {
             map.insert("shareRouterDomain".into(), json!(resolved_domain));
         }
@@ -395,6 +391,30 @@ pub fn settings_patch_from_args(args: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::settings::config::ServerConfig;
+
+    #[test]
+    fn settings_for_frontend_prefers_server_router_config() {
+        let store = UiSettingsStore {
+            value: json!({ "shareRouterDomain": "jptokenswitch.cc" }),
+        };
+        let config = ServerConfig {
+            auth: Default::default(),
+            owner: Default::default(),
+            router: crate::domain::settings::config::RouterConfig {
+                url: Some("https://sgptokenswitch.cc".to_string()),
+                domain: Some("sgptokenswitch.cc".to_string()),
+                ..Default::default()
+            },
+            client: Default::default(),
+            upstream_proxy: Default::default(),
+        };
+        let settings = store.settings_for_frontend(&config);
+        assert_eq!(
+            settings["shareRouterDomain"].as_str(),
+            Some("sgptokenswitch.cc")
+        );
+    }
 
     #[test]
     fn merge_preserves_nested_objects() {

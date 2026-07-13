@@ -19,10 +19,46 @@ pub(in crate::api) async fn setup(
 
     let config = ServerConfig::from_setup(input).map_err(ApiError::bad_request)?;
     let response = SetupResponse::from_config(&config);
+    let mut saved_config = config.clone();
     state
-        .replace_config(config)
+        .replace_config(saved_config.clone())
         .await
         .map_err(ApiError::internal)?;
+    if saved_config.router_api_base().is_some() {
+        let mut registered_config = saved_config.clone();
+        let http_client = state.http_client().await;
+        match crate::clients::router::client::register_installation(
+            &http_client,
+            &mut registered_config,
+        )
+        .await
+        {
+            Ok(_) => {
+                state
+                    .replace_config(registered_config.clone())
+                    .await
+                    .map_err(ApiError::internal)?;
+                saved_config = registered_config;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "router installation register during setup failed"
+                );
+            }
+        }
+    }
+    if let Some(domain) = saved_config.router.domain.clone() {
+        if let Err(error) = state
+            .apply_ui_settings_patch_immediate(json!({ "shareRouterDomain": domain }))
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                "persist share router domain during setup failed"
+            );
+        }
+    }
     crate::state::start_client_tunnel(state.clone()).await;
 
     Ok(Json(response))

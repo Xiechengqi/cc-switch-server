@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::Path;
 
+use crate::domain::sharing::share_router_domain::{
+    normalize_share_router_domain, router_domain_from_url, share_router_region_for_domain,
+};
 use anyhow::{bail, Context};
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
@@ -371,7 +374,7 @@ impl ServerConfig {
 
     pub fn from_setup(input: SetupInput) -> anyhow::Result<Self> {
         let owner_email = normalize_email(&input.owner_email)?;
-        let router_url = normalize_router_url(&input.router_url)?;
+        let router = router_config_from_setup_url(&input.router_url)?;
         let tunnel_subdomain = match input.client_tunnel_subdomain {
             Some(value) if !value.trim().is_empty() => normalize_subdomain(&value)?,
             _ => default_client_subdomain(&owner_email),
@@ -388,18 +391,7 @@ impl ServerConfig {
                 email: Some(owner_email),
                 ..OwnerConfig::default()
             },
-            router: RouterConfig {
-                url: Some(router_url),
-                api_base: None,
-                domain: None,
-                region: None,
-                ssh_host: None,
-                ssh_user: None,
-                custom: false,
-                identity: None,
-                last_register_error: None,
-                last_registered_at_ms: None,
-            },
+            router,
             client: ClientConfig {
                 tunnel_subdomain: Some(tunnel_subdomain),
                 tunnel_status: Some("claimed".to_string()),
@@ -579,6 +571,28 @@ fn normalize_router_url(router_url: &str) -> anyhow::Result<String> {
     Ok(value)
 }
 
+fn router_config_from_setup_url(router_url: &str) -> anyhow::Result<RouterConfig> {
+    let url = normalize_router_url(router_url)?;
+    let domain = router_domain_from_url(Some(&url))
+        .map(|value| normalize_share_router_domain(&value).unwrap_or(value));
+    let region = domain
+        .as_deref()
+        .and_then(share_router_region_for_domain)
+        .map(str::to_string);
+    Ok(RouterConfig {
+        url: Some(url),
+        api_base: None,
+        domain,
+        region,
+        ssh_host: None,
+        ssh_user: None,
+        custom: false,
+        identity: None,
+        last_register_error: None,
+        last_registered_at_ms: None,
+    })
+}
+
 fn optional_trimmed(value: String) -> Option<String> {
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
@@ -698,6 +712,7 @@ mod tests {
             config.router.url.as_deref(),
             Some("https://router.example.com")
         );
+        assert_eq!(config.router.domain.as_deref(), Some("router.example.com"));
         let subdomain = config.client.tunnel_subdomain.as_deref().unwrap();
         assert_eq!(subdomain.len(), 10);
         assert!(subdomain.starts_with("alice"));
@@ -719,6 +734,20 @@ mod tests {
             config.client.tunnel_subdomain.as_deref(),
             Some("route-abc12")
         );
+    }
+
+    #[test]
+    fn setup_resolves_known_share_router_domain_and_region() {
+        let config = ServerConfig::from_setup(SetupInput {
+            password: "password123".to_string(),
+            owner_email: "owner@example.com".to_string(),
+            router_url: "https://sgptokenswitch.cc/".to_string(),
+            client_tunnel_subdomain: Some("us01".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(config.router.domain.as_deref(), Some("sgptokenswitch.cc"));
+        assert_eq!(config.router.region.as_deref(), Some("singapore"));
     }
 
     #[test]

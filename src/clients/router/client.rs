@@ -77,6 +77,15 @@ pub struct ClientTunnelResponse {
     pub tunnel: Option<ClientTunnelView>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallationOwnerEmailResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientTunnelClaimRequest {
@@ -438,6 +447,54 @@ pub async fn get_client_tunnel(
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     bail!("router client tunnel get failed: {status}: {body}");
+}
+
+pub async fn get_installation_owner_email(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+) -> anyhow::Result<Option<String>> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/')
+        .to_string();
+    let identity = config
+        .router
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let empty = serde_json::json!({});
+    let signature = sign_payload(
+        identity,
+        "get_installation_owner_email",
+        &empty,
+        timestamp_ms,
+        &nonce,
+    )?;
+    let timestamp_ms = timestamp_ms.to_string();
+    let response = http
+        .get(format!("{api_base}/v1/installations/owner-email"))
+        .query(&[
+            ("installationId", identity.installation_id.as_str()),
+            ("timestampMs", timestamp_ms.as_str()),
+            ("nonce", nonce.as_str()),
+            ("signature", signature.as_str()),
+        ])
+        .send()
+        .await
+        .context("send router installation owner email status")?;
+    if response.status().is_success() {
+        let body = response
+            .json::<InstallationOwnerEmailResponse>()
+            .await
+            .context("parse router installation owner email response")?;
+        return Ok(body.owner_email);
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    bail!("router installation owner email status failed: {status}: {body}");
 }
 
 pub async fn update_client_tunnel(

@@ -143,6 +143,18 @@ export function ClientTunnelSettingsPanel({
         </div>
       </div>
 
+      {clientTunnel?.status?.lastError &&
+      /owner email is not verified|installation owner email is not configured/i.test(
+        clientTunnel.status.lastError,
+      ) ? (
+        <p className="text-xs text-muted-foreground">
+          {t("settings.share.clientTunnel.ownerVerifyHint", {
+            defaultValue:
+              "请退出登录后，使用「邮箱验证码」重新登录一次，以在 Router 上绑定 Owner 邮箱。",
+          })}
+        </p>
+      ) : null}
+
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-muted-foreground">{statusLabel}</span>
         {!hideSaveButton ? (

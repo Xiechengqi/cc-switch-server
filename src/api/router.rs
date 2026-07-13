@@ -125,6 +125,17 @@ pub(in crate::api) async fn claim_client_tunnel(
         enabled: true,
     };
     let http_client = state.http_client().await;
+    if let Err(error) = crate::state::ensure_router_installation_owner_bound(&state, &config).await
+    {
+        let mut next = config;
+        next.client.tunnel_status = Some("claim_failed".to_string());
+        next.router.last_register_error = Some(error.to_string());
+        state
+            .replace_config(next)
+            .await
+            .map_err(ApiError::internal)?;
+        return Err(ApiError::conflict(error.to_string()));
+    }
     match crate::clients::router::client::claim_client_tunnel(&http_client, &config, tunnel).await {
         Ok(()) => {
             let mut next = config;

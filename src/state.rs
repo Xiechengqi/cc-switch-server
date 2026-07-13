@@ -2672,6 +2672,72 @@ fn clamp_u128_to_u64(value: u128) -> u64 {
     value.min(u128::from(u64::MAX)) as u64
 }
 
+pub(crate) async fn ensure_router_installation_owner_bound(
+    state: &ServerState,
+    config: &ServerConfig,
+) -> anyhow::Result<()> {
+    let expected_owner = config
+        .owner
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("owner email is not configured"))?;
+    if config
+        .router
+        .identity
+        .as_ref()
+        .is_none_or(|identity| identity.installation_id.trim().is_empty())
+    {
+        anyhow::bail!("router installation is not registered");
+    }
+
+    let http_client = state.http_client().await;
+    if let Ok(Some(bound_owner)) = client::get_installation_owner_email(&http_client, config).await
+    {
+        if bound_owner.eq_ignore_ascii_case(expected_owner) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "router installation owner email ({bound_owner}) does not match configured owner ({expected_owner})"
+        );
+    }
+
+    if let Ok(Some(email_state)) = crate::clients::router::email_auth::load_state(&state.config_dir)
+    {
+        if email_state.email.eq_ignore_ascii_case(expected_owner) {
+            if let Some(access_token) = email_state
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                match crate::clients::router::email_auth::bind_owner_email(
+                    &http_client,
+                    config,
+                    expected_owner,
+                    access_token,
+                )
+                .await
+                {
+                    Ok(binding) if binding.ok => return Ok(()),
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error.message,
+                            "bind router owner email from stored session failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "router installation owner email is not verified; request an email verification code for {expected_owner} and sign in before claiming the client tunnel"
+    )
+}
+
 async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLeaseResponse> {
     let mut config = state.config.read().await.clone();
     if !config.is_setup_complete() {
@@ -2694,6 +2760,11 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
         if let Err(error) = reconcile_payout_profile_to_router(state.clone()).await {
             tracing::warn!(error = %error, "router payout profile reconcile after implicit registration failed");
         }
+    }
+
+    if let Err(error) = ensure_router_installation_owner_bound(&state, &config).await {
+        record_router_error(&state, &config, error.to_string()).await;
+        return Err(error);
     }
 
     let owner_email = config

@@ -61,6 +61,28 @@ pub fn router_domain_from_url(url: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+pub fn resolve_share_router_domain(
+    stored_domain: Option<&str>,
+    router_domain: Option<&str>,
+    router_url: Option<&str>,
+) -> String {
+    let configured = router_domain
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| router_domain_from_url(router_url));
+    if let Some(domain) = configured {
+        return normalize_share_router_domain(&domain).unwrap_or(domain);
+    }
+    if let Some(stored) = stored_domain
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return stored.to_string();
+    }
+    DEFAULT_SHARE_ROUTER_DOMAIN.to_string()
+}
+
 fn validate_share_router_authority(authority: &str) -> Result<(), String> {
     if authority.is_empty()
         || authority.len() > 253
@@ -133,6 +155,26 @@ mod tests {
         assert_eq!(
             share_router_region_for_domain("jptokenswitch.cc"),
             Some("japan")
+        );
+    }
+
+    #[test]
+    fn resolve_share_router_domain_prefers_server_config_over_stored_default() {
+        assert_eq!(
+            resolve_share_router_domain(
+                Some("jptokenswitch.cc"),
+                None,
+                Some("https://sgptokenswitch.cc"),
+            ),
+            "sgptokenswitch.cc"
+        );
+        assert_eq!(
+            resolve_share_router_domain(
+                Some("jptokenswitch.cc"),
+                Some("sgptokenswitch.cc"),
+                Some("https://jptokenswitch.cc"),
+            ),
+            "sgptokenswitch.cc"
         );
     }
 }
