@@ -17,7 +17,7 @@ export function ProviderEmptyState({
     appId === "claude" || appId === "codex" || appId === "gemini";
 
   return (
-    <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border p-10 text-center">
+    <div className="density-empty-state flex flex-col items-center justify-center rounded-lg border border-dashed border-border p-10 text-center">
       <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
         <Users className="h-7 w-7 text-muted-foreground" />
       </div>

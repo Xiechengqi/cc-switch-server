@@ -92,7 +92,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           transition={{ duration: 0.2 }}
-          className="fixed inset-0 z-[60] flex min-h-0 flex-col overflow-hidden"
+          className="density-fullscreen-panel fixed inset-0 z-[60] flex min-h-0 flex-col overflow-hidden"
           style={{ backgroundColor: "hsl(var(--background))" }}
         >
           {/* Drag region - match App.tsx. Linux 上 DRAG_BAR_HEIGHT=0，
@@ -111,7 +111,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
 
           {/* Header - match App.tsx */}
           <div
-            className="flex-shrink-0 flex items-center"
+            className="density-fullscreen-header flex-shrink-0 flex items-center"
             {...DRAG_REGION_ATTR}
             style={
               {
@@ -151,7 +151,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
             <div
               className={cn(
                 PAGE_SHELL_CLASS,
-                "space-y-6 py-6",
+                "density-fullscreen-content space-y-6 py-6",
                 PAGE_SHELL_PADDING_X,
                 footer && "pb-8",
                 contentClassName,
@@ -164,7 +164,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
           {/* Footer */}
           {footer && (
             <div
-              className="flex-shrink-0 py-4 border-t border-border-default"
+              className="density-fullscreen-footer flex-shrink-0 py-4 border-t border-border-default"
               style={{ backgroundColor: "hsl(var(--background))" }}
             >
               <div

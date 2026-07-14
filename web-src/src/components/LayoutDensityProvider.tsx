@@ -33,10 +33,16 @@ export function LayoutDensityProvider({
     const next = detectLayoutDensity();
     setDensity(next);
     applyLayoutDensityClass(next);
+    if (typeof document !== "undefined") {
+      document.body.dataset.density = next;
+    }
   }, []);
 
   React.useEffect(() => {
     applyLayoutDensityClass(density);
+    if (typeof document !== "undefined") {
+      document.body.dataset.density = density;
+    }
   }, [density]);
 
   const value = React.useMemo(
@@ -49,7 +55,7 @@ export function LayoutDensityProvider({
 
   return (
     <LayoutDensityContext.Provider value={value}>
-      {children}
+      <div className="density-app-surface min-h-screen">{children}</div>
     </LayoutDensityContext.Provider>
   );
 }

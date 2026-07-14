@@ -495,7 +495,7 @@ export function ProviderCard({
           </div>
         </div>
 
-        <div className="flex w-full min-w-0 flex-col gap-2 sm:ml-auto sm:w-auto sm:max-w-[55%]">
+        <div className="provider-card-side flex w-full min-w-0 flex-col gap-2 sm:ml-auto sm:w-auto sm:max-w-[55%]">
           <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-x-1 gap-y-1">
             {quotaSource === "copilot" ? (
               <CopilotQuotaFooter

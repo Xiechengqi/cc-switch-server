@@ -73,6 +73,73 @@ html.density-compact .layout-page-content-scroll {
   padding-bottom: 0.75rem !important;
 }
 
+/* Settings page tabs + panels */
+html.density-compact .settings-page-tablist {
+  margin-bottom: 0.75rem !important;
+  gap: 0.125rem !important;
+  padding: 0.25rem !important;
+}
+
+html.density-compact .settings-page-tab-trigger {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  padding: 0.25rem 0.125rem !important;
+  font-size: 10px !important;
+  line-height: 1.15 !important;
+  font-weight: 500 !important;
+  height: auto !important;
+  min-height: 1.625rem !important;
+}
+
+html.density-compact .settings-page-content {
+  font-size: var(--density-text-sm);
+}
+
+html.density-compact .settings-page section h3 {
+  font-size: var(--density-text-sm) !important;
+  line-height: 1.25rem !important;
+}
+
+html.density-compact .settings-page section p {
+  font-size: var(--density-text-xs) !important;
+  line-height: 1.25rem !important;
+}
+
+html.density-compact .settings-page section .inline-flex {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  gap: 0.25rem !important;
+  padding: 0.25rem !important;
+}
+
+html.density-compact .settings-page section .inline-flex > button {
+  min-width: 0 !important;
+  flex: 1 1 calc(50% - 0.25rem) !important;
+  height: 1.5rem !important;
+  padding-inline: 0.375rem !important;
+  font-size: 10px !important;
+}
+
+html.density-compact .settings-page section .inline-flex > button svg {
+  height: 0.75rem !important;
+  width: 0.75rem !important;
+}
+
+html.density-compact .settings-page-tablist {
+  display: grid !important;
+}
+
+html.density-compact .settings-page-tabs--cols-6 .settings-page-tablist {
+  grid-template-columns: repeat(6, minmax(0, 1fr)) !important;
+}
+
+html.density-compact .settings-page-tabs--cols-5 .settings-page-tablist {
+  grid-template-columns: repeat(5, minmax(0, 1fr)) !important;
+}
+
 /* Legacy tables / settings grids */
 html.density-compact table {
   min-width: 0;
@@ -95,37 +162,6 @@ html.density-compact .panel {
   margin: var(--density-card-p);
 }
 
-/* Settings tabs */
-html.density-compact .settings-tabs-compact,
-.settings-tabs-compact {
-  display: flex;
-  width: 100%;
-  justify-content: flex-start;
-  overflow-x: auto;
-  gap: 0.25rem;
-  padding: 0.25rem;
-  margin-bottom: 0.75rem;
-  scrollbar-width: thin;
-}
-
-html.density-compact .settings-tabs-compact [role="tab"],
-.settings-tabs-compact [role="tab"] {
-  flex: 0 0 auto;
-  min-width: 0;
-  min-height: var(--density-control-h);
-  padding-inline: 0.625rem;
-  padding-block: 0.25rem;
-  font-size: var(--density-text-xs);
-}
-
-html.density-compact .settings-tab-panel {
-  gap: 0.75rem !important;
-}
-
-html.density-compact .settings-tab-panel > * + * {
-  margin-top: 0.75rem;
-}
-
 /* Surface cards: providers, shares, settings panels */
 html.density-compact .density-surface-card {
   padding: var(--density-card-p) !important;
@@ -133,6 +169,17 @@ html.density-compact .density-surface-card {
 
 html.density-compact .density-surface-card .density-surface-card-inner {
   gap: var(--density-gap) !important;
+}
+
+html.density-compact .density-surface-card-inner {
+  flex-direction: column !important;
+  align-items: stretch !important;
+}
+
+html.density-compact .provider-card-side {
+  margin-left: 0 !important;
+  max-width: 100% !important;
+  width: 100% !important;
 }
 
 html.density-compact .density-surface-card h3 {
@@ -186,7 +233,7 @@ html.density-compact [role="dialog"] {
 }
 
 html.density-compact .glass-card [data-radix-accordion-trigger] {
-  padding: 0.625rem 0.75rem !important;
+  padding: 0.5rem 0.75rem !important;
 }
 
 html.density-compact .glass-card [data-radix-accordion-trigger] h3 {
@@ -197,9 +244,84 @@ html.density-compact .glass-card [data-radix-accordion-trigger] p {
   font-size: var(--density-text-xs) !important;
 }
 
-html.density-compact .glass-card [data-radix-accordion-content] > div {
+html.density-compact .glass-card [data-radix-accordion-content] > div,
+html.density-compact .glass-card [data-radix-accordion-content].px-6 {
   padding-inline: 0.75rem !important;
   padding-bottom: 0.625rem !important;
+}
+
+html.density-compact .glass-card .px-6 {
+  padding-left: 0.75rem !important;
+  padding-right: 0.75rem !important;
+}
+
+html.density-compact .glass-card .py-4 {
+  padding-top: 0.5rem !important;
+  padding-bottom: 0.5rem !important;
+}
+
+html.density-compact .glass-card .pb-6 {
+  padding-bottom: 0.75rem !important;
+}
+
+html.density-compact .glass-card .pt-4 {
+  padding-top: 0.5rem !important;
+}
+
+html.density-compact .settings-tab-panel {
+  gap: 0.75rem !important;
+}
+
+html.density-compact .settings-tab-panel > * + * {
+  margin-top: 0.75rem !important;
+}
+
+html.density-compact .space-y-6 > :not([hidden]) ~ :not([hidden]) {
+  margin-top: 0.75rem !important;
+}
+
+html.density-compact .space-y-4 > :not([hidden]) ~ :not([hidden]) {
+  margin-top: var(--density-gap) !important;
+}
+
+html.density-compact .space-y-3 > :not([hidden]) ~ :not([hidden]) {
+  margin-top: calc(var(--density-gap) * 0.75) !important;
+}
+
+html.density-compact .gap-4 {
+  gap: var(--density-gap) !important;
+}
+
+html.density-compact .gap-3 {
+  gap: calc(var(--density-gap) * 0.75) !important;
+}
+
+html.density-compact .h-8 {
+  height: var(--density-control-h) !important;
+}
+
+html.density-compact .h-9 {
+  height: calc(var(--density-control-h) + 0.125rem) !important;
+}
+
+html.density-compact .min-h-7 {
+  min-height: 1.25rem !important;
+}
+
+html.density-compact .min-w-\[96px\] {
+  min-width: 4.25rem !important;
+}
+
+html.density-compact .min-w-\[120px\] {
+  min-width: 0 !important;
+}
+
+html.density-compact .text-xl {
+  font-size: var(--density-header-title) !important;
+}
+
+html.density-compact .text-lg {
+  font-size: 0.9375rem !important;
 }
 
 html.density-compact .app-switcher-compact button {
@@ -220,4 +342,290 @@ html.density-compact .share-auth-input.min-w-32 {
 html.density-compact .app-switcher-compact {
   padding: 0.125rem !important;
   gap: 0.125rem !important;
+}
+
+/* App surface scope */
+html.density-compact .density-app-surface {
+  font-size: var(--density-text-sm);
+}
+
+html.density-compact .density-app-surface .px-6 {
+  padding-left: var(--density-page-px) !important;
+  padding-right: var(--density-page-px) !important;
+}
+
+html.density-compact .density-app-surface .py-6 {
+  padding-top: 0.75rem !important;
+  padding-bottom: 0.75rem !important;
+}
+
+html.density-compact .text-2xl {
+  font-size: 1.0625rem !important;
+  line-height: 1.375rem;
+}
+
+/* Usage dashboard */
+html.density-compact .usage-dashboard.space-y-8 > :not([hidden]) ~ :not([hidden]) {
+  margin-top: 0.75rem !important;
+}
+
+html.density-compact .usage-dashboard {
+  padding-bottom: 1rem !important;
+}
+
+html.density-compact .usage-dashboard > .flex.flex-col.lg\:flex-row h2 {
+  font-size: 1rem !important;
+  line-height: 1.25rem;
+}
+
+html.density-compact .usage-dashboard .w-\[100px\] {
+  width: 4.25rem !important;
+  min-width: 0 !important;
+}
+
+html.density-compact .usage-dashboard .flex-wrap {
+  gap: 0.25rem !important;
+}
+
+html.density-compact .usage-dashboard .flex-wrap > .flex.items-center.p-1 button {
+  height: 1.5rem !important;
+  padding-inline: 0.375rem !important;
+}
+
+html.density-compact .usage-dashboard .flex-wrap > .flex.items-center.p-1 button svg,
+html.density-compact .usage-dashboard .flex-wrap > .flex.items-center.p-1 img {
+  height: 0.75rem !important;
+  width: 0.75rem !important;
+}
+
+/* Usage hero */
+html.density-compact .usage-hero [class*="CardContent"],
+html.density-compact .usage-hero .p-4,
+html.density-compact .usage-hero .md\:p-5 {
+  padding: 0.625rem !important;
+}
+
+html.density-compact .usage-hero .text-2xl,
+html.density-compact .usage-hero .md\:text-3xl {
+  font-size: 1.125rem !important;
+  line-height: 1.25rem;
+}
+
+html.density-compact .usage-hero .lg\:grid-cols-5 {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+}
+
+html.density-compact .usage-hero .grid-cols-2 {
+  gap: 0.375rem !important;
+}
+
+html.density-compact .usage-hero .gap-5 {
+  gap: 0.5rem !important;
+}
+
+html.density-compact .usage-hero .px-4 {
+  padding-inline: 0.5rem !important;
+}
+
+html.density-compact .usage-hero .py-2\.5 {
+  padding-block: 0.375rem !important;
+}
+
+/* Nested subtabs (usage logs / stats) */
+html.density-compact .density-subtabs [role="tablist"],
+html.density-compact .density-subtabs-list {
+  height: auto !important;
+  min-height: 0 !important;
+  padding: 0.125rem !important;
+  gap: 0.125rem !important;
+  flex-wrap: wrap;
+}
+
+html.density-compact .density-subtabs [role="tab"] {
+  font-size: 10px !important;
+  line-height: 1.15 !important;
+  padding: 0.25rem 0.375rem !important;
+  height: 1.5rem !important;
+  gap: 0.25rem !important;
+}
+
+html.density-compact .density-subtabs [role="tab"] svg {
+  height: 0.75rem !important;
+  width: 0.75rem !important;
+}
+
+/* Fullscreen provider form panel */
+html.density-compact .density-fullscreen-header {
+  height: 2.75rem !important;
+}
+
+html.density-compact .density-fullscreen-content.space-y-6 > :not([hidden]) ~ :not([hidden]) {
+  margin-top: 0.75rem !important;
+}
+
+html.density-compact .density-fullscreen-content {
+  padding-top: 0.5rem !important;
+  padding-bottom: 0.5rem !important;
+}
+
+html.density-compact .density-fullscreen-panel .text-lg {
+  font-size: 0.9375rem !important;
+}
+
+html.density-compact .density-fullscreen-footer {
+  padding-top: 0.5rem !important;
+  padding-bottom: 0.5rem !important;
+}
+
+/* Settings tab panels (auth/proxy/advanced without section wrappers) */
+html.density-compact .settings-page-content .p-4 {
+  padding: 0.625rem !important;
+}
+
+html.density-compact .settings-page-content .px-6 {
+  padding-left: 0.625rem !important;
+  padding-right: 0.625rem !important;
+}
+
+html.density-compact .settings-page-content .py-6,
+html.density-compact .settings-page-content .py-4 {
+  padding-top: 0.5rem !important;
+  padding-bottom: 0.5rem !important;
+}
+
+html.density-compact .settings-page-content .text-base {
+  font-size: var(--density-text-sm) !important;
+}
+
+html.density-compact .settings-page-content .rounded-xl.border {
+  border-radius: 0.625rem;
+}
+
+/* Empty / share list states */
+html.density-compact .density-empty-state.p-10 {
+  padding: 1rem !important;
+}
+
+html.density-compact .density-empty-state .text-xl {
+  font-size: 0.9375rem !important;
+}
+
+html.density-compact .density-empty-state .text-lg {
+  font-size: 0.875rem !important;
+}
+
+html.density-compact .density-empty-state .h-16 {
+  height: 2.5rem !important;
+  width: 2.5rem !important;
+}
+
+html.density-compact .density-empty-state .h-7 {
+  height: 1.25rem !important;
+  width: 1.25rem !important;
+}
+
+html.density-compact .density-empty-state .py-12 {
+  padding-top: 1.25rem !important;
+  padding-bottom: 1.25rem !important;
+}
+
+html.density-compact .share-list-skeleton .h-52 {
+  height: 8rem !important;
+}
+
+html.density-compact .share-list-root {
+  gap: var(--density-gap) !important;
+}
+
+/* Dialogs */
+html.density-compact .density-dialog {
+  max-width: var(--density-dialog-max-w) !important;
+}
+
+html.density-compact .density-dialog-header {
+  padding: 0.75rem 0.875rem !important;
+}
+
+html.density-compact .density-dialog-footer {
+  padding: 0.625rem 0.875rem !important;
+}
+
+html.density-compact .density-confirm-dialog .text-lg {
+  font-size: 0.9375rem !important;
+}
+
+html.density-compact .density-confirm-dialog .px-6 {
+  padding-left: 0.875rem !important;
+  padding-right: 0.875rem !important;
+}
+
+/* Proxy panel stats */
+html.density-compact .proxy-panel .md\:grid-cols-4 {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+}
+
+html.density-compact .proxy-panel .density-stat-card {
+  padding: 0.625rem !important;
+}
+
+html.density-compact .proxy-panel .density-stat-card .text-xl {
+  font-size: 0.9375rem !important;
+}
+
+html.density-compact .proxy-panel .density-stat-card .mb-2 {
+  margin-bottom: 0.25rem !important;
+}
+
+/* Failover toggle in header */
+html.density-compact .density-failover-toggle {
+  height: 1.625rem !important;
+  padding-inline: 0.25rem !important;
+  gap: 0.125rem !important;
+}
+
+html.density-compact .density-failover-toggle svg {
+  height: 0.75rem !important;
+  width: 0.75rem !important;
+}
+
+/* Client web login (iframe) */
+html.density-compact .density-auth-page.auth-shell {
+  padding: 0.5rem !important;
+  min-height: 100%;
+}
+
+html.density-compact .density-auth-page .auth-shell-card--compact {
+  width: min(100%, 100%) !important;
+  padding-top: 2rem !important;
+}
+
+html.density-compact .density-auth-page .auth-client-card {
+  padding: 0.875rem !important;
+}
+
+html.density-compact .density-auth-page .text-lg {
+  font-size: 0.9375rem !important;
+}
+
+html.density-compact .density-auth-page .h-12 {
+  height: 2rem !important;
+  width: 2rem !important;
+}
+
+html.density-compact .density-auth-page .mb-5 {
+  margin-bottom: 0.75rem !important;
+}
+
+html.density-compact .density-auth-page .mb-4 {
+  margin-bottom: 0.5rem !important;
+}
+
+html.density-compact .density-auth-page .grid.gap-2 button {
+  font-size: var(--density-text-xs) !important;
+  height: var(--density-control-h) !important;
+  padding-inline: 0.375rem !important;
+}
+
+html.density-compact .density-auth-page .grid.gap-3 {
+  gap: 0.5rem !important;
 }

@@ -62,7 +62,6 @@ import { ServerVersionSettings } from "@/components/settings/ServerVersionSettin
 import { ServerConfigDirSettings } from "@/components/settings/ServerConfigDirSettings";
 import { ShareSettingsTab, type ShareSettingsSaveState } from "@/components/settings/ShareSettingsTab";
 import { useInstalledSkills } from "@/hooks/useSkills";
-import { useLayoutDensity } from "@/hooks/useLayoutDensity";
 import { useImportExport } from "@/hooks/useImportExport";
 import { useTranslation } from "react-i18next";
 import { useSettings, type SettingsFormState } from "@/hooks/useSettings";
@@ -88,7 +87,6 @@ export function SettingsPage({
   onSignOut,
 }: SettingsDialogProps) {
   const { t } = useTranslation();
-  const { isCompact } = useLayoutDensity();
   const {
     settings,
     isLoading,
@@ -247,7 +245,7 @@ export function SettingsPage({
   return (
     <div
       className={cn(
-        "flex flex-col h-full overflow-hidden",
+        "settings-page flex flex-col h-full overflow-hidden",
         shellPaddingXClass(),
       )}
     >
@@ -259,41 +257,40 @@ export function SettingsPage({
         <Tabs
           value={activeTab}
           onValueChange={setActiveTab}
-          className="flex flex-col h-full"
+          className={cn(
+            "settings-page-tabs flex flex-col h-full",
+            serverMode ? "settings-page-tabs--cols-6" : "settings-page-tabs--cols-5",
+          )}
         >
           <TabsList
-            compact={isCompact}
             className={cn(
-              !isCompact &&
-                cn(
-                  "grid w-full mb-6",
-                  serverMode ? "grid-cols-6" : "grid-cols-5",
-                ),
+              "settings-page-tablist grid w-full glass rounded-lg mb-6",
+              serverMode ? "grid-cols-6" : "grid-cols-5",
             )}
           >
-            <TabsTrigger compact={isCompact} value="general">
+            <TabsTrigger className="settings-page-tab-trigger" value="general">
               {t("settings.tabGeneral")}
             </TabsTrigger>
-            <TabsTrigger compact={isCompact} value="proxy">
+            <TabsTrigger className="settings-page-tab-trigger" value="proxy">
               {t("settings.tabProxy")}
             </TabsTrigger>
-            <TabsTrigger compact={isCompact} value="auth">
+            <TabsTrigger className="settings-page-tab-trigger" value="auth">
               {t("settings.tabAuth", { defaultValue: "认证" })}
             </TabsTrigger>
             {serverMode ? (
-              <TabsTrigger compact={isCompact} value="share">
+              <TabsTrigger className="settings-page-tab-trigger" value="share">
                 {t("settings.tabShare", { defaultValue: "分享" })}
               </TabsTrigger>
             ) : null}
-            <TabsTrigger compact={isCompact} value="advanced">
+            <TabsTrigger className="settings-page-tab-trigger" value="advanced">
               {t("settings.tabAdvanced")}
             </TabsTrigger>
-            <TabsTrigger compact={isCompact} value="usage">
+            <TabsTrigger className="settings-page-tab-trigger" value="usage">
               {t("usage.title")}
             </TabsTrigger>
           </TabsList>
 
-          <div className="flex-1 min-h-0 flex flex-col">
+          <div className="settings-page-content flex-1 min-h-0 flex flex-col">
             <div
               ref={tabScrollContainerRef}
               className="flex-1 overflow-y-auto overflow-x-hidden pr-2"

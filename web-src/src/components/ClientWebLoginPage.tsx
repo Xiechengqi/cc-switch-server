@@ -189,7 +189,7 @@ export function ClientWebLoginPage({
   };
 
   return (
-    <div className="auth-shell">
+    <div className="auth-shell density-auth-page">
       <div className="auth-shell-card auth-shell-card--compact">
         <AuthLanguageSwitcher />
         <div className="auth-client-card">
