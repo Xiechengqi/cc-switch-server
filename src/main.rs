@@ -34,7 +34,17 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     cc_switch_server::state::restore_tunnels(state.clone()).await;
     cc_switch_server::state::spawn_periodic_backups(state.clone());
     cc_switch_server::state::spawn_periodic_share_sync_retry(state.clone());
+    cc_switch_server::state::spawn_auto_upgrade_scheduler(state.clone());
+    cc_switch_server::state::spawn_periodic_installation_status_report(state.clone());
     cc_switch_server::state::spawn_account_quota_refresh(state.clone());
+    let status_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) =
+            cc_switch_server::state::report_installation_upgrade_status(&status_state).await
+        {
+            tracing::warn!(error = %error, "initial installation upgrade status report failed");
+        }
+    });
     cc_switch_server::state::spawn_share_edit_event_listener(state.clone());
     cc_switch_server::api::serve(state).await
 }

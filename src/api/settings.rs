@@ -2,11 +2,14 @@ use super::*;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::session::require_local_server_owner_session;
 use crate::client_tunnel_provision::{
     check_router_reachable, check_subdomain_for_router_outcome, suggest_client_tunnel_subdomain,
     RouterReachabilityOutcome, SuggestSubdomainOutcome,
 };
-use crate::domain::settings::config::{ServerConfig, SetupInput, SetupOptions};
+use crate::domain::settings::config::{
+    ServerConfig, SetupInput, SetupOptions, UpgradePolicyConfig,
+};
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct SetupSubdomainCheckRequest {
@@ -616,4 +619,51 @@ pub(in crate::api) async fn update_upstream_proxy(
         ok: true,
         upstream_proxy,
     }))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct UpgradePolicyResponse {
+    pub delegate_upgrade_to_router_owner: bool,
+    pub auto_upgrade_enabled: bool,
+    pub auto_upgrade_check_interval_minutes: u64,
+}
+
+impl From<UpgradePolicyConfig> for UpgradePolicyResponse {
+    fn from(policy: UpgradePolicyConfig) -> Self {
+        Self {
+            delegate_upgrade_to_router_owner: policy.delegate_upgrade_to_router_owner,
+            auto_upgrade_enabled: policy.auto_upgrade_enabled,
+            auto_upgrade_check_interval_minutes: policy.auto_upgrade_check_interval_minutes,
+        }
+    }
+}
+
+pub(in crate::api) async fn upgrade_policy_snapshot(state: &ServerState) -> serde_json::Value {
+    let config = state.config.read().await;
+    serde_json::to_value(UpgradePolicyResponse::from(
+        config.upgrade_policy.clone().normalize(),
+    ))
+    .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+pub(in crate::api) async fn save_upgrade_policy(
+    state: &ServerState,
+    headers: HeaderMap,
+    value: serde_json::Value,
+) -> Result<UpgradePolicyResponse, ApiError> {
+    require_local_server_owner_session(state, &headers).await?;
+    let policy: UpgradePolicyConfig = serde_json::from_value(value)
+        .map_err(|error| ApiError::bad_request(format!("invalid upgrade policy: {error}")))?;
+    state
+        .set_upgrade_policy(policy.normalize())
+        .await
+        .map_err(ApiError::internal)?;
+    if let Err(error) = crate::state::report_installation_upgrade_status(state).await {
+        tracing::warn!(error = %error, "report installation upgrade status failed");
+    }
+    let config = state.config.read().await;
+    Ok(UpgradePolicyResponse::from(
+        config.upgrade_policy.clone().normalize(),
+    ))
 }

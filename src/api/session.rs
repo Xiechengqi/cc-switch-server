@@ -75,6 +75,22 @@ pub(crate) async fn resolve_web_admin_principal(
     Ok(None)
 }
 
+pub(crate) fn is_router_delegated_session(headers: &HeaderMap) -> bool {
+    router_web_user_email(headers).is_some()
+}
+
+pub(crate) async fn require_local_server_owner_session(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<WebAdminPrincipal, ApiError> {
+    if is_router_delegated_session(headers) {
+        return Err(ApiError::forbidden(
+            "only local server owner can change this setting",
+        ));
+    }
+    require_web_admin_session(state, headers).await
+}
+
 pub(crate) fn router_web_user_email(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-cc-switch-web-user-email")

@@ -242,9 +242,13 @@ pub(crate) async fn debug_upgrade_start(
     Json(input): Json<DebugUpgradeRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_debug_capability(&state, &headers, DebugCapability::Upgrade).await?;
-    let task_id =
-        super::self_update::start_upgrade_for_actor(&state, input.restart_after, "remote-debug")
-            .await?;
+    let task_id = super::self_update::start_upgrade_for_actor(
+        &state,
+        input.restart_after,
+        "remote-debug",
+        false,
+    )
+    .await?;
     Ok(Json(json!({ "ok": true, "taskId": task_id })))
 }
 

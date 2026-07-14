@@ -405,6 +405,7 @@ mod tests {
             },
             client: Default::default(),
             upstream_proxy: Default::default(),
+            upgrade_policy: Default::default(),
         };
         let settings = store.settings_for_frontend(&config);
         assert_eq!(

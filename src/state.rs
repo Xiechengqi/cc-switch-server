@@ -708,6 +708,16 @@ impl ServerStateInner {
         Ok(())
     }
 
+    pub async fn set_upgrade_policy(
+        &self,
+        policy: crate::domain::settings::config::UpgradePolicyConfig,
+    ) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        config.upgrade_policy = policy;
+        config.save(&self.config_dir)?;
+        Ok(())
+    }
+
     pub async fn config_snapshot(&self) -> ServerConfig {
         self.config.read().await.clone()
     }
@@ -1717,6 +1727,101 @@ pub fn spawn_periodic_backups(state: ServerState) {
             }
         }
     });
+}
+
+pub fn spawn_auto_upgrade_scheduler(state: ServerState) {
+    tokio::spawn(async move {
+        loop {
+            let (enabled, interval_minutes) = {
+                let config = state.config.read().await;
+                (
+                    config.upgrade_policy.auto_upgrade_enabled,
+                    config
+                        .upgrade_policy
+                        .auto_upgrade_check_interval_minutes
+                        .max(5),
+                )
+            };
+            if enabled {
+                if let Err(error) = run_auto_upgrade_tick(&state).await {
+                    tracing::warn!(error = %error, "auto upgrade tick failed");
+                }
+                sleep(Duration::from_secs(interval_minutes * 60)).await;
+            } else {
+                sleep(Duration::from_secs(60)).await;
+            }
+        }
+    });
+}
+
+async fn run_auto_upgrade_tick(state: &ServerState) -> anyhow::Result<()> {
+    if let Err(error) = report_installation_upgrade_status(state).await {
+        tracing::debug!(error = %error, "auto upgrade status report failed");
+    }
+    if state.upgrade.is_restart_pending().await {
+        return Ok(());
+    }
+    if let Some(handle) = state.upgrade.current().await {
+        if matches!(
+            *handle.status.lock().await,
+            crate::self_update::upgrade::UpgradeStatus::Running
+        ) {
+            return Ok(());
+        }
+    }
+    let client = state.http_client().await;
+    let latest = crate::self_update::version::fetch_latest_release_meta(&client).await;
+    if !latest.update_available {
+        return Ok(());
+    }
+    if crate::self_update::version::ensure_binary_writable().is_err() {
+        return Ok(());
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("cc-switch-server/0.1 auto-upgrade")
+        .build()
+        .context("build auto-upgrade client")?;
+    state
+        .upgrade
+        .start(
+            client,
+            Some("auto-upgrade".to_string()),
+            true,
+            false,
+            state.bind_addr,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(())
+}
+
+pub fn spawn_periodic_installation_status_report(state: ServerState) {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(60 * 60)).await;
+            if let Err(error) = report_installation_upgrade_status(&state).await {
+                tracing::debug!(error = %error, "periodic installation status report failed");
+            }
+        }
+    });
+}
+
+pub async fn report_installation_upgrade_status(state: &ServerState) -> anyhow::Result<()> {
+    let config = state.config.read().await.clone();
+    if config.router.identity.is_none() {
+        return Ok(());
+    }
+    let client = state.http_client().await;
+    let latest = crate::self_update::version::fetch_latest_release_meta(&client).await;
+    let upgrade_capable = crate::self_update::version::ensure_binary_writable().is_ok();
+    crate::clients::router::client::report_installation_status(
+        &client,
+        &config,
+        &config.upgrade_policy,
+        &latest,
+        upgrade_capable,
+    )
+    .await
 }
 
 pub fn spawn_periodic_share_sync_retry(state: ServerState) {

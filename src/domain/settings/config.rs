@@ -23,6 +23,41 @@ pub struct ServerConfig {
     pub client: ClientConfig,
     #[serde(default)]
     pub upstream_proxy: UpstreamProxyConfig,
+    #[serde(default)]
+    pub upgrade_policy: UpgradePolicyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradePolicyConfig {
+    #[serde(default = "default_true")]
+    pub delegate_upgrade_to_router_owner: bool,
+    #[serde(default)]
+    pub auto_upgrade_enabled: bool,
+    #[serde(default = "default_auto_upgrade_check_interval_minutes")]
+    pub auto_upgrade_check_interval_minutes: u64,
+}
+
+impl Default for UpgradePolicyConfig {
+    fn default() -> Self {
+        Self {
+            delegate_upgrade_to_router_owner: true,
+            auto_upgrade_enabled: false,
+            auto_upgrade_check_interval_minutes: default_auto_upgrade_check_interval_minutes(),
+        }
+    }
+}
+
+fn default_auto_upgrade_check_interval_minutes() -> u64 {
+    60
+}
+
+impl UpgradePolicyConfig {
+    pub fn normalize(mut self) -> Self {
+        self.auto_upgrade_check_interval_minutes =
+            self.auto_upgrade_check_interval_minutes.clamp(5, 24 * 60);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -290,6 +325,7 @@ impl ServerConfig {
             router: RouterConfig::default(),
             client: ClientConfig::default(),
             upstream_proxy: UpstreamProxyConfig::default(),
+            upgrade_policy: UpgradePolicyConfig::default(),
         }
     }
 
@@ -439,6 +475,7 @@ impl ServerConfig {
                 last_heartbeat_ms: None,
             },
             upstream_proxy: UpstreamProxyConfig::default(),
+            upgrade_policy: UpgradePolicyConfig::default(),
         })
     }
 

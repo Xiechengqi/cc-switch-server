@@ -8,7 +8,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
-use crate::api::session::{require_event_session, require_session};
+use crate::api::session::{require_event_session, require_session, router_web_user_email};
 use crate::build_info::{build_info, BuildInfo};
 use crate::self_update::restart::{
     restart_from_detected_service, rollback_from_backup_and_restart,
@@ -42,14 +42,22 @@ pub(in crate::api) struct AdminVersionResponse {
 pub(in crate::api) struct StartUpgradeRequest {
     #[serde(default = "default_restart_after")]
     restart_after: bool,
+    #[serde(default)]
+    force: bool,
 }
 
 fn default_restart_after() -> bool {
     true
 }
 
-pub(in crate::api) fn start_upgrade_request(restart_after: bool) -> StartUpgradeRequest {
-    StartUpgradeRequest { restart_after }
+pub(in crate::api) fn start_upgrade_request(
+    restart_after: bool,
+    force: bool,
+) -> StartUpgradeRequest {
+    StartUpgradeRequest {
+        restart_after,
+        force,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,17 +153,53 @@ pub(in crate::api) async fn admin_upgrade_start(
     Json(input): Json<StartUpgradeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_session(&state, &headers).await?;
-    let task_id = start_upgrade_for_actor(&state, input.restart_after, "web-admin").await?;
+    ensure_upgrade_actor_allowed(&state, &headers).await?;
+    let actor = if router_web_user_email(&headers).is_some() {
+        "router-owner"
+    } else {
+        "web-admin"
+    };
+    let task_id = start_upgrade_for_actor(&state, input.restart_after, actor, input.force).await?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "taskId": task_id,
     })))
 }
 
+async fn ensure_upgrade_actor_allowed(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let Some(router_email) = router_web_user_email(headers) else {
+        return Ok(());
+    };
+    let config = state.config.read().await;
+    if !config.upgrade_policy.delegate_upgrade_to_router_owner {
+        return Err(ApiError::forbidden(
+            "router owner upgrade delegation is disabled",
+        ));
+    }
+    let owner_email = config
+        .owner
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if owner_email.is_empty() || router_email != owner_email {
+        return Err(ApiError::forbidden(
+            "only installation owner can trigger upgrade",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn start_upgrade_for_actor(
     state: &ServerState,
     restart_after: bool,
     actor: &str,
+    force: bool,
 ) -> Result<String, ApiError> {
     map_self_update_error(ensure_binary_writable())?;
     let client = reqwest::Client::builder()
@@ -169,6 +213,7 @@ pub(crate) async fn start_upgrade_for_actor(
                 client,
                 Some(actor.to_string()),
                 restart_after,
+                force,
                 state.bind_addr,
             )
             .await,

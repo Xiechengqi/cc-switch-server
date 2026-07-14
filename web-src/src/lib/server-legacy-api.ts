@@ -876,12 +876,29 @@ export async function rollbackServerService(): Promise<void> {
 
 export async function startServerUpgrade(input: {
   restartAfter: boolean;
+  force?: boolean;
 }): Promise<{ taskId: string }> {
   const result = await invokeCommand<{ ok: boolean; taskId: string }>(
     "start_admin_upgrade",
-    { restartAfter: input.restartAfter },
+    { restartAfter: input.restartAfter, force: input.force ?? false },
   );
   return { taskId: result.taskId };
+}
+
+export interface UpgradePolicy {
+  delegateUpgradeToRouterOwner: boolean;
+  autoUpgradeEnabled: boolean;
+  autoUpgradeCheckIntervalMinutes: number;
+}
+
+export async function loadUpgradePolicy(): Promise<UpgradePolicy> {
+  return invokeCommand<UpgradePolicy>("get_upgrade_policy");
+}
+
+export async function saveUpgradePolicy(
+  policy: UpgradePolicy,
+): Promise<UpgradePolicy> {
+  return invokeCommand<UpgradePolicy>("set_upgrade_policy", policy);
 }
 
 export interface AdminUpgradeStatus {

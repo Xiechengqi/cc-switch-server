@@ -451,6 +451,7 @@ mod tests {
                 ..ClientConfig::default()
             },
             upstream_proxy: Default::default(),
+            upgrade_policy: Default::default(),
         };
         if let Some(password) = password {
             config.set_password(password).expect("hash password");

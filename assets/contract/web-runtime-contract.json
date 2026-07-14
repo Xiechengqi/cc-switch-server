@@ -1051,6 +1051,20 @@
       "notes": "Persists scoped remote-debug API switches in ui-settings.json."
     },
     {
+      "name": "get_upgrade_policy",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Returns server.json upgradePolicy for delegate/auto-upgrade settings."
+    },
+    {
+      "name": "set_upgrade_policy",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Persists server.json upgradePolicy; local server owner only."
+    },
+    {
       "name": "generate_debug_token",
       "support": "shim",
       "implemented": true,

@@ -510,6 +510,16 @@
       "checkUpdateReachableButUnavailable": "A newer version is available (current {{current}}, latest {{latest}}), but this environment cannot upgrade in place (common in dev mode).",
       "checkUpdateFailed": "Failed to check for updates: {{error}}"
     },
+    "upgradePolicy": {
+      "title": "Upgrade Policy",
+      "description": "Control router-delegated upgrades and background auto-upgrade checks.",
+      "delegateTitle": "Allow router owner to upgrade",
+      "delegateDescription": "When enabled, the client owner can force-upgrade this server from Router Web.",
+      "autoUpgradeTitle": "Auto upgrade",
+      "autoUpgradeDescription": "Periodically check GitHub Releases and upgrade only when the local version is behind.",
+      "intervalTitle": "Auto-check interval (minutes)",
+      "intervalDescription": "Default 60 minutes, minimum 5 minutes."
+    },
     "advanced": {
       "configDir": {
         "title": "Configuration Directory",

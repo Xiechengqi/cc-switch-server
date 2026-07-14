@@ -134,6 +134,7 @@ impl UpgradeRegistry {
         client: reqwest::Client,
         actor: Option<String>,
         restart_after: bool,
+        force: bool,
         health_addr: SocketAddr,
     ) -> Result<UpgradeHandle, SelfUpdateError> {
         let mut guard = self.inner.lock().await;
@@ -166,6 +167,7 @@ impl UpgradeRegistry {
                 &task_handle,
                 actor,
                 restart_after,
+                force,
                 health_addr,
             )
             .await;
@@ -302,6 +304,7 @@ async fn run_upgrade(
     handle: &UpgradeHandle,
     actor: Option<String>,
     restart_after: bool,
+    force: bool,
     health_addr: SocketAddr,
 ) -> Result<UpgradeRunOutcome, SelfUpdateError> {
     let actor = actor.unwrap_or_else(|| "unknown".to_string());
@@ -331,7 +334,7 @@ async fn run_upgrade(
         }
     };
     *handle.target_commit_id.lock().await = Some(target_commit.clone());
-    if commits_equal(&target_commit, crate::build_info::build_info().commit_id) {
+    if !force && commits_equal(&target_commit, crate::build_info::build_info().commit_id) {
         emit(
             registry,
             handle,

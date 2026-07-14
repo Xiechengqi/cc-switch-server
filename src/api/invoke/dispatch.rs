@@ -81,15 +81,24 @@ async fn web_invoke_dispatch(
                 .get("restartAfter")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
             let response = crate::api::self_update::admin_upgrade_start(
                 State(state.clone()),
                 headers.clone(),
                 Json(crate::api::self_update::start_upgrade_request(
                     restart_after,
+                    force,
                 )),
             )
             .await?;
             Ok(json!(response.0))
+        }
+        "get_upgrade_policy" => Ok(crate::api::settings::upgrade_policy_snapshot(state).await),
+        "set_upgrade_policy" => {
+            let policy = args.get("policy").cloned().unwrap_or_else(|| args.clone());
+            Ok(json!(
+                crate::api::settings::save_upgrade_policy(state, headers.clone(), policy).await?
+            ))
         }
         "complete_server_setup" => {
             let password = web_arg_string_any(&args, &["password"])?;

@@ -514,6 +514,16 @@
       "checkUpdateReachableButUnavailable": "检测到新版本（当前 {{current}}，最新 {{latest}}），但当前环境无法就地升级（常见于开发模式）",
       "checkUpdateFailed": "检查更新失败：{{error}}"
     },
+    "upgradePolicy": {
+      "title": "升级策略",
+      "description": "控制 Router 代升级与后台自动检查更新行为。",
+      "delegateTitle": "授权 Router Owner 代升级",
+      "delegateDescription": "开启后，Router Web 中 client owner 可对这台 server 执行强制升级。",
+      "autoUpgradeTitle": "自动升级",
+      "autoUpgradeDescription": "定时检查 GitHub Releases，仅当本地版本落后于最新版本时才执行升级。",
+      "intervalTitle": "自动检查间隔（分钟）",
+      "intervalDescription": "默认 60 分钟，最小 5 分钟。"
+    },
     "advanced": {
       "configDir": {
         "title": "配置文件目录",

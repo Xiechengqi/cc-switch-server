@@ -10,8 +10,11 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::settings::config::{PayoutProfileState, RouterIdentity, ServerConfig};
+use crate::domain::settings::config::{
+    PayoutProfileState, RouterIdentity, ServerConfig, UpgradePolicyConfig,
+};
 use crate::domain::sharing::router_contract::*;
+use crate::self_update::version::LatestReleaseMeta;
 
 const ROUTER_LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1260,6 +1263,65 @@ fn url_encode(value: &str) -> String {
         }
     }
     encoded
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReportInstallationStatusPayload {
+    delegate_upgrade_to_router_owner: bool,
+    auto_upgrade_enabled: bool,
+    app_commit_id: String,
+    update_available: bool,
+    upgrade_capable: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReportInstallationStatusResponse {
+    ok: bool,
+}
+
+pub async fn report_installation_status(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    policy: &UpgradePolicyConfig,
+    latest: &LatestReleaseMeta,
+    upgrade_capable: bool,
+) -> anyhow::Result<()> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/')
+        .to_string();
+    let identity = config
+        .router
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let payload = ReportInstallationStatusPayload {
+        delegate_upgrade_to_router_owner: policy.delegate_upgrade_to_router_owner,
+        auto_upgrade_enabled: policy.auto_upgrade_enabled,
+        app_commit_id: crate::build_info::build_info().commit_id.to_string(),
+        update_available: latest.update_available,
+        upgrade_capable,
+    };
+    let request = signed_request(identity, "report_installation_status", payload)?;
+    let response = http
+        .post(format!("{api_base}/v1/installations/report-status"))
+        .json(&request)
+        .send()
+        .await
+        .context("send router installation status report")?;
+    if response.status().is_success() {
+        let _ = response
+            .json::<ReportInstallationStatusResponse>()
+            .await
+            .context("parse router installation status report response")?;
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    bail!("router installation status report failed: {status}: {body}");
 }
 
 fn default_tunnel_enabled() -> bool {

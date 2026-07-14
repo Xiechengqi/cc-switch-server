@@ -57,6 +57,7 @@ import { ApiManagementPanel } from "@/components/settings/ApiManagementPanel";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySettings";
+import { ServerUpgradePolicySettings } from "@/components/settings/ServerUpgradePolicySettings";
 import { ServerVersionSettings } from "@/components/settings/ServerVersionSettings";
 import { ServerConfigDirSettings } from "@/components/settings/ServerConfigDirSettings";
 import { ShareSettingsTab, type ShareSettingsSaveState } from "@/components/settings/ShareSettingsTab";
@@ -339,6 +340,7 @@ export function SettingsPage({
                       <>
                         <ServerSecuritySettings />
                         <ServerVersionSettings />
+                        <ServerUpgradePolicySettings />
                       </>
                     )}
                   </motion.div>
