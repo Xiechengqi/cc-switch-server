@@ -462,6 +462,9 @@ function ProviderFormFull({
     setCodexImageGenerationEnabled(
       initialData?.meta?.codexImageGenerationEnabled ?? false,
     );
+    setCodexImageToolStripPolicy(
+      initialData?.meta?.codexImageToolStripPolicy ?? "never",
+    );
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
     setCustomUserAgent(initialData?.meta?.customUserAgent ?? "");
     setLocalProxyHeadersOverride(
@@ -679,6 +682,9 @@ function ProviderFormFull({
     useState<boolean>(
       () => initialData?.meta?.codexImageGenerationEnabled ?? false,
     );
+  const [codexImageToolStripPolicy, setCodexImageToolStripPolicy] = useState<
+    "never" | "on-error" | "always"
+  >(() => initialData?.meta?.codexImageToolStripPolicy ?? "never");
   const [codexWebsocketEnabled, setCodexWebsocketEnabled] = useState<boolean>(
     () => initialData?.meta?.codexWebsocketEnabled ?? true,
   );
@@ -2273,6 +2279,9 @@ function ProviderFormFull({
       codexImageGenerationEnabled: isCodexOfficialPreset
         ? codexImageGenerationEnabled
         : undefined,
+      codexImageToolStripPolicy: isCodexOauthProvider
+        ? codexImageToolStripPolicy
+        : undefined,
       codexWebsocketEnabled: isCodexOauthProvider
         ? codexWebsocketEnabled
         : undefined,
@@ -2339,6 +2348,9 @@ function ProviderFormFull({
 
     if (!isCodexOfficialPreset && "codexImageGenerationEnabled" in nextMeta) {
       delete nextMeta.codexImageGenerationEnabled;
+    }
+    if (!isCodexOauthProvider && "codexImageToolStripPolicy" in nextMeta) {
+      delete nextMeta.codexImageToolStripPolicy;
     }
     if (!isCodexOauthProvider && "codexWebsocketEnabled" in nextMeta) {
       delete nextMeta.codexWebsocketEnabled;
@@ -3114,6 +3126,8 @@ function ProviderFormFull({
               onCodexChatReasoningChange={setCodexChatReasoning}
               codexImageGenerationEnabled={codexImageGenerationEnabled}
               onCodexImageGenerationChange={setCodexImageGenerationEnabled}
+              codexImageToolStripPolicy={codexImageToolStripPolicy}
+              onCodexImageToolStripPolicyChange={setCodexImageToolStripPolicy}
               codexWebsocketEnabled={codexWebsocketEnabled}
               onCodexWebsocketChange={setCodexWebsocketEnabled}
               singleUpstreamModel={codexSingleUpstreamModel}

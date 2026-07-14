@@ -158,6 +158,8 @@ pub struct ProviderMeta {
     #[serde(default)]
     pub codex_image_generation_enabled: Option<bool>,
     #[serde(default)]
+    pub codex_image_tool_strip_policy: Option<CodexImageToolStripPolicy>,
+    #[serde(default)]
     pub codex_websocket_enabled: Option<bool>,
     #[serde(default)]
     pub codex_chat_reasoning: Option<Value>,
@@ -165,6 +167,15 @@ pub struct ProviderMeta {
     pub local_proxy_request_overrides: Option<Value>,
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexImageToolStripPolicy {
+    Never,
+    #[serde(alias = "on_error")]
+    OnError,
+    Always,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -14,6 +14,7 @@ export interface Provider {
 export interface ProviderMeta {
   apiFormat?: string | null;
   providerType?: string | null;
+  codexImageToolStripPolicy?: "never" | "on-error" | "always" | null;
   authBinding?: {
     source?: string | null;
     authProvider?: string | null;
@@ -137,6 +138,7 @@ export interface AccountRecord {
   idToken?: string | null;
   tokenType?: string | null;
   apiKey?: string | null;
+  extraHeaders?: Record<string, string>;
   scopes?: string[];
   profile?: unknown;
   raw?: unknown;
@@ -206,6 +208,7 @@ export interface UpsertAccountInput {
   idToken?: string;
   tokenType?: string;
   apiKey?: string;
+  extraHeaders?: Record<string, string>;
   scopes?: string[];
   profile?: unknown;
   raw?: unknown;

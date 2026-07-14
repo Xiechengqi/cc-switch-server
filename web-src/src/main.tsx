@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { QueryClientProvider } from "@tanstack/react-query";
 
 import App from "./App";
+import { LayoutDensityProvider } from "./components/LayoutDensityProvider";
 import { ThemeProvider } from "./components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
 import { I18nProvider } from "./lib/i18n";
@@ -14,6 +15,7 @@ import "./styles/modals.css";
 import "./styles/auth-accounts.css";
 import "./styles/providers.css";
 import "./styles/usage.css";
+import "./styles/density.css";
 
 try {
   const ua = navigator.userAgent || "";
@@ -30,7 +32,9 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <QueryClientProvider client={queryClient}>
       <ThemeProvider defaultTheme="light" storageKey="cc-switch-theme">
         <I18nProvider>
-            <App />
+            <LayoutDensityProvider>
+              <App />
+            </LayoutDensityProvider>
             <Toaster />
         </I18nProvider>
       </ThemeProvider>

@@ -21,8 +21,9 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
+use crate::domain::accounts::store::AccountStore;
 use crate::domain::failover::{current_time_ms, ProviderOutcome};
-use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
@@ -39,6 +40,7 @@ use super::deepseek;
 use super::kiro;
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy, decode_response_body_for_proxy,
+    ResponseDecodeResult,
 };
 use super::router::{
     account_concurrency_for_provider, select_provider, select_provider_for_codex_image_generation,
@@ -258,6 +260,7 @@ async fn forward_with_attempt(
             adapter_request.body = normalize_codex_oauth_responses_body_bytes(
                 &adapter_request.body,
                 codex_oauth_session_id.as_deref(),
+                codex_image_tool_strip_policy(&stored),
             )?;
         }
     }
@@ -331,25 +334,19 @@ async fn forward_with_attempt(
     if stored.provider_type == ProviderType::CodexOAuth {
         super::codex_identity::finalize_headers(&mut target_headers);
     }
+    let mut target_headers = owned_headers(target_headers);
+    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
 
     let http_client = forward_http_client(&state, &stored).await?;
-    let mut request = http_client
-        .post(&url)
-        .body(adapter_request.body.clone())
-        .header(ACCEPT, copy_header(&headers, ACCEPT).unwrap_or("*/*"));
-
-    if let Some(content_type) = copy_header(&headers, CONTENT_TYPE) {
-        request = request.header(CONTENT_TYPE, content_type);
-    } else {
-        request = request.header(CONTENT_TYPE, "application/json");
-    }
-
-    for (name, value) in target_headers {
-        request = request.header(name, value);
-    }
-    if !adapter_request.stream_requested {
-        request = request.timeout(provider_upstream_timeout(&stored));
-    }
+    let request = build_upstream_post_request(
+        &http_client,
+        &url,
+        adapter_request.body.clone(),
+        &headers,
+        &target_headers,
+        &stored,
+        adapter_request.stream_requested,
+    );
 
     let upstream_result = if adapter_request.stream_requested {
         match stream_first_byte_timeout(&stored) {
@@ -389,7 +386,7 @@ async fn forward_with_attempt(
     } else {
         request.send().await
     };
-    let upstream = match upstream_result {
+    let mut upstream = match upstream_result {
         Ok(upstream) => upstream,
         Err(error) => {
             record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
@@ -414,17 +411,153 @@ async fn forward_with_attempt(
             return Err(ProxyError::bad_gateway(error));
         }
     };
-    let status = upstream.status();
-    let status_code = status.as_u16();
+    let mut status = upstream.status();
+    let mut status_code = status.as_u16();
     let mut response_headers = upstream.headers().clone();
     strip_hop_by_hop_response_headers(&mut response_headers);
     maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
     maybe_mark_grok_cooldown(&state, &stored, status, &response_headers).await;
-    let content_type = response_headers
+    let mut content_type = response_headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let content_encoding = content_encoding_value(&response_headers);
+    let mut content_encoding = content_encoding_value(&response_headers);
+
+    if codex_image_tool_strip_policy(&stored) == CodexImageToolStripPolicy::OnError
+        && stored.provider_type == ProviderType::CodexOAuth
+        && matches!(
+            route,
+            ProxyRoute::CodexResponses | ProxyRoute::CodexChatCompletions
+        )
+        && !status.is_success()
+    {
+        let original_bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
+        let original_decoded = decode_response_body_for_proxy(&response_headers, original_bytes);
+        if codex_image_tool_rejection_body(&original_decoded.body) {
+            if let Some(retry_body) = codex_image_tool_stripped_body_bytes(&adapter_request.body)? {
+                let retry_request = build_upstream_post_request(
+                    &http_client,
+                    &url,
+                    retry_body.clone(),
+                    &headers,
+                    &target_headers,
+                    &stored,
+                    adapter_request.stream_requested,
+                );
+                match retry_request.send().await {
+                    Ok(retry_upstream) => {
+                        adapter_request.body = retry_body;
+                        upstream = retry_upstream;
+                        status = upstream.status();
+                        status_code = status.as_u16();
+                        response_headers = upstream.headers().clone();
+                        strip_hop_by_hop_response_headers(&mut response_headers);
+                        maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
+                        maybe_mark_grok_cooldown(&state, &stored, status, &response_headers).await;
+                        content_type = response_headers
+                            .get(CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        content_encoding = content_encoding_value(&response_headers);
+                    }
+                    Err(_) => {
+                        record_provider_outcome(
+                            &state,
+                            &stored,
+                            provider_outcome_from_status_and_headers(
+                                status_code,
+                                &response_headers,
+                            ),
+                        )
+                        .await;
+                        log_usage(
+                            &state,
+                            &stored,
+                            status_code,
+                            started.elapsed().as_millis(),
+                            model_metadata(&adapter_request),
+                            TokenUsage::default(),
+                            UsageLogContext {
+                                is_streaming: adapter_request.stream_requested,
+                                stream_status: adapter_request
+                                    .stream_requested
+                                    .then(|| "image_tool_retry_failed".to_string()),
+                                ..request_context
+                            },
+                        )
+                        .await;
+                        return Ok(decoded_upstream_response(
+                            status,
+                            &response_headers,
+                            content_type,
+                            content_encoding,
+                            original_decoded,
+                        ));
+                    }
+                }
+            } else {
+                record_provider_outcome(
+                    &state,
+                    &stored,
+                    provider_outcome_from_status_and_headers(status_code, &response_headers),
+                )
+                .await;
+                log_usage(
+                    &state,
+                    &stored,
+                    status_code,
+                    started.elapsed().as_millis(),
+                    model_metadata(&adapter_request),
+                    TokenUsage::default(),
+                    UsageLogContext {
+                        is_streaming: adapter_request.stream_requested,
+                        stream_status: adapter_request
+                            .stream_requested
+                            .then(|| "upstream_error".to_string()),
+                        ..request_context
+                    },
+                )
+                .await;
+                return Ok(decoded_upstream_response(
+                    status,
+                    &response_headers,
+                    content_type,
+                    content_encoding,
+                    original_decoded,
+                ));
+            }
+        } else {
+            record_provider_outcome(
+                &state,
+                &stored,
+                provider_outcome_from_status_and_headers(status_code, &response_headers),
+            )
+            .await;
+            log_usage(
+                &state,
+                &stored,
+                status_code,
+                started.elapsed().as_millis(),
+                model_metadata(&adapter_request),
+                TokenUsage::default(),
+                UsageLogContext {
+                    is_streaming: adapter_request.stream_requested,
+                    stream_status: adapter_request
+                        .stream_requested
+                        .then(|| "upstream_error".to_string()),
+                    ..request_context
+                },
+            )
+            .await;
+            return Ok(decoded_upstream_response(
+                status,
+                &response_headers,
+                content_type,
+                content_encoding,
+                original_decoded,
+            ));
+        }
+    }
 
     if status == StatusCode::TOO_MANY_REQUESTS {
         let bytes = match upstream.bytes().await {
@@ -1052,6 +1185,8 @@ pub async fn forward_codex_responses_ws(
             );
         }
     }
+    let mut target_headers = owned_headers(target_headers);
+    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
 
     let ws_url = if stored.provider_type == ProviderType::GrokOAuth {
         super::grok::websocket_url().to_string()
@@ -1201,6 +1336,8 @@ async fn forward_grok_media_with_stored(
         "accept",
         "application/json, text/event-stream".to_string(),
     );
+    let mut target_headers = owned_headers(target_headers);
+    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
     let (body, content_type) = if upstream_path.contains("/images/edits") {
         (
             super::grok::image_edit_body(&headers, body)?,
@@ -1219,8 +1356,8 @@ async fn forward_grok_media_with_stored(
     let mut request = http_client
         .request(method.clone(), &url)
         .header(CONTENT_TYPE, content_type);
-    for (name, value) in target_headers {
-        request = request.header(name, value);
+    for (name, value) in &target_headers {
+        request = request.header(name.as_str(), value.as_str());
     }
     if method != Method::GET {
         request = request.body(body);
@@ -1303,6 +1440,8 @@ async fn forward_codex_images_generations(
     let session_id = codex_oauth_session_id_from_request(&headers, &body);
     append_codex_oauth_session_headers(&mut target_headers, session_id.as_deref());
     super::codex_identity::finalize_headers(&mut target_headers);
+    let mut target_headers = owned_headers(target_headers);
+    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
     let adapter_request = adapters::AdapterRequest {
         body: prepared.body.clone(),
         upstream_endpoint: None,
@@ -1327,8 +1466,8 @@ async fn forward_codex_images_generations(
         .header(ACCEPT, "application/json, text/event-stream")
         .header(CONTENT_TYPE, "application/json")
         .body(prepared.body.clone());
-    for (name, value) in target_headers {
-        request = request.header(name, value);
+    for (name, value) in &target_headers {
+        request = request.header(name.as_str(), value.as_str());
     }
     let started = Instant::now();
     let upstream = request.send().await.map_err(|error| {
@@ -1730,7 +1869,7 @@ enum ResponsesWebsocketMode {
 
 async fn bridge_responses_websocket(
     downstream: WebSocket,
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     connect_timeout: Duration,
     ws_url: String,
     mode: ResponsesWebsocketMode,
@@ -3258,6 +3397,144 @@ fn replace_or_push_header(
     headers.push((name, value));
 }
 
+fn owned_headers(headers: Vec<(&'static str, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
+}
+
+fn replace_or_push_owned_header(headers: &mut Vec<(String, String)>, name: String, value: String) {
+    if let Some((_, existing)) = headers
+        .iter_mut()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(&name))
+    {
+        *existing = value;
+        return;
+    }
+    headers.push((name, value));
+}
+
+fn apply_account_header_overrides(
+    headers: &mut Vec<(String, String)>,
+    stored: &StoredProvider,
+    accounts: &AccountStore,
+) -> Result<(), ProxyError> {
+    let Some(account) =
+        accounts.find_for_provider(stored.provider_type, managed_account_id(stored))
+    else {
+        return Ok(());
+    };
+    for (name, value) in &account.extra_headers {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            ProxyError::bad_request(format!(
+                "account {} extra header name is invalid: {name}",
+                account.id
+            ))
+        })?;
+        let normalized_name = header_name.as_str();
+        if account_header_override_blocked(normalized_name) {
+            return Err(ProxyError::bad_request(format!(
+                "account {} extra header cannot override proxy-controlled header: {normalized_name}",
+                account.id
+            )));
+        }
+        HeaderValue::from_str(value).map_err(|_| {
+            ProxyError::bad_request(format!(
+                "account {} extra header value is invalid for {normalized_name}",
+                account.id
+            ))
+        })?;
+        replace_or_push_owned_header(headers, normalized_name.to_string(), value.clone());
+    }
+    Ok(())
+}
+
+fn account_header_override_blocked(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "host"
+            | "content-length"
+            | "content-type"
+            | "accept"
+            | "connection"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "cookie"
+            | "set-cookie"
+            | "user-agent"
+            | "originator"
+            | "version"
+            | "chatgpt-account-id"
+            | "session_id"
+            | "x-client-request-id"
+            | "x-codex-window-id"
+            | "openai-beta"
+    )
+}
+
+fn build_upstream_post_request(
+    http_client: &reqwest::Client,
+    url: &str,
+    body: Bytes,
+    client_headers: &HeaderMap,
+    target_headers: &[(String, String)],
+    stored: &StoredProvider,
+    stream_requested: bool,
+) -> reqwest::RequestBuilder {
+    let mut request = http_client
+        .post(url)
+        .body(body)
+        .header(ACCEPT, copy_header(client_headers, ACCEPT).unwrap_or("*/*"));
+
+    if let Some(content_type) = copy_header(client_headers, CONTENT_TYPE) {
+        request = request.header(CONTENT_TYPE, content_type);
+    } else {
+        request = request.header(CONTENT_TYPE, "application/json");
+    }
+
+    for (name, value) in target_headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    if !stream_requested {
+        request = request.timeout(provider_upstream_timeout(stored));
+    }
+    request
+}
+
+fn decoded_upstream_response(
+    status: StatusCode,
+    response_headers: &HeaderMap,
+    content_type: Option<String>,
+    content_encoding: Option<HeaderValue>,
+    decoded: ResponseDecodeResult,
+) -> Response {
+    let mut response = Response::new(Body::from(decoded.body));
+    *response.status_mut() = status;
+    if let Some(content_type) = content_type {
+        if let Ok(value) = HeaderValue::from_str(&content_type) {
+            response.headers_mut().insert(CONTENT_TYPE, value);
+        }
+    }
+    if decoded.preserve_content_encoding {
+        if let Some(value) = content_encoding {
+            response.headers_mut().insert(CONTENT_ENCODING, value);
+        }
+    }
+    copy_safe_upstream_response_headers(response_headers, &mut response);
+    response
+}
+
 fn codex_oauth_session_id_from_request(headers: &HeaderMap, body: &[u8]) -> Option<String> {
     optional_header(headers, "session_id")
         .or_else(|| optional_header(headers, "x-session-id"))
@@ -3336,12 +3613,13 @@ const CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS: &[&str] = &[
 fn normalize_codex_oauth_responses_body_bytes(
     body: &Bytes,
     prompt_cache_key: Option<&str>,
+    image_tool_strip_policy: CodexImageToolStripPolicy,
 ) -> Result<Bytes, ProxyError> {
     let mut value = serde_json::from_slice::<Value>(body).map_err(|error| ProxyError {
         status: StatusCode::BAD_REQUEST,
         message: format!("invalid codex oauth responses body: {error}"),
     })?;
-    value = normalize_codex_oauth_responses_body(value, prompt_cache_key);
+    value = normalize_codex_oauth_responses_body(value, prompt_cache_key, image_tool_strip_policy);
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|error| ProxyError {
@@ -3393,7 +3671,11 @@ fn codex_compact_url(url: &str) -> String {
     }
 }
 
-fn normalize_codex_oauth_responses_body(mut body: Value, prompt_cache_key: Option<&str>) -> Value {
+fn normalize_codex_oauth_responses_body(
+    mut body: Value,
+    prompt_cache_key: Option<&str>,
+    image_tool_strip_policy: CodexImageToolStripPolicy,
+) -> Value {
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -3458,6 +3740,9 @@ fn normalize_codex_oauth_responses_body(mut body: Value, prompt_cache_key: Optio
     if body.get("tools").is_none() {
         body["tools"] = Value::Array(Vec::new());
     }
+    if image_tool_strip_policy == CodexImageToolStripPolicy::Always {
+        strip_codex_image_generation_tools(&mut body);
+    }
     if body.get("parallel_tool_calls").is_none() {
         body["parallel_tool_calls"] = Value::Bool(false);
     }
@@ -3469,6 +3754,80 @@ fn normalize_codex_oauth_responses_body(mut body: Value, prompt_cache_key: Optio
     }
 
     body
+}
+
+fn codex_image_tool_strip_policy(stored: &StoredProvider) -> CodexImageToolStripPolicy {
+    stored
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.codex_image_tool_strip_policy)
+        .unwrap_or(CodexImageToolStripPolicy::Never)
+}
+
+fn codex_image_tool_stripped_body_bytes(body: &Bytes) -> Result<Option<Bytes>, ProxyError> {
+    let mut value = serde_json::from_slice::<Value>(body).map_err(|error| ProxyError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid codex oauth responses body: {error}"),
+    })?;
+    if !strip_codex_image_generation_tools(&mut value) {
+        return Ok(None);
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map(Some)
+        .map_err(|error| ProxyError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("encode codex oauth responses body failed: {error}"),
+        })
+}
+
+fn strip_codex_image_generation_tools(body: &mut Value) -> bool {
+    let mut stripped = false;
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        let before = tools.len();
+        tools.retain(|tool| !is_codex_image_generation_tool(tool));
+        stripped |= tools.len() != before;
+    }
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                continue;
+            }
+            if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                let before = tools.len();
+                tools.retain(|tool| !is_codex_image_generation_tool(tool));
+                stripped |= tools.len() != before;
+            }
+        }
+    }
+    stripped
+}
+
+fn is_codex_image_generation_tool(tool: &Value) -> bool {
+    matches!(
+        tool.get("type").and_then(Value::as_str),
+        Some("image_generation") | Some("image_gen")
+    ) || tool
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| matches!(name, "image_generation" | "image_gen"))
+}
+
+fn codex_image_tool_rejection_body(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    (text.contains("image_generation") || text.contains("image_gen"))
+        && [
+            "unsupported",
+            "not allowed",
+            "forbidden",
+            "invalid",
+            "unknown tool",
+            "unrecognized",
+            "permission",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
 }
 
 fn response_instruction_text_for_codex(value: &Value) -> Option<String> {
@@ -4643,6 +5002,55 @@ mod tests {
     }
 
     #[test]
+    fn account_header_overrides_merge_custom_headers_and_reject_controlled_names() {
+        let mut accounts = AccountStore::default();
+        accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+            id: Some("acct-headers".to_string()),
+            provider_type: ProviderType::CodexOAuth,
+            email: None,
+            access_token: Some("access".to_string()),
+            refresh_token: Some("refresh".to_string()),
+            id_token: None,
+            token_type: Some("Bearer".to_string()),
+            api_key: None,
+            extra_headers: Some(BTreeMap::from([(
+                "x-enterprise-sso".to_string(),
+                "tenant-a".to_string(),
+            )])),
+            scopes: Vec::new(),
+            profile: None,
+            raw: None,
+            subscription_level: None,
+            entitlement_status: None,
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at: None,
+            rate_limited_until: None,
+            last_refresh_error: None,
+        });
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({}),
+            Some("acct-headers"),
+        );
+        let mut headers = owned_headers(vec![("authorization", "Bearer access".to_string())]);
+
+        apply_account_header_overrides(&mut headers, &stored, &accounts).unwrap();
+
+        assert!(headers.contains(&("x-enterprise-sso".to_string(), "tenant-a".to_string())));
+
+        accounts.accounts[0]
+            .extra_headers
+            .insert("authorization".to_string(), "Bearer attacker".to_string());
+        let error = apply_account_header_overrides(&mut headers, &stored, &accounts).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("proxy-controlled header"));
+    }
+
+    #[test]
     fn cross_protocol_secret_detection_uses_upstream_auth_family() {
         let codex_to_gemini = stored_provider(
             AppKind::Codex,
@@ -4851,7 +5259,8 @@ mod tests {
             "model": "gpt-5",
             "input": [{"role": "user", "content": "hi"}]
         });
-        let normalized = normalize_codex_oauth_responses_body(body, None);
+        let normalized =
+            normalize_codex_oauth_responses_body(body, None, CodexImageToolStripPolicy::Never);
         assert_eq!(normalized["store"], json!(false));
         assert_eq!(normalized["stream"], json!(true));
         assert!(normalized["instructions"]
@@ -4879,11 +5288,57 @@ mod tests {
                 ]
             }),
             None,
+            CodexImageToolStripPolicy::Never,
         );
         assert_eq!(normalized.pointer("/reasoning/effort"), Some(&json!("max")));
         assert!(normalized.pointer("/input/0/id").is_none());
         assert_eq!(normalized.pointer("/input/1/id"), Some(&json!("msg_valid")));
         assert_eq!(normalized.pointer("/input/2/id"), Some(&json!("item_call")));
+    }
+
+    #[test]
+    fn normalize_codex_oauth_responses_body_strips_image_generation_tools_when_configured() {
+        let normalized = normalize_codex_oauth_responses_body(
+            json!({
+                "model": "gpt-5",
+                "tools": [
+                    {"type": "image_generation"},
+                    {"type": "function", "name": "lookup"}
+                ],
+                "input": [{
+                    "type": "additional_tools",
+                    "tools": [
+                        {"type": "image_gen"},
+                        {"type": "custom", "name": "edit"}
+                    ]
+                }]
+            }),
+            None,
+            CodexImageToolStripPolicy::Always,
+        );
+        assert_eq!(normalized.pointer("/tools/0/name"), Some(&json!("lookup")));
+        assert_eq!(
+            normalized.pointer("/input/0/tools/0/name"),
+            Some(&json!("edit"))
+        );
+    }
+
+    #[test]
+    fn codex_image_tool_on_error_helpers_detect_rejection_and_build_retry_body() {
+        assert!(codex_image_tool_rejection_body(
+            br#"{"error":{"message":"unsupported image_generation tool"}}"#,
+        ));
+        assert!(!codex_image_tool_rejection_body(
+            br#"{"error":{"message":"ordinary upstream failure"}}"#,
+        ));
+
+        let retry = codex_image_tool_stripped_body_bytes(&Bytes::from_static(
+            br#"{"tools":[{"type":"image_generation"},{"type":"function","name":"lookup"}]}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        let value: Value = serde_json::from_slice(&retry).unwrap();
+        assert_eq!(value.pointer("/tools/0/name"), Some(&json!("lookup")));
     }
 
     #[test]
@@ -4913,8 +5368,12 @@ mod tests {
                 },
             )
             .unwrap();
-        let normalized =
-            normalize_codex_oauth_responses_body_bytes(&request.body, None).expect("normalize");
+        let normalized = normalize_codex_oauth_responses_body_bytes(
+            &request.body,
+            None,
+            CodexImageToolStripPolicy::Never,
+        )
+        .expect("normalize");
         let value: Value = serde_json::from_slice(&normalized).unwrap();
         assert_eq!(value["store"], json!(false));
     }
@@ -4927,7 +5386,8 @@ mod tests {
             "max_output_tokens": 128,
             "temperature": 0.2
         });
-        let normalized = normalize_codex_oauth_responses_body(body, None);
+        let normalized =
+            normalize_codex_oauth_responses_body(body, None, CodexImageToolStripPolicy::Never);
         assert!(normalized.get("max_output_tokens").is_none());
         assert!(normalized.get("temperature").is_none());
     }
@@ -4938,7 +5398,11 @@ mod tests {
             "model": "gpt-5",
             "input": []
         });
-        let normalized = normalize_codex_oauth_responses_body(body, Some("session-123"));
+        let normalized = normalize_codex_oauth_responses_body(
+            body,
+            Some("session-123"),
+            CodexImageToolStripPolicy::Never,
+        );
         assert_eq!(normalized["prompt_cache_key"], json!("session-123"));
     }
 
@@ -4966,7 +5430,8 @@ mod tests {
             "instructions": "Keep this local policy.",
             "input": []
         });
-        let normalized = normalize_codex_oauth_responses_body(body, None);
+        let normalized =
+            normalize_codex_oauth_responses_body(body, None, CodexImageToolStripPolicy::Never);
         let instructions = normalized["instructions"].as_str().unwrap();
         assert!(instructions.contains("Keep this local policy."));
         assert!(instructions.len() > "Keep this local policy.".len());

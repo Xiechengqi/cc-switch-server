@@ -501,6 +501,7 @@ fn upsert_input_from_claude_credentials(
         id_token: None,
         token_type,
         api_key: None,
+        extra_headers: None,
         scopes: Vec::new(),
         profile: Some(json!({
             "providerType": ProviderType::ClaudeOAuth.as_str(),
@@ -623,6 +624,7 @@ fn upsert_input_from_grok_auth_json(auth_json: Value) -> Result<UpsertAccountInp
         token_type: first_json_string(entry, &["/tokenType", "/token_type"])
             .or_else(|| Some("Bearer".to_string())),
         api_key: None,
+        extra_headers: None,
         scopes: first_json_string(entry, &["/scope", "/scopes"])
             .map(|scope| scope.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),

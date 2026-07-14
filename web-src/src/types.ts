@@ -168,6 +168,8 @@ export interface ProviderMeta {
   codexFastMode?: boolean;
   // Codex OAuth image generation via ChatGPT Codex backend
   codexImageGenerationEnabled?: boolean;
+  // Strip image_generation tools from Codex Responses requests.
+  codexImageToolStripPolicy?: "never" | "on-error" | "always";
   // Per-provider incident rollback for the Codex Responses WebSocket path
   codexWebsocketEnabled?: boolean;
   // Codex Responses -> Chat Completions reasoning capability metadata

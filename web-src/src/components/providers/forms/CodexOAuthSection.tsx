@@ -50,6 +50,12 @@ interface CodexOAuthSectionProps {
   imageGenerationEnabled?: boolean;
   /** 生成图片能力切换回调 */
   onImageGenerationChange?: (enabled: boolean) => void;
+  /** Responses image_generation tool strip policy */
+  imageToolStripPolicy?: "never" | "on-error" | "always";
+  /** Responses image_generation tool strip policy callback */
+  onImageToolStripPolicyChange?: (
+    policy: "never" | "on-error" | "always",
+  ) => void;
   /** 是否启用 Codex Responses WebSocket，上游故障时可回退 SSE */
   websocketEnabled?: boolean;
   /** WebSocket 切换回调 */
@@ -74,6 +80,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   onFastModeChange,
   imageGenerationEnabled = false,
   onImageGenerationChange,
+  imageToolStripPolicy = "never",
+  onImageToolStripPolicyChange,
   websocketEnabled = true,
   onWebsocketChange,
   showBankedResetPanel = false,
@@ -214,6 +222,45 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             onCheckedChange={onImageGenerationChange}
             aria-label={t("codexOauth.imageGeneration", "生成图片")}
           />
+        </div>
+      )}
+
+      {onImageToolStripPolicyChange && (
+        <div className="flex items-center justify-between gap-4 rounded-md border bg-muted/30 p-3">
+          <div className="space-y-1 pr-4">
+            <Label className="text-sm font-medium">
+              {t("codexOauth.imageToolStripPolicy", "Image tool policy")}
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              {t("codexOauth.imageToolStripPolicyDescription", {
+                defaultValue:
+                  "Control whether Codex Responses requests may declare image_generation tools.",
+              })}
+            </p>
+          </div>
+          <Select
+            value={imageToolStripPolicy}
+            onValueChange={(value) =>
+              onImageToolStripPolicyChange(
+                value as "never" | "on-error" | "always",
+              )
+            }
+          >
+            <SelectTrigger className="w-[150px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="never">
+                {t("codexOauth.imageToolStripNever", "Never strip")}
+              </SelectItem>
+              <SelectItem value="on-error">
+                {t("codexOauth.imageToolStripOnError", "On error")}
+              </SelectItem>
+              <SelectItem value="always">
+                {t("codexOauth.imageToolStripAlways", "Always strip")}
+              </SelectItem>
+            </SelectContent>
+          </Select>
         </div>
       )}
 

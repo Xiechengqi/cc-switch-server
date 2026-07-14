@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -54,6 +55,8 @@ pub struct Account {
     pub token_type: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_headers: BTreeMap<String, String>,
     #[serde(default)]
     pub scopes: Vec<String>,
     #[serde(default)]
@@ -131,6 +134,8 @@ pub struct UpsertAccountInput {
     pub token_type: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub extra_headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub scopes: Vec<String>,
     #[serde(default)]
@@ -242,6 +247,7 @@ impl AccountStore {
             id_token: input.id_token,
             token_type: input.token_type,
             api_key: input.api_key,
+            extra_headers: input.extra_headers.clone().unwrap_or_default(),
             scopes: input.scopes,
             profile: input.profile,
             raw: input.raw,
@@ -259,6 +265,9 @@ impl AccountStore {
         };
 
         if let Some(existing) = self.accounts.iter_mut().find(|item| item.id == account.id) {
+            if input.extra_headers.is_none() {
+                account.extra_headers = existing.extra_headers.clone();
+            }
             if account.provider_type == ProviderType::CodexOAuth {
                 if let Some(profile) = account.profile.as_mut() {
                     preserve_codex_profile_selection(existing.profile.as_ref(), profile);
@@ -806,11 +815,22 @@ fn value_has_encrypted_secret(value: &Value) -> bool {
                 && value
                     .as_str()
                     .is_some_and(|value| value.starts_with(ENCRYPTED_PREFIX)))
+                || (field == "extraHeaders" && extra_headers_have_encrypted_secret(value))
                 || value_has_encrypted_secret(value)
         }),
         Value::Array(values) => values.iter().any(value_has_encrypted_secret),
         _ => false,
     }
+}
+
+fn extra_headers_have_encrypted_secret(value: &Value) -> bool {
+    value.as_object().is_some_and(|headers| {
+        headers.values().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value.starts_with(ENCRYPTED_PREFIX))
+        })
+    })
 }
 
 fn encrypt_account_store_value(value: &mut Value, key: &[u8; 32]) -> anyhow::Result<()> {
@@ -841,7 +861,9 @@ fn transform_secret_fields(
     match value {
         Value::Object(object) => {
             for (field, value) in object {
-                if SECRET_FIELDS.contains(&field.as_str()) {
+                if field == "extraHeaders" {
+                    transform_extra_header_values(value, transform)?;
+                } else if SECRET_FIELDS.contains(&field.as_str()) {
                     if let Value::String(secret) = value {
                         if !secret.trim().is_empty() {
                             *secret = transform(secret)?;
@@ -858,6 +880,23 @@ fn transform_secret_fields(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn transform_extra_header_values(
+    value: &mut Value,
+    transform: &impl Fn(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
+    let Value::Object(headers) = value else {
+        return Ok(());
+    };
+    for value in headers.values_mut() {
+        if let Value::String(secret) = value {
+            if !secret.trim().is_empty() {
+                *secret = transform(secret)?;
+            }
+        }
     }
     Ok(())
 }
@@ -920,6 +959,7 @@ mod tests {
             id_token: None,
             token_type: None,
             api_key: None,
+            extra_headers: None,
             scopes: Vec::new(),
             profile: None,
             raw: None,
@@ -947,6 +987,7 @@ mod tests {
             id_token: None,
             token_type: Some("Bearer".to_string()),
             api_key: None,
+            extra_headers: None,
             scopes: vec!["openid".to_string()],
             profile: None,
             raw: None,
@@ -1013,6 +1054,7 @@ mod tests {
                 } else {
                     None
                 },
+                extra_headers: None,
                 scopes: vec!["profile".to_string(), provider_type.as_str().to_string()],
                 profile: Some(json!({
                     "providerType": provider_type.as_str(),
@@ -1091,6 +1133,7 @@ mod tests {
             id_token: None,
             token_type: Some("Bearer".to_string()),
             api_key: None,
+            extra_headers: None,
             scopes: vec!["openid".to_string()],
             profile: Some(json!({"plan": "plus"})),
             raw: Some(json!({"source": "fixture"})),
@@ -1150,6 +1193,7 @@ mod tests {
             id_token: None,
             token_type: Some("Bearer".to_string()),
             api_key: None,
+            extra_headers: None,
             scopes: Vec::new(),
             profile: Some(json!({
                 "chatgpt_account_id": "account-default",
@@ -1258,6 +1302,7 @@ mod tests {
             id_token: None,
             token_type: None,
             api_key: None,
+            extra_headers: None,
             scopes: Vec::new(),
             profile: None,
             raw: None,
@@ -1340,6 +1385,7 @@ mod tests {
             id_token: None,
             token_type: Some("Bearer".to_string()),
             api_key: None,
+            extra_headers: None,
             scopes: Vec::new(),
             profile: Some(json!({"source": "fixture"})),
             raw: None,
@@ -1390,6 +1436,7 @@ mod tests {
             id_token: Some("id-secret".to_string()),
             token_type: Some("Bearer".to_string()),
             api_key: Some("api-secret".to_string()),
+            extra_headers: None,
             scopes: Vec::new(),
             profile: None,
             raw: Some(serde_json::json!({

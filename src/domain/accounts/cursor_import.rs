@@ -143,6 +143,7 @@ pub fn upsert_input_from_cursor_local_import(
         id_token: None,
         token_type: Some("Bearer".to_string()),
         api_key: None,
+        extra_headers: None,
         scopes: Vec::new(),
         profile: Some(profile),
         raw: Some(json!({

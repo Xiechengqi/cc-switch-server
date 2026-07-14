@@ -2946,6 +2946,7 @@ mod tests {
             id_token: None,
             token_type: Some("Bearer".to_string()),
             api_key: None,
+            extra_headers: Default::default(),
             scopes: vec![],
             profile: Some(json!({
                 "profileArn": "arn:aws:codewhisperer:us-west-2:123456789012:profile/profile-id",

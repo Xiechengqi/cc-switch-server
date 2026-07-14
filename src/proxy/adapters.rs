@@ -3265,6 +3265,7 @@ mod tests {
             id_token: None,
             token_type: Some("Bearer".to_string()),
             api_key: None,
+            extra_headers: Default::default(),
             scopes: Vec::new(),
             profile: Some(profile),
             raw: None,

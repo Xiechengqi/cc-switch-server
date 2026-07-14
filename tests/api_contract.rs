@@ -196,6 +196,7 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
                 id_token: None,
                 token_type: None,
                 api_key: None,
+                extra_headers: None,
                 scopes: Vec::new(),
                 profile: None,
                 raw: Some(json!({
@@ -934,6 +935,7 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
                 id_token: None,
                 token_type: Some("Bearer".to_string()),
                 api_key: None,
+                extra_headers: None,
                 scopes: Vec::new(),
                 profile: Some(json!({"githubDomain": "github.com", "ghes": false})),
                 raw: Some(json!({
@@ -1089,6 +1091,7 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
                 id_token: None,
                 token_type: Some("Bearer".to_string()),
                 api_key: None,
+                extra_headers: None,
                 scopes: Vec::new(),
                 profile: Some(json!({
                     "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/profile-id",
@@ -1260,6 +1263,7 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
                 id_token: None,
                 token_type: Some("Bearer".to_string()),
                 api_key: None,
+                extra_headers: None,
                 scopes: Vec::new(),
                 profile: Some(json!({
                     "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/profile-id",
@@ -1827,6 +1831,7 @@ fn codex_oauth_schema_fixture_preserves_future_native_fields() {
         id_token: None,
         token_type: Some("Bearer".to_string()),
         api_key: None,
+        extra_headers: None,
         scopes: vec!["openid".to_string(), "profile".to_string()],
         profile: Some(json!({"plan":"pro"})),
         raw: Some(json!({"source":"mock"})),

@@ -16,6 +16,16 @@ Run the checks manually at:
 
 - Desktop width: 1366x768 or wider.
 - Narrow width: around 390px wide.
+- Router Client Console iframe: open a Client Tunnel console from the Router dashboard at roughly 880x548 (default window) and confirm embed-compact layout.
+
+## Embed Compact (Router Client Console)
+
+- Opening a Client Tunnel from Router dashboard iframe loads the server UI with `html.density-compact` (auto via iframe detection, or explicitly via `?embed=compact`).
+- Full-screen Client Tunnel in a new tab or direct browser visit stays on comfortable density (no compact class).
+- Top bar, App Switcher, and main content padding shrink without clipping actions.
+- Settings tabs scroll horizontally instead of forcing a 6-column grid.
+- Provider list and share forms fit the iframe width; tables scroll horizontally when needed instead of overflowing.
+- `?density=comfortable` on an iframe URL overrides back to desktop spacing when debugging.
 
 ## Global
 

@@ -2476,6 +2476,7 @@ mod tests {
             id_token: None,
             token_type: None,
             api_key: None,
+            extra_headers: Default::default(),
             scopes: Vec::new(),
             profile: None,
             raw: Some(raw),

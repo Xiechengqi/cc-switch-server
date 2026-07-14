@@ -116,6 +116,7 @@ pub fn import_api_key(
         id_token: None,
         token_type: Some("API_KEY".to_string()),
         api_key: Some(key.to_string()),
+        extra_headers: None,
         scopes: KIRO_SCOPES
             .iter()
             .map(|scope| (*scope).to_string())
@@ -274,6 +275,7 @@ fn upsert_from_credentials_entry(
         id_token: string_at(entry, &["/idToken", "/id_token"]),
         token_type: Some("Bearer".to_string()),
         api_key: None,
+        extra_headers: None,
         scopes: KIRO_SCOPES
             .iter()
             .map(|scope| (*scope).to_string())

@@ -323,6 +323,7 @@ mod tests {
             id_token: None,
             token_type: None,
             api_key: None,
+            extra_headers: None,
             scopes: Vec::new(),
             profile: Some(json!({"chatgpt_account_id":"acct_123"})),
             raw: None,

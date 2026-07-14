@@ -546,7 +546,7 @@ async fn web_invoke_dispatch(
                 .as_ref()
                 .map(|identity| identity.installation_id.as_str());
             let availability = crate::client_tunnel_provision::check_subdomain_for_router(
-                &state,
+                state,
                 router_url,
                 &subdomain,
                 installation_id,
@@ -569,7 +569,7 @@ async fn web_invoke_dispatch(
                 .as_ref()
                 .map(|identity| identity.installation_id.as_str());
             let outcome = crate::client_tunnel_provision::suggest_client_tunnel_subdomain(
-                &state,
+                state,
                 router_url,
                 installation_id,
             )
@@ -582,7 +582,7 @@ async fn web_invoke_dispatch(
                 .router_api_base()
                 .ok_or_else(|| ApiError::bad_request("router url is not configured"))?;
             let outcome =
-                crate::client_tunnel_provision::check_router_reachable(&state, router_url).await?;
+                crate::client_tunnel_provision::check_router_reachable(state, router_url).await?;
             Ok(json!(outcome))
         }
         "claim_client_tunnel" => {
@@ -614,7 +614,7 @@ async fn web_invoke_dispatch(
                         .map_err(ApiError::bad_request)?;
                 }
             }
-            crate::client_tunnel_provision::claim_client_tunnel_config(&state, &config).await?;
+            crate::client_tunnel_provision::claim_client_tunnel_config(state, &config).await?;
             if web_optional_bool(&args, &["autoStart", "auto_start"]).unwrap_or(true) {
                 crate::state::start_client_tunnel(state.clone()).await;
             }

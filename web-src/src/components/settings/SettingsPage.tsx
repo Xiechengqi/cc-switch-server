@@ -62,10 +62,10 @@ import { ServerVersionSettings } from "@/components/settings/ServerVersionSettin
 import { ServerConfigDirSettings } from "@/components/settings/ServerConfigDirSettings";
 import { ShareSettingsTab, type ShareSettingsSaveState } from "@/components/settings/ShareSettingsTab";
 import { useInstalledSkills } from "@/hooks/useSkills";
-import { useSettings } from "@/hooks/useSettings";
+import { useLayoutDensity } from "@/hooks/useLayoutDensity";
 import { useImportExport } from "@/hooks/useImportExport";
 import { useTranslation } from "react-i18next";
-import type { SettingsFormState } from "@/hooks/useSettings";
+import { useSettings, type SettingsFormState } from "@/hooks/useSettings";
 import { isServerWebRuntime } from "@/lib/runtime";
 
 export type SettingsTab =
@@ -88,6 +88,7 @@ export function SettingsPage({
   onSignOut,
 }: SettingsDialogProps) {
   const { t } = useTranslation();
+  const { isCompact } = useLayoutDensity();
   const {
     settings,
     isLoading,
@@ -244,7 +245,12 @@ export function SettingsPage({
   const isBusy = useMemo(() => isLoading && !settings, [isLoading, settings]);
 
   return (
-    <div className={cn("flex flex-col h-full overflow-hidden", PAGE_SHELL_PADDING_X)}>
+    <div
+      className={cn(
+        "flex flex-col h-full overflow-hidden",
+        isCompact ? "px-3" : PAGE_SHELL_PADDING_X,
+      )}
+    >
       {isBusy ? (
         <div className="flex flex-1 items-center justify-center">
           <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -257,8 +263,13 @@ export function SettingsPage({
         >
           <TabsList
             className={cn(
-              "grid w-full mb-6 glass rounded-lg",
-              serverMode ? "grid-cols-6" : "grid-cols-5",
+              "w-full glass rounded-lg",
+              isCompact
+                ? "settings-tabs-scroll mb-3"
+                : cn(
+                    "grid mb-6",
+                    serverMode ? "grid-cols-6" : "grid-cols-5",
+                  ),
             )}
           >
             <TabsTrigger value="general">

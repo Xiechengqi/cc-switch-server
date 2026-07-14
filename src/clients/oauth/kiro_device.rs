@@ -783,6 +783,7 @@ async fn account_input_from_token(
         id_token: None,
         token_type: Some("Bearer".to_string()),
         api_key: None,
+        extra_headers: None,
         scopes: vec![
             "codewhisperer:completions".to_string(),
             "codewhisperer:analysis".to_string(),

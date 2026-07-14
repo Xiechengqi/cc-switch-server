@@ -297,6 +297,7 @@ fn account_input_from_device_flow(
         id_token: None,
         token_type: Some("Bearer".to_string()),
         api_key: None,
+        extra_headers: None,
         scopes: oauth
             .scope
             .unwrap_or_default()

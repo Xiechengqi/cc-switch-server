@@ -152,7 +152,7 @@ pub(crate) async fn suggest_client_tunnel_subdomain(
     }
 
     let mut last_subdomain = String::new();
-    let mut availability_api_supported = reachability.subdomain_check_supported;
+    let availability_api_supported = reachability.subdomain_check_supported;
 
     for attempt in 0..SUGGEST_MAX_ATTEMPTS {
         let candidate = generate_candidate(&mut rand::thread_rng(), attempt);
