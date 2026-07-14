@@ -25,7 +25,7 @@ import {
   getTunnelConfigFromSettings,
   isTunnelConfigured,
 } from "@/utils/shareUtils";
-import { shellPaddingXClass } from "@/lib/layout";
+import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
 import { ShareList } from "./ShareList";
 import {
   getProviderAccountLabel,
@@ -242,8 +242,8 @@ export function SharePage({
   };
 
   return (
-    <div className={shellPaddingXClass()}>
-      <div className="share-page-stack flex flex-col gap-5 pb-8 sm:pb-10">
+    <div className={cn(PAGE_SHELL_PADDING_X, "py-2 sm:py-3")}>
+      <div className="flex flex-col gap-5 pb-8 sm:pb-10">
         {shareScoped ? (
           <ShareOwnerAuthBar
             share={primaryShare}
@@ -485,7 +485,7 @@ function ShareOwnerAuthBar({
                   value={email}
                   disabled={busy}
                   placeholder={share?.ownerEmail || "owner@example.com"}
-                  className="share-auth-input h-8 min-w-64"
+                  className="h-8 min-w-64"
                   onChange={(event) => setEmail(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
@@ -516,7 +516,7 @@ function ShareOwnerAuthBar({
                   placeholder={t("share.routerOwner.codePlaceholder", {
                     defaultValue: "验证码",
                   })}
-                  className="share-auth-input h-8 min-w-32"
+                  className="h-8 min-w-32"
                   onChange={(event) => setCode(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {

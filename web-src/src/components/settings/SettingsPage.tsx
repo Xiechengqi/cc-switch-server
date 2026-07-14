@@ -36,7 +36,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { shellPaddingXClass } from "@/lib/layout";
+import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
 import { settingsApi } from "@/lib/api";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
@@ -62,9 +62,10 @@ import { ServerVersionSettings } from "@/components/settings/ServerVersionSettin
 import { ServerConfigDirSettings } from "@/components/settings/ServerConfigDirSettings";
 import { ShareSettingsTab, type ShareSettingsSaveState } from "@/components/settings/ShareSettingsTab";
 import { useInstalledSkills } from "@/hooks/useSkills";
+import { useSettings } from "@/hooks/useSettings";
 import { useImportExport } from "@/hooks/useImportExport";
 import { useTranslation } from "react-i18next";
-import { useSettings, type SettingsFormState } from "@/hooks/useSettings";
+import type { SettingsFormState } from "@/hooks/useSettings";
 import { isServerWebRuntime } from "@/lib/runtime";
 
 export type SettingsTab =
@@ -243,12 +244,7 @@ export function SettingsPage({
   const isBusy = useMemo(() => isLoading && !settings, [isLoading, settings]);
 
   return (
-    <div
-      className={cn(
-        "settings-page flex flex-col h-full overflow-hidden",
-        shellPaddingXClass(),
-      )}
-    >
+    <div className={cn("flex flex-col h-full overflow-hidden", PAGE_SHELL_PADDING_X)}>
       {isBusy ? (
         <div className="flex flex-1 items-center justify-center">
           <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -257,51 +253,44 @@ export function SettingsPage({
         <Tabs
           value={activeTab}
           onValueChange={setActiveTab}
-          className={cn(
-            "settings-page-tabs flex flex-col h-full",
-            serverMode ? "settings-page-tabs--cols-6" : "settings-page-tabs--cols-5",
-          )}
+          className="flex flex-col h-full"
         >
           <TabsList
             className={cn(
-              "settings-page-tablist grid w-full glass rounded-lg mb-6",
+              "grid w-full mb-6 glass rounded-lg",
               serverMode ? "grid-cols-6" : "grid-cols-5",
             )}
           >
-            <TabsTrigger className="settings-page-tab-trigger" value="general">
+            <TabsTrigger value="general">
               {t("settings.tabGeneral")}
             </TabsTrigger>
-            <TabsTrigger className="settings-page-tab-trigger" value="proxy">
-              {t("settings.tabProxy")}
-            </TabsTrigger>
-            <TabsTrigger className="settings-page-tab-trigger" value="auth">
+            <TabsTrigger value="proxy">{t("settings.tabProxy")}</TabsTrigger>
+            <TabsTrigger value="auth">
               {t("settings.tabAuth", { defaultValue: "认证" })}
             </TabsTrigger>
             {serverMode ? (
-              <TabsTrigger className="settings-page-tab-trigger" value="share">
+              <TabsTrigger value="share">
                 {t("settings.tabShare", { defaultValue: "分享" })}
               </TabsTrigger>
             ) : null}
-            <TabsTrigger className="settings-page-tab-trigger" value="advanced">
+            <TabsTrigger value="advanced">
               {t("settings.tabAdvanced")}
             </TabsTrigger>
-            <TabsTrigger className="settings-page-tab-trigger" value="usage">
-              {t("usage.title")}
-            </TabsTrigger>
+            <TabsTrigger value="usage">{t("usage.title")}</TabsTrigger>
           </TabsList>
 
-          <div className="settings-page-content flex-1 min-h-0 flex flex-col">
+          <div className="flex-1 min-h-0 flex flex-col">
             <div
               ref={tabScrollContainerRef}
               className="flex-1 overflow-y-auto overflow-x-hidden pr-2"
             >
-              <TabsContent value="general" className="settings-tab-panel space-y-6 mt-0">
+              <TabsContent value="general" className="space-y-6 mt-0">
                 {settings ? (
                   <motion.div
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ duration: 0.3 }}
-                    className="settings-tab-panel space-y-6"
+                    className="space-y-6"
                   >
                     <LanguageSettings
                       value={settings.language}
@@ -364,7 +353,7 @@ export function SettingsPage({
                 )}
               </TabsContent>
 
-              <TabsContent value="proxy" className="settings-tab-panel space-y-6 mt-0 pb-4">
+              <TabsContent value="proxy" className="space-y-6 mt-0 pb-4">
                 {settings ? (
                   <ProxyTabContent
                     settings={settings}
@@ -374,7 +363,7 @@ export function SettingsPage({
                 ) : null}
               </TabsContent>
 
-              <TabsContent value="auth" className="settings-tab-panel space-y-6 mt-0 pb-4">
+              <TabsContent value="auth" className="space-y-6 mt-0 pb-4">
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
@@ -386,7 +375,7 @@ export function SettingsPage({
               </TabsContent>
 
               {serverMode ? (
-                <TabsContent value="share" className="settings-tab-panel space-y-6 mt-0 pb-4">
+                <TabsContent value="share" className="space-y-6 mt-0 pb-4">
                   <motion.div
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -397,7 +386,7 @@ export function SettingsPage({
                 </TabsContent>
               ) : null}
 
-              <TabsContent value="advanced" className="settings-tab-panel space-y-6 mt-0 pb-4">
+              <TabsContent value="advanced" className="space-y-6 mt-0 pb-4">
                 {settings ? (
                   <motion.div
                     initial={{ opacity: 0, y: 10 }}

@@ -181,7 +181,7 @@ export function ProxyPanel({ serverMode = false }: ProxyPanelProps) {
 
   return (
     <>
-      <section className="proxy-panel space-y-4">
+      <section className="space-y-4">
         {/* [1] Local routing service state — always on */}
         <div className="flex items-center justify-between rounded-xl border border-border bg-card/50 p-4 transition-colors hover:bg-muted/50">
           <div className="flex items-center gap-3">
@@ -645,7 +645,7 @@ function StatCard({ icon, label, value, variant = "default" }: StatCardProps) {
 
   return (
     <div
-      className={`density-stat-card rounded-lg border border-border bg-card/60 p-4 text-sm text-muted-foreground ${variantStyles[variant]}`}
+      className={`rounded-lg border border-border bg-card/60 p-4 text-sm text-muted-foreground ${variantStyles[variant]}`}
     >
       <div className="flex items-center gap-2 text-muted-foreground mb-2">
         {icon}

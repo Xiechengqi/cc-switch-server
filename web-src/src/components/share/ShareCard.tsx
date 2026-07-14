@@ -150,8 +150,8 @@ export function ShareCard({
   };
 
   return (
-    <Card className="density-surface-card border-border-default/70 bg-card/90">
-      <CardContent className="density-surface-card-inner space-y-5 px-5 py-5">
+    <Card className="border-border-default/70 bg-card/90">
+      <CardContent className="space-y-5 px-5 py-5">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           <div className="space-y-2">
             <div className="flex flex-wrap items-center gap-2">

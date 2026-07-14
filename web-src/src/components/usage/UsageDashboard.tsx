@@ -166,7 +166,7 @@ export function UsageDashboard() {
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4 }}
-      className="usage-dashboard space-y-8 pb-8"
+      className="space-y-8 pb-8"
     >
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 mb-2">
         <div className="flex flex-col gap-1">
@@ -311,9 +311,9 @@ export function UsageDashboard() {
       />
 
       <div className="space-y-4">
-        <Tabs defaultValue="logs" className="w-full density-subtabs">
+        <Tabs defaultValue="logs" className="w-full">
           <div className="flex items-center justify-between mb-4">
-            <TabsList className="bg-muted/50 density-subtabs-list">
+            <TabsList className="bg-muted/50">
               <TabsTrigger value="logs" className="gap-2">
                 <ListFilter className="h-4 w-4" />
                 {t("usage.requestLogs")}

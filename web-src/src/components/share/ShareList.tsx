@@ -47,7 +47,7 @@ export function ShareList({
 
   if (error) {
     return (
-      <Card className="density-empty-state density-surface-card border-red-500/30 bg-red-500/5">
+      <Card className="border-red-500/30 bg-red-500/5">
         <CardContent className="flex flex-col items-start gap-4 px-6 py-6">
           <div>
             <div className="text-base font-medium">
@@ -65,7 +65,7 @@ export function ShareList({
 
   if (isLoading) {
     return (
-      <div className="share-list-skeleton grid gap-4">
+      <div className="grid gap-4">
         {Array.from({ length: 3 }).map((_, index) => (
           <div
             key={index}
@@ -78,7 +78,7 @@ export function ShareList({
 
   if (shares.length === 0) {
     return (
-      <Card className="density-empty-state density-surface-card border-dashed border-border-default/80 bg-muted/15">
+      <Card className="border-dashed border-border-default/80 bg-muted/15">
         <CardContent className="flex flex-col items-center gap-4 px-6 py-12 text-center">
           <div className="space-y-2">
             <h3 className="text-xl font-semibold">{t("share.empty")}</h3>
@@ -97,7 +97,7 @@ export function ShareList({
   }
 
   return (
-    <div className="share-list-root grid gap-4">
+    <div className="grid gap-4">
       {readOnly ? (
         <p className="rounded-xl border border-border-default/70 bg-card/40 px-4 py-2.5 text-sm text-muted-foreground">
           {t("share.readOnlyOverviewHint", {
