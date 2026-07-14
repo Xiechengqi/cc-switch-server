@@ -108,6 +108,7 @@
   width: min(100%, 560px);
 }.auth-shell-card--compact{
   width: min(100%, 384px);
+  padding-top: 40px;
 }.auth-client-card{
   width: 100%;
   border: 1px solid hsl(var(--border));
@@ -115,8 +116,6 @@
   background: hsl(var(--panel));
   box-shadow: 0 1px 2px hsl(220 20% 20% / 0.04);
   padding: 20px 18px 18px;
-}.auth-client-card-header{
-  padding-right: 72px;
 }.auth-shell .auth-panel{
   width: 100%;
   max-width: none;

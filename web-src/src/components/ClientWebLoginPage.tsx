@@ -5,6 +5,7 @@ import { AuthLanguageSwitcher } from "@/components/AuthLanguageSwitcher";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SecretInput } from "@/components/ui/secret-input";
+import { useI18n } from "@/lib/i18n";
 import {
   clearRouterSessionTokens,
   getWebAuthMethods,
@@ -20,11 +21,15 @@ import { extractErrorMessage } from "@/utils/errorUtils";
 
 type LoginMode = "email" | "token" | "password" | "setup";
 
+const AUTH_SECRET_PLACEHOLDER_CLASS =
+  "placeholder:text-slate-400 dark:placeholder:text-slate-500";
+
 export function ClientWebLoginPage({
   onAuthenticated,
 }: {
   onAuthenticated: () => Promise<WebRuntimeContext>;
 }) {
+  const { t } = useI18n();
   const [authMethods, setAuthMethods] = useState<WebAuthMethods | null>(null);
   const [mode, setMode] = useState<LoginMode>("password");
   const [code, setCode] = useState("");
@@ -64,9 +69,9 @@ export function ClientWebLoginPage({
   const finishAuth = useCallback(async () => {
     const context = await onAuthenticated();
     if (context.mode === "client-login") {
-      throw new Error("登录凭证无权访问当前 client");
+      throw new Error(t("server.auth.clientWeb.unauthorizedCredential"));
     }
-  }, [onAuthenticated]);
+  }, [onAuthenticated, t]);
 
   const ownerEmail = authMethods?.ownerEmail?.trim() ?? "";
 
@@ -80,13 +85,13 @@ export function ClientWebLoginPage({
       });
       setCode("");
       setCodeSent(true);
-      toast.success("验证码已发送");
+      toast.success(t("server.auth.clientWeb.codeSent"));
     } catch (err) {
       setError(extractErrorMessage(err));
     } finally {
       setBusy(false);
     }
-  }, [busy, ownerEmail]);
+  }, [busy, ownerEmail, t]);
 
   const verifyCode = useCallback(async () => {
     if (!ownerEmail || code.trim().length < 6 || busy) return;
@@ -95,13 +100,13 @@ export function ClientWebLoginPage({
     try {
       await verifyRouterEmailCode(ownerEmail, code.trim(), { clientWeb: true });
       await finishAuth();
-      toast.success("已登录 client");
+      toast.success(t("server.auth.clientWeb.loggedIn"));
     } catch (err) {
       setError(extractErrorMessage(err));
     } finally {
       setBusy(false);
     }
-  }, [busy, code, finishAuth, ownerEmail]);
+  }, [busy, code, finishAuth, ownerEmail, t]);
 
   const loginWithToken = useCallback(async () => {
     const token = apiToken.trim();
@@ -111,14 +116,14 @@ export function ClientWebLoginPage({
     try {
       setRouterApiToken(token);
       await finishAuth();
-      toast.success("已使用 API token 登录 client");
+      toast.success(t("server.auth.clientWeb.loggedInWithToken"));
     } catch (err) {
       clearRouterSessionTokens();
       setError(extractErrorMessage(err));
     } finally {
       setBusy(false);
     }
-  }, [apiToken, busy, finishAuth]);
+  }, [apiToken, busy, finishAuth, t]);
 
   const loginWithPassword = useCallback(async () => {
     if (!password || busy) return;
@@ -128,14 +133,14 @@ export function ClientWebLoginPage({
       await loginWithWebPassword(password);
       writeCachedPassword(password);
       await finishAuth();
-      toast.success("已使用 Web 密码登录");
+      toast.success(t("server.auth.clientWeb.loggedInWithPassword"));
     } catch (err) {
       clearRouterSessionTokens();
       setError(extractErrorMessage(err));
     } finally {
       setBusy(false);
     }
-  }, [busy, finishAuth, password]);
+  }, [busy, finishAuth, password, t]);
 
   const setupPasswordOnly = useCallback(async () => {
     if (!setupPasswordValue || busy) return;
@@ -145,14 +150,14 @@ export function ClientWebLoginPage({
       await setupWebPassword(setupPasswordValue);
       writeCachedPassword(setupPasswordValue);
       await finishAuth();
-      toast.success("Web 密码已设置");
+      toast.success(t("server.auth.clientWeb.passwordSet"));
     } catch (err) {
       clearRouterSessionTokens();
       setError(extractErrorMessage(err));
     } finally {
       setBusy(false);
     }
-  }, [busy, finishAuth, setupPasswordValue]);
+  }, [busy, finishAuth, setupPasswordValue, t]);
 
   const canUseEmail = authMethods?.methods.includes("email") ?? false;
   const canUseToken = authMethods?.methods.includes("apiToken") ?? false;
@@ -195,13 +200,15 @@ export function ClientWebLoginPage({
             className="mx-auto mb-3 h-12 w-12"
           />
           <div className="text-lg font-semibold">
-            {needsPasswordSetup ? "设置 Web 密码" : "Client Web 登录"}
-          </div>
-          <div className="mt-1 text-sm text-muted-foreground">
             {needsPasswordSetup
-              ? "首次访问需要设置 Web 管理密码。"
-              : "使用可用的鉴权方式访问当前 client。"}
+              ? t("server.auth.clientWeb.setupTitle")
+              : t("server.auth.clientWeb.loginTitle")}
           </div>
+          {needsPasswordSetup ? (
+            <div className="mt-1 text-sm text-muted-foreground">
+              {t("server.auth.clientWeb.setupSubtitle")}
+            </div>
+          ) : null}
         </div>
         {needsPasswordSetup ? null : tabCount > 1 ? (
           <div
@@ -216,7 +223,7 @@ export function ClientWebLoginPage({
                 variant={mode === "password" ? "default" : "outline"}
                 onClick={() => setMode("password")}
               >
-                Web 密码
+                {t("server.auth.clientWeb.webPassword")}
               </Button>
             ) : null}
             {canUseEmail ? (
@@ -225,7 +232,7 @@ export function ClientWebLoginPage({
                 variant={mode === "email" ? "default" : "outline"}
                 onClick={() => setMode("email")}
               >
-                邮箱验证码
+                {t("server.auth.methodEmail")}
               </Button>
             ) : null}
             {canUseToken ? (
@@ -234,7 +241,7 @@ export function ClientWebLoginPage({
                 variant={mode === "token" ? "default" : "outline"}
                 onClick={() => setMode("token")}
               >
-                API Token
+                {t("server.auth.methodApiToken")}
               </Button>
             ) : null}
           </div>
@@ -243,9 +250,10 @@ export function ClientWebLoginPage({
           <form className="grid gap-3" onSubmit={handleSetupSubmit}>
             <SecretInput
               value={setupPasswordValue}
-              placeholder="设置 Web 密码"
+              placeholder={t("server.auth.clientWeb.setupPasswordPlaceholder")}
               autoComplete="new-password"
               disabled={busy}
+              className={AUTH_SECRET_PLACEHOLDER_CLASS}
               onChange={(event) =>
                 setSetupPasswordValue(event.currentTarget.value)
               }
@@ -255,14 +263,14 @@ export function ClientWebLoginPage({
                 type="submit"
                 disabled={busy || setupPasswordValue.length < 8}
               >
-                设置并登录
+                {t("server.auth.clientWeb.setupAndLogin")}
               </Button>
             </div>
           </form>
         ) : mode === "email" && canUseEmail ? (
           <form className="grid gap-3" onSubmit={handleEmailSubmit}>
             <label className="grid gap-2">
-              <span className="text-sm font-medium">Owner 邮箱</span>
+              <span className="text-sm font-medium">{t("server.auth.ownerEmail")}</span>
               <Input
                 readOnly
                 value={ownerEmail}
@@ -272,7 +280,7 @@ export function ClientWebLoginPage({
             {codeSent ? (
               <Input
                 value={code}
-                placeholder="验证码"
+                placeholder={t("server.auth.clientWeb.verificationCode")}
                 inputMode="numeric"
                 autoComplete="one-time-code"
                 disabled={busy}
@@ -281,7 +289,9 @@ export function ClientWebLoginPage({
             ) : null}
             <div className="auth-panel-footer">
               <Button type="submit" disabled={busy || !ownerEmail}>
-                {codeSent ? "验证并登录" : "发送验证码"}
+                {codeSent
+                  ? t("server.auth.clientWeb.verifyAndLogin")
+                  : t("server.auth.clientWeb.sendCode")}
               </Button>
             </div>
           </form>
@@ -292,11 +302,12 @@ export function ClientWebLoginPage({
               placeholder="ccrt_..."
               autoComplete="off"
               disabled={busy}
+              className={AUTH_SECRET_PLACEHOLDER_CLASS}
               onChange={(event) => setApiToken(event.currentTarget.value)}
             />
             <div className="auth-panel-footer">
               <Button type="submit" disabled={busy || !apiToken.trim()}>
-                登录
+                {t("server.auth.clientWeb.login")}
               </Button>
             </div>
           </form>
@@ -304,14 +315,15 @@ export function ClientWebLoginPage({
           <form className="grid gap-3" onSubmit={handlePasswordSubmit}>
             <SecretInput
               value={password}
-              placeholder="Web 密码"
+              placeholder={t("server.auth.clientWeb.webPassword")}
               autoComplete="current-password"
               disabled={busy}
+              className={AUTH_SECRET_PLACEHOLDER_CLASS}
               onChange={(event) => setPassword(event.currentTarget.value)}
             />
             <div className="auth-panel-footer">
               <Button type="submit" disabled={busy || !password}>
-                登录
+                {t("server.auth.clientWeb.login")}
               </Button>
             </div>
           </form>
