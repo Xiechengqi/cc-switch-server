@@ -36,7 +36,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
+import { shellPaddingXClass } from "@/lib/layout";
 import { settingsApi } from "@/lib/api";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
@@ -248,7 +248,7 @@ export function SettingsPage({
     <div
       className={cn(
         "flex flex-col h-full overflow-hidden",
-        isCompact ? "px-3" : PAGE_SHELL_PADDING_X,
+        shellPaddingXClass(),
       )}
     >
       {isBusy ? (
@@ -262,32 +262,35 @@ export function SettingsPage({
           className="flex flex-col h-full"
         >
           <TabsList
+            compact={isCompact}
             className={cn(
-              "w-full glass rounded-lg",
-              isCompact
-                ? "settings-tabs-scroll mb-3"
-                : cn(
-                    "grid mb-6",
-                    serverMode ? "grid-cols-6" : "grid-cols-5",
-                  ),
+              !isCompact &&
+                cn(
+                  "grid w-full mb-6",
+                  serverMode ? "grid-cols-6" : "grid-cols-5",
+                ),
             )}
           >
-            <TabsTrigger value="general">
+            <TabsTrigger compact={isCompact} value="general">
               {t("settings.tabGeneral")}
             </TabsTrigger>
-            <TabsTrigger value="proxy">{t("settings.tabProxy")}</TabsTrigger>
-            <TabsTrigger value="auth">
+            <TabsTrigger compact={isCompact} value="proxy">
+              {t("settings.tabProxy")}
+            </TabsTrigger>
+            <TabsTrigger compact={isCompact} value="auth">
               {t("settings.tabAuth", { defaultValue: "认证" })}
             </TabsTrigger>
             {serverMode ? (
-              <TabsTrigger value="share">
+              <TabsTrigger compact={isCompact} value="share">
                 {t("settings.tabShare", { defaultValue: "分享" })}
               </TabsTrigger>
             ) : null}
-            <TabsTrigger value="advanced">
+            <TabsTrigger compact={isCompact} value="advanced">
               {t("settings.tabAdvanced")}
             </TabsTrigger>
-            <TabsTrigger value="usage">{t("usage.title")}</TabsTrigger>
+            <TabsTrigger compact={isCompact} value="usage">
+              {t("usage.title")}
+            </TabsTrigger>
           </TabsList>
 
           <div className="flex-1 min-h-0 flex flex-col">
@@ -295,13 +298,13 @@ export function SettingsPage({
               ref={tabScrollContainerRef}
               className="flex-1 overflow-y-auto overflow-x-hidden pr-2"
             >
-              <TabsContent value="general" className="space-y-6 mt-0">
+              <TabsContent value="general" className="settings-tab-panel space-y-6 mt-0">
                 {settings ? (
                   <motion.div
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ duration: 0.3 }}
-                    className="space-y-6"
+                    className="settings-tab-panel space-y-6"
                   >
                     <LanguageSettings
                       value={settings.language}
@@ -364,7 +367,7 @@ export function SettingsPage({
                 )}
               </TabsContent>
 
-              <TabsContent value="proxy" className="space-y-6 mt-0 pb-4">
+              <TabsContent value="proxy" className="settings-tab-panel space-y-6 mt-0 pb-4">
                 {settings ? (
                   <ProxyTabContent
                     settings={settings}
@@ -374,7 +377,7 @@ export function SettingsPage({
                 ) : null}
               </TabsContent>
 
-              <TabsContent value="auth" className="space-y-6 mt-0 pb-4">
+              <TabsContent value="auth" className="settings-tab-panel space-y-6 mt-0 pb-4">
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
@@ -386,7 +389,7 @@ export function SettingsPage({
               </TabsContent>
 
               {serverMode ? (
-                <TabsContent value="share" className="space-y-6 mt-0 pb-4">
+                <TabsContent value="share" className="settings-tab-panel space-y-6 mt-0 pb-4">
                   <motion.div
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -397,7 +400,7 @@ export function SettingsPage({
                 </TabsContent>
               ) : null}
 
-              <TabsContent value="advanced" className="space-y-6 mt-0 pb-4">
+              <TabsContent value="advanced" className="settings-tab-panel space-y-6 mt-0 pb-4">
                 {settings ? (
                   <motion.div
                     initial={{ opacity: 0, y: 10 }}

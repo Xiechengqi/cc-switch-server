@@ -24,9 +24,12 @@ import { clearRouterSessionTokens } from "@/lib/routerAuth";
 import { writeCachedPassword, writeToken } from "@/lib/runtime";
 import {
   APP_VIEWPORT_PADDING_Y,
+  LAYOUT_PAGE_HEADER_CLASS,
+  LAYOUT_PAGE_VIEWPORT_CLASS,
   PAGE_HEADER_CONTENT_GAP,
   PAGE_SHELL_CLASS,
   PAGE_SHELL_PADDING_X,
+  shellPaddingXClass,
 } from "@/lib/layout";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
@@ -266,15 +269,10 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
           <div
             className={cn(
               "flex flex-col flex-1 min-h-0 overflow-hidden",
-              isCompact ? "px-3" : PAGE_SHELL_PADDING_X,
+              shellPaddingXClass(),
             )}
           >
-            <div
-              className={cn(
-                "flex-1 overflow-y-auto overflow-x-hidden",
-                isCompact ? "pb-4" : "pb-10 sm:pb-12",
-              )}
-            >
+            <div className="layout-page-content-scroll flex-1 overflow-y-auto overflow-x-hidden pb-4 sm:pb-10">
               <AnimatePresence mode="wait">
                 <motion.div
                   key={activeApp}
@@ -315,17 +313,19 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
   return (
     <div
       className={cn(
-        "flex flex-col h-screen overflow-hidden bg-background text-foreground selection:bg-primary/30",
-        isCompact ? "py-1.5 gap-2" : cn(APP_VIEWPORT_PADDING_Y, PAGE_HEADER_CONTENT_GAP),
+        LAYOUT_PAGE_VIEWPORT_CLASS,
+        APP_VIEWPORT_PADDING_Y,
+        PAGE_HEADER_CONTENT_GAP,
+        "bg-background text-foreground selection:bg-primary/30",
       )}
     >
       <header className="sticky top-0 z-50 w-full shrink-0 bg-background/80 backdrop-blur-md">
         <div
           className={cn(
             PAGE_SHELL_CLASS,
-            isCompact ? "px-3" : PAGE_SHELL_PADDING_X,
-            "flex items-center justify-between gap-2",
-            isCompact ? "min-h-11" : "min-h-14",
+            PAGE_SHELL_PADDING_X,
+            LAYOUT_PAGE_HEADER_CLASS,
+            "flex min-h-14 items-center justify-between gap-2",
           )}
         >
           <div className="flex min-w-0 items-center gap-2">
@@ -335,11 +335,11 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                   variant="outline"
                   size="icon"
                   onClick={() => setCurrentView("providers")}
-                  className="rounded-lg"
+                  className="layout-icon-btn rounded-lg"
                 >
                   <ArrowLeft className="w-4 h-4" />
                 </Button>
-                <h1 className={cn("font-semibold truncate", isCompact ? "text-base" : "text-lg")}>
+                <h1 className="layout-brand-title text-lg font-semibold truncate">
                   {currentView === "settings" && t("settings.title")}
                   {currentView === "shares" && t("share.title")}
                 </h1>
@@ -351,8 +351,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                   target="_blank"
                   rel="noreferrer"
                   className={cn(
-                    "font-semibold transition-colors",
-                    isCompact ? "text-base" : "text-xl",
+                    "layout-brand-title text-xl font-semibold transition-colors",
                     isProxyRunning && isCurrentAppTakeoverActive
                       ? "text-emerald-500 hover:text-emerald-600"
                       : "text-blue-500 hover:text-blue-600",
@@ -365,7 +364,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                   size="icon"
                   onClick={() => openSettings("general")}
                   title={t("common.settings")}
-                  className="hover:bg-black/5 dark:hover:bg-white/5"
+                  className="layout-icon-btn hover:bg-black/5 dark:hover:bg-white/5"
                 >
                   <Settings className="w-4 h-4" />
                 </Button>
@@ -376,7 +375,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                       size="icon"
                       onClick={() => openSettings("auth")}
                       title={t("settings.tabAuth", { defaultValue: "认证" })}
-                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                      className="layout-icon-btn hover:bg-black/5 dark:hover:bg-white/5"
                     >
                       <ShieldCheck className="w-4 h-4" />
                     </Button>
@@ -385,7 +384,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                       size="icon"
                       onClick={() => setCurrentView("shares")}
                       title={t("share.title")}
-                      className="hover:bg-black/5 dark:hover:bg-white/5"
+                      className="layout-icon-btn hover:bg-black/5 dark:hover:bg-white/5"
                     >
                       <Share2 className="w-4 h-4" />
                     </Button>
@@ -403,7 +402,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                 </div>
               )}
               <div className="flex min-w-0 flex-1 items-center">
-                <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                <div className={cn("ml-auto flex shrink-0 items-center gap-1.5", isCompact && "app-switcher-compact")}>
                   <AppSwitcher
                     activeApp={activeApp}
                     onSwitch={setActiveApp}
@@ -413,7 +412,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                   <Button
                     onClick={() => setIsAddOpen(true)}
                     size="icon"
-                    className={cn("ml-1", addActionButtonClass, isCompact && "h-7 w-7")}
+                    className={cn("layout-icon-btn ml-1", addActionButtonClass)}
                     title={t("providers.addProvider", {
                       defaultValue: "添加供应商",
                     })}
@@ -431,7 +430,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
         <AnimatePresence mode="wait">
           <motion.div
             key={currentView}
-            className={cn(PAGE_SHELL_CLASS, "h-full", isCompact && "px-3")}
+            className={cn(PAGE_SHELL_CLASS, PAGE_SHELL_PADDING_X, "h-full")}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}

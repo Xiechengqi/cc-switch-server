@@ -6,12 +6,17 @@ use base64::Engine;
 use bytes::Bytes;
 use rand::RngCore;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{ProxyError, ProxyRoute};
 
-const DEFAULT_GROK_MODEL: &str = "grok-4.3";
+const DEFAULT_GROK_MODEL: &str = "grok-4.5";
 const GROK_API_BASE: &str = "https://api.x.ai/v1";
+const GROK_CLI_CHAT_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const GROK_WS_URL: &str = "wss://api.x.ai/v1/responses";
+const GROK_CLI_USER_AGENT: &str = "grok-pager/0.2.93 grok-shell/0.2.93 (linux; x86_64)";
+static GROK_TURN_IDX: AtomicU64 = AtomicU64::new(1);
 
 pub(super) struct GrokForwardContract {
     pub session_id: Option<String>,
@@ -23,22 +28,57 @@ pub(super) fn apply_forward_contract(
     downstream_headers: &HeaderMap,
     route: ProxyRoute,
     downstream_session_id: Option<&str>,
+    tenant_scope: Option<&str>,
+    cli_profile: bool,
 ) -> Result<GrokForwardContract, ProxyError> {
     patch_grok_request_body(body, route)?;
     let model = request_model(body).unwrap_or_else(|| DEFAULT_GROK_MODEL.to_string());
-    let session_id = grok_session_id(downstream_headers, downstream_session_id, &model);
+    let session_id = grok_session_id(
+        downstream_headers,
+        downstream_session_id,
+        &model,
+        tenant_scope,
+    );
     if let Some(session_id) = session_id.as_deref() {
         inject_prompt_cache_key(body, session_id)?;
     }
+    let free_cache_identity = if cli_profile && route != ProxyRoute::CodexResponsesCompact {
+        maybe_apply_free_cache(body, session_id.as_deref())?
+    } else {
+        None
+    };
     let mut headers = vec![
         ("accept", "application/json, text/event-stream".to_string()),
-        ("user-agent", "cc-switch-server-grok/1.0".to_string()),
+        (
+            "user-agent",
+            if cli_profile {
+                GROK_CLI_USER_AGENT.to_string()
+            } else {
+                "cc-switch-server-grok/1.0".to_string()
+            },
+        ),
     ];
+    if cli_profile {
+        headers.push(("x-xai-token-auth", "xai-grok-cli".to_string()));
+        headers.push(("x-grok-client-identifier", "grok-pager".to_string()));
+        headers.push(("x-grok-client-version", "0.2.93".to_string()));
+        headers.push((
+            "x-authenticateresponse",
+            "authenticate-response".to_string(),
+        ));
+        headers.push((
+            "x-grok-turn-idx",
+            GROK_TURN_IDX.fetch_add(1, Ordering::Relaxed).to_string(),
+        ));
+    }
     if let Some(openai_beta) = header_string(downstream_headers, "openai-beta") {
         headers.push(("openai-beta", openai_beta));
     }
     if let Some(session_id) = session_id.clone() {
         headers.push(("x-grok-conv-id", session_id));
+    }
+    if let Some(identity) = free_cache_identity {
+        headers.push(("x-grok-cache-identity", identity));
     }
     Ok(GrokForwardContract {
         session_id,
@@ -52,6 +92,21 @@ pub(super) fn websocket_url() -> &'static str {
 
 pub(super) fn default_base_url() -> &'static str {
     GROK_API_BASE
+}
+
+pub(super) fn chat_upstream_url(resolved_url: &str, cli_profile: bool) -> String {
+    if !cli_profile {
+        return resolved_url.to_string();
+    }
+    let trimmed = resolved_url.trim();
+    if let Some(path) = trimmed.strip_prefix(GROK_API_BASE) {
+        return format!("{GROK_CLI_CHAT_BASE}{path}");
+    }
+    if let Some(path) = trimmed.strip_prefix("https://api.x.ai") {
+        let path = path.strip_prefix("/v1").unwrap_or(path);
+        return format!("{GROK_CLI_CHAT_BASE}{path}");
+    }
+    trimmed.to_string()
 }
 
 pub(super) fn upstream_media_url(path: &str) -> String {
@@ -106,6 +161,7 @@ fn patch_grok_request_value(value: &mut Value, route: ProxyRoute) {
         model
     };
     remove_recursive(value, "external_web_access");
+    let store_false = value.get("store").and_then(Value::as_bool) == Some(false);
     if let Some(object) = value.as_object_mut() {
         if route != ProxyRoute::CodexChatCompletions {
             object.remove("stream_options");
@@ -122,7 +178,93 @@ fn patch_grok_request_value(value: &mut Value, route: ProxyRoute) {
         sanitize_reasoning(object, &model);
         sanitize_tools(object);
     }
+    if store_false {
+        strip_server_item_ids(value);
+    }
+    if grok_strict_allowlist_enabled() {
+        if let Some(object) = value.as_object_mut() {
+            retain_responses_allowlist(object);
+        }
+    }
     strip_invalid_encrypted_content(value);
+}
+
+fn maybe_apply_free_cache(
+    body: &mut Bytes,
+    session_id: Option<&str>,
+) -> Result<Option<String>, ProxyError> {
+    if !grok_free_cache_enabled() {
+        return Ok(None);
+    }
+    let Some(identity) = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+    let mut value = serde_json::from_slice::<Value>(body).map_err(|error| {
+        ProxyError::bad_request(format!("Grok request body must be valid JSON: {error}"))
+    })?;
+    let Some(object) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    object.insert(
+        "tools".to_string(),
+        json!([
+            {"type": "web_search"},
+            {"type": "x_search"}
+        ]),
+    );
+    object.insert("tool_choice".to_string(), Value::String("none".to_string()));
+    *body = serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::bad_request(format!("Grok request encode failed: {error}")))?;
+    Ok(Some(identity))
+}
+
+fn grok_free_cache_enabled() -> bool {
+    env_flag("CC_SWITCH_GROK_FREE_CACHE")
+}
+
+fn grok_strict_allowlist_enabled() -> bool {
+    env_flag("CC_SWITCH_GROK_STRICT_ALLOWLIST")
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn retain_responses_allowlist(object: &mut Map<String, Value>) {
+    object.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "background"
+                | "include"
+                | "input"
+                | "instructions"
+                | "max_output_tokens"
+                | "metadata"
+                | "model"
+                | "parallel_tool_calls"
+                | "previous_response_id"
+                | "prompt"
+                | "prompt_cache_key"
+                | "reasoning"
+                | "store"
+                | "stream"
+                | "temperature"
+                | "text"
+                | "tool_choice"
+                | "tools"
+                | "top_p"
+                | "truncation"
+                | "user"
+        )
+    });
 }
 
 pub(super) fn parse_cooldown_until_ms(
@@ -407,6 +549,7 @@ fn request_model(body: &[u8]) -> Option<String> {
 fn normalize_grok_model(model: &str) -> String {
     match model.trim() {
         "" | "grok" | "grok-latest" => DEFAULT_GROK_MODEL.to_string(),
+        "grok-build-latest" | "grok-4.5-latest" => DEFAULT_GROK_MODEL.to_string(),
         "grok-build" => "grok-build-0.1".to_string(),
         "grok-composer" => "grok-composer-2.5-fast".to_string(),
         "grok-4.20-reasoning" => "grok-4.20-0309-reasoning".to_string(),
@@ -419,20 +562,38 @@ fn grok_session_id(
     headers: &HeaderMap,
     downstream_session_id: Option<&str>,
     model: &str,
+    tenant_scope: Option<&str>,
 ) -> Option<String> {
-    if model.starts_with("grok-composer-") {
-        return Some(random_session_id());
-    }
-    header_string(headers, "x-grok-conv-id")
-        .or_else(|| header_string(headers, "x-session-id"))
-        .or_else(|| downstream_session_id.map(str::to_string))
-        .or_else(|| Some(random_session_id()))
+    let raw = if model.starts_with("grok-composer-") {
+        random_session_id()
+    } else {
+        header_string(headers, "x-grok-conv-id")
+            .or_else(|| header_string(headers, "x-session-id"))
+            .or_else(|| downstream_session_id.map(str::to_string))
+            .or_else(|| Some(random_session_id()))?
+    };
+    Some(namespace_session_id(tenant_scope, &raw))
 }
 
 fn random_session_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub(super) fn namespace_session_id(tenant_scope: Option<&str>, raw: &str) -> String {
+    let Some(scope) = tenant_scope
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return raw.to_string();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    format!("ccs_{}", URL_SAFE_NO_PAD.encode(&digest[..18]))
 }
 
 fn sanitize_reasoning(object: &mut Map<String, Value>, model: &str) {
@@ -448,6 +609,36 @@ fn grok_model_supports_reasoning_effort(model: &str) -> bool {
     model.starts_with("grok-3-mini")
         || model.starts_with("grok-4.20-multi-agent")
         || model.starts_with("grok-4.3")
+        || model.starts_with("grok-4.5")
+}
+
+fn strip_server_item_ids(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if object
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(is_server_item_id)
+            {
+                object.remove("id");
+            }
+            for child in object.values_mut() {
+                strip_server_item_ids(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                strip_server_item_ids(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_server_item_id(value: &str) -> bool {
+    ["rs_", "fc_", "resp_", "msg_"]
+        .into_iter()
+        .any(|prefix| value.starts_with(prefix))
 }
 
 fn sanitize_tools(object: &mut Map<String, Value>) {
@@ -617,7 +808,8 @@ mod tests {
 
     #[test]
     fn normalizes_grok_model_aliases() {
-        assert_eq!(normalize_grok_model("grok"), "grok-4.3");
+        assert_eq!(normalize_grok_model("grok"), "grok-4.5");
+        assert_eq!(normalize_grok_model("grok-build-latest"), "grok-4.5");
         assert_eq!(normalize_grok_model("grok-build"), "grok-build-0.1");
         assert_eq!(
             normalize_grok_model("grok-composer"),
@@ -632,6 +824,39 @@ mod tests {
             "grok-4.20-0309-non-reasoning"
         );
         assert_eq!(normalize_grok_model("grok-custom"), "grok-custom");
+    }
+
+    #[test]
+    fn cli_profile_rewrites_official_chat_base_only() {
+        assert_eq!(
+            chat_upstream_url("https://api.x.ai/v1/responses", true),
+            "https://cli-chat-proxy.grok.com/v1/responses"
+        );
+        assert_eq!(
+            chat_upstream_url("https://relay.example/v1/responses", true),
+            "https://relay.example/v1/responses"
+        );
+        assert_eq!(
+            chat_upstream_url("https://api.x.ai/v1/responses", false),
+            "https://api.x.ai/v1/responses"
+        );
+    }
+
+    #[test]
+    fn store_false_strips_server_side_item_ids() {
+        let mut body = json_body(json!({
+            "model": "grok",
+            "store": false,
+            "input": [
+                {"id": "resp_123", "type": "message", "content": "keep"},
+                {"id": "client_123", "type": "message", "content": "keep-client"}
+            ]
+        }));
+
+        patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
+        let value = serde_json::from_slice::<Value>(&body).unwrap();
+        assert!(value["input"][0].get("id").is_none());
+        assert_eq!(value["input"][1]["id"], "client_123");
     }
 
     #[test]

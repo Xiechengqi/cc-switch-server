@@ -1106,6 +1106,123 @@ pub(in crate::api) async fn cancel_codex_device_login(
     }))
 }
 
+pub(in crate::api) async fn start_grok_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(_input): Json<StartGrokDeviceLoginRequest>,
+) -> Result<Json<StartGrokDeviceLoginResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let http_client = state.http_client().await;
+    let now = now_ms() as i64;
+    let (device, flow) = crate::clients::oauth::grok_device::start_device_flow(&http_client, now)
+        .await
+        .map_err(map_grok_device_error)?;
+    state
+        .insert_grok_device_flow(device.device_code.clone(), flow, now)
+        .await;
+    Ok(Json(StartGrokDeviceLoginResponse { ok: true, device }))
+}
+
+pub(in crate::api) async fn poll_grok_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PollGrokDeviceLoginRequest>,
+) -> Result<Json<PollGrokDeviceLoginResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let now = now_ms() as i64;
+    let lease = state
+        .begin_grok_device_poll(&input.device_code, now)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("grok device flow is expired or unknown"))?;
+    let result = match lease {
+        crate::clients::oauth::grok_device::GrokDevicePollLease::Ready(flow) => {
+            let http_client = state.http_client().await;
+            match crate::clients::oauth::grok_device::poll_device_flow(
+                &http_client,
+                &input.device_code,
+                &flow,
+                now,
+            )
+            .await
+            {
+                Ok(result) => {
+                    if !state
+                        .finish_grok_device_poll(&input.device_code, result.clone())
+                        .await
+                    {
+                        return Err(ApiError::unauthorized(
+                            "grok device flow was cancelled while polling",
+                        ));
+                    }
+                    result
+                }
+                Err(error) => {
+                    let terminal = matches!(
+                        error.status,
+                        StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
+                    );
+                    state
+                        .fail_grok_device_poll(&input.device_code, terminal)
+                        .await;
+                    return Err(map_grok_device_error(error));
+                }
+            }
+        }
+        crate::clients::oauth::grok_device::GrokDevicePollLease::InProgress => {
+            return Ok(Json(PollGrokDeviceLoginResponse {
+                ok: true,
+                pending: true,
+                message: "poll_in_progress".to_string(),
+                retry_after_secs: Some(1),
+                account: None,
+            }));
+        }
+        crate::clients::oauth::grok_device::GrokDevicePollLease::Completed(result) => *result,
+    };
+    if result.pending {
+        return Ok(Json(PollGrokDeviceLoginResponse {
+            ok: true,
+            pending: true,
+            message: result.message,
+            retry_after_secs: result.retry_after_secs,
+            account: None,
+        }));
+    }
+    let account_input = result
+        .account_input
+        .clone()
+        .ok_or_else(|| ApiError::bad_gateway("grok device flow completed without account"))?;
+    let provider_type = account_input.provider_type;
+    let account = state
+        .try_mutate_accounts_immediate(|store| {
+            manager_for(provider_type)
+                .finish_login(store, account_input)
+                .map_err(ApiError::bad_request)
+        })
+        .await
+        .map_err(ApiError::internal)??;
+    Ok(Json(PollGrokDeviceLoginResponse {
+        ok: true,
+        pending: false,
+        message: result.message,
+        retry_after_secs: None,
+        account: Some(AccountLoginAccountSummary::from_account(&account)),
+    }))
+}
+
+pub(in crate::api) async fn cancel_grok_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CancelGrokDeviceLoginRequest>,
+) -> Result<Json<CancelGrokDeviceLoginResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let cancelled = state.cancel_grok_device_flow(&input.device_code).await;
+    Ok(Json(CancelGrokDeviceLoginResponse {
+        ok: true,
+        cancelled,
+    }))
+}
+
 pub(in crate::api) async fn execute_account_login_token_exchange(
     state: &ServerState,
     finish: &mut OAuthLoginFinish,

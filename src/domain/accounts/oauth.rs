@@ -178,7 +178,8 @@ static ANTIGRAVITY_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"
 static ANTIGRAVITY_AUTHORIZE_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 static XAI_TOKEN_URLS: &[&str] = &["https://auth.x.ai/oauth2/token"];
 static XAI_AUTHORIZE_URL: &str = "https://auth.x.ai/oauth2/authorize";
-static XAI_AUTHORIZE_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+static XAI_AUTHORIZE_SCOPE: &str =
+    "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
 pub const XAI_LOOPBACK_REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
 
 pub fn claude_oauth_token_urls_for_redirect(redirect_uri: &str) -> Vec<&'static str> {

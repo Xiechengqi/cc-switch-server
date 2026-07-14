@@ -265,11 +265,15 @@ async fn forward_with_attempt(
         }
     }
     let grok_contract = if stored.provider_type == ProviderType::GrokOAuth {
+        let cli_profile = grok_cli_profile(app, &stored);
+        let tenant_scope = grok_tenant_scope(&request_context, &stored);
         let contract = super::grok::apply_forward_contract(
             &mut adapter_request.body,
             &headers,
             route,
             request_context.session_id.as_deref(),
+            tenant_scope.as_deref(),
+            cli_profile,
         )?;
         if request_context.session_id.is_none() {
             request_context.session_id = contract.session_id.clone();
@@ -280,6 +284,9 @@ async fn forward_with_attempt(
     };
     let mut url =
         adapter.resolve_endpoint_for_request(route, gemini_path, &stored, &adapter_request)?;
+    if stored.provider_type == ProviderType::GrokOAuth {
+        url = super::grok::chat_upstream_url(&url, grok_cli_profile(app, &stored));
+    }
     if stored.provider_type == ProviderType::CodexOAuth
         && route == ProxyRoute::CodexResponses
         && codex_responses_body_has_compaction_trigger(&adapter_request.body)
@@ -1137,18 +1144,32 @@ pub async fn forward_codex_responses_ws(
 ) -> Result<Response, ProxyError> {
     let route = ProxyRoute::CodexResponses;
     let app = route.app();
+    let mut request_context = request_context_from_headers(&headers);
+    let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
+        let (share_name, guard) = validate_and_acquire_share_invocation(&state, &share_id).await?;
+        request_context.share_name = Some(share_name);
+        Some(guard)
+    } else {
+        None
+    };
+    let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let stored = state
-        .try_mutate_failover_best_effort_if_changed("failover ws selection state", |failover| {
-            select_provider(&providers, &accounts_for_selection, failover, app, &headers).map(
-                |selected| {
-                    let changed = selected.failover_state_changed;
-                    (selected.provider, changed)
-                },
-            )
-        })
-        .await?;
+    let stored = if let Some(share_id) = request_context.share_id.as_deref() {
+        let (stored, _share_name) = select_share_provider(&providers, &shares, app, share_id)?;
+        stored
+    } else {
+        state
+            .try_mutate_failover_best_effort_if_changed("failover ws selection state", |failover| {
+                select_provider(&providers, &accounts_for_selection, failover, app, &headers).map(
+                    |selected| {
+                        let changed = selected.failover_state_changed;
+                        (selected.provider, changed)
+                    },
+                )
+            })
+            .await?
+    };
     drop(providers);
     if !matches!(
         stored.provider_type,
@@ -1169,9 +1190,18 @@ pub async fn forward_codex_responses_ws(
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(app, stored.provider_type);
     let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
-    let session_id = codex_oauth_session_id_from_request(&headers, b"").or_else(|| {
+    let mut session_id = codex_oauth_session_id_from_request(&headers, b"").or_else(|| {
         (stored.provider_type == ProviderType::GrokOAuth).then(super::grok::new_session_id)
     });
+    if stored.provider_type == ProviderType::GrokOAuth {
+        if let Some(raw) = session_id.as_deref() {
+            let tenant_scope = grok_tenant_scope(&request_context, &stored);
+            session_id = Some(super::grok::namespace_session_id(
+                tenant_scope.as_deref(),
+                raw,
+            ));
+        }
+    }
     append_codex_oauth_session_headers(&mut target_headers, session_id.as_deref());
     if stored.provider_type == ProviderType::CodexOAuth {
         super::codex_identity::finalize_headers(&mut target_headers);
@@ -1198,7 +1228,10 @@ pub async fn forward_codex_responses_ws(
     } else {
         ResponsesWebsocketMode::Codex
     };
+    let share_id = request_context.share_id.clone();
+    let state_for_share = state.clone();
     let response = ws.on_upgrade(move |socket| async move {
+        let _share_invocation_guard = share_invocation_guard;
         if let Err(error) = bridge_responses_websocket(
             socket,
             target_headers,
@@ -1211,6 +1244,12 @@ pub async fn forward_codex_responses_ws(
         {
             tracing::warn!(error = %error, "responses websocket bridge failed");
         }
+        record_share_invocation_result(
+            &state_for_share,
+            share_id.as_deref(),
+            TokenUsage::default(),
+        )
+        .await;
     });
     Ok(response)
 }
@@ -1233,6 +1272,14 @@ pub async fn forward_grok_media(
     body: Bytes,
 ) -> Result<Response, ProxyError> {
     let body = decode_request_body_for_proxy(&headers, body)?;
+    let mut request_context = request_context_from_headers(&headers);
+    let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
+        let (share_name, guard) = validate_and_acquire_share_invocation(&state, &share_id).await?;
+        request_context.share_name = Some(share_name);
+        Some(guard)
+    } else {
+        None
+    };
     let mut selection_headers = headers.clone();
     if let Some(session_key) = super::grok::sticky_media_session_key(&upstream_path, &body) {
         if selection_headers.get("x-cc-provider-id").is_none() {
@@ -1243,28 +1290,45 @@ pub async fn forward_grok_media(
             }
         }
     }
+    let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let stored = state
-        .try_mutate_failover_best_effort_if_changed("grok media selection state", |failover| {
-            super::router::select_provider_for_type(
-                &providers,
-                &accounts_for_selection,
-                failover,
-                AppKind::Codex,
-                &selection_headers,
-                ProviderType::GrokOAuth,
-            )
-            .map(|selected| (selected.provider, selected.failover_state_changed))
-        })
-        .await?;
+    let stored = if let Some(share_id) = request_context.share_id.as_deref() {
+        let (stored, _share_name) =
+            select_share_provider(&providers, &shares, AppKind::Codex, share_id)?;
+        stored
+    } else {
+        state
+            .try_mutate_failover_best_effort_if_changed("grok media selection state", |failover| {
+                super::router::select_provider_for_type(
+                    &providers,
+                    &accounts_for_selection,
+                    failover,
+                    AppKind::Codex,
+                    &selection_headers,
+                    ProviderType::GrokOAuth,
+                )
+                .map(|selected| (selected.provider, selected.failover_state_changed))
+            })
+            .await?
+    };
     drop(providers);
     if stored.provider_type != ProviderType::GrokOAuth {
         return Err(ProxyError::bad_request(
             "Grok media endpoints require a grok_oauth provider",
         ));
     }
-    forward_grok_media_with_stored(state, stored, method, upstream_path, headers, body).await
+    forward_grok_media_with_stored(
+        state,
+        stored,
+        method,
+        upstream_path,
+        headers,
+        body,
+        request_context.share_id,
+        share_invocation_guard,
+    )
+    .await
 }
 
 pub async fn forward_images_generations(
@@ -1273,22 +1337,37 @@ pub async fn forward_images_generations(
     body: Bytes,
 ) -> Result<Response, ProxyError> {
     let body = decode_request_body_for_proxy(&headers, body)?;
+    let mut request_context = request_context_from_headers(&headers);
+    let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
+        let (share_name, guard) = validate_and_acquire_share_invocation(&state, &share_id).await?;
+        request_context.share_name = Some(share_name);
+        Some(guard)
+    } else {
+        None
+    };
+    let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let stored = state
-        .try_mutate_failover_best_effort_if_changed(
-            "image generation selection state",
-            |failover| {
-                select_provider_for_codex_image_generation(
-                    &providers,
-                    &accounts_for_selection,
-                    failover,
-                    &headers,
-                )
-                .map(|selected| (selected.provider, selected.failover_state_changed))
-            },
-        )
-        .await?;
+    let stored = if let Some(share_id) = request_context.share_id.as_deref() {
+        let (stored, _share_name) =
+            select_share_provider(&providers, &shares, AppKind::Codex, share_id)?;
+        stored
+    } else {
+        state
+            .try_mutate_failover_best_effort_if_changed(
+                "image generation selection state",
+                |failover| {
+                    select_provider_for_codex_image_generation(
+                        &providers,
+                        &accounts_for_selection,
+                        failover,
+                        &headers,
+                    )
+                    .map(|selected| (selected.provider, selected.failover_state_changed))
+                },
+            )
+            .await?
+    };
     drop(providers);
 
     match stored.provider_type {
@@ -1300,10 +1379,13 @@ pub async fn forward_images_generations(
                 "/images/generations".to_string(),
                 headers,
                 body,
+                request_context.share_id,
+                share_invocation_guard,
             )
             .await
         }
         ProviderType::CodexOAuth => {
+            drop(share_invocation_guard);
             forward_codex_images_generations(state, stored, headers, body).await
         }
         _ => Err(ProxyError::bad_request(
@@ -1319,6 +1401,8 @@ async fn forward_grok_media_with_stored(
     upstream_path: String,
     headers: HeaderMap,
     body: Bytes,
+    share_id: Option<String>,
+    _share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
     refresh_managed_account_if_needed(&state, AppKind::Codex, &stored).await?;
     let accounts = state.accounts_snapshot().await;
@@ -1403,6 +1487,7 @@ async fn forward_grok_media_with_stored(
         provider_outcome_from_status_and_headers(status_code, &response_headers),
     )
     .await;
+    record_share_invocation_result(&state, share_id.as_deref(), TokenUsage::default()).await;
     let mut response = Response::new(Body::from(response_body));
     *response.status_mut() = status;
     if let Some(content_type) = content_type {
@@ -3206,6 +3291,23 @@ fn managed_account_id(stored: &StoredProvider) -> Option<&str> {
         .as_ref()
         .and_then(|meta| meta.auth_binding.as_ref())
         .and_then(|binding| binding.account_id.as_deref())
+}
+
+fn grok_cli_profile(app: AppKind, stored: &StoredProvider) -> bool {
+    stored.provider_type == ProviderType::GrokOAuth && !provider_secret_configured(app, stored)
+}
+
+fn grok_tenant_scope(context: &UsageLogContext, stored: &StoredProvider) -> Option<String> {
+    if stored.provider_type != ProviderType::GrokOAuth {
+        return None;
+    }
+    Some(format!(
+        "share={}|user={}|provider={}|account={}",
+        context.share_id.as_deref().unwrap_or("direct"),
+        context.user_email.as_deref().unwrap_or("anonymous"),
+        stored.provider.id,
+        managed_account_id(stored).unwrap_or("provider-secret")
+    ))
 }
 
 fn claude_oauth_identity_seed(stored: &StoredProvider) -> String {

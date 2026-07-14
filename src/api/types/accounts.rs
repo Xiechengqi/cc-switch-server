@@ -225,6 +225,48 @@ pub(in crate::api) struct PollCodexDeviceLoginResponse {
     pub(in crate::api) account: Option<AccountLoginAccountSummary>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartGrokDeviceLoginRequest {}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartGrokDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) device: crate::clients::oauth::grok_device::GrokDeviceCodeResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollGrokDeviceLoginRequest {
+    pub(in crate::api) device_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelGrokDeviceLoginRequest {
+    pub(in crate::api) device_code: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelGrokDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) cancelled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollGrokDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) pending: bool,
+    pub(in crate::api) message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) retry_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) account: Option<AccountLoginAccountSummary>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct PollKiroDeviceLoginResponse {

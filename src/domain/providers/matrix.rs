@@ -433,7 +433,7 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
         ProviderType::GrokOAuth => ProviderDefaults {
             base_url: "https://api.x.ai/v1",
             api_format: "openai_responses",
-            model: "grok-4.3",
+            model: "grok-4.5",
             key: "XAI_API_KEY",
             aws_region: None,
         },

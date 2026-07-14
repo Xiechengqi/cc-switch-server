@@ -8,6 +8,7 @@ import { ThemeProvider } from "./components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
 import { I18nProvider } from "./lib/i18n";
 import { queryClient } from "@/lib/query/queryClient";
+import { detectLayoutDensity, applyLayoutDensityClass } from "./lib/layout-density";
 import "./i18n";
 import "./desktop-theme.css";
 import "./styles.css";
@@ -26,6 +27,8 @@ try {
 } catch {
   // ignore platform detection failures
 }
+
+applyLayoutDensityClass(detectLayoutDensity());
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

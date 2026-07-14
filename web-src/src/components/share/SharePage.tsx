@@ -25,8 +25,7 @@ import {
   getTunnelConfigFromSettings,
   isTunnelConfigured,
 } from "@/utils/shareUtils";
-import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
-import { useLayoutDensity } from "@/hooks/useLayoutDensity";
+import { shellPaddingXClass } from "@/lib/layout";
 import { ShareList } from "./ShareList";
 import {
   getProviderAccountLabel,
@@ -65,7 +64,6 @@ export function SharePage({
   onOpenShareSettings,
 }: SharePageProps) {
   const { t } = useTranslation();
-  const { isCompact } = useLayoutDensity();
   const { data: shares = [], isLoading, error, refetch } = useSharesQuery();
   const { data: settings } = useSettingsQuery();
   const {
@@ -244,13 +242,8 @@ export function SharePage({
   };
 
   return (
-    <div
-      className={cn(
-        isCompact ? "px-3" : PAGE_SHELL_PADDING_X,
-        isCompact ? "py-1.5" : "py-2 sm:py-3",
-      )}
-    >
-      <div className={cn("flex flex-col", isCompact ? "gap-3 pb-4" : "gap-5 pb-8 sm:pb-10")}>
+    <div className={shellPaddingXClass()}>
+      <div className="share-page-stack flex flex-col gap-5 pb-8 sm:pb-10">
         {shareScoped ? (
           <ShareOwnerAuthBar
             share={primaryShare}
@@ -398,7 +391,6 @@ function ShareOwnerAuthBar({
   onRefresh: () => Promise<void>;
 }) {
   const { t } = useTranslation();
-  const { isCompact } = useLayoutDensity();
   const [step, setStep] = useState<"email" | "code">("email");
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
@@ -493,7 +485,7 @@ function ShareOwnerAuthBar({
                   value={email}
                   disabled={busy}
                   placeholder={share?.ownerEmail || "owner@example.com"}
-                  className={cn("h-8", isCompact ? "min-w-0 flex-1" : "min-w-64")}
+                  className="share-auth-input h-8 min-w-64"
                   onChange={(event) => setEmail(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
@@ -524,7 +516,7 @@ function ShareOwnerAuthBar({
                   placeholder={t("share.routerOwner.codePlaceholder", {
                     defaultValue: "验证码",
                   })}
-                  className={cn("h-8", isCompact ? "min-w-0 w-24" : "min-w-32")}
+                  className="share-auth-input h-8 min-w-32"
                   onChange={(event) => setCode(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {

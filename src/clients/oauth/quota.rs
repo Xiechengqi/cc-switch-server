@@ -27,6 +27,8 @@ const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CHATGPT_ACCOUNTS_CHECK_URL: &str =
     "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
 const CHATGPT_SUBSCRIPTIONS_URL: &str = "https://chatgpt.com/backend-api/subscriptions";
+const GROK_USER_URL: &str = "https://cli-chat-proxy.grok.com/v1/user";
+const GROK_BILLING_CREDITS_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const GEMINI_LOAD_CODE_ASSIST_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const GEMINI_RETRIEVE_USER_QUOTA_URL: &str =
@@ -73,10 +75,11 @@ impl QuotaRefreshFailure {
     ) -> Self {
         let status_code = match upstream_status.as_u16() {
             401 | 403 => 400,
+            402 => 402,
             429 => 429,
             _ => 502,
         };
-        let retryable = !matches!(upstream_status.as_u16(), 401 | 403);
+        let retryable = !matches!(upstream_status.as_u16(), 401 | 402 | 403);
         let next_refresh_at = retry_after
             .as_deref()
             .and_then(parse_retry_after_ms)
@@ -155,6 +158,9 @@ pub async fn refresh_account_quota(
         }
         ProviderType::KiroOAuth => {
             refresh_kiro_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
+        }
+        ProviderType::GrokOAuth => {
+            refresh_grok_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
         }
         ProviderType::GitHubCopilot | ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
             refresh_imported_snapshot_quota(account, now_ms, success_cooldown_ms)?
@@ -446,6 +452,204 @@ async fn refresh_gemini_quota(
         now_ms,
         success_cooldown_ms,
     ))
+}
+
+async fn refresh_grok_quota(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let access_token = required_access_token(account)?;
+    let user_probe = grok_probe_json(
+        http,
+        account,
+        GROK_USER_URL,
+        access_token,
+        request_timeout,
+        now_ms,
+    )
+    .await?;
+    let billing_probe = grok_probe_json(
+        http,
+        account,
+        GROK_BILLING_CREDITS_URL,
+        access_token,
+        request_timeout,
+        now_ms,
+    )
+    .await;
+
+    let subscription_level = grok_subscription_level(&user_probe)
+        .or_else(|| account.subscription_level.clone())
+        .or_else(|| account.entitlement_status.clone());
+    let billing_spending_limited = matches!(
+        billing_probe.as_ref(),
+        Err(error) if error.status_code == 402
+    );
+    let billing_body = billing_probe.ok();
+    let quota = grok_quota_from_probes(
+        &user_probe,
+        billing_body.as_ref(),
+        subscription_level.clone(),
+        now_ms,
+        billing_spending_limited,
+    );
+    let profile = merge_profile_overlay(
+        account.profile.as_ref(),
+        Some(grok_profile_from_user_probe(
+            &user_probe,
+            billing_body.as_ref(),
+            now_ms,
+        )),
+    );
+    Ok(update_from_quota(
+        quota,
+        subscription_level,
+        profile,
+        now_ms,
+        success_cooldown_ms,
+    ))
+}
+
+async fn grok_probe_json(
+    http: &reqwest::Client,
+    account: &Account,
+    url: &str,
+    access_token: &str,
+    request_timeout: Duration,
+    now_ms: i64,
+) -> Result<Value, QuotaRefreshFailure> {
+    let request = http
+        .get(url)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header(ACCEPT, "application/json")
+        .header(
+            USER_AGENT,
+            "grok-pager/0.2.93 grok-shell/0.2.93 (linux; x86_64)",
+        )
+        .header("x-xai-token-auth", "xai-grok-cli")
+        .header("x-grok-client-identifier", "grok-pager")
+        .header("x-grok-client-version", "0.2.93")
+        .timeout(request_timeout);
+    request_json(account.provider_type, request, now_ms).await
+}
+
+fn grok_quota_from_probes(
+    user: &Value,
+    billing: Option<&Value>,
+    subscription_level: Option<String>,
+    now_ms: i64,
+    billing_spending_limited: bool,
+) -> AccountQuota {
+    let tier = billing.and_then(grok_billing_tier);
+    let spending_limited = user
+        .pointer("/spendingLimitReached")
+        .or_else(|| user.pointer("/spending_limit_reached"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || billing_spending_limited;
+    let mut tiers = tier.into_iter().collect::<Vec<_>>();
+    if spending_limited && tiers.is_empty() {
+        tiers.push(AccountQuotaTier {
+            name: "grok_spending_limit".to_string(),
+            utilization: Some(1.0),
+            resets_at: Some(now_ms.saturating_add(60 * 60_000)),
+            ..Default::default()
+        });
+    }
+    AccountQuota {
+        success: !spending_limited,
+        credential_message: subscription_level,
+        tiers,
+        extra_usage: Some(json!({
+            "provider": "grok",
+            "user": user,
+            "billing": billing,
+            "spendingLimitReached": spending_limited,
+            "queriedAt": now_ms,
+        })),
+    }
+}
+
+fn grok_billing_tier(body: &Value) -> Option<AccountQuotaTier> {
+    let used = number_at(
+        body,
+        &[
+            "/used",
+            "/creditsUsed",
+            "/credits_used",
+            "/usage/used",
+            "/data/used",
+        ],
+    );
+    let limit = number_at(
+        body,
+        &[
+            "/limit",
+            "/creditsLimit",
+            "/credits_limit",
+            "/usage/limit",
+            "/data/limit",
+        ],
+    );
+    let remaining = number_at(
+        body,
+        &[
+            "/remaining",
+            "/creditsRemaining",
+            "/credits_remaining",
+            "/usage/remaining",
+            "/data/remaining",
+        ],
+    );
+    let inferred_used = used.or_else(|| match (limit, remaining) {
+        (Some(limit), Some(remaining)) if limit.is_finite() && remaining.is_finite() => {
+            Some((limit - remaining).max(0.0))
+        }
+        _ => None,
+    });
+    let utilization = match (inferred_used, limit) {
+        (Some(used), Some(limit)) if limit > 0.0 => Some((used / limit).clamp(0.0, 10_000.0)),
+        _ => number_at(
+            body,
+            &["/utilization", "/usage/utilization", "/data/utilization"],
+        )
+        .map(|value| if value > 1.0 { value / 100.0 } else { value }),
+    };
+    (inferred_used.is_some() || limit.is_some() || utilization.is_some()).then(|| {
+        AccountQuotaTier {
+            name: "grok_credits".to_string(),
+            utilization,
+            used: inferred_used,
+            limit,
+            unit: Some("credits".to_string()),
+            ..Default::default()
+        }
+    })
+}
+
+fn grok_subscription_level(value: &Value) -> Option<String> {
+    string_at(
+        value,
+        &[
+            "/subscriptionTier",
+            "/subscription_tier",
+            "/tier",
+            "/entitlement/tier",
+            "/data/subscriptionTier",
+            "/data/tier",
+        ],
+    )
+}
+
+fn grok_profile_from_user_probe(user: &Value, billing: Option<&Value>, now_ms: i64) -> Value {
+    json!({
+        "grokUser": user,
+        "grokBilling": billing,
+        "quotaRefreshedAt": now_ms,
+    })
 }
 
 async fn refresh_antigravity_quota(

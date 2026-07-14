@@ -17,6 +17,9 @@ use crate::clients::oauth::codex_device::{
     CodexDeviceFlowStore, CodexDevicePollLease, CodexDevicePollResult, PendingCodexDeviceFlow,
 };
 use crate::clients::oauth::copilot_device;
+use crate::clients::oauth::grok_device::{
+    GrokDeviceFlowStore, GrokDevicePollLease, GrokDevicePollResult, PendingGrokDeviceFlow,
+};
 use crate::clients::oauth::kiro_device::{
     KiroDeviceFlowStore, PendingKiroDeviceFlow, PendingKiroSocialDeviceFlow,
 };
@@ -68,6 +71,7 @@ pub struct ServerStateInner {
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
     grok_media_sessions: Mutex<BTreeMap<String, GrokMediaSessionBinding>>,
+    grok_device_flows: RwLock<GrokDeviceFlowStore>,
     kiro_device_flows: RwLock<KiroDeviceFlowStore>,
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
     pub cursor_sessions: CursorSessionManager,
@@ -651,6 +655,7 @@ impl ServerStateInner {
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
             copilot_upstream_auth: RwLock::new(BTreeMap::new()),
             grok_media_sessions: Mutex::new(BTreeMap::new()),
+            grok_device_flows: RwLock::new(GrokDeviceFlowStore::default()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             cursor_sessions: CursorSessionManager::default(),
@@ -1282,6 +1287,51 @@ impl ServerStateInner {
             .write()
             .await
             .remove_social(device_code);
+    }
+
+    pub async fn insert_grok_device_flow(
+        &self,
+        device_code: String,
+        flow: PendingGrokDeviceFlow,
+        now_ms: i64,
+    ) {
+        self.grok_device_flows
+            .write()
+            .await
+            .insert(device_code, flow, now_ms);
+    }
+
+    pub async fn begin_grok_device_poll(
+        &self,
+        device_code: &str,
+        now_ms: i64,
+    ) -> Option<GrokDevicePollLease> {
+        self.grok_device_flows
+            .write()
+            .await
+            .begin_poll(device_code, now_ms)
+    }
+
+    pub async fn finish_grok_device_poll(
+        &self,
+        device_code: &str,
+        result: GrokDevicePollResult,
+    ) -> bool {
+        self.grok_device_flows
+            .write()
+            .await
+            .finish_poll(device_code, result)
+    }
+
+    pub async fn fail_grok_device_poll(&self, device_code: &str, terminal: bool) {
+        self.grok_device_flows
+            .write()
+            .await
+            .fail_poll(device_code, terminal);
+    }
+
+    pub async fn cancel_grok_device_flow(&self, device_code: &str) -> bool {
+        self.grok_device_flows.write().await.cancel(device_code)
     }
 
     pub async fn insert_codex_device_flow(

@@ -9,25 +9,71 @@
   --density-gap: 1rem;
   --density-card-p: 1rem;
   --density-dialog-max-w: 32rem;
+  --density-shell-max-w: 80rem;
 }
 
 html.density-compact {
-  --density-page-py: 0.375rem;
-  --density-page-px: 0.75rem;
-  --density-header-min-h: 2.75rem;
-  --density-header-title: 1rem;
+  --density-page-py: 0.25rem;
+  --density-page-px: 0.5rem;
+  --density-header-min-h: 2.5rem;
+  --density-header-title: 0.9375rem;
   --density-control-h: 1.75rem;
   --density-text-sm: 0.8125rem;
   --density-text-xs: 0.6875rem;
-  --density-gap: 0.625rem;
-  --density-card-p: 0.75rem;
-  --density-dialog-max-w: calc(100vw - 1rem);
+  --density-gap: 0.5rem;
+  --density-card-p: 0.625rem;
+  --density-dialog-max-w: calc(100vw - 0.75rem);
+  --density-shell-max-w: 100%;
 }
 
 html.density-compact body {
   overflow: auto;
+  font-size: var(--density-text-sm);
 }
 
+/* Shell */
+html.density-compact .layout-page-shell {
+  max-width: var(--density-shell-max-w) !important;
+}
+
+html.density-compact .layout-page-padding-x {
+  padding-left: var(--density-page-px) !important;
+  padding-right: var(--density-page-px) !important;
+}
+
+html.density-compact .layout-page-viewport-y {
+  padding-top: var(--density-page-py) !important;
+  padding-bottom: var(--density-page-py) !important;
+}
+
+html.density-compact .layout-page-header-gap {
+  gap: var(--density-gap) !important;
+}
+
+html.density-compact .layout-page-header {
+  min-height: var(--density-header-min-h) !important;
+}
+
+html.density-compact .layout-page-header .layout-brand-title {
+  font-size: var(--density-header-title) !important;
+  line-height: 1.25rem;
+}
+
+html.density-compact .layout-page-header .layout-icon-btn {
+  height: 1.75rem !important;
+  width: 1.75rem !important;
+}
+
+html.density-compact .layout-page-header .layout-icon-btn svg {
+  height: 0.875rem;
+  width: 0.875rem;
+}
+
+html.density-compact .layout-page-content-scroll {
+  padding-bottom: 0.75rem !important;
+}
+
+/* Legacy tables / settings grids */
 html.density-compact table {
   min-width: 0;
 }
@@ -45,33 +91,81 @@ html.density-compact .segmented {
   min-width: 0;
 }
 
-html.density-compact .provider-list {
-  padding: var(--density-card-p);
-  margin-top: 0.5rem;
-}
-
-html.density-compact .provider-list .space-y-3 > * + * {
-  margin-top: 0.5rem;
-}
-
 html.density-compact .panel {
   margin: var(--density-card-p);
 }
 
-html.density-compact .settings-tabs-scroll {
+/* Settings tabs */
+html.density-compact .settings-tabs-compact,
+.settings-tabs-compact {
   display: flex;
   width: 100%;
+  justify-content: flex-start;
   overflow-x: auto;
   gap: 0.25rem;
-  padding-bottom: 0.125rem;
+  padding: 0.25rem;
+  margin-bottom: 0.75rem;
   scrollbar-width: thin;
 }
 
-html.density-compact .settings-tabs-scroll > button {
+html.density-compact .settings-tabs-compact [role="tab"],
+.settings-tabs-compact [role="tab"] {
   flex: 0 0 auto;
+  min-width: 0;
   min-height: var(--density-control-h);
   padding-inline: 0.625rem;
+  padding-block: 0.25rem;
   font-size: var(--density-text-xs);
+}
+
+html.density-compact .settings-tab-panel {
+  gap: 0.75rem !important;
+}
+
+html.density-compact .settings-tab-panel > * + * {
+  margin-top: 0.75rem;
+}
+
+/* Surface cards: providers, shares, settings panels */
+html.density-compact .density-surface-card {
+  padding: var(--density-card-p) !important;
+}
+
+html.density-compact .density-surface-card .density-surface-card-inner {
+  gap: var(--density-gap) !important;
+}
+
+html.density-compact .density-surface-card h3 {
+  font-size: 0.9375rem !important;
+  line-height: 1.25rem;
+}
+
+html.density-compact .density-surface-card .text-lg {
+  font-size: 0.9375rem !important;
+  line-height: 1.25rem;
+}
+
+html.density-compact .density-surface-card .text-base {
+  font-size: var(--density-text-sm) !important;
+  line-height: 1.25rem;
+}
+
+html.density-compact .provider-list {
+  margin-top: 0.25rem;
+}
+
+html.density-compact .provider-list .space-y-3 > * + * {
+  margin-top: var(--density-gap) !important;
+}
+
+html.density-compact .provider-search-floating {
+  top: 3rem;
+  width: min(96vw, 20rem);
+}
+
+html.density-compact .share-page-stack {
+  gap: var(--density-gap) !important;
+  padding-bottom: 1rem !important;
 }
 
 html.density-compact .density-compact-hide-label {
@@ -84,22 +178,46 @@ html.density-compact .density-compact-table-wrap {
 }
 
 html.density-compact .density-compact-table-wrap table {
-  min-width: 520px;
+  min-width: 480px;
 }
 
 html.density-compact [role="dialog"] {
-  max-width: var(--density-dialog-max-w);
+  max-width: var(--density-dialog-max-w) !important;
 }
 
 html.density-compact .glass-card [data-radix-accordion-trigger] {
-  padding: 0.75rem 1rem;
+  padding: 0.625rem 0.75rem !important;
+}
+
+html.density-compact .glass-card [data-radix-accordion-trigger] h3 {
+  font-size: var(--density-text-sm) !important;
+}
+
+html.density-compact .glass-card [data-radix-accordion-trigger] p {
+  font-size: var(--density-text-xs) !important;
 }
 
 html.density-compact .glass-card [data-radix-accordion-content] > div {
-  padding-inline: 1rem;
-  padding-bottom: 0.75rem;
+  padding-inline: 0.75rem !important;
+  padding-bottom: 0.625rem !important;
 }
 
-html.density-compact .settings-tabs-scroll [role="tab"] {
-  min-width: 0;
+html.density-compact .app-switcher-compact button {
+  height: 1.75rem !important;
+  padding-inline: 0.5rem !important;
+}
+
+html.density-compact .share-auth-input {
+  min-width: 0 !important;
+  flex: 1 1 auto;
+}
+
+html.density-compact .share-auth-input.min-w-32 {
+  flex: 0 1 6rem;
+  max-width: 6rem;
+}
+
+html.density-compact .app-switcher-compact {
+  padding: 0.125rem !important;
+  gap: 0.125rem !important;
 }

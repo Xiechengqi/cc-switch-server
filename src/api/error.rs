@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::clients::oauth::codex_device::CodexDeviceError;
 use crate::clients::oauth::copilot_device::CopilotDeviceError;
+use crate::clients::oauth::grok_device::GrokDeviceError;
 use crate::clients::oauth::kiro_device::KiroDeviceError;
 use crate::clients::router::email_auth::EmailAuthError;
 use crate::proxy;
@@ -211,6 +212,13 @@ pub(crate) fn map_kiro_device_error(error: KiroDeviceError) -> ApiError {
 }
 
 pub(crate) fn map_codex_device_error(error: CodexDeviceError) -> ApiError {
+    ApiError::new(
+        StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        error.message,
+    )
+}
+
+pub(crate) fn map_grok_device_error(error: GrokDeviceError) -> ApiError {
     ApiError::new(
         StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
         error.message,
