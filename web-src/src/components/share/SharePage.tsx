@@ -242,7 +242,12 @@ export function SharePage({
   };
 
   return (
-    <div className={cn(PAGE_SHELL_PADDING_X, "py-2 sm:py-3")}>
+    <div
+      className={cn(
+        PAGE_SHELL_PADDING_X,
+        "h-full min-h-0 overflow-y-auto overflow-x-hidden py-2 sm:py-3",
+      )}
+    >
       <div className="flex flex-col gap-5 pb-8 sm:pb-10">
         {shareScoped ? (
           <ShareOwnerAuthBar

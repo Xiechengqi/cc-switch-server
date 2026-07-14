@@ -1,6 +1,6 @@
 use axum::body::Bytes;
-use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{OriginalUri, Query, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -33,7 +33,10 @@ mod ctl;
 mod share_router;
 
 pub(crate) use ctl::{control_apply_share_settings, control_refresh_share_usage};
-pub use ctl::{control_signature, refresh_share_usage_items, ControlRefreshShareUsageItem};
+pub use ctl::{
+    control_signature, control_signature_for_method, refresh_share_usage_items,
+    ControlRefreshShareUsageItem,
+};
 pub(crate) use share_router::{
     share_router_health, share_router_model_health, share_router_request_logs, share_router_runtime,
 };

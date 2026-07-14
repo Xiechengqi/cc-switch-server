@@ -105,6 +105,16 @@ pub(crate) async fn verify_control_request(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(), ApiError> {
+    verify_control_request_for_method(state, "POST", path, headers, body).await
+}
+
+pub(crate) async fn verify_control_request_for_method(
+    state: &ServerState,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), ApiError> {
     let installation_id = required_header(headers, "x-ctl-installation-id")?;
     let timestamp_raw = required_header(headers, "x-ctl-timestamp-ms")?;
     let nonce = required_header(headers, "x-ctl-nonce")?;
@@ -142,7 +152,7 @@ pub(crate) async fn verify_control_request(
     let provided = BASE64_STANDARD
         .decode(signature_raw)
         .map_err(|_| ApiError::unauthorized("bad control signature"))?;
-    let expected = control_signature(path, secret, body, timestamp_ms, nonce)?;
+    let expected = control_signature_for_method(method, path, secret, body, timestamp_ms, nonce)?;
     if !constant_time_eq(&provided, &expected) {
         return Err(ApiError::unauthorized("bad control signature"));
     }
@@ -171,9 +181,21 @@ pub fn control_signature(
     timestamp_ms: i64,
     nonce: &str,
 ) -> Result<Vec<u8>, ApiError> {
+    control_signature_for_method("POST", path, secret, body, timestamp_ms, nonce)
+}
+
+pub fn control_signature_for_method(
+    method: &str,
+    path: &str,
+    secret: &str,
+    body: &[u8],
+    timestamp_ms: i64,
+    nonce: &str,
+) -> Result<Vec<u8>, ApiError> {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .map_err(|_| ApiError::unauthorized("bad control secret"))?;
-    mac.update(b"POST\n");
+    mac.update(method.as_bytes());
+    mac.update(b"\n");
     mac.update(path.as_bytes());
     mac.update(b"\n");
     mac.update(body);

@@ -2804,11 +2804,23 @@ async fn mark_usage_router_sync(state: &ServerState, request_id: &str, result: R
 }
 
 fn is_router_request_id(value: &str) -> bool {
+    is_prefixed_router_request_id(value) || is_canonical_uuid(value)
+}
+
+fn is_prefixed_router_request_id(value: &str) -> bool {
     (8..=80).contains(&value.len())
         && value.starts_with("req_")
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 fn app_key(app: AppKind) -> &'static str {
@@ -3191,6 +3203,20 @@ mod tests {
         assert!(entry.is_health_check);
         assert_eq!(entry.cache_read_tokens, 30);
         assert_eq!(entry.cache_creation_tokens, 5);
+    }
+
+    #[test]
+    fn router_request_id_accepts_prefixed_and_canonical_uuid_forms() {
+        assert!(is_router_request_id("req_router_123"));
+        assert!(is_router_request_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_router_request_id("550E8400-E29B-41D4-A716-446655440000"));
+
+        assert!(!is_router_request_id("router-request-1"));
+        assert!(!is_router_request_id("550e8400e29b41d4a716446655440000"));
+        assert!(!is_router_request_id(
+            "550e8400-e29b-41d4-a716-44665544000z"
+        ));
+        assert!(!is_router_request_id("req_bad/value"));
     }
 
     fn test_state() -> ServerState {

@@ -667,10 +667,7 @@ async fn web_invoke_dispatch(
         }
         "get_request_logs" => {
             let usage = state.usage.read().await;
-            Ok(json!(usage.latest_filtered(UsageLogFilter {
-                limit: Some(200),
-                ..UsageLogFilter::default()
-            })))
+            Ok(web_request_logs_json(&usage, &args))
         }
         "get_request_detail" => {
             let id = web_arg_string(&args, "id").or_else(|_| web_arg_string(&args, "requestId"))?;

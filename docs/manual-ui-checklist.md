@@ -40,6 +40,9 @@ Run the checks manually at:
 - Share Owner is read-only and always displays Client Owner; Provider Share create/save requests do not submit an independent owner. Changing Client Owner through verified email ownership updates every Share and preserves a valid previous owner as shared access.
 - Pause/resume/binding/tunnel actions are disabled or gated consistently with server state.
 - Share connect info can be inspected without exposing hidden desktop-only features.
+- The full Shares page scrolls vertically to the bottom at both target viewports; expanding settings or request logs does not leave content clipped below the shell.
+- Request logs show the selected Share's recent seven-day history with correct token, status, latency, range, and pagination values; the table remains horizontally scrollable on narrow screens.
+- After a server restart, requests written since the last usage snapshot still appear, and a completed streaming request keeps its final token and latency values.
 
 ## Usage And Pricing
 

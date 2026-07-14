@@ -23,7 +23,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 use cc_switch_server::api::*;
-use cc_switch_server::api::{control_signature, refresh_share_usage_items};
+use cc_switch_server::api::{
+    control_signature, control_signature_for_method, refresh_share_usage_items,
+};
 use cc_switch_server::cli::Cli;
 use cc_switch_server::domain::accounts::store::{AccountQuota, UpsertAccountInput};
 use cc_switch_server::domain::failover::UpdateFailoverAppInput;
@@ -31,6 +33,9 @@ use cc_switch_server::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
 };
 use cc_switch_server::domain::sharing::shares::{ShareBinding, UpsertShareInput};
+use cc_switch_server::domain::usage::store::{
+    TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata,
+};
 use cc_switch_server::state::{ServerState, ServerStateInner};
 
 async fn upsert_test_provider(state: &ServerState, app: AppKind, provider: Provider) {
@@ -50,6 +55,7 @@ async fn providers_snapshot(
 #[tokio::test]
 async fn share_router_health_is_hidden_without_probe_header() {
     let state = test_state();
+    configure_share_router_identity(&state).await;
     let app = app_router(state);
 
     let response = app
@@ -66,6 +72,7 @@ async fn share_router_health_is_hidden_without_probe_header() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -76,10 +83,133 @@ async fn share_router_health_is_hidden_without_probe_header() {
         )
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .oneshot(share_router_request(
+            Method::GET,
+            "/_share-router/health",
+            &[],
+            "nonce-health",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     assert_eq!(body["ok"].as_bool(), Some(true));
     assert_eq!(body["status"].as_str(), Some("healthy"));
+}
+
+#[tokio::test]
+async fn share_router_request_logs_are_scoped_to_tunnel_share_header() {
+    let state = test_state();
+    configure_share_router_identity(&state).await;
+    for share_id in ["share-a", "share-b"] {
+        let provider_id = format!("provider-{share_id}");
+        state
+            .mutate_shares_immediate(|store| {
+                store
+                    .upsert(test_share_input(
+                        share_id,
+                        &provider_id,
+                        ProviderType::Codex,
+                    ))
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            provider_id,
+            "Provider Logs".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            UsageModelMetadata {
+                model: Some("gpt-5.5".to_string()),
+                ..Default::default()
+            },
+            TokenUsage::default(),
+        );
+        log.apply_context(UsageLogContext {
+            request_id: Some(format!("req_{share_id}-new")),
+            share_id: Some(share_id.to_string()),
+            data_source: Some("direct".to_string()),
+            ..Default::default()
+        });
+        log.created_at_ms = if share_id == "share-a" { 2_000 } else { 3_000 };
+        state.push_usage_log(log).await.unwrap();
+    }
+    let mut older_share_a = state
+        .usage_snapshot()
+        .await
+        .logs
+        .into_iter()
+        .find(|log| log.share_id.as_deref() == Some("share-a"))
+        .unwrap();
+    older_share_a.request_id = "req_share-a-old".to_string();
+    older_share_a.created_at_ms = 1_000;
+    state.push_usage_log(older_share_a).await.unwrap();
+    let app = app_router(state);
+
+    let missing_header = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::GET,
+            "/_share-router/request-logs",
+            &[],
+            "nonce-logs-missing-share",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_header.status(), StatusCode::NOT_FOUND);
+
+    let duplicated_header = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::GET,
+            "/_share-router/request-logs",
+            &["share-b", "share-a"],
+            "nonce-logs-duplicate-share",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(duplicated_header.status(), StatusCode::NOT_FOUND);
+
+    let mismatched_query = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::GET,
+            "/_share-router/request-logs?shareId=share-b",
+            &["share-a"],
+            "nonce-logs-mismatched-share",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mismatched_query.status(), StatusCode::NOT_FOUND);
+
+    let scoped = app
+        .oneshot(share_router_request(
+            Method::GET,
+            "/_share-router/request-logs",
+            &["share-a"],
+            "nonce-logs-scoped",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(scoped.status(), StatusCode::OK);
+    let scoped = json_body(scoped).await;
+    assert_eq!(scoped["shareId"], "share-a");
+    assert_eq!(scoped["logs"].as_array().map(Vec::len), Some(2));
+    assert_eq!(scoped["logs"][0]["shareId"], "share-a");
+    assert_eq!(scoped["logs"][0]["requestId"], "req_share-a-new");
+    assert_eq!(scoped["logs"][1]["requestId"], "req_share-a-old");
 }
 
 #[tokio::test]
@@ -2228,6 +2358,107 @@ async fn automatic_router_reconcile_replaces_installation_shares() {
 }
 
 #[tokio::test]
+async fn router_log_retry_syncs_canonical_uuid_request_ids() {
+    const ROUTER_REQUEST_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let batch_seen = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route(
+            "/v1/share-request-logs/batch-sync",
+            post(
+                |State(batch_seen): State<Arc<AtomicUsize>>,
+                 axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(body["installationId"], "inst-request-logs");
+                    assert_eq!(body["logs"].as_array().map(Vec::len), Some(1));
+                    assert_eq!(body["logs"][0]["requestId"], ROUTER_REQUEST_ID);
+                    assert_eq!(body["logs"][0]["shareId"], "share-request-logs");
+                    batch_seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"ok": true}))
+                },
+            ),
+        )
+        .with_state(batch_seen.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config_snapshot().await;
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-request-logs".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+    state
+        .mutate_shares_immediate(|store| {
+            store
+                .upsert(test_share_input(
+                    "share-request-logs",
+                    "provider-request-logs",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+    let mut log = UsageLog::new(
+        AppKind::Codex,
+        "provider-request-logs".to_string(),
+        "Provider Request Logs".to_string(),
+        ProviderType::Codex,
+        200,
+        25,
+        UsageModelMetadata {
+            model: Some("gpt-5.5".to_string()),
+            ..Default::default()
+        },
+        TokenUsage::default(),
+    );
+    log.apply_context(UsageLogContext {
+        request_id: Some(ROUTER_REQUEST_ID.to_string()),
+        share_id: Some("share-request-logs".to_string()),
+        data_source: Some("direct".to_string()),
+        ..Default::default()
+    });
+    state.push_usage_log(log).await.unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/usage/router-sync/retry",
+            json!(null),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = json_body(response).await;
+    assert_eq!(response["attempted"], 1);
+    assert_eq!(response["synced"], 1);
+    assert_eq!(response["failed"], 0);
+    assert_eq!(batch_seen.load(Ordering::SeqCst), 1);
+
+    let usage = state.usage_snapshot().await;
+    let synced = usage
+        .logs
+        .iter()
+        .find(|log| log.request_id == ROUTER_REQUEST_ID)
+        .unwrap();
+    assert!(synced.router_last_synced_at_ms.is_some());
+    assert_eq!(synced.router_sync_attempt_count, 1);
+}
+
+#[tokio::test]
 async fn provider_share_settings_are_saved_atomically() {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -2632,6 +2863,139 @@ async fn web_invoke_registry_returns_stable_errors() {
     let body = json_body(response).await;
     assert_eq!(body["code"].as_str(), Some("cc_switch_web_invoke_unknown"));
     assert_eq!(body["type"].as_str(), Some("web_invoke_unknown"));
+}
+
+#[tokio::test]
+async fn web_invoke_request_logs_matches_desktop_filter_and_pagination_contract() {
+    const START_SECONDS: u128 = 1_700_000_000;
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    let make_log = |request_id: &str, created_at_ms: u128| {
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "provider-1".to_string(),
+            "Provider One".to_string(),
+            ProviderType::Codex,
+            200,
+            321,
+            UsageModelMetadata {
+                model: Some("request-alias".to_string()),
+                requested_model: Some("request-alias".to_string()),
+                actual_model: Some("gpt-5.5".to_string()),
+                actual_model_source: Some("response".to_string()),
+                pricing_model: Some("gpt-5.5-priced".to_string()),
+            },
+            TokenUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+                cache_read_tokens: Some(3),
+                cache_creation_tokens: Some(2),
+                total_tokens: Some(23),
+                ..Default::default()
+            },
+        );
+        log.request_id = request_id.to_string();
+        log.request_agent = Some("codex-cli".to_string());
+        log.first_token_ms = Some(42);
+        log.cost_multiplier = Some(1.25);
+        log.input_cost_usd = Some(0.1);
+        log.output_cost_usd = Some(0.2);
+        log.cache_read_cost_usd = Some(0.03);
+        log.cache_creation_cost_usd = Some(0.04);
+        log.total_cost_usd = Some(0.37);
+        log.created_at_ms = created_at_ms;
+        log.apply_context(UsageLogContext {
+            share_id: Some("share-1".to_string()),
+            share_name: Some("Share One".to_string()),
+            user_email: Some("reader@example.com".to_string()),
+            data_source: Some("proxy".to_string()),
+            ..Default::default()
+        });
+        log
+    };
+
+    let old = make_log("req-old", START_SECONDS * 1_000);
+    let new = make_log("req-new", (START_SECONDS + 1) * 1_000 + 999);
+
+    let mut wrong_share = make_log("req-wrong-share", START_SECONDS * 1_000 + 100);
+    wrong_share.share_id = Some("share-2".to_string());
+    let mut wrong_app = make_log("req-wrong-app", START_SECONDS * 1_000 + 200);
+    wrong_app.app = AppKind::Claude;
+    let mut wrong_provider = make_log("req-wrong-provider", START_SECONDS * 1_000 + 300);
+    wrong_provider.provider_name = "Provider Two".to_string();
+    let mut wrong_model = make_log("req-wrong-model", START_SECONDS * 1_000 + 400);
+    wrong_model.pricing_model = Some("gpt-other-priced".to_string());
+    let mut wrong_status = make_log("req-wrong-status", START_SECONDS * 1_000 + 500);
+    wrong_status.status_code = 429;
+    let too_early = make_log("req-too-early", (START_SECONDS - 1) * 1_000 + 999);
+
+    for log in [
+        too_early,
+        new,
+        wrong_share,
+        wrong_app,
+        wrong_provider,
+        wrong_model,
+        wrong_status,
+        old,
+    ] {
+        state.push_usage_log(log).await.unwrap();
+    }
+
+    let filters = json!({
+        "shareId": "share-1",
+        "appType": "codex",
+        "providerName": "Provider One",
+        "model": "gpt-5.5-priced",
+        "statusCode": 200,
+        "startDate": START_SECONDS as u64,
+        "endDate": (START_SECONDS + 1) as u64
+    });
+    let first_page = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/get_request_logs",
+            json!({"filters": filters, "page": 0, "pageSize": 1}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_page = json_body(first_page).await;
+    assert_eq!(first_page["total"], 2);
+    assert_eq!(first_page["page"], 0);
+    assert_eq!(first_page["pageSize"], 1);
+    assert_eq!(first_page["data"].as_array().map(Vec::len), Some(1));
+    let newest = &first_page["data"][0];
+    assert_eq!(newest["requestId"], "req-new");
+    assert_eq!(newest["appType"], "codex");
+    assert_eq!(newest["providerName"], "Provider One");
+    assert_eq!(newest["latencyMs"], 321);
+    assert_eq!(newest["firstTokenMs"], 42);
+    assert_eq!(newest["createdAt"], (START_SECONDS + 1) as u64);
+    assert_eq!(newest["inputTokens"], 11);
+    assert_eq!(newest["totalCostUsd"], "0.370000");
+    assert_eq!(newest["costMultiplier"], "1.25");
+    assert_eq!(newest["shareId"], "share-1");
+    assert_eq!(newest["userEmail"], "reader@example.com");
+
+    let second_page = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/get_request_logs",
+            json!({"filters": filters, "page": 1, "pageSize": 1}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_page.status(), StatusCode::OK);
+    let second_page = json_body(second_page).await;
+    assert_eq!(second_page["total"], 2);
+    assert_eq!(second_page["data"][0]["requestId"], "req-old");
 }
 
 #[tokio::test]
@@ -3407,6 +3771,49 @@ fn control_request(
         .header("x-ctl-signature", signature)
         .body(Body::from(body))
         .unwrap()
+}
+
+async fn configure_share_router_identity(state: &ServerState) {
+    let mut config = state.config_snapshot().await;
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-share-router".to_string(),
+        public_key: "public-key".to_string(),
+        private_key: "private-key".to_string(),
+        control_secret: Some("share-router-control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+}
+
+fn share_router_request(
+    method: Method,
+    uri: &str,
+    share_ids: &[&str],
+    nonce: &str,
+    body: Vec<u8>,
+) -> Request<Body> {
+    let timestamp_ms = now_ms() as i64;
+    let signature = BASE64_STANDARD.encode(
+        control_signature_for_method(
+            method.as_str(),
+            uri,
+            "share-router-control-secret",
+            &body,
+            timestamp_ms,
+            nonce,
+        )
+        .unwrap(),
+    );
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-ctl-installation-id", "inst-share-router")
+        .header("x-ctl-timestamp-ms", timestamp_ms.to_string())
+        .header("x-ctl-nonce", nonce)
+        .header("x-ctl-signature", signature);
+    for share_id in share_ids {
+        builder = builder.header("x-cc-switch-share-id", *share_id);
+    }
+    builder.body(Body::from(body)).unwrap()
 }
 
 fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) -> UpsertShareInput {

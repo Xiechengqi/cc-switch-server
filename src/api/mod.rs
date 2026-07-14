@@ -30,7 +30,10 @@ pub(crate) use control::{
     control_apply_share_settings, control_refresh_share_usage, share_router_health,
     share_router_model_health, share_router_request_logs, share_router_runtime,
 };
-pub use control::{control_signature, refresh_share_usage_items, ControlRefreshShareUsageItem};
+pub use control::{
+    control_signature, control_signature_for_method, refresh_share_usage_items,
+    ControlRefreshShareUsageItem,
+};
 pub(in crate::api) use debug::*;
 pub use error::ApiError;
 pub(crate) use error::{
@@ -115,7 +118,7 @@ use crate::domain::sharing::shares::{
     Share, ShareAcl, ShareBinding, ShareMarketGrantStatus, ShareStore, UpsertShareInput,
 };
 use crate::domain::usage::pricing::UpdateModelPricingInput;
-use crate::domain::usage::store::{UsageLogFilter, UsageStatsFilter, UsageStore};
+use crate::domain::usage::store::{UsageStatsFilter, UsageStore};
 use crate::proxy::adapters::ProviderAdapter;
 use crate::proxy::{self, ProxyRoute};
 use crate::state::{ServerEvent, ServerState, Session};

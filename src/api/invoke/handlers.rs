@@ -7,6 +7,7 @@ use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch,
 };
+use crate::domain::usage::store::UsageLog;
 
 pub(in crate::api) fn web_provider_health_json(
     app: AppKind,
@@ -1763,6 +1764,161 @@ pub(in crate::api) fn web_usage_stats_filter_from_args(args: &Value) -> UsageSta
         provider_id: web_optional_string_any(args, &["providerName", "providerId", "provider_id"]),
         ..UsageStatsFilter::default()
     }
+}
+
+pub(in crate::api) fn web_request_logs_json(usage: &UsageStore, args: &Value) -> Value {
+    const DEFAULT_PAGE_SIZE: usize = 20;
+    const MAX_PAGE_SIZE: usize = 200;
+
+    let filters = args
+        .get("filters")
+        .filter(|value| value.is_object())
+        .unwrap_or(args);
+    let app_type = web_optional_string_any(filters, &["appType", "app_type", "app"])
+        .filter(|value| value != "all");
+    let provider_name = web_optional_string_any(filters, &["providerName", "provider_name"]);
+    let model = web_optional_string_any(filters, &["model"]);
+    let share_id = web_optional_string_any(filters, &["shareId", "share_id"]);
+    let status_code = web_optional_u32(filters, &["statusCode", "status_code"])
+        .and_then(|value| u16::try_from(value).ok());
+    let from_ms = web_request_log_date_bound_ms(filters, true);
+    let to_ms = web_request_log_date_bound_ms(filters, false);
+
+    let page = web_optional_u64(args, &["page"])
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let page_size = web_optional_u64(args, &["pageSize", "page_size"])
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+
+    let matches = |log: &&UsageLog| {
+        from_ms.is_none_or(|from| log.created_at_ms >= from)
+            && to_ms.is_none_or(|to| log.created_at_ms <= to)
+            && app_type
+                .as_deref()
+                .is_none_or(|app_type| log.app.as_str() == app_type)
+            && provider_name
+                .as_deref()
+                .is_none_or(|provider_name| log.provider_name == provider_name)
+            && model
+                .as_deref()
+                .is_none_or(|model| web_request_log_effective_model(log) == model)
+            && share_id
+                .as_deref()
+                .is_none_or(|share_id| log.share_id.as_deref() == Some(share_id))
+            && status_code.is_none_or(|status_code| log.status_code == status_code)
+    };
+    let mut matching = usage.logs.iter().filter(matches).collect::<Vec<_>>();
+    matching.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+    let total = matching.len();
+    let offset = page.saturating_mul(page_size);
+    let data = matching
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .map(web_request_log_json)
+        .collect::<Vec<_>>();
+
+    json!({
+        "data": data,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+    })
+}
+
+fn web_request_log_date_bound_ms(filters: &Value, is_start: bool) -> Option<u128> {
+    let (seconds_keys, milliseconds_keys) = if is_start {
+        (["startDate", "start_date"], ["fromMs", "from_ms"])
+    } else {
+        (["endDate", "end_date"], ["toMs", "to_ms"])
+    };
+    if let Some(seconds) = web_optional_u64(filters, &seconds_keys) {
+        let milliseconds = u128::from(seconds).saturating_mul(1_000);
+        return Some(if is_start {
+            milliseconds
+        } else {
+            milliseconds.saturating_add(999)
+        });
+    }
+    web_optional_u64(filters, &milliseconds_keys).map(u128::from)
+}
+
+fn web_request_log_effective_model(log: &UsageLog) -> &str {
+    log.pricing_model
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or(log.model.as_deref())
+        .unwrap_or_default()
+}
+
+fn web_request_log_json(log: &UsageLog) -> Value {
+    let model = log
+        .model
+        .as_deref()
+        .or(log.requested_model.as_deref())
+        .or(log.actual_model.as_deref())
+        .unwrap_or_default();
+    let requested_model = log.requested_model.as_deref().unwrap_or(model);
+    let actual_model = log.actual_model.as_deref().unwrap_or(model);
+
+    json!({
+        "requestId": log.request_id,
+        "providerId": log.provider_id,
+        "providerName": log.provider_name,
+        "appType": log.app.as_str(),
+        "model": model,
+        "requestModel": requested_model,
+        "requestAgent": log.request_agent.as_deref().unwrap_or_default(),
+        "requestedModel": requested_model,
+        "actualModel": actual_model,
+        "actualModelSource": log.actual_model_source.as_deref().unwrap_or("server"),
+        "pricingModel": log.pricing_model,
+        "costMultiplier": web_request_log_multiplier(log.cost_multiplier),
+        "inputTokens": web_request_log_token_count(log.input_tokens),
+        "outputTokens": web_request_log_token_count(log.output_tokens),
+        "cacheReadTokens": web_request_log_token_count(log.cache_read_tokens),
+        "cacheCreationTokens": web_request_log_token_count(log.cache_creation_tokens),
+        "inputCostUsd": web_request_log_cost(log.input_cost_usd),
+        "outputCostUsd": web_request_log_cost(log.output_cost_usd),
+        "cacheReadCostUsd": web_request_log_cost(log.cache_read_cost_usd),
+        "cacheCreationCostUsd": web_request_log_cost(log.cache_creation_cost_usd),
+        "totalCostUsd": web_request_log_cost(log.total_cost_usd),
+        "isStreaming": log.is_streaming,
+        "latencyMs": web_request_log_u128_to_u64(log.duration_ms),
+        "firstTokenMs": log.first_token_ms.map(web_request_log_u128_to_u64),
+        "durationMs": web_request_log_u128_to_u64(log.duration_ms),
+        "statusCode": log.status_code,
+        "errorMessage": Value::Null,
+        "createdAt": web_request_log_u128_to_i64(log.created_at_ms / 1_000),
+        "shareId": log.share_id,
+        "shareName": log.share_name,
+        "userEmail": log.user_email,
+        "dataSource": log.data_source,
+    })
+}
+
+fn web_request_log_token_count(value: Option<u64>) -> u32 {
+    value.unwrap_or(0).min(u64::from(u32::MAX)) as u32
+}
+
+fn web_request_log_u128_to_u64(value: u128) -> u64 {
+    value.min(u128::from(u64::MAX)) as u64
+}
+
+fn web_request_log_u128_to_i64(value: u128) -> i64 {
+    value.min(i64::MAX as u128) as i64
+}
+
+fn web_request_log_cost(value: Option<f64>) -> String {
+    let value = value.filter(|value| value.is_finite()).unwrap_or(0.0);
+    format!("{value:.6}")
+}
+
+fn web_request_log_multiplier(value: Option<f64>) -> String {
+    let value = value.filter(|value| value.is_finite()).unwrap_or(1.0);
+    value.to_string()
 }
 
 pub(in crate::api) fn web_optional_bool(args: &Value, keys: &[&str]) -> Option<bool> {

@@ -145,6 +145,25 @@ fetch_optional() {
   rm -f "$body_file"
 }
 
+fetch_status_optional() {
+  local label="$1"
+  local expected_status="$2"
+  local url="$3"
+  shift 3
+  local body_file
+  local status
+  body_file="$(mktemp /tmp/cc-switch-server-smoke-fetch.XXXXXX)"
+  status="$(curl -sS -o "$body_file" -w "%{http_code}" "$@" "$url" || true)"
+  cat "$body_file"
+  echo
+  if [[ "$status" == "$expected_status" ]]; then
+    pass "$label"
+  else
+    warn "$label (expected $expected_status, got $status)"
+  fi
+  rm -f "$body_file"
+}
+
 post_optional() {
   local label="$1"
   local url="$2"
@@ -274,16 +293,16 @@ else
 fi
 
 if [[ -n "$DIRECT_SHARE_URL" ]]; then
-  echo "== direct share internal router health probe =="
-  fetch_optional "direct share internal router health probe" "$DIRECT_SHARE_URL/_share-router/health" \
+  echo "== direct share unsigned internal router health probe =="
+  fetch_status_optional "unsigned internal router health is hidden" "404" "$DIRECT_SHARE_URL/_share-router/health" \
     -H "X-Share-Router-Probe: 1"
 
-  echo "== direct share internal request logs probe =="
-  fetch_optional "direct share internal request logs probe" "$DIRECT_SHARE_URL/_share-router/request-logs?limit=5"
+  echo "== direct share unsigned internal request logs probe =="
+  fetch_status_optional "unsigned internal request logs are hidden" "404" "$DIRECT_SHARE_URL/_share-router/request-logs?limit=5"
 
   if [[ -n "$SHARE_ID" ]]; then
-    echo "== direct share internal runtime probe =="
-    fetch_optional "direct share internal runtime probe" "$DIRECT_SHARE_URL/_share-router/share-runtime?shareId=$SHARE_ID" \
+    echo "== direct share unsigned internal runtime probe =="
+    fetch_status_optional "unsigned internal runtime is hidden" "404" "$DIRECT_SHARE_URL/_share-router/share-runtime?shareId=$SHARE_ID" \
       -H "X-Share-Router-Probe: 1"
   else
     warn "SHARE_ID not set; skipped direct share internal runtime probe"

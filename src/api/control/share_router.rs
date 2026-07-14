@@ -1,11 +1,14 @@
 use super::*;
 
 const SHARE_ROUTER_REQUEST_LOGS_LIMIT: usize = 10;
+const SHARE_ROUTER_SHARE_ID_HEADER: &str = "x-cc-switch-share-id";
 
 pub(crate) async fn share_router_health(
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Json<ShareRouterHealthResponse>, ApiError> {
-    require_share_router_probe(&headers)?;
+    require_share_router_request(&state, "GET", &uri, &headers, &[]).await?;
     Ok(Json(ShareRouterHealthResponse {
         ok: true,
         status: "healthy".to_string(),
@@ -15,37 +18,54 @@ pub(crate) async fn share_router_health(
 
 pub(crate) async fn share_router_request_logs(
     State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     Query(query): Query<ShareRouterRequestLogsQuery>,
 ) -> Result<Json<ShareRouterRequestLogsResponse>, ApiError> {
+    require_share_router_request(&state, "GET", &uri, &headers, &[]).await?;
+    let mut header_share_ids = headers.get_all(SHARE_ROUTER_SHARE_ID_HEADER).iter();
+    let header_share_id = header_share_ids
+        .next()
+        .filter(|_| header_share_ids.next().is_none())
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::not_found("not found"))?;
+    if query
+        .share_id
+        .as_deref()
+        .is_some_and(|query_share_id| query_share_id != header_share_id)
+    {
+        return Err(ApiError::not_found("not found"));
+    }
+    let share_id = header_share_id.to_string();
     let limit = query.limit.unwrap_or(SHARE_ROUTER_REQUEST_LOGS_LIMIT);
     let usage = state.usage.read().await.clone();
+    let mut matching = usage
+        .logs
+        .iter()
+        .filter(|log| log.share_id.as_deref() == Some(share_id.as_str()))
+        .collect::<Vec<_>>();
+    matching.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
     let mut logs = Vec::new();
-    for log in usage.logs.iter().rev().filter(|log| {
-        log.share_id.is_some()
-            && query
-                .share_id
-                .as_deref()
-                .is_none_or(|share_id| log.share_id.as_deref() == Some(share_id))
-    }) {
-        if logs.len() >= limit {
-            break;
-        }
+    for log in matching.into_iter().take(limit) {
         if let Some(entry) = crate::state::share_request_log_entry(&state, log).await {
             logs.push(entry);
         }
     }
     Ok(Json(ShareRouterRequestLogsResponse {
-        share_id: query.share_id,
+        share_id: Some(share_id),
         logs,
     }))
 }
 
 pub(crate) async fn share_router_runtime(
     State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Query(query): Query<ShareRouterRuntimeQuery>,
 ) -> Result<Json<ShareRouterRuntimeResponse>, ApiError> {
-    require_share_router_probe(&headers)?;
+    require_share_router_request(&state, "GET", &uri, &headers, &[]).await?;
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
     let usage = state.usage.read().await.clone();
@@ -61,10 +81,13 @@ pub(crate) async fn share_router_runtime(
 
 pub(crate) async fn share_router_model_health(
     State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    Json(input): Json<ShareRouterModelHealthRequest>,
+    body: Bytes,
 ) -> Result<Json<ShareRouterModelHealthResponse>, ApiError> {
-    require_share_router_health_check(&headers)?;
+    require_share_router_request(&state, "POST", &uri, &headers, &body).await?;
+    let input: ShareRouterModelHealthRequest =
+        serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
     let app = parse_app_kind(&input.app_type)?;
     let providers = state.providers.read().await.clone();
     let usage = state.usage.read().await.clone();
@@ -113,29 +136,20 @@ pub(crate) async fn share_router_model_health(
     }))
 }
 
-pub(crate) fn require_share_router_probe(headers: &HeaderMap) -> Result<(), ApiError> {
-    if truthy_header(headers, "x-share-router-probe") {
-        Ok(())
-    } else {
-        Err(ApiError::not_found("not found"))
-    }
-}
-
-pub(crate) fn require_share_router_health_check(headers: &HeaderMap) -> Result<(), ApiError> {
-    if truthy_header(headers, "x-share-router-probe")
-        || truthy_header(headers, "x-share-router-health-check")
-    {
-        Ok(())
-    } else {
-        Err(ApiError::not_found("not found"))
-    }
-}
-
-pub(crate) fn truthy_header(headers: &HeaderMap, name: &str) -> bool {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+async fn require_share_router_request(
+    state: &ServerState,
+    method: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), ApiError> {
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| uri.path());
+    super::ctl::verify_control_request_for_method(state, method, path_and_query, headers, body)
+        .await
+        .map_err(|_| ApiError::not_found("not found"))
 }
 
 pub(crate) async fn resolve_share_for_internal_request(

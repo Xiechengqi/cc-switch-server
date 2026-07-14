@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -23,10 +23,11 @@ const MAX_USAGE_LOGS: usize = 2_000;
 const USAGE_ROLLUP_BUCKET_MS: u128 = 60 * 1000;
 const USAGE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 const USAGE_COMPACT_EVERY_EVENTS: u64 = 500;
+const USAGE_JOURNAL_VERSION: u8 = 1;
 const DEFAULT_USAGE_STATS_WINDOW_MS: u128 = 60 * 60 * 1000;
 const DEFAULT_USAGE_STATS_LIMIT: usize = 50;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageStore {
     #[serde(default)]
@@ -35,6 +36,48 @@ pub struct UsageStore {
     pub rollups: UsageRollupStore,
     #[serde(default, skip)]
     pub writes_since_compact: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) journal_checkpoint: Option<UsageJournalCheckpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UsageJournalCheckpoint {
+    generation: String,
+    through_sequence: u64,
+}
+
+impl UsageJournalCheckpoint {
+    fn new() -> Self {
+        Self {
+            generation: generate_journal_generation(),
+            through_sequence: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageJournalRecord {
+    version: u8,
+    generation: String,
+    sequence: u64,
+    log: UsageLog,
+}
+
+impl Default for UsageStore {
+    fn default() -> Self {
+        let checkpoint = UsageJournalCheckpoint::new();
+        Self {
+            logs: Vec::new(),
+            rollups: UsageRollupStore {
+                buckets: BTreeMap::new(),
+                journal_checkpoint: Some(checkpoint.clone()),
+            },
+            writes_since_compact: 0,
+            journal_checkpoint: Some(checkpoint),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,25 +178,58 @@ impl UsageStore {
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
         let path = usage_path(config_dir);
         let jsonl_path = usage_jsonl_path(config_dir);
-        let mut store = if path.exists() {
+        let snapshot_exists = path.exists();
+        let mut store = if snapshot_exists {
             let content = fs::read_to_string(&path)
                 .with_context(|| format!("read usage {}", path.display()))?;
             serde_json::from_str(&content)
                 .with_context(|| format!("parse usage {}", path.display()))?
-        } else if jsonl_path.exists() {
-            load_usage_jsonl_store(&jsonl_path)?
         } else {
             Self::default()
         };
-        store.trim_recent_window();
-        store.rollups = load_usage_rollups(config_dir)?.unwrap_or_else(|| {
-            let mut rollups = UsageRollupStore::default();
-            for log in &store.logs {
-                rollups.add_log(log);
+        let journal = load_usage_journal(&jsonl_path)?;
+        let loaded_rollups = load_usage_rollups(config_dir)?;
+
+        if !snapshot_exists {
+            for entry in &journal.entries {
+                store.push_log_only(entry.log().clone());
             }
-            rollups
-        });
-        store.writes_since_compact = 0;
+            store.trim_recent_window();
+            let checkpoint = UsageJournalCheckpoint::new();
+            store.journal_checkpoint = Some(checkpoint.clone());
+            store.rollups = rebuild_usage_rollups(&store.logs, checkpoint);
+            store.writes_since_compact = 0;
+            store.save_rollups(config_dir)?;
+            store.save_recent_snapshot(config_dir)?;
+            return Ok(store);
+        }
+
+        let Some(snapshot_checkpoint) = store.journal_checkpoint.clone() else {
+            let recovered = recover_unambiguous_legacy_journal_tail(&mut store, &journal);
+            store.trim_recent_window();
+            let checkpoint = UsageJournalCheckpoint::new();
+            store.journal_checkpoint = Some(checkpoint.clone());
+            store.rollups = loaded_rollups
+                .unwrap_or_else(|| rebuild_usage_rollups(&store.logs, checkpoint.clone()));
+            store.rollups.journal_checkpoint = Some(checkpoint);
+            store.writes_since_compact = 0;
+            store.save_rollups(config_dir)?;
+            store.save_recent_snapshot(config_dir)?;
+            if !journal.entries.is_empty() {
+                tracing::warn!(
+                    recovered,
+                    path = %jsonl_path.display(),
+                    "migrated legacy usage journal conservatively; existing request ids remain snapshot-authoritative"
+                );
+            }
+            return Ok(store);
+        };
+
+        store.trim_recent_window();
+        store.rollups =
+            compatible_usage_rollups(&store.logs, &snapshot_checkpoint, loaded_rollups, &journal);
+        let replayed = replay_versioned_usage_journal(&mut store, &journal, &snapshot_checkpoint);
+        store.writes_since_compact = replayed as u64;
         Ok(store)
     }
 
@@ -195,12 +271,15 @@ impl UsageStore {
     }
 
     pub fn push_and_persist(&mut self, config_dir: &Path, log: UsageLog) -> anyhow::Result<()> {
-        self.push(log.clone());
-        append_usage_jsonl(config_dir, &log)?;
+        self.ensure_journal_checkpoint(config_dir)?;
+        let sequence = self.append_usage_journal(config_dir, &log)?;
+        self.push(log);
+        self.advance_journal_checkpoint(sequence);
         self.save_rollups(config_dir)?;
         self.writes_since_compact = self.writes_since_compact.saturating_add(1);
         if self.compact_due(config_dir) {
             self.save_recent_snapshot(config_dir)?;
+            truncate_usage_journal(config_dir)?;
             self.writes_since_compact = 0;
         }
         Ok(())
@@ -222,18 +301,71 @@ impl UsageStore {
         else {
             return Ok(None);
         };
+        self.ensure_journal_checkpoint(config_dir)?;
         let previous = self.logs[index].clone();
-        update(&mut self.logs[index]);
-        let updated = self.logs[index].clone();
+        let mut updated = previous.clone();
+        update(&mut updated);
+        let sequence = self.append_usage_journal(config_dir, &updated)?;
         self.rollups.replace_log(&previous, &updated);
-        append_usage_jsonl(config_dir, &updated)?;
+        self.logs[index] = updated.clone();
+        self.advance_journal_checkpoint(sequence);
         self.save_rollups(config_dir)?;
         self.writes_since_compact = self.writes_since_compact.saturating_add(1);
         if self.compact_due(config_dir) {
             self.save_recent_snapshot(config_dir)?;
+            truncate_usage_journal(config_dir)?;
             self.writes_since_compact = 0;
         }
         Ok(Some(updated))
+    }
+
+    fn push_log_only(&mut self, log: UsageLog) {
+        if let Some(existing) = self
+            .logs
+            .iter_mut()
+            .find(|existing| existing.request_id == log.request_id)
+        {
+            *existing = log;
+            return;
+        }
+        self.logs.push(log);
+        self.trim_recent_window();
+    }
+
+    fn ensure_journal_checkpoint(&mut self, config_dir: &Path) -> anyhow::Result<()> {
+        if self.journal_checkpoint.is_some() {
+            return Ok(());
+        }
+        let checkpoint = UsageJournalCheckpoint::new();
+        self.journal_checkpoint = Some(checkpoint.clone());
+        self.rollups.journal_checkpoint = Some(checkpoint);
+        self.save_rollups(config_dir)?;
+        self.save_recent_snapshot(config_dir)
+    }
+
+    fn append_usage_journal(&self, config_dir: &Path, log: &UsageLog) -> anyhow::Result<u64> {
+        let checkpoint = self
+            .journal_checkpoint
+            .as_ref()
+            .context("usage journal checkpoint is unavailable")?;
+        let sequence = checkpoint.through_sequence.saturating_add(1);
+        append_usage_journal_record(
+            config_dir,
+            &UsageJournalRecord {
+                version: USAGE_JOURNAL_VERSION,
+                generation: checkpoint.generation.clone(),
+                sequence,
+                log: log.clone(),
+            },
+        )?;
+        Ok(sequence)
+    }
+
+    fn advance_journal_checkpoint(&mut self, sequence: u64) {
+        if let Some(checkpoint) = self.journal_checkpoint.as_mut() {
+            checkpoint.through_sequence = sequence;
+            self.rollups.journal_checkpoint = Some(checkpoint.clone());
+        }
     }
 
     fn trim_recent_window(&mut self) {
@@ -650,6 +782,8 @@ impl UsageRollup {
 pub struct UsageRollupStore {
     #[serde(default)]
     buckets: BTreeMap<String, UsageRollupBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal_checkpoint: Option<UsageJournalCheckpoint>,
 }
 
 impl UsageRollupStore {
@@ -1586,28 +1720,70 @@ fn load_usage_rollups(config_dir: &Path) -> anyhow::Result<Option<UsageRollupSto
     Ok(Some(rollups))
 }
 
-fn load_usage_jsonl_store(path: &Path) -> anyhow::Result<UsageStore> {
+#[derive(Debug, Default)]
+struct LoadedUsageJournal {
+    entries: Vec<LoadedUsageJournalEntry>,
+}
+
+#[derive(Debug)]
+enum LoadedUsageJournalEntry {
+    Legacy(UsageLog),
+    Versioned(UsageJournalRecord),
+}
+
+impl LoadedUsageJournalEntry {
+    fn log(&self) -> &UsageLog {
+        match self {
+            Self::Legacy(log) => log,
+            Self::Versioned(record) => &record.log,
+        }
+    }
+}
+
+fn load_usage_journal(path: &Path) -> anyhow::Result<LoadedUsageJournal> {
+    if !path.exists() {
+        return Ok(LoadedUsageJournal::default());
+    }
     let file =
         fs::File::open(path).with_context(|| format!("open usage jsonl {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut store = UsageStore::default();
+    let mut journal = LoadedUsageJournal::default();
     for line in reader.lines() {
         let line = line.with_context(|| format!("read usage jsonl {}", path.display()))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<UsageLog>(line) {
-            Ok(log) => store.push(log),
-            Err(error) => {
-                tracing::warn!(error = %error, path = %path.display(), "skip malformed usage jsonl line");
+        if let Ok(record) = serde_json::from_str::<UsageJournalRecord>(line) {
+            if record.version == USAGE_JOURNAL_VERSION {
+                journal
+                    .entries
+                    .push(LoadedUsageJournalEntry::Versioned(record));
+            } else {
+                tracing::warn!(
+                    version = record.version,
+                    path = %path.display(),
+                    "skip unsupported usage journal record"
+                );
             }
+            continue;
+        }
+        match serde_json::from_str::<UsageLog>(line) {
+            Ok(log) => journal.entries.push(LoadedUsageJournalEntry::Legacy(log)),
+            Err(error) => tracing::warn!(
+                error = %error,
+                path = %path.display(),
+                "skip malformed usage jsonl line"
+            ),
         }
     }
-    Ok(store)
+    Ok(journal)
 }
 
-fn append_usage_jsonl(config_dir: &Path, log: &UsageLog) -> anyhow::Result<()> {
+fn append_usage_journal_record(
+    config_dir: &Path,
+    record: &UsageJournalRecord,
+) -> anyhow::Result<()> {
     fs::create_dir_all(config_dir)
         .with_context(|| format!("create config dir {}", config_dir.display()))?;
     let path = usage_jsonl_path(config_dir);
@@ -1616,11 +1792,165 @@ fn append_usage_jsonl(config_dir: &Path, log: &UsageLog) -> anyhow::Result<()> {
         .append(true)
         .open(&path)
         .with_context(|| format!("open usage jsonl {}", path.display()))?;
-    serde_json::to_writer(&mut file, log)
+    serde_json::to_writer(&mut file, record)
         .with_context(|| format!("serialize usage jsonl {}", path.display()))?;
     file.write_all(b"\n")
         .with_context(|| format!("append usage jsonl {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("flush usage jsonl {}", path.display()))?;
     Ok(())
+}
+
+fn truncate_usage_journal(config_dir: &Path) -> anyhow::Result<()> {
+    let path = usage_jsonl_path(config_dir);
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("truncate usage jsonl {}", path.display()))?;
+    Ok(())
+}
+
+fn rebuild_usage_rollups(
+    logs: &[UsageLog],
+    checkpoint: UsageJournalCheckpoint,
+) -> UsageRollupStore {
+    let mut rollups = UsageRollupStore {
+        buckets: BTreeMap::new(),
+        journal_checkpoint: Some(checkpoint),
+    };
+    for log in logs {
+        rollups.add_log(log);
+    }
+    rollups
+}
+
+fn compatible_usage_rollups(
+    logs: &[UsageLog],
+    snapshot_checkpoint: &UsageJournalCheckpoint,
+    loaded: Option<UsageRollupStore>,
+    journal: &LoadedUsageJournal,
+) -> UsageRollupStore {
+    let max_journal_sequence = journal
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            LoadedUsageJournalEntry::Versioned(record)
+                if record.generation == snapshot_checkpoint.generation =>
+            {
+                Some(record.sequence)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(snapshot_checkpoint.through_sequence);
+    if let Some(rollups) = loaded {
+        if rollups
+            .journal_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| {
+                checkpoint.generation == snapshot_checkpoint.generation
+                    && checkpoint.through_sequence >= snapshot_checkpoint.through_sequence
+                    && checkpoint.through_sequence <= max_journal_sequence
+            })
+        {
+            return rollups;
+        }
+    }
+    rebuild_usage_rollups(logs, snapshot_checkpoint.clone())
+}
+
+fn replay_versioned_usage_journal(
+    store: &mut UsageStore,
+    journal: &LoadedUsageJournal,
+    snapshot_checkpoint: &UsageJournalCheckpoint,
+) -> usize {
+    let mut records = journal
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            LoadedUsageJournalEntry::Versioned(record)
+                if record.generation == snapshot_checkpoint.generation =>
+            {
+                Some(record)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| record.sequence);
+
+    let mut log_through = snapshot_checkpoint.through_sequence;
+    let mut rollup_through = store
+        .rollups
+        .journal_checkpoint
+        .as_ref()
+        .filter(|checkpoint| checkpoint.generation == snapshot_checkpoint.generation)
+        .map(|checkpoint| checkpoint.through_sequence)
+        .unwrap_or(snapshot_checkpoint.through_sequence);
+    let mut replayed = 0;
+    for record in records {
+        if record.sequence <= log_through {
+            continue;
+        }
+        if record.sequence > rollup_through {
+            store.push(record.log.clone());
+            rollup_through = record.sequence;
+        } else {
+            store.push_log_only(record.log.clone());
+        }
+        log_through = record.sequence;
+        replayed += 1;
+    }
+
+    store.journal_checkpoint = Some(UsageJournalCheckpoint {
+        generation: snapshot_checkpoint.generation.clone(),
+        through_sequence: log_through,
+    });
+    store.rollups.journal_checkpoint = Some(UsageJournalCheckpoint {
+        generation: snapshot_checkpoint.generation.clone(),
+        through_sequence: rollup_through,
+    });
+    replayed
+}
+
+fn recover_unambiguous_legacy_journal_tail(
+    store: &mut UsageStore,
+    journal: &LoadedUsageJournal,
+) -> usize {
+    let snapshot_ids = store
+        .logs
+        .iter()
+        .map(|log| log.request_id.as_str())
+        .collect::<HashSet<_>>();
+    let snapshot_latest = store.logs.iter().map(|log| log.created_at_ms).max();
+    let mut candidates = BTreeMap::<String, UsageLog>::new();
+    for entry in &journal.entries {
+        let log = entry.log();
+        if snapshot_ids.contains(log.request_id.as_str())
+            || snapshot_latest.is_some_and(|latest| log.created_at_ms <= latest)
+        {
+            continue;
+        }
+        candidates.insert(log.request_id.clone(), log.clone());
+    }
+    let mut recovered = candidates.into_values().collect::<Vec<_>>();
+    recovered.sort_by(|left, right| {
+        left.created_at_ms
+            .cmp(&right.created_at_ms)
+            .then(left.request_id.cmp(&right.request_id))
+    });
+    let count = recovered.len();
+    for log in recovered {
+        store.push_log_only(log);
+    }
+    count
+}
+
+fn generate_journal_generation() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn generate_request_id() -> String {
@@ -2320,6 +2650,162 @@ mod tests {
         assert_eq!(before, after);
         assert!(jsonl.contains("req_append_only"));
         assert!(usage_rollups_path(&dir).exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn versioned_journal_replays_new_and_updated_logs_after_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("cc-switch-server-usage-replay-test-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut store = UsageStore::default();
+        store.save(&dir).unwrap();
+
+        let mut first = UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                total_tokens: Some(2),
+                ..Default::default()
+            },
+        );
+        first.request_id = "req_replay_first".to_string();
+        first.created_at_ms = 1_000;
+        store.push_and_persist(&dir, first).unwrap();
+
+        let mut second = UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::Codex,
+            200,
+            5,
+            UsageModelMetadata::default(),
+            TokenUsage::default(),
+        );
+        second.request_id = "req_replay_second".to_string();
+        second.created_at_ms = 2_000;
+        store.push_and_persist(&dir, second).unwrap();
+        store
+            .update_log_and_persist(&dir, "req_replay_second", |log| {
+                log.duration_ms = 55;
+                log.input_tokens = Some(7);
+                log.output_tokens = Some(3);
+                log.total_tokens = Some(10);
+                log.stream_status = Some("completed".to_string());
+            })
+            .unwrap();
+
+        let disk_snapshot = fs::read_to_string(usage_path(&dir)).unwrap();
+        assert!(!disk_snapshot.contains("req_replay_first"));
+        let journal = fs::read_to_string(usage_jsonl_path(&dir)).unwrap();
+        assert!(journal.contains("\"version\":1"));
+        assert!(journal.contains("\"sequence\":3"));
+
+        let loaded = UsageStore::load_or_default(&dir).unwrap();
+        assert_eq!(loaded.logs.len(), 2);
+        let final_second = loaded
+            .logs
+            .iter()
+            .find(|log| log.request_id == "req_replay_second")
+            .unwrap();
+        assert_eq!(final_second.duration_ms, 55);
+        assert_eq!(final_second.input_tokens, Some(7));
+        assert_eq!(final_second.output_tokens, Some(3));
+        assert_eq!(final_second.stream_status.as_deref(), Some("completed"));
+        let rollup = loaded.rollup();
+        assert_eq!(rollup.requests, 2);
+        assert_eq!(rollup.input_tokens, 8);
+        assert_eq!(rollup.output_tokens, 4);
+
+        loaded.save_recent_snapshot(&dir).unwrap();
+        let reloaded = UsageStore::load_or_default(&dir).unwrap();
+        assert_eq!(reloaded.logs.len(), 2);
+        assert_eq!(reloaded.rollup().requests, 2);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_journal_recovery_keeps_snapshot_updates_authoritative() {
+        let dir =
+            std::env::temp_dir().join(format!("cc-switch-server-usage-legacy-test-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut snapshot_log = UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                input_tokens: Some(5),
+                output_tokens: Some(1),
+                total_tokens: Some(6),
+                ..Default::default()
+            },
+        );
+        snapshot_log.request_id = "req_snapshot".to_string();
+        snapshot_log.created_at_ms = 1_000;
+        fs::write(
+            usage_path(&dir),
+            serde_json::to_vec_pretty(&json!({"logs": [snapshot_log.clone()]})).unwrap(),
+        )
+        .unwrap();
+
+        let mut stale_same_id = snapshot_log.clone();
+        stale_same_id.input_tokens = Some(1);
+        let mut newer_request = snapshot_log.clone();
+        newer_request.request_id = "req_legacy_new".to_string();
+        newer_request.created_at_ms = 2_000;
+        let mut trimmed_old_request = snapshot_log.clone();
+        trimmed_old_request.request_id = "req_legacy_trimmed".to_string();
+        trimmed_old_request.created_at_ms = 500;
+        let legacy_journal = [stale_same_id, newer_request, trimmed_old_request]
+            .into_iter()
+            .map(|log| serde_json::to_string(&log).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(usage_jsonl_path(&dir), format!("{legacy_journal}\n")).unwrap();
+
+        let mut loaded = UsageStore::load_or_default(&dir).unwrap();
+        assert_eq!(loaded.logs.len(), 2);
+        assert_eq!(
+            loaded
+                .logs
+                .iter()
+                .find(|log| log.request_id == "req_snapshot")
+                .and_then(|log| log.input_tokens),
+            Some(5)
+        );
+        assert!(loaded
+            .logs
+            .iter()
+            .any(|log| log.request_id == "req_legacy_new"));
+        assert!(loaded
+            .logs
+            .iter()
+            .all(|log| log.request_id != "req_legacy_trimmed"));
+
+        let mut post_migration = snapshot_log;
+        post_migration.request_id = "req_post_migration".to_string();
+        post_migration.created_at_ms = 3_000;
+        loaded.push_and_persist(&dir, post_migration).unwrap();
+        let reloaded = UsageStore::load_or_default(&dir).unwrap();
+        assert!(reloaded
+            .logs
+            .iter()
+            .any(|log| log.request_id == "req_post_migration"));
 
         fs::remove_dir_all(&dir).unwrap();
     }
