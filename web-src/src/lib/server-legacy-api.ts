@@ -898,7 +898,10 @@ export async function loadUpgradePolicy(): Promise<UpgradePolicy> {
 export async function saveUpgradePolicy(
   policy: UpgradePolicy,
 ): Promise<UpgradePolicy> {
-  return invokeCommand<UpgradePolicy>("set_upgrade_policy", policy);
+  return invokeCommand<UpgradePolicy>(
+    "set_upgrade_policy",
+    { ...policy } as Record<string, unknown>,
+  );
 }
 
 export interface AdminUpgradeStatus {
