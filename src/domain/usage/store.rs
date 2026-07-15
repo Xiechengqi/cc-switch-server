@@ -105,6 +105,8 @@ pub struct UsageLog {
     #[serde(default)]
     pub cost_multiplier: Option<f64>,
     pub status_code: u16,
+    #[serde(default)]
+    pub error_message: Option<String>,
     pub duration_ms: u128,
     #[serde(default)]
     pub first_token_ms: Option<u128>,
@@ -677,6 +679,7 @@ impl UsageLog {
             pricing_model: model.pricing_model,
             cost_multiplier: None,
             status_code,
+            error_message: None,
             duration_ms,
             first_token_ms: None,
             raw_input_tokens: usage.raw_input_tokens,

@@ -14,6 +14,7 @@ pub(crate) mod invoke;
 pub(in crate::api) mod logs;
 pub(in crate::api) mod models;
 pub(in crate::api) mod payout;
+pub(in crate::api) mod provider_health_scheduler;
 pub(in crate::api) mod providers;
 pub(in crate::api) mod router;
 pub(in crate::api) mod self_update;
@@ -136,6 +137,7 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {}", state.bind_addr))?;
 
+    provider_health_scheduler::spawn_share_model_health_scheduler(state.clone());
     tracing::info!("cc-switch-server listening on {}", state.bind_addr);
     axum::serve(listener, app).await.context("serve http")
 }
@@ -859,10 +861,6 @@ pub fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-pub(crate) fn clamp_u128_to_u64(value: u128) -> u64 {
-    value.min(u64::MAX as u128) as u64
 }
 
 pub(crate) fn parse_app_kind(value: &str) -> Result<AppKind, ApiError> {

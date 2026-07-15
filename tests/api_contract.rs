@@ -213,6 +213,210 @@ async fn share_router_request_logs_are_scoped_to_tunnel_share_header() {
 }
 
 #[tokio::test]
+async fn share_router_runtime_reports_health_for_requested_share_binding() {
+    let state = test_state();
+    configure_share_router_identity(&state).await;
+    for (provider_id, name) in [
+        ("provider-other", "Other Provider"),
+        ("provider-bound", "Bound Provider"),
+    ] {
+        upsert_test_provider(
+            &state,
+            AppKind::Codex,
+            Provider {
+                id: provider_id.to_string(),
+                name: name.to_string(),
+                settings_config: json!({
+                    "env": {"OPENAI_API_KEY": "sk-test"},
+                    "models": ["gpt-5.5"]
+                }),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+        )
+        .await;
+    }
+    state
+        .mutate_shares_immediate(|store| {
+            store
+                .upsert(test_share_input(
+                    "share-runtime-health",
+                    "provider-bound",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+    let mut bound_log = UsageLog::new(
+        AppKind::Codex,
+        "provider-bound".to_string(),
+        "Bound Provider".to_string(),
+        ProviderType::Codex,
+        599,
+        250,
+        UsageModelMetadata {
+            model: Some("gpt-5.5".to_string()),
+            requested_model: Some("gpt-5.5".to_string()),
+            ..Default::default()
+        },
+        TokenUsage::default(),
+    );
+    bound_log.apply_context(UsageLogContext {
+        share_id: Some("share-runtime-health".to_string()),
+        data_source: Some("cc-switch-scheduled".to_string()),
+        is_health_check: true,
+        is_streaming: true,
+        stream_status: Some("failed".to_string()),
+        ..Default::default()
+    });
+    bound_log.error_message = Some("upstream connection timed out".to_string());
+    bound_log.created_at_ms = 1_783_917_271_880;
+    state.push_usage_log(bound_log).await.unwrap();
+
+    let app = app_router(state);
+    let response = app
+        .oneshot(share_router_request(
+            Method::GET,
+            "/_share-router/share-runtime?shareId=share-runtime-health",
+            &[],
+            "nonce-runtime-health",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["shareId"], "share-runtime-health");
+    let results = body["modelHealth"]["codex"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["providerId"], "provider-bound");
+    assert_eq!(results[0]["providerName"], "Bound Provider");
+    assert_eq!(results[0]["status"], "failed");
+    assert_eq!(results[0]["checkedAt"], 1_783_917_271_i64);
+    assert_eq!(results[0]["source"], "cc-switch-scheduled");
+    assert_eq!(results[0]["errorMessage"], "upstream connection timed out");
+}
+
+#[tokio::test]
+async fn share_router_model_health_stream_probe_persists_bound_provider_result() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream_calls = calls.clone();
+    let upstream = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let calls = upstream_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+                )
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = test_state();
+    configure_share_router_identity(&state).await;
+    upsert_test_provider(
+        &state,
+        AppKind::Codex,
+        Provider {
+            id: "provider-health-probe".to_string(),
+            name: "Health Probe Provider".to_string(),
+            settings_config: json!({
+                "env": {
+                    "OPENAI_BASE_URL": format!("http://{upstream_addr}"),
+                    "OPENAI_API_KEY": "sk-local-secret"
+                },
+                "models": ["gpt-5.5"]
+            }),
+            category: None,
+            meta: None,
+            extra: Default::default(),
+        },
+    )
+    .await;
+    state
+        .mutate_shares_immediate(|store| {
+            store
+                .upsert(test_share_input(
+                    "share-health-probe",
+                    "provider-health-probe",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+    let app = app_router(state.clone());
+    let body = serde_json::to_vec(&json!({"appType": "codex"})).unwrap();
+    let response = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::POST,
+            "/_share-router/model-health",
+            &["share-health-probe"],
+            "nonce-model-health-probe",
+            body,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = json_body(response).await;
+    assert_eq!(response["success"], true);
+    assert_eq!(response["status"], "healthy");
+    assert_eq!(response["statusCode"], 200);
+    assert_eq!(response["modelUsed"], "gpt-5.5");
+    assert_eq!(response["providerId"], "provider-health-probe");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let usage = state.usage_snapshot().await;
+    let log = usage
+        .logs
+        .iter()
+        .find(|log| log.share_id.as_deref() == Some("share-health-probe"))
+        .unwrap();
+    assert!(log.is_health_check);
+    assert!(log.is_streaming);
+    assert_eq!(log.provider_id, "provider-health-probe");
+    assert_eq!(log.data_source.as_deref(), Some("cc-switch-router-probe"));
+    assert_eq!(log.stream_status.as_deref(), Some("completed"));
+    assert_eq!(log.status_code, 200);
+    assert!(log.error_message.is_none());
+
+    let response = app
+        .oneshot(share_router_request(
+            Method::GET,
+            "/_share-router/share-runtime?shareId=share-health-probe",
+            &[],
+            "nonce-runtime-after-health-probe",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = json_body(response).await;
+    assert_eq!(
+        response["modelHealth"]["codex"][0]["providerId"],
+        "provider-health-probe"
+    );
+    assert_eq!(response["modelHealth"]["codex"][0]["status"], "success");
+}
+
+#[tokio::test]
 async fn control_apply_share_settings_rejects_replayed_nonce() {
     let state = test_state();
     let mut config = state.config_snapshot().await;

@@ -1045,6 +1045,35 @@ impl ServerStateInner {
             .push_and_persist(&self.config_dir, log)
     }
 
+    pub(crate) async fn push_health_usage_log_if_due(
+        &self,
+        log: UsageLog,
+        min_interval_ms: u128,
+    ) -> anyhow::Result<UsageLog> {
+        anyhow::ensure!(log.is_health_check, "usage log is not a health check");
+        let mut usage = self.usage.write().await;
+        let latest = usage
+            .logs
+            .iter()
+            .filter(|existing| {
+                existing.is_health_check
+                    && existing.share_id == log.share_id
+                    && existing.app == log.app
+                    && existing.provider_id == log.provider_id
+                    && existing.data_source == log.data_source
+                    && existing.requested_model == log.requested_model
+            })
+            .max_by_key(|existing| existing.created_at_ms)
+            .cloned();
+        if let Some(existing) = latest {
+            if log.created_at_ms.saturating_sub(existing.created_at_ms) < min_interval_ms {
+                return Ok(existing);
+            }
+        }
+        usage.push_and_persist(&self.config_dir, log.clone())?;
+        Ok(log)
+    }
+
     pub async fn update_usage_log(
         &self,
         request_id: &str,
@@ -3111,6 +3140,54 @@ mod tests {
             copilot_github_token(&fallback).as_deref(),
             Some("github-refresh-token")
         );
+    }
+
+    #[tokio::test]
+    async fn health_usage_log_if_due_deduplicates_matching_binding_and_model() {
+        let state = test_state();
+        let make_log = |request_id: &str, model: &str, created_at_ms: u128| {
+            let mut log = UsageLog::new(
+                AppKind::Codex,
+                "provider-1".to_string(),
+                "Provider 1".to_string(),
+                ProviderType::Codex,
+                429,
+                0,
+                UsageModelMetadata {
+                    model: Some(model.to_string()),
+                    requested_model: Some(model.to_string()),
+                    ..UsageModelMetadata::default()
+                },
+                TokenUsage::default(),
+            );
+            log.apply_context(UsageLogContext {
+                request_id: Some(request_id.to_string()),
+                share_id: Some("share-1".to_string()),
+                data_source: Some("cc-switch-quota".to_string()),
+                is_health_check: true,
+                ..UsageLogContext::default()
+            });
+            log.created_at_ms = created_at_ms;
+            log
+        };
+
+        let first = state
+            .push_health_usage_log_if_due(make_log("health-1", "gpt-5.5", 1_000), 10_000)
+            .await
+            .unwrap();
+        let duplicate = state
+            .push_health_usage_log_if_due(make_log("health-2", "gpt-5.5", 2_000), 10_000)
+            .await
+            .unwrap();
+        let changed_model = state
+            .push_health_usage_log_if_due(make_log("health-3", "gpt-5.6", 3_000), 10_000)
+            .await
+            .unwrap();
+
+        assert_eq!(first.request_id, "health-1");
+        assert_eq!(duplicate.request_id, "health-1");
+        assert_eq!(changed_model.request_id, "health-3");
+        assert_eq!(state.usage_snapshot().await.logs.len(), 2);
     }
 
     #[tokio::test]

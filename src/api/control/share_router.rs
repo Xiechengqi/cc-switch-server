@@ -23,14 +23,7 @@ pub(crate) async fn share_router_request_logs(
     Query(query): Query<ShareRouterRequestLogsQuery>,
 ) -> Result<Json<ShareRouterRequestLogsResponse>, ApiError> {
     require_share_router_request(&state, "GET", &uri, &headers, &[]).await?;
-    let mut header_share_ids = headers.get_all(SHARE_ROUTER_SHARE_ID_HEADER).iter();
-    let header_share_id = header_share_ids
-        .next()
-        .filter(|_| header_share_ids.next().is_none())
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::not_found("not found"))?;
+    let header_share_id = share_id_from_router_header(&headers)?;
     if query
         .share_id
         .as_deref()
@@ -89,51 +82,63 @@ pub(crate) async fn share_router_model_health(
     let input: ShareRouterModelHealthRequest =
         serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
     let app = parse_app_kind(&input.app_type)?;
+    let share_id = share_id_from_router_header(&headers)?;
+    let share = resolve_share_for_internal_request(&state, Some(share_id)).await?;
+    let provider_id = crate::domain::sharing::model_health::share_bindings(&share)
+        .into_iter()
+        .find_map(|(bound_app, provider_id)| (bound_app == app).then_some(provider_id))
+        .ok_or_else(|| ApiError::not_found("share app binding not found"))?;
     let providers = state.providers.read().await.clone();
-    let usage = state.usage.read().await.clone();
     let provider = providers
         .providers
         .iter()
-        .find(|provider| provider.app == app)
+        .find(|provider| provider.app == app && provider.provider.id == provider_id)
         .cloned()
-        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "no provider selected"))?;
-    let health = crate::domain::health::provider_health(&provider, &usage);
-    let latest = usage
-        .logs
-        .iter()
-        .rev()
-        .find(|log| log.app == app && log.provider_id == provider.provider.id);
+        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "provider not found"))?;
+    let accounts = state.accounts_snapshot().await;
+    let config = web_stream_check_config(&state).await;
+    let check = crate::api::provider_health_scheduler::check_share_binding(
+        &state,
+        &share,
+        &provider,
+        &accounts,
+        &config,
+        "cc-switch-router-probe",
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let status = if check.quota_blocked {
+        "quota_blocked"
+    } else if check.result.success {
+        "healthy"
+    } else {
+        "failed"
+    };
     Ok(Json(ShareRouterModelHealthResponse {
         ok: true,
-        success: health.healthy,
-        status: if health.healthy { "healthy" } else { "failed" }.to_string(),
-        message: health
-            .reason
-            .clone()
-            .unwrap_or_else(|| "derived from server usage health".to_string()),
-        status_code: latest.map(|log| log.status_code),
-        model_used: latest
-            .and_then(|log| {
-                log.actual_model
-                    .clone()
-                    .or_else(|| log.requested_model.clone())
-            })
-            .or_else(|| {
-                provider
-                    .provider
-                    .settings_config
-                    .get("model")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default(),
-        response_time_ms: latest.map(|log| clamp_u128_to_u64(log.duration_ms)),
-        tested_at: (latest.map(|log| log.created_at_ms).unwrap_or_else(now_ms) / 1000) as i64,
-        retry_count: 0,
-        error_category: None,
-        provider_id: provider.provider.id,
-        provider_name: provider.provider.name,
+        success: check.result.success,
+        status: status.to_string(),
+        message: check.result.message,
+        status_code: check.result.http_status,
+        model_used: check.result.model_used,
+        response_time_ms: check.result.response_time_ms,
+        tested_at: check.result.tested_at,
+        retry_count: check.result.retry_count,
+        error_category: check.result.error_category,
+        provider_id: check.provider_id,
+        provider_name: check.provider_name,
     }))
+}
+
+fn share_id_from_router_header(headers: &HeaderMap) -> Result<&str, ApiError> {
+    let mut values = headers.get_all(SHARE_ROUTER_SHARE_ID_HEADER).iter();
+    values
+        .next()
+        .filter(|_| values.next().is_none())
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::not_found("not found"))
 }
 
 async fn require_share_router_request(

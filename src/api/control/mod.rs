@@ -26,7 +26,8 @@ use crate::domain::sharing::shares::ShareBinding;
 use crate::state::ServerState;
 
 use super::{
-    clamp_u128_to_u64, now_ms, parse_app_kind, APPLY_SHARE_SETTINGS_PATH, REFRESH_SHARE_USAGE_PATH,
+    now_ms, parse_app_kind, web_stream_check_config, APPLY_SHARE_SETTINGS_PATH,
+    REFRESH_SHARE_USAGE_PATH,
 };
 
 mod ctl;

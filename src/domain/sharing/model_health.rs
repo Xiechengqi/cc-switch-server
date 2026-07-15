@@ -60,7 +60,11 @@ pub fn summary_for_share(
         };
 
         let result = if quota_blocked_for_provider(share, provider, accounts) {
-            Some(quota_blocked_result(app, provider))
+            Some(quota_blocked_result(
+                app,
+                provider,
+                usage.and_then(|usage| latest_quota_health_log(share, app, provider, usage)),
+            ))
         } else {
             usage.and_then(|usage| latest_health_result(share, app, provider, usage))
         };
@@ -131,18 +135,59 @@ fn result_from_log(
         recent_results: Vec::new(),
         status_code: Some(log.status_code),
         latency_ms: saturating_u128_to_u64(log.duration_ms),
-        error_message: error_message_for_log(log, status),
+        error_message: log
+            .error_message
+            .clone()
+            .or_else(|| error_message_for_log(log, status)),
         checked_at: ms_to_seconds(log.created_at_ms),
-        source: "cc-switch-health-check".to_string(),
+        source: log
+            .data_source
+            .as_deref()
+            .filter(|source| source.starts_with("cc-switch-"))
+            .unwrap_or("cc-switch-health-check")
+            .to_string(),
         provider_id: Some(provider.provider.id.clone()),
         provider_name: Some(provider.provider.name.clone()),
     }
 }
 
-fn quota_blocked_result(app: AppKind, provider: &StoredProvider) -> ShareModelHealthResult {
-    let requested_model =
-        default_model_for_provider(provider).unwrap_or_else(|| app.as_str().into());
-    let actual_model = actual_model_for_provider(provider, &requested_model);
+fn latest_quota_health_log<'a>(
+    share: &Share,
+    app: AppKind,
+    provider: &StoredProvider,
+    usage: &'a UsageStore,
+) -> Option<&'a UsageLog> {
+    usage
+        .logs
+        .iter()
+        .filter(|log| {
+            log.is_health_check
+                && log.app == app
+                && log.provider_id == provider.provider.id
+                && log.share_id.as_deref() == Some(share.id.as_str())
+                && log.data_source.as_deref() == Some("cc-switch-quota")
+        })
+        .max_by_key(|log| log.created_at_ms)
+}
+
+fn quota_blocked_result(
+    app: AppKind,
+    provider: &StoredProvider,
+    log: Option<&UsageLog>,
+) -> ShareModelHealthResult {
+    let requested_model = log
+        .and_then(|log| log.requested_model.as_deref().or(log.model.as_deref()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| default_model_for_provider(provider))
+        .unwrap_or_else(|| app.as_str().into());
+    let actual_model = log
+        .and_then(|log| log.actual_model.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| actual_model_for_provider(provider, &requested_model));
     ShareModelHealthResult {
         app_type: app.as_str().to_string(),
         requested_model,
@@ -150,10 +195,18 @@ fn quota_blocked_result(app: AppKind, provider: &StoredProvider) -> ShareModelHe
         status: "quota_blocked".to_string(),
         recent_results: vec!["quota_blocked".to_string()],
         status_code: None,
-        latency_ms: 0,
-        error_message: Some("quota blocked".to_string()),
-        checked_at: ms_to_seconds(now_ms()),
-        source: "cc-switch-quota".to_string(),
+        latency_ms: log
+            .map(|log| saturating_u128_to_u64(log.duration_ms))
+            .unwrap_or(0),
+        error_message: log
+            .and_then(|log| log.error_message.clone())
+            .or_else(|| Some("quota blocked".to_string())),
+        checked_at: log
+            .map(|log| ms_to_seconds(log.created_at_ms))
+            .unwrap_or_else(|| ms_to_seconds(now_ms())),
+        source: log
+            .and_then(|log| log.data_source.clone())
+            .unwrap_or_else(|| "cc-switch-quota".to_string()),
         provider_id: Some(provider.provider.id.clone()),
         provider_name: Some(provider.provider.name.clone()),
     }
@@ -259,7 +312,7 @@ fn default_model_for_provider(provider: &StoredProvider) -> Option<String> {
     })
 }
 
-fn quota_blocked_for_provider(
+pub(crate) fn quota_blocked_for_provider(
     share: &Share,
     provider: &StoredProvider,
     accounts: Option<&AccountStore>,
@@ -290,7 +343,7 @@ fn account_for_provider<'a>(
     accounts.and_then(|accounts| accounts.find_for_provider(provider.provider_type, account_id))
 }
 
-fn share_bindings(share: &Share) -> Vec<(AppKind, String)> {
+pub(crate) fn share_bindings(share: &Share) -> Vec<(AppKind, String)> {
     if share.bindings.is_empty() {
         vec![(share.app, share.provider_id.clone())]
     } else {
@@ -440,6 +493,85 @@ mod tests {
         assert_eq!(result.status, "quota_blocked");
         assert_eq!(result.source, "cc-switch-quota");
         assert_eq!(result.recent_results, vec!["quota_blocked"]);
+    }
+
+    #[test]
+    fn quota_block_reuses_persisted_health_log_metadata() {
+        let share = test_share(
+            "share-1",
+            AppKind::Codex,
+            "p-codex",
+            ProviderType::Codex,
+            Some(100.0),
+        );
+        let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::Codex);
+        let mut log = health_log(&share, &provider, 429, false, None, Some("gpt-5.5"), None);
+        log.created_at_ms = 2_000;
+        log.data_source = Some("cc-switch-quota".to_string());
+        log.error_message = Some("quota blocked until reset".to_string());
+        let usage = UsageStore {
+            logs: vec![log],
+            ..Default::default()
+        };
+        let providers = ProviderStore {
+            providers: vec![provider],
+        };
+
+        let first = summary_for_share(&share, &providers, None, Some(&usage));
+        let second = summary_for_share(&share, &providers, None, Some(&usage));
+        let first = first.codex.first().unwrap();
+        let second = second.codex.first().unwrap();
+
+        assert_eq!(first.status, "quota_blocked");
+        assert_eq!(first.checked_at, 2);
+        assert_eq!(second.checked_at, first.checked_at);
+        assert_eq!(first.source, "cc-switch-quota");
+        assert_eq!(
+            first.error_message.as_deref(),
+            Some("quota blocked until reset")
+        );
+    }
+
+    #[test]
+    fn scheduled_health_log_preserves_source_error_and_seconds_timestamp() {
+        let share = test_share(
+            "share-1",
+            AppKind::Codex,
+            "p-codex",
+            ProviderType::Codex,
+            None,
+        );
+        let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::Codex);
+        let mut log = health_log(
+            &share,
+            &provider,
+            599,
+            true,
+            Some("failed"),
+            Some("gpt-5.5"),
+            None,
+        );
+        log.created_at_ms = 1_783_917_271_880;
+        log.data_source = Some("cc-switch-scheduled".to_string());
+        log.error_message = Some("upstream connection timed out".to_string());
+        let usage = UsageStore {
+            logs: vec![log],
+            ..Default::default()
+        };
+        let providers = ProviderStore {
+            providers: vec![provider],
+        };
+
+        let summary = summary_for_share(&share, &providers, None, Some(&usage));
+        let result = summary.codex.first().unwrap();
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.checked_at, 1_783_917_271);
+        assert_eq!(result.source, "cc-switch-scheduled");
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("upstream connection timed out")
+        );
     }
 
     #[test]
@@ -602,13 +734,13 @@ mod tests {
             status_code: Some(200),
             latency_ms: 120,
             error_message: None,
-            checked_at: 1_783_917_271_880,
+            checked_at: 1_783_917_271,
             source: "health_check".to_string(),
             provider_id: Some("provider-1".to_string()),
             provider_name: Some("Provider".to_string()),
         };
         let serialized = serde_json::to_string(&result).unwrap();
-        assert!(serialized.contains("\"checkedAt\":1783917271880"));
+        assert!(serialized.contains("\"checkedAt\":1783917271"));
         assert!(!serialized.contains("lastCheckedAt"));
 
         let from_router: ShareModelHealthResult = serde_json::from_value(serde_json::json!({
