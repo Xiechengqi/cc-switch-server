@@ -333,6 +333,8 @@ impl AccountStore {
             .ok_or_else(|| {
                 "workspace is not present in the verified OpenAI account claims".to_string()
             })?;
+        let selection_changed =
+            effective_codex_workspace_id(account).as_deref() != Some(selected.id.as_str());
         let mut profile = account
             .profile
             .take()
@@ -349,6 +351,31 @@ impl AccountStore {
             );
         }
         account.profile = Some(profile);
+        if selection_changed {
+            // Codex quota and reset-credit snapshots are scoped by
+            // ChatGPT-Account-Id. Never carry a workspace A snapshot into
+            // workspace B while the fresh details request is unavailable.
+            account.subscription_level = None;
+            account.entitlement_status = None;
+            account.quota_percent = None;
+            account.quota = None;
+            account.quota_refreshed_at = None;
+            account.quota_next_refresh_at = None;
+            account.rate_limited_until = None;
+            account.last_refresh_error = None;
+            if let Some(raw) = account.raw.as_mut().and_then(Value::as_object_mut) {
+                for key in [
+                    "bankedReset",
+                    "banked_reset",
+                    "codexBankedReset",
+                    "codex_banked_reset",
+                    "rateLimitResetCredits",
+                    "rate_limit_reset_credits",
+                ] {
+                    raw.remove(key);
+                }
+            }
+        }
         Ok(account.clone())
     }
 
@@ -591,6 +618,20 @@ pub fn selected_codex_workspace_id(account: &Account) -> Option<String> {
         .iter()
         .any(|workspace| workspace.id == selected)
         .then_some(selected)
+}
+
+pub fn effective_codex_workspace_id(account: &Account) -> Option<String> {
+    selected_codex_workspace_id(account).or_else(|| {
+        let default_id = account
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.get(VERIFIED_OPENAI_CLAIMS_KEY))
+            .and_then(codex_account_id_from_value)?;
+        codex_workspace_options(account)
+            .iter()
+            .any(|workspace| workspace.id == default_id)
+            .then_some(default_id)
+    })
 }
 
 pub fn codex_workspace_options(account: &Account) -> Vec<CodexWorkspace> {
@@ -1232,6 +1273,96 @@ mod tests {
         assert!(store
             .select_codex_workspace("acct-1", "attacker-account")
             .is_err());
+    }
+
+    #[test]
+    fn codex_effective_workspace_prefers_verified_default_over_sorted_options() {
+        let mut store = AccountStore::default();
+        let mut profile = Some(json!({}));
+        set_verified_openai_claims(
+            &mut profile,
+            Some(json!({
+                "chatgpt_account_id": "workspace-z-default",
+                "organizations": [
+                    {"id": "workspace-a-team", "name": "A Team"}
+                ]
+            })),
+        );
+        let account = store.upsert(UpsertAccountInput {
+            id: Some("acct-effective-workspace".to_string()),
+            provider_type: ProviderType::CodexOAuth,
+            profile,
+            ..fixture_input(ProviderType::CodexOAuth)
+        });
+
+        assert_eq!(
+            codex_workspace_options(&account)
+                .first()
+                .map(|workspace| workspace.id.as_str()),
+            Some("workspace-a-team")
+        );
+        assert_eq!(
+            effective_codex_workspace_id(&account).as_deref(),
+            Some("workspace-z-default")
+        );
+    }
+
+    #[test]
+    fn codex_workspace_change_invalidates_workspace_scoped_quota_cache() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::CodexOAuth);
+        input.id = Some("acct-workspace-cache".to_string());
+        input.profile = Some(json!({
+            "verifiedOpenAiClaims": {
+                "chatgpt_account_id": "account-default",
+                "organizations": [{"id": "account-team", "name": "Team"}]
+            },
+            "selectedChatgptAccountId": "account-default"
+        }));
+        input.raw = Some(json!({
+            "bankedReset": {"availableCount": 2},
+            "rate_limit_reset_credits": {"available_count": 2},
+            "unrelated": "preserved"
+        }));
+        input.subscription_level = Some("ChatGPT Plus".to_string());
+        input.entitlement_status = Some("active".to_string());
+        input.quota_percent = Some(50.0);
+        input.quota = Some(AccountQuota {
+            success: true,
+            extra_usage: Some(json!({
+                "bankedReset": {
+                    "workspaceId": "account-default",
+                    "availableCount": 2
+                }
+            })),
+            ..Default::default()
+        });
+        input.quota_refreshed_at = Some(1_000);
+        input.quota_next_refresh_at = Some(2_000);
+        input.rate_limited_until = Some(3_000);
+        input.last_refresh_error = Some("old workspace error".to_string());
+        store.upsert(input);
+
+        let account = store
+            .select_codex_workspace("acct-workspace-cache", "account-team")
+            .unwrap();
+
+        assert_eq!(
+            selected_codex_workspace_id(&account).as_deref(),
+            Some("account-team")
+        );
+        assert!(account.subscription_level.is_none());
+        assert!(account.entitlement_status.is_none());
+        assert!(account.quota_percent.is_none());
+        assert!(account.quota.is_none());
+        assert!(account.quota_refreshed_at.is_none());
+        assert!(account.quota_next_refresh_at.is_none());
+        assert!(account.rate_limited_until.is_none());
+        assert!(account.last_refresh_error.is_none());
+        let raw = account.raw.as_ref().unwrap();
+        assert!(raw.get("bankedReset").is_none());
+        assert!(raw.get("rate_limit_reset_credits").is_none());
+        assert_eq!(raw["unrelated"], "preserved");
     }
 
     #[test]

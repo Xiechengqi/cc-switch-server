@@ -2064,8 +2064,7 @@ pub(in crate::api) fn map_managed_auth_account(
 ) -> Value {
     let workspaces = crate::domain::accounts::store::codex_workspace_options(account);
     let selected_workspace_id =
-        crate::domain::accounts::store::selected_codex_workspace_id(account)
-            .or_else(|| workspaces.first().map(|workspace| workspace.id.clone()));
+        crate::domain::accounts::store::effective_codex_workspace_id(account);
     json!({
         "id": account.id,
         "provider": provider_label,
@@ -2560,6 +2559,13 @@ pub(in crate::api) async fn web_managed_auth_set_workspace(
     }
     let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
     let workspace_id = web_arg_string_any(args, &["workspaceId", "workspace_id"])?;
+    // Serialize workspace changes with token/quota refreshes for the same
+    // account. Otherwise an in-flight workspace A response could be persisted
+    // after workspace B has cleared the old cache.
+    let _refresh_guard = state
+        .account_refresh_locks
+        .lock(ProviderType::CodexOAuth, &account_id)
+        .await;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             store.select_codex_workspace(&account_id, &workspace_id)

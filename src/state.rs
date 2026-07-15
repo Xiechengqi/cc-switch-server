@@ -2081,12 +2081,22 @@ async fn refresh_due_account_quotas(state: &ServerState) {
 }
 
 async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i64) {
+    let locked_provider_type = account.provider_type;
     let Some(_guard) = state
         .account_refresh_locks
-        .try_lock(account.provider_type, &account.id)
+        .try_lock(locked_provider_type, &account.id)
     else {
         return;
     };
+    // The periodic scan clones accounts before acquiring the per-account lock.
+    // A workspace switch may complete between those two operations, so always
+    // re-read under the lock and re-check due state before issuing requests.
+    let Some(account) = state.find_account_by_id(&account.id).await else {
+        return;
+    };
+    if account.provider_type != locked_provider_type || !account_quota_refresh_due(&account, now) {
+        return;
+    }
     let success_cooldown_ms = state.oauth_quota_refresh_interval_ms().await;
     let mut active_account = account;
     let mut account_mutated = false;

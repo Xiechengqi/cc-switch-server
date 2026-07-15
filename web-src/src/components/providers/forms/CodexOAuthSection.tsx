@@ -60,7 +60,7 @@ interface CodexOAuthSectionProps {
   websocketEnabled?: boolean;
   /** WebSocket 切换回调 */
   onWebsocketChange?: (enabled: boolean) => void;
-  /** 是否显示临时 Banked Reset 活动面板 */
+  /** 是否显示只读 Banked Reset 次数与到期明细面板 */
   showBankedResetPanel?: boolean;
 }
 
@@ -133,6 +133,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     accounts.find((account) => account.id === selectedAccountId) ??
     accounts.find((account) => account.id === defaultAccountId) ??
     accounts[0];
+  const activeWorkspaceId =
+    activeAccount?.selected_workspace_id ?? activeAccount?.workspaces?.[0]?.id;
 
   const copyUserCode = async () => {
     if (deviceCode?.user_code) {
@@ -392,10 +394,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             {t("codexOauth.workspace", "ChatGPT Workspace")}
           </Label>
           <Select
-            value={
-              activeAccount.selected_workspace_id ??
-              activeAccount.workspaces[0]?.id
-            }
+            value={activeWorkspaceId}
             onValueChange={(workspaceId) =>
               setWorkspace(activeAccount.id, workspaceId)
             }
@@ -424,7 +423,10 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
       )}
 
       {ENABLE_CODEX_BANKED_RESET && showBankedResetPanel && hasAnyAccount && (
-        <CodexBankedResetPanel accountId={selectedAccountId} />
+        <CodexBankedResetPanel
+          accountId={activeAccount?.id}
+          workspaceId={activeWorkspaceId}
+        />
       )}
 
       {/* 未认证 - 登录按钮 */}

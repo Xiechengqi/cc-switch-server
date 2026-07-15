@@ -1821,12 +1821,35 @@ async fn web_invoke_dispatch(
         | "clear_claude_onboarding_skip" => Ok(Value::Null),
         "codex_banked_reset_status" => {
             let account_id = web_optional_string_any(&args, &["accountId", "account_id"]);
-            let now_ms = crate::infra::time::now_ms() as i64;
-            let accounts = state.accounts_snapshot().await;
-            let account = accounts
-                .find_for_provider(ProviderType::CodexOAuth, account_id.as_deref())
+            let account_id = {
+                let accounts = state.accounts_snapshot().await;
+                let account = accounts
+                    .find_for_provider(ProviderType::CodexOAuth, account_id.as_deref())
+                    .filter(|account| account.provider_type == ProviderType::CodexOAuth)
+                    .ok_or_else(|| ApiError::not_found("codex oauth account not found"))?;
+                account.id.clone()
+            };
+            let response = account_quota(
+                State(state.clone()),
+                headers.clone(),
+                Path(account_id),
+                Query(AccountQuotaQuery {
+                    refresh: Some(true),
+                    force: web_optional_bool(&args, &["force"]),
+                }),
+            )
+            .await?
+            .0;
+            let account = response
+                .account
+                .as_ref()
                 .ok_or_else(|| ApiError::not_found("codex oauth account not found"))?;
-            Ok(crate::clients::oauth::quota::codex_banked_reset_status_snapshot(account, now_ms))
+            Ok(
+                crate::clients::oauth::quota::codex_banked_reset_status_snapshot(
+                    account,
+                    crate::infra::time::now_ms() as i64,
+                ),
+            )
         }
         "codex_banked_reset_invite" | "codex_banked_reset_consume" => Err(
             ApiError::not_implemented("codex banked reset is not available on cc-switch-server"),

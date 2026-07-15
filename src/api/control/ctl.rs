@@ -297,77 +297,74 @@ pub(crate) async fn refresh_share_usage_item(
         };
     };
     let account_id = active_account.id.clone();
+    let Some(_refresh_guard) = state
+        .account_refresh_locks
+        .try_lock(active_account.provider_type, &active_account.id)
+    else {
+        return ControlRefreshShareUsageItem {
+            app: app.as_str().to_string(),
+            provider_id: Some(provider_id),
+            provider_name,
+            auth_provider,
+            account_id: Some(account_id),
+            refreshed: false,
+            error: Some("account_refresh_in_progress".to_string()),
+            message: None,
+        };
+    };
+    let latest_account = state.find_account_by_id(&active_account.id).await;
+    let Some(latest_account) =
+        latest_account.filter(|account| account.provider_type == provider.provider_type)
+    else {
+        return ControlRefreshShareUsageItem {
+            app: app.as_str().to_string(),
+            provider_id: Some(provider_id),
+            provider_name,
+            auth_provider,
+            account_id: Some(account_id),
+            refreshed: false,
+            error: Some("account_not_found".to_string()),
+            message: None,
+        };
+    };
+    active_account = latest_account;
     let now = now_ms() as i64;
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
 
     if account_needs_native_refresh(&active_account, now) {
-        let Some(_refresh_guard) = state
-            .account_refresh_locks
-            .try_lock(active_account.provider_type, &active_account.id)
-        else {
-            return ControlRefreshShareUsageItem {
-                app: app.as_str().to_string(),
-                provider_id: Some(provider_id),
-                provider_name,
-                auth_provider,
-                account_id: Some(account_id),
-                refreshed: false,
-                error: Some("account_refresh_in_progress".to_string()),
-                message: None,
-            };
-        };
-        let latest_account = state
-            .find_account_for_provider(provider.provider_type, Some(&active_account.id))
-            .await;
-        let Some(latest_account) = latest_account else {
-            return ControlRefreshShareUsageItem {
-                app: app.as_str().to_string(),
-                provider_id: Some(provider_id),
-                provider_name,
-                auth_provider,
-                account_id: Some(account_id),
-                refreshed: false,
-                error: Some("account_not_found".to_string()),
-                message: None,
-            };
-        };
-        active_account = latest_account;
-        if account_needs_native_refresh(&active_account, now) {
-            let http_client = state.http_client().await;
-            match execute_native_account_refresh(&http_client, &active_account, now, interval_ms)
-                .await
-            {
-                Ok(update) => {
-                    let updated = state
-                        .mutate_accounts_debounced(|accounts| {
-                            accounts.mark_native_refresh_success(&active_account.id, update)
-                        })
-                        .await;
-                    if let Some(updated) = updated {
-                        active_account = updated;
-                    }
+        let http_client = state.http_client().await;
+        match execute_native_account_refresh(&http_client, &active_account, now, interval_ms).await
+        {
+            Ok(update) => {
+                let updated = state
+                    .mutate_accounts_debounced(|accounts| {
+                        accounts.mark_native_refresh_success(&active_account.id, update)
+                    })
+                    .await;
+                if let Some(updated) = updated {
+                    active_account = updated;
                 }
-                Err(error) => {
-                    state
-                        .mutate_accounts_debounced(|accounts| {
-                            accounts.mark_native_refresh_failure(
-                                &active_account.id,
-                                error.message.clone(),
-                                error.kind,
-                            );
-                        })
-                        .await;
-                    return ControlRefreshShareUsageItem {
-                        app: app.as_str().to_string(),
-                        provider_id: Some(provider_id),
-                        provider_name,
-                        auth_provider,
-                        account_id: Some(account_id),
-                        refreshed: false,
-                        error: Some(error.message),
-                        message: None,
-                    };
-                }
+            }
+            Err(error) => {
+                state
+                    .mutate_accounts_debounced(|accounts| {
+                        accounts.mark_native_refresh_failure(
+                            &active_account.id,
+                            error.message.clone(),
+                            error.kind,
+                        );
+                    })
+                    .await;
+                return ControlRefreshShareUsageItem {
+                    app: app.as_str().to_string(),
+                    provider_id: Some(provider_id),
+                    provider_name,
+                    auth_provider,
+                    account_id: Some(account_id),
+                    refreshed: false,
+                    error: Some(error.message),
+                    message: None,
+                };
             }
         }
     }
@@ -440,12 +437,15 @@ pub(crate) async fn mark_quota_refresh_error(
     account_id: &str,
     error: &QuotaRefreshFailure,
 ) {
+    let next_refresh_at = Some(error.next_refresh_at.unwrap_or_else(|| {
+        (now_ms() as i64).saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS)
+    }));
     state
         .mutate_accounts_debounced(|accounts| {
             accounts.mark_refresh_success(
                 account_id,
                 AccountRefreshUpdate {
-                    quota_next_refresh_at: error.next_refresh_at,
+                    quota_next_refresh_at: next_refresh_at,
                     last_refresh_error: Some(error.message.clone()),
                     ..Default::default()
                 },

@@ -5,6 +5,10 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGE
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::clients::oauth::codex_reset_credits::{
+    codex_authenticated_get, fetch_reset_credit_details, merge_reset_credit_snapshot,
+    normalize_imported_snapshot, parse_usage_available_count,
+};
 use crate::clients::oauth::kiro_device::{
     default_profile_arn, fetch_usage_limits, machine_id_from_refresh_token, quota_from_usage_limits,
 };
@@ -79,7 +83,7 @@ impl QuotaRefreshFailure {
             429 => 429,
             _ => 502,
         };
-        let retryable = !matches!(upstream_status.as_u16(), 401 | 402 | 403);
+        let retryable = !matches!(upstream_status.as_u16(), 401..=403);
         let next_refresh_at = retry_after
             .as_deref()
             .and_then(parse_retry_after_ms)
@@ -91,7 +95,7 @@ impl QuotaRefreshFailure {
                 "{} quota request failed: upstream HTTP {}: {}",
                 provider_type.as_str(),
                 upstream_status.as_u16(),
-                truncate(&body, 240)
+                truncate(&crate::logging::redact_sensitive_text(&body), 240)
             ),
             retryable,
             next_refresh_at,
@@ -191,19 +195,29 @@ async fn refresh_codex_quota(
     request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
-    let account_id = codex_account_id(account);
-    let mut request = http
-        .get(CHATGPT_USAGE_URL)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(USER_AGENT, "codex-cli")
-        .header(ACCEPT, "application/json")
-        .timeout(request_timeout);
-    if let Some(account_id) = account_id.as_deref() {
-        request = request.header("ChatGPT-Account-Id", account_id);
-    }
-    let body = request_json(account.provider_type, request, now_ms).await?;
+    let workspace_id = codex_account_id(account);
+    let usage_request = codex_authenticated_get(
+        http,
+        CHATGPT_USAGE_URL,
+        access_token,
+        workspace_id.as_deref(),
+        request_timeout,
+    );
+    let (body, reset_credit_details) = tokio::join!(
+        request_json(account.provider_type, usage_request, now_ms),
+        fetch_reset_credit_details(http, access_token, workspace_id.as_deref(), request_timeout,),
+    );
+    let body = body?;
     let usage: CodexUsageResponse = serde_json::from_value(body.clone())
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
+    let previous_reset_credits = codex_banked_reset_status_from_account(account);
+    let reset_credits = merge_reset_credit_snapshot(
+        parse_usage_available_count(&body),
+        reset_credit_details,
+        previous_reset_credits.as_ref(),
+        workspace_id.as_deref(),
+        now_ms,
+    );
 
     let usage_plan_type = usage
         .plan_type
@@ -212,12 +226,12 @@ async fn refresh_codex_quota(
         .filter(|value| !value.is_empty());
     let usage_plan_label = usage_plan_type.as_deref().map(format_chatgpt_plan_label);
     let account_lookup =
-        fetch_chatgpt_account_lookup(http, access_token, account_id.as_deref(), request_timeout)
+        fetch_chatgpt_account_lookup(http, access_token, workspace_id.as_deref(), request_timeout)
             .await;
     let subscription_lookup = fetch_chatgpt_subscription_lookup(
         http,
         access_token,
-        account_id.as_deref(),
+        workspace_id.as_deref(),
         request_timeout,
     )
     .await;
@@ -245,7 +259,7 @@ async fn refresh_codex_quota(
         extra_usage: Some(json!({
             "raw": body,
             "subscription": subscription_json,
-            "bankedReset": codex_banked_reset_status_from_account(account, now_ms),
+            "bankedReset": reset_credits,
             "queriedAt": now_ms,
         })),
     };
@@ -1697,10 +1711,13 @@ fn chatgpt_account_matches_id(account: &Value, account_id: &str) -> bool {
 }
 
 fn codex_account_id(account: &Account) -> Option<String> {
-    account
-        .profile
-        .as_ref()
-        .and_then(|value| string_at(value, CODEX_ACCOUNT_ID_POINTERS))
+    crate::domain::accounts::store::effective_codex_workspace_id(account)
+        .or_else(|| {
+            account
+                .profile
+                .as_ref()
+                .and_then(|value| string_at(value, CODEX_ACCOUNT_ID_POINTERS))
+        })
         .or_else(|| {
             account
                 .raw
@@ -1714,12 +1731,18 @@ const CODEX_ACCOUNT_ID_POINTERS: &[&str] = &[
     "/account_id",
     "/chatgptAccountId",
     "/chatgpt_account_id",
+    "/openai_auth/chatgpt_account_id",
+    "/openaiAuth/chatgptAccountId",
+    "/verifiedOpenAiClaims/chatgpt_account_id",
+    "/verifiedOpenAiClaims/chatgptAccountId",
     "/organizationId",
     "/organization_id",
     "/account/id",
     "/account/account_id",
     "/account/chatgpt_account_id",
     "/account/organization_id",
+    "/raw/chatgpt_account_id",
+    "/raw/openai_auth/chatgpt_account_id",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -2051,90 +2074,50 @@ fn require_imported_snapshot(
     })
 }
 
-fn codex_banked_reset_status_from_account(account: &Account, now_ms: i64) -> Option<Value> {
-    let source = account
-        .raw
-        .as_ref()
-        .and_then(|raw| {
-            value_at(
-                raw,
-                &[
-                    "/bankedReset",
-                    "/banked_reset",
-                    "/codexBankedReset",
-                    "/codex_banked_reset",
-                    "/rateLimitResetCredits",
-                    "/rate_limit_reset_credits",
-                ],
-            )
-        })
-        .or_else(|| {
-            account.quota.as_ref().and_then(|quota| {
-                quota
-                    .extra_usage
-                    .as_ref()
-                    .and_then(|extra| value_at(extra, &["/bankedReset", "/codexBankedReset"]))
-            })
-        })?;
-    Some(normalize_codex_banked_reset(source, now_ms))
-}
+fn codex_banked_reset_status_from_account(account: &Account) -> Option<Value> {
+    if let Some(cached) = account.quota.as_ref().and_then(|quota| {
+        quota
+            .extra_usage
+            .as_ref()
+            .and_then(|extra| value_at(extra, &["/bankedReset", "/codexBankedReset"]))
+    }) {
+        let cached = if cached.get("countSource").is_some() && cached.get("detailsSource").is_some()
+        {
+            cached
+        } else {
+            normalize_imported_snapshot(&cached)
+        };
+        let cached_workspace = string_at(&cached, &["/workspaceId", "/workspace_id"]);
+        if cached_workspace != codex_account_id(account) {
+            return None;
+        }
+        return Some(cached);
+    }
 
-fn normalize_codex_banked_reset(source: Value, now_ms: i64) -> Value {
-    let credits = value_at(
-        &source,
-        &["/credits", "/remainingCredits", "/remaining_credits"],
-    )
-    .and_then(|value| value.as_array().cloned())
-    .or_else(|| source.as_array().cloned())
-    .unwrap_or_default();
-    let available_count = number_at(
-        &source,
-        &["/availableCount", "/available_count", "/available"],
-    )
-    .map(|value| value as i64)
-    .unwrap_or_else(|| {
-        credits
-            .iter()
-            .filter(|credit| {
-                string_at(credit, &["/status"])
-                    .as_deref()
-                    .is_some_and(|status| status.eq_ignore_ascii_case("available"))
-            })
-            .count() as i64
-    });
-    let next_expires_at = credits
-        .iter()
-        .filter(|credit| {
-            string_at(credit, &["/status"])
-                .as_deref()
-                .map(|status| status.eq_ignore_ascii_case("available"))
-                .unwrap_or(true)
+    account.raw.as_ref().and_then(|raw| {
+        value_at(
+            raw,
+            &[
+                "/bankedReset",
+                "/banked_reset",
+                "/codexBankedReset",
+                "/codex_banked_reset",
+                "/rateLimitResetCredits",
+                "/rate_limit_reset_credits",
+            ],
+        )
+        .map(|source| normalize_imported_snapshot(&source))
+        .filter(|snapshot| {
+            string_at(snapshot, &["/workspaceId", "/workspace_id"]) == codex_account_id(account)
         })
-        .filter_map(|credit| string_at(credit, &["/expiresAt", "/expires_at"]))
-        .filter_map(|value| dateish_to_unix_ms(&value).map(|ms| (ms, value)))
-        .min_by_key(|(ms, _)| *ms)
-        .map(|(_, value)| value);
-    json!({
-        "readOnly": true,
-        "source": "imported_snapshot",
-        "availableCount": available_count,
-        "nextExpiresAt": next_expires_at,
-        "credits": credits,
-        "raw": source,
-        "queriedAt": now_ms,
     })
 }
 
-pub fn codex_banked_reset_status_snapshot(account: &Account, now_ms: i64) -> Value {
-    codex_banked_reset_status_from_account(account, now_ms).unwrap_or_else(|| {
-        json!({
-            "enabled": false,
-            "readOnly": true,
-            "source": "imported_snapshot",
-            "availableCount": 0,
-            "credits": [],
-            "queriedAt": now_ms,
-        })
+pub fn codex_banked_reset_status_snapshot(account: &Account, _now_ms: i64) -> Value {
+    codex_banked_reset_status_from_account(account).unwrap_or_else(|| {
+        crate::clients::oauth::codex_reset_credits::empty_snapshot(
+            codex_account_id(account).as_deref(),
+        )
     })
 }
 
@@ -2292,6 +2275,20 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_upstream_errors_redact_reflected_credentials() {
+        let failure = QuotaRefreshFailure::upstream(
+            ProviderType::CodexOAuth,
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{"access_token":"should-not-escape"}"#.to_string(),
+            None,
+            1_000,
+        );
+
+        assert!(!failure.message.contains("should-not-escape"));
+        assert!(failure.message.contains("[REDACTED]"));
+    }
 
     #[test]
     fn ollama_me_parse_is_display_only_and_keeps_subscription_window() {
@@ -2623,7 +2620,7 @@ mod tests {
             }),
         );
 
-        let status = codex_banked_reset_status_from_account(&account, 1_000).unwrap();
+        let status = codex_banked_reset_status_snapshot(&account, 1_000);
 
         assert_eq!(
             status.get("availableCount").and_then(Value::as_i64),
@@ -2631,9 +2628,106 @@ mod tests {
         );
         assert_eq!(
             status.get("nextExpiresAt").and_then(Value::as_str),
-            Some("2026-07-10T00:00:00Z")
+            Some("2026-07-10T00:00:00.000Z")
         );
         assert_eq!(status.get("readOnly").and_then(Value::as_bool), Some(true));
+        assert!(status.get("queriedAt").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn codex_banked_reset_snapshot_prefers_live_quota_cache_over_imported_raw() {
+        let mut account = imported_account(
+            ProviderType::CodexOAuth,
+            json!({"codexBankedReset": {"availableCount": 99}}),
+        );
+        account.profile = Some(json!({"accountId": "workspace-a"}));
+        account.quota = Some(AccountQuota {
+            success: true,
+            credential_message: None,
+            tiers: Vec::new(),
+            extra_usage: Some(json!({
+                "bankedReset": {
+                    "enabled": true,
+                    "workspaceId": "workspace-a",
+                    "availableCount": 2,
+                    "credits": [],
+                    "countSource": "usage",
+                    "detailsSource": "unavailable",
+                    "countFetchedAt": 123,
+                    "detailsFetchedAt": null,
+                    "detailsAvailable": false,
+                    "detailsStale": false,
+                    "detailsError": null,
+                    "queriedAt": 123,
+                    "source": "usage"
+                }
+            })),
+        });
+
+        let status = codex_banked_reset_status_snapshot(&account, 999_999);
+        assert_eq!(status["availableCount"], 2);
+        assert_eq!(status["queriedAt"], 123);
+        assert_eq!(status["workspaceId"], "workspace-a");
+    }
+
+    #[test]
+    fn codex_banked_reset_snapshot_rejects_cache_from_another_workspace() {
+        let mut account = imported_account(
+            ProviderType::CodexOAuth,
+            json!({"accountId": "workspace-b"}),
+        );
+        account.profile = Some(json!({"accountId": "workspace-b"}));
+        account.quota = Some(AccountQuota {
+            success: true,
+            extra_usage: Some(json!({
+                "bankedReset": {
+                    "enabled": true,
+                    "workspaceId": "workspace-a",
+                    "availableCount": 2,
+                    "credits": [{"id": "a-credit", "status": "available"}],
+                    "countSource": "details",
+                    "detailsSource": "details",
+                    "countFetchedAt": 123,
+                    "detailsFetchedAt": 123,
+                    "detailsAvailable": true,
+                    "detailsStale": false,
+                    "detailsError": null,
+                    "queriedAt": 123,
+                    "source": "upstream"
+                }
+            })),
+            ..Default::default()
+        });
+
+        let status = codex_banked_reset_status_snapshot(&account, 999_999);
+        assert!(status["availableCount"].is_null());
+        assert_eq!(status["workspaceId"], "workspace-b");
+        assert!(status["credits"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_quota_uses_selected_verified_workspace_before_legacy_account_id() {
+        let mut account = imported_account(
+            ProviderType::CodexOAuth,
+            json!({
+                "accountId": "workspace-legacy"
+            }),
+        );
+        account.profile = Some(json!({
+            "accountId": "workspace-profile-default",
+            "selectedChatgptAccountId": "workspace-selected",
+            "verifiedOpenAiClaims": {
+                "chatgpt_account_id": "workspace-profile-default",
+                "organizations": [
+                    {"id": "workspace-selected", "name": "Selected"}
+                ]
+            }
+        }));
+
+        assert_eq!(
+            codex_account_id(&account).as_deref(),
+            Some("workspace-selected")
+        );
     }
 
     #[test]

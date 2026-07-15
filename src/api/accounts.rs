@@ -1629,15 +1629,51 @@ pub(in crate::api) async fn account_quota(
         }));
     }
 
-    let now = now_ms() as i64;
     let force = query.force.unwrap_or(false);
+    let mut waited_for_in_flight = false;
+    let _quota_refresh_guard = match state
+        .account_refresh_locks
+        .try_lock(existing.provider_type, &existing.id)
+    {
+        Some(guard) => guard,
+        None => {
+            // Coalesce concurrent token/quota refreshes for the same account. Once the
+            // in-flight request completes, inspect the persisted quota marker. The
+            // same lock also protects token-only refreshes, so waiting alone does not
+            // prove that this quota request has already been satisfied.
+            waited_for_in_flight = true;
+            state
+                .account_refresh_locks
+                .lock(existing.provider_type, &existing.id)
+                .await
+        }
+    };
+
+    // The account may have been refreshed by the background worker between the
+    // initial lookup and lock acquisition. Re-read it and apply cooldown to the
+    // latest persisted state while holding the per-account refresh lock.
+    let mut active_account = state
+        .find_account_by_id(&id)
+        .await
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
+    if waited_for_in_flight && quota_refresh_satisfied_by_in_flight(&existing, &active_account) {
+        return Ok(Json(AccountQuotaResponse {
+            ok: true,
+            quota: active_account.quota.clone(),
+            account: Some(active_account.clone()),
+            refreshed: false,
+            message: Some("quota refresh coalesced with an in-flight account refresh".to_string()),
+            next_refresh_at: active_account.quota_next_refresh_at,
+        }));
+    }
+    let now = now_ms() as i64;
     if !force {
-        if let Some(next_refresh_at) = existing.quota_next_refresh_at {
+        if let Some(next_refresh_at) = active_account.quota_next_refresh_at {
             if next_refresh_at > now {
                 return Ok(Json(AccountQuotaResponse {
                     ok: true,
-                    quota: existing.quota.clone(),
-                    account: Some(existing),
+                    quota: active_account.quota.clone(),
+                    account: Some(active_account),
                     refreshed: false,
                     message: Some(format!("quota refresh skipped until {next_refresh_at}")),
                     next_refresh_at: Some(next_refresh_at),
@@ -1647,12 +1683,7 @@ pub(in crate::api) async fn account_quota(
     }
 
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-    let mut active_account = existing;
     if account_needs_native_refresh(&active_account, now) {
-        let _refresh_guard = state
-            .account_refresh_locks
-            .try_lock(active_account.provider_type, &active_account.id)
-            .ok_or_else(|| ApiError::conflict("account refresh is already in progress"))?;
         let http_client = state.http_client().await;
         let update =
             match execute_native_account_refresh(&http_client, &active_account, now, interval_ms)
@@ -1726,12 +1757,15 @@ pub(in crate::api) async fn account_quota(
             next_refresh_at: Some(next_refresh_at),
         })),
         Err(error) => {
+            let next_refresh_at = Some(error.next_refresh_at.unwrap_or_else(|| {
+                now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS)
+            }));
             state
                 .mutate_accounts_immediate(|store| {
                     store.mark_refresh_success(
                         &id,
                         AccountRefreshUpdate {
-                            quota_next_refresh_at: error.next_refresh_at,
+                            quota_next_refresh_at: next_refresh_at,
                             last_refresh_error: Some(error.message.clone()),
                             ..Default::default()
                         },
@@ -1745,6 +1779,20 @@ pub(in crate::api) async fn account_quota(
             ))
         }
     }
+}
+
+fn quota_refresh_satisfied_by_in_flight(before: &Account, after: &Account) -> bool {
+    if crate::domain::accounts::store::effective_codex_workspace_id(before)
+        != crate::domain::accounts::store::effective_codex_workspace_id(after)
+    {
+        return false;
+    }
+    timestamp_updated(before.quota_refreshed_at, after.quota_refreshed_at)
+        || timestamp_updated(before.quota_next_refresh_at, after.quota_next_refresh_at)
+}
+
+fn timestamp_updated(before: Option<i64>, after: Option<i64>) -> bool {
+    after.is_some() && after != before
 }
 
 pub(in crate::api) fn redact_oauth_request(mut request: OAuthHttpRequest) -> OAuthHttpRequest {
@@ -1816,6 +1864,68 @@ mod tests {
 
     use super::*;
     use crate::domain::accounts::oauth::{OAuthHttpRequest, OAuthRequestBodyFormat};
+
+    #[test]
+    fn quota_singleflight_only_coalesces_when_quota_marker_advanced() {
+        let before: Account = serde_json::from_value(json!({
+            "id": "acct-codex",
+            "providerType": "codex_oauth",
+            "accessToken": "old-token",
+            "lastRefreshError": "old quota error"
+        }))
+        .unwrap();
+        let mut token_only = before.clone();
+        token_only.access_token = Some("new-token".to_string());
+        token_only.last_refresh_error = None;
+        assert!(!quota_refresh_satisfied_by_in_flight(&before, &token_only));
+
+        let mut quota_success = token_only.clone();
+        quota_success.quota_refreshed_at = Some(1_000);
+        quota_success.quota_next_refresh_at = Some(2_000);
+        assert!(quota_refresh_satisfied_by_in_flight(
+            &before,
+            &quota_success
+        ));
+
+        let mut quota_failure = token_only;
+        quota_failure.quota_next_refresh_at = Some(3_000);
+        assert!(quota_refresh_satisfied_by_in_flight(
+            &before,
+            &quota_failure
+        ));
+
+        let mut prior_long_cooldown = quota_failure.clone();
+        prior_long_cooldown.quota_next_refresh_at = Some(10_000);
+        assert!(quota_refresh_satisfied_by_in_flight(
+            &prior_long_cooldown,
+            &quota_failure
+        ));
+
+        let mut cache_cleared = quota_success.clone();
+        cache_cleared.quota_refreshed_at = None;
+        cache_cleared.quota_next_refresh_at = None;
+        assert!(!quota_refresh_satisfied_by_in_flight(
+            &quota_success,
+            &cache_cleared
+        ));
+
+        let mut workspace_a = quota_success;
+        workspace_a.profile = Some(json!({
+            "verifiedOpenAiClaims": {
+                "chatgpt_account_id": "workspace-a",
+                "organizations": [{"id": "workspace-b"}]
+            },
+            "selectedChatgptAccountId": "workspace-a"
+        }));
+        let mut workspace_b = workspace_a.clone();
+        workspace_b.profile.as_mut().unwrap()["selectedChatgptAccountId"] = json!("workspace-b");
+        workspace_b.quota_refreshed_at = Some(4_000);
+        workspace_b.quota_next_refresh_at = Some(5_000);
+        assert!(!quota_refresh_satisfied_by_in_flight(
+            &workspace_a,
+            &workspace_b
+        ));
+    }
 
     #[test]
     fn oauth_request_redaction_removes_authorization_codes_and_verifiers() {

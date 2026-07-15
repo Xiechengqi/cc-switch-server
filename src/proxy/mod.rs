@@ -3,7 +3,7 @@
 pub mod adapters;
 mod cache_injector;
 pub(crate) mod claude_oauth;
-mod codex_identity;
+pub(crate) mod codex_identity;
 mod codex_instructions;
 pub(crate) mod codex_models;
 mod copilot_model_map;

@@ -2150,13 +2150,10 @@ fn apply_auth_headers(
 fn codex_oauth_chatgpt_account_id(
     account: &crate::domain::accounts::store::Account,
 ) -> Option<String> {
-    if let Some(selected) = crate::domain::accounts::store::selected_codex_workspace_id(account) {
-        if crate::domain::accounts::store::codex_workspace_options(account)
-            .iter()
-            .any(|workspace| workspace.id == selected)
-        {
-            return Some(selected);
-        }
+    if let Some(workspace_id) =
+        crate::domain::accounts::store::effective_codex_workspace_id(account)
+    {
+        return Some(workspace_id);
     }
     account
         .profile
