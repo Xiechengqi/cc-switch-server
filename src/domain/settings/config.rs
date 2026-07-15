@@ -238,7 +238,7 @@ pub struct RouterConfig {
     pub last_registered_at_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouterIdentity {
     pub installation_id: String,
@@ -246,6 +246,18 @@ pub struct RouterIdentity {
     pub private_key: String,
     #[serde(default)]
     pub control_secret: Option<String>,
+}
+
+impl RouterIdentity {
+    pub fn is_registered(&self) -> bool {
+        !self.installation_id.trim().is_empty()
+            && !self.public_key.trim().is_empty()
+            && !self.private_key.trim().is_empty()
+    }
+
+    pub fn has_keypair(&self) -> bool {
+        !self.public_key.trim().is_empty() && !self.private_key.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -367,6 +379,20 @@ impl ServerConfig {
                 .tunnel_subdomain
                 .as_deref()
                 .is_some_and(|value| !value.is_empty())
+    }
+
+    pub fn has_registered_router_identity(&self) -> bool {
+        self.router
+            .identity
+            .as_ref()
+            .is_some_and(RouterIdentity::is_registered)
+    }
+
+    pub fn registered_router_identity(&self) -> Option<&RouterIdentity> {
+        self.router
+            .identity
+            .as_ref()
+            .filter(|identity| identity.is_registered())
     }
 
     pub fn verify_password(&self, password: &str) -> bool {
@@ -977,5 +1003,20 @@ mod tests {
         assert!(!config.verify_debug_token("temporary-secret", 2_000));
         config.revoke_debug_token();
         assert!(!config.verify_debug_token("temporary-secret", 1_000));
+    }
+
+    #[test]
+    fn pending_router_identity_is_not_treated_as_registered() {
+        let mut config = ServerConfig::empty();
+        config.router.identity = Some(RouterIdentity {
+            installation_id: String::new(),
+            public_key: "public-key".to_string(),
+            private_key: "private-key".to_string(),
+            control_secret: None,
+        });
+
+        assert!(!config.has_registered_router_identity());
+        config.router.identity.as_mut().unwrap().installation_id = "inst-1".to_string();
+        assert!(config.has_registered_router_identity());
     }
 }

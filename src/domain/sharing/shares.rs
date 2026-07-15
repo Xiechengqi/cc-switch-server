@@ -25,11 +25,34 @@ pub struct ShareStore {
     #[serde(default)]
     pub shares: Vec<Share>,
     #[serde(default)]
+    pub pending_router_deletes: Vec<ShareDeleteTombstone>,
+    #[serde(default)]
+    pub router_share_prune_marker: Option<RouterSharePruneMarker>,
+    #[serde(default)]
     pub router_registered: bool,
     #[serde(default)]
     pub last_router_error: Option<String>,
     #[serde(default)]
     pub last_router_heartbeat_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareDeleteTombstone {
+    pub share_id: String,
+    pub operation_id: String,
+    pub created_at_ms: u128,
+    #[serde(default)]
+    pub last_attempt_at_ms: Option<u128>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouterSharePruneMarker {
+    pub router_api_base: String,
+    pub installation_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +377,7 @@ impl ShareStore {
         let mut share = share;
         share.router_last_sync_error = None;
 
+        self.cancel_pending_router_delete(&share.id);
         if let Some(existing) = self.shares.iter_mut().find(|item| item.id == share.id) {
             *existing = share.clone();
         } else {
@@ -375,10 +399,99 @@ impl ShareStore {
             .collect()
     }
 
-    pub fn delete(&mut self, share_id: &str) -> bool {
+    pub fn delete(&mut self, share_id: &str) -> Option<ShareDeleteTombstone> {
         let before = self.shares.len();
         self.shares.retain(|item| item.id != share_id);
-        self.shares.len() != before
+        if self.shares.len() == before {
+            return None;
+        }
+        self.pending_router_deletes
+            .retain(|pending| pending.share_id != share_id);
+        let tombstone = ShareDeleteTombstone {
+            share_id: share_id.to_string(),
+            operation_id: generate_share_delete_operation_id(),
+            created_at_ms: now_ms(),
+            last_attempt_at_ms: None,
+            last_error: None,
+        };
+        self.pending_router_deletes.push(tombstone.clone());
+        Some(tombstone)
+    }
+
+    pub fn pending_router_delete(
+        &self,
+        share_id: &str,
+        operation_id: &str,
+    ) -> Option<&ShareDeleteTombstone> {
+        self.pending_router_deletes
+            .iter()
+            .find(|pending| pending.share_id == share_id && pending.operation_id == operation_id)
+    }
+
+    pub fn has_pending_router_delete_for_share(&self, share_id: &str) -> bool {
+        self.pending_router_deletes
+            .iter()
+            .any(|pending| pending.share_id == share_id)
+    }
+
+    pub fn router_share_prune_applied_for(
+        &self,
+        router_api_base: &str,
+        installation_id: &str,
+    ) -> bool {
+        self.router_share_prune_marker
+            .as_ref()
+            .is_some_and(|marker| {
+                normalize_router_api_base(&marker.router_api_base)
+                    == normalize_router_api_base(router_api_base)
+                    && marker.installation_id.trim() == installation_id.trim()
+            })
+    }
+
+    pub fn mark_router_share_prune_applied(
+        &mut self,
+        router_api_base: &str,
+        installation_id: &str,
+    ) -> bool {
+        if self.router_share_prune_applied_for(router_api_base, installation_id) {
+            return false;
+        }
+        self.router_share_prune_marker = Some(RouterSharePruneMarker {
+            router_api_base: normalize_router_api_base(router_api_base),
+            installation_id: installation_id.trim().to_string(),
+        });
+        true
+    }
+
+    pub fn complete_pending_router_delete(&mut self, operation_id: &str) -> bool {
+        let before = self.pending_router_deletes.len();
+        self.pending_router_deletes
+            .retain(|pending| pending.operation_id != operation_id);
+        self.pending_router_deletes.len() != before
+    }
+
+    pub fn mark_pending_router_delete_failure(
+        &mut self,
+        operation_id: &str,
+        error: String,
+    ) -> bool {
+        let Some(pending) = self
+            .pending_router_deletes
+            .iter_mut()
+            .find(|pending| pending.operation_id == operation_id)
+        else {
+            return false;
+        };
+        pending.last_attempt_at_ms = Some(now_ms());
+        pending.last_error = Some(error);
+        true
+    }
+
+    fn cancel_pending_router_delete(&mut self, share_id: &str) -> bool {
+        let before = self.pending_router_deletes.len();
+        self.pending_router_deletes
+            .retain(|pending| pending.share_id != share_id);
+        self.pending_router_deletes.len() != before
     }
 
     pub fn pause(&mut self, share_id: &str) -> Option<Share> {
@@ -811,7 +924,10 @@ impl ShareStore {
 
     pub fn import_shares(&mut self, shares: Vec<Share>) -> usize {
         let mut imported = 0;
-        for share in shares {
+        for mut share in shares {
+            if self.cancel_pending_router_delete(&share.id) {
+                mark_share_config_pending(&mut share);
+            }
             if let Some(existing) = self.shares.iter_mut().find(|item| item.id == share.id) {
                 *existing = share;
             } else {
@@ -820,6 +936,15 @@ impl ShareStore {
             imported += 1;
         }
         imported
+    }
+
+    pub fn replace_shares(&mut self, mut shares: Vec<Share>) {
+        for share in &mut shares {
+            if self.cancel_pending_router_delete(&share.id) {
+                mark_share_config_pending(share);
+            }
+        }
+        self.shares = shares;
     }
 
     pub fn replace_configured_share(&mut self, candidate: Share) -> Result<Share, SharePatchError> {
@@ -850,6 +975,7 @@ impl ShareStore {
                 ));
             }
         }
+        self.cancel_pending_router_delete(&candidate.id);
         self.shares[index] = candidate.clone();
         Ok(candidate)
     }
@@ -1097,6 +1223,16 @@ fn generate_share_id() -> String {
     format!("share-{suffix}")
 }
 
+fn generate_share_delete_operation_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn normalize_router_api_base(router_api_base: &str) -> String {
+    router_api_base.trim().trim_end_matches('/').to_string()
+}
+
 pub fn default_share_subdomain(owner_email: &str) -> String {
     let email_prefix = owner_email.split('@').next().unwrap_or("share");
     let prefix = email_prefix
@@ -1312,6 +1448,46 @@ fn normalize_app_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_share_store_defaults_router_delete_outbox() {
+        let store: ShareStore = serde_json::from_str(r#"{"shares":[]}"#).unwrap();
+        assert!(store.pending_router_deletes.is_empty());
+        assert!(store.router_share_prune_marker.is_none());
+    }
+
+    #[test]
+    fn router_share_prune_marker_normalizes_target_and_changes_with_installation() {
+        let mut store = ShareStore::default();
+        assert!(store.mark_router_share_prune_applied(
+            " https://router.example.test/api/// ",
+            " installation-a "
+        ));
+        assert!(store
+            .router_share_prune_applied_for("https://router.example.test/api", "installation-a"));
+        assert!(!store
+            .mark_router_share_prune_applied("https://router.example.test/api/", "installation-a"));
+
+        assert!(!store
+            .router_share_prune_applied_for("https://router.example.test/api", "installation-b"));
+        assert!(store
+            .mark_router_share_prune_applied("https://router.example.test/api", "installation-b"));
+    }
+
+    #[test]
+    fn recreating_same_share_id_cancels_pending_router_delete() {
+        let mut store = ShareStore::default();
+        store.upsert(codex_share_input("share-recreated")).unwrap();
+        let tombstone = store.delete("share-recreated").unwrap();
+        assert!(store
+            .pending_router_delete("share-recreated", &tombstone.operation_id)
+            .is_some());
+
+        let recreated = store.upsert(codex_share_input("share-recreated")).unwrap();
+
+        assert!(store.pending_router_deletes.is_empty());
+        assert!(recreated.config_revision > recreated.router_synced_revision);
+    }
 
     fn codex_share_input(id: &str) -> UpsertShareInput {
         UpsertShareInput {

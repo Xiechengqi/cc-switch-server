@@ -975,7 +975,7 @@ pub(in crate::api) async fn web_save_provider_share(
 
     if subdomain_changed {
         let config = state.config.read().await.clone();
-        if config.router.identity.is_some() {
+        if config.has_registered_router_identity() {
             let providers = state.providers.read().await.clone();
             let accounts = state.accounts.read().await.clone();
             let usage = state.usage.read().await.clone();

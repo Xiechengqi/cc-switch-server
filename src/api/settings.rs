@@ -434,30 +434,17 @@ pub(in crate::api) async fn ensure_email_router_config(
     if !config.is_setup_complete() {
         return Err(ApiError::forbidden("setup is required before email login"));
     }
-    let has_identity = config.router.identity.as_ref().is_some_and(|identity| {
-        !identity.installation_id.trim().is_empty() && !identity.private_key.trim().is_empty()
-    });
-    if has_identity {
+    if config.has_registered_router_identity() {
         return Ok(config);
     }
 
-    let http_client = state.http_client().await;
-    match crate::clients::router::client::register_installation(&http_client, &mut config).await {
+    match state.register_router_installation().await {
         Ok(_) => {
+            config = state.config_snapshot().await;
             state
-                .replace_config(config.clone())
+                .complete_router_registration_control_plane("email_login_registration")
                 .await
                 .map_err(ApiError::internal)?;
-            state
-                .mutate_shares_immediate(|shares| {
-                    shares.router_registered = true;
-                    shares.last_router_error = None;
-                })
-                .await
-                .map_err(ApiError::internal)?;
-            if let Err(error) = crate::state::reconcile_all_shares_to_router(state.clone()).await {
-                tracing::warn!(error = %error, "automatic router share reconcile after registration failed");
-            }
             Ok(config)
         }
         Err(error) => {

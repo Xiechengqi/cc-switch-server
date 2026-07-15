@@ -116,7 +116,8 @@ use crate::domain::settings::config::{
 };
 use crate::domain::settings::ui_settings;
 use crate::domain::sharing::shares::{
-    Share, ShareAcl, ShareBinding, ShareMarketGrantStatus, ShareStore, UpsertShareInput,
+    Share, ShareAcl, ShareBinding, ShareDeleteTombstone, ShareMarketGrantStatus, ShareStore,
+    UpsertShareInput,
 };
 use crate::domain::usage::pricing::UpdateModelPricingInput;
 use crate::domain::usage::store::{UsageStatsFilter, UsageStore};

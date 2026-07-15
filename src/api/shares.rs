@@ -135,7 +135,7 @@ pub(in crate::api) async fn update_share_subdomain(
         Some(&usage),
     );
     let mut remote_claimed = false;
-    if config.router.identity.is_some() {
+    if config.has_registered_router_identity() {
         let http_client = state.http_client().await;
         crate::clients::router::client::claim_share_subdomain(&http_client, &config, descriptor)
             .await
@@ -165,19 +165,22 @@ pub(in crate::api) async fn delete_share(
     Path(id): Path<String>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let deleted = state
+    let tombstone = state
         .mutate_shares_immediate(|store| store.delete(&id))
         .await
         .map_err(ApiError::internal)?;
-    if deleted {
-        spawn_share_delete_sync(state.clone(), id.clone());
+    if let Some(tombstone) = tombstone.as_ref() {
+        spawn_share_delete_sync(state.clone(), tombstone.clone());
         state.emit_event(
             ServerEvent::new("share.deleted", "share")
                 .id(id.clone())
                 .message("deleted"),
         );
     }
-    Ok(Json(DeleteResponse { ok: true, deleted }))
+    Ok(Json(DeleteResponse {
+        ok: true,
+        deleted: tombstone.is_some(),
+    }))
 }
 
 pub(in crate::api) async fn pause_share(

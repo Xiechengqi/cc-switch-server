@@ -85,12 +85,12 @@ pub(in crate::api) async fn cascade_delete_shares_for_provider(
         crate::state::stop_share_tunnel(state, share_id).await;
     }
     for share_id in share_ids {
-        let removed = state
+        let tombstone = state
             .mutate_shares_immediate(|store| store.delete(&share_id))
             .await
             .map_err(ApiError::internal)?;
-        if removed {
-            spawn_share_delete_sync(state.clone(), share_id.clone());
+        if let Some(tombstone) = tombstone {
+            spawn_share_delete_sync(state.clone(), tombstone);
             state.emit_event(
                 ServerEvent::new("share.deleted", "share")
                     .id(share_id)

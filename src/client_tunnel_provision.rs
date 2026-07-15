@@ -61,12 +61,29 @@ pub(crate) fn is_subdomain_conflict_error(message: &str) -> bool {
 }
 
 pub(crate) fn is_router_unreachable_error(error: &anyhow::Error) -> bool {
+    if let Some(error) = error.downcast_ref::<crate::state::RouterRegistrationFailure>() {
+        return error.is_unreachable();
+    }
+    if error
+        .downcast_ref::<crate::state::RouterRegistrationTimeout>()
+        .is_some()
+    {
+        return true;
+    }
     error.chain().any(|cause| {
         cause
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("connection")
-    }) || error.to_string().to_ascii_lowercase().contains("timed out")
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_connect() || error.is_timeout())
+            || cause
+                .downcast_ref::<crate::clients::router::client::RegisterInstallationAttemptError>()
+                .is_some_and(|error| error.is_transient())
+            || cause
+                .downcast_ref::<crate::clients::router::client::ClientTunnelClaimError>()
+                .is_some_and(|error| error.is_transient())
+            || cause
+                .downcast_ref::<crate::state::RouterRegistrationTimeout>()
+                .is_some()
+    })
 }
 
 pub(crate) async fn check_subdomain_for_router(
@@ -229,7 +246,8 @@ pub(crate) async fn provision_client_tunnel(
     let api_base = config
         .router_api_base()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     let Some(api_base) = api_base else {
         return Ok(ClientTunnelProvisionOutcome {
@@ -241,12 +259,10 @@ pub(crate) async fn provision_client_tunnel(
 
     let http_client = state.http_client().await;
     let installation_id = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .map(|identity| identity.installation_id.as_str());
     if let Some(subdomain) = config.client.tunnel_subdomain.clone() {
-        match check_subdomain_for_router(state, api_base, &subdomain, installation_id).await {
+        match check_subdomain_for_router(state, &api_base, &subdomain, installation_id).await {
             Ok(availability) if !availability.available => {
                 return Err(subdomain_conflict_error(
                     &subdomain,
@@ -264,10 +280,17 @@ pub(crate) async fn provision_client_tunnel(
         }
     }
 
-    if config.router.identity.is_none() {
-        match client::register_installation(&http_client, &mut config).await {
-            Ok(_) => {}
+    if !config.has_registered_router_identity() {
+        match state.register_router_installation().await {
+            Ok(_) => {
+                state
+                    .complete_router_registration_control_plane("client_tunnel_provision")
+                    .await
+                    .map_err(ApiError::internal)?;
+                config = state.config_snapshot().await;
+            }
             Err(error) if allow_offline && is_router_unreachable_error(&error) => {
+                config = state.config_snapshot().await;
                 warnings.push(format!(
                     "router installation register skipped (offline): {error}"
                 ));
@@ -382,16 +405,14 @@ pub(crate) async fn claim_client_tunnel_config(
         .tunnel_subdomain
         .clone()
         .ok_or_else(|| ApiError::bad_request("client tunnel subdomain is not configured"))?;
-    if config.router.identity.is_none() {
+    if !config.has_registered_router_identity() {
         return Err(ApiError::conflict("router installation is not registered"));
     }
     if let Err(error) = crate::state::ensure_router_installation_owner_bound(state, config).await {
         return Err(ApiError::conflict(error.to_string()));
     }
     let installation_id = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .map(|identity| identity.installation_id.as_str());
     if let Some(api_base) = config.router_api_base() {
         let availability =
@@ -418,6 +439,50 @@ pub(crate) async fn claim_client_tunnel_config(
     let mut next = config.clone();
     mark_claim_success(state, &mut next).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod transient_classification_tests {
+    use super::*;
+    use crate::clients::router::client::{
+        ClientTunnelClaimError, RegisterInstallationAttemptError,
+    };
+
+    #[test]
+    fn typed_registration_statuses_do_not_depend_on_response_wording() {
+        let permanent = anyhow::Error::new(RegisterInstallationAttemptError::Rejected {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "connection policy is invalid".to_string(),
+        });
+        assert!(!is_router_unreachable_error(&permanent));
+
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let transient = anyhow::Error::new(RegisterInstallationAttemptError::Rejected {
+                status,
+                body: "retry later".to_string(),
+            });
+            assert!(is_router_unreachable_error(&transient), "{status}");
+        }
+    }
+
+    #[test]
+    fn typed_client_tunnel_claim_statuses_distinguish_permanent_and_transient() {
+        let permanent = anyhow::Error::new(ClientTunnelClaimError::Rejected {
+            status: reqwest::StatusCode::CONFLICT,
+            body: "connection already belongs to another owner".to_string(),
+        });
+        assert!(!is_router_unreachable_error(&permanent));
+
+        let transient = anyhow::Error::new(ClientTunnelClaimError::Rejected {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: "retry later".to_string(),
+        });
+        assert!(is_router_unreachable_error(&transient));
+    }
 }
 
 fn map_claim_error(error: anyhow::Error) -> ApiError {

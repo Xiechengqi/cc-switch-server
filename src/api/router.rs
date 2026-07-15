@@ -2,10 +2,6 @@ use super::*;
 
 use axum::extract::Query;
 
-use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareSyncOperation,
-};
-
 pub(in crate::api) async fn router_config(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -42,7 +38,7 @@ pub(in crate::api) async fn client_tunnel_status(
     let config = state.config.read().await.clone();
     let mut remote_tunnel = None;
     let mut remote_error = None;
-    if config.router.identity.is_some() {
+    if config.has_registered_router_identity() {
         let http_client = state.http_client().await;
         match crate::clients::router::client::get_client_tunnel(&http_client, &config).await {
             Ok(tunnel) => remote_tunnel = tunnel,
@@ -99,17 +95,18 @@ pub(in crate::api) async fn claim_client_tunnel(
 ) -> Result<Json<ClientTunnelClaimResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let mut config = state.config.read().await.clone();
-    if config.router.identity.is_none() {
-        let http_client = state.http_client().await;
-        crate::clients::router::client::register_installation(&http_client, &mut config)
+    if !config.has_registered_router_identity() {
+        state
+            .register_router_installation()
             .await
             .map_err(|error| {
                 ApiError::bad_gateway(format!("router installation register failed: {error}"))
             })?;
         state
-            .replace_config(config.clone())
+            .complete_router_registration_control_plane("client_tunnel_claim")
             .await
             .map_err(ApiError::internal)?;
+        config = state.config_snapshot().await;
     }
     let owner_email = config
         .owner
@@ -246,7 +243,7 @@ pub(in crate::api) async fn stop_client_tunnel(
         .replace_config(config)
         .await
         .map_err(ApiError::internal)?;
-    if release_config.router.identity.is_some()
+    if release_config.has_registered_router_identity()
         && release_config.owner.email.is_some()
         && release_config.client.tunnel_subdomain.is_some()
     {
@@ -375,33 +372,17 @@ pub(in crate::api) async fn router_register(
     headers: HeaderMap,
 ) -> Result<Json<RouterRegisterResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let mut config = state.config.read().await.clone();
+    let config = state.config.read().await.clone();
     if !config.is_setup_complete() {
         return Err(ApiError::bad_request("setup is incomplete"));
     }
 
-    let http_client = state.http_client().await;
-    match crate::clients::router::client::register_installation(&http_client, &mut config).await {
+    match state.register_router_installation().await {
         Ok(registration) => {
             state
-                .replace_config(config)
+                .complete_router_registration_control_plane("manual_router_register")
                 .await
                 .map_err(ApiError::internal)?;
-            state
-                .mutate_shares_immediate(|shares| {
-                    shares.router_registered = true;
-                    shares.last_router_error = None;
-                })
-                .await
-                .map_err(ApiError::internal)?;
-            if let Err(error) = crate::state::reconcile_all_shares_to_router(state.clone()).await {
-                tracing::warn!(error = %error, "automatic router share reconcile after registration failed");
-            }
-            if let Err(error) =
-                crate::state::reconcile_payout_profile_to_router(state.clone()).await
-            {
-                tracing::warn!(error = %error, "automatic router payout profile reconcile after registration failed");
-            }
             Ok(Json(RouterRegisterResponse {
                 ok: true,
                 registration,
@@ -413,12 +394,6 @@ pub(in crate::api) async fn router_register(
                     shares.router_registered = false;
                     shares.last_router_error = Some(error.to_string());
                 })
-                .await
-                .map_err(ApiError::internal)?;
-            let mut failed_config = config;
-            failed_config.router.last_register_error = Some(error.to_string());
-            state
-                .replace_config(failed_config)
                 .await
                 .map_err(ApiError::internal)?;
             Err(ApiError::bad_gateway(format!(
@@ -450,134 +425,38 @@ pub(in crate::api) async fn sync_share_upsert(
     state: ServerState,
     share: Share,
 ) -> Result<(), String> {
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
-    let descriptor = descriptor_for_share_with_accounts_and_usage(
-        &share,
-        &providers,
-        Some(&accounts),
-        Some(&usage),
-    );
-    let op = ShareSyncOperation {
-        kind: "upsert".to_string(),
-        share_id: None,
-        share: Some(descriptor),
+    crate::state::sync_one_share_to_router(&state, &share.id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(current) = state.shares.read().await.get(&share.id).cloned() else {
+        return Ok(());
     };
-    sync_share_ops(state, vec![op]).await
-}
-
-pub(in crate::api) fn spawn_share_delete_sync(state: ServerState, share_id: String) {
-    tokio::spawn(async move {
-        let op = ShareSyncOperation {
-            kind: "delete".to_string(),
-            share_id: Some(share_id),
-            share: None,
-        };
-        let _ = sync_share_ops(state, vec![op]).await;
-    });
-}
-
-pub(in crate::api) async fn sync_share_ops(
-    state: ServerState,
-    ops: Vec<ShareSyncOperation>,
-) -> Result<(), String> {
-    let synced_shares = ops
-        .iter()
-        .filter_map(|op| {
-            op.share
-                .as_ref()
-                .map(|share| (share.share_id.clone(), share.config_revision))
-                .or_else(|| op.share_id.clone().map(|share_id| (share_id, 0)))
-        })
-        .collect::<Vec<_>>();
-    let refresh_targets = ops
-        .iter()
-        .filter(|op| op.kind == "upsert")
-        .filter_map(|op| {
-            op.share
-                .as_ref()
-                .map(|share| (share.share_id.clone(), share.subdomain.clone()))
-        })
-        .collect::<Vec<_>>();
-    let config = state.config.read().await.clone();
-    if config.router.identity.is_none() {
-        let message = "router installation is not registered".to_string();
+    let Some(subdomain) = current.tunnel_subdomain.as_deref() else {
+        return Ok(());
+    };
+    let config = state.config_snapshot().await;
+    let http_client = state.http_client().await;
+    if let Err(error) = crate::clients::router::client::notify_runtime_refresh(
+        &http_client,
+        &config,
+        current.id.clone(),
+        subdomain.to_string(),
+    )
+    .await
+    {
+        let message = error.to_string();
+        tracing::warn!(share_id = %current.id, error = %message, "router share runtime refresh failed");
         state
             .mutate_shares_debounced(|store| {
                 store.last_router_error = Some(message.clone());
-                for (share_id, revision) in &synced_shares {
-                    store.mark_router_sync(share_id, *revision, None, Err(message.clone()));
-                }
             })
             .await;
-        return Err(message);
     }
-    let router_base = config.router_api_base().map(str::to_string);
-    let http_client = state.http_client().await;
-    match crate::clients::router::client::push_share_ops(&http_client, &config, ops).await {
-        Ok(()) => {
-            let now = now_ms();
-            let refresh_error =
-                notify_runtime_refreshes(&http_client, &config, &refresh_targets).await;
-            state
-                .mutate_shares_debounced(|store| {
-                    store.router_registered = true;
-                    store.last_router_error = refresh_error.clone();
-                    for (share_id, revision) in &synced_shares {
-                        store.mark_router_sync(share_id, *revision, router_base.clone(), Ok(now));
-                    }
-                })
-                .await;
-            Ok(())
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "router share sync failed");
-            let message = error.to_string();
-            state
-                .mutate_shares_debounced(|store| {
-                    store.last_router_error = Some(message.clone());
-                    for (share_id, revision) in &synced_shares {
-                        store.mark_router_sync(
-                            share_id,
-                            *revision,
-                            router_base.clone(),
-                            Err(message.clone()),
-                        );
-                    }
-                })
-                .await;
-            Err(message)
-        }
-    }
+    Ok(())
 }
 
-async fn notify_runtime_refreshes(
-    http_client: &reqwest::Client,
-    config: &crate::domain::settings::config::ServerConfig,
-    refresh_targets: &[(String, String)],
-) -> Option<String> {
-    let mut last_error = None;
-    for (share_id, subdomain) in refresh_targets {
-        if let Err(error) = crate::clients::router::client::notify_runtime_refresh(
-            http_client,
-            config,
-            share_id.clone(),
-            subdomain.clone(),
-        )
-        .await
-        {
-            let message = error.to_string();
-            tracing::warn!(
-                share_id = %share_id,
-                subdomain = %subdomain,
-                error = %message,
-                "router share runtime refresh failed"
-            );
-            last_error = Some(message);
-        }
-    }
-    last_error
+pub(in crate::api) fn spawn_share_delete_sync(state: ServerState, tombstone: ShareDeleteTombstone) {
+    crate::state::spawn_router_share_delete_retry(state, tombstone);
 }
 
 async fn client_tunnel_response(

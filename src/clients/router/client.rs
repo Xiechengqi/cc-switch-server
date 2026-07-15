@@ -17,6 +17,13 @@ use crate::domain::sharing::router_contract::*;
 use crate::self_update::version::LatestReleaseMeta;
 
 const ROUTER_LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
+const ROUTER_INSTALLATION_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTER_INSTALLATION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTER_CONTROL_PLANE_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTER_ERROR_BODY_LIMIT: usize = 512;
+const ROUTER_SHARE_PRUNE_MAX_IDS: usize = 10_000;
+const REGISTRATION_PROOF_VERSION: u8 = 2;
+const INSTALLATION_HEARTBEAT_PROTOCOL_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +32,8 @@ pub struct RegisterInstallationRequest {
     pub platform: String,
     pub app_version: String,
     pub instance_nonce: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_version: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,6 +46,93 @@ pub struct RegisterInstallationResponse {
     pub installation_id: String,
     #[serde(default)]
     pub control_secret: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RegisterInstallationAttemptError {
+    #[error("router installation register request failed: {0}")]
+    Request(#[source] reqwest::Error),
+    #[error("build router installation register request: {0}")]
+    InvalidRequest(String),
+    #[error("router installation register rejected: {status}: {body}")]
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("parse router installation register response: {0}")]
+    InvalidResponse(String),
+}
+
+impl RegisterInstallationAttemptError {
+    pub fn allows_legacy_fallback(&self) -> bool {
+        matches!(
+            self,
+            Self::Rejected {
+                status: reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNAUTHORIZED,
+                ..
+            }
+        )
+    }
+
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Request(error) => error.is_connect() || error.is_timeout(),
+            Self::Rejected { status, .. } => {
+                *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+            }
+            Self::InvalidRequest(_) | Self::InvalidResponse(_) => false,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InstallationHeartbeatError {
+    #[error("router installation heartbeat endpoint is unavailable: {status}: {body}")]
+    EndpointUnavailable {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("router installation heartbeat requires registration: {status}: {body}")]
+    RegistrationRequired {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("router installation heartbeat transient failure: {0}")]
+    Transient(String),
+    #[error("router installation heartbeat rejected: {status}: {body}")]
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClientTunnelClaimError {
+    #[error("send router client tunnel claim: {0}")]
+    Request(#[source] reqwest::Error),
+    #[error("router client tunnel claim failed: {status}: {body}")]
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("router client tunnel claim timed out after {timeout_seconds}s")]
+    Timeout { timeout_seconds: f64 },
+}
+
+impl ClientTunnelClaimError {
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Request(error) => error.is_connect() || error.is_timeout(),
+            Self::Rejected { status, .. } => {
+                *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+            }
+            Self::Timeout { .. } => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +153,15 @@ pub struct SignedRequest<T> {
     pub signature: String,
     #[serde(flatten)]
     pub payload: T,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationHeartbeatPayload {
+    pub protocol_version: u8,
+    pub boot_id: String,
+    pub app_version: String,
+    pub commit_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +282,22 @@ struct ShareBatchSyncRequest {
     nonce: String,
     signature: String,
     ops: Vec<ShareSyncOperation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SharePruneRequest {
+    installation_id: String,
+    timestamp_ms: i64,
+    nonce: String,
+    signature: String,
+    share_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharePruneOutcome {
+    Applied,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -317,57 +438,170 @@ pub struct RouterRegisterResult {
     pub registered_at_ms: i64,
 }
 
-pub async fn register_installation(
+pub async fn register_installation_v2(
     http: &reqwest::Client,
-    config: &mut ServerConfig,
-) -> anyhow::Result<RouterRegisterResult> {
-    let api_base = config
-        .router_api_base()
-        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
-        .trim_end_matches('/')
-        .to_string();
-    let mut identity = config
-        .router
-        .identity
-        .clone()
-        .unwrap_or_else(generate_identity_without_installation);
-
+    api_base: &str,
+    identity: &RouterIdentity,
+) -> Result<RegisterInstallationResponse, RegisterInstallationAttemptError> {
     let request = build_register_installation_request(
-        &identity,
+        identity,
         std::env::consts::OS,
         crate::build_info::router_registration_version(),
         nonce(),
         now_ms(),
-    )?;
+    )
+    .map_err(|error| RegisterInstallationAttemptError::InvalidRequest(error.to_string()))?;
+    send_register_installation_request(http, api_base, &request).await
+}
+
+pub async fn discover_legacy_installation(
+    http: &reqwest::Client,
+    api_base: &str,
+    identity: &RouterIdentity,
+) -> Result<RegisterInstallationResponse, RegisterInstallationAttemptError> {
+    let request = build_unsigned_legacy_register_installation_request(
+        identity,
+        std::env::consts::OS,
+        crate::build_info::router_registration_version(),
+        nonce(),
+    );
+    send_register_installation_request(http, api_base, &request).await
+}
+
+pub async fn recover_legacy_installation(
+    http: &reqwest::Client,
+    api_base: &str,
+    identity: &RouterIdentity,
+) -> Result<RegisterInstallationResponse, RegisterInstallationAttemptError> {
+    let request = build_legacy_register_installation_request(
+        identity,
+        std::env::consts::OS,
+        crate::build_info::router_registration_version(),
+        nonce(),
+        now_ms(),
+    )
+    .map_err(|error| RegisterInstallationAttemptError::InvalidRequest(error.to_string()))?;
+    send_register_installation_request(http, api_base, &request).await
+}
+
+async fn send_register_installation_request(
+    http: &reqwest::Client,
+    api_base: &str,
+    request: &RegisterInstallationRequest,
+) -> Result<RegisterInstallationResponse, RegisterInstallationAttemptError> {
+    send_register_installation_request_with_timeout(
+        http,
+        api_base,
+        request,
+        ROUTER_INSTALLATION_REGISTER_TIMEOUT,
+    )
+    .await
+}
+
+async fn send_register_installation_request_with_timeout(
+    http: &reqwest::Client,
+    api_base: &str,
+    request: &RegisterInstallationRequest,
+    timeout: Duration,
+) -> Result<RegisterInstallationResponse, RegisterInstallationAttemptError> {
     let response = http
-        .post(format!("{api_base}/v1/installations/register"))
-        .json(&request)
+        .post(format!(
+            "{}/v1/installations/register",
+            api_base.trim_end_matches('/')
+        ))
+        .json(request)
+        .timeout(timeout)
         .send()
         .await
-        .context("send router installation register")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!("router installation register failed: {status}: {body}");
-    }
-
-    let registered = response
-        .json::<RegisterInstallationResponse>()
+        .map_err(RegisterInstallationAttemptError::Request)?;
+    let status = response.status();
+    let body = response
+        .bytes()
         .await
-        .context("parse router installation register response")?;
-    identity.installation_id = registered.installation_id;
-    identity.control_secret = registered.control_secret;
-    let registered_at_ms = now_ms();
-    let result = RouterRegisterResult {
-        installation_id: identity.installation_id.clone(),
-        public_key: identity.public_key.clone(),
-        control_secret_present: identity.control_secret.is_some(),
-        registered_at_ms,
-    };
-    config.router.identity = Some(identity);
-    config.router.last_register_error = None;
-    config.router.last_registered_at_ms = Some(registered_at_ms);
-    Ok(result)
+        .map_err(RegisterInstallationAttemptError::Request)?;
+    if !status.is_success() {
+        return Err(RegisterInstallationAttemptError::Rejected {
+            status,
+            body: bounded_router_error_body(&String::from_utf8_lossy(&body)),
+        });
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| RegisterInstallationAttemptError::InvalidResponse(error.to_string()))
+}
+
+pub async fn send_installation_heartbeat(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    boot_id: &str,
+) -> Result<(), InstallationHeartbeatError> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| {
+            InstallationHeartbeatError::Transient("router api base is not configured".into())
+        })?
+        .trim_end_matches('/');
+    let identity = config.registered_router_identity().ok_or_else(|| {
+        InstallationHeartbeatError::Transient("router installation is not registered".into())
+    })?;
+    let request = build_installation_heartbeat_request(identity, boot_id)
+        .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
+    let response = http
+        .post(format!("{api_base}/v1/installations/heartbeat"))
+        .json(&request)
+        .timeout(ROUTER_INSTALLATION_HEARTBEAT_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
+    Err(classify_installation_heartbeat_failure(status, &body))
+}
+
+fn classify_installation_heartbeat_failure(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> InstallationHeartbeatError {
+    let body = bounded_router_error_body(body);
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return InstallationHeartbeatError::RegistrationRequired { status, body };
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return InstallationHeartbeatError::EndpointUnavailable { status, body };
+    }
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        return InstallationHeartbeatError::Transient(format!("{status}: {body}"));
+    }
+    InstallationHeartbeatError::Rejected { status, body }
+}
+
+fn bounded_router_error_body(body: &str) -> String {
+    body.chars().take(512).collect()
+}
+
+fn build_installation_heartbeat_request(
+    identity: &RouterIdentity,
+    boot_id: &str,
+) -> anyhow::Result<SignedRequest<InstallationHeartbeatPayload>> {
+    let build = crate::build_info::build_info();
+    signed_request(
+        identity,
+        "installation_heartbeat_v1",
+        InstallationHeartbeatPayload {
+            protocol_version: INSTALLATION_HEARTBEAT_PROTOCOL_VERSION,
+            boot_id: boot_id.to_string(),
+            app_version: crate::build_info::router_registration_version().to_string(),
+            commit_id: build.commit_id.to_string(),
+        },
+    )
 }
 
 pub async fn claim_client_tunnel(
@@ -375,15 +609,22 @@ pub async fn claim_client_tunnel(
     config: &ServerConfig,
     tunnel: ClientTunnelConfig,
 ) -> anyhow::Result<()> {
+    claim_client_tunnel_with_timeout(http, config, tunnel, ROUTER_CONTROL_PLANE_SYNC_TIMEOUT).await
+}
+
+async fn claim_client_tunnel_with_timeout(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    tunnel: ClientTunnelConfig,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     let api_base = config
         .router_api_base()
         .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let timestamp_ms = now_ms();
     let nonce = nonce();
@@ -401,18 +642,31 @@ pub async fn claim_client_tunnel(
         signature,
         tunnel,
     };
-    let response = http
-        .post(format!("{api_base}/v1/installations/client-tunnel/claim"))
-        .json(&request)
-        .send()
-        .await
-        .context("send router client tunnel claim")?;
-    if response.status().is_success() {
-        return Ok(());
-    }
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    bail!("router client tunnel claim failed: {status}: {body}");
+    tokio::time::timeout(timeout, async {
+        let response = http
+            .post(format!("{api_base}/v1/installations/client-tunnel/claim"))
+            .json(&request)
+            .send()
+            .await
+            .map_err(ClientTunnelClaimError::Request)?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(ClientTunnelClaimError::Request)?;
+        Err(ClientTunnelClaimError::Rejected {
+            status,
+            body: bounded_router_error_body(&body),
+        })
+    })
+    .await
+    .map_err(|_| ClientTunnelClaimError::Timeout {
+        timeout_seconds: timeout.as_secs_f64(),
+    })?
+    .map_err(anyhow::Error::new)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -424,6 +678,47 @@ pub struct SubdomainAvailability {
 }
 
 pub async fn check_client_tunnel_subdomain_available(
+    http: &reqwest::Client,
+    router_api_base: &str,
+    subdomain: &str,
+    installation_id: Option<&str>,
+) -> anyhow::Result<SubdomainAvailability> {
+    check_client_tunnel_subdomain_available_with_timeout(
+        http,
+        router_api_base,
+        subdomain,
+        installation_id,
+        ROUTER_CONTROL_PLANE_SYNC_TIMEOUT,
+    )
+    .await
+}
+
+async fn check_client_tunnel_subdomain_available_with_timeout(
+    http: &reqwest::Client,
+    router_api_base: &str,
+    subdomain: &str,
+    installation_id: Option<&str>,
+    timeout: Duration,
+) -> anyhow::Result<SubdomainAvailability> {
+    tokio::time::timeout(
+        timeout,
+        check_client_tunnel_subdomain_available_request(
+            http,
+            router_api_base,
+            subdomain,
+            installation_id,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "router subdomain availability check timed out after {}s",
+            timeout.as_secs_f64()
+        )
+    })?
+}
+
+async fn check_client_tunnel_subdomain_available_request(
     http: &reqwest::Client,
     router_api_base: &str,
     subdomain: &str,
@@ -466,9 +761,7 @@ pub async fn get_client_tunnel(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let timestamp_ms = now_ms();
     let nonce = nonce();
@@ -508,9 +801,7 @@ pub async fn get_installation_owner_email(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let timestamp_ms = now_ms();
     let nonce = nonce();
@@ -557,9 +848,7 @@ pub async fn update_client_tunnel(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let timestamp_ms = now_ms();
     let nonce = nonce();
@@ -626,15 +915,37 @@ pub async fn push_payout_profile(
     config: &ServerConfig,
     update: PayoutProfileState,
 ) -> anyhow::Result<InstallationPayoutProfileUpdateResponse> {
+    push_payout_profile_with_timeout(http, config, update, ROUTER_CONTROL_PLANE_SYNC_TIMEOUT).await
+}
+
+async fn push_payout_profile_with_timeout(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    update: PayoutProfileState,
+    timeout: Duration,
+) -> anyhow::Result<InstallationPayoutProfileUpdateResponse> {
+    tokio::time::timeout(timeout, push_payout_profile_request(http, config, update))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "router payout profile sync timed out after {}s",
+                timeout.as_secs_f64()
+            )
+        })?
+}
+
+async fn push_payout_profile_request(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    update: PayoutProfileState,
+) -> anyhow::Result<InstallationPayoutProfileUpdateResponse> {
     let api_base = config
         .router_api_base()
         .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let timestamp_ms = now_ms();
     let nonce = nonce();
@@ -719,10 +1030,9 @@ async fn renew_tunnel_lease_with_timeout(
         .ok_or_else(|| RenewLeaseError::Terminal("router api base is not configured".into()))?
         .trim_end_matches('/')
         .to_string();
-    let identity =
-        config.router.identity.as_ref().ok_or_else(|| {
-            RenewLeaseError::Terminal("router installation is not registered".into())
-        })?;
+    let identity = config
+        .registered_router_identity()
+        .ok_or_else(|| RenewLeaseError::Terminal("router installation is not registered".into()))?;
     let request = signed_request(
         identity,
         "renew_lease",
@@ -785,9 +1095,7 @@ pub async fn claim_share_subdomain(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let claim = ShareClaimPayload {
         share_id: share.share_id.clone(),
@@ -830,15 +1138,134 @@ pub async fn push_share_ops(
     config: &ServerConfig,
     ops: Vec<ShareSyncOperation>,
 ) -> anyhow::Result<()> {
+    push_share_ops_with_timeout(http, config, ops, ROUTER_CONTROL_PLANE_SYNC_TIMEOUT).await
+}
+
+pub async fn prune_shares(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    share_ids: Vec<String>,
+) -> anyhow::Result<SharePruneOutcome> {
+    prune_shares_with_timeout(http, config, share_ids, ROUTER_CONTROL_PLANE_SYNC_TIMEOUT).await
+}
+
+async fn prune_shares_with_timeout(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    share_ids: Vec<String>,
+    timeout: Duration,
+) -> anyhow::Result<SharePruneOutcome> {
+    tokio::time::timeout(timeout, prune_shares_request(http, config, share_ids))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "router share prune timed out after {}s",
+                timeout.as_secs_f64()
+            )
+        })?
+}
+
+async fn prune_shares_request(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    share_ids: Vec<String>,
+) -> anyhow::Result<SharePruneOutcome> {
+    if share_ids.len() > ROUTER_SHARE_PRUNE_MAX_IDS {
+        bail!(
+            "router share prune exceeds the {ROUTER_SHARE_PRUNE_MAX_IDS} share id limit: {}",
+            share_ids.len()
+        );
+    }
     let api_base = config
         .router_api_base()
         .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let request = build_share_prune_request(identity, share_ids, now_ms(), nonce())?;
+    let response = http
+        .post(format!("{api_base}/v1/shares/prune"))
+        .json(&request)
+        .send()
+        .await
+        .context("send router share prune")?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(SharePruneOutcome::Applied);
+    }
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+    {
+        return Ok(SharePruneOutcome::Unsupported);
+    }
+    let body = read_bounded_router_error_body(response)
+        .await
+        .context("read router share prune error response")?;
+    bail!("router share prune failed: {status}: {body}")
+}
+
+fn build_share_prune_request(
+    identity: &RouterIdentity,
+    share_ids: Vec<String>,
+    timestamp_ms: i64,
+    nonce: String,
+) -> anyhow::Result<SharePruneRequest> {
+    let signature = sign_payload(identity, "share_prune_v1", &share_ids, timestamp_ms, &nonce)?;
+    Ok(SharePruneRequest {
+        installation_id: identity.installation_id.clone(),
+        timestamp_ms,
+        nonce,
+        signature,
+        share_ids,
+    })
+}
+
+async fn read_bounded_router_error_body(
+    mut response: reqwest::Response,
+) -> Result<String, reqwest::Error> {
+    let mut body = Vec::with_capacity(ROUTER_ERROR_BODY_LIMIT);
+    while body.len() < ROUTER_ERROR_BODY_LIMIT {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        if chunk.is_empty() {
+            break;
+        }
+        let remaining = ROUTER_ERROR_BODY_LIMIT - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn push_share_ops_with_timeout(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    ops: Vec<ShareSyncOperation>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(timeout, push_share_ops_request(http, config, ops))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "router share batch sync timed out after {}s",
+                timeout.as_secs_f64()
+            )
+        })?
+}
+
+async fn push_share_ops_request(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    ops: Vec<ShareSyncOperation>,
+) -> anyhow::Result<()> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/')
+        .to_string();
+    let identity = config
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let response = send_share_ops_request(http, &api_base, identity, ops.clone()).await?;
     if response.status().is_success() {
@@ -921,9 +1348,7 @@ pub async fn notify_runtime_refresh(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let refresh = ShareRuntimeRefreshPayload {
         share_id,
@@ -970,9 +1395,7 @@ pub async fn batch_sync_share_request_logs(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let timestamp_ms = now_ms();
     let nonce = nonce();
@@ -1015,9 +1438,7 @@ pub async fn pending_share_edits(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let payload = SharePendingEditsPayload { share_ids };
     let request = signed_request(identity, "share_pending_edits", payload)?;
@@ -1050,9 +1471,7 @@ pub async fn ack_share_edit(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let request = signed_request(identity, "share_edit_ack", ShareEditAckEnvelope { ack })?;
     let response = http
@@ -1076,9 +1495,7 @@ pub fn share_edit_events_url(config: &ServerConfig) -> anyhow::Result<String> {
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let timestamp_ms = now_ms();
     let nonce = nonce();
@@ -1113,9 +1530,7 @@ async fn issue_lease(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let timestamp_ms = now_ms();
     let nonce = nonce();
@@ -1235,7 +1650,7 @@ pub fn sign_lease_request(
     Ok(STANDARD.encode(signing_key.sign(canonical.as_bytes()).to_bytes()))
 }
 
-fn generate_identity_without_installation() -> RouterIdentity {
+pub(crate) fn generate_identity_without_installation() -> RouterIdentity {
     let signing_key = SigningKey::generate(&mut OsRng);
     RouterIdentity {
         installation_id: String::new(),
@@ -1252,26 +1667,89 @@ fn build_register_installation_request(
     instance_nonce: String,
     timestamp_ms: i64,
 ) -> anyhow::Result<RegisterInstallationRequest> {
-    let (timestamp_ms, signature) = if identity.installation_id.trim().is_empty() {
-        (None, None)
-    } else {
-        let signature = sign_registration_recovery(
-            identity,
-            platform,
-            app_version,
-            &instance_nonce,
-            timestamp_ms,
-        )?;
-        (Some(timestamp_ms), Some(signature))
-    };
+    let signature = sign_registration_v2(
+        identity,
+        platform,
+        app_version,
+        &instance_nonce,
+        timestamp_ms,
+    )?;
     Ok(RegisterInstallationRequest {
         public_key: identity.public_key.clone(),
         platform: platform.to_string(),
         app_version: app_version.to_string(),
         instance_nonce,
-        timestamp_ms,
-        signature,
+        proof_version: Some(REGISTRATION_PROOF_VERSION),
+        timestamp_ms: Some(timestamp_ms),
+        signature: Some(signature),
     })
+}
+
+fn build_legacy_register_installation_request(
+    identity: &RouterIdentity,
+    platform: &str,
+    app_version: &str,
+    instance_nonce: String,
+    timestamp_ms: i64,
+) -> anyhow::Result<RegisterInstallationRequest> {
+    let signature = sign_registration_recovery(
+        identity,
+        platform,
+        app_version,
+        &instance_nonce,
+        timestamp_ms,
+    )?;
+    Ok(RegisterInstallationRequest {
+        public_key: identity.public_key.clone(),
+        platform: platform.to_string(),
+        app_version: app_version.to_string(),
+        instance_nonce,
+        proof_version: None,
+        timestamp_ms: Some(timestamp_ms),
+        signature: Some(signature),
+    })
+}
+
+fn build_unsigned_legacy_register_installation_request(
+    identity: &RouterIdentity,
+    platform: &str,
+    app_version: &str,
+    instance_nonce: String,
+) -> RegisterInstallationRequest {
+    RegisterInstallationRequest {
+        public_key: identity.public_key.clone(),
+        platform: platform.to_string(),
+        app_version: app_version.to_string(),
+        instance_nonce,
+        proof_version: None,
+        timestamp_ms: None,
+        signature: None,
+    }
+}
+
+fn sign_registration_v2(
+    identity: &RouterIdentity,
+    platform: &str,
+    app_version: &str,
+    instance_nonce: &str,
+    timestamp_ms: i64,
+) -> anyhow::Result<String> {
+    let secret = STANDARD
+        .decode(&identity.private_key)
+        .context("decode router private key")?;
+    let secret: [u8; 32] = secret
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid router private key length"))?;
+    let signing_key = SigningKey::from_bytes(&secret);
+    let canonical = format!(
+        "register_installation_v2\n{}\n{}\n{}\n{}\n{}",
+        identity.public_key.trim(),
+        platform.trim(),
+        app_version,
+        instance_nonce,
+        timestamp_ms
+    );
+    Ok(STANDARD.encode(signing_key.sign(canonical.as_bytes()).to_bytes()))
 }
 
 fn sign_registration_recovery(
@@ -1357,9 +1835,7 @@ pub async fn report_installation_status(
         .trim_end_matches('/')
         .to_string();
     let identity = config
-        .router
-        .identity
-        .as_ref()
+        .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
     let payload = ReportInstallationStatusPayload {
         delegate_upgrade_to_router_owner: policy.delegate_upgrade_to_router_owner,
@@ -1394,7 +1870,14 @@ fn default_tunnel_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[derive(Debug, Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -1438,7 +1921,36 @@ mod tests {
     }
 
     #[test]
-    fn first_registration_request_is_unsigned() {
+    fn share_prune_request_signs_exact_share_ids_payload() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-prune".to_string();
+        let request = build_share_prune_request(
+            &identity,
+            vec!["share-b".to_string(), "share-a".to_string()],
+            123,
+            "prune-nonce".to_string(),
+        )
+        .unwrap();
+
+        let public_key = STANDARD.decode(&identity.public_key).unwrap();
+        let public_key: [u8; 32] = public_key.try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
+        let signature = STANDARD.decode(&request.signature).unwrap();
+        let signature: [u8; 64] = signature.try_into().unwrap();
+        let signature = Signature::from_bytes(&signature);
+        let canonical = "inst-prune\nshare_prune_v1\n[\"share-b\",\"share-a\"]\n123\nprune-nonce";
+
+        verifying_key
+            .verify(canonical.as_bytes(), &signature)
+            .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["installationId"], "inst-prune");
+        assert_eq!(value["shareIds"], json!(["share-b", "share-a"]));
+        assert!(value.get("payload").is_none());
+    }
+
+    #[test]
+    fn first_registration_request_carries_v2_proof_of_possession() {
         let identity = generate_identity_without_installation();
 
         let request = build_register_installation_request(
@@ -1450,15 +1962,26 @@ mod tests {
         )
         .unwrap();
 
-        assert!(request.timestamp_ms.is_none());
-        assert!(request.signature.is_none());
-        let value = serde_json::to_value(request).unwrap();
-        assert!(value.get("timestampMs").is_none());
-        assert!(value.get("signature").is_none());
+        assert_eq!(request.proof_version, Some(2));
+        assert_eq!(request.timestamp_ms, Some(123));
+        let public_key = STANDARD.decode(&identity.public_key).unwrap();
+        let public_key: [u8; 32] = public_key.try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
+        let signature = STANDARD.decode(request.signature.unwrap()).unwrap();
+        let signature: [u8; 64] = signature.try_into().unwrap();
+        let signature = Signature::from_bytes(&signature);
+        let canonical = format!(
+            "register_installation_v2\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
+            identity.public_key
+        );
+
+        verifying_key
+            .verify(canonical.as_bytes(), &signature)
+            .unwrap();
     }
 
     #[test]
-    fn existing_registration_request_signs_router_recovery_payload() {
+    fn existing_registration_request_still_uses_id_independent_v2_proof() {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-existing".into();
 
@@ -1471,7 +1994,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(request.timestamp_ms, Some(123));
+        assert_eq!(request.proof_version, Some(2));
         let public_key = STANDARD.decode(&identity.public_key).unwrap();
         let public_key: [u8; 32] = public_key.try_into().unwrap();
         let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
@@ -1479,13 +2002,627 @@ mod tests {
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
         let canonical = format!(
-            "inst-existing\nregister_installation\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
+            "register_installation_v2\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
             identity.public_key
         );
 
         verifying_key
             .verify(canonical.as_bytes(), &signature)
             .unwrap();
+    }
+
+    #[test]
+    fn legacy_registration_retry_preserves_old_router_canonical_format() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-existing".into();
+
+        let request = build_legacy_register_installation_request(
+            &identity,
+            "linux",
+            "1.2.3",
+            "legacy-nonce".into(),
+            456,
+        )
+        .unwrap();
+
+        assert_eq!(request.proof_version, None);
+        let public_key = STANDARD.decode(&identity.public_key).unwrap();
+        let public_key: [u8; 32] = public_key.try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
+        let signature = STANDARD.decode(request.signature.unwrap()).unwrap();
+        let signature: [u8; 64] = signature.try_into().unwrap();
+        let signature = Signature::from_bytes(&signature);
+        let canonical = format!(
+            "inst-existing\nregister_installation\n{}\nlinux\n1.2.3\nlegacy-nonce\n456",
+            identity.public_key
+        );
+
+        verifying_key
+            .verify(canonical.as_bytes(), &signature)
+            .unwrap();
+    }
+
+    #[test]
+    fn heartbeat_request_is_flattened_and_matches_signed_request_canonical() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-heartbeat".into();
+
+        let request = build_installation_heartbeat_request(&identity, "boot-123").unwrap();
+        let payload_json = serde_json::to_string(&request.payload).unwrap();
+        let canonical = format!(
+            "inst-heartbeat\ninstallation_heartbeat_v1\n{}\n{}\n{}",
+            payload_json, request.timestamp_ms, request.nonce
+        );
+        let public_key = STANDARD.decode(&identity.public_key).unwrap();
+        let public_key: [u8; 32] = public_key.try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
+        let signature = STANDARD.decode(&request.signature).unwrap();
+        let signature: [u8; 64] = signature.try_into().unwrap();
+        let signature = Signature::from_bytes(&signature);
+
+        verifying_key
+            .verify(canonical.as_bytes(), &signature)
+            .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["installationId"], "inst-heartbeat");
+        assert_eq!(value["protocolVersion"], 1);
+        assert_eq!(value["bootId"], "boot-123");
+        assert_eq!(
+            value["appVersion"],
+            crate::build_info::router_registration_version()
+        );
+        assert_eq!(value["commitId"], env!("CC_SWITCH_BUILD_COMMIT"));
+        assert!(value.get("payload").is_none());
+    }
+
+    #[test]
+    fn cross_repo_registration_and_heartbeat_contract_vectors_are_stable() {
+        let identity = RouterIdentity {
+            installation_id: "fixture-installation".into(),
+            public_key: "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=".into(),
+            private_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=".into(),
+            control_secret: None,
+        };
+        let registration = build_register_installation_request(
+            &identity,
+            "linux",
+            "1.2.3",
+            "fixture-nonce-123".into(),
+            1_700_000_000_123,
+        )
+        .unwrap();
+        assert_eq!(registration.proof_version, Some(2));
+        assert_eq!(
+            registration.signature.as_deref(),
+            Some(
+                "ZZXnKtvGo8dPqW7oRNH6p878npyjH7AOjQHnFEegYdgbtSmx0GYMVdVOehycNZxxkKgTuyBfM176MjtNsZhqDg=="
+            )
+        );
+
+        let legacy = build_legacy_register_installation_request(
+            &identity,
+            "linux",
+            "1.2.3",
+            "fixture-legacy-123".into(),
+            1_700_000_000_234,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.signature.as_deref(),
+            Some(
+                "Xa7QqLps3PE6UpT8xeTZTR7DP/2FQnJIUEZGl5dkK672YWMBzXBrm4UwXtc1YsgnUUYH+4e0gxgpugZEfbBMDQ=="
+            )
+        );
+
+        let payload = InstallationHeartbeatPayload {
+            protocol_version: 1,
+            boot_id: "fixture-boot".into(),
+            app_version: "1.2.3".into(),
+            commit_id: "abcdef123456".into(),
+        };
+        let signature = sign_payload(
+            &identity,
+            "installation_heartbeat_v1",
+            &payload,
+            1_700_000_000_456,
+            "fixture-heartbeat-123",
+        )
+        .unwrap();
+        assert_eq!(
+            signature,
+            "SKGGtibTy3D/Fbnclkw2sLlq3q+LtiLfELbnDTlj+mT68pGPpULSJjKM9J/5LKcFysxaA87tuesjPD9WhEOmDw=="
+        );
+        let value = serde_json::to_value(SignedRequest {
+            installation_id: identity.installation_id,
+            timestamp_ms: 1_700_000_000_456,
+            nonce: "fixture-heartbeat-123".into(),
+            signature,
+            payload,
+        })
+        .unwrap();
+        assert_eq!(value["protocolVersion"], 1);
+        assert_eq!(value["bootId"], "fixture-boot");
+        assert!(value.get("payload").is_none());
+    }
+
+    #[test]
+    fn heartbeat_failure_classification_distinguishes_old_endpoint_and_missing_identity() {
+        assert!(matches!(
+            classify_installation_heartbeat_failure(
+                reqwest::StatusCode::NOT_FOUND,
+                "route not found"
+            ),
+            InstallationHeartbeatError::EndpointUnavailable { .. }
+        ));
+        assert!(matches!(
+            classify_installation_heartbeat_failure(
+                reqwest::StatusCode::NOT_FOUND,
+                "installation not found"
+            ),
+            InstallationHeartbeatError::EndpointUnavailable { .. }
+        ));
+        assert!(matches!(
+            classify_installation_heartbeat_failure(
+                reqwest::StatusCode::NOT_FOUND,
+                "route /v1/installations/heartbeat not found"
+            ),
+            InstallationHeartbeatError::EndpointUnavailable { .. }
+        ));
+        assert!(matches!(
+            classify_installation_heartbeat_failure(
+                reqwest::StatusCode::UNAUTHORIZED,
+                "invalid signature"
+            ),
+            InstallationHeartbeatError::RegistrationRequired { .. }
+        ));
+        assert!(matches!(
+            classify_installation_heartbeat_failure(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "retry later"
+            ),
+            InstallationHeartbeatError::Transient(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn registration_v2_exposes_fallback_eligible_rejection_to_state() {
+        async fn handler(
+            State(requests): State<Arc<Mutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let mut requests = requests.lock().await;
+            requests.push(request);
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"message": "arbitrary old router rejection"})),
+            )
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/installations/register", post(handler))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-existing".into();
+
+        let error = register_installation_v2(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &identity,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.allows_legacy_fallback());
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["proofVersion"], 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registration_total_timeout_covers_a_stalled_response_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let identity = generate_identity_without_installation();
+        let request = build_register_installation_request(
+            &identity,
+            "linux",
+            "1.2.3",
+            "timeout-nonce".into(),
+            123,
+        )
+        .unwrap();
+
+        let error = send_register_installation_request_with_timeout(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &request,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("stalled response body must hit the total request timeout");
+
+        let RegisterInstallationAttemptError::Request(error) = error else {
+            panic!("stalled response must be classified as a request failure");
+        };
+        assert!(error.is_timeout());
+        server.abort();
+    }
+
+    #[test]
+    fn unsigned_legacy_discovery_omits_all_proof_fields() {
+        let identity = generate_identity_without_installation();
+        let request = build_unsigned_legacy_register_installation_request(
+            &identity,
+            "linux",
+            "1.2.3",
+            "discovery-nonce".into(),
+        );
+        let value = serde_json::to_value(request).unwrap();
+
+        assert!(value.get("proofVersion").is_none());
+        assert!(value.get("timestampMs").is_none());
+        assert!(value.get("signature").is_none());
+        assert_eq!(value["instanceNonce"], "discovery-nonce");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_http_failure_returns_without_blocking_the_caller() {
+        async fn handler() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"message": "temporarily unavailable"})),
+            )
+        }
+
+        let app = Router::new().route("/v1/installations/heartbeat", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-heartbeat".into();
+        config.router.identity = Some(identity);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_installation_heartbeat(&reqwest::Client::new(), &config, "boot-123"),
+        )
+        .await
+        .expect("heartbeat failure should return promptly")
+        .expect_err("a non-success response must be reported");
+
+        assert!(error.to_string().contains("503 Service Unavailable"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn share_sync_has_one_total_http_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-share-sync-timeout".into();
+        config.router.identity = Some(identity);
+
+        let error = push_share_ops_with_timeout(
+            &reqwest::Client::new(),
+            &config,
+            Vec::new(),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a stalled share sync must hit the operation deadline");
+
+        assert!(error.to_string().contains("share batch sync timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn share_prune_classifies_only_404_and_405_as_unsupported() {
+        async fn handler(Json(request): Json<Value>) -> (StatusCode, String) {
+            match request["shareIds"][0].as_str().unwrap_or_default() {
+                "unsupported-404" => (StatusCode::NOT_FOUND, "missing".to_string()),
+                "unsupported-405" => (StatusCode::METHOD_NOT_ALLOWED, "old".to_string()),
+                "failure" => (StatusCode::CONFLICT, "x".repeat(4096)),
+                _ => (StatusCode::NO_CONTENT, String::new()),
+            }
+        }
+
+        let app = Router::new().route("/v1/shares/prune", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-prune-status".into();
+        config.router.identity = Some(identity);
+
+        assert_eq!(
+            prune_shares(
+                &reqwest::Client::new(),
+                &config,
+                vec!["applied".to_string()]
+            )
+            .await
+            .unwrap(),
+            SharePruneOutcome::Applied
+        );
+        for share_id in ["unsupported-404", "unsupported-405"] {
+            assert_eq!(
+                prune_shares(&reqwest::Client::new(), &config, vec![share_id.to_string()])
+                    .await
+                    .unwrap(),
+                SharePruneOutcome::Unsupported
+            );
+        }
+        let error = prune_shares(
+            &reqwest::Client::new(),
+            &config,
+            vec!["failure".to_string()],
+        )
+        .await
+        .expect_err("non-404/405 failures must remain retryable errors");
+        assert!(error.to_string().contains("409 Conflict"));
+        assert!(error.to_string().len() < 600, "{error:#}");
+
+        let error = prune_shares(
+            &reqwest::Client::new(),
+            &config,
+            vec!["share".to_string(); ROUTER_SHARE_PRUNE_MAX_IDS + 1],
+        )
+        .await
+        .expect_err("an oversized prune payload must be rejected before sending");
+        assert!(error.to_string().contains("10000 share id limit"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn share_prune_response_loss_is_not_classified_as_applied() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let received = socket.read(&mut request).await.unwrap();
+            assert!(received > 0);
+        });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-prune-lost-response".into();
+        config.router.identity = Some(identity);
+
+        prune_shares_with_timeout(
+            &reqwest::Client::new(),
+            &config,
+            vec!["share-lost-response".to_string()],
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("a lost response must not be treated as an applied prune");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn share_prune_timeout_covers_stalled_error_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 128\r\n\r\nx",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-prune-timeout".into();
+        config.router.identity = Some(identity);
+
+        let error = prune_shares_with_timeout(
+            &reqwest::Client::new(),
+            &config,
+            vec!["share-prune-timeout".to_string()],
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a stalled prune error body must hit the total deadline");
+
+        assert!(error.to_string().contains("share prune timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn payout_sync_has_one_total_http_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-payout-sync-timeout".into();
+        config.router.identity = Some(identity);
+        let update = PayoutProfileState {
+            schema_version: crate::domain::settings::config::PAYOUT_PROFILE_SCHEMA_VERSION,
+            revision: 1,
+            profile: None,
+            updated_at_ms: 1,
+        };
+
+        let error = push_payout_profile_with_timeout(
+            &reqwest::Client::new(),
+            &config,
+            update,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a stalled payout sync must hit the operation deadline");
+
+        assert!(error.to_string().contains("payout profile sync timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_tunnel_claim_preserves_typed_http_status() {
+        async fn handler(Json(request): Json<Value>) -> (StatusCode, Json<Value>) {
+            if request["tunnel"]["subdomain"] == "permanent" {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({"message": "connection belongs to another owner"})),
+                )
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"message": "retry later"})),
+                )
+            }
+        }
+
+        let app = Router::new().route("/v1/installations/client-tunnel/claim", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-claim-status".into();
+        config.router.identity = Some(identity);
+
+        let permanent = claim_client_tunnel(
+            &reqwest::Client::new(),
+            &config,
+            ClientTunnelConfig {
+                owner_email: "owner@example.com".into(),
+                subdomain: "permanent".into(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(!crate::client_tunnel_provision::is_router_unreachable_error(&permanent));
+
+        let transient = claim_client_tunnel(
+            &reqwest::Client::new(),
+            &config,
+            ClientTunnelConfig {
+                owner_email: "owner@example.com".into(),
+                subdomain: "transient".into(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(crate::client_tunnel_provision::is_router_unreachable_error(
+            &transient
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_tunnel_claim_timeout_covers_stalled_error_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 128\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-claim-timeout".into();
+        config.router.identity = Some(identity);
+
+        let error = claim_client_tunnel_with_timeout(
+            &reqwest::Client::new(),
+            &config,
+            ClientTunnelConfig {
+                owner_email: "owner@example.com".into(),
+                subdomain: "claim-timeout".into(),
+                enabled: true,
+            },
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a stalled claim error body must hit the total deadline");
+
+        assert!(crate::client_tunnel_provision::is_router_unreachable_error(
+            &error
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn subdomain_availability_timeout_covers_stalled_success_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let error = check_client_tunnel_subdomain_available_with_timeout(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            "availability-timeout",
+            None,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a stalled availability response must hit the total deadline");
+
+        assert!(error.to_string().contains("availability check timed out"));
+        server.abort();
     }
 
     #[test]

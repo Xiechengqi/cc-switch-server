@@ -2505,7 +2505,7 @@ async fn stop_client_tunnel_releases_remote_tunnel_without_blocking_local_stop()
 }
 
 #[tokio::test]
-async fn automatic_router_reconcile_replaces_installation_shares() {
+async fn automatic_router_reconcile_upserts_installation_shares_without_delete_all() {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -2518,11 +2518,10 @@ async fn automatic_router_reconcile_replaces_installation_shares() {
                 |State(batch_seen): State<Arc<AtomicUsize>>,
                  axum::Json(body): axum::Json<Value>| async move {
                     assert_eq!(body["installationId"].as_str(), Some("inst-runtime"));
-                    assert_eq!(body["ops"].as_array().map(Vec::len), Some(2));
-                    assert_eq!(body["ops"][0]["kind"].as_str(), Some("delete_all"));
-                    assert_eq!(body["ops"][1]["kind"].as_str(), Some("upsert"));
+                    assert_eq!(body["ops"].as_array().map(Vec::len), Some(1));
+                    assert_eq!(body["ops"][0]["kind"].as_str(), Some("upsert"));
                     assert_eq!(
-                        body["ops"][1]["share"]["shareId"].as_str(),
+                        body["ops"][0]["share"]["shareId"].as_str(),
                         Some("share-runtime")
                     );
                     batch_seen.fetch_add(1, Ordering::SeqCst);

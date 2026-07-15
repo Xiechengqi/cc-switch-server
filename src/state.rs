@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -8,8 +8,8 @@ use anyhow::Context;
 use futures_util::StreamExt;
 use rand::RngCore;
 use serde_json::Value;
-use tokio::sync::{broadcast, RwLock};
-use tokio::time::{sleep, Duration};
+use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, RwLock};
+use tokio::time::{sleep, timeout_at, Duration, Instant};
 
 use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::Cli;
@@ -39,19 +39,23 @@ use crate::domain::failover::FailoverStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::settings::config::{
-    mask_proxy_url, PayoutProfile, PayoutProfileState, ServerConfig,
+    mask_proxy_url, PayoutProfile, PayoutProfileState, RouterIdentity, ServerConfig,
 };
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, ShareRequestLogEntry, ShareSyncOperation,
 };
 use crate::domain::sharing::shares::{
-    Share, ShareInvocation, ShareInvocationRejection, ShareMarketGrantStatus, ShareStore,
+    Share, ShareDeleteTombstone, ShareInvocation, ShareInvocationRejection, ShareMarketGrantStatus,
+    ShareStore,
 };
 use crate::domain::usage::pricing::ModelPricingStore;
 use crate::domain::usage::store::{UsageLog, UsageStore};
 use crate::logging::{LogTailAccessError, LogTailResponse, SharedLogCapture};
 use crate::proxy::cursor::session::CursorSessionManager;
+
+const ROUTER_INSTALLATION_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTER_SHARE_SYNC_BATCH_SIZE: usize = 100;
 
 #[derive(Debug)]
 pub struct ServerStateInner {
@@ -79,6 +83,8 @@ pub struct ServerStateInner {
     pub account_in_flight: Arc<AccountInFlightTracker>,
     pub share_in_flight: Arc<ShareInFlightTracker>,
     pub control_nonces: Arc<ControlNonceCache>,
+    router_registration_flight: AsyncMutex<Option<Arc<RouterRegistrationFlight>>>,
+    router_share_sync: AsyncMutex<()>,
     pub http_client: RwLock<reqwest::Client>,
     pub events: broadcast::Sender<ServerEvent>,
     pub tunnels: Arc<TunnelSupervisor>,
@@ -88,6 +94,75 @@ pub struct ServerStateInner {
     pub process_instance_id: String,
     pub upgrade: crate::self_update::upgrade::SharedUpgradeRegistry,
     pub(crate) log_capture: SharedLogCapture,
+}
+
+#[derive(Debug)]
+struct RouterRegistrationFlight {
+    result: watch::Sender<Option<Result<client::RouterRegisterResult, RouterRegistrationFailure>>>,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct RouterRegistrationFailure {
+    message: String,
+    unreachable: bool,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("router installation registration timed out after {timeout_seconds}s")]
+pub(crate) struct RouterRegistrationTimeout {
+    timeout_seconds: f64,
+}
+
+impl RouterRegistrationTimeout {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout_seconds: timeout.as_secs_f64(),
+        }
+    }
+}
+
+impl RouterRegistrationFailure {
+    fn from_error(error: &anyhow::Error) -> Self {
+        let unreachable = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<client::RegisterInstallationAttemptError>()
+                .is_some_and(client::RegisterInstallationAttemptError::is_transient)
+                || cause.downcast_ref::<RouterRegistrationTimeout>().is_some()
+        });
+        Self {
+            message: format!("{error:#}"),
+            unreachable,
+        }
+    }
+
+    pub(crate) fn is_unreachable(&self) -> bool {
+        self.unreachable
+    }
+}
+
+impl RouterRegistrationFlight {
+    fn new() -> Self {
+        Self {
+            result: watch::channel(None).0,
+        }
+    }
+
+    async fn wait(&self) -> Result<client::RouterRegisterResult, RouterRegistrationFailure> {
+        let mut receiver = self.result.subscribe();
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result;
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| RouterRegistrationFailure {
+                    message: "router installation registration flight stopped".to_string(),
+                    unreachable: false,
+                })?;
+        }
+    }
 }
 
 pub type ServerState = Arc<ServerStateInner>;
@@ -663,6 +738,8 @@ impl ServerStateInner {
             account_in_flight: Arc::new(AccountInFlightTracker::default()),
             share_in_flight: Arc::new(ShareInFlightTracker::default()),
             control_nonces: Arc::new(ControlNonceCache::default()),
+            router_registration_flight: AsyncMutex::new(None),
+            router_share_sync: AsyncMutex::new(()),
             http_client: RwLock::new(http_client),
             events,
             tunnels,
@@ -705,11 +782,13 @@ impl ServerStateInner {
         Ok(self.log_capture.read_tail(&config, &self.config_dir, lines))
     }
 
-    pub async fn replace_config(&self, config: ServerConfig) -> anyhow::Result<()> {
+    pub async fn replace_config(&self, mut config: ServerConfig) -> anyhow::Result<()> {
+        let mut current = self.config.write().await;
+        preserve_router_identity_from_stale_snapshot(&current, &mut config);
         let http_client = build_http_client(&config, self.bind_addr)?;
         config.save(&self.config_dir)?;
         *self.http_client.write().await = http_client;
-        *self.config.write().await = config;
+        *current = config;
         Ok(())
     }
 
@@ -725,6 +804,232 @@ impl ServerStateInner {
 
     pub async fn config_snapshot(&self) -> ServerConfig {
         self.config.read().await.clone()
+    }
+
+    pub(crate) async fn lock_router_share_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.router_share_sync.lock().await
+    }
+
+    pub async fn register_router_installation(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<client::RouterRegisterResult> {
+        let deadline = Instant::now() + ROUTER_INSTALLATION_REGISTRATION_TIMEOUT;
+        let (flight, should_start) = timeout_at(deadline, async {
+            let mut current = self.router_registration_flight.lock().await;
+            if let Some(flight) = current.as_ref() {
+                (flight.clone(), false)
+            } else {
+                let flight = Arc::new(RouterRegistrationFlight::new());
+                *current = Some(flight.clone());
+                (flight, true)
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::Error::new(RouterRegistrationTimeout::new(
+                ROUTER_INSTALLATION_REGISTRATION_TIMEOUT,
+            ))
+        })?;
+
+        if should_start {
+            let state = self.clone();
+            let running_flight = flight.clone();
+            tokio::spawn(async move {
+                let result = state
+                    .register_router_installation_locked()
+                    .await
+                    .map_err(|error| RouterRegistrationFailure::from_error(&error));
+                running_flight.result.send_replace(Some(result.clone()));
+                if let Err(error) = &result {
+                    if let Err(save_error) = state
+                        .record_router_registration_error(error.to_string())
+                        .await
+                    {
+                        tracing::warn!(error = %save_error, "persist router registration error failed");
+                    }
+                }
+                let mut current = state.router_registration_flight.lock().await;
+                if current
+                    .as_ref()
+                    .is_some_and(|flight| Arc::ptr_eq(flight, &running_flight))
+                {
+                    *current = None;
+                }
+            });
+        }
+
+        timeout_at(deadline, flight.wait())
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(RouterRegistrationTimeout::new(
+                    ROUTER_INSTALLATION_REGISTRATION_TIMEOUT,
+                ))
+            })?
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn complete_router_registration_control_plane(
+        self: &Arc<Self>,
+        source: &'static str,
+    ) -> anyhow::Result<()> {
+        self.mutate_shares_immediate(|shares| {
+            shares.router_registered = true;
+            shares.last_router_error = None;
+        })
+        .await?;
+        if let Err(error) = reconcile_all_shares_to_router(self.clone()).await {
+            tracing::warn!(%error, source, "router share reconcile after registration failed");
+        }
+        retry_pending_router_share_deletes(self.clone()).await;
+        if let Err(error) = reconcile_payout_profile_to_router(self.clone()).await {
+            tracing::warn!(%error, source, "router payout profile reconcile after registration failed");
+        }
+        Ok(())
+    }
+
+    async fn register_router_installation_locked(
+        &self,
+    ) -> anyhow::Result<client::RouterRegisterResult> {
+        self.register_router_installation_locked_with_timeout(
+            ROUTER_INSTALLATION_REGISTRATION_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn register_router_installation_locked_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<client::RouterRegisterResult> {
+        tokio::time::timeout(timeout, self.run_router_registration_stages())
+            .await
+            .map_err(|_| anyhow::Error::new(RouterRegistrationTimeout::new(timeout)))?
+    }
+
+    async fn run_router_registration_stages(&self) -> anyhow::Result<client::RouterRegisterResult> {
+        let mut identity = self.ensure_pending_router_identity().await?;
+        let config = self.config_snapshot().await;
+        let api_base = config
+            .router_api_base()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+            .trim_end_matches('/')
+            .to_string();
+        let http = self.http_client().await;
+        let mut response = match client::register_installation_v2(&http, &api_base, &identity).await
+        {
+            Ok(response) if response.control_secret.is_some() => response,
+            Ok(response) => {
+                identity = identity_for_registration_recovery(&identity, &response)?;
+                client::recover_legacy_installation(&http, &api_base, &identity).await?
+            }
+            Err(error) if error.allows_legacy_fallback() => {
+                let discovered =
+                    client::discover_legacy_installation(&http, &api_base, &identity).await?;
+                identity = identity_for_registration_recovery(&identity, &discovered)?;
+                client::recover_legacy_installation(&http, &api_base, &identity).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if response.control_secret.is_none()
+            && response.installation_id.trim() == identity.installation_id.trim()
+        {
+            response.control_secret = identity.control_secret.clone();
+        }
+        ensure_complete_router_registration_response(&identity, &response)?;
+        let registered_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let identity = self
+            .merge_router_registration_response(
+                &api_base,
+                &identity.public_key,
+                response,
+                Some(registered_at_ms),
+            )
+            .await?;
+        Ok(client::RouterRegisterResult {
+            installation_id: identity.installation_id,
+            public_key: identity.public_key,
+            control_secret_present: identity.control_secret.is_some(),
+            registered_at_ms,
+        })
+    }
+
+    async fn ensure_pending_router_identity(&self) -> anyhow::Result<RouterIdentity> {
+        let mut config = self.config.write().await;
+        if let Some(identity) = config.router.identity.as_ref() {
+            if !identity.has_keypair() {
+                anyhow::bail!("router installation identity keypair is incomplete");
+            }
+            return Ok(identity.clone());
+        }
+
+        let identity = client::generate_identity_without_installation();
+        let mut next = config.clone();
+        next.router.identity = Some(identity.clone());
+        next.save(&self.config_dir)?;
+        *config = next;
+        Ok(identity)
+    }
+
+    async fn merge_router_registration_response(
+        &self,
+        expected_api_base: &str,
+        expected_public_key: &str,
+        response: client::RegisterInstallationResponse,
+        registered_at_ms: Option<i64>,
+    ) -> anyhow::Result<RouterIdentity> {
+        let installation_id = response.installation_id.trim();
+        if installation_id.is_empty() {
+            anyhow::bail!("router installation register returned an empty installation id");
+        }
+
+        let mut config = self.config.write().await;
+        let current_api_base = config
+            .router_api_base()
+            .map(str::trim)
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        if current_api_base != expected_api_base {
+            anyhow::bail!("router configuration changed while registration was in progress");
+        }
+        let current = config
+            .router
+            .identity
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pending router identity disappeared"))?;
+        if current.public_key.trim() != expected_public_key.trim() {
+            anyhow::bail!("pending router identity changed while registration was in progress");
+        }
+
+        let mut next = config.clone();
+        let identity = {
+            let identity = next
+                .router
+                .identity
+                .as_mut()
+                .expect("router identity checked above");
+            identity.installation_id = installation_id.to_string();
+            if response.control_secret.is_some() {
+                identity.control_secret = response.control_secret;
+            }
+            identity.clone()
+        };
+        if let Some(registered_at_ms) = registered_at_ms {
+            next.router.last_register_error = None;
+            next.router.last_registered_at_ms = Some(registered_at_ms);
+        }
+        next.save(&self.config_dir)?;
+        *config = next;
+        Ok(identity)
+    }
+
+    async fn record_router_registration_error(&self, message: String) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        let mut next = config.clone();
+        next.router.last_register_error = Some(message);
+        next.save(&self.config_dir)?;
+        *config = next;
+        Ok(())
     }
 
     pub async fn set_debug_token(&self, token: &str, expires_at_ms: i64) -> anyhow::Result<()> {
@@ -1581,7 +1886,7 @@ impl ServerStateInner {
 
     pub async fn replace_shares(&self, shares: Vec<Share>) {
         self.mutate_shares(|store| {
-            store.shares = shares;
+            store.replace_shares(shares);
         })
         .await;
     }
@@ -1632,6 +1937,86 @@ fn new_process_instance_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+fn identity_for_registration_recovery(
+    current: &RouterIdentity,
+    response: &client::RegisterInstallationResponse,
+) -> anyhow::Result<RouterIdentity> {
+    let installation_id = response.installation_id.trim();
+    if installation_id.is_empty() {
+        anyhow::bail!("router installation discovery returned an empty installation id");
+    }
+    let mut identity = current.clone();
+    if identity.installation_id.trim() != installation_id {
+        identity.control_secret = None;
+    }
+    identity.installation_id = installation_id.to_string();
+    if let Some(control_secret) = response.control_secret.as_ref() {
+        identity.control_secret = Some(control_secret.clone());
+    }
+    Ok(identity)
+}
+
+fn ensure_complete_router_registration_response(
+    recovery_identity: &RouterIdentity,
+    response: &client::RegisterInstallationResponse,
+) -> anyhow::Result<()> {
+    let installation_id = response.installation_id.trim();
+    if installation_id.is_empty() {
+        anyhow::bail!("router installation register returned an empty installation id");
+    }
+    let retained_secret_is_valid = recovery_identity.installation_id.trim() == installation_id
+        && recovery_identity.control_secret.is_some();
+    if response.control_secret.is_none() && !retained_secret_is_valid {
+        anyhow::bail!("router installation registration did not return a control secret");
+    }
+    Ok(())
+}
+
+fn preserve_router_identity_from_stale_snapshot(
+    current: &ServerConfig,
+    incoming: &mut ServerConfig,
+) {
+    let current_api_base = current
+        .router_api_base()
+        .map(str::trim)
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let incoming_api_base = incoming
+        .router_api_base()
+        .map(str::trim)
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    if current_api_base != incoming_api_base {
+        return;
+    }
+    let Some(current_identity) = current.router.identity.as_ref() else {
+        return;
+    };
+
+    let stale = match incoming.router.identity.as_mut() {
+        None => {
+            incoming.router.identity = Some(current_identity.clone());
+            true
+        }
+        Some(incoming_identity)
+            if incoming_identity.public_key.trim() == current_identity.public_key.trim() =>
+        {
+            let stale = incoming_identity.installation_id != current_identity.installation_id
+                || incoming_identity.private_key != current_identity.private_key
+                || incoming_identity.control_secret != current_identity.control_secret;
+            if stale {
+                *incoming_identity = current_identity.clone();
+            }
+            stale
+        }
+        Some(_) => false,
+    };
+    if stale {
+        incoming.router.last_register_error = current.router.last_register_error.clone();
+        incoming.router.last_registered_at_ms = current.router.last_registered_at_ms;
+    }
 }
 
 pub fn build_provider_http_client(
@@ -1715,49 +2100,40 @@ fn proxy_points_to_addr(value: &str, bind_addr: SocketAddr) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-pub async fn refresh_router_installation_registration(state: &ServerState) {
-    let mut config = state.config.read().await.clone();
+pub async fn refresh_router_installation_registration(state: &ServerState) -> bool {
+    let config = state.config.read().await.clone();
     if !config.is_setup_complete() || config.router_api_base().is_none() {
-        return;
-    }
-    if config.router.identity.is_none() {
-        return;
+        return false;
     }
 
-    let http_client = state.http_client().await;
-    match client::register_installation(&http_client, &mut config).await {
+    match state.register_router_installation().await {
         Ok(registration) => {
-            if let Err(error) = state.replace_config(config).await {
-                tracing::warn!(error = %error, "persist router installation refresh failed");
-                return;
-            }
             if let Err(error) = state
-                .mutate_shares_immediate(|shares| {
-                    shares.router_registered = true;
-                    shares.last_router_error = None;
-                })
+                .complete_router_registration_control_plane("startup_refresh")
                 .await
             {
                 tracing::warn!(
                     error = %error,
-                    "mark router registered after installation refresh failed"
+                    "complete router registration refresh failed"
                 );
-                return;
+                return false;
             }
             tracing::info!(
                 installation_id = %registration.installation_id,
                 app_version = %crate::build_info::router_registration_version(),
                 "refreshed router installation registration"
             );
+            true
         }
         Err(error) => {
             tracing::warn!(error = %error, "router installation registration refresh failed");
+            false
         }
     }
 }
 
 pub async fn restore_tunnels(state: ServerState) {
-    refresh_router_installation_registration(&state).await;
+    let registration_completed = refresh_router_installation_registration(&state).await;
 
     if state.config.read().await.is_setup_complete()
         && should_restore_client_tunnel(
@@ -1776,12 +2152,15 @@ pub async fn restore_tunnels(state: ServerState) {
         start_share_tunnel(state.clone(), share_id).await;
     }
 
-    if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
-        tracing::warn!(error = %error, "automatic router share reconcile failed");
+    if !registration_completed {
+        if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
+            tracing::warn!(error = %error, "fallback router share reconcile failed");
+        }
+        if let Err(error) = reconcile_payout_profile_to_router(state.clone()).await {
+            tracing::warn!(error = %error, "fallback router payout profile reconcile failed");
+        }
     }
-    if let Err(error) = reconcile_payout_profile_to_router(state.clone()).await {
-        tracing::warn!(error = %error, "automatic router payout profile reconcile failed");
-    }
+    retry_pending_router_share_deletes(state).await;
 }
 
 pub fn spawn_periodic_backups(state: ServerState) {
@@ -1885,9 +2264,231 @@ pub fn spawn_periodic_installation_status_report(state: ServerState) {
     });
 }
 
+const DEFAULT_ROUTER_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+const MIN_ROUTER_HEARTBEAT_INTERVAL_SECS: u64 = 15;
+const MAX_ROUTER_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+const ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS: u64 = 5;
+const ROUTER_HEARTBEAT_UNREGISTERED_MAX_RETRY_SECS: u64 = 5 * 60;
+const ROUTER_HEARTBEAT_WARNING_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const ROUTER_HEARTBEAT_ENDPOINT_WARNING_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const ROUTER_HEARTBEAT_SUSTAINED_FAILURES: u32 = 3;
+
+pub fn spawn_installation_heartbeat(state: ServerState) {
+    tokio::spawn(async move {
+        let mut consecutive_failures = 0_u32;
+        let mut last_failure_warning = None;
+        let mut last_endpoint_warning = None;
+        let mut unregistered_retry_secs = ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS;
+        loop {
+            if run_installation_heartbeat_once(
+                &state,
+                &mut consecutive_failures,
+                &mut last_failure_warning,
+                &mut last_endpoint_warning,
+            )
+            .await
+            {
+                unregistered_retry_secs = ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS;
+                sleep(next_router_heartbeat_delay(router_heartbeat_interval_secs())).await;
+            } else {
+                sleep(Duration::from_secs(unregistered_retry_secs)).await;
+                unregistered_retry_secs =
+                    next_router_registration_retry_secs(unregistered_retry_secs);
+            }
+        }
+    });
+}
+
+async fn run_installation_heartbeat_once(
+    state: &ServerState,
+    consecutive_failures: &mut u32,
+    last_failure_warning: &mut Option<tokio::time::Instant>,
+    last_endpoint_warning: &mut Option<tokio::time::Instant>,
+) -> bool {
+    let config = state.config_snapshot().await;
+    if !config.has_registered_router_identity() {
+        if config.is_setup_complete() && config.router_api_base().is_some() {
+            match state.register_router_installation().await {
+                Ok(_) => {
+                    if let Err(error) = state
+                        .complete_router_registration_control_plane("heartbeat_unregistered_retry")
+                        .await
+                    {
+                        tracing::warn!(%error, "complete heartbeat registration retry failed");
+                    }
+                    return true;
+                }
+                Err(error) => {
+                    *consecutive_failures = consecutive_failures.saturating_add(1);
+                    warn_on_sustained_heartbeat_failure(
+                        last_failure_warning,
+                        *consecutive_failures,
+                        &error,
+                    );
+                }
+            }
+        }
+        return false;
+    }
+    let http_client = state.http_client().await;
+    match client::send_installation_heartbeat(&http_client, &config, &state.process_instance_id)
+        .await
+    {
+        Ok(()) => {
+            *consecutive_failures = 0;
+            *last_failure_warning = None;
+            *last_endpoint_warning = None;
+        }
+        Err(client::InstallationHeartbeatError::EndpointUnavailable { status, body }) => {
+            if config
+                .registered_router_identity()
+                .is_some_and(|identity| identity.control_secret.is_none())
+            {
+                match state.register_router_installation().await {
+                    Ok(_) => {
+                        if let Err(error) = state
+                            .complete_router_registration_control_plane(
+                                "heartbeat_legacy_secret_recovery",
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, "complete legacy heartbeat registration recovery failed");
+                        }
+                        *consecutive_failures = 0;
+                        *last_failure_warning = None;
+                    }
+                    Err(error) => {
+                        *consecutive_failures = consecutive_failures.saturating_add(1);
+                        warn_on_sustained_heartbeat_failure(
+                            last_failure_warning,
+                            *consecutive_failures,
+                            &error,
+                        );
+                    }
+                }
+            } else {
+                *consecutive_failures = 0;
+                *last_failure_warning = None;
+            }
+            let now = tokio::time::Instant::now();
+            if rate_limited_warning_due(
+                last_endpoint_warning,
+                now,
+                ROUTER_HEARTBEAT_ENDPOINT_WARNING_INTERVAL,
+            ) {
+                tracing::warn!(
+                    %status,
+                    response = %body,
+                    "router does not support installation heartbeat; upgrade Router to enable offline notifications"
+                );
+            }
+        }
+        Err(client::InstallationHeartbeatError::RegistrationRequired { status, body }) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            tracing::debug!(%status, response = %body, "router installation heartbeat requires registration recovery");
+            let heartbeat_error =
+                format!("router installation heartbeat requires registration: {status}: {body}");
+            match state.register_router_installation().await {
+                Ok(_) => {
+                    if let Err(error) = state
+                        .complete_router_registration_control_plane("heartbeat_identity_recovery")
+                        .await
+                    {
+                        tracing::warn!(%error, "complete heartbeat identity recovery failed");
+                    }
+                    warn_on_sustained_heartbeat_failure(
+                        last_failure_warning,
+                        *consecutive_failures,
+                        &heartbeat_error,
+                    );
+                }
+                Err(error) => {
+                    let error = format!(
+                        "{heartbeat_error}; router installation registration recovery failed: {error}"
+                    );
+                    warn_on_sustained_heartbeat_failure(
+                        last_failure_warning,
+                        *consecutive_failures,
+                        &error,
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            tracing::debug!(error = %error, consecutive_failures = *consecutive_failures, "router installation heartbeat failed");
+            warn_on_sustained_heartbeat_failure(
+                last_failure_warning,
+                *consecutive_failures,
+                &error,
+            );
+        }
+    }
+    true
+}
+
+fn warn_on_sustained_heartbeat_failure(
+    last_warning: &mut Option<tokio::time::Instant>,
+    consecutive_failures: u32,
+    error: &impl std::fmt::Display,
+) {
+    if consecutive_failures < ROUTER_HEARTBEAT_SUSTAINED_FAILURES {
+        return;
+    }
+    let now = tokio::time::Instant::now();
+    if rate_limited_warning_due(last_warning, now, ROUTER_HEARTBEAT_WARNING_INTERVAL) {
+        tracing::warn!(
+            %error,
+            consecutive_failures,
+            "router installation heartbeat is persistently failing"
+        );
+    }
+}
+
+fn rate_limited_warning_due(
+    last_warning: &mut Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    interval: Duration,
+) -> bool {
+    if last_warning.is_some_and(|last| now.duration_since(last) < interval) {
+        return false;
+    }
+    *last_warning = Some(now);
+    true
+}
+
+fn router_heartbeat_interval_secs() -> u64 {
+    let value = env::var("CC_SWITCH_SERVER_ROUTER_HEARTBEAT_INTERVAL_SECS").ok();
+    normalize_router_heartbeat_interval(value.as_deref())
+}
+
+fn normalize_router_heartbeat_interval(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ROUTER_HEARTBEAT_INTERVAL_SECS)
+        .clamp(
+            MIN_ROUTER_HEARTBEAT_INTERVAL_SECS,
+            MAX_ROUTER_HEARTBEAT_INTERVAL_SECS,
+        )
+}
+
+fn next_router_heartbeat_delay(interval_secs: u64) -> Duration {
+    let jitter = (interval_secs / 10).max(1);
+    let width = jitter.saturating_mul(2).saturating_add(1);
+    let offset = i128::from(rand::thread_rng().next_u64() % width) - i128::from(jitter);
+    Duration::from_secs((i128::from(interval_secs) + offset).max(1) as u64)
+}
+
+fn next_router_registration_retry_secs(current_secs: u64) -> u64 {
+    current_secs
+        .max(ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS)
+        .saturating_mul(2)
+        .min(ROUTER_HEARTBEAT_UNREGISTERED_MAX_RETRY_SECS)
+}
+
 pub async fn report_installation_upgrade_status(state: &ServerState) -> anyhow::Result<()> {
     let config = state.config.read().await.clone();
-    if config.router.identity.is_none() {
+    if !config.has_registered_router_identity() {
         return Ok(());
     }
     let client = state.http_client().await;
@@ -1908,9 +2509,10 @@ pub fn spawn_periodic_share_sync_retry(state: ServerState) {
         loop {
             sleep(Duration::from_secs(30)).await;
             let config = state.config.read().await.clone();
-            if config.router.identity.is_none() {
+            if !config.has_registered_router_identity() {
                 continue;
             }
+            retry_pending_router_share_deletes(state.clone()).await;
             let pending_ids = state
                 .shares
                 .read()
@@ -1924,7 +2526,7 @@ pub fn spawn_periodic_share_sync_retry(state: ServerState) {
                 .map(|share| share.id.clone())
                 .collect::<Vec<_>>();
             for share_id in pending_ids {
-                if let Err(error) = sync_one_share_to_router(&state, &config, &share_id).await {
+                if let Err(error) = sync_one_share_to_router(&state, &share_id).await {
                     tracing::warn!(share_id = %share_id, error = %error, "periodic router share sync retry failed");
                 }
             }
@@ -2355,7 +2957,7 @@ pub async fn sync_pending_direct_share_logs(
         return summary;
     }
     let config = state.config.read().await.clone();
-    if config.router.identity.is_none() {
+    if !config.has_registered_router_identity() {
         return summary;
     }
     for log in logs {
@@ -2413,7 +3015,7 @@ pub struct ShareEditSyncSummary {
 
 pub async fn pull_and_apply_pending_share_edits(state: ServerState) -> ShareEditSyncSummary {
     let config = state.config.read().await.clone();
-    if config.router.identity.is_none() {
+    if !config.has_registered_router_identity() {
         return ShareEditSyncSummary {
             error: Some("router installation is not registered".to_string()),
             ..ShareEditSyncSummary::default()
@@ -2461,7 +3063,7 @@ async fn apply_and_ack_share_edit(
     let (ack_status, ack_error) = match apply_result {
         Ok(()) => {
             summary.applied += 1;
-            let sync_result = sync_one_share_to_router(state, config, &edit.share_id).await;
+            let sync_result = sync_one_share_to_router(state, &edit.share_id).await;
             match sync_result {
                 Ok(()) => summary.remote_synced += 1,
                 Err(error) => {
@@ -2562,23 +3164,36 @@ async fn record_share_edit_sync_error(state: &ServerState, message: String) {
     save_shares_debounced(state);
 }
 
-async fn sync_one_share_to_router(
+pub(crate) async fn sync_one_share_to_router(
     state: &ServerState,
-    config: &ServerConfig,
     share_id: &str,
 ) -> anyhow::Result<()> {
+    let _sync = state.lock_router_share_sync().await;
+    sync_one_share_to_router_locked(state, share_id).await
+}
+
+async fn sync_one_share_to_router_locked(
+    state: &ServerState,
+    share_id: &str,
+) -> anyhow::Result<()> {
+    let config = state.config_snapshot().await;
+    if !config.has_registered_router_identity() {
+        anyhow::bail!("router installation is not registered");
+    }
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
     let usage = state.usage.read().await.clone();
-    let share = state
-        .shares
-        .read()
-        .await
-        .shares
-        .iter()
-        .find(|share| share.id == share_id)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("share not found"))?;
+    let share = {
+        let store = state.shares.read().await;
+        let blocked_by_delete = store.has_pending_router_delete_for_share(share_id);
+        if blocked_by_delete {
+            return Ok(());
+        }
+        let Some(share) = store.shares.iter().find(|share| share.id == share_id) else {
+            return Ok(());
+        };
+        share.clone()
+    };
     let descriptor = descriptor_for_share_with_accounts_and_usage(
         &share,
         &providers,
@@ -2591,7 +3206,7 @@ async fn sync_one_share_to_router(
         share: Some(descriptor),
     };
     let http_client = state.http_client().await;
-    let result = client::push_share_ops(&http_client, config, vec![op]).await;
+    let result = client::push_share_ops(&http_client, &config, vec![op]).await;
     let router_base = config.router_api_base().map(str::to_string);
     {
         let mut store = state.shares.write().await;
@@ -2617,38 +3232,261 @@ async fn sync_one_share_to_router(
     result
 }
 
+pub(crate) fn spawn_router_share_delete_retry(state: ServerState, tombstone: ShareDeleteTombstone) {
+    tokio::spawn(async move {
+        if let Err(error) = retry_router_share_deletes(&state, &[tombstone.clone()]).await {
+            tracing::warn!(
+                share_id = %tombstone.share_id,
+                operation_id = %tombstone.operation_id,
+                %error,
+                "router share delete remains pending"
+            );
+        }
+    });
+}
+
+async fn retry_pending_router_share_deletes(state: ServerState) {
+    let pending = state.shares.read().await.pending_router_deletes.clone();
+    if pending.is_empty() {
+        return;
+    }
+    if let Err(error) = retry_router_share_deletes(&state, &pending).await {
+        tracing::warn!(
+            pending_deletes = pending.len(),
+            %error,
+            "router share delete outbox retry failed"
+        );
+    }
+}
+
+async fn retry_router_share_deletes(
+    state: &ServerState,
+    tombstones: &[ShareDeleteTombstone],
+) -> anyhow::Result<usize> {
+    let _sync = state.lock_router_share_sync().await;
+    let mut completed = 0;
+    for chunk in tombstones.chunks(ROUTER_SHARE_SYNC_BATCH_SIZE) {
+        completed += retry_router_share_delete_chunk_locked(state, chunk).await?;
+    }
+    Ok(completed)
+}
+
+async fn retry_router_share_delete_chunk_locked(
+    state: &ServerState,
+    tombstones: &[ShareDeleteTombstone],
+) -> anyhow::Result<usize> {
+    let active = {
+        let store = state.shares.read().await;
+        tombstones
+            .iter()
+            .filter(|tombstone| {
+                store
+                    .pending_router_delete(&tombstone.share_id, &tombstone.operation_id)
+                    .is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if active.is_empty() {
+        return Ok(0);
+    }
+    let config = state.config_snapshot().await;
+    if !config.has_registered_router_identity() {
+        let error = anyhow::anyhow!("router installation is not registered");
+        record_router_share_delete_failures(state, &active, error.to_string()).await?;
+        return Err(error);
+    }
+
+    let current_ids = {
+        let store = state.shares.read().await;
+        active
+            .iter()
+            .filter(|tombstone| store.get(&tombstone.share_id).is_some())
+            .map(|tombstone| tombstone.share_id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let mut ops = active
+        .iter()
+        .filter(|tombstone| !current_ids.contains(&tombstone.share_id))
+        .map(|tombstone| ShareSyncOperation {
+            kind: "delete".to_string(),
+            share_id: Some(tombstone.share_id.clone()),
+            share: None,
+        })
+        .collect::<Vec<_>>();
+    ops.extend(build_router_share_upsert_ops(state, &current_ids).await);
+    let http_client = state.http_client().await;
+    if let Err(error) = client::push_share_ops(&http_client, &config, ops).await {
+        record_router_share_delete_failures(state, &active, error.to_string()).await?;
+        return Err(error);
+    }
+
+    let compensation_ids = {
+        let store = state.shares.read().await;
+        active
+            .iter()
+            .filter(|tombstone| store.get(&tombstone.share_id).is_some())
+            .map(|tombstone| tombstone.share_id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let compensation_ops = build_router_share_upsert_ops(state, &compensation_ids).await;
+    if !compensation_ops.is_empty() {
+        if let Err(error) =
+            client::push_share_ops(&http_client, &config, compensation_ops.clone()).await
+        {
+            record_router_share_delete_failures(state, &active, error.to_string()).await?;
+            return Err(error);
+        }
+        mark_router_share_upserts_synced(state, &config, &compensation_ops).await;
+    }
+
+    let operation_ids = active
+        .iter()
+        .map(|tombstone| tombstone.operation_id.clone())
+        .collect::<BTreeSet<_>>();
+    let completed = state
+        .mutate_shares_immediate(|store| {
+            operation_ids
+                .iter()
+                .filter(|operation_id| store.complete_pending_router_delete(operation_id))
+                .count()
+        })
+        .await?;
+    Ok(completed)
+}
+
+async fn build_router_share_upsert_ops(
+    state: &ServerState,
+    share_ids: &BTreeSet<String>,
+) -> Vec<ShareSyncOperation> {
+    if share_ids.is_empty() {
+        return Vec::new();
+    }
+    let providers = state.providers.read().await.clone();
+    let accounts = state.accounts.read().await.clone();
+    let usage = state.usage.read().await.clone();
+    let shares = state
+        .shares
+        .read()
+        .await
+        .shares
+        .iter()
+        .filter(|share| share_ids.contains(&share.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    shares
+        .iter()
+        .map(|share| ShareSyncOperation {
+            kind: "upsert".to_string(),
+            share_id: None,
+            share: Some(descriptor_for_share_with_accounts_and_usage(
+                share,
+                &providers,
+                Some(&accounts),
+                Some(&usage),
+            )),
+        })
+        .collect()
+}
+
+async fn mark_router_share_upserts_synced(
+    state: &ServerState,
+    config: &ServerConfig,
+    operations: &[ShareSyncOperation],
+) {
+    let revisions = operations
+        .iter()
+        .filter_map(|operation| {
+            operation
+                .share
+                .as_ref()
+                .map(|share| (share.share_id.clone(), share.config_revision))
+        })
+        .collect::<Vec<_>>();
+    let router_base = config.router_api_base().map(str::to_string);
+    let now = crate::infra::time::now_ms();
+    state
+        .mutate_shares_debounced(|store| {
+            store.router_registered = true;
+            store.last_router_error = None;
+            for (share_id, revision) in &revisions {
+                store.mark_router_sync(share_id, *revision, router_base.clone(), Ok(now));
+            }
+        })
+        .await;
+}
+
+async fn record_router_share_delete_failures(
+    state: &ServerState,
+    tombstones: &[ShareDeleteTombstone],
+    message: String,
+) -> anyhow::Result<()> {
+    let operation_ids = tombstones
+        .iter()
+        .map(|tombstone| tombstone.operation_id.clone())
+        .collect::<BTreeSet<_>>();
+    state
+        .mutate_shares_immediate(|store| {
+            for operation_id in operation_ids {
+                store.mark_pending_router_delete_failure(&operation_id, message.clone());
+            }
+        })
+        .await
+}
+
 /// Reconcile the router's installation-scoped share set with the current local
 /// store. This is an internal recovery path used after startup/registration;
 /// it is intentionally not exposed as a manual Web API action.
 pub async fn reconcile_all_shares_to_router(state: ServerState) -> anyhow::Result<usize> {
+    let _sync = state.lock_router_share_sync().await;
     let config = state.config.read().await.clone();
-    if config.router.identity.is_none() {
+    if !config.has_registered_router_identity() {
         return Ok(0);
     }
+    let router_api_base = config
+        .router_api_base()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?;
+    let installation_id = config
+        .registered_router_identity()
+        .expect("registered identity checked above")
+        .installation_id
+        .trim()
+        .to_string();
 
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
     let usage = state.usage.read().await.clone();
-    let shares = state.shares.read().await.shares.clone();
-    let mut ops = Vec::with_capacity(shares.len() + 1);
-    ops.push(ShareSyncOperation {
-        kind: "delete_all".to_string(),
-        share_id: None,
-        share: None,
-    });
-    ops.extend(shares.iter().map(|share| ShareSyncOperation {
-        kind: "upsert".to_string(),
-        share_id: None,
-        share: Some(descriptor_for_share_with_accounts_and_usage(
-            share,
-            &providers,
-            Some(&accounts),
-            Some(&usage),
-        )),
-    }));
+    let (shares, prune_already_applied) = {
+        let store = state.shares.read().await;
+        (
+            store.shares.clone(),
+            store.router_share_prune_applied_for(&router_api_base, &installation_id),
+        )
+    };
+    let ops = shares
+        .iter()
+        .map(|share| ShareSyncOperation {
+            kind: "upsert".to_string(),
+            share_id: None,
+            share: Some(descriptor_for_share_with_accounts_and_usage(
+                share,
+                &providers,
+                Some(&accounts),
+                Some(&usage),
+            )),
+        })
+        .collect::<Vec<_>>();
 
     let http_client = state.http_client().await;
-    let result = client::push_share_ops(&http_client, &config, ops).await;
+    let result: anyhow::Result<()> = async {
+        for chunk in ops.chunks(ROUTER_SHARE_SYNC_BATCH_SIZE) {
+            client::push_share_ops(&http_client, &config, chunk.to_vec()).await?;
+        }
+        Ok(())
+    }
+    .await;
     let router_base = config.router_api_base().map(str::to_string);
     let now = crate::infra::time::now_ms();
     state
@@ -2679,7 +3517,42 @@ pub async fn reconcile_all_shares_to_router(state: ServerState) -> anyhow::Resul
             }
         })
         .await;
-    result.map(|()| shares.len())
+    result?;
+
+    if !prune_already_applied {
+        match client::prune_shares(
+            &http_client,
+            &config,
+            shares.iter().map(|share| share.id.clone()).collect(),
+        )
+        .await
+        {
+            Ok(client::SharePruneOutcome::Applied) => {
+                state
+                    .mutate_shares_immediate(|store| {
+                        store.mark_router_share_prune_applied(&router_api_base, &installation_id);
+                    })
+                    .await?;
+            }
+            Ok(client::SharePruneOutcome::Unsupported) => {
+                tracing::debug!(
+                    installation_id,
+                    "router does not support one-time share prune"
+                );
+            }
+            Err(error) => {
+                let message = error.to_string();
+                state
+                    .mutate_shares_debounced(|store| {
+                        store.last_router_error = Some(message.clone());
+                    })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(shares.len())
 }
 
 pub async fn reconcile_payout_profile_to_router(state: ServerState) -> anyhow::Result<()> {
@@ -2721,7 +3594,7 @@ async fn share_edit_event_loop(state: ServerState) {
 
 async fn listen_for_share_edit_events_once(state: ServerState) -> anyhow::Result<()> {
     let config = state.config.read().await.clone();
-    if config.router.identity.is_none() || state.shares.read().await.shares.is_empty() {
+    if !config.has_registered_router_identity() || state.shares.read().await.shares.is_empty() {
         return Ok(());
     }
     let url = client::share_edit_events_url(&config)?;
@@ -2889,12 +3762,7 @@ pub(crate) async fn ensure_router_installation_owner_bound(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("owner email is not configured"))?;
-    if config
-        .router
-        .identity
-        .as_ref()
-        .is_none_or(|identity| identity.installation_id.trim().is_empty())
-    {
+    if !config.has_registered_router_identity() {
         anyhow::bail!("router installation is not registered");
     }
 
@@ -2949,23 +3817,14 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
     if !config.is_setup_complete() {
         anyhow::bail!("setup is incomplete");
     }
-    if config.router.identity.is_none() {
-        let http_client = state.http_client().await;
-        if let Err(error) = client::register_installation(&http_client, &mut config).await {
-            record_router_error(&state, &config, error.to_string()).await;
+    if !config.has_registered_router_identity() {
+        if let Err(error) = state.register_router_installation().await {
             return Err(error);
         }
-        state.replace_config(config.clone()).await?;
-        {
-            let mut shares = state.shares.write().await;
-            shares.router_registered = true;
-            shares.last_router_error = None;
-        }
-        state.save_shares().await?;
-        reconcile_all_shares_to_router(state.clone()).await?;
-        if let Err(error) = reconcile_payout_profile_to_router(state.clone()).await {
-            tracing::warn!(error = %error, "router payout profile reconcile after implicit registration failed");
-        }
+        config = state.config_snapshot().await;
+        state
+            .complete_router_registration_control_plane("implicit_client_tunnel_registration")
+            .await?;
     }
 
     if let Err(error) = ensure_router_installation_owner_bound(&state, &config).await {
@@ -3033,7 +3892,7 @@ async fn issue_share_tunnel_lease(
     share_id: String,
 ) -> anyhow::Result<IssueLeaseResponse> {
     let config = state.config.read().await.clone();
-    if config.router.identity.is_none() {
+    if !config.has_registered_router_identity() {
         anyhow::bail!("router installation is not registered");
     }
     let providers = state.providers.read().await.clone();
@@ -3066,6 +3925,7 @@ async fn issue_share_tunnel_lease(
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::cli::Cli;
@@ -3074,9 +3934,188 @@ mod tests {
     use crate::domain::providers::model::{AppKind, ProviderType};
     use crate::domain::sharing::shares::{Share, ShareAcl, UpsertShareInput};
     use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
-    use serde_json::json;
+    use axum::extract::State as AxumState;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::{json, Value};
+    use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
+
+    fn router_sync_share_input(share_id: &str, provider_id: &str) -> UpsertShareInput {
+        UpsertShareInput {
+            id: Some(share_id.to_string()),
+            owner_email: Some("owner@example.com".to_string()),
+            app: AppKind::Codex,
+            provider_id: provider_id.to_string(),
+            provider_type: ProviderType::Codex,
+            display_name: Some("Router sync share".to_string()),
+            enabled: None,
+            status: None,
+            subscription_level: None,
+            account_email: None,
+            quota_percent: None,
+            tunnel_subdomain: Some(format!("{}sync", share_id.replace('-', ""))),
+            acl: None,
+            token_limit: None,
+            parallel_limit: None,
+            expires_at: None,
+            for_sale: None,
+            free_access: None,
+            sale_market_kind: None,
+            access_by_app: BTreeMap::new(),
+            app_settings: BTreeMap::new(),
+            for_sale_official_price_percent_by_app: BTreeMap::new(),
+            official_price_percent: None,
+            auto_start: None,
+            description: None,
+            bindings: Vec::new(),
+            runtime_snapshot: None,
+            market_grant: None,
+        }
+    }
+
+    async fn create_router_delete_tombstones(
+        state: &ServerState,
+        prefix: &str,
+        count: usize,
+    ) -> Vec<ShareDeleteTombstone> {
+        state
+            .mutate_shares_immediate(|store| {
+                (0..count)
+                    .map(|index| {
+                        let share_id = format!("{prefix}{index}");
+                        store
+                            .upsert(router_sync_share_input(
+                                &share_id,
+                                &format!("provider-{prefix}-{index}"),
+                            ))
+                            .unwrap();
+                        store.delete(&share_id).unwrap()
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn create_router_shares(state: &ServerState, prefix: &str, count: usize) {
+        state
+            .mutate_shares_immediate(|store| {
+                for index in 0..count {
+                    let share_id = format!("{prefix}{index}");
+                    store
+                        .upsert(router_sync_share_input(
+                            &share_id,
+                            &format!("provider-{prefix}-{index}"),
+                        ))
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+    }
+
+    #[derive(Clone)]
+    struct SharePruneMockRouter {
+        remote_share_ids: Arc<TokioMutex<BTreeSet<String>>>,
+        batch_sizes: Arc<TokioMutex<Vec<usize>>>,
+        request_order: Arc<TokioMutex<Vec<String>>>,
+        prune_requests: Arc<AtomicUsize>,
+        prune_status: StatusCode,
+    }
+
+    async fn share_prune_mock_batch_handler(
+        AxumState(router): AxumState<SharePruneMockRouter>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        let operations = request["ops"].as_array().unwrap();
+        router.batch_sizes.lock().await.push(operations.len());
+        router
+            .request_order
+            .lock()
+            .await
+            .push(format!("batch:{}", operations.len()));
+        let mut remote_share_ids = router.remote_share_ids.lock().await;
+        for operation in operations {
+            match operation["kind"].as_str() {
+                Some("upsert") => {
+                    remote_share_ids
+                        .insert(operation["share"]["shareId"].as_str().unwrap().to_string());
+                }
+                Some("delete") => {
+                    remote_share_ids.remove(operation["shareId"].as_str().unwrap());
+                }
+                kind => panic!("unexpected share sync operation: {kind:?}"),
+            }
+        }
+        Json(json!({"ok": true}))
+    }
+
+    async fn share_prune_mock_handler(
+        AxumState(router): AxumState<SharePruneMockRouter>,
+        Json(request): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        router.prune_requests.fetch_add(1, AtomicOrdering::SeqCst);
+        let share_ids = request["shareIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<BTreeSet<_>>();
+        router
+            .request_order
+            .lock()
+            .await
+            .push(format!("prune:{}", share_ids.len()));
+        if router.prune_status.is_success() {
+            router
+                .remote_share_ids
+                .lock()
+                .await
+                .retain(|share_id| share_ids.contains(share_id));
+        }
+        (router.prune_status, Json(json!({"ok": true})))
+    }
+
+    async fn spawn_share_prune_mock_router(
+        remote_share_ids: impl IntoIterator<Item = String>,
+        prune_status: StatusCode,
+    ) -> (String, SharePruneMockRouter, tokio::task::JoinHandle<()>) {
+        let router = SharePruneMockRouter {
+            remote_share_ids: Arc::new(TokioMutex::new(remote_share_ids.into_iter().collect())),
+            batch_sizes: Arc::new(TokioMutex::new(Vec::new())),
+            request_order: Arc::new(TokioMutex::new(Vec::new())),
+            prune_requests: Arc::new(AtomicUsize::new(0)),
+            prune_status,
+        };
+        let app = Router::new()
+            .route(
+                "/v1/shares/batch-sync",
+                post(share_prune_mock_batch_handler),
+            )
+            .route("/v1/shares/prune", post(share_prune_mock_handler))
+            .with_state(router.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), router, server)
+    }
+
+    async fn configure_registered_test_router(
+        state: &ServerState,
+        router_url: &str,
+        installation_id: &str,
+    ) {
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(router_url.to_string());
+        config.router.api_base = None;
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = installation_id.to_string();
+        config.router.identity = Some(identity);
+        state.replace_config(config).await.unwrap();
+    }
 
     fn copilot_account_fixture(expires_at: Option<i64>) -> Account {
         Account {
@@ -3306,12 +4345,1266 @@ mod tests {
         assert!(!is_router_request_id("req_bad/value"));
     }
 
+    #[test]
+    fn router_heartbeat_interval_defaults_and_clamps_operator_input() {
+        assert_eq!(normalize_router_heartbeat_interval(None), 60);
+        assert_eq!(normalize_router_heartbeat_interval(Some("invalid")), 60);
+        assert_eq!(normalize_router_heartbeat_interval(Some(" 60 ")), 60);
+        assert_eq!(normalize_router_heartbeat_interval(Some("90")), 60);
+        assert_eq!(normalize_router_heartbeat_interval(Some("1")), 15);
+        assert_eq!(normalize_router_heartbeat_interval(Some("99999")), 60);
+    }
+
+    #[test]
+    fn router_registration_retry_uses_bounded_exponential_backoff() {
+        assert_eq!(next_router_registration_retry_secs(5), 10);
+        assert_eq!(next_router_registration_retry_secs(10), 20);
+        assert_eq!(next_router_registration_retry_secs(200), 300);
+        assert_eq!(next_router_registration_retry_secs(300), 300);
+    }
+
+    #[test]
+    fn router_heartbeat_jitter_stays_within_ten_percent() {
+        for _ in 0..256 {
+            let delay = next_router_heartbeat_delay(60).as_secs();
+            assert!((54..=66).contains(&delay));
+        }
+    }
+
+    #[test]
+    fn heartbeat_warnings_are_rate_limited_per_failure_class() {
+        let now = tokio::time::Instant::now();
+        let mut last_warning = None;
+
+        assert!(rate_limited_warning_due(
+            &mut last_warning,
+            now,
+            Duration::from_secs(60)
+        ));
+        assert!(!rate_limited_warning_due(
+            &mut last_warning,
+            now + Duration::from_secs(59),
+            Duration::from_secs(60)
+        ));
+        assert!(rate_limited_warning_due(
+            &mut last_warning,
+            now + Duration::from_secs(60),
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_registration_recovery_does_not_hide_repeated_heartbeat_401s() {
+        #[derive(Clone)]
+        struct Counts {
+            heartbeats: Arc<AtomicUsize>,
+            registrations: Arc<AtomicUsize>,
+            share_syncs: Arc<TokioMutex<Vec<Value>>>,
+        }
+
+        async fn heartbeat_handler(
+            AxumState(counts): AxumState<Counts>,
+        ) -> (StatusCode, Json<Value>) {
+            counts.heartbeats.fetch_add(1, AtomicOrdering::SeqCst);
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"message": "invalid heartbeat identity"})),
+            )
+        }
+
+        async fn registration_handler(AxumState(counts): AxumState<Counts>) -> Json<Value> {
+            counts.registrations.fetch_add(1, AtomicOrdering::SeqCst);
+            Json(json!({
+                "installationId": "inst-heartbeat-remapped",
+                "controlSecret": "recovered-secret"
+            }))
+        }
+
+        async fn share_sync_handler(
+            AxumState(counts): AxumState<Counts>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            counts.share_syncs.lock().await.push(request);
+            Json(json!({"ok": true}))
+        }
+
+        let counts = Counts {
+            heartbeats: Arc::new(AtomicUsize::new(0)),
+            registrations: Arc::new(AtomicUsize::new(0)),
+            share_syncs: Arc::new(TokioMutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/v1/installations/heartbeat", post(heartbeat_handler))
+            .route("/v1/installations/register", post(registration_handler))
+            .route("/v1/shares/batch-sync", post(share_sync_handler))
+            .with_state(counts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "inst-heartbeat-401".to_string();
+        identity.control_secret = Some("existing-secret".to_string());
+        config.router.identity = Some(identity);
+        state.replace_config(config).await.unwrap();
+        state
+            .shares
+            .write()
+            .await
+            .upsert(UpsertShareInput {
+                id: Some("share-heartbeat-remap".to_string()),
+                owner_email: Some("owner@example.com".to_string()),
+                app: AppKind::Codex,
+                provider_id: "provider-heartbeat-remap".to_string(),
+                provider_type: ProviderType::Codex,
+                display_name: Some("Heartbeat remap share".to_string()),
+                tunnel_subdomain: Some("heartbeatremap".to_string()),
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                acl: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                for_sale: None,
+                free_access: None,
+                sale_market_kind: None,
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: None,
+                description: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                market_grant: None,
+            })
+            .unwrap();
+        let mut consecutive_failures = 0;
+        let mut last_failure_warning = None;
+        let mut last_endpoint_warning = None;
+
+        for _ in 0..ROUTER_HEARTBEAT_SUSTAINED_FAILURES {
+            assert!(
+                run_installation_heartbeat_once(
+                    &state,
+                    &mut consecutive_failures,
+                    &mut last_failure_warning,
+                    &mut last_endpoint_warning,
+                )
+                .await
+            );
+        }
+
+        assert_eq!(consecutive_failures, ROUTER_HEARTBEAT_SUSTAINED_FAILURES);
+        assert!(last_failure_warning.is_some());
+        assert_eq!(
+            counts.heartbeats.load(AtomicOrdering::SeqCst),
+            ROUTER_HEARTBEAT_SUSTAINED_FAILURES as usize
+        );
+        assert_eq!(
+            counts.registrations.load(AtomicOrdering::SeqCst),
+            ROUTER_HEARTBEAT_SUSTAINED_FAILURES as usize
+        );
+        assert_eq!(
+            state
+                .config_snapshot()
+                .await
+                .registered_router_identity()
+                .unwrap()
+                .installation_id,
+            "inst-heartbeat-remapped"
+        );
+        let share_syncs = counts.share_syncs.lock().await;
+        assert_eq!(
+            share_syncs.len(),
+            ROUTER_HEARTBEAT_SUSTAINED_FAILURES as usize
+        );
+        assert!(share_syncs.iter().all(|request| {
+            let operations = request["ops"].as_array().unwrap();
+            operations.len() == 1 && operations[0]["kind"] == "upsert"
+        }));
+        drop(share_syncs);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_retries_registration_after_startup_registration_failure() {
+        async fn registration_handler(
+            AxumState(requests): AxumState<Arc<AtomicUsize>>,
+        ) -> Json<Value> {
+            requests.fetch_add(1, AtomicOrdering::SeqCst);
+            Json(json!({
+                "installationId": "inst-startup-recovered",
+                "controlSecret": "startup-recovered-secret"
+            }))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/installations/register", post(registration_handler))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.auth.password_hash = Some("configured".to_string());
+        config.owner.email = Some("owner@example.com".to_string());
+        config.router.url = Some(format!("http://{addr}"));
+        config.client.tunnel_subdomain = Some("startup-recovery".to_string());
+        config.router.identity = Some(client::generate_identity_without_installation());
+        state.replace_config(config).await.unwrap();
+        let mut consecutive_failures = 0;
+        let mut last_failure_warning = None;
+        let mut last_endpoint_warning = None;
+
+        assert!(
+            run_installation_heartbeat_once(
+                &state,
+                &mut consecutive_failures,
+                &mut last_failure_warning,
+                &mut last_endpoint_warning,
+            )
+            .await
+        );
+
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            state
+                .config_snapshot()
+                .await
+                .registered_router_identity()
+                .unwrap()
+                .installation_id,
+            "inst-startup-recovered"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_control_secret_recovery_failures_accumulate_across_endpoint_404s() {
+        #[derive(Clone)]
+        struct Counts {
+            heartbeats: Arc<AtomicUsize>,
+            registrations: Arc<AtomicUsize>,
+        }
+
+        async fn heartbeat_handler(
+            AxumState(counts): AxumState<Counts>,
+        ) -> (StatusCode, Json<Value>) {
+            counts.heartbeats.fetch_add(1, AtomicOrdering::SeqCst);
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": "route /v1/installations/heartbeat not found"})),
+            )
+        }
+
+        async fn registration_handler(
+            AxumState(counts): AxumState<Counts>,
+        ) -> (StatusCode, Json<Value>) {
+            counts.registrations.fetch_add(1, AtomicOrdering::SeqCst);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"message": "router unavailable"})),
+            )
+        }
+
+        let counts = Counts {
+            heartbeats: Arc::new(AtomicUsize::new(0)),
+            registrations: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/v1/installations/heartbeat", post(heartbeat_handler))
+            .route("/v1/installations/register", post(registration_handler))
+            .with_state(counts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "inst-endpoint-404".to_string();
+        config.router.identity = Some(identity);
+        state.replace_config(config).await.unwrap();
+        let mut consecutive_failures = 0;
+        let mut last_failure_warning = None;
+        let mut last_endpoint_warning = None;
+
+        for _ in 0..ROUTER_HEARTBEAT_SUSTAINED_FAILURES {
+            assert!(
+                run_installation_heartbeat_once(
+                    &state,
+                    &mut consecutive_failures,
+                    &mut last_failure_warning,
+                    &mut last_endpoint_warning,
+                )
+                .await
+            );
+        }
+
+        assert_eq!(consecutive_failures, ROUTER_HEARTBEAT_SUSTAINED_FAILURES);
+        assert!(last_failure_warning.is_some());
+        assert_eq!(
+            counts.heartbeats.load(AtomicOrdering::SeqCst),
+            ROUTER_HEARTBEAT_SUSTAINED_FAILURES as usize
+        );
+        assert_eq!(
+            counts.registrations.load(AtomicOrdering::SeqCst),
+            ROUTER_HEARTBEAT_SUSTAINED_FAILURES as usize
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn stale_config_snapshot_cannot_regress_router_identity_fields() {
+        let mut current = ServerConfig::empty();
+        current.router.url = Some("https://router.example.com".to_string());
+        current.router.identity = Some(RouterIdentity {
+            installation_id: "inst-new".to_string(),
+            public_key: "same-public-key".to_string(),
+            private_key: "current-private-key".to_string(),
+            control_secret: Some("current-control-secret".to_string()),
+        });
+        current.router.last_registered_at_ms = Some(200);
+        let mut stale = current.clone();
+        stale.owner.email = Some("new-owner@example.com".to_string());
+        stale.router.identity = Some(RouterIdentity {
+            installation_id: "inst-old".to_string(),
+            public_key: "same-public-key".to_string(),
+            private_key: "current-private-key".to_string(),
+            control_secret: Some("old-control-secret".to_string()),
+        });
+        stale.router.last_registered_at_ms = Some(100);
+
+        preserve_router_identity_from_stale_snapshot(&current, &mut stale);
+
+        assert_eq!(stale.owner.email.as_deref(), Some("new-owner@example.com"));
+        assert_eq!(stale.router.identity, current.router.identity);
+        assert_eq!(stale.router.last_registered_at_ms, Some(200));
+    }
+
+    #[tokio::test]
+    async fn pending_router_identity_survives_lost_response_and_restart() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dropped_response = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = socket.read(&mut buffer).await;
+        });
+        let state = test_state();
+        set_test_router_url(&state, format!("http://{addr}")).await;
+
+        state
+            .register_router_installation()
+            .await
+            .expect_err("a dropped registration response must fail");
+        dropped_response.await.unwrap();
+        let pending = state
+            .config_snapshot()
+            .await
+            .router
+            .identity
+            .expect("pending identity must be persisted before the request");
+        assert!(pending.installation_id.is_empty());
+        let config_dir = state.config_dir.clone();
+        drop(state);
+
+        let restarted = test_state_at(config_dir);
+        let reloaded = restarted
+            .config_snapshot()
+            .await
+            .router
+            .identity
+            .expect("restart must reload the pending identity");
+        assert_eq!(reloaded.public_key, pending.public_key);
+        assert_eq!(reloaded.private_key, pending.private_key);
+
+        let requests = Arc::new(TokioMutex::new(Vec::<Value>::new()));
+        let app = Router::new().route(
+            "/v1/installations/register",
+            post({
+                let requests = requests.clone();
+                move |Json(request): Json<Value>| {
+                    let requests = requests.clone();
+                    async move {
+                        requests.lock().await.push(request);
+                        Json(json!({
+                            "installationId": "inst-after-restart",
+                            "controlSecret": "secret-after-restart"
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        set_test_router_url(&restarted, format!("http://{addr}")).await;
+
+        restarted.register_router_installation().await.unwrap();
+
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["publicKey"], pending.public_key);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_router_registration_is_singleflight_with_one_identity() {
+        async fn handler(
+            AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            requests.lock().await.push(request);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Json(json!({
+                "installationId": "inst-singleflight",
+                "controlSecret": "singleflight-secret"
+            }))
+        }
+
+        let requests = Arc::new(TokioMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/installations/register", post(handler))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        set_test_router_url(&state, format!("http://{addr}")).await;
+
+        let (first, second) = tokio::join!(
+            state.register_router_installation(),
+            state.register_router_installation()
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.installation_id, "inst-singleflight");
+        assert_eq!(second.installation_id, first.installation_id);
+        assert_eq!(second.public_key, first.public_key);
+        assert_eq!(requests.lock().await.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_failed_router_registration_shares_one_attempt() {
+        async fn handler(
+            AxumState(requests): AxumState<Arc<AtomicUsize>>,
+        ) -> (StatusCode, Json<Value>) {
+            requests.fetch_add(1, AtomicOrdering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": "router unavailable"})),
+            )
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/installations/register", post(handler))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        set_test_router_url(&state, format!("http://{addr}")).await;
+
+        let (first, second) = tokio::join!(
+            state.register_router_installation(),
+            state.register_router_installation()
+        );
+
+        let first = first.expect_err("first registration must fail").to_string();
+        let second = second
+            .expect_err("concurrent registration must share failure")
+            .to_string();
+        assert_eq!(first, second);
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registration_singleflight_preserves_unreachable_classification() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let state = test_state();
+        set_test_router_url(&state, format!("http://{addr}")).await;
+
+        let error = state
+            .register_router_installation()
+            .await
+            .expect_err("registration against a closed listener must fail");
+
+        assert!(
+            crate::client_tunnel_provision::is_router_unreachable_error(&error),
+            "error lost its unreachable classification: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_singleflight_classifies_503_as_transient() {
+        async fn handler() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"message": "retry later"})),
+            )
+        }
+
+        let app = Router::new().route("/v1/installations/register", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        set_test_router_url(&state, format!("http://{addr}")).await;
+
+        let error = state.register_router_installation().await.unwrap_err();
+
+        assert!(crate::client_tunnel_provision::is_router_unreachable_error(
+            &error
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registration_4xx_body_wording_cannot_enable_offline_fallback() {
+        async fn handler() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "connection policy is invalid"})),
+            )
+        }
+
+        let app = Router::new().route("/v1/installations/register", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        set_test_router_url(&state, format!("http://{addr}")).await;
+
+        let error = state.register_router_installation().await.unwrap_err();
+
+        assert!(!crate::client_tunnel_provision::is_router_unreachable_error(&error));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registration_response_merge_preserves_concurrent_config_updates() {
+        #[derive(Clone)]
+        struct Gate {
+            request_received: Arc<tokio::sync::Notify>,
+            send_response: Arc<tokio::sync::Notify>,
+        }
+
+        async fn handler(AxumState(gate): AxumState<Gate>) -> Json<Value> {
+            gate.request_received.notify_one();
+            gate.send_response.notified().await;
+            Json(json!({
+                "installationId": "inst-merge",
+                "controlSecret": "merge-secret"
+            }))
+        }
+
+        let gate = Gate {
+            request_received: Arc::new(tokio::sync::Notify::new()),
+            send_response: Arc::new(tokio::sync::Notify::new()),
+        };
+        let app = Router::new()
+            .route("/v1/installations/register", post(handler))
+            .with_state(gate.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        set_test_router_url(&state, format!("http://{addr}")).await;
+        let mut stale_snapshot = state.config_snapshot().await;
+        let registration_state = state.clone();
+        let registration =
+            tokio::spawn(async move { registration_state.register_router_installation().await });
+
+        gate.request_received.notified().await;
+        let pending = state.config_snapshot().await.router.identity.unwrap();
+        assert!(pending.has_keypair());
+        assert!(pending.installation_id.is_empty());
+        stale_snapshot.owner.email = Some("concurrent@example.com".to_string());
+        state.replace_config(stale_snapshot).await.unwrap();
+        gate.send_response.notify_one();
+        registration.await.unwrap().unwrap();
+
+        let config = state.config_snapshot().await;
+        assert_eq!(
+            config.owner.email.as_deref(),
+            Some("concurrent@example.com")
+        );
+        assert_eq!(
+            config.registered_router_identity().unwrap().installation_id,
+            "inst-merge"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn old_router_recovery_discovers_id_before_legacy_signed_request() {
+        async fn handler(
+            AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let mut requests = requests.lock().await;
+            requests.push(request);
+            match requests.len() {
+                1 => (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"message": "old protocol only"})),
+                ),
+                2 => (
+                    StatusCode::OK,
+                    Json(json!({"installationId": "inst-discovered"})),
+                ),
+                _ => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "installationId": "inst-discovered",
+                        "controlSecret": "legacy-control-secret"
+                    })),
+                ),
+            }
+        }
+
+        let requests = Arc::new(TokioMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/installations/register", post(handler))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        set_test_router_url(&state, format!("http://{addr}")).await;
+        let mut stale_config = state.config_snapshot().await;
+        let mut stale_identity = client::generate_identity_without_installation();
+        stale_identity.installation_id = "inst-from-another-router".to_string();
+        stale_identity.control_secret = Some("stale-control-secret".to_string());
+        stale_config.router.identity = Some(stale_identity);
+        state.replace_config(stale_config).await.unwrap();
+
+        let result = state.register_router_installation().await.unwrap();
+
+        assert_eq!(result.installation_id, "inst-discovered");
+        assert!(result.control_secret_present);
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["proofVersion"], 2);
+        assert!(requests[1].get("proofVersion").is_none());
+        assert!(requests[1].get("timestampMs").is_none());
+        assert!(requests[1].get("signature").is_none());
+        assert!(requests[2].get("proofVersion").is_none());
+        assert!(requests[2]["timestampMs"].is_number());
+        assert!(requests[2]["signature"].is_string());
+        assert_ne!(requests[0]["instanceNonce"], requests[1]["instanceNonce"]);
+        assert_ne!(requests[1]["instanceNonce"], requests[2]["instanceNonce"]);
+        drop(requests);
+        let identity = state.config_snapshot().await.router.identity.unwrap();
+        assert_eq!(identity.installation_id, "inst-discovered");
+        assert_eq!(
+            identity.control_secret.as_deref(),
+            Some("legacy-control-secret")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registration_fallback_chain_has_one_total_deadline() {
+        async fn handler(
+            AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let request_number = {
+                let mut requests = requests.lock().await;
+                requests.push(request);
+                requests.len()
+            };
+            match request_number {
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({"message": "legacy only"})),
+                    )
+                }
+                2 => (
+                    StatusCode::OK,
+                    Json(json!({"installationId": "discovered-before-timeout"})),
+                ),
+                _ => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "installationId": "discovered-before-timeout",
+                            "controlSecret": "too-late"
+                        })),
+                    )
+                }
+            }
+        }
+
+        let requests = Arc::new(TokioMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/installations/register", post(handler))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        set_test_router_url(&state, format!("http://{addr}")).await;
+
+        let started = tokio::time::Instant::now();
+        let error = state
+            .register_router_installation_locked_with_timeout(Duration::from_millis(200))
+            .await
+            .expect_err("the whole fallback chain must share one deadline");
+
+        assert!(started.elapsed() < Duration::from_millis(750));
+        assert!(error.to_string().contains("timed out"));
+        assert!(crate::client_tunnel_provision::is_router_unreachable_error(
+            &error
+        ));
+        assert_eq!(requests.lock().await.len(), 3);
+        assert!(state
+            .config_snapshot()
+            .await
+            .router
+            .identity
+            .unwrap()
+            .installation_id
+            .is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registered_identity_without_control_secret_recovers_via_legacy_signature() {
+        async fn handler(
+            AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let mut requests = requests.lock().await;
+            requests.push(request);
+            if requests.len() == 1 {
+                (
+                    StatusCode::OK,
+                    Json(json!({"installationId": "inst-known"})),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "installationId": "inst-known",
+                        "controlSecret": "recovered-control-secret"
+                    })),
+                )
+            }
+        }
+
+        let requests = Arc::new(TokioMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/installations/register", post(handler))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "inst-known".to_string();
+        config.router.identity = Some(identity);
+        state.replace_config(config).await.unwrap();
+
+        let result = state.register_router_installation().await.unwrap();
+
+        assert!(result.control_secret_present);
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["proofVersion"], 2);
+        assert!(requests[1].get("proofVersion").is_none());
+        assert!(requests[1]["timestampMs"].is_number());
+        assert!(requests[1]["signature"].is_string());
+        drop(requests);
+        let identity = state.config_snapshot().await.router.identity.unwrap();
+        assert_eq!(
+            identity.control_secret.as_deref(),
+            Some("recovered-control-secret")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_router_share_prune_is_compatible_without_persisting_marker() {
+        let (router_url, router, server) =
+            spawn_share_prune_mock_router(["ghost-share".to_string()], StatusCode::NOT_FOUND).await;
+        let state = test_state();
+        configure_registered_test_router(&state, &router_url, "inst-prune-legacy").await;
+        create_router_shares(&state, "legacyshare", 1).await;
+
+        assert_eq!(
+            reconcile_all_shares_to_router(state.clone()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            reconcile_all_shares_to_router(state.clone()).await.unwrap(),
+            1
+        );
+
+        assert_eq!(router.prune_requests.load(AtomicOrdering::SeqCst), 2);
+        assert!(state
+            .shares
+            .read()
+            .await
+            .router_share_prune_marker
+            .is_none());
+        assert!(ShareStore::load_or_default(&state.config_dir)
+            .unwrap()
+            .router_share_prune_marker
+            .is_none());
+        assert!(router.remote_share_ids.lock().await.contains("ghost-share"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_share_prune_clears_ghost_once_and_target_change_runs_again() {
+        let (first_url, first_router, first_server) =
+            spawn_share_prune_mock_router(["ghost-first".to_string()], StatusCode::NO_CONTENT)
+                .await;
+        let state = test_state();
+        configure_registered_test_router(&state, &first_url, "inst-prune-target").await;
+        create_router_shares(&state, "localshare", 1).await;
+
+        reconcile_all_shares_to_router(state.clone()).await.unwrap();
+        assert_eq!(
+            first_router
+                .remote_share_ids
+                .lock()
+                .await
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["localshare0".to_string()]
+        );
+        assert_eq!(first_router.prune_requests.load(AtomicOrdering::SeqCst), 1);
+        assert!(state
+            .shares
+            .read()
+            .await
+            .router_share_prune_applied_for(&first_url, "inst-prune-target"));
+
+        reconcile_all_shares_to_router(state.clone()).await.unwrap();
+        assert_eq!(
+            first_router.prune_requests.load(AtomicOrdering::SeqCst),
+            1,
+            "the same target must not be pruned twice after the marker is durable"
+        );
+
+        let (second_url, second_router, second_server) =
+            spawn_share_prune_mock_router(["ghost-second".to_string()], StatusCode::NO_CONTENT)
+                .await;
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(second_url.clone());
+        config.router.api_base = None;
+        state.replace_config(config).await.unwrap();
+
+        reconcile_all_shares_to_router(state.clone()).await.unwrap();
+        assert_eq!(second_router.prune_requests.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            second_router
+                .remote_share_ids
+                .lock()
+                .await
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["localshare0".to_string()]
+        );
+        let persisted = ShareStore::load_or_default(&state.config_dir).unwrap();
+        assert!(persisted.router_share_prune_applied_for(&second_url, "inst-prune-target"));
+        assert!(!persisted.router_share_prune_applied_for(&first_url, "inst-prune-target"));
+
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn router_share_reconcile_chunks_upserts_before_one_time_prune() {
+        let (router_url, router, server) =
+            spawn_share_prune_mock_router(Vec::new(), StatusCode::NO_CONTENT).await;
+        let state = test_state();
+        configure_registered_test_router(&state, &router_url, "inst-prune-chunks").await;
+        let share_count = ROUTER_SHARE_SYNC_BATCH_SIZE * 2 + 3;
+        create_router_shares(&state, "chunkedshare", share_count).await;
+
+        assert_eq!(
+            reconcile_all_shares_to_router(state.clone()).await.unwrap(),
+            share_count
+        );
+
+        assert_eq!(
+            *router.batch_sizes.lock().await,
+            vec![
+                ROUTER_SHARE_SYNC_BATCH_SIZE,
+                ROUTER_SHARE_SYNC_BATCH_SIZE,
+                3
+            ]
+        );
+        assert_eq!(
+            *router.request_order.lock().await,
+            vec![
+                format!("batch:{}", ROUTER_SHARE_SYNC_BATCH_SIZE),
+                format!("batch:{}", ROUTER_SHARE_SYNC_BATCH_SIZE),
+                "batch:3".to_string(),
+                format!("prune:{share_count}"),
+            ]
+        );
+        assert_eq!(router.remote_share_ids.lock().await.len(), share_count);
+        assert!(state
+            .shares
+            .read()
+            .await
+            .router_share_prune_applied_for(&router_url, "inst-prune-chunks"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_router_share_delete_survives_restart_and_success_clears_it() {
+        async fn handler(
+            AxumState(attempts): AxumState<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            if attempts.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"message": "retry later"})),
+                )
+            } else {
+                (StatusCode::OK, Json(json!({"ok": true})))
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/shares/batch-sync", post(handler))
+            .with_state(attempts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "inst-delete-restart".to_string();
+        config.router.identity = Some(identity);
+        state.replace_config(config).await.unwrap();
+        state
+            .mutate_shares_immediate(|store| {
+                store.upsert(router_sync_share_input("sharedelete", "provider-delete"))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let tombstone = state
+            .mutate_shares_immediate(|store| store.delete("sharedelete"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        retry_router_share_deletes(&state, &[tombstone.clone()])
+            .await
+            .expect_err("the first Router delete must remain pending");
+        let persisted = ShareStore::load_or_default(&state.config_dir).unwrap();
+        assert_eq!(persisted.pending_router_deletes.len(), 1);
+        assert!(persisted.pending_router_deletes[0].last_error.is_some());
+        let config_dir = state.config_dir.clone();
+        drop(state);
+
+        let restarted = test_state_at(config_dir.clone());
+        let pending = restarted.shares.read().await.pending_router_deletes.clone();
+        assert_eq!(pending.len(), 1);
+        retry_router_share_deletes(&restarted, &pending)
+            .await
+            .unwrap();
+
+        assert!(restarted
+            .shares
+            .read()
+            .await
+            .pending_router_deletes
+            .is_empty());
+        assert!(ShareStore::load_or_default(&config_dir)
+            .unwrap()
+            .pending_router_deletes
+            .is_empty());
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_router_share_deletes_are_replayed_in_bounded_batches() {
+        async fn handler(
+            AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            requests.lock().await.push(request);
+            Json(json!({"ok": true}))
+        }
+
+        let requests = Arc::new(TokioMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/shares/batch-sync", post(handler))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "inst-delete-batch".to_string();
+        config.router.identity = Some(identity);
+        state.replace_config(config).await.unwrap();
+
+        let tombstone_count = ROUTER_SHARE_SYNC_BATCH_SIZE * 2 + 3;
+        let tombstones =
+            create_router_delete_tombstones(&state, "batchshare", tombstone_count).await;
+
+        assert_eq!(
+            retry_router_share_deletes(&state, &tombstones)
+                .await
+                .unwrap(),
+            tombstone_count
+        );
+
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["ops"].as_array().unwrap().len())
+                .collect::<Vec<_>>(),
+            vec![
+                ROUTER_SHARE_SYNC_BATCH_SIZE,
+                ROUTER_SHARE_SYNC_BATCH_SIZE,
+                3
+            ]
+        );
+        assert!(requests
+            .iter()
+            .flat_map(|request| request["ops"].as_array().unwrap())
+            .all(|operation| operation["kind"] == "delete"));
+        assert!(state.shares.read().await.pending_router_deletes.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_router_share_delete_replay_confirms_each_batch_before_stopping_on_failure() {
+        async fn handler(
+            AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let attempt = {
+                let mut requests = requests.lock().await;
+                requests.push(request);
+                requests.len()
+            };
+            if attempt == 2 {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"message": "retry later"})),
+                )
+            } else {
+                (StatusCode::OK, Json(json!({"ok": true})))
+            }
+        }
+
+        let requests = Arc::new(TokioMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/shares/batch-sync", post(handler))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "inst-delete-batch-failure".to_string();
+        config.router.identity = Some(identity);
+        state.replace_config(config).await.unwrap();
+
+        let tombstone_count = ROUTER_SHARE_SYNC_BATCH_SIZE * 2 + 7;
+        let tombstones =
+            create_router_delete_tombstones(&state, "failedbatchshare", tombstone_count).await;
+
+        retry_router_share_deletes(&state, &tombstones)
+            .await
+            .expect_err("the second Router delete batch must remain pending");
+
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            request["ops"].as_array().unwrap().len() == ROUTER_SHARE_SYNC_BATCH_SIZE
+        }));
+        drop(requests);
+
+        let persisted = ShareStore::load_or_default(&state.config_dir).unwrap();
+        assert_eq!(
+            persisted.pending_router_deletes.len(),
+            tombstone_count - ROUTER_SHARE_SYNC_BATCH_SIZE
+        );
+        assert!(
+            persisted.pending_router_deletes[..ROUTER_SHARE_SYNC_BATCH_SIZE]
+                .iter()
+                .all(|tombstone| tombstone.last_error.is_some())
+        );
+        assert!(
+            persisted.pending_router_deletes[ROUTER_SHARE_SYNC_BATCH_SIZE..]
+                .iter()
+                .all(|tombstone| tombstone.last_error.is_none())
+        );
+        assert_eq!(
+            persisted.pending_router_deletes[0].share_id,
+            format!("failedbatchshare{}", ROUTER_SHARE_SYNC_BATCH_SIZE)
+        );
+        assert_eq!(
+            persisted.pending_router_deletes[ROUTER_SHARE_SYNC_BATCH_SIZE].share_id,
+            format!("failedbatchshare{}", ROUTER_SHARE_SYNC_BATCH_SIZE * 2)
+        );
+        assert_eq!(
+            state.shares.read().await.pending_router_deletes,
+            persisted.pending_router_deletes
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn in_flight_delete_is_followed_by_upsert_when_same_id_is_recreated() {
+        #[derive(Clone)]
+        struct Gate {
+            requests: Arc<TokioMutex<Vec<Value>>>,
+            delete_received: Arc<tokio::sync::Notify>,
+            release_delete: Arc<tokio::sync::Notify>,
+        }
+
+        async fn handler(
+            AxumState(gate): AxumState<Gate>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            let kind = request["ops"][0]["kind"].as_str().unwrap().to_string();
+            gate.requests.lock().await.push(request);
+            if kind == "delete" {
+                gate.delete_received.notify_one();
+                gate.release_delete.notified().await;
+            }
+            Json(json!({"ok": true}))
+        }
+
+        let gate = Gate {
+            requests: Arc::new(TokioMutex::new(Vec::new())),
+            delete_received: Arc::new(tokio::sync::Notify::new()),
+            release_delete: Arc::new(tokio::sync::Notify::new()),
+        };
+        let app = Router::new()
+            .route("/v1/shares/batch-sync", post(handler))
+            .with_state(gate.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "inst-delete-recreate".to_string();
+        config.router.identity = Some(identity);
+        state.replace_config(config).await.unwrap();
+        state
+            .mutate_shares_immediate(|store| {
+                store.upsert(router_sync_share_input(
+                    "recreatedshare",
+                    "provider-before-delete",
+                ))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let tombstone = state
+            .mutate_shares_immediate(|store| store.delete("recreatedshare"))
+            .await
+            .unwrap()
+            .unwrap();
+        let retry_state = state.clone();
+        let retry_tombstone = tombstone.clone();
+        let retry = tokio::spawn(async move {
+            retry_router_share_deletes(&retry_state, &[retry_tombstone]).await
+        });
+
+        gate.delete_received.notified().await;
+        state
+            .mutate_shares_immediate(|store| {
+                store.upsert(router_sync_share_input(
+                    "recreatedshare",
+                    "provider-after-delete",
+                ))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.shares.read().await.pending_router_deletes.is_empty());
+        gate.release_delete.notify_one();
+        retry.await.unwrap().unwrap();
+
+        let requests = gate.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["ops"][0]["kind"], "delete");
+        assert_eq!(requests[1]["ops"][0]["kind"], "upsert");
+        assert_eq!(
+            requests[1]["ops"][0]["share"]["providerId"],
+            "provider-after-delete"
+        );
+        drop(requests);
+        let share = state
+            .shares
+            .read()
+            .await
+            .get("recreatedshare")
+            .cloned()
+            .unwrap();
+        assert_eq!(share.router_synced_revision, share.config_revision);
+        server.abort();
+    }
+
+    async fn set_test_router_url(state: &ServerState, url: String) {
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(url);
+        config.router.api_base = None;
+        state.replace_config(config).await.unwrap();
+    }
+
     fn test_state() -> ServerState {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let config_dir = std::env::temp_dir().join(format!("cc-switch-server-state-test-{nanos}"));
+        test_state_at(config_dir)
+    }
+
+    fn test_state_at(config_dir: PathBuf) -> ServerState {
         let log_capture = Arc::new(crate::logging::LogCapture::new(
             crate::logging::RING_BUFFER_CAPACITY,
         ));

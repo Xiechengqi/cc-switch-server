@@ -327,7 +327,7 @@ async fn notify_runtime_refresh(state: &ServerState, share: &Share) {
         return;
     };
     let config = state.config_snapshot().await;
-    if config.router_api_base().is_none() || config.router.identity.is_none() {
+    if config.router_api_base().is_none() || !config.has_registered_router_identity() {
         return;
     }
     let http = state.http_client().await;
