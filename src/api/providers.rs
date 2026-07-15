@@ -86,7 +86,7 @@ pub(in crate::api) async fn cascade_delete_shares_for_provider(
     }
     for share_id in share_ids {
         let tombstone = state
-            .mutate_shares_immediate(|store| store.delete(&share_id))
+            .delete_share_immediate(&share_id)
             .await
             .map_err(ApiError::internal)?;
         if let Some(tombstone) = tombstone {

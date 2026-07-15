@@ -20,6 +20,7 @@ const ROUTER_LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const ROUTER_INSTALLATION_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_CONTROL_PLANE_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTER_INSTALLATION_REGISTER_RESPONSE_BODY_LIMIT: usize = 16 * 1024;
 const ROUTER_ERROR_BODY_LIMIT: usize = 512;
 const ROUTER_SHARE_PRUNE_MAX_IDS: usize = 10_000;
 const REGISTRATION_PROOF_VERSION: u8 = 2;
@@ -515,17 +516,21 @@ async fn send_register_installation_request_with_timeout(
         .await
         .map_err(RegisterInstallationAttemptError::Request)?;
     let status = response.status();
-    let body = response
-        .bytes()
+    if !status.is_success() {
+        let body = read_bounded_router_error_body(response)
+            .await
+            .map_err(RegisterInstallationAttemptError::Request)?;
+        return Err(RegisterInstallationAttemptError::Rejected { status, body });
+    }
+    let body = read_bounded_router_registration_response_body(response)
         .await
         .map_err(RegisterInstallationAttemptError::Request)?;
-    if !status.is_success() {
-        return Err(RegisterInstallationAttemptError::Rejected {
-            status,
-            body: bounded_router_error_body(&String::from_utf8_lossy(&body)),
-        });
+    if body.truncated {
+        return Err(RegisterInstallationAttemptError::InvalidResponse(format!(
+            "router response body exceeds the {ROUTER_INSTALLATION_REGISTER_RESPONSE_BODY_LIMIT} byte limit"
+        )));
     }
-    serde_json::from_slice(&body)
+    serde_json::from_slice(&body.bytes)
         .map_err(|error| RegisterInstallationAttemptError::InvalidResponse(error.to_string()))
 }
 
@@ -556,8 +561,7 @@ pub async fn send_installation_heartbeat(
     if status.is_success() {
         return Ok(());
     }
-    let body = response
-        .text()
+    let body = read_bounded_router_error_body(response)
         .await
         .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
     Err(classify_installation_heartbeat_failure(status, &body))
@@ -584,7 +588,7 @@ fn classify_installation_heartbeat_failure(
 }
 
 fn bounded_router_error_body(body: &str) -> String {
-    body.chars().take(512).collect()
+    body.chars().take(ROUTER_ERROR_BODY_LIMIT).collect()
 }
 
 fn build_installation_heartbeat_request(
@@ -1230,12 +1234,44 @@ async fn read_bounded_router_error_body(
             break;
         };
         if chunk.is_empty() {
-            break;
+            continue;
         }
         let remaining = ROUTER_ERROR_BODY_LIMIT - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    Ok(bounded_router_error_body(&String::from_utf8_lossy(&body)))
+}
+
+struct BoundedRouterResponseBody {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_bounded_router_registration_response_body(
+    mut response: reqwest::Response,
+) -> Result<BoundedRouterResponseBody, reqwest::Error> {
+    let mut body = Vec::with_capacity(ROUTER_INSTALLATION_REGISTER_RESPONSE_BODY_LIMIT);
+    loop {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        let remaining = ROUTER_INSTALLATION_REGISTER_RESPONSE_BODY_LIMIT - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            return Ok(BoundedRouterResponseBody {
+                bytes: body,
+                truncated: true,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(BoundedRouterResponseBody {
+        bytes: body,
+        truncated: false,
+    })
 }
 
 async fn push_share_ops_with_timeout(
@@ -1870,12 +1906,16 @@ fn default_tunnel_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
     use axum::extract::State;
     use axum::http::StatusCode;
+    use axum::response::Response;
     use axum::routing::post;
     use axum::{Json, Router};
+    use bytes::Bytes;
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use serde_json::{json, Value};
+    use std::convert::Infallible;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -1883,6 +1923,19 @@ mod tests {
     #[serde(rename_all = "camelCase")]
     struct TestPayload {
         share_id: String,
+    }
+
+    fn oversized_chunked_response(status: StatusCode, prefix: &'static str) -> Response {
+        let chunks = std::iter::once(Ok::<_, Infallible>(Bytes::from_static(prefix.as_bytes())))
+            .chain(
+                (0..=ROUTER_INSTALLATION_REGISTER_RESPONSE_BODY_LIMIT / 1024)
+                    .map(|_| Ok::<_, Infallible>(Bytes::from_static(&[b'x'; 1024]))),
+            );
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from_stream(futures_util::stream::iter(chunks)))
+            .unwrap()
     }
 
     #[test]
@@ -2265,6 +2318,72 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn registration_rejects_an_oversized_chunked_success_response() {
+        async fn handler() -> Response {
+            oversized_chunked_response(StatusCode::OK, "{\"installationId\":\"")
+        }
+
+        let app = Router::new().route("/v1/installations/register", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let identity = generate_identity_without_installation();
+        let request = build_register_installation_request(
+            &identity,
+            "linux",
+            "1.2.3",
+            "oversized-response-nonce".into(),
+            123,
+        )
+        .unwrap();
+
+        let error = send_register_installation_request_with_timeout(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &request,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("an oversized success response must be rejected");
+
+        assert!(matches!(
+            error,
+            RegisterInstallationAttemptError::InvalidResponse(message)
+                if message.contains("response body exceeds the 16384 byte limit")
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registration_preserves_rejection_for_an_oversized_chunked_error() {
+        async fn handler() -> Response {
+            oversized_chunked_response(StatusCode::UNAUTHORIZED, "registration denied: ")
+        }
+
+        let app = Router::new().route("/v1/installations/register", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let identity = generate_identity_without_installation();
+
+        let error = register_installation_v2(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &identity,
+        )
+        .await
+        .expect_err("an oversized rejection must remain a rejection");
+
+        let RegisterInstallationAttemptError::Rejected { status, body } = error else {
+            panic!("oversized error response changed registration error classification");
+        };
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert!(body.starts_with("registration denied: "));
+        assert_eq!(body.chars().count(), ROUTER_ERROR_BODY_LIMIT);
+        server.abort();
+    }
+
     #[test]
     fn unsigned_legacy_discovery_omits_all_proof_fields() {
         let identity = generate_identity_without_installation();
@@ -2311,6 +2430,94 @@ mod tests {
 
         assert!(error.to_string().contains("503 Service Unavailable"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_preserves_classification_for_an_oversized_chunked_error() {
+        async fn handler() -> Response {
+            oversized_chunked_response(StatusCode::SERVICE_UNAVAILABLE, "router overloaded: ")
+        }
+
+        let app = Router::new().route("/v1/installations/heartbeat", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-heartbeat-oversized".into();
+        config.router.identity = Some(identity);
+
+        let error = send_installation_heartbeat(
+            &reqwest::Client::new(),
+            &config,
+            "boot-oversized-response",
+        )
+        .await
+        .expect_err("an oversized heartbeat error must be reported");
+
+        let InstallationHeartbeatError::Transient(message) = error else {
+            panic!("oversized error response changed heartbeat error classification");
+        };
+        assert!(message.contains("503 Service Unavailable: router overloaded: "));
+        assert!(message.chars().count() < ROUTER_ERROR_BODY_LIMIT + 40);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_classifies_401_and_404_without_waiting_for_a_stalled_chunked_tail() {
+        use tokio::io::AsyncWriteExt;
+
+        for (status, status_line) in [
+            (reqwest::StatusCode::UNAUTHORIZED, "401 Unauthorized"),
+            (reqwest::StatusCode::NOT_FOUND, "404 Not Found"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body = "x".repeat(ROUTER_ERROR_BODY_LIMIT);
+                let headers = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                    body.len()
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(body.as_bytes()).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+            let mut config = ServerConfig::empty();
+            config.router.url = Some(format!("http://{addr}"));
+            let mut identity = generate_identity_without_installation();
+            identity.installation_id = format!("inst-heartbeat-stalled-{}", status.as_u16());
+            config.router.identity = Some(identity);
+
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                send_installation_heartbeat(
+                    &reqwest::Client::new(),
+                    &config,
+                    "boot-stalled-error-tail",
+                ),
+            )
+            .await
+            .expect("heartbeat must stop reading after the bounded error prefix")
+            .expect_err("the heartbeat response must remain an error");
+
+            let body = match (status, error) {
+                (
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    InstallationHeartbeatError::RegistrationRequired { body, .. },
+                ) => body,
+                (
+                    reqwest::StatusCode::NOT_FOUND,
+                    InstallationHeartbeatError::EndpointUnavailable { body, .. },
+                ) => body,
+                (_, error) => panic!("stalled error tail changed classification: {error}"),
+            };
+            assert_eq!(body.len(), ROUTER_ERROR_BODY_LIMIT);
+            server.abort();
+        }
     }
 
     #[tokio::test]

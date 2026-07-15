@@ -43,9 +43,28 @@ pub struct ShareDeleteTombstone {
     pub operation_id: String,
     pub created_at_ms: u128,
     #[serde(default)]
+    pub router_api_base: Option<String>,
+    #[serde(default)]
+    pub installation_id: Option<String>,
+    #[serde(default)]
     pub last_attempt_at_ms: Option<u128>,
     #[serde(default)]
     pub last_error: Option<String>,
+}
+
+impl ShareDeleteTombstone {
+    pub fn has_legacy_router_target(&self) -> bool {
+        self.router_api_base.is_none() && self.installation_id.is_none()
+    }
+
+    pub fn router_target_matches(&self, router_api_base: &str, installation_id: &str) -> bool {
+        self.router_api_base.as_deref().is_some_and(|target| {
+            normalize_router_api_base(target) == normalize_router_api_base(router_api_base)
+        }) && self
+            .installation_id
+            .as_deref()
+            .is_some_and(|target| target.trim() == installation_id.trim())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +419,23 @@ impl ShareStore {
     }
 
     pub fn delete(&mut self, share_id: &str) -> Option<ShareDeleteTombstone> {
+        self.delete_with_router_target(share_id, None)
+    }
+
+    pub fn delete_for_router_target(
+        &mut self,
+        share_id: &str,
+        router_api_base: &str,
+        installation_id: &str,
+    ) -> Option<ShareDeleteTombstone> {
+        self.delete_with_router_target(share_id, Some((router_api_base, installation_id)))
+    }
+
+    fn delete_with_router_target(
+        &mut self,
+        share_id: &str,
+        router_target: Option<(&str, &str)>,
+    ) -> Option<ShareDeleteTombstone> {
         let before = self.shares.len();
         self.shares.retain(|item| item.id != share_id);
         if self.shares.len() == before {
@@ -411,11 +447,36 @@ impl ShareStore {
             share_id: share_id.to_string(),
             operation_id: generate_share_delete_operation_id(),
             created_at_ms: now_ms(),
+            router_api_base: router_target
+                .map(|(router_api_base, _)| normalize_router_api_base(router_api_base)),
+            installation_id: router_target
+                .map(|(_, installation_id)| installation_id.trim().to_string()),
             last_attempt_at_ms: None,
             last_error: None,
         };
         self.pending_router_deletes.push(tombstone.clone());
         Some(tombstone)
+    }
+
+    pub fn bind_legacy_router_delete_target(
+        &mut self,
+        operation_id: &str,
+        router_api_base: &str,
+        installation_id: &str,
+    ) -> bool {
+        let Some(tombstone) = self
+            .pending_router_deletes
+            .iter_mut()
+            .find(|pending| pending.operation_id == operation_id)
+        else {
+            return false;
+        };
+        if tombstone.router_api_base.is_some() || tombstone.installation_id.is_some() {
+            return false;
+        }
+        tombstone.router_api_base = Some(normalize_router_api_base(router_api_base));
+        tombstone.installation_id = Some(installation_id.trim().to_string());
+        true
     }
 
     pub fn pending_router_delete(
@@ -1454,6 +1515,35 @@ mod tests {
         let store: ShareStore = serde_json::from_str(r#"{"shares":[]}"#).unwrap();
         assert!(store.pending_router_deletes.is_empty());
         assert!(store.router_share_prune_marker.is_none());
+
+        let tombstone: ShareDeleteTombstone = serde_json::from_str(
+            r#"{"shareId":"legacy","operationId":"legacy-op","createdAtMs":1}"#,
+        )
+        .unwrap();
+        assert!(tombstone.has_legacy_router_target());
+    }
+
+    #[test]
+    fn router_delete_tombstone_normalizes_bound_target() {
+        let mut store = ShareStore::default();
+        store.upsert(codex_share_input("share-targeted")).unwrap();
+
+        let tombstone = store
+            .delete_for_router_target(
+                "share-targeted",
+                " https://router.example.test/api/// ",
+                " installation-a ",
+            )
+            .unwrap();
+
+        assert_eq!(
+            tombstone.router_api_base.as_deref(),
+            Some("https://router.example.test/api")
+        );
+        assert_eq!(tombstone.installation_id.as_deref(), Some("installation-a"));
+        assert!(
+            tombstone.router_target_matches("https://router.example.test/api/", "installation-a")
+        );
     }
 
     #[test]

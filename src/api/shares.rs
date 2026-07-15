@@ -166,7 +166,7 @@ pub(in crate::api) async fn delete_share(
 ) -> Result<Json<DeleteResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let tombstone = state
-        .mutate_shares_immediate(|store| store.delete(&id))
+        .delete_share_immediate(&id)
         .await
         .map_err(ApiError::internal)?;
     if let Some(tombstone) = tombstone.as_ref() {
