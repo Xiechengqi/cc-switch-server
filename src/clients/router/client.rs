@@ -25,6 +25,10 @@ pub struct RegisterInstallationRequest {
     pub platform: String,
     pub app_version: String,
     pub instance_nonce: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -328,12 +332,13 @@ pub async fn register_installation(
         .clone()
         .unwrap_or_else(generate_identity_without_installation);
 
-    let request = RegisterInstallationRequest {
-        public_key: identity.public_key.clone(),
-        platform: std::env::consts::OS.to_string(),
-        app_version: crate::build_info::router_registration_version().to_string(),
-        instance_nonce: nonce(),
-    };
+    let request = build_register_installation_request(
+        &identity,
+        std::env::consts::OS,
+        crate::build_info::router_registration_version(),
+        nonce(),
+        now_ms(),
+    )?;
     let response = http
         .post(format!("{api_base}/v1/installations/register"))
         .json(&request)
@@ -1240,6 +1245,64 @@ fn generate_identity_without_installation() -> RouterIdentity {
     }
 }
 
+fn build_register_installation_request(
+    identity: &RouterIdentity,
+    platform: &str,
+    app_version: &str,
+    instance_nonce: String,
+    timestamp_ms: i64,
+) -> anyhow::Result<RegisterInstallationRequest> {
+    let (timestamp_ms, signature) = if identity.installation_id.trim().is_empty() {
+        (None, None)
+    } else {
+        let signature = sign_registration_recovery(
+            identity,
+            platform,
+            app_version,
+            &instance_nonce,
+            timestamp_ms,
+        )?;
+        (Some(timestamp_ms), Some(signature))
+    };
+    Ok(RegisterInstallationRequest {
+        public_key: identity.public_key.clone(),
+        platform: platform.to_string(),
+        app_version: app_version.to_string(),
+        instance_nonce,
+        timestamp_ms,
+        signature,
+    })
+}
+
+fn sign_registration_recovery(
+    identity: &RouterIdentity,
+    platform: &str,
+    app_version: &str,
+    instance_nonce: &str,
+    timestamp_ms: i64,
+) -> anyhow::Result<String> {
+    if identity.installation_id.trim().is_empty() {
+        bail!("router installation id is missing");
+    }
+    let secret = STANDARD
+        .decode(&identity.private_key)
+        .context("decode router private key")?;
+    let secret: [u8; 32] = secret
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid router private key length"))?;
+    let signing_key = SigningKey::from_bytes(&secret);
+    let canonical = format!(
+        "{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
+        identity.installation_id,
+        identity.public_key.trim(),
+        platform.trim(),
+        app_version,
+        instance_nonce,
+        timestamp_ms
+    );
+    Ok(STANDARD.encode(signing_key.sign(canonical.as_bytes()).to_bytes()))
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1372,6 +1435,57 @@ mod tests {
         let second = sign_payload(&identity, "share_delete", &payload, 123, "nonce-2").unwrap();
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn first_registration_request_is_unsigned() {
+        let identity = generate_identity_without_installation();
+
+        let request = build_register_installation_request(
+            &identity,
+            "linux",
+            "1.2.3",
+            "registration-nonce".into(),
+            123,
+        )
+        .unwrap();
+
+        assert!(request.timestamp_ms.is_none());
+        assert!(request.signature.is_none());
+        let value = serde_json::to_value(request).unwrap();
+        assert!(value.get("timestampMs").is_none());
+        assert!(value.get("signature").is_none());
+    }
+
+    #[test]
+    fn existing_registration_request_signs_router_recovery_payload() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-existing".into();
+
+        let request = build_register_installation_request(
+            &identity,
+            "linux",
+            "1.2.3",
+            "registration-nonce".into(),
+            123,
+        )
+        .unwrap();
+
+        assert_eq!(request.timestamp_ms, Some(123));
+        let public_key = STANDARD.decode(&identity.public_key).unwrap();
+        let public_key: [u8; 32] = public_key.try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
+        let signature = STANDARD.decode(request.signature.unwrap()).unwrap();
+        let signature: [u8; 64] = signature.try_into().unwrap();
+        let signature = Signature::from_bytes(&signature);
+        let canonical = format!(
+            "inst-existing\nregister_installation\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
+            identity.public_key
+        );
+
+        verifying_key
+            .verify(canonical.as_bytes(), &signature)
+            .unwrap();
     }
 
     #[test]
