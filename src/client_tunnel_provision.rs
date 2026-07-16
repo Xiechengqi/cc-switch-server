@@ -316,6 +316,12 @@ pub(crate) async fn provision_client_tunnel(
         )
         .await
         {
+            if !allow_offline {
+                return Err(ApiError::bad_gateway(format!(
+                    "router owner bootstrap bind failed: {}",
+                    error.message
+                )));
+            }
             tracing::warn!(
                 error = %error.message,
                 "router owner bootstrap bind during provision failed"

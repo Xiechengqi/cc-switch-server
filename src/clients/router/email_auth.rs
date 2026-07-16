@@ -160,6 +160,13 @@ impl EmailAuthError {
         }
     }
 
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -431,7 +438,13 @@ pub async fn bind_owner_email_at_setup(
         .map_err(|error| {
             EmailAuthError::bad_gateway(format!("bind installation owner email failed: {error}"))
         })?;
-    handle_json_response(response).await
+    let binding: BindOwnerEmailResponse = handle_json_response(response).await?;
+    if !binding.owner_verified {
+        return Err(EmailAuthError::conflict(
+            "router accepted owner binding without verifying the email; upgrade cc-switch-router to the latest release that trusts installation-signed owner bind",
+        ));
+    }
+    Ok(binding)
 }
 
 pub async fn change_owner_email_at_installation(

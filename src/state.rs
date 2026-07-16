@@ -4179,8 +4179,17 @@ pub(crate) async fn ensure_router_installation_owner_bound(
     )
     .await
     {
-        Ok(binding) if binding.ok && binding.owner_email.eq_ignore_ascii_case(expected_owner) => {
+        Ok(binding)
+            if binding.ok
+                && binding.owner_verified
+                && binding.owner_email.eq_ignore_ascii_case(expected_owner) =>
+        {
             return Ok(());
+        }
+        Ok(binding) if binding.ok && !binding.owner_verified => {
+            anyhow::bail!(
+                "router installation owner email is not verified; upgrade cc-switch-router to the latest release"
+            );
         }
         Ok(_) => {}
         Err(error) => {
@@ -4208,7 +4217,7 @@ async fn installation_owner_matches(
         return Ok(false);
     };
     if bound_owner.eq_ignore_ascii_case(expected_owner) {
-        return Ok(true);
+        return Ok(owner_status.owner_verified);
     }
     anyhow::bail!(
         "router installation owner email ({bound_owner}) does not match configured owner ({expected_owner})"
@@ -5568,7 +5577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unverified_owner_email_match_passes_owner_gate() {
+    async fn unverified_owner_email_match_blocks_owner_gate() {
         async fn owner_status() -> Json<Value> {
             Json(json!({
                 "ok": true,
@@ -5592,9 +5601,15 @@ mod tests {
         config.owner.email = Some("owner@example.com".to_string());
         state.replace_config(config.clone()).await.unwrap();
 
-        ensure_router_installation_owner_bound(&state, &config)
+        let error = ensure_router_installation_owner_bound(&state, &config)
             .await
-            .unwrap();
+            .expect_err("unverified owner must block owner gate");
+        assert!(
+            error
+                .to_string()
+                .contains("router installation owner email is not bound"),
+            "unexpected error: {error}"
+        );
 
         server.abort();
     }
