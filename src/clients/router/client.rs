@@ -18,6 +18,7 @@ use crate::domain::sharing::router_contract::*;
 use crate::self_update::version::LatestReleaseMeta;
 
 const ROUTER_LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
+const ROUTER_TUNNEL_CONTROL_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const ROUTER_INSTALLATION_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_CONTROL_PLANE_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1331,7 +1332,7 @@ async fn send_namespace_tunnel_control<T: Serialize + Clone>(
     let request = tunnel_signed_request(identity, action, payload)?;
     let response = http
         .post(format!("{api_base}{path}"))
-        .timeout(ROUTER_LEASE_RENEW_TIMEOUT)
+        .timeout(ROUTER_TUNNEL_CONTROL_HTTP_TIMEOUT)
         .json(&request)
         .send()
         .await

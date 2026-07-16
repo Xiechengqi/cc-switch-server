@@ -836,8 +836,10 @@ async fn run_tunnel_actor(
                 tracing::warn!(
                     tunnel_key = %key,
                     tunnel_kind = %kind,
-                    generation,
-                    error = %error,
+                    actor_generation = generation,
+                    lease_generation = lease.generation,
+                    expected_generation = lease.expected_generation,
+                    error = %format!("{error:#}"),
                     "tunnel connection cycle failed"
                 );
             }
@@ -983,76 +985,92 @@ async fn connect_and_forward(
         anyhow::bail!("router ssh authentication failed");
     }
 
-    let remote_port = tokio::time::timeout(REMOTE_FORWARD_TIMEOUT, request_forward(&mut handle))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "router remote forward request timed out after {}s",
-                REMOTE_FORWARD_TIMEOUT.as_secs()
-            )
-        })??;
+    let result = async {
+        let remote_port =
+            tokio::time::timeout(REMOTE_FORWARD_TIMEOUT, request_forward(&mut handle))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "router remote forward request timed out after {}s",
+                        REMOTE_FORWARD_TIMEOUT.as_secs()
+                    )
+                })??;
 
-    let activation =
-        tokio::time::timeout(TUNNEL_CONTROL_TIMEOUT, activate_tunnel_fn(lease.clone())).await;
-    let activation_confirmed = match activation {
-        Ok(Ok(state)) => tunnel_state_is_active(&state, lease),
-        Ok(Err(error)) => {
-            tracing::warn!(
-                tunnel_key = %key,
-                tunnel_kind = %kind,
-                generation,
-                error = %error,
-                "tunnel activation failed; checking authoritative state"
+        // Router activation probes the candidate through this reverse forward.
+        // Keep the pump live while control-plane activation is in flight.
+        let forward = accept_loop(fwd_rx, local_addr);
+        tokio::pin!(forward);
+        let activation = poll_control_with_forward(
+            forward.as_mut(),
+            tokio::time::timeout(TUNNEL_CONTROL_TIMEOUT, activate_tunnel_fn(lease.clone())),
+            "tunnel forward ended before activation completed",
+        )
+        .await?;
+        let activation_confirmed = match activation {
+            Ok(Ok(state)) => tunnel_state_is_active(&state, lease),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    tunnel_key = %key,
+                    tunnel_kind = %kind,
+                    actor_generation = generation,
+                    lease_generation = lease.generation,
+                    expected_generation = lease.expected_generation,
+                    error = %format!("{error:#}"),
+                    "tunnel activation failed; checking authoritative state"
+                );
+                query_tunnel_activation_state(forward.as_mut(), tunnel_state_fn, lease).await?
+            }
+            Err(_) => {
+                tracing::warn!(
+                    tunnel_key = %key,
+                    tunnel_kind = %kind,
+                    actor_generation = generation,
+                    lease_generation = lease.generation,
+                    expected_generation = lease.expected_generation,
+                    timeout_seconds = TUNNEL_CONTROL_TIMEOUT.as_secs(),
+                    "tunnel activation timed out; checking authoritative state"
+                );
+                query_tunnel_activation_state(forward.as_mut(), tunnel_state_fn, lease).await?
+            }
+        };
+        if !activation_confirmed {
+            anyhow::bail!(
+                "router did not confirm lease generation {} as active (expected active generation {})",
+                lease.generation,
+                lease.expected_generation
             );
-            query_tunnel_activation_state(tunnel_state_fn, lease).await?
         }
-        Err(_) => {
-            tracing::warn!(
-                tunnel_key = %key,
-                tunnel_kind = %kind,
-                generation,
-                timeout_seconds = TUNNEL_CONTROL_TIMEOUT.as_secs(),
-                "tunnel activation timed out; checking authoritative state"
-            );
-            query_tunnel_activation_state(tunnel_state_fn, lease).await?
-        }
-    };
-    if !activation_confirmed {
-        anyhow::bail!(
-            "router did not confirm tunnel generation {} as active",
-            lease.generation
+
+        let mut connected = status_from_lease(
+            key,
+            kind,
+            "connected",
+            lease,
+            None,
+            generation,
+            start_reason,
+            spec_id,
+            TransportState::Active,
         );
+        connected.remote_port = Some(remote_port);
+        connected.connected_at_ms = Some(now_ms());
+        set_status_for_generation(statuses, store_path, connected).await;
+
+        maintain_forward_with_pump(
+            forward.as_mut(),
+            lease,
+            remote_port,
+            statuses,
+            store_path,
+            key,
+            kind,
+            renew_lease_fn,
+            generation,
+            start_reason,
+            spec_id,
+        )
+        .await
     }
-
-    let mut connected = status_from_lease(
-        key,
-        kind,
-        "connected",
-        lease,
-        None,
-        generation,
-        start_reason,
-        spec_id,
-        TransportState::Active,
-    );
-    connected.remote_port = Some(remote_port);
-    connected.connected_at_ms = Some(now_ms());
-    set_status_for_generation(statuses, store_path, connected).await;
-
-    let result = maintain_forward(
-        fwd_rx,
-        local_addr,
-        lease,
-        remote_port,
-        statuses,
-        store_path,
-        key,
-        kind,
-        renew_lease_fn,
-        generation,
-        start_reason,
-        spec_id,
-    )
     .await;
     let _ = tokio::time::timeout(
         SSH_DISCONNECT_TIMEOUT,
@@ -1063,18 +1081,42 @@ async fn connect_and_forward(
 }
 
 async fn query_tunnel_activation_state(
+    forward: Pin<&mut impl Future<Output = anyhow::Result<()>>>,
     tunnel_state_fn: &TunnelStateFn,
     lease: &NamespaceLeaseResponse,
 ) -> anyhow::Result<bool> {
-    let state = tokio::time::timeout(TUNNEL_CONTROL_TIMEOUT, tunnel_state_fn(lease.clone()))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "router tunnel state request timed out after {}s",
-                TUNNEL_CONTROL_TIMEOUT.as_secs()
-            )
-        })??;
+    let state = poll_control_with_forward(
+        forward,
+        tokio::time::timeout(TUNNEL_CONTROL_TIMEOUT, tunnel_state_fn(lease.clone())),
+        "tunnel forward ended before activation state was confirmed",
+    )
+    .await?
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "router tunnel state request timed out after {}s",
+            TUNNEL_CONTROL_TIMEOUT.as_secs()
+        )
+    })??;
     Ok(tunnel_state_is_active(&state, lease))
+}
+
+async fn poll_control_with_forward<F, C, T>(
+    mut forward: Pin<&mut F>,
+    control: C,
+    forward_ended_message: &'static str,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<()>>,
+    C: Future<Output = T>,
+{
+    tokio::pin!(control);
+    tokio::select! {
+        result = forward.as_mut() => {
+            result?;
+            anyhow::bail!(forward_ended_message)
+        }
+        result = &mut control => Ok(result),
+    }
 }
 
 fn tunnel_state_is_active(state: &TunnelStateResponse, lease: &NamespaceLeaseResponse) -> bool {
@@ -1089,6 +1131,7 @@ fn tunnel_state_is_active(state: &TunnelStateResponse, lease: &NamespaceLeaseRes
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn maintain_forward(
     fwd_rx: mpsc::UnboundedReceiver<Channel<client::Msg>>,
     local_addr: &str,
@@ -1103,10 +1146,43 @@ async fn maintain_forward(
     start_reason: &str,
     spec_id: &str,
 ) -> anyhow::Result<TunnelConnectionEnd> {
-    let connected_at_ms = now_ms();
-    let mut active_lease = lease.clone();
     let accept = accept_loop(fwd_rx, local_addr);
     tokio::pin!(accept);
+    maintain_forward_with_pump(
+        accept.as_mut(),
+        lease,
+        remote_port,
+        statuses,
+        store_path,
+        key,
+        kind,
+        renew_lease_fn,
+        generation,
+        start_reason,
+        spec_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maintain_forward_with_pump<F>(
+    mut accept: Pin<&mut F>,
+    lease: &NamespaceLeaseResponse,
+    remote_port: u16,
+    statuses: &RwLock<BTreeMap<String, TunnelRuntimeStatus>>,
+    store_path: &Path,
+    key: &str,
+    kind: &str,
+    renew_lease_fn: &RenewLeaseFn,
+    generation: u64,
+    start_reason: &str,
+    spec_id: &str,
+) -> anyhow::Result<TunnelConnectionEnd>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    let connected_at_ms = now_ms();
+    let mut active_lease = lease.clone();
     let mut retry_delay = None;
     let mut retry_cap = INITIAL_RECONNECT_BACKOFF;
 
@@ -1117,7 +1193,7 @@ async fn maintain_forward(
                 .ok_or_else(|| anyhow::anyhow!("router lease expiration is invalid"))?,
         };
         tokio::select! {
-            result = &mut accept => return result.map(|_| TunnelConnectionEnd::Ended),
+            result = accept.as_mut() => return result.map(|_| TunnelConnectionEnd::Ended),
             _ = tokio::time::sleep(delay) => {}
         }
 
@@ -1139,7 +1215,7 @@ async fn maintain_forward(
         let renewal = renew_lease_fn(active_lease.clone());
         tokio::pin!(renewal);
         let renewed = tokio::select! {
-            result = &mut accept => return result.map(|_| TunnelConnectionEnd::Ended),
+            result = accept.as_mut() => return result.map(|_| TunnelConnectionEnd::Ended),
             result = tokio::time::timeout(LEASE_RENEW_TIMEOUT, &mut renewal) => {
                 match result {
                     Ok(result) => result,
@@ -1432,6 +1508,7 @@ impl client::Handler for TunnelHandler {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -1477,6 +1554,72 @@ mod tests {
 
     fn pending_tunnel_control_fn() -> ActivateTunnelFn {
         Arc::new(|_| Box::pin(std::future::pending()))
+    }
+
+    #[tokio::test]
+    async fn activation_control_poll_drives_the_candidate_forward_pump() {
+        let pump_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pump_polled_by_forward = pump_polled.clone();
+        let forward = std::future::poll_fn(move |_| {
+            pump_polled_by_forward.store(true, Ordering::SeqCst);
+            Poll::<anyhow::Result<()>>::Pending
+        });
+        tokio::pin!(forward);
+        let pump_polled_by_control = pump_polled.clone();
+        let control = async move {
+            while !pump_polled_by_control.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            42_u8
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            poll_control_with_forward(forward.as_mut(), control, "forward ended before activation"),
+        )
+        .await
+        .expect("activation must not deadlock waiting for the forward pump")
+        .expect("forward remains available");
+
+        assert_eq!(result, 42);
+        assert!(pump_polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn activation_control_fails_if_the_forward_pump_ends_first() {
+        let forward = async { anyhow::bail!("candidate bridge failed") };
+        tokio::pin!(forward);
+
+        let error = poll_control_with_forward(
+            forward.as_mut(),
+            std::future::pending::<()>(),
+            "forward ended before activation",
+        )
+        .await
+        .expect_err("a dead candidate must not be activated");
+
+        assert!(error.to_string().contains("candidate bridge failed"));
+    }
+
+    #[test]
+    fn authoritative_active_state_recovers_a_lost_activation_response() {
+        let lease = test_lease("2099-01-01T00:00:00Z".to_string());
+        let mut state = TunnelStateResponse {
+            protocol_epoch: lease.protocol_epoch.clone(),
+            router_id: lease.router_id.clone(),
+            route_id: lease.route_id.clone(),
+            rotation_id: lease.rotation_id.clone(),
+            generation: lease.generation,
+            expected_generation: lease.expected_generation,
+            state: "active".into(),
+            active_generation: Some(lease.generation),
+            candidate_generations: Vec::new(),
+            draining_generations: Vec::new(),
+        };
+
+        assert!(tunnel_state_is_active(&state, &lease));
+        state.active_generation = Some(lease.generation + 1);
+        assert!(!tunnel_state_is_active(&state, &lease));
     }
 
     #[tokio::test]
