@@ -283,14 +283,14 @@ pub(crate) async fn provision_client_tunnel(
     if !config.has_registered_router_identity() {
         match state.register_router_installation().await {
             Ok(_) => {
-                state
-                    .complete_router_registration_control_plane("client_tunnel_provision")
-                    .await
-                    .map_err(ApiError::internal)?;
                 config = state.config_snapshot().await;
             }
             Err(error) if allow_offline && is_router_unreachable_error(&error) => {
                 config = state.config_snapshot().await;
+                mark_claim_skipped(&mut config);
+                if let Err(save_error) = state.replace_config(config.clone()).await {
+                    tracing::warn!(error = %save_error, "persist claim_skipped status failed");
+                }
                 warnings.push(format!(
                     "router installation register skipped (offline): {error}"
                 ));
@@ -336,6 +336,10 @@ pub(crate) async fn provision_client_tunnel(
 
     if let Err(error) = crate::state::ensure_router_installation_owner_bound(state, &config).await {
         if allow_offline {
+            mark_claim_skipped(&mut config);
+            if let Err(save_error) = state.replace_config(config.clone()).await {
+                tracing::warn!(error = %save_error, "persist claim_skipped status failed");
+            }
             warnings.push(format!("router owner bind pending: {error}"));
             return Ok(ClientTunnelProvisionOutcome {
                 config,
@@ -373,6 +377,10 @@ pub(crate) async fn provision_client_tunnel(
             ))
         }
         Err(error) if allow_offline && is_router_unreachable_error(&error) => {
+            mark_claim_skipped(&mut config);
+            if let Err(save_error) = state.replace_config(config.clone()).await {
+                tracing::warn!(error = %save_error, "persist claim_skipped status failed");
+            }
             warnings.push(format!(
                 "router client tunnel claim skipped (offline): {error}"
             ));
@@ -503,11 +511,24 @@ pub(crate) fn subdomain_conflict_error(subdomain: &str, reason: Option<&str>) ->
     )
 }
 
+pub(crate) fn mark_claim_skipped(config: &mut ServerConfig) {
+    config.client.tunnel_status = Some("claim_skipped".to_string());
+}
+
 pub(crate) async fn mark_claim_success(state: &ServerState, config: &mut ServerConfig) {
     config.client.tunnel_status = Some("claimed_remote".to_string());
     config.router.last_register_error = None;
     if let Err(error) = state.replace_config(config.clone()).await {
         tracing::warn!(error = %error, "persist client tunnel claim success failed");
+    }
+    if let Err(error) = state
+        .complete_router_registration_control_plane("client_tunnel_claim")
+        .await
+    {
+        tracing::warn!(
+            error = %error,
+            "router control-plane reconcile after client tunnel claim failed"
+        );
     }
     {
         let mut shares = state.shares.write().await;

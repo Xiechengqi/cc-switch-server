@@ -108,6 +108,12 @@ async fn web_invoke_dispatch(
                 &args,
                 &["clientTunnelSubdomain", "client_tunnel_subdomain"],
             );
+            let options = args.get("options").and_then(|value| {
+                serde_json::from_value::<crate::domain::settings::config::SetupOptions>(
+                    value.clone(),
+                )
+                .ok()
+            });
             let response = crate::api::settings::setup(
                 State(state.clone()),
                 Json(crate::domain::settings::config::SetupInput {
@@ -115,7 +121,7 @@ async fn web_invoke_dispatch(
                     owner_email,
                     router_url,
                     client_tunnel_subdomain,
-                    options: None,
+                    options,
                 }),
             )
             .await?;

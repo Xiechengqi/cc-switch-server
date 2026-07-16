@@ -12,7 +12,7 @@ pub struct Cli {
     #[arg(
         long,
         env = "CC_SWITCH_SERVER_HOST",
-        default_value = "0.0.0.0",
+        default_value = "127.0.0.1",
         global = true
     )]
     pub host: IpAddr,
@@ -98,8 +98,8 @@ pub struct InitArgs {
     /// Validate input without writing server.json.
     #[arg(long)]
     pub dry_run: bool,
-    /// Continue when Router is unreachable.
-    #[arg(long, default_value_t = true)]
+    /// Continue when Router is unreachable (skip client tunnel claim).
+    #[arg(long, default_value_t = false)]
     pub allow_offline: bool,
     /// Write server.json but skip Router registration and client tunnel claim.
     #[arg(long)]
@@ -171,6 +171,12 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn default_host_is_loopback() {
+        let cli = Cli::try_parse_from(["cc-switch-server"]).unwrap();
+        assert_eq!(cli.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
 
     #[test]
     fn parses_legacy_startup_without_subcommand_as_serve() {

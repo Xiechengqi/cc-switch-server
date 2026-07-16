@@ -312,7 +312,7 @@ impl Default for SetupOptions {
     fn default() -> Self {
         Self {
             dry_run: false,
-            allow_offline: true,
+            allow_offline: false,
             issue_session_token: false,
             issue_api_token: false,
         }
@@ -364,7 +364,7 @@ impl ServerConfig {
             .with_context(|| format!("write config {}", config_path.display()))
     }
 
-    pub fn is_setup_complete(&self) -> bool {
+    pub fn is_local_setup_complete(&self) -> bool {
         self.auth.password_hash.is_some()
             && self
                 .owner
@@ -381,6 +381,35 @@ impl ServerConfig {
                 .tunnel_subdomain
                 .as_deref()
                 .is_some_and(|value| !value.is_empty())
+    }
+
+    pub fn is_router_client_ready(&self) -> bool {
+        if !self
+            .router
+            .url
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            return true;
+        }
+        if matches!(
+            self.client.tunnel_status.as_deref(),
+            Some("claimed_remote")
+                | Some("connected")
+                | Some("active")
+                | Some("running")
+                | Some("claim_skipped")
+        ) {
+            return true;
+        }
+        if !self.has_registered_router_identity() {
+            return false;
+        }
+        false
+    }
+
+    pub fn is_setup_complete(&self) -> bool {
+        self.is_local_setup_complete() && self.is_router_client_ready()
     }
 
     pub fn has_registered_router_identity(&self) -> bool {
@@ -883,6 +912,52 @@ mod tests {
         });
 
         assert!(result.is_err());
+    }
+
+    fn sample_local_complete_config() -> ServerConfig {
+        let mut config = ServerConfig::from_setup(SetupInput {
+            password: "password123".to_string(),
+            owner_email: "owner@example.com".to_string(),
+            router_url: "https://router.example.com".to_string(),
+            client_tunnel_subdomain: Some("client-alpha".to_string()),
+            options: None,
+        })
+        .unwrap();
+        config.router.identity = Some(RouterIdentity {
+            installation_id: "inst-test".to_string(),
+            public_key: "public-key".to_string(),
+            private_key: "private-key".to_string(),
+            control_secret: None,
+        });
+        config.client.tunnel_status = None;
+        config
+    }
+
+    #[test]
+    fn is_setup_complete_requires_router_claim_when_router_configured() {
+        let mut config = sample_local_complete_config();
+        assert!(!config.is_setup_complete());
+        assert!(config.is_local_setup_complete());
+        assert!(!config.is_router_client_ready());
+
+        config.client.tunnel_status = Some("claimed_remote".to_string());
+        assert!(config.is_setup_complete());
+
+        config.client.tunnel_status = Some("claim_skipped".to_string());
+        assert!(config.is_setup_complete());
+
+        config.client.tunnel_status = Some("pending".to_string());
+        assert!(!config.is_setup_complete());
+    }
+
+    #[test]
+    fn is_router_client_ready_skips_claim_when_router_url_missing() {
+        let mut config = sample_local_complete_config();
+        config.router.url = None;
+        config.router.domain = None;
+        assert!(config.is_router_client_ready());
+        assert!(!config.is_local_setup_complete());
+        assert!(!config.is_setup_complete());
     }
 
     #[test]

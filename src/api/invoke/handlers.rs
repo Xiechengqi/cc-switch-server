@@ -608,27 +608,12 @@ pub(in crate::api) async fn web_email_auth_verify_code(
 }
 
 pub(in crate::api) async fn web_email_auth_request_owner_change_code(
-    state: &ServerState,
-    args: &Value,
+    _state: &ServerState,
+    _args: &Value,
 ) -> Result<crate::clients::router::email_auth::EmailCodeRequestResponse, ApiError> {
-    let router_domain = web_optional_string_any(args, &["routerDomain", "router_domain"]);
-    let current_email = web_arg_string_any(args, &["currentEmail", "current_email"])?;
-    let new_email = web_arg_string_any(args, &["newEmail", "new_email"])?;
-    let config = ensure_email_router_config(state).await?;
-    ensure_router_domain_matches(&config, router_domain.as_deref())?;
-    let (current_email, new_email) =
-        ensure_owner_change_allowed(state, &config, &current_email, &new_email).await?;
-    let http_client = state.http_client().await;
-    crate::clients::router::email_auth::request_code(&http_client, &config, &new_email)
-        .await
-        .map_err(map_email_auth_error)
-        .inspect(|_| {
-            tracing::info!(
-                old_owner = %current_email,
-                new_owner = %new_email,
-                "requested share owner change email code"
-            );
-        })
+    Err(ApiError::bad_request(
+        "owner change no longer requires email verification; call email_auth_change_owner_email directly",
+    ))
 }
 
 pub(in crate::api) async fn web_email_auth_change_owner_email(
@@ -638,34 +623,16 @@ pub(in crate::api) async fn web_email_auth_change_owner_email(
     let router_domain = web_optional_string_any(args, &["routerDomain", "router_domain"]);
     let current_email = web_arg_string_any(args, &["currentEmail", "current_email"])?;
     let new_email = web_arg_string_any(args, &["newEmail", "new_email"])?;
-    let code = web_arg_string_any(args, &["code"])?;
     let config = ensure_email_router_config(state).await?;
     ensure_router_domain_matches(&config, router_domain.as_deref())?;
     let (current_email, new_email) =
-        ensure_owner_change_allowed(state, &config, &current_email, &new_email).await?;
+        ensure_owner_change_allowed(&config, &current_email, &new_email)?;
     let http_client = state.http_client().await;
-    let router_session = crate::clients::router::email_auth::verify_client_web_code(
-        &http_client,
-        &config,
-        &new_email,
-        &code,
-    )
-    .await
-    .map_err(map_email_auth_error)?;
-    let verified_email =
-        crate::clients::router::email_auth::normalize_email(&router_session.user.email)
-            .map_err(map_email_auth_error)?;
-    if verified_email != new_email {
-        return Err(ApiError::unauthorized(
-            "verified email does not match new owner email",
-        ));
-    }
-    let remote = crate::clients::router::email_auth::change_owner_email(
+    let remote = crate::clients::router::email_auth::change_owner_email_at_installation(
         &http_client,
         &config,
         &current_email,
         &new_email,
-        &router_session.access_token,
     )
     .await
     .map_err(map_email_auth_error)?;
@@ -692,30 +659,26 @@ pub(in crate::api) async fn web_email_auth_change_owner_email(
         .map_err(map_share_patch_error)?;
     for share in &updated_shares {
         spawn_share_upsert_sync(state.clone(), share.clone());
-        emit_share_event(
-            state,
-            "share.changed",
-            share,
-            "owner_email_verified_changed",
-        );
+        emit_share_event(state, "share.changed", share, "owner_email_changed");
     }
 
-    let email_state = crate::clients::router::email_auth::state_from_router_session(
-        &next_config,
-        &router_session,
-    )
-    .map_err(map_email_auth_error)?;
-    crate::clients::router::email_auth::save_state(&state.config_dir, &email_state)
-        .map_err(ApiError::internal)?;
+    if let Ok(Some(email_state)) = crate::clients::router::email_auth::load_state(&state.config_dir)
+    {
+        if email_state.email.eq_ignore_ascii_case(&current_email) {
+            let _ = std::fs::remove_file(crate::clients::router::email_auth::email_auth_path(
+                &state.config_dir,
+            ));
+        }
+    }
     if let Err(error) = crate::state::reconcile_payout_profile_to_router(state.clone()).await {
         tracing::warn!(error = %error, "router payout profile reconcile after owner email change failed");
     }
 
     Ok(crate::clients::router::email_auth::EmailAuthStatus {
-        authenticated: true,
+        authenticated: false,
         email: Some(new_email),
-        expires_at: email_state.expires_at,
-        router_domain: email_state.router_domain,
+        expires_at: None,
+        router_domain: config.router.domain.clone(),
     })
 }
 
@@ -803,8 +766,7 @@ async fn bind_verified_email_session(
     })
 }
 
-async fn ensure_owner_change_allowed(
-    state: &ServerState,
+fn ensure_owner_change_allowed(
     config: &ServerConfig,
     current_email: &str,
     new_email: &str,
@@ -828,26 +790,6 @@ async fn ensure_owner_change_allowed(
     if configured_owner != current_email {
         return Err(ApiError::unauthorized(
             "current email does not match configured owner email",
-        ));
-    }
-    let email_state = crate::clients::router::email_auth::load_state(&state.config_dir)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| {
-            ApiError::unauthorized("owner change requires current owner email auth login")
-        })?;
-    if email_state.email.trim().to_ascii_lowercase() != current_email {
-        return Err(ApiError::unauthorized(
-            "current email auth state does not match share owner",
-        ));
-    }
-    if !state.shares.read().await.shares.iter().any(|share| {
-        share
-            .owner_email
-            .as_deref()
-            .is_some_and(|email| email.eq_ignore_ascii_case(&current_email))
-    }) {
-        return Err(ApiError::not_found(
-            "this server has no share owned by the current email",
         ));
     }
     Ok((current_email, new_email))
@@ -1032,6 +974,19 @@ pub(in crate::api) async fn web_save_provider_share(
     Ok(saved)
 }
 
+pub(in crate::api) fn expected_client_tunnel_url(
+    client_subdomain: &str,
+    router_domain: &str,
+) -> Option<String> {
+    let client_subdomain = client_subdomain.trim();
+    let router_domain = router_domain.trim();
+    if client_subdomain.is_empty() || router_domain.is_empty() {
+        None
+    } else {
+        Some(format!("https://{client_subdomain}.{router_domain}"))
+    }
+}
+
 pub(in crate::api) fn web_client_tunnel_share_status(
     runtime: Option<crate::clients::router::tunnel::TunnelRuntimeStatus>,
 ) -> Value {
@@ -1101,14 +1056,26 @@ pub(in crate::api) async fn web_configure_share_tunnel(
 
 pub(in crate::api) async fn web_client_tunnel_state(state: &ServerState) -> Value {
     let config = state.config.read().await;
+    let ui_settings = state.ui_settings.read().await;
+    let router_domain = ui_settings
+        .settings_for_frontend(&config)
+        .get("shareRouterDomain")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let runtime = state
         .tunnels
         .status(&crate::clients::router::tunnel::client_tunnel_key())
         .await;
-    let tunnel_url = runtime
+    let active_tunnel_url = runtime
         .as_ref()
         .and_then(|status| status.tunnel_url.clone());
     let subdomain = config.client.tunnel_subdomain.clone().unwrap_or_default();
+    let expected_tunnel_url = expected_client_tunnel_url(&subdomain, &router_domain);
+    let tunnel_url = active_tunnel_url
+        .clone()
+        .or_else(|| expected_tunnel_url.clone());
     let owner_email = config.owner.email.clone().unwrap_or_default();
     let enabled = matches!(
         config.client.tunnel_status.as_deref(),
@@ -1124,6 +1091,7 @@ pub(in crate::api) async fn web_client_tunnel_state(state: &ServerState) -> Valu
             "enabled": enabled,
             "autoStart": true,
             "tunnelUrl": tunnel_url,
+            "expectedUrl": expected_tunnel_url,
         }
     });
     if let Value::Object(ref mut map) = response {
@@ -1213,15 +1181,7 @@ pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Valu
     };
 
     let client_subdomain = config.client.tunnel_subdomain.clone().unwrap_or_default();
-    let expected_tunnel_url = if client_subdomain.is_empty() || router_domain.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "https://{}.{}",
-            client_subdomain.trim(),
-            router_domain.trim()
-        ))
-    };
+    let expected_tunnel_url = expected_client_tunnel_url(&client_subdomain, &router_domain);
     let active_tunnel_url = client_runtime
         .as_ref()
         .and_then(|status| status.tunnel_url.clone());

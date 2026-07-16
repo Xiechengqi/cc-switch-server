@@ -84,6 +84,7 @@ export const serverLocalOverrides = [
   "components/share/EditShareDialog.tsx",
   "components/share/ImportSharesModal.tsx",
   "components/share/OwnerChangeModal.tsx",
+  "components/share/ShareOwnerChangeEmailDialog.tsx",
   "components/share/ShareEmptyState.tsx",
   "components/share/ShareExportModal.tsx",
   "components/share/SharePage.tsx",
@@ -95,7 +96,6 @@ export const serverLocalOverrides = [
 export const serverExcludedFromSync = [
   "components/universal",
   "config/universalProviderPresets.ts",
-  "components/share/ShareOwnerChangeEmailDialog.tsx",
   "components/share/ShareOwnerLoginDialog.tsx",
   "components/share/ShareRouterBar.tsx",
   "components/settings/ShareEmailLoginCard.tsx",

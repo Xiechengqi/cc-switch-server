@@ -113,7 +113,7 @@
     "enable": "有効化",
     "share": {
       "ownerNotConfigured": "先に Client Owner を設定してください",
-      "ownerManagedHint": "Share Owner は常に Client Owner と一致し、メール所有権の確認後にのみ変更できます。"
+      "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。"
     },
     "inUse": "使用中",
     "editProvider": "プロバイダーを編集",
@@ -3040,7 +3040,7 @@
     "confirmResetUsageMessage": "現在の share の Token カウント、リクエスト数、最終使用時刻をクリアします。続行しますか？",
     "copyApiKey": "API Key をコピー",
     "copyUrl": "URL をコピー",
-    "copySubdomain": "サブドメインをコピー",
+    "copySubdomain": "Share slug をコピー",
     "copyCurl": "Curl をコピー",
     "openUrl": "URL を開く",
     "ownerEmail": "Owner Email",
@@ -3089,7 +3089,8 @@
     "subdomain": "Share ホスト",
     "subdomainHint": "任意の Share slug です。空欄なら自動生成します。使用できるのは小文字、数字、- のみです。",
     "subdomainSettings": "Share slug 設定",
-    "subdomainEditHint": "保存時に cc-switch-router 上で {share-slug}--{client-subdomain} を確保します。share が有効なら新しいホストで tunnel を再構築します。",
+    "subdomainEditHint": "保存時に Router 上で完全な Share host を確保し、旧 host は tombstone されます。share が有効なら新しい host で tunnel を再構築します。",
+    "shareHostPreview": "公開 host: {{host}}",
     "saveSubdomain": "Share slug を保存",
     "tunnelUrl": "Tunnel URL",
     "apiUrl": "API URL",
@@ -3166,9 +3167,9 @@
     "ownerChange": {
       "action": "Owner メールを変更",
       "title": "Owner メールを変更",
-      "description": "先にルーターを選択し、新しい owner メールを入力して、そのメールに届いた確認コードを検証します。",
+      "description": "ルーターを選択し、新しい owner メールを入力して確認します。server installation 資格情報で承認され、メール確認は不要です。",
       "confirmTitle": "Owner 変更を確認しますか？",
-      "confirmMessage": "以下のメールに server owner を変更しますか？変更後は新しいメールで router にログインする必要があります。",
+      "confirmMessage": "以下のメールに server owner を変更しますか？ローカル share は新しい owner に再バインドされます。",
       "routerStep": "ルーター",
       "emailStep": "新しい owner",
       "codeStep": "コード",
@@ -3237,8 +3238,8 @@
       "configureTunnelError": "Tunnel 設定の保存に失敗しました: {{error}}",
       "resetUsageSuccess": "Token カウントをリセットしました",
       "resetUsageError": "Token カウントのリセットに失敗しました: {{error}}",
-      "updateSubdomainSuccess": "サブドメインを更新しました",
-      "updateSubdomainError": "サブドメインの更新に失敗しました: {{error}}",
+      "updateSubdomainSuccess": "Share slug を更新しました",
+      "updateSubdomainError": "Share slug の更新に失敗しました: {{error}}",
       "updateApiKeySuccess": "API Key を更新しました",
       "updateApiKeyError": "API Key の更新に失敗しました: {{error}}",
       "updateDescriptionSuccess": "説明を更新しました",
@@ -3253,7 +3254,7 @@
       "updateParallelLimitError": "最大同時実行数の更新に失敗しました: {{error}}",
       "copyApiKey": "API Key をコピーしました",
       "copyUrl": "URL をコピーしました",
-      "copySubdomain": "サブドメインをコピーしました",
+      "copySubdomain": "Share slug をコピーしました",
       "copyCurl": "Curl をコピーしました"
     }
   },

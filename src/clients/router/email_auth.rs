@@ -434,6 +434,53 @@ pub async fn bind_owner_email_at_setup(
     handle_json_response(response).await
 }
 
+pub async fn change_owner_email_at_installation(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    old_email: &str,
+    new_email: &str,
+) -> Result<ChangeOwnerEmailResponse, EmailAuthError> {
+    let old_email = normalize_email(old_email)?;
+    let new_email = normalize_email(new_email)?;
+    if old_email == new_email {
+        return Err(EmailAuthError::bad_request(
+            "new owner email must be different from current owner email",
+        ));
+    }
+    let identity = router_identity(config)?;
+    let payload = ChangeOwnerEmailSignaturePayload {
+        old_email: &old_email,
+        new_email: &new_email,
+    };
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let signature = crate::clients::router::client::sign_payload(
+        identity,
+        "change_installation_owner_email",
+        &payload,
+        timestamp_ms,
+        &nonce,
+    )
+    .map_err(|error| EmailAuthError::internal(error.to_string()))?;
+    let api_base = router_api_base(config)?;
+    let response = http
+        .post(format!("{api_base}/v1/installations/change-owner-email"))
+        .json(&json!({
+            "installationId": identity.installation_id.as_str(),
+            "oldEmail": old_email,
+            "newEmail": new_email,
+            "timestampMs": timestamp_ms,
+            "nonce": nonce,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            EmailAuthError::bad_gateway(format!("change owner email failed: {error}"))
+        })?;
+    handle_json_response(response).await
+}
+
 pub async fn change_owner_email(
     http: &reqwest::Client,
     config: &ServerConfig,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -6,10 +6,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   useClientTunnelQuery,
+  useConfigureTunnelMutation,
+  useSettingsQuery,
   useStartClientTunnelMutation,
   useStopClientTunnelMutation,
 } from "@/lib/query";
 import { copyText } from "@/lib/clipboard";
+import { ShareOwnerChangeEmailDialog } from "@/components/share/ShareOwnerChangeEmailDialog";
+import { getTunnelConfigFromSettings } from "@/utils/shareUtils";
 
 export interface ClientTunnelFormState {
   dirty: boolean;
@@ -29,9 +33,18 @@ export function ClientTunnelSettingsPanel({
   onFormStateChange,
 }: ClientTunnelSettingsPanelProps) {
   const { t } = useTranslation();
-  const { data: clientTunnel } = useClientTunnelQuery();
+  const { data: settings } = useSettingsQuery();
+  const { data: clientTunnel, refetch: refetchClientTunnel } =
+    useClientTunnelQuery();
+  const configureTunnelMutation = useConfigureTunnelMutation();
   const startMutation = useStartClientTunnelMutation();
   const stopMutation = useStopClientTunnelMutation();
+  const [ownerChangeOpen, setOwnerChangeOpen] = useState(false);
+  const tunnelConfig = useMemo(
+    () => getTunnelConfigFromSettings(settings),
+    [settings],
+  );
+  const currentOwnerEmail = clientTunnel?.config?.ownerEmail?.trim() ?? "";
   const isRunning = Boolean(clientTunnel?.status?.info);
   const isToggling = startMutation.isPending || stopMutation.isPending;
 
@@ -66,13 +79,27 @@ export function ClientTunnelSettingsPanel({
               defaultValue: "Client Tunnel Owner",
             })}
           </div>
-          <Input
-            className="h-9"
-            type="email"
-            value={clientTunnel?.config?.ownerEmail?.trim() ?? ""}
-            disabled
-            readOnly
-          />
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <Input
+              className="h-9"
+              type="email"
+              value={currentOwnerEmail}
+              disabled
+              readOnly
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              disabled={!currentOwnerEmail}
+              onClick={() => setOwnerChangeOpen(true)}
+            >
+              {t("share.ownerChange.action", {
+                defaultValue: "Change Owner Email",
+              })}
+            </Button>
+          </div>
         </div>
         <div className="space-y-2">
           <div className="text-xs font-medium text-muted-foreground">
@@ -126,7 +153,24 @@ export function ClientTunnelSettingsPanel({
   );
 
   if (embedded) {
-    return <div className="space-y-4">{body}</div>;
+    return (
+      <div className="space-y-4">
+        {body}
+        <ShareOwnerChangeEmailDialog
+          open={ownerChangeOpen}
+          tunnelConfig={tunnelConfig}
+          tunnelConfigSaving={configureTunnelMutation.isPending}
+          currentEmail={currentOwnerEmail || null}
+          onOpenChange={setOwnerChangeOpen}
+          onSaveTunnelConfig={async (config) => {
+            await configureTunnelMutation.mutateAsync(config);
+          }}
+          onChanged={async () => {
+            await refetchClientTunnel();
+          }}
+        />
+      </div>
+    );
   }
 
   return (
@@ -144,6 +188,19 @@ export function ClientTunnelSettingsPanel({
         </p>
       </div>
       {body}
+      <ShareOwnerChangeEmailDialog
+        open={ownerChangeOpen}
+        tunnelConfig={tunnelConfig}
+        tunnelConfigSaving={configureTunnelMutation.isPending}
+        currentEmail={currentOwnerEmail || null}
+        onOpenChange={setOwnerChangeOpen}
+        onSaveTunnelConfig={async (config) => {
+          await configureTunnelMutation.mutateAsync(config);
+        }}
+        onChanged={async () => {
+          await refetchClientTunnel();
+        }}
+      />
     </section>
   );
 }

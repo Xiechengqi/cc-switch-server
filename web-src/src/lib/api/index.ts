@@ -16,6 +16,8 @@ export { workspaceApi } from "./workspace";
 export { shareApi } from "./share";
 export * as configApi from "./config";
 export * as authApi from "./auth";
+export { emailAuthApi } from "./emailAuth";
+export type { EmailAuthStatus, EmailSessionMeResponse } from "./emailAuth";
 export * as copilotApi from "./copilot";
 export type { ProviderSwitchEvent } from "./providers";
 export type { Prompt } from "./prompts";

@@ -1008,18 +1008,29 @@ export async function bootstrapServerSetup(input: {
       ownerEmail: input.ownerEmail,
       routerUrl: input.routerUrl,
       clientTunnelSubdomain: input.clientTunnelSubdomain ?? "",
-      options: input.options,
+      options: {
+        allowOffline: false,
+        ...input.options,
+      },
     }),
   });
 }
+
+export type SetupCompletionResponse = {
+  ok: boolean;
+  clientTunnelSubdomain?: string;
+  clientTunnelClaimStatus?: string;
+  warnings?: string[];
+  message?: string;
+};
 
 export async function completeServerSetup(input: {
   password: string;
   ownerEmail: string;
   routerUrl: string;
   clientTunnelSubdomain?: string;
-}): Promise<void> {
-  await jsonFetch("/api/setup", {
+}): Promise<SetupCompletionResponse> {
+  return jsonFetch<SetupCompletionResponse>("/api/setup", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -1027,6 +1038,9 @@ export async function completeServerSetup(input: {
       ownerEmail: input.ownerEmail,
       routerUrl: input.routerUrl,
       clientTunnelSubdomain: input.clientTunnelSubdomain,
+      options: {
+        allowOffline: false,
+      },
     }),
   });
 }

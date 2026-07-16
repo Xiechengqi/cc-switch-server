@@ -2352,7 +2352,7 @@ async fn run_installation_heartbeat_once(
 ) -> bool {
     let config = state.config_snapshot().await;
     if !config.has_registered_router_identity() {
-        if config.is_setup_complete() && config.router_api_base().is_some() {
+        if config.is_local_setup_complete() && config.router_api_base().is_some() {
             match state.register_router_installation().await {
                 Ok(_) => {
                     match state
@@ -4168,58 +4168,50 @@ pub(crate) async fn ensure_router_installation_owner_bound(
     }
 
     let http_client = state.http_client().await;
-    if let Ok(owner_status) =
-        client::get_installation_owner_email_status(&http_client, config).await
+    if installation_owner_matches(config, &http_client, expected_owner).await? {
+        return Ok(());
+    }
+
+    match crate::clients::router::email_auth::bind_owner_email_at_setup(
+        &http_client,
+        config,
+        expected_owner,
+    )
+    .await
     {
-        if let Some(bound_owner) = owner_status.owner_email.as_deref() {
-            if !bound_owner.eq_ignore_ascii_case(expected_owner) {
-                anyhow::bail!(
-                    "router installation owner email ({bound_owner}) does not match configured owner ({expected_owner})"
-                );
-            }
-            if owner_status.owner_verified {
-                return Ok(());
-            }
+        Ok(binding) if binding.ok && binding.owner_email.eq_ignore_ascii_case(expected_owner) => {
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = %error.message,
+                "bind router owner email during installation bootstrap failed"
+            );
         }
     }
 
-    if let Ok(Some(email_state)) = crate::clients::router::email_auth::load_state(&state.config_dir)
-    {
-        if email_state.email.eq_ignore_ascii_case(expected_owner) {
-            if let Some(access_token) = email_state
-                .access_token
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                match crate::clients::router::email_auth::bind_owner_email(
-                    &http_client,
-                    config,
-                    expected_owner,
-                    access_token,
-                )
-                .await
-                {
-                    Ok(binding)
-                        if binding.ok
-                            && binding.owner_email.eq_ignore_ascii_case(expected_owner) =>
-                    {
-                        return Ok(());
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error.message,
-                            "bind router owner email from stored session failed"
-                        );
-                    }
-                }
-            }
-        }
+    if installation_owner_matches(config, &http_client, expected_owner).await? {
+        return Ok(());
     }
 
+    anyhow::bail!("router installation owner email is not bound to {expected_owner}")
+}
+
+async fn installation_owner_matches(
+    config: &ServerConfig,
+    http_client: &reqwest::Client,
+    expected_owner: &str,
+) -> anyhow::Result<bool> {
+    let owner_status = client::get_installation_owner_email_status(http_client, config).await?;
+    let Some(bound_owner) = owner_status.owner_email.as_deref() else {
+        return Ok(false);
+    };
+    if bound_owner.eq_ignore_ascii_case(expected_owner) {
+        return Ok(true);
+    }
     anyhow::bail!(
-        "router installation owner email is not verified; request an email verification code for {expected_owner} and sign in before claiming the client tunnel"
+        "router installation owner email ({bound_owner}) does not match configured owner ({expected_owner})"
     )
 }
 
@@ -5576,68 +5568,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unverified_router_owner_uses_stored_access_token_binding() {
+    async fn unverified_owner_email_match_passes_owner_gate() {
         async fn owner_status() -> Json<Value> {
             Json(json!({
                 "ok": true,
-                "ownerEmail": null,
+                "ownerEmail": "owner@example.com",
                 "ownerVerified": false
             }))
         }
 
-        async fn bind_owner(
-            AxumState(bind_requests): AxumState<Arc<AtomicUsize>>,
-            headers: HeaderMap,
-            Json(request): Json<Value>,
-        ) -> Json<Value> {
-            assert_eq!(
-                headers
-                    .get("authorization")
-                    .and_then(|value| value.to_str().ok()),
-                Some("Bearer stored-owner-access-token")
-            );
-            assert_eq!(request["email"], "owner@example.com");
-            bind_requests.fetch_add(1, AtomicOrdering::SeqCst);
-            Json(json!({
-                "ok": true,
-                "ownerEmail": "owner@example.com",
-                "alreadyBound": true
-            }))
-        }
-
-        let bind_requests = Arc::new(AtomicUsize::new(0));
-        let app = Router::new()
-            .route("/v1/installations/owner-email", get(owner_status))
-            .route("/v1/installations/bind-owner-email", post(bind_owner))
-            .with_state(bind_requests.clone());
+        let app = Router::new().route("/v1/installations/owner-email", get(owner_status));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = test_state();
-        configure_registered_test_router(&state, &format!("http://{addr}"), "inst-owner-status")
-            .await;
+        configure_registered_test_router(
+            &state,
+            &format!("http://{addr}"),
+            "inst-unverified-owner",
+        )
+        .await;
         let mut config = state.config_snapshot().await;
         config.owner.email = Some("owner@example.com".to_string());
         state.replace_config(config.clone()).await.unwrap();
-        crate::clients::router::email_auth::save_state(
-            &state.config_dir,
-            &crate::clients::router::email_auth::EmailAuthState {
-                email: "owner@example.com".to_string(),
-                router_domain: Some(format!("http://{addr}")),
-                access_token: Some("stored-owner-access-token".to_string()),
-                refresh_token: None,
-                expires_at: None,
-                refresh_expires_at: None,
-                verified_at: 1,
-            },
-        )
-        .unwrap();
 
         ensure_router_installation_owner_bound(&state, &config)
             .await
             .unwrap();
 
-        assert_eq!(bind_requests.load(AtomicOrdering::SeqCst), 1);
         server.abort();
     }
 

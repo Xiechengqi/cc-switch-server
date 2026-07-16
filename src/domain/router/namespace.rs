@@ -47,6 +47,7 @@ pub struct ClientSubdomain(String);
 
 impl ClientSubdomain {
     pub fn parse(value: &str) -> Result<Self, NamespaceError> {
+        let value = value.trim();
         validate_public_slug(value).map_err(|_| NamespaceError::InvalidClientSubdomain)?;
         Ok(Self(value.to_string()))
     }
@@ -67,6 +68,7 @@ pub struct ShareSlug(String);
 
 impl ShareSlug {
     pub fn parse(value: &str) -> Result<Self, NamespaceError> {
+        let value = value.trim();
         validate_public_slug(value).map_err(|_| NamespaceError::InvalidShareSlug)?;
         Ok(Self(value.to_string()))
     }
@@ -87,6 +89,7 @@ pub struct MarketSlug(String);
 
 impl MarketSlug {
     pub fn parse(value: &str) -> Result<Self, NamespaceError> {
+        let value = value.trim();
         validate_public_slug(value).map_err(|_| NamespaceError::InvalidMarketSlug)?;
         Ok(Self(value.to_string()))
     }
@@ -506,6 +509,18 @@ mod tests {
         assert!(ClientSubdomain::parse("Edge-main").is_err());
         assert!(ClientSubdomain::parse("short").is_err());
         assert!(ClientSubdomain::parse("edge-").is_err());
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace_from_public_slugs() {
+        assert_eq!(
+            ShareSlug::parse("  team-pro  ").unwrap().as_str(),
+            "team-pro"
+        );
+        assert_eq!(
+            ClientSubdomain::parse(" edge-main ").unwrap().as_str(),
+            "edge-main"
+        );
     }
 
     #[test]

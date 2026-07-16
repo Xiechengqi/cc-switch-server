@@ -111,7 +111,7 @@
     "enable": "啟用",
     "share": {
       "ownerNotConfigured": "請先設定 Client Owner",
-      "ownerManagedHint": "Share Owner 與 Client Owner 保持一致，只能在驗證電子郵件所有權後變更。"
+      "ownerManagedHint": "Share Owner 與 Client Owner 保持一致。可在「設定 → 分享」透過安裝簽名的 Owner 換綁進行修改。"
     },
     "inUse": "使用中",
     "blockedByProxyHint": "代理接管模式下無法切換至官方供應商",

@@ -525,6 +525,14 @@ export function ProviderShareSection({
   const tunnelLabel = share?.tunnelUrl || share?.subdomain
     ? formatShareRouterDisplay(share.tunnelUrl || share.subdomain || "")
     : null;
+  const clientSubdomain = clientTunnel?.config?.subdomain?.trim() ?? "";
+  const shareSlugPreview = subdomainInput.trim();
+  const routerHost =
+    tunnelConfig.domain.split(":")[0]?.trim() || tunnelConfig.domain.trim();
+  const shareHostPreview =
+    clientSubdomain && shareSlugPreview && routerHost
+      ? `${shareSlugPreview}--${clientSubdomain}.${routerHost}`
+      : null;
 
   const marketsErrorMessage =
     marketsError instanceof Error ? marketsError.message : undefined;
@@ -665,7 +673,7 @@ export function ProviderShareSection({
                   <p className="text-xs text-muted-foreground">
                     {t("provider.share.ownerManagedHint", {
                       defaultValue:
-                        "Share Owner 与 Client Owner 保持一致，只能通过验证邮箱所有权后修改。",
+                        "Share Owner 与 Client Owner 保持一致。可在「设置 → 分享」通过安装签名的 Owner 换绑进行修改。",
                     })}
                   </p>
                   {ownerEmail && ownerEmailInvalid ? (
@@ -703,6 +711,22 @@ export function ProviderShareSection({
                       onError={(message) => toast.error(message)}
                       suggest={() => shareApi.suggestShareSlug()}
                     />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-muted-foreground">
+                      {t("share.subdomainHint")}
+                    </p>
+                    {shareHostPreview ? (
+                      <p className="text-xs font-mono text-muted-foreground">
+                        {t("share.shareHostPreview", {
+                          defaultValue: "Public host: {{host}}",
+                          host: shareHostPreview,
+                        })}
+                      </p>
+                    ) : null}
+                    <p className="text-xs text-muted-foreground">
+                      {t("share.subdomainEditHint")}
+                    </p>
                   </div>
                 </div>
 

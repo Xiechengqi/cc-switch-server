@@ -327,7 +327,7 @@ pub async fn run_cli_init(cli: &crate::cli::Cli, args: crate::cli::InitArgs) -> 
         input,
         SetupExecution {
             idempotent: !args.force,
-            start_client_tunnel: false,
+            start_client_tunnel: true,
             issue_session_token: false,
             issue_api_token: false,
             skip_router_claim: args.skip_router_claim,

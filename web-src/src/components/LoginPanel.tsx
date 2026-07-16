@@ -51,19 +51,27 @@ async function saveSetupConfig(input: {
   ownerEmail: string;
   routerDomain: string;
   clientTunnelSubdomain?: string;
-}) {
+}): Promise<{
+  claimStatus?: string;
+  warnings: string[];
+}> {
   const routerUrl = shareRouterUrlFromDomain(input.routerDomain);
   try {
-    await completeServerSetup({
+    const outcome = await completeServerSetup({
       password: input.password,
       ownerEmail: input.ownerEmail,
       routerUrl,
       clientTunnelSubdomain: input.clientTunnelSubdomain,
     });
+    return {
+      claimStatus: outcome.clientTunnelClaimStatus,
+      warnings: outcome.warnings ?? [],
+    };
   } catch (error) {
     if (!isSetupAlreadyCompleteError(error)) {
       throw error;
     }
+    return { warnings: [] };
   }
 }
 
@@ -97,6 +105,7 @@ export function LoginPanel({
   const [resendCooldown, setResendCooldown] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [setupNotice, setSetupNotice] = useState<string | null>(null);
   const loginOwnerEmail = context.auth?.ownerEmail?.trim() ?? "";
 
   useEffect(() => {
@@ -195,6 +204,7 @@ export function LoginPanel({
   async function submitPassword(event?: FormEvent) {
     event?.preventDefault();
     setError(null);
+    setSetupNotice(null);
     setRouterDomainError(null);
     if (setupRequired && subdomainStatus === "unavailable") {
       setError(t("server.auth.clientSubdomainTaken"));
@@ -213,12 +223,28 @@ export function LoginPanel({
           );
           return;
         }
-        await saveSetupConfig({
+        const setupOutcome = await saveSetupConfig({
           password,
           ownerEmail,
           routerDomain: normalizedRouterDomain,
           clientTunnelSubdomain: clientTunnelSubdomain.trim() || undefined,
         });
+        const notices = [...setupOutcome.warnings];
+        if (
+          setupOutcome.claimStatus &&
+          setupOutcome.claimStatus !== "claimed"
+        ) {
+          notices.push(
+            t("server.auth.setupClaimPending", {
+              defaultValue:
+                "Router client 注册状态：{{status}}。请检查 Router 连接或稍后重试。",
+              status: setupOutcome.claimStatus,
+            }),
+          );
+        }
+        if (notices.length > 0) {
+          setSetupNotice(notices.join("\n"));
+        }
         await loginWithPassword(password);
         await onAuthenticated();
         return;
@@ -558,6 +584,11 @@ export function LoginPanel({
             </div>
           ) : null}
 
+          {setupNotice ? (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-100 whitespace-pre-wrap">
+              {setupNotice}
+            </div>
+          ) : null}
           {error ? <div className="form-error">{error}</div> : null}
 
           <div className="auth-panel-footer">

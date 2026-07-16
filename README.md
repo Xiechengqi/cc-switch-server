@@ -273,7 +273,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 
 | 领域 | 配置 |
 | --- | --- |
-| 监听地址 | `--host` / `CC_SWITCH_SERVER_HOST`，默认 `0.0.0.0` |
+| 监听地址 | `--host` / `CC_SWITCH_SERVER_HOST`，默认 `127.0.0.1` |
 | 监听端口 | `--port` / `CC_SWITCH_SERVER_PORT`，默认 `15721` |
 | 配置目录 | `--config-dir` / `CC_SWITCH_SERVER_CONFIG_DIR`，默认 `~/.cc-switch-server` |
 | 静态 Web | 默认使用构建时内嵌到 binary 的 Web UI；`--web-dist-dir` / `CC_SWITCH_SERVER_WEB_DIST_DIR` 仅用于开发或调试时覆盖静态目录 |

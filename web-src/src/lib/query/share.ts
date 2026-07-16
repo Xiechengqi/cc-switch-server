@@ -607,9 +607,9 @@ export function useUpdateShareSubdomainMutation() {
       shareApi.updateSubdomain({ shareId, subdomain }),
     {
       successKey: "share.toast.updateSubdomainSuccess",
-      successDefault: "子域名已更新",
+      successDefault: "Share slug 已更新",
       errorKey: "share.toast.updateSubdomainError",
-      errorDefault: "更新子域名失败: {{error}}",
+      errorDefault: "更新 Share slug 失败: {{error}}",
     },
     ({ shareId }) => shareId,
   );
