@@ -634,7 +634,10 @@ async fn run_tunnel_actor(
             Ok(Ok(lease)) => lease,
             Ok(Err(error)) => {
                 if lease_issue_requires_new_rotation(&error) {
-                    router_generation = router_generation.saturating_add(1);
+                    router_generation = next_router_generation_after_lease_error(
+                        error.to_string().as_str(),
+                        router_generation,
+                    );
                     rotation_id = new_rotation_id();
                 }
                 set_status_for_generation(
@@ -1261,6 +1264,17 @@ fn lease_issue_requires_new_rotation(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("rotationId belongs to an expired or retired lease")
         || message.contains("generation must be newer than persisted generation")
+        || message.contains("route already has a non-expired candidate rotation")
+}
+
+fn next_router_generation_after_lease_error(message: &str, current: u64) -> u64 {
+    if let Some(rest) = message.strip_prefix("generation must be newer than persisted generation ")
+    {
+        if let Ok(max_generation) = rest.trim().parse::<u64>() {
+            return max_generation.saturating_add(1).max(current);
+        }
+    }
+    current.saturating_add(1).max(1)
 }
 
 fn new_rotation_id() -> String {
@@ -1798,5 +1812,23 @@ mod tests {
             TunnelConnectionEnd::ReplaceRequired("lease not found".into())
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn next_router_generation_after_lease_error_reads_persisted_max() {
+        assert_eq!(
+            next_router_generation_after_lease_error(
+                "generation must be newer than persisted generation 7",
+                3,
+            ),
+            8,
+        );
+        assert_eq!(
+            next_router_generation_after_lease_error(
+                "route already has a non-expired candidate rotation",
+                4,
+            ),
+            5,
+        );
     }
 }
