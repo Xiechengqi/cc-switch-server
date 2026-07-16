@@ -16,9 +16,11 @@ use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
 use axum::Router;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
+use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
@@ -89,7 +91,7 @@ async fn share_router_health_is_hidden_without_probe_header() {
         .oneshot(share_router_request(
             Method::GET,
             "/_share-router/health",
-            &[],
+            &["share-health"],
             "nonce-health",
             Vec::new(),
         ))
@@ -281,7 +283,7 @@ async fn share_router_runtime_reports_health_for_requested_share_binding() {
         .oneshot(share_router_request(
             Method::GET,
             "/_share-router/share-runtime?shareId=share-runtime-health",
-            &[],
+            &["share-runtime-health"],
             "nonce-runtime-health",
             Vec::new(),
         ))
@@ -401,7 +403,7 @@ async fn share_router_model_health_stream_probe_persists_bound_provider_result()
         .oneshot(share_router_request(
             Method::GET,
             "/_share-router/share-runtime?shareId=share-health-probe",
-            &[],
+            &["share-health-probe"],
             "nonce-runtime-after-health-probe",
             Vec::new(),
         ))
@@ -2524,6 +2526,10 @@ async fn automatic_router_reconcile_upserts_installation_shares_without_delete_a
                         body["ops"][0]["share"]["shareId"].as_str(),
                         Some("share-runtime")
                     );
+                    assert_eq!(
+                        body["ops"][0]["share"]["subdomain"].as_str(),
+                        Some("runtime-sub--client-runtime")
+                    );
                     batch_seen.fetch_add(1, Ordering::SeqCst);
                     axum::Json(json!({"ok": true}))
                 },
@@ -2543,6 +2549,7 @@ async fn automatic_router_reconcile_upserts_installation_shares_without_delete_a
         private_key: BASE64_STANDARD.encode([7_u8; 32]),
         control_secret: Some("control-secret".to_string()),
     });
+    config.client.tunnel_subdomain = Some("client-runtime".to_string());
     state.replace_config(config).await.unwrap();
     let mut share = test_share_input("share-runtime", "provider-runtime", ProviderType::Codex);
     share.tunnel_subdomain = Some("runtime-sub".to_string());
@@ -3916,7 +3923,7 @@ async fn web_password_change_updates_login_password() {
 }
 
 #[tokio::test]
-async fn router_identity_headers_authenticate_invoke() {
+async fn unsigned_router_identity_headers_do_not_authenticate_invoke() {
     let app = app_router(test_state());
     let _ = setup_and_login(&app).await;
 
@@ -3933,7 +3940,7 @@ async fn router_identity_headers_authenticate_invoke() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 fn json_request(
@@ -3978,12 +3985,14 @@ fn control_request(
 
 async fn configure_share_router_identity(state: &ServerState) {
     let mut config = state.config_snapshot().await;
+    config.router.domain = Some("router.test".to_string());
     config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
         installation_id: "inst-share-router".to_string(),
         public_key: "public-key".to_string(),
         private_key: "private-key".to_string(),
         control_secret: Some("share-router-control-secret".to_string()),
     });
+    config.client.tunnel_subdomain = Some("client-alpha".to_string());
     state.replace_config(config).await.unwrap();
 }
 
@@ -4015,6 +4024,38 @@ fn share_router_request(
         .header("x-ctl-signature", signature);
     for share_id in share_ids {
         builder = builder.header("x-cc-switch-share-id", *share_id);
+    }
+    if let [share_id] = share_ids {
+        let context = cc_switch_server::clients::router::ingress::IngressContext {
+            protocol_epoch: cc_switch_server::clients::router::ingress::PROTOCOL_EPOCH.to_string(),
+            router_id: "router.test".to_string(),
+            route_id: format!("share:{share_id}"),
+            installation_id: "inst-share-router".to_string(),
+            target_lane_id: "inst-share-router".to_string(),
+            public_host: format!("{share_id}--client-alpha.router.test"),
+            share_id: Some((*share_id).to_string()),
+            request_id: format!("request-{nonce}"),
+            user_email: Some("owner@example.com".to_string()),
+            user_role: None,
+            user_country: Some("JP".to_string()),
+            issued_at_ms: timestamp_ms,
+        };
+        let encoded_context = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context).unwrap());
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"share-router-control-secret").unwrap();
+        mac.update(b"cc-switch-router-ingress-v1\n");
+        mac.update(cc_switch_server::clients::router::ingress::PROTOCOL_EPOCH.as_bytes());
+        mac.update(b"\n");
+        mac.update(encoded_context.as_bytes());
+        let ingress_signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        builder = builder
+            .header(
+                cc_switch_server::clients::router::ingress::INGRESS_CONTEXT_HEADER,
+                encoded_context,
+            )
+            .header(
+                cc_switch_server::clients::router::ingress::INGRESS_SIGNATURE_HEADER,
+                ingress_signature,
+            );
     }
     builder.body(Body::from(body)).unwrap()
 }

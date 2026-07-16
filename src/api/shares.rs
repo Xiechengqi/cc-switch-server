@@ -503,20 +503,29 @@ pub(in crate::api) fn connect_info_for_share(
     config: &ServerConfig,
     share: &Share,
 ) -> Result<ShareConnectInfoResponse, ApiError> {
-    let subdomain = share
+    let share_slug = share
         .tunnel_subdomain
         .clone()
-        .ok_or_else(|| ApiError::conflict("share subdomain is not configured"))?;
+        .ok_or_else(|| ApiError::conflict("share slug is not configured"))?;
+    let share_slug = crate::domain::router::ShareSlug::parse(&share_slug)
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    let client_subdomain = config
+        .client
+        .tunnel_subdomain
+        .as_deref()
+        .ok_or_else(|| ApiError::conflict("client subdomain is not configured"))
+        .and_then(|value| {
+            crate::domain::router::ClientSubdomain::parse(value)
+                .map_err(|error| ApiError::conflict(error.to_string()))
+        })?;
+    let subdomain = format!("{}--{}", share_slug, client_subdomain);
     let router_domain = config
         .router
         .domain
         .clone()
         .or_else(|| router_domain_from_url(config.router.url.as_deref()))
         .ok_or_else(|| ApiError::conflict("router domain is not configured"))?;
-    let direct_url = share
-        .router_url
-        .clone()
-        .unwrap_or_else(|| format!("https://{subdomain}.{router_domain}"));
+    let direct_url = format!("https://{subdomain}.{router_domain}");
     let snippets = [
         (
             AppKind::Claude,
@@ -612,4 +621,34 @@ pub(in crate::api) async fn fetch_public_markets_from_router(
         .await
         .map_err(|error| ApiError::bad_gateway(format!("parse share markets failed: {error}")))?;
     Ok(response.markets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_info_uses_canonical_share_host_and_router_domain() {
+        let mut config = ServerConfig::empty();
+        config.client.tunnel_subdomain = Some("client-alpha".to_string());
+        config.router.domain = Some("router.example.com".to_string());
+        config.router.api_base = Some("https://api.internal.example".to_string());
+        let share: Share = serde_json::from_value(serde_json::json!({
+            "id": "share-1",
+            "app": "codex",
+            "providerId": "provider-1",
+            "providerType": "codex",
+            "tunnelSubdomain": "codex-pro",
+            "routerUrl": "https://stale.example.com"
+        }))
+        .expect("minimal Share fixture must deserialize");
+
+        let response = connect_info_for_share(&config, &share).expect("connect info");
+        assert_eq!(response.subdomain, "codex-pro--client-alpha");
+        assert_eq!(
+            response.direct_url,
+            "https://codex-pro--client-alpha.router.example.com"
+        );
+        assert_eq!(response.router_domain, "router.example.com");
+    }
 }

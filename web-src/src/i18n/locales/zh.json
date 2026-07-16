@@ -334,7 +334,7 @@
       "sections": {
         "client": {
           "title": "Client",
-          "description": "配置 Client Tunnel 的 Owner 邮箱、子域名与启停状态。当前：{{status}}"
+          "description": "查看不可变的 Client Tunnel Owner、子域名与启停状态。当前：{{status}}"
         },
         "payout": {
           "title": "收款信息",
@@ -412,7 +412,7 @@
       },
       "clientTunnel": {
         "title": "Client Tunnel",
-        "description": "配置远程访问本机管理界面的 Client Tunnel。",
+        "description": "Client 子域名在初始化时确定，之后只读且不可修改。",
         "ownerEmail": "Owner 邮箱",
         "subdomain": "子域名",
         "url": "访问地址",
@@ -3134,7 +3134,7 @@
     "exitEdit": "退出编辑",
     "settings": "设置项",
     "detailDescription": "查看设备级 share 的完整信息、状态和配额。",
-    "editDescription": "编辑 share 的子域名、配额和用量设置。",
+    "editDescription": "编辑 Share slug、配额和用量设置。",
     "connectInfo": "连接信息",
     "connectDescription": "复制 tunnel URL、apiKey 和 curl 示例，直接访问穿透后的本地代理服务。",
     "confirmResetUsageMessage": "这会清空当前 share 的 Token 计数、请求数和最后使用时间。是否继续？",
@@ -3185,11 +3185,12 @@
     "expirationMinute": "分钟",
     "saveExpiration": "保存到期时间",
     "expirationEditHint": "按本地时间设置 share 的到期日期、小时和分钟。",
-    "subdomain": "子域名",
-    "subdomainHint": "可选。留空时自动生成；只能包含小写字母、数字和 -。",
-    "subdomainSettings": "子域名设置",
-    "subdomainEditHint": "修改后会在 cc-switch-router 上重新声明该子域名；若分享当前在线，会自动按新子域名重建 tunnel。",
-    "saveSubdomain": "保存子域名",
+    "shareSlug": "Share slug",
+    "subdomain": "Share 完整域名",
+    "subdomainHint": "可选的 Share slug。留空时自动生成；只能包含小写字母、数字和 -。",
+    "subdomainSettings": "Share slug 设置",
+    "subdomainEditHint": "保存后会在 cc-switch-router 声明 {share-slug}--{client-subdomain}；若分享在线，会按新域名重建 tunnel。",
+    "saveSubdomain": "保存 Share slug",
     "tunnelUrl": "Tunnel URL",
     "apiUrl": "API URL",
     "more": "更多",

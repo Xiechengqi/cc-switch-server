@@ -1,13 +1,13 @@
 use rand::Rng;
 
 pub const MIN_SUBDOMAIN_LEN: usize = 6;
-pub const MAX_SUBDOMAIN_LEN: usize = 63;
+pub const MAX_SUBDOMAIN_LEN: usize = 30;
 pub const MAX_WORDS_PER_CANDIDATE: usize = 8;
 pub const COLLISION_SUFFIX_LEN: usize = 2;
 pub const SUGGEST_MAX_ATTEMPTS: usize = 8;
 pub const SUGGEST_COLLISION_BREAKER_AFTER: usize = 6;
 
-pub const RESERVED_SUBDOMAINS: &[&str] = &["admin", "api", "www", "cdn-cgi"];
+pub const RESERVED_SUBDOMAINS: &[&str] = &["admin", "api", "www", "router", "cdn-cgi"];
 
 const WORDLIST: &str = include_str!("../../assets/wordlists/client-subdomain-words.txt");
 
@@ -44,6 +44,14 @@ pub fn generate_memorable_subdomain(rng: &mut impl Rng) -> String {
         result.truncate(MAX_SUBDOMAIN_LEN);
     }
     result
+}
+
+pub fn generate_client_subdomain(rng: &mut impl Rng) -> String {
+    generate_memorable_subdomain(rng)
+}
+
+pub fn generate_share_slug(rng: &mut impl Rng) -> String {
+    generate_memorable_subdomain(rng)
 }
 
 pub fn append_random_letters(rng: &mut impl Rng, base: &str, count: usize) -> String {
@@ -91,6 +99,17 @@ mod tests {
             assert!(value.len() >= MIN_SUBDOMAIN_LEN);
             assert!(value.len() <= MAX_SUBDOMAIN_LEN);
             assert!(value.chars().all(|ch| ch.is_ascii_lowercase()));
+        }
+    }
+
+    #[test]
+    fn client_and_share_generators_emit_valid_public_slugs() {
+        let mut rng = StdRng::seed_from_u64(20260716);
+        for _ in 0..200 {
+            let client = generate_client_subdomain(&mut rng);
+            let share = generate_share_slug(&mut rng);
+            assert!(crate::domain::router::ClientSubdomain::parse(&client).is_ok());
+            assert!(crate::domain::router::ShareSlug::parse(&share).is_ok());
         }
     }
 

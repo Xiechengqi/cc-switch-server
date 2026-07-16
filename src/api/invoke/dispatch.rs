@@ -386,13 +386,24 @@ async fn web_invoke_dispatch(
             Ok(json!(web_provider_health_json(app, &provider_id, breaker)))
         }
         "list_shares" | "export_all_shares" => {
+            let config = state.config_snapshot().await;
             let shares = state.shares.read().await.shares.clone();
-            Ok(json!(shares))
+            Ok(Value::Array(
+                shares
+                    .iter()
+                    .map(|share| web_share_json(&config, share))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
         }
         "get_share_detail" => {
             let id = web_arg_share_id(&args)?;
             let share = state.shares.read().await.get(&id).cloned();
-            Ok(json!(share))
+            let config = state.config_snapshot().await;
+            share
+                .as_ref()
+                .map(|share| web_share_json(&config, share))
+                .transpose()
+                .map(|share| json!(share))
         }
         "get_share_connect_info" => {
             let id = web_arg_share_id(&args)?;
@@ -415,7 +426,10 @@ async fn web_invoke_dispatch(
             let response = upsert_share(State(state.clone()), headers.clone(), Json(input))
                 .await?
                 .0;
-            Ok(json!(response.share))
+            Ok(web_share_json(
+                &state.config_snapshot().await,
+                &response.share,
+            )?)
         }
         "delete_share" => {
             let id = web_arg_share_id(&args)?;
@@ -429,21 +443,30 @@ async fn web_invoke_dispatch(
             let response = pause_share(State(state.clone()), headers.clone(), Path(id))
                 .await?
                 .0;
-            Ok(json!(response.share))
+            Ok(web_share_json(
+                &state.config_snapshot().await,
+                &response.share,
+            )?)
         }
         "resume_share" => {
             let id = web_arg_share_id(&args)?;
             let response = resume_share(State(state.clone()), headers.clone(), Path(id))
                 .await?
                 .0;
-            Ok(json!(response.share))
+            Ok(web_share_json(
+                &state.config_snapshot().await,
+                &response.share,
+            )?)
         }
         "reset_share_usage" => {
             let id = web_arg_share_id(&args)?;
             let response = reset_share_usage(State(state.clone()), headers.clone(), Path(id))
                 .await?
                 .0;
-            Ok(json!(response.share))
+            Ok(web_share_json(
+                &state.config_snapshot().await,
+                &response.share,
+            )?)
         }
         "email_auth_request_code" => {
             let response = web_email_auth_request_code(state, &args).await?;
@@ -575,6 +598,31 @@ async fn web_invoke_dispatch(
             )
             .await?;
             Ok(json!(outcome))
+        }
+        "suggest_share_slug" => {
+            let shares = state.shares.read().await;
+            let mut selected = None;
+            for attempt in 0..crate::domain::subdomain_suggest::SUGGEST_MAX_ATTEMPTS {
+                let candidate = crate::domain::subdomain_suggest::generate_candidate(
+                    &mut rand::thread_rng(),
+                    attempt,
+                );
+                if !shares.shares.iter().any(|share| {
+                    share.status != "deleted"
+                        && share.tunnel_subdomain.as_deref() == Some(candidate.as_str())
+                }) {
+                    selected = Some((candidate, attempt + 1));
+                    break;
+                }
+            }
+            let (subdomain, attempts) = selected
+                .ok_or_else(|| ApiError::conflict("unable to generate an available share slug"))?;
+            Ok(json!({
+                "subdomain": subdomain,
+                "available": true,
+                "checked": true,
+                "attempts": attempts,
+            }))
         }
         "check_router_reachable" => {
             let config = state.config.read().await;

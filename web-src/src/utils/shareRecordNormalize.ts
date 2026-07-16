@@ -155,9 +155,10 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
 
   const bindings = normalizeShareBindings(record);
   const acl = normalizeAcl(record);
-  const subdomain =
-    readString(record, "subdomain", "tunnelSubdomain", "tunnel_subdomain") ??
+  const shareSlug =
+    readString(record, "shareSlug", "share_slug", "tunnelSubdomain", "tunnel_subdomain") ??
     null;
+  const subdomain = readString(record, "subdomain") ?? shareSlug;
   const tunnelUrl =
     readString(
       record,
@@ -199,6 +200,7 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
     tokensUsed: readNumber(record, "tokensUsed", "tokens_used") ?? 0,
     requestsCount: readNumber(record, "requestsCount", "requests_count") ?? 0,
     expiresAt: normalizeExpiresAt(record),
+    shareSlug,
     subdomain,
     tunnelUrl,
     status:

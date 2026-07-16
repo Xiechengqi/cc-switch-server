@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::router::{
-    BaseDomain, ClientKey, NamespaceError, PublicHost, PublicHostClaim, PublicHostKind,
+    BaseDomain, ClientSubdomain, NamespaceError, PublicHost, PublicHostClaim, PublicHostKind,
     PROTOCOL_EPOCH,
 };
 use crate::domain::settings::config::router_control_db_path;
@@ -42,8 +42,8 @@ pub enum RouterControlStoreError {
     InvalidDeviceIdentity(String),
     #[error("global device identity has not been initialized")]
     DeviceIdentityMissing,
-    #[error("global device identity already uses client prefix {existing}")]
-    ClientPrefixMismatch { existing: String },
+    #[error("global device identity already uses client subdomain {existing}")]
+    ClientSubdomainMismatch { existing: String },
     #[error("invalid Router profile: {0}")]
     InvalidRouterProfile(String),
     #[error("Router profile {0} already exists")]
@@ -87,8 +87,8 @@ pub enum RouterControlStoreError {
         kind: PublicHostKind,
         subject_id: String,
     },
-    #[error("public host claim uses a client key different from the global DeviceIdentity")]
-    ClientKeyMismatch,
+    #[error("public host claim uses a client subdomain different from the global DeviceIdentity")]
+    HostClientSubdomainMismatch,
     #[error("Router control database invariant failed: {0}")]
     DatabaseInvariant(String),
 }
@@ -113,8 +113,7 @@ impl fmt::Debug for RouterControlStore {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceIdentity {
     pub protocol_epoch: String,
-    pub client_prefix: String,
-    pub client_key: ClientKey,
+    pub client_subdomain: ClientSubdomain,
     pub public_key: String,
     pub private_key: String,
     pub created_at_ms: i64,
@@ -125,8 +124,7 @@ impl fmt::Debug for DeviceIdentity {
         formatter
             .debug_struct("DeviceIdentity")
             .field("protocol_epoch", &self.protocol_epoch)
-            .field("client_prefix", &self.client_prefix)
-            .field("client_key", &self.client_key)
+            .field("client_subdomain", &self.client_subdomain)
             .field("public_key", &self.public_key)
             .field("private_key", &"[REDACTED]")
             .field("created_at_ms", &self.created_at_ms)
@@ -135,14 +133,12 @@ impl fmt::Debug for DeviceIdentity {
 }
 
 impl DeviceIdentity {
-    fn generate(client_prefix: &str, created_at_ms: i64) -> Result<Self> {
+    fn generate(client_subdomain: &str, created_at_ms: i64) -> Result<Self> {
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key_bytes = signing_key.verifying_key().to_bytes();
-        let client_key = ClientKey::derive(client_prefix, &public_key_bytes)?;
         Ok(Self {
             protocol_epoch: PROTOCOL_EPOCH.to_string(),
-            client_prefix: client_prefix.to_string(),
-            client_key,
+            client_subdomain: ClientSubdomain::parse(client_subdomain)?,
             public_key: STANDARD.encode(public_key_bytes),
             private_key: STANDARD.encode(signing_key.to_bytes()),
             created_at_ms,
@@ -178,12 +174,7 @@ impl DeviceIdentity {
                 "public and private keys do not match".to_string(),
             ));
         }
-        let expected_client_key = ClientKey::derive(&self.client_prefix, &expected_public_key)?;
-        if self.client_key != expected_client_key {
-            return Err(RouterControlStoreError::InvalidDeviceIdentity(
-                "client key does not match the public key fingerprint".to_string(),
-            ));
-        }
+        ClientSubdomain::parse(self.client_subdomain.as_str())?;
         Ok(())
     }
 }
@@ -310,34 +301,31 @@ impl RouterControlStore {
 
     pub fn load_or_create_device_identity(
         &self,
-        client_prefix: &str,
+        client_subdomain: &str,
         now_ms: i64,
     ) -> Result<DeviceIdentity> {
         validate_timestamp(now_ms)?;
-        // Validate the prefix before starting the write transaction.
-        let placeholder_key = [0_u8; 32];
-        ClientKey::derive(client_prefix, &placeholder_key)?;
+        ClientSubdomain::parse(client_subdomain)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(identity) = load_device_identity(&transaction)? {
-            if identity.client_prefix != client_prefix {
-                return Err(RouterControlStoreError::ClientPrefixMismatch {
-                    existing: identity.client_prefix,
+            if identity.client_subdomain.as_str() != client_subdomain {
+                return Err(RouterControlStoreError::ClientSubdomainMismatch {
+                    existing: identity.client_subdomain.to_string(),
                 });
             }
             transaction.commit()?;
             return Ok(identity);
         }
-        let identity = DeviceIdentity::generate(client_prefix, now_ms)?;
+        let identity = DeviceIdentity::generate(client_subdomain, now_ms)?;
         transaction.execute(
             "INSERT INTO device_identity (
-                 singleton, protocol_epoch, client_prefix, client_key,
+                 singleton, protocol_epoch, client_subdomain,
                  public_key, private_key, created_at_ms
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
             params![
                 PROTOCOL_EPOCH,
-                identity.client_prefix,
-                identity.client_key.as_str(),
+                identity.client_subdomain.as_str(),
                 identity.public_key,
                 identity.private_key,
                 identity.created_at_ms,
@@ -902,7 +890,7 @@ pub struct StoredHostClaim {
     pub host: PublicHost,
     pub kind: PublicHostKind,
     pub subject_id: String,
-    pub client_key: Option<ClientKey>,
+    pub client_subdomain: Option<ClientSubdomain>,
     pub slug: Option<String>,
     pub created_at_ms: i64,
 }
@@ -924,15 +912,15 @@ impl RouterControlStore {
         if claim.kind() != PublicHostKind::Market {
             let identity = load_device_identity(&transaction)?
                 .ok_or(RouterControlStoreError::DeviceIdentityMissing)?;
-            if claim.client_key() != Some(&identity.client_key) {
-                return Err(RouterControlStoreError::ClientKeyMismatch);
+            if claim.client_subdomain() != Some(&identity.client_subdomain) {
+                return Err(RouterControlStoreError::HostClientSubdomainMismatch);
             }
         }
         if let Some(existing) = load_host_claim(&transaction, claim.host())? {
             if existing.router_id == router_id
                 && existing.kind == claim.kind()
                 && existing.subject_id == claim.subject_id()
-                && existing.client_key.as_ref() == claim.client_key()
+                && existing.client_subdomain.as_ref() == claim.client_subdomain()
                 && existing.slug.as_deref() == claim.slug()
             {
                 transaction.commit()?;
@@ -962,7 +950,7 @@ impl RouterControlStore {
         transaction.execute(
             "INSERT INTO public_hosts (
                  host, protocol_epoch, router_id, kind, subject_id,
-                 client_key, slug, created_at_ms
+                 client_subdomain, slug, created_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 claim.host().as_str(),
@@ -970,7 +958,7 @@ impl RouterControlStore {
                 router_id,
                 claim.kind().as_str(),
                 claim.subject_id(),
-                claim.client_key().map(ClientKey::as_str),
+                claim.client_subdomain().map(ClientSubdomain::as_str),
                 claim.slug(),
                 now_ms,
             ],
@@ -1008,7 +996,7 @@ impl RouterControlStore {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT protocol_epoch, router_id, host, kind, subject_id,
-                    client_key, slug, created_at_ms
+                    client_subdomain, slug, created_at_ms
              FROM public_hosts WHERE router_id = ?1 ORDER BY host",
         )?;
         let rows = statement.query_map(params![router_id], host_claim_from_row)?;
@@ -1059,8 +1047,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS device_identity (
              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
              protocol_epoch TEXT NOT NULL CHECK (protocol_epoch = 'namespace-flat-1'),
-             client_prefix TEXT NOT NULL,
-             client_key TEXT NOT NULL UNIQUE,
+             client_subdomain TEXT NOT NULL UNIQUE,
              public_key TEXT NOT NULL UNIQUE,
              private_key TEXT NOT NULL,
              created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
@@ -1128,14 +1115,14 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
              router_id TEXT NOT NULL REFERENCES router_profiles(router_id) ON DELETE CASCADE,
              kind TEXT NOT NULL CHECK (kind IN ('client', 'share', 'market')),
              subject_id TEXT NOT NULL,
-             client_key TEXT,
+             client_subdomain TEXT,
              slug TEXT,
              created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
              UNIQUE (router_id, kind, subject_id),
              CHECK (
-                 (kind = 'client' AND client_key IS NOT NULL AND slug IS NULL)
-                 OR (kind = 'share' AND client_key IS NOT NULL AND slug IS NOT NULL)
-                 OR (kind = 'market' AND client_key IS NULL AND slug IS NOT NULL)
+                 (kind = 'client' AND client_subdomain IS NOT NULL AND slug IS NULL)
+                 OR (kind = 'share' AND client_subdomain IS NOT NULL AND slug IS NOT NULL)
+                 OR (kind = 'market' AND client_subdomain IS NULL AND slug IS NOT NULL)
              )
          ) STRICT;
 
@@ -1173,10 +1160,9 @@ fn harden_database_permissions(_path: &Path) -> Result<()> {
 }
 
 fn load_device_identity(connection: &Connection) -> Result<Option<DeviceIdentity>> {
-    let raw: Option<(String, String, String, String, String, i64)> = connection
+    let raw: Option<(String, String, String, String, i64)> = connection
         .query_row(
-            "SELECT protocol_epoch, client_prefix, client_key,
-                    public_key, private_key, created_at_ms
+            "SELECT protocol_epoch, client_subdomain, public_key, private_key, created_at_ms
              FROM device_identity WHERE singleton = 1",
             [],
             |row| {
@@ -1186,20 +1172,17 @@ fn load_device_identity(connection: &Connection) -> Result<Option<DeviceIdentity
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((protocol_epoch, client_prefix, client_key, public_key, private_key, created_at_ms)) =
-        raw
+    let Some((protocol_epoch, client_subdomain, public_key, private_key, created_at_ms)) = raw
     else {
         return Ok(None);
     };
     let identity = DeviceIdentity {
         protocol_epoch,
-        client_prefix,
-        client_key: ClientKey::parse(&client_key)?,
+        client_subdomain: ClientSubdomain::parse(&client_subdomain)?,
         public_key,
         private_key,
         created_at_ms,
@@ -1371,7 +1354,7 @@ fn load_host_claim(connection: &Connection, host: &PublicHost) -> Result<Option<
     connection
         .query_row(
             "SELECT protocol_epoch, router_id, host, kind, subject_id,
-                    client_key, slug, created_at_ms
+                    client_subdomain, slug, created_at_ms
              FROM public_hosts WHERE host = ?1",
             params![host.as_str()],
             host_claim_from_row,
@@ -1383,15 +1366,15 @@ fn load_host_claim(connection: &Connection, host: &PublicHost) -> Result<Option<
 fn host_claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredHostClaim> {
     let host: String = row.get(2)?;
     let kind: String = row.get(3)?;
-    let client_key: Option<String> = row.get(5)?;
+    let client_subdomain: Option<String> = row.get(5)?;
     Ok(StoredHostClaim {
         protocol_epoch: row.get(0)?,
         router_id: row.get(1)?,
         host: PublicHost::parse(&host).map_err(|error| conversion_error(2, error))?,
         kind: PublicHostKind::parse(&kind).map_err(|error| conversion_error(3, error))?,
         subject_id: row.get(4)?,
-        client_key: client_key
-            .map(|value| ClientKey::parse(&value))
+        client_subdomain: client_subdomain
+            .map(|value| ClientSubdomain::parse(&value))
             .transpose()
             .map_err(|error| conversion_error(5, error))?,
         slug: row.get(6)?,
@@ -1530,15 +1513,15 @@ mod tests {
     #[test]
     fn global_device_identity_is_stable_and_private_key_is_redacted() {
         let store = RouterControlStore::open_in_memory().unwrap();
-        let first = store.load_or_create_device_identity("edge", 100).unwrap();
-        let second = store.load_or_create_device_identity("edge", 200).unwrap();
+        let first = store.load_or_create_device_identity("edge01", 100).unwrap();
+        let second = store.load_or_create_device_identity("edge01", 200).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(first.protocol_epoch, PROTOCOL_EPOCH);
         assert!(!format!("{first:?}").contains(&first.private_key));
         assert!(matches!(
-            store.load_or_create_device_identity("other", 300),
-            Err(RouterControlStoreError::ClientPrefixMismatch { .. })
+            store.load_or_create_device_identity("other1", 300),
+            Err(RouterControlStoreError::ClientSubdomainMismatch { .. })
         ));
     }
 
@@ -1676,19 +1659,20 @@ mod tests {
     }
 
     #[test]
-    fn exact_public_host_claims_use_global_client_key_and_typed_grammar() {
+    fn exact_public_host_claims_use_global_client_subdomain_and_typed_grammar() {
         let store = RouterControlStore::open_in_memory().unwrap();
-        let identity = store.load_or_create_device_identity("edge", 1).unwrap();
+        let identity = store.load_or_create_device_identity("edge01", 1).unwrap();
         let base = BaseDomain::parse("one.example.com").unwrap();
         store
             .insert_router_profile(primary("r1", base.as_str()), 2)
             .unwrap();
 
-        let client = PublicHostClaim::client(&base, identity.client_key.clone(), "device").unwrap();
+        let client =
+            PublicHostClaim::client(&base, identity.client_subdomain.clone(), "device").unwrap();
         let share = PublicHostClaim::share(
             &base,
             ShareSlug::parse("shared").unwrap(),
-            identity.client_key.clone(),
+            identity.client_subdomain.clone(),
             "share-1",
         )
         .unwrap();

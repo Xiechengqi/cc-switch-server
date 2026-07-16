@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use crate::domain::router::ClientSubdomain;
 use crate::domain::sharing::share_router_domain::{
     normalize_share_router_domain, router_domain_from_url, share_router_region_for_domain,
 };
@@ -479,9 +480,9 @@ impl ServerConfig {
         let router = router_config_from_setup_url(&input.router_url)?;
         let tunnel_subdomain = match input.client_tunnel_subdomain {
             Some(value) if !value.trim().is_empty() => normalize_subdomain(&value)?,
-            _ => crate::domain::subdomain_suggest::generate_memorable_subdomain(
-                &mut rand::thread_rng(),
-            ),
+            _ => {
+                crate::domain::subdomain_suggest::generate_client_subdomain(&mut rand::thread_rng())
+            }
         };
 
         Ok(Self {
@@ -541,7 +542,12 @@ impl ServerConfig {
 
     pub fn update_client_tunnel(&mut self, input: UpdateClientTunnelInput) -> anyhow::Result<()> {
         if let Some(subdomain) = input.tunnel_subdomain {
-            self.client.tunnel_subdomain = Some(normalize_subdomain(&subdomain)?);
+            let subdomain = normalize_subdomain(&subdomain)?;
+            if self.client.tunnel_subdomain.as_deref() != Some(subdomain.as_str()) {
+                bail!(
+                    "client_subdomain_immutable: client subdomain can only be chosen during setup"
+                );
+            }
         }
         if let Some(status) = input.tunnel_status {
             self.client.tunnel_status = optional_trimmed(status);
@@ -744,16 +750,8 @@ fn default_follow_system_proxy() -> bool {
 
 fn normalize_subdomain(subdomain: &str) -> anyhow::Result<String> {
     let value = subdomain.trim().to_ascii_lowercase();
-    if value.is_empty()
-        || value.len() > 63
-        || value.starts_with('-')
-        || value.ends_with('-')
-        || !value
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-    {
-        bail!("client tunnel subdomain format is invalid");
-    }
+    ClientSubdomain::parse(&value)
+        .map_err(|_| anyhow::anyhow!("client tunnel subdomain format is invalid"))?;
     Ok(value)
 }
 
@@ -828,12 +826,44 @@ mod tests {
     }
 
     #[test]
+    fn client_subdomain_is_immutable_after_setup() {
+        let mut config = ServerConfig::from_setup(SetupInput {
+            password: "password123".to_string(),
+            owner_email: "owner@example.com".to_string(),
+            router_url: "https://router.example.com".to_string(),
+            client_tunnel_subdomain: Some("client-alpha".to_string()),
+            options: None,
+        })
+        .unwrap();
+
+        config
+            .update_client_tunnel(UpdateClientTunnelInput {
+                tunnel_subdomain: Some("client-alpha".to_string()),
+                tunnel_status: Some("connected".to_string()),
+            })
+            .expect("same subdomain and status update must remain valid");
+        assert_eq!(config.client.tunnel_status.as_deref(), Some("connected"));
+
+        let error = config
+            .update_client_tunnel(UpdateClientTunnelInput {
+                tunnel_subdomain: Some("client-beta".to_string()),
+                tunnel_status: None,
+            })
+            .expect_err("setup subdomain must not be replaceable");
+        assert!(error.to_string().contains("client_subdomain_immutable"));
+        assert_eq!(
+            config.client.tunnel_subdomain.as_deref(),
+            Some("client-alpha")
+        );
+    }
+
+    #[test]
     fn setup_resolves_known_share_router_domain_and_region() {
         let config = ServerConfig::from_setup(SetupInput {
             password: "password123".to_string(),
             owner_email: "owner@example.com".to_string(),
             router_url: "https://sgptokenswitch.cc/".to_string(),
-            client_tunnel_subdomain: Some("us01".to_string()),
+            client_tunnel_subdomain: Some("us-east".to_string()),
             options: None,
         })
         .unwrap();
@@ -861,7 +891,7 @@ mod tests {
             password: "password123".to_string(),
             owner_email: "owner@example.com".to_string(),
             router_url: "https://router.example.com".to_string(),
-            client_tunnel_subdomain: Some("owner".to_string()),
+            client_tunnel_subdomain: Some("owner1".to_string()),
             options: None,
         })
         .unwrap();

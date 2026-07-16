@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use base64::Engine;
 use futures_util::StreamExt;
 use rand::RngCore;
 use serde_json::Value;
@@ -43,7 +42,7 @@ use crate::domain::accounts::store::{Account, AccountRefreshUpdate, AccountStore
 use crate::domain::failover::FailoverStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
-use crate::domain::router::{ClientKey, ShareSlug, PROTOCOL_EPOCH};
+use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
     mask_proxy_url, PayoutProfile, PayoutProfileState, RouterIdentity, ServerConfig,
 };
@@ -4252,16 +4251,12 @@ async fn issue_client_tunnel_lease(
         .email
         .clone()
         .ok_or_else(|| anyhow::anyhow!("owner email is not configured"))?;
-    let configured_subdomain = config
+    let subdomain = config
         .client
         .tunnel_subdomain
         .clone()
         .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))?;
-    let subdomain = resolve_client_key(&config, &configured_subdomain)?;
-    if subdomain != configured_subdomain {
-        config.client.tunnel_subdomain = Some(subdomain.clone());
-        state.replace_config(config.clone()).await?;
-    }
+    ClientSubdomain::parse(&subdomain)?;
     let http_client = state.http_client().await;
     if let Err(error) = client::claim_client_tunnel(
         &http_client,
@@ -4354,13 +4349,13 @@ async fn issue_share_tunnel_lease(
         Some(&usage),
     );
     let mut descriptor = descriptor;
-    let client_key = config
+    let client_subdomain = config
         .client
         .tunnel_subdomain
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("client tunnel key is not configured"))
-        .and_then(|value| ClientKey::parse(value).map_err(Into::into))?;
-    descriptor.subdomain = resolve_share_label(&descriptor.subdomain, &client_key)?;
+        .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))
+        .and_then(|value| ClientSubdomain::parse(value).map_err(Into::into))?;
+    descriptor.subdomain = resolve_share_label(&descriptor.subdomain, &client_subdomain)?;
     let requested_subdomain = descriptor.subdomain.clone();
     let http_client = state.http_client().await;
     client::claim_share_subdomain(&http_client, &config, descriptor.clone()).await?;
@@ -4382,41 +4377,20 @@ async fn issue_share_tunnel_lease(
     .await
 }
 
-fn resolve_client_key(config: &ServerConfig, configured: &str) -> anyhow::Result<String> {
-    if let Ok(client_key) = ClientKey::parse(configured) {
-        return Ok(client_key.to_string());
-    }
-    let identity = config
-        .registered_router_identity()
-        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
-    let public_key = base64::engine::general_purpose::STANDARD
-        .decode(&identity.public_key)
-        .context("decode router identity public key")?;
-    let mut prefix = configured
-        .trim()
-        .to_ascii_lowercase()
-        .bytes()
-        .filter(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        .take(7)
-        .map(char::from)
-        .collect::<String>();
-    if prefix.len() < 3 || !prefix.as_bytes()[0].is_ascii_lowercase() {
-        prefix = "client".to_string();
-    }
-    Ok(ClientKey::derive(&prefix, &public_key)?.to_string())
-}
-
-fn resolve_share_label(configured: &str, client_key: &ClientKey) -> anyhow::Result<String> {
+fn resolve_share_label(
+    configured: &str,
+    client_subdomain: &ClientSubdomain,
+) -> anyhow::Result<String> {
     if let Some((slug, suffix)) = configured.split_once("--") {
         let slug = ShareSlug::parse(slug)?;
-        let suffix = ClientKey::parse(suffix)?;
-        if &suffix != client_key {
-            anyhow::bail!("share host belongs to another client key");
+        let suffix = ClientSubdomain::parse(suffix)?;
+        if &suffix != client_subdomain {
+            anyhow::bail!("share host belongs to another client subdomain");
         }
         return Ok(format!("{}--{}", slug.as_str(), suffix.as_str()));
     }
     let slug = ShareSlug::parse(configured)?;
-    Ok(format!("{}--{}", slug.as_str(), client_key.as_str()))
+    Ok(format!("{}--{}", slug.as_str(), client_subdomain.as_str()))
 }
 
 #[cfg(test)]
@@ -4621,6 +4595,7 @@ mod tests {
         let mut identity = client::generate_identity_without_installation();
         identity.installation_id = installation_id.to_string();
         config.router.identity = Some(identity);
+        config.client.tunnel_subdomain = Some("clienttest".to_string());
         state.replace_config(config).await.unwrap();
     }
 
@@ -5164,6 +5139,7 @@ mod tests {
         identity.installation_id = "inst-heartbeat-401".to_string();
         identity.control_secret = Some("existing-secret".to_string());
         config.router.identity = Some(identity);
+        config.client.tunnel_subdomain = Some("clienttest".to_string());
         state.replace_config(config).await.unwrap();
         state
             .shares
@@ -6661,6 +6637,7 @@ mod tests {
         let mut identity = client::generate_identity_without_installation();
         identity.installation_id = "inst-delete-recreate".to_string();
         config.router.identity = Some(identity);
+        config.client.tunnel_subdomain = Some("clienttest".to_string());
         state.replace_config(config).await.unwrap();
         state
             .mutate_shares_immediate(|store| {

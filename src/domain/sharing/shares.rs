@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Context;
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -275,17 +275,19 @@ impl ShareStore {
         let provider_id = input.provider_id.clone();
         let provider_type = input.provider_type;
         let app = input.app;
-        let owner_email = input.owner_email.clone();
-        let tunnel_subdomain = input
-            .tunnel_subdomain
-            .clone()
-            .or_else(|| owner_email.as_deref().map(default_share_subdomain));
-
         let existing_id = input.id.clone().or_else(|| {
             self.shares
                 .iter()
                 .find(|item| item.app == app && item.provider_id == provider_id)
                 .map(|item| item.id.clone())
+        });
+        let owner_email = input.owner_email.clone();
+        let tunnel_subdomain = input.tunnel_subdomain.clone().or_else(|| {
+            existing_id
+                .as_deref()
+                .and_then(|id| self.shares.iter().find(|share| share.id == id))
+                .and_then(|share| share.tunnel_subdomain.clone())
+                .or_else(|| Some(generate_unique_share_slug(&self.shares)))
         });
 
         if let Some(conflict) = self.shares.iter().find(|item| {
@@ -1294,24 +1296,18 @@ fn normalize_router_api_base(router_api_base: &str) -> String {
     router_api_base.trim().trim_end_matches('/').to_string()
 }
 
-pub fn default_share_subdomain(owner_email: &str) -> String {
-    let email_prefix = owner_email.split('@').next().unwrap_or("share");
-    let prefix = email_prefix
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(5)
-        .collect::<String>();
-    let prefix = if prefix.is_empty() {
-        "share".to_string()
-    } else {
-        prefix.to_ascii_lowercase()
-    };
-    let suffix: String = rand::thread_rng()
-        .sample_iter(rand::distributions::Uniform::new_inclusive(b'a', b'z'))
-        .take(5)
-        .map(char::from)
-        .collect();
-    format!("{prefix}{suffix}")
+fn generate_unique_share_slug(shares: &[Share]) -> String {
+    for attempt in 0..crate::domain::subdomain_suggest::SUGGEST_MAX_ATTEMPTS {
+        let candidate =
+            crate::domain::subdomain_suggest::generate_candidate(&mut rand::thread_rng(), attempt);
+        if !shares.iter().any(|share| {
+            share.status != "deleted"
+                && share.tunnel_subdomain.as_deref() == Some(candidate.as_str())
+        }) {
+            return candidate;
+        }
+    }
+    crate::domain::subdomain_suggest::generate_share_slug(&mut rand::thread_rng())
 }
 
 fn default_share_status() -> String {
@@ -1430,18 +1426,8 @@ fn normalize_verified_email(email: &str) -> Result<String, SharePatchError> {
 
 pub fn normalize_share_subdomain(subdomain: &str) -> Result<String, &'static str> {
     let value = subdomain.trim().to_ascii_lowercase();
-    if value.len() < 3 || value.len() > 63 {
-        return Err("share subdomain must be 3-63 characters");
-    }
-    if value.starts_with('-') || value.ends_with('-') {
-        return Err("share subdomain cannot start or end with '-'");
-    }
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-    {
-        return Err("share subdomain may only contain lowercase letters, digits, and '-'");
-    }
+    crate::domain::router::ShareSlug::parse(&value)
+        .map_err(|_| "share slug must be 6-30 lowercase DNS characters without '--'")?;
     Ok(value)
 }
 
@@ -1786,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn upsert_share_generates_default_subdomain_from_owner_email() {
+    fn upsert_share_generates_default_slug_from_shared_generator() {
         let mut store = ShareStore::default();
         let share = store
             .upsert(UpsertShareInput {
@@ -1822,8 +1808,7 @@ mod tests {
             .unwrap();
 
         let subdomain = share.tunnel_subdomain.unwrap();
-        assert!(subdomain.starts_with("abcde"));
-        assert_eq!(subdomain.len(), 10);
+        assert!(crate::domain::router::ShareSlug::parse(&subdomain).is_ok());
     }
 
     #[test]

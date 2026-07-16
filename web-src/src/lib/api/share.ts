@@ -55,6 +55,7 @@ export interface ShareRecord {
   tokensUsed: number;
   requestsCount: number;
   expiresAt: string;
+  shareSlug?: string | null;
   subdomain?: string | null;
   tunnelUrl?: string | null;
   status: string;
@@ -547,6 +548,15 @@ async function suggestClientTunnelSubdomain(): Promise<{
   return invokeCommand("suggest_client_tunnel_subdomain");
 }
 
+async function suggestShareSlug(): Promise<{
+  subdomain: string;
+  available: boolean;
+  checked: boolean;
+  attempts: number;
+}> {
+  return invokeCommand("suggest_share_slug");
+}
+
 async function checkRouterReachable(): Promise<{ reachable: boolean }> {
   return invokeCommand("check_router_reachable");
 }
@@ -611,6 +621,7 @@ export const shareApi = {
   checkClientTunnelSubdomain,
   checkRouterReachable,
   suggestClientTunnelSubdomain,
+  suggestShareSlug,
   updateClientTunnel,
   startClientTunnel,
   stopClientTunnel,

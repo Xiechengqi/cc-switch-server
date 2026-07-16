@@ -796,6 +796,13 @@
       "notes": "Generates a memorable Client Tunnel subdomain and verifies availability on Router."
     },
     {
+      "name": "suggest_share_slug",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "notes": "Generates a memorable local Share slug using the same wordlist strategy as Client setup."
+    },
+    {
       "name": "start_admin_upgrade",
       "support": "native",
       "implemented": true,

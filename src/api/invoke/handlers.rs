@@ -1417,6 +1417,40 @@ pub(in crate::api) fn web_arg_share_id(args: &Value) -> Result<String, ApiError>
     web_arg_string_any(value, &["shareId", "share_id", "id"])
 }
 
+pub(in crate::api) fn web_share_json(
+    config: &ServerConfig,
+    share: &Share,
+) -> Result<Value, ApiError> {
+    let mut value = serde_json::to_value(share).map_err(ApiError::internal)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("share did not serialize as an object"))?;
+    let Some(slug) = share.tunnel_subdomain.as_deref() else {
+        return Ok(value);
+    };
+    let slug = crate::domain::router::ShareSlug::parse(slug)
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    let client = config
+        .client
+        .tunnel_subdomain
+        .as_deref()
+        .ok_or_else(|| ApiError::conflict("client subdomain is not configured"))
+        .and_then(|value| {
+            crate::domain::router::ClientSubdomain::parse(value)
+                .map_err(|error| ApiError::conflict(error.to_string()))
+        })?;
+    let label = format!("{slug}--{client}");
+    object.insert("shareSlug".into(), json!(slug.as_str()));
+    object.insert("subdomain".into(), json!(label));
+    if let Some(domain) = config.router.domain.as_deref() {
+        object.insert(
+            "tunnelUrl".into(),
+            json!(format!("https://{label}.{}", domain.trim())),
+        );
+    }
+    Ok(value)
+}
+
 pub(in crate::api) fn web_payload<'a>(args: &'a Value, keys: &[&str]) -> &'a Value {
     keys.iter().find_map(|key| args.get(*key)).unwrap_or(args)
 }

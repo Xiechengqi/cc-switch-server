@@ -312,6 +312,10 @@
     "tabRouter": "Router",
     "share": {
       "sections": {
+        "client": {
+          "title": "Client",
+          "description": "変更不可の Client Tunnel Owner、サブドメイン、稼働状態を表示します。現在：{{status}}"
+        },
         "payout": {
           "title": "受取情報",
           "description": "公開 EVM 受取アドレス、トークン、対応ネットワークを設定します。"
@@ -341,6 +345,18 @@
         "clearTitle": "受取情報をクリア",
         "clearDescription": "公開受取アドレスをクリアし、削除状態を Router に同期します。続行しますか？",
         "clearConfirm": "情報をクリア"
+      },
+      "clientTunnel": {
+        "title": "Client Tunnel",
+        "description": "Client サブドメインは初期設定時に確定し、その後は読み取り専用で変更できません。",
+        "ownerEmail": "Owner メール",
+        "subdomain": "Client サブドメイン",
+        "url": "アクセス URL",
+        "start": "開始",
+        "stop": "停止",
+        "running": "稼働中",
+        "stopped": "停止中",
+        "failed": "失敗: {{error}}"
       },
       "defaultRouter": {
         "title": "デフォルト Router ノード",
@@ -3018,7 +3034,7 @@
     "exitEdit": "編集を終了",
     "settings": "設定項目",
     "detailDescription": "デバイス単位 share の全情報、状態、クォータを確認します。",
-    "editDescription": "share のサブドメイン、クォータ、使用量設定を編集します。",
+    "editDescription": "Share slug、クォータ、使用量設定を編集します。",
     "connectInfo": "接続情報",
     "connectDescription": "tunnel されたローカルプロキシサービスへアクセスするための tunnel URL、apiKey、curl 例をコピーします。",
     "confirmResetUsageMessage": "現在の share の Token カウント、リクエスト数、最終使用時刻をクリアします。続行しますか？",
@@ -3069,11 +3085,12 @@
     "expirationMinute": "分",
     "saveExpiration": "期限を保存",
     "expirationEditHint": "share の期限となる日付・時・分をローカル時刻で設定します。",
-    "subdomain": "サブドメイン",
-    "subdomainHint": "任意です。空欄なら自動生成します。使用できるのは小文字、数字、- のみです。",
-    "subdomainSettings": "サブドメイン設定",
-    "subdomainEditHint": "保存時に cc-switch-router 上でこのサブドメインを再確保します。share が有効なら新しいサブドメインで tunnel を再構築します。",
-    "saveSubdomain": "サブドメインを保存",
+    "shareSlug": "Share slug",
+    "subdomain": "Share ホスト",
+    "subdomainHint": "任意の Share slug です。空欄なら自動生成します。使用できるのは小文字、数字、- のみです。",
+    "subdomainSettings": "Share slug 設定",
+    "subdomainEditHint": "保存時に cc-switch-router 上で {share-slug}--{client-subdomain} を確保します。share が有効なら新しいホストで tunnel を再構築します。",
+    "saveSubdomain": "Share slug を保存",
     "tunnelUrl": "Tunnel URL",
     "apiUrl": "API URL",
     "more": "その他",

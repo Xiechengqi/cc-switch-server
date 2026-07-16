@@ -10,8 +10,6 @@ import {
   UNLIMITED_TOKEN_LIMIT,
 } from "@/utils/shareUtils";
 
-const SUBDOMAIN_PREFIX_LENGTH = 5;
-const SUBDOMAIN_TIMESTAMP_LENGTH = 5;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function isValidShareEmail(value: string): boolean {
@@ -32,17 +30,6 @@ export function normalizeShareEmails(emails: string[]): string[] {
 
 export function formatMarketSelectLabel(market: PublicMarket): string {
   return market.displayName.replace(/^https?:\/\//i, "");
-}
-
-export function deriveSubdomainFromEmail(
-  email: string | null | undefined,
-): string {
-  const local = (email ?? "").split("@")[0] ?? "";
-  const filtered = local.toLowerCase().replace(/[^a-z]/g, "");
-  const prefix =
-    filtered.length === 0 ? "s" : filtered.slice(0, SUBDOMAIN_PREFIX_LENGTH);
-  const suffix = Date.now().toString(36).slice(-SUBDOMAIN_TIMESTAMP_LENGTH);
-  return `${prefix}-${suffix}`;
 }
 
 export function shareAppDisplayLabel(app: keyof ShareBindings): string {

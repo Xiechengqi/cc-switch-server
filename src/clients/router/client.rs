@@ -10,7 +10,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::router::PROTOCOL_EPOCH;
+use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
     PayoutProfileState, RouterIdentity, ServerConfig, UpgradePolicyConfig,
 };
@@ -1481,6 +1481,7 @@ pub async fn claim_share_subdomain(
     config: &ServerConfig,
     share: ShareDescriptor,
 ) -> anyhow::Result<()> {
+    let share = canonicalize_share_descriptor(config, share)?;
     let api_base = config
         .router_api_base()
         .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
@@ -1531,7 +1532,43 @@ pub async fn push_share_ops(
     config: &ServerConfig,
     ops: Vec<ShareSyncOperation>,
 ) -> anyhow::Result<()> {
+    let ops = canonicalize_share_operations(config, ops)?;
     push_share_ops_with_timeout(http, config, ops, ROUTER_CONTROL_PLANE_SYNC_TIMEOUT).await
+}
+
+fn canonicalize_share_operations(
+    config: &ServerConfig,
+    mut ops: Vec<ShareSyncOperation>,
+) -> anyhow::Result<Vec<ShareSyncOperation>> {
+    for operation in &mut ops {
+        if let Some(share) = operation.share.take() {
+            operation.share = Some(canonicalize_share_descriptor(config, share)?);
+        }
+    }
+    Ok(ops)
+}
+
+pub fn canonicalize_share_descriptor(
+    config: &ServerConfig,
+    mut share: ShareDescriptor,
+) -> anyhow::Result<ShareDescriptor> {
+    let client_subdomain = config
+        .client
+        .tunnel_subdomain
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))
+        .and_then(|value| ClientSubdomain::parse(value).map_err(Into::into))?;
+    let slug = if let Some((slug, suffix)) = share.subdomain.split_once("--") {
+        let suffix = ClientSubdomain::parse(suffix)?;
+        if suffix != client_subdomain {
+            bail!("share host belongs to another client subdomain");
+        }
+        ShareSlug::parse(slug)?
+    } else {
+        ShareSlug::parse(&share.subdomain)?
+    };
+    share.subdomain = format!("{}--{}", slug.as_str(), client_subdomain.as_str());
+    Ok(share)
 }
 
 pub async fn prune_shares(
@@ -1732,6 +1769,20 @@ pub async fn notify_runtime_refresh(
     share_id: String,
     subdomain: String,
 ) -> anyhow::Result<()> {
+    let client_subdomain = config
+        .client
+        .tunnel_subdomain
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))
+        .and_then(|value| ClientSubdomain::parse(value).map_err(Into::into))?;
+    let subdomain = if let Some((slug, suffix)) = subdomain.split_once("--") {
+        if ClientSubdomain::parse(suffix)? != client_subdomain {
+            bail!("share host belongs to another client subdomain");
+        }
+        format!("{}--{}", ShareSlug::parse(slug)?, client_subdomain)
+    } else {
+        format!("{}--{}", ShareSlug::parse(&subdomain)?, client_subdomain)
+    };
     let api_base = config
         .router_api_base()
         .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
@@ -2331,6 +2382,71 @@ mod tests {
 
         assert_eq!(status.owner_email, None);
         assert!(!status.owner_verified);
+    }
+
+    #[test]
+    fn share_descriptors_are_canonicalized_to_the_configured_client() {
+        let mut config = ServerConfig::empty();
+        config.client.tunnel_subdomain = Some("client-alpha".to_string());
+
+        let descriptor = canonicalize_share_descriptor(
+            &config,
+            ShareDescriptor {
+                subdomain: "codex-pro".to_string(),
+                ..ShareDescriptor::default()
+            },
+        )
+        .expect("raw Share slug must become a canonical Router label");
+        assert_eq!(descriptor.subdomain, "codex-pro--client-alpha");
+
+        let canonical = canonicalize_share_descriptor(
+            &config,
+            ShareDescriptor {
+                subdomain: "codex-pro--client-alpha".to_string(),
+                ..ShareDescriptor::default()
+            },
+        )
+        .expect("canonical label must remain stable");
+        assert_eq!(canonical.subdomain, "codex-pro--client-alpha");
+
+        let error = canonicalize_share_descriptor(
+            &config,
+            ShareDescriptor {
+                subdomain: "codex-pro--client-beta".to_string(),
+                ..ShareDescriptor::default()
+            },
+        )
+        .expect_err("another Client suffix must be rejected");
+        assert!(error.to_string().contains("another client subdomain"));
+    }
+
+    #[test]
+    fn share_batch_operations_canonicalize_upserts_only() {
+        let mut config = ServerConfig::empty();
+        config.client.tunnel_subdomain = Some("client-alpha".to_string());
+        let operations = vec![
+            ShareSyncOperation {
+                kind: "upsert".to_string(),
+                share: Some(ShareDescriptor {
+                    subdomain: "claude-pro".to_string(),
+                    ..ShareDescriptor::default()
+                }),
+                share_id: None,
+            },
+            ShareSyncOperation {
+                kind: "delete".to_string(),
+                share: None,
+                share_id: Some("share-deleted".to_string()),
+            },
+        ];
+
+        let operations = canonicalize_share_operations(&config, operations)
+            .expect("batch canonicalization must succeed");
+        assert_eq!(
+            operations[0].share.as_ref().unwrap().subdomain,
+            "claude-pro--client-alpha"
+        );
+        assert_eq!(operations[1].share_id.as_deref(), Some("share-deleted"));
     }
 
     #[test]

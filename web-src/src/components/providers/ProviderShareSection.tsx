@@ -26,6 +26,8 @@ import {
 } from "@/components/ui/select";
 import { EmailTagsInput } from "@/components/ui/tags-input";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
+import { shareApi } from "@/lib/api/share";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -60,7 +62,6 @@ import {
 import { formatShareRouterDisplay } from "@/utils/shareRouter";
 import {
   buildShareAclPayload,
-  deriveSubdomainFromEmail,
   formatMarketSelectLabel,
   isValidShareEmail,
   normalizeShareEmails,
@@ -265,8 +266,8 @@ export function ProviderShareSection({
     setForSaleValue(share?.forSale ?? "Yes");
     setSaleMarketKind(share?.saleMarketKind ?? "token");
     setMarketAccessMode(share?.marketAccessMode ?? "all");
-    setSubdomainInput(share?.subdomain?.trim() ?? "");
-    subdomainManualRef.current = Boolean(share?.subdomain?.trim());
+    setSubdomainInput(share?.shareSlug?.trim() ?? "");
+    subdomainManualRef.current = Boolean(share?.shareSlug?.trim());
 
     const appAccess = share?.accessByApp?.[shareableApp];
     const allEmails = normalizeShareEmails(
@@ -308,8 +309,19 @@ export function ProviderShareSection({
 
   useEffect(() => {
     if (shareExists || subdomainManualRef.current || share) return;
-    setSubdomainInput(deriveSubdomainFromEmail(ownerEmail));
-  }, [shareExists, ownerEmail, share]);
+    let active = true;
+    void shareApi
+      .suggestShareSlug()
+      .then((outcome) => {
+        if (active && !subdomainManualRef.current) {
+          setSubdomainInput(outcome.subdomain);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [shareExists, share]);
 
   const busy =
     createMutation.isPending ||
@@ -667,19 +679,31 @@ export function ProviderShareSection({
 
                 <div className="space-y-2">
                   <Label htmlFor="provider-share-subdomain">
-                    {t("share.subdomain", { defaultValue: "子域名" })}
+                    {t("share.shareSlug", { defaultValue: "Share slug" })}
                   </Label>
-                  <Input
-                    id="provider-share-subdomain"
-                    value={subdomainInput}
-                    disabled={busy}
-                    placeholder="my-share"
-                    onChange={(event) => {
-                      subdomainManualRef.current = true;
-                      setSubdomainInput(event.target.value);
-                      setShareDraftDirty(true);
-                    }}
-                  />
+                  <div className="flex items-center gap-2">
+                    <Input
+                      id="provider-share-subdomain"
+                      value={subdomainInput}
+                      disabled={busy}
+                      placeholder="my-share"
+                      onChange={(event) => {
+                        subdomainManualRef.current = true;
+                        setSubdomainInput(event.target.value);
+                        setShareDraftDirty(true);
+                      }}
+                    />
+                    <SubdomainGeneratorButton
+                      disabled={busy}
+                      onGenerated={(value) => {
+                        subdomainManualRef.current = true;
+                        setSubdomainInput(value);
+                        setShareDraftDirty(true);
+                      }}
+                      onError={(message) => toast.error(message)}
+                      suggest={() => shareApi.suggestShareSlug()}
+                    />
+                  </div>
                 </div>
 
                 <div className="space-y-2 md:col-span-2">

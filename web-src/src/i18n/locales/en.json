@@ -330,7 +330,7 @@
       "sections": {
         "client": {
           "title": "Client",
-          "description": "Configure Client Tunnel owner email, subdomain, and runtime status. Current: {{status}}"
+          "description": "View the immutable Client Tunnel owner, subdomain, and runtime status. Current: {{status}}"
         },
         "payout": {
           "title": "Payout Information",
@@ -408,7 +408,7 @@
       },
       "clientTunnel": {
         "title": "Client Tunnel",
-        "description": "Expose the local admin UI through a Client Tunnel.",
+        "description": "The Client subdomain is selected during setup and is read-only afterward.",
         "ownerEmail": "Owner email",
         "subdomain": "Subdomain",
         "url": "URL",
@@ -3130,7 +3130,7 @@
     "exitEdit": "Exit Edit",
     "settings": "Settings",
     "detailDescription": "Inspect the full device-level share record, status, and quota.",
-    "editDescription": "Edit the share subdomain, quota, and usage settings.",
+    "editDescription": "Edit the Share slug, quota, and usage settings.",
     "connectInfo": "Connect Info",
     "connectDescription": "Copy the tunnel URL, apiKey, and curl example to access the tunneled local proxy service.",
     "confirmResetUsageMessage": "This clears token count, request count, and last-used time for the current share. Continue?",
@@ -3181,11 +3181,12 @@
     "expirationMinute": "Minute",
     "saveExpiration": "Save Expiration",
     "expirationEditHint": "Set the share expiration date, hour, and minute in local time.",
-    "subdomain": "Subdomain",
-    "subdomainHint": "Optional. Leave blank to auto-generate. Only lowercase letters, numbers, and - are allowed.",
-    "subdomainSettings": "Subdomain Settings",
-    "subdomainEditHint": "Saving reclaims this subdomain on cc-switch-router. If the share is active, the tunnel will be rebuilt with the new subdomain.",
-    "saveSubdomain": "Save Subdomain",
+    "shareSlug": "Share slug",
+    "subdomain": "Share host",
+    "subdomainHint": "Optional Share slug. Leave blank to auto-generate. Only lowercase letters, numbers, and - are allowed.",
+    "subdomainSettings": "Share Slug Settings",
+    "subdomainEditHint": "Saving claims {share-slug}--{client-subdomain} on cc-switch-router. If the share is active, the tunnel is rebuilt with the new host.",
+    "saveSubdomain": "Save Share Slug",
     "tunnelUrl": "Tunnel URL",
     "apiUrl": "API URL",
     "more": "More",
