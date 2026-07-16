@@ -79,7 +79,13 @@ pub struct RouterVerifyEmailCodeResponse {
 pub struct BindOwnerEmailResponse {
     pub ok: bool,
     pub owner_email: String,
+    #[serde(default = "legacy_owner_binding_is_verified")]
+    pub owner_verified: bool,
     pub already_bound: bool,
+}
+
+const fn legacy_owner_binding_is_verified() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,7 +385,13 @@ pub async fn bind_owner_email(
         .map_err(|error| {
             EmailAuthError::bad_gateway(format!("bind installation owner email failed: {error}"))
         })?;
-    handle_json_response(response).await
+    let binding: BindOwnerEmailResponse = handle_json_response(response).await?;
+    if !binding.owner_verified {
+        return Err(EmailAuthError::bad_gateway(
+            "router accepted owner binding without verifying the email",
+        ));
+    }
+    Ok(binding)
 }
 
 pub async fn bind_owner_email_at_setup(
@@ -621,5 +633,25 @@ mod tests {
     #[test]
     fn state_path_uses_dedicated_json_store() {
         assert!(email_auth_path(Path::new("/tmp/ccs")).ends_with("email-auth.json"));
+    }
+
+    #[test]
+    fn owner_binding_verification_is_additive_and_explicit() {
+        let legacy: BindOwnerEmailResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "ownerEmail": "owner@example.com",
+            "alreadyBound": true
+        }))
+        .unwrap();
+        assert!(legacy.owner_verified);
+
+        let tentative: BindOwnerEmailResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "ownerEmail": "owner@example.com",
+            "ownerVerified": false,
+            "alreadyBound": true
+        }))
+        .unwrap();
+        assert!(!tentative.owner_verified);
     }
 }

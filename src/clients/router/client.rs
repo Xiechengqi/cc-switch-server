@@ -197,6 +197,28 @@ struct InstallationOwnerEmailResponse {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
+    #[serde(default = "legacy_owner_email_is_verified")]
+    pub owner_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallationOwnerEmailStatus {
+    pub owner_email: Option<String>,
+    pub owner_verified: bool,
+}
+
+impl From<InstallationOwnerEmailResponse> for InstallationOwnerEmailStatus {
+    fn from(response: InstallationOwnerEmailResponse) -> Self {
+        Self {
+            owner_email: response.owner_email,
+            owner_verified: response.owner_verified,
+        }
+    }
+}
+
+const fn legacy_owner_email_is_verified() -> bool {
+    // Older Routers exposed ownerEmail only after treating the binding as verified.
+    true
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -795,10 +817,10 @@ pub async fn get_client_tunnel(
     bail!("router client tunnel get failed: {status}: {body}");
 }
 
-pub async fn get_installation_owner_email(
+pub async fn get_installation_owner_email_status(
     http: &reqwest::Client,
     config: &ServerConfig,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<InstallationOwnerEmailStatus> {
     let api_base = config
         .router_api_base()
         .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
@@ -834,7 +856,7 @@ pub async fn get_installation_owner_email(
             .json::<InstallationOwnerEmailResponse>()
             .await
             .context("parse router installation owner email response")?;
-        return Ok(body.owner_email);
+        return Ok(body.into());
     }
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -1936,6 +1958,33 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from_stream(futures_util::stream::iter(chunks)))
             .unwrap()
+    }
+
+    #[test]
+    fn installation_owner_status_treats_legacy_visible_owner_as_verified() {
+        let response: InstallationOwnerEmailResponse = serde_json::from_value(json!({
+            "ok": true,
+            "ownerEmail": "owner@example.com"
+        }))
+        .unwrap();
+        let status = InstallationOwnerEmailStatus::from(response);
+
+        assert_eq!(status.owner_email.as_deref(), Some("owner@example.com"));
+        assert!(status.owner_verified);
+    }
+
+    #[test]
+    fn installation_owner_status_preserves_explicit_unverified_state() {
+        let response: InstallationOwnerEmailResponse = serde_json::from_value(json!({
+            "ok": true,
+            "ownerEmail": null,
+            "ownerVerified": false
+        }))
+        .unwrap();
+        let status = InstallationOwnerEmailStatus::from(response);
+
+        assert_eq!(status.owner_email, None);
+        assert!(!status.owner_verified);
     }
 
     #[test]
