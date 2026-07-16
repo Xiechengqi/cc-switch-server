@@ -3191,6 +3191,8 @@
     "more": "More",
     "remotePort": "Remote Port",
     "tunnelHealth": "Tunnel Health",
+    "transportState": "Transport State",
+    "tunnelGeneration": "Tunnel Generation",
     "quota": "Quota",
     "requestLogs": "Request Logs",
     "requestLogsHint": "Latest 10 share requests",

@@ -1002,8 +1002,12 @@ pub(in crate::api) async fn web_save_provider_share(
         .map_err(ApiError::internal)?
         .map_err(map_share_patch_error)?;
     if subdomain_changed && was_running {
-        crate::state::stop_share_tunnel(state, &share_id).await;
-        crate::state::start_share_tunnel(state.clone(), share_id.clone()).await;
+        crate::state::force_reconnect_share_tunnel(
+            state.clone(),
+            share_id.clone(),
+            "share_subdomain_changed",
+        )
+        .await;
     }
     crate::api::router::sync_share_upsert(state.clone(), saved.clone())
         .await
@@ -1041,6 +1045,12 @@ pub(in crate::api) fn web_client_tunnel_share_status(
             "subdomain": status.subdomain.clone().unwrap_or_default(),
             "remotePort": status.remote_port.unwrap_or(0),
             "healthy": tunnel_runtime_is_healthy(status.status.as_str()),
+            "status": status.status,
+            "kind": status.kind,
+            "generation": status.generation,
+            "desiredGeneration": status.desired_generation,
+            "transportState": status.transport_state,
+            "startReason": status.start_reason,
         }))
     });
     json!({

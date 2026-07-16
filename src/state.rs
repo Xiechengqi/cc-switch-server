@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
+use base64::Engine;
 use futures_util::StreamExt;
 use rand::RngCore;
 use serde_json::Value;
@@ -28,9 +29,13 @@ use crate::clients::oauth::refresh::{
     account_needs_native_refresh, execute_native_account_refresh,
 };
 use crate::clients::router::client::{
-    self, IssueLeaseResponse, ShareEditAckPayload, ShareEditView,
+    self, ActivateTunnelPayload, NamespaceLeasePayload, NamespaceLeaseResponse,
+    NamespaceRenewLeasePayload, ShareEditAckPayload, ShareEditView, TunnelStatePayload,
 };
-use crate::clients::router::tunnel::{self, LeaseFn, RenewLeaseFn, TunnelSupervisor};
+use crate::clients::router::tunnel::{
+    self, ActivateTunnelFn, LeaseFn, RenewLeaseFn, TunnelLeaseRequest, TunnelRenewalError,
+    TunnelStateFn, TunnelSupervisor,
+};
 use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::AccountRefreshLocks;
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
@@ -38,6 +43,7 @@ use crate::domain::accounts::store::{Account, AccountRefreshUpdate, AccountStore
 use crate::domain::failover::FailoverStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
+use crate::domain::router::{ClientKey, ShareSlug, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
     mask_proxy_url, PayoutProfile, PayoutProfileState, RouterIdentity, ServerConfig,
 };
@@ -2183,12 +2189,12 @@ pub async fn restore_tunnels(state: ServerState) {
                 .as_ref(),
         )
     {
-        start_client_tunnel(state.clone()).await;
+        ensure_client_tunnel_running(state.clone(), "startup_restore").await;
     }
 
     let auto_start_share_ids = share_tunnel_restore_ids(&state.shares.read().await.shares);
     for share_id in auto_start_share_ids {
-        start_share_tunnel(state.clone(), share_id).await;
+        ensure_share_tunnel_running_for(state.clone(), &share_id, "startup_restore").await;
     }
 
     if !registration_completed {
@@ -2962,6 +2968,10 @@ fn share_tunnel_restore_ids(shares: &[crate::domain::sharing::shares::Share]) ->
 }
 
 pub async fn ensure_share_tunnel_running(state: ServerState, share_id: &str) {
+    ensure_share_tunnel_running_for(state, share_id, "share_state_ensure").await;
+}
+
+pub async fn ensure_share_tunnel_running_for(state: ServerState, share_id: &str, reason: &str) {
     let share = {
         let shares = state.shares.read().await;
         shares.get(share_id).cloned()
@@ -2972,38 +2982,51 @@ pub async fn ensure_share_tunnel_running(state: ServerState, share_id: &str) {
     if !should_restore_share_tunnel(&share) {
         return;
     }
-    let share = match state
-        .mutate_shares_immediate(|store| store.set_share_tunnel_status(share_id, "active", None))
-        .await
-    {
-        Ok(Some(share)) => share,
-        _ => return,
-    };
-    start_share_tunnel(state, share.id).await;
+    ensure_share_tunnel_actor(state, share.id, reason).await;
 }
 
 pub async fn start_client_tunnel(state: ServerState) {
+    ensure_client_tunnel_running(state, "client_tunnel_start").await;
+}
+
+pub async fn ensure_client_tunnel_running(state: ServerState, reason: &str) {
     let local_addr = tunnel::local_forward_addr(state.bind_addr);
-    let lease_state = state.clone();
-    let lease_fn: LeaseFn = Arc::new(move || {
-        let lease_state = lease_state.clone();
-        Box::pin(async move { issue_client_tunnel_lease(lease_state).await })
-    });
-    let renew_state = state.clone();
-    let renew_lease_fn: RenewLeaseFn = Arc::new(move |lease_id, connection_id| {
-        let renew_state = renew_state.clone();
-        Box::pin(
-            async move { renew_router_tunnel_lease(renew_state, lease_id, connection_id).await },
-        )
-    });
+    let spec_id = client_tunnel_spec_id(&state, &local_addr).await;
+    let (lease_fn, activate_tunnel_fn, tunnel_state_fn, renew_lease_fn) =
+        client_tunnel_callbacks(&state);
     state
         .tunnels
-        .start(
+        .ensure_running(
             tunnel::client_tunnel_key(),
             "client-web",
             local_addr,
             lease_fn,
+            activate_tunnel_fn,
+            tunnel_state_fn,
             renew_lease_fn,
+            reason,
+            spec_id,
+        )
+        .await;
+}
+
+pub async fn force_reconnect_client_tunnel(state: ServerState, reason: &str) {
+    let local_addr = tunnel::local_forward_addr(state.bind_addr);
+    let spec_id = client_tunnel_spec_id(&state, &local_addr).await;
+    let (lease_fn, activate_tunnel_fn, tunnel_state_fn, renew_lease_fn) =
+        client_tunnel_callbacks(&state);
+    state
+        .tunnels
+        .force_reconnect(
+            tunnel::client_tunnel_key(),
+            "client-web",
+            local_addr,
+            lease_fn,
+            activate_tunnel_fn,
+            tunnel_state_fn,
+            renew_lease_fn,
+            reason,
+            spec_id,
         )
         .await;
 }
@@ -3016,36 +3039,220 @@ pub async fn stop_client_tunnel(state: &ServerState) {
 }
 
 pub async fn start_share_tunnel(state: ServerState, share_id: String) {
+    ensure_share_tunnel_running_for(state, &share_id, "share_tunnel_start").await;
+}
+
+async fn ensure_share_tunnel_actor(state: ServerState, share_id: String, reason: &str) {
     let local_addr = tunnel::local_forward_addr(state.bind_addr);
     let key = tunnel::share_tunnel_key(&share_id);
-    let lease_state = state.clone();
-    let lease_share_id = share_id.clone();
-    let lease_fn: LeaseFn = Arc::new(move || {
-        let lease_state = lease_state.clone();
-        let lease_share_id = lease_share_id.clone();
-        Box::pin(async move { issue_share_tunnel_lease(lease_state, lease_share_id).await })
-    });
-    let renew_state = state.clone();
-    let renew_lease_fn: RenewLeaseFn = Arc::new(move |lease_id, connection_id| {
-        let renew_state = renew_state.clone();
-        Box::pin(
-            async move { renew_router_tunnel_lease(renew_state, lease_id, connection_id).await },
-        )
-    });
+    let spec_id = share_tunnel_spec_id(&state, &share_id, &local_addr).await;
+    let (lease_fn, activate_tunnel_fn, tunnel_state_fn, renew_lease_fn) =
+        share_tunnel_callbacks(&state, &share_id);
     state
         .tunnels
-        .start(key, "share-http", local_addr, lease_fn, renew_lease_fn)
+        .ensure_running(
+            key,
+            "share-http",
+            local_addr,
+            lease_fn,
+            activate_tunnel_fn,
+            tunnel_state_fn,
+            renew_lease_fn,
+            reason,
+            spec_id,
+        )
         .await;
+}
+
+pub async fn force_reconnect_share_tunnel(state: ServerState, share_id: String, reason: &str) {
+    let share = {
+        let shares = state.shares.read().await;
+        shares.get(&share_id).cloned()
+    };
+    if !share.as_ref().is_some_and(should_restore_share_tunnel) {
+        return;
+    }
+    let local_addr = tunnel::local_forward_addr(state.bind_addr);
+    let key = tunnel::share_tunnel_key(&share_id);
+    let spec_id = share_tunnel_spec_id(&state, &share_id, &local_addr).await;
+    let (lease_fn, activate_tunnel_fn, tunnel_state_fn, renew_lease_fn) =
+        share_tunnel_callbacks(&state, &share_id);
+    state
+        .tunnels
+        .force_reconnect(
+            key,
+            "share-http",
+            local_addr,
+            lease_fn,
+            activate_tunnel_fn,
+            tunnel_state_fn,
+            renew_lease_fn,
+            reason,
+            spec_id,
+        )
+        .await;
+}
+
+fn client_tunnel_callbacks(
+    state: &ServerState,
+) -> (LeaseFn, ActivateTunnelFn, TunnelStateFn, RenewLeaseFn) {
+    let lease_state = state.clone();
+    let lease_fn: LeaseFn = Arc::new(move |request| {
+        let lease_state = lease_state.clone();
+        Box::pin(async move { issue_client_tunnel_lease(lease_state, request).await })
+    });
+    (
+        lease_fn,
+        activate_tunnel_callback(state),
+        tunnel_state_callback(state),
+        renew_tunnel_callback(state),
+    )
+}
+
+async fn client_tunnel_spec_id(state: &ServerState, local_addr: &str) -> String {
+    let config = state.config.read().await;
+    format!(
+        "client-web|{}|{}|{}|{local_addr}",
+        config.router_api_base().unwrap_or_default(),
+        config
+            .router
+            .identity
+            .as_ref()
+            .map(|identity| identity.installation_id.as_str())
+            .unwrap_or_default(),
+        config
+            .client
+            .tunnel_subdomain
+            .as_deref()
+            .unwrap_or_default(),
+    )
+}
+
+async fn share_tunnel_spec_id(state: &ServerState, share_id: &str, local_addr: &str) -> String {
+    let config = state.config.read().await;
+    let router_api_base = config.router_api_base().unwrap_or_default().to_string();
+    let installation_id = config
+        .router
+        .identity
+        .as_ref()
+        .map(|identity| identity.installation_id.clone())
+        .unwrap_or_default();
+    drop(config);
+    let subdomain = state
+        .shares
+        .read()
+        .await
+        .get(share_id)
+        .and_then(|share| share.tunnel_subdomain.clone())
+        .unwrap_or_default();
+    format!("share-http|{router_api_base}|{installation_id}|{share_id}|{subdomain}|{local_addr}")
+}
+
+fn share_tunnel_callbacks(
+    state: &ServerState,
+    share_id: &str,
+) -> (LeaseFn, ActivateTunnelFn, TunnelStateFn, RenewLeaseFn) {
+    let lease_state = state.clone();
+    let lease_share_id = share_id.to_string();
+    let lease_fn: LeaseFn = Arc::new(move |request| {
+        let lease_state = lease_state.clone();
+        let lease_share_id = lease_share_id.clone();
+        Box::pin(
+            async move { issue_share_tunnel_lease(lease_state, lease_share_id, request).await },
+        )
+    });
+    (
+        lease_fn,
+        activate_tunnel_callback(state),
+        tunnel_state_callback(state),
+        renew_tunnel_callback(state),
+    )
+}
+
+fn activate_tunnel_callback(state: &ServerState) -> ActivateTunnelFn {
+    let activate_state = state.clone();
+    Arc::new(move |lease| {
+        let activate_state = activate_state.clone();
+        Box::pin(async move {
+            let config = activate_state.config.read().await.clone();
+            let http_client = activate_state.http_client().await;
+            client::activate_namespace_tunnel(
+                &http_client,
+                &config,
+                ActivateTunnelPayload {
+                    protocol_epoch: PROTOCOL_EPOCH.to_string(),
+                    router_id: lease.router_id,
+                    lease_id: lease.lease_id,
+                    connection_id: lease.connection_id,
+                    route_id: lease.route_id,
+                    rotation_id: lease.rotation_id,
+                    generation: lease.generation,
+                    expected_generation: lease.expected_generation,
+                },
+            )
+            .await
+        })
+    })
+}
+
+fn tunnel_state_callback(state: &ServerState) -> TunnelStateFn {
+    let query_state = state.clone();
+    Arc::new(move |lease| {
+        let query_state = query_state.clone();
+        Box::pin(async move {
+            let config = query_state.config.read().await.clone();
+            let http_client = query_state.http_client().await;
+            client::namespace_tunnel_state(
+                &http_client,
+                &config,
+                TunnelStatePayload {
+                    protocol_epoch: PROTOCOL_EPOCH.to_string(),
+                    router_id: lease.router_id,
+                    lease_id: lease.lease_id,
+                    connection_id: lease.connection_id,
+                    route_id: lease.route_id,
+                    rotation_id: lease.rotation_id,
+                    generation: lease.generation,
+                    expected_generation: lease.expected_generation,
+                },
+            )
+            .await
+        })
+    })
+}
+
+fn renew_tunnel_callback(state: &ServerState) -> RenewLeaseFn {
+    let renew_state = state.clone();
+    Arc::new(move |lease| {
+        let renew_state = renew_state.clone();
+        Box::pin(async move { renew_router_tunnel_lease(renew_state, lease).await })
+    })
 }
 
 async fn renew_router_tunnel_lease(
     state: ServerState,
-    lease_id: String,
-    connection_id: String,
-) -> Result<String, crate::clients::router::client::RenewLeaseError> {
+    lease: NamespaceLeaseResponse,
+) -> Result<String, TunnelRenewalError> {
     let config = state.config.read().await.clone();
+    let configuration_available =
+        config.router_api_base().is_some() && config.registered_router_identity().is_some();
     let http_client = state.http_client().await;
-    client::renew_tunnel_lease(&http_client, &config, lease_id, connection_id).await
+    let payload = NamespaceRenewLeasePayload {
+        protocol_epoch: PROTOCOL_EPOCH.to_string(),
+        router_id: client::tunnel_router_id(&config).map_err(|error| {
+            TunnelRenewalError::FatalConfiguration(format!("resolve router id failed: {error}"))
+        })?,
+        lease_id: lease.lease_id,
+        connection_id: lease.connection_id,
+        route_id: lease.route_id,
+        rotation_id: lease.rotation_id,
+        generation: lease.generation,
+        expected_generation: lease.expected_generation,
+    };
+    client::renew_namespace_lease(&http_client, &config, payload)
+        .await
+        .map(|renewed| renewed.expires_at)
+        .map_err(|error| TunnelRenewalError::from_router(error, configuration_available))
 }
 
 pub async fn stop_share_tunnel(state: &ServerState, share_id: &str) {
@@ -4017,7 +4224,10 @@ pub(crate) async fn ensure_router_installation_owner_bound(
     )
 }
 
-async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLeaseResponse> {
+async fn issue_client_tunnel_lease(
+    state: ServerState,
+    request: TunnelLeaseRequest,
+) -> anyhow::Result<NamespaceLeaseResponse> {
     let mut config = state.config.read().await.clone();
     if !config.is_setup_complete() {
         anyhow::bail!("setup is incomplete");
@@ -4042,11 +4252,16 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
         .email
         .clone()
         .ok_or_else(|| anyhow::anyhow!("owner email is not configured"))?;
-    let subdomain = config
+    let configured_subdomain = config
         .client
         .tunnel_subdomain
         .clone()
         .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))?;
+    let subdomain = resolve_client_key(&config, &configured_subdomain)?;
+    if subdomain != configured_subdomain {
+        config.client.tunnel_subdomain = Some(subdomain.clone());
+        state.replace_config(config.clone()).await?;
+    }
     let http_client = state.http_client().await;
     if let Err(error) = client::claim_client_tunnel(
         &http_client,
@@ -4063,7 +4278,23 @@ async fn issue_client_tunnel_lease(state: ServerState) -> anyhow::Result<IssueLe
         return Err(error);
     }
     crate::client_tunnel_provision::mark_claim_success(&state, &mut config).await;
-    let lease = match client::issue_client_web_lease(&http_client, &config, subdomain).await {
+    let installation_id = config
+        .registered_router_identity()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?
+        .installation_id
+        .clone();
+    let payload = NamespaceLeasePayload {
+        protocol_epoch: PROTOCOL_EPOCH.to_string(),
+        router_id: client::tunnel_router_id(&config)?,
+        route_id: format!("client:{installation_id}"),
+        rotation_id: request.rotation_id,
+        generation: request.generation,
+        expected_generation: request.expected_generation,
+        requested_subdomain: subdomain,
+        tunnel_type: "client-web-http".to_string(),
+        share: None,
+    };
+    let lease = match client::issue_namespace_lease(&http_client, &config, payload).await {
         Ok(lease) => lease,
         Err(error) => {
             record_router_error(&state, &config, error.to_string()).await;
@@ -4095,7 +4326,8 @@ async fn record_router_error(state: &ServerState, config: &ServerConfig, message
 async fn issue_share_tunnel_lease(
     state: ServerState,
     share_id: String,
-) -> anyhow::Result<IssueLeaseResponse> {
+    request: TunnelLeaseRequest,
+) -> anyhow::Result<NamespaceLeaseResponse> {
     let config = state.config.read().await.clone();
     if !config.has_registered_router_identity() {
         anyhow::bail!("router installation is not registered");
@@ -4121,10 +4353,70 @@ async fn issue_share_tunnel_lease(
         Some(&accounts),
         Some(&usage),
     );
+    let mut descriptor = descriptor;
+    let client_key = config
+        .client
+        .tunnel_subdomain
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("client tunnel key is not configured"))
+        .and_then(|value| ClientKey::parse(value).map_err(Into::into))?;
+    descriptor.subdomain = resolve_share_label(&descriptor.subdomain, &client_key)?;
     let requested_subdomain = descriptor.subdomain.clone();
     let http_client = state.http_client().await;
     client::claim_share_subdomain(&http_client, &config, descriptor.clone()).await?;
-    client::issue_share_lease(&http_client, &config, requested_subdomain, descriptor).await
+    client::issue_namespace_lease(
+        &http_client,
+        &config,
+        NamespaceLeasePayload {
+            protocol_epoch: PROTOCOL_EPOCH.to_string(),
+            router_id: client::tunnel_router_id(&config)?,
+            route_id: request.route_id,
+            rotation_id: request.rotation_id,
+            generation: request.generation,
+            expected_generation: request.expected_generation,
+            requested_subdomain,
+            tunnel_type: "http".to_string(),
+            share: Some(descriptor),
+        },
+    )
+    .await
+}
+
+fn resolve_client_key(config: &ServerConfig, configured: &str) -> anyhow::Result<String> {
+    if let Ok(client_key) = ClientKey::parse(configured) {
+        return Ok(client_key.to_string());
+    }
+    let identity = config
+        .registered_router_identity()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let public_key = base64::engine::general_purpose::STANDARD
+        .decode(&identity.public_key)
+        .context("decode router identity public key")?;
+    let mut prefix = configured
+        .trim()
+        .to_ascii_lowercase()
+        .bytes()
+        .filter(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        .take(7)
+        .map(char::from)
+        .collect::<String>();
+    if prefix.len() < 3 || !prefix.as_bytes()[0].is_ascii_lowercase() {
+        prefix = "client".to_string();
+    }
+    Ok(ClientKey::derive(&prefix, &public_key)?.to_string())
+}
+
+fn resolve_share_label(configured: &str, client_key: &ClientKey) -> anyhow::Result<String> {
+    if let Some((slug, suffix)) = configured.split_once("--") {
+        let slug = ShareSlug::parse(slug)?;
+        let suffix = ClientKey::parse(suffix)?;
+        if &suffix != client_key {
+            anyhow::bail!("share host belongs to another client key");
+        }
+        return Ok(format!("{}--{}", slug.as_str(), suffix.as_str()));
+    }
+    let slug = ShareSlug::parse(configured)?;
+    Ok(format!("{}--{}", slug.as_str(), client_key.as_str()))
 }
 
 #[cfg(test)]
@@ -5661,7 +5953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_router_recovery_discovers_id_before_legacy_signed_request() {
+    async fn old_router_rejection_does_not_trigger_legacy_registration() {
         async fn handler(
             AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
             Json(request): Json<Value>,
@@ -5703,33 +5995,17 @@ mod tests {
         stale_config.router.identity = Some(stale_identity);
         state.replace_config(stale_config).await.unwrap();
 
-        let result = state.register_router_installation().await.unwrap();
+        let error = state.register_router_installation().await.unwrap_err();
 
-        assert_eq!(result.installation_id, "inst-discovered");
-        assert!(result.control_secret_present);
+        assert!(error.to_string().contains("401 Unauthorized"));
         let requests = requests.lock().await;
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["proofVersion"], 2);
-        assert!(requests[1].get("proofVersion").is_none());
-        assert!(requests[1].get("timestampMs").is_none());
-        assert!(requests[1].get("signature").is_none());
-        assert!(requests[2].get("proofVersion").is_none());
-        assert!(requests[2]["timestampMs"].is_number());
-        assert!(requests[2]["signature"].is_string());
-        assert_ne!(requests[0]["instanceNonce"], requests[1]["instanceNonce"]);
-        assert_ne!(requests[1]["instanceNonce"], requests[2]["instanceNonce"]);
-        drop(requests);
-        let identity = state.config_snapshot().await.router.identity.unwrap();
-        assert_eq!(identity.installation_id, "inst-discovered");
-        assert_eq!(
-            identity.control_secret.as_deref(),
-            Some("legacy-control-secret")
-        );
         server.abort();
     }
 
     #[tokio::test]
-    async fn registration_fallback_chain_has_one_total_deadline() {
+    async fn registration_rejection_returns_without_legacy_fallback() {
         async fn handler(
             AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
             Json(request): Json<Value>,
@@ -5778,14 +6054,12 @@ mod tests {
         let error = state
             .register_router_installation_locked_with_timeout(Duration::from_millis(200))
             .await
-            .expect_err("the whole fallback chain must share one deadline");
+            .expect_err("registration rejection must be terminal");
 
         assert!(started.elapsed() < Duration::from_millis(750));
-        assert!(error.to_string().contains("timed out"));
-        assert!(crate::client_tunnel_provision::is_router_unreachable_error(
-            &error
-        ));
-        assert_eq!(requests.lock().await.len(), 3);
+        assert!(error.to_string().contains("401 Unauthorized"));
+        assert!(!crate::client_tunnel_provision::is_router_unreachable_error(&error));
+        assert_eq!(requests.lock().await.len(), 1);
         assert!(state
             .config_snapshot()
             .await

@@ -226,6 +226,12 @@ export interface TunnelInfo {
   subdomain: string;
   remotePort: number;
   healthy: boolean;
+  status?: string;
+  kind?: string;
+  generation?: number;
+  desiredGeneration?: number;
+  transportState?: string | null;
+  startReason?: string | null;
 }
 
 export interface ShareTunnelStatus {

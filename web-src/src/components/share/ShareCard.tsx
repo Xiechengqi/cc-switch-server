@@ -243,6 +243,16 @@ export function ShareCard({
                 {t("share.tunnelHealth")}:{" "}
                 {t(`share.statuses.${tunnelRuntimeStatus}`)}
               </span>
+              {tunnelStatus?.transportState ? (
+                <span>
+                  {t("share.transportState")}: {tunnelStatus.transportState}
+                </span>
+              ) : null}
+              {tunnelStatus?.generation ? (
+                <span>
+                  {t("share.tunnelGeneration")}: {tunnelStatus.generation}
+                </span>
+              ) : null}
               <span>
                 {t("share.tunnel.region")}: {routerDisplay}
               </span>

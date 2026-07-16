@@ -3079,6 +3079,8 @@
     "more": "その他",
     "remotePort": "リモートポート",
     "tunnelHealth": "Tunnel 状態",
+    "transportState": "転送状態",
+    "tunnelGeneration": "Tunnel 世代",
     "quota": "クォータ",
     "requestLogs": "リクエスト記録",
     "requestLogsHint": "最新 10 件の share リクエスト",

@@ -78,13 +78,47 @@ pub(in crate::api) async fn upsert_share(
             .clone()
             .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?,
     );
+    let previous = {
+        let shares = state.shares.read().await;
+        input
+            .id
+            .as_deref()
+            .and_then(|id| shares.get(id))
+            .or_else(|| {
+                shares
+                    .shares
+                    .iter()
+                    .find(|share| share.app == input.app && share.provider_id == input.provider_id)
+            })
+            .cloned()
+    };
     let share = state
         .mutate_shares_immediate(|store| store.upsert(input))
         .await
         .map_err(ApiError::internal)?
         .map_err(map_share_patch_error)?;
     spawn_share_upsert_sync(state.clone(), share.clone());
-    crate::state::ensure_share_tunnel_running(state.clone(), &share.id).await;
+    let was_running = previous
+        .as_ref()
+        .is_some_and(crate::state::should_restore_share_tunnel);
+    let should_run = crate::state::should_restore_share_tunnel(&share);
+    if was_running && !should_run {
+        crate::state::stop_share_tunnel(&state, &share.id).await;
+    } else if should_run
+        && previous
+            .as_ref()
+            .is_some_and(|previous| previous.tunnel_subdomain != share.tunnel_subdomain)
+    {
+        crate::state::force_reconnect_share_tunnel(
+            state.clone(),
+            share.id.clone(),
+            "share_subdomain_changed",
+        )
+        .await;
+    } else if should_run {
+        crate::state::ensure_share_tunnel_running_for(state.clone(), &share.id, "share_upsert")
+            .await;
+    }
     emit_share_event(&state, "share.changed", &share, "upserted");
     Ok(Json(UpsertShareResponse { ok: true, share }))
 }
@@ -151,6 +185,12 @@ pub(in crate::api) async fn update_share_subdomain(
         .await
         .map_err(ApiError::internal)??;
     spawn_share_upsert_sync(state.clone(), share.clone());
+    crate::state::force_reconnect_share_tunnel(
+        state.clone(),
+        share.id.clone(),
+        "share_subdomain_changed",
+    )
+    .await;
     emit_share_event(&state, "share.changed", &share, "subdomain_updated");
     Ok(Json(UpdateShareSubdomainResponse {
         ok: true,
@@ -170,6 +210,7 @@ pub(in crate::api) async fn delete_share(
         .await
         .map_err(ApiError::internal)?;
     if let Some(tombstone) = tombstone.as_ref() {
+        crate::state::stop_share_tunnel(&state, &id).await;
         spawn_share_delete_sync(state.clone(), tombstone.clone());
         state.emit_event(
             ServerEvent::new("share.deleted", "share")
@@ -197,6 +238,7 @@ pub(in crate::api) async fn pause_share(
         })
         .await
         .map_err(ApiError::internal)??;
+    crate::state::stop_share_tunnel(&state, &share.id).await;
     spawn_share_upsert_sync(state.clone(), share.clone());
     emit_share_event(&state, "share.changed", &share, "paused");
     Ok(Json(UpsertShareResponse { ok: true, share }))
@@ -217,7 +259,7 @@ pub(in crate::api) async fn resume_share(
         .await
         .map_err(ApiError::internal)??;
     spawn_share_upsert_sync(state.clone(), share.clone());
-    crate::state::ensure_share_tunnel_running(state.clone(), &share.id).await;
+    crate::state::ensure_share_tunnel_running_for(state.clone(), &share.id, "share_resumed").await;
     emit_share_event(&state, "share.changed", &share, "resumed");
     Ok(Json(UpsertShareResponse { ok: true, share }))
 }
@@ -236,7 +278,8 @@ pub(in crate::api) async fn start_share_tunnel(
         })
         .await
         .map_err(ApiError::internal)??;
-    crate::state::start_share_tunnel(state.clone(), id).await;
+    crate::state::ensure_share_tunnel_running_for(state.clone(), &id, "share_tunnel_api_start")
+        .await;
     spawn_share_upsert_sync(state.clone(), share.clone());
     emit_share_event(&state, "share.changed", &share, "tunnel_started");
     emit_tunnel_event(&state, "tunnel.changed", &share.id, "share_started");
@@ -277,7 +320,12 @@ pub(in crate::api) async fn restore_share_tunnels(
         .iter()
         .filter(|share| crate::state::should_restore_share_tunnel(share))
     {
-        crate::state::start_share_tunnel(state.clone(), share.id.clone()).await;
+        crate::state::ensure_share_tunnel_running_for(
+            state.clone(),
+            &share.id,
+            "share_tunnel_restore",
+        )
+        .await;
         spawn_share_upsert_sync(state.clone(), share.clone());
         emit_share_event(&state, "share.changed", share, "tunnel_restored");
         emit_tunnel_event(&state, "tunnel.changed", &share.id, "share_restored");

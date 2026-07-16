@@ -3,6 +3,7 @@ pub mod claude_cli;
 pub mod failover;
 pub mod health;
 pub mod providers;
+pub mod router;
 pub mod settings;
 pub mod sharing;
 pub mod stream_check;

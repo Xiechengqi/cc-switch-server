@@ -652,6 +652,10 @@ export interface TunnelRuntimeStatus {
   remotePort?: number | null;
   lastError?: string | null;
   connectedAtMs?: number | null;
+  generation: number;
+  desiredGeneration: number;
+  transportState?: string | null;
+  startReason?: string | null;
   updatedAtMs: number;
 }
 

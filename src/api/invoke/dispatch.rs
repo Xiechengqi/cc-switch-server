@@ -616,7 +616,8 @@ async fn web_invoke_dispatch(
             }
             crate::client_tunnel_provision::claim_client_tunnel_config(state, &config).await?;
             if web_optional_bool(&args, &["autoStart", "auto_start"]).unwrap_or(true) {
-                crate::state::start_client_tunnel(state.clone()).await;
+                crate::state::ensure_client_tunnel_running(state.clone(), "client_tunnel_claim")
+                    .await;
             }
             Ok(web_client_tunnel_state(state).await)
         }
@@ -1710,26 +1711,13 @@ async fn web_invoke_dispatch(
         }
         "enable_share" => {
             let share_id = web_arg_share_id(&args)?;
-            let _ = resume_share(
-                State(state.clone()),
-                headers.clone(),
-                Path(share_id.clone()),
-            )
-            .await?;
-            let response =
-                start_share_tunnel(State(state.clone()), headers.clone(), Path(share_id))
-                    .await?
-                    .0;
+            let response = resume_share(State(state.clone()), headers.clone(), Path(share_id))
+                .await?
+                .0;
             Ok(json!(response.share))
         }
         "disable_share" => {
             let share_id = web_arg_share_id(&args)?;
-            let _ = stop_share_tunnel(
-                State(state.clone()),
-                headers.clone(),
-                Path(share_id.clone()),
-            )
-            .await?;
             let response = pause_share(State(state.clone()), headers.clone(), Path(share_id))
                 .await?
                 .0;

@@ -67,9 +67,31 @@ pub(in crate::api) async fn update_client_tunnel(
 ) -> Result<Json<ClientTunnelResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let mut config = state.config.read().await.clone();
+    let previous_subdomain = config.client.tunnel_subdomain.clone();
+    let previous_runtime = state
+        .tunnels
+        .status(&crate::clients::router::tunnel::client_tunnel_key())
+        .await;
     config
         .update_client_tunnel(input)
         .map_err(ApiError::bad_request)?;
+    state
+        .replace_config(config.clone())
+        .await
+        .map_err(ApiError::internal)?;
+    if config.client.tunnel_status.as_deref() == Some("stopped") {
+        crate::state::stop_client_tunnel(&state).await;
+    } else if previous_subdomain != config.client.tunnel_subdomain
+        && previous_runtime
+            .as_ref()
+            .is_some_and(|status| status.status != "stopped")
+    {
+        crate::state::force_reconnect_client_tunnel(
+            state.clone(),
+            "client_tunnel_subdomain_changed",
+        )
+        .await;
+    }
     let response = ClientTunnelResponse {
         ok: true,
         tunnel_subdomain: config.client.tunnel_subdomain.clone(),
@@ -82,10 +104,6 @@ pub(in crate::api) async fn update_client_tunnel(
         remote_tunnel: None,
         remote_error: None,
     };
-    state
-        .replace_config(config)
-        .await
-        .map_err(ApiError::internal)?;
     Ok(Json(response))
 }
 
@@ -218,7 +236,7 @@ pub(in crate::api) async fn issue_client_tunnel_lease(
     headers: HeaderMap,
 ) -> Result<Json<ClientTunnelLeaseResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    crate::state::start_client_tunnel(state.clone()).await;
+    crate::state::ensure_client_tunnel_running(state.clone(), "client_tunnel_api_start").await;
     emit_tunnel_event(&state, "tunnel.changed", "client", "started");
     Ok(Json(ClientTunnelLeaseResponse {
         ok: true,

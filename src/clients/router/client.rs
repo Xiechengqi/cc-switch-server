@@ -10,6 +10,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+use crate::domain::router::PROTOCOL_EPOCH;
 use crate::domain::settings::config::{
     PayoutProfileState, RouterIdentity, ServerConfig, UpgradePolicyConfig,
 };
@@ -29,6 +30,7 @@ const INSTALLATION_HEARTBEAT_PROTOCOL_VERSION: u8 = 1;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterInstallationRequest {
+    pub protocol_epoch: String,
     pub public_key: String,
     pub platform: String,
     pub app_version: String,
@@ -66,13 +68,7 @@ pub enum RegisterInstallationAttemptError {
 
 impl RegisterInstallationAttemptError {
     pub fn allows_legacy_fallback(&self) -> bool {
-        matches!(
-            self,
-            Self::Rejected {
-                status: reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNAUTHORIZED,
-                ..
-            }
-        )
+        false
     }
 
     pub fn is_transient(&self) -> bool {
@@ -148,6 +144,7 @@ pub struct ClientTunnelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedRequest<T> {
+    pub protocol_epoch: String,
     pub installation_id: String,
     pub timestamp_ms: i64,
     pub nonce: String,
@@ -224,6 +221,7 @@ const fn legacy_owner_email_is_verified() -> bool {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientTunnelClaimRequest {
+    protocol_epoch: &'static str,
     installation_id: String,
     timestamp_ms: i64,
     nonce: String,
@@ -234,6 +232,7 @@ struct ClientTunnelClaimRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientTunnelUpdateRequest {
+    protocol_epoch: &'static str,
     installation_id: String,
     timestamp_ms: i64,
     nonce: String,
@@ -244,6 +243,7 @@ struct ClientTunnelUpdateRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InstallationPayoutProfileUpdateRequest {
+    protocol_epoch: &'static str,
     installation_id: String,
     timestamp_ms: i64,
     nonce: String,
@@ -261,6 +261,7 @@ pub struct InstallationPayoutProfileUpdateResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareRuntimeRefreshRequest {
+    protocol_epoch: &'static str,
     installation_id: String,
     timestamp_ms: i64,
     nonce: String,
@@ -287,6 +288,7 @@ pub struct IssueLeasePayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IssueLeaseRequest {
+    protocol_epoch: &'static str,
     installation_id: String,
     requested_subdomain: String,
     tunnel_type: String,
@@ -300,6 +302,7 @@ struct IssueLeaseRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareBatchSyncRequest {
+    protocol_epoch: &'static str,
     installation_id: String,
     timestamp_ms: i64,
     nonce: String,
@@ -310,6 +313,7 @@ struct ShareBatchSyncRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SharePruneRequest {
+    protocol_epoch: &'static str,
     installation_id: String,
     timestamp_ms: i64,
     nonce: String,
@@ -326,6 +330,7 @@ pub enum SharePruneOutcome {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareRequestLogBatchSyncRequest {
+    protocol_epoch: &'static str,
     installation_id: String,
     timestamp_ms: i64,
     nonce: String,
@@ -399,6 +404,7 @@ pub struct ShareEditAvailableEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareClaimSubdomainRequest {
+    protocol_epoch: &'static str,
     installation_id: String,
     timestamp_ms: i64,
     nonce: String,
@@ -450,6 +456,158 @@ pub enum RenewLeaseError {
     Retryable(String),
     #[error("{0}")]
     Terminal(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NamespaceLeasePayload {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
+    pub requested_subdomain: String,
+    pub tunnel_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<ShareDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NamespaceLeaseResponse {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub lease_id: String,
+    pub connection_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
+    pub ssh_username: String,
+    pub ssh_password: String,
+    pub ssh_addr: String,
+    pub expires_at: String,
+    pub tunnel_url: String,
+    pub subdomain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_host_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NamespaceRenewLeasePayload {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub lease_id: String,
+    pub connection_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NamespaceRenewLeaseResponse {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActivateTunnelPayload {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub lease_id: String,
+    pub connection_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TunnelStatePayload {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub lease_id: String,
+    pub connection_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TunnelStateResponse {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_generations: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub draining_generations: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelSignedRequest<T> {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    #[serde(flatten)]
+    pub payload: T,
+}
+
+pub fn tunnel_router_id(config: &ServerConfig) -> anyhow::Result<String> {
+    if let Some(domain) = config
+        .router
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(domain.trim_end_matches('.').to_ascii_lowercase());
+    }
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?;
+    reqwest::Url::parse(api_base)
+        .context("parse router api base")?
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .ok_or_else(|| anyhow::anyhow!("router api base does not contain a host"))
+}
+
+fn tunnel_signed_request<T: Serialize + Clone>(
+    identity: &RouterIdentity,
+    action: &str,
+    payload: T,
+) -> anyhow::Result<TunnelSignedRequest<T>> {
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let signature = sign_payload(identity, action, &payload, timestamp_ms, &nonce)?;
+    Ok(TunnelSignedRequest {
+        installation_id: identity.installation_id.clone(),
+        timestamp_ms,
+        nonce,
+        signature,
+        payload,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -662,6 +820,7 @@ async fn claim_client_tunnel_with_timeout(
         &nonce,
     )?;
     let request = ClientTunnelClaimRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
         timestamp_ms,
         nonce,
@@ -797,6 +956,7 @@ pub async fn get_client_tunnel(
     let response = http
         .get(format!("{api_base}/v1/installations/client-tunnel"))
         .query(&[
+            ("protocolEpoch", PROTOCOL_EPOCH),
             ("installationId", identity.installation_id.as_str()),
             ("timestampMs", timestamp_ms.as_str()),
             ("nonce", nonce.as_str()),
@@ -843,6 +1003,7 @@ pub async fn get_installation_owner_email_status(
     let response = http
         .get(format!("{api_base}/v1/installations/owner-email"))
         .query(&[
+            ("protocolEpoch", PROTOCOL_EPOCH),
             ("installationId", identity.installation_id.as_str()),
             ("timestampMs", timestamp_ms.as_str()),
             ("nonce", nonce.as_str()),
@@ -886,6 +1047,7 @@ pub async fn update_client_tunnel(
         &nonce,
     )?;
     let request = ClientTunnelUpdateRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
         timestamp_ms,
         nonce,
@@ -984,6 +1146,7 @@ async fn push_payout_profile_request(
     )?;
     let revision = update.revision;
     let request = InstallationPayoutProfileUpdateRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
         timestamp_ms,
         nonce,
@@ -1026,6 +1189,209 @@ pub async fn issue_share_lease(
     share: ShareDescriptor,
 ) -> anyhow::Result<IssueLeaseResponse> {
     issue_lease(http, config, requested_subdomain, "http", Some(share)).await
+}
+
+pub async fn issue_namespace_lease(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    payload: NamespaceLeasePayload,
+) -> anyhow::Result<NamespaceLeaseResponse> {
+    validate_namespace_payload_header(config, &payload.protocol_epoch, &payload.router_id)?;
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/');
+    let identity = config
+        .registered_router_identity()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let request = tunnel_signed_request(identity, "tunnel_lease_issue", payload.clone())?;
+    let response = http
+        .post(format!("{api_base}/v1/tunnels/lease"))
+        .json(&request)
+        .send()
+        .await
+        .context("send router namespace tunnel lease")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("router namespace tunnel lease failed: {status}: {body}");
+    }
+    let mut lease = response
+        .json::<NamespaceLeaseResponse>()
+        .await
+        .context("parse router namespace tunnel lease response")?;
+    validate_namespace_lease_response(&payload, &lease)?;
+    normalize_namespace_lease_url_scheme(config, &mut lease);
+    Ok(lease)
+}
+
+pub async fn renew_namespace_lease(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    payload: NamespaceRenewLeasePayload,
+) -> Result<NamespaceRenewLeaseResponse, RenewLeaseError> {
+    validate_namespace_payload_header(config, &payload.protocol_epoch, &payload.router_id)
+        .map_err(|error| RenewLeaseError::Terminal(error.to_string()))?;
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| RenewLeaseError::Terminal("router api base is not configured".into()))?
+        .trim_end_matches('/');
+    let identity = config
+        .registered_router_identity()
+        .ok_or_else(|| RenewLeaseError::Terminal("router installation is not registered".into()))?;
+    let request = tunnel_signed_request(identity, "tunnel_lease_renew", payload.clone())
+        .map_err(|error| RenewLeaseError::Terminal(error.to_string()))?;
+    let response = http
+        .post(format!("{api_base}/v1/tunnels/lease/renew"))
+        .timeout(ROUTER_LEASE_RENEW_TIMEOUT)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| {
+            RenewLeaseError::Retryable(format!("send router namespace lease renewal: {error}"))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let message = format!("router namespace lease renewal failed: {status}: {body}");
+        return if renew_status_is_retryable(status) {
+            Err(RenewLeaseError::Retryable(message))
+        } else {
+            Err(RenewLeaseError::Terminal(message))
+        };
+    }
+    let renewed = response
+        .json::<NamespaceRenewLeaseResponse>()
+        .await
+        .map_err(|error| {
+            RenewLeaseError::Retryable(format!(
+                "parse router namespace lease renewal response: {error}"
+            ))
+        })?;
+    if renewed.protocol_epoch != payload.protocol_epoch
+        || renewed.router_id != payload.router_id
+        || renewed.route_id != payload.route_id
+        || renewed.rotation_id != payload.rotation_id
+        || renewed.generation != payload.generation
+    {
+        return Err(RenewLeaseError::Terminal(
+            "router namespace lease renewal identity mismatch".into(),
+        ));
+    }
+    Ok(renewed)
+}
+
+pub async fn activate_namespace_tunnel(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    payload: ActivateTunnelPayload,
+) -> anyhow::Result<TunnelStateResponse> {
+    send_namespace_tunnel_control(
+        http,
+        config,
+        "/v1/tunnels/activate",
+        "tunnel_activate",
+        payload,
+    )
+    .await
+}
+
+pub async fn namespace_tunnel_state(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    payload: TunnelStatePayload,
+) -> anyhow::Result<TunnelStateResponse> {
+    send_namespace_tunnel_control(http, config, "/v1/tunnels/state", "tunnel_state", payload).await
+}
+
+async fn send_namespace_tunnel_control<T: Serialize + Clone>(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    path: &str,
+    action: &str,
+    payload: T,
+) -> anyhow::Result<TunnelStateResponse> {
+    let payload_value = serde_json::to_value(&payload).context("serialize tunnel control")?;
+    let protocol_epoch = payload_value
+        .get("protocolEpoch")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("tunnel control protocolEpoch is missing"))?;
+    let router_id = payload_value
+        .get("routerId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("tunnel control routerId is missing"))?;
+    validate_namespace_payload_header(config, protocol_epoch, router_id)?;
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/');
+    let identity = config
+        .registered_router_identity()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let request = tunnel_signed_request(identity, action, payload)?;
+    let response = http
+        .post(format!("{api_base}{path}"))
+        .timeout(ROUTER_LEASE_RENEW_TIMEOUT)
+        .json(&request)
+        .send()
+        .await
+        .with_context(|| format!("send router tunnel control {action}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("router tunnel control {action} failed: {status}: {body}");
+    }
+    let state = response
+        .json::<TunnelStateResponse>()
+        .await
+        .with_context(|| format!("parse router tunnel control {action} response"))?;
+    if state.protocol_epoch != PROTOCOL_EPOCH || state.router_id != tunnel_router_id(config)? {
+        bail!("router tunnel control {action} response identity mismatch");
+    }
+    Ok(state)
+}
+
+fn validate_namespace_payload_header(
+    config: &ServerConfig,
+    protocol_epoch: &str,
+    router_id: &str,
+) -> anyhow::Result<()> {
+    if protocol_epoch != PROTOCOL_EPOCH {
+        bail!("unsupported tunnel protocol epoch");
+    }
+    if router_id != tunnel_router_id(config)? {
+        bail!("tunnel routerId does not match configured Router");
+    }
+    Ok(())
+}
+
+fn validate_namespace_lease_response(
+    request: &NamespaceLeasePayload,
+    response: &NamespaceLeaseResponse,
+) -> anyhow::Result<()> {
+    if response.protocol_epoch != request.protocol_epoch
+        || response.router_id != request.router_id
+        || response.route_id != request.route_id
+        || response.rotation_id != request.rotation_id
+        || response.generation != request.generation
+        || response.expected_generation != request.expected_generation
+        || response.subdomain != request.requested_subdomain
+    {
+        bail!("router namespace tunnel lease response identity mismatch");
+    }
+    Ok(())
+}
+
+fn normalize_namespace_lease_url_scheme(config: &ServerConfig, lease: &mut NamespaceLeaseResponse) {
+    let router_url = config
+        .router
+        .url
+        .as_deref()
+        .or(config.router.api_base.as_deref())
+        .unwrap_or_default();
+    if router_url.starts_with("https://") && lease.tunnel_url.starts_with("http://") {
+        lease.tunnel_url = format!("https://{}", lease.tunnel_url.trim_start_matches("http://"));
+    }
 }
 
 pub async fn renew_tunnel_lease(
@@ -1138,6 +1504,7 @@ pub async fn claim_share_subdomain(
         &nonce,
     )?;
     let request = ShareClaimSubdomainRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
         timestamp_ms,
         nonce,
@@ -1239,6 +1606,7 @@ fn build_share_prune_request(
 ) -> anyhow::Result<SharePruneRequest> {
     let signature = sign_payload(identity, "share_prune_v1", &share_ids, timestamp_ms, &nonce)?;
     Ok(SharePruneRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
         timestamp_ms,
         nonce,
@@ -1325,25 +1693,12 @@ async fn push_share_ops_request(
     let identity = config
         .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
-    let response = send_share_ops_request(http, &api_base, identity, ops.clone()).await?;
+    let response = send_share_ops_request(http, &api_base, identity, ops).await?;
     if response.status().is_success() {
         return Ok(());
     }
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    if should_retry_legacy_share_sync(status, &body, &ops) {
-        tracing::warn!(
-            "router rejected versioned share sync signature; retrying legacy signed payload"
-        );
-        let response =
-            send_share_ops_request(http, &api_base, identity, legacy_share_sync_ops(ops)).await?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!("router legacy share batch sync failed: {status}: {body}");
-    }
     bail!("router share batch sync failed: {status}: {body}");
 }
 
@@ -1357,6 +1712,7 @@ async fn send_share_ops_request(
     let nonce = nonce();
     let signature = sign_payload(identity, "share_batch_sync", &ops, timestamp_ms, &nonce)?;
     let request = ShareBatchSyncRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
         timestamp_ms,
         nonce,
@@ -1368,30 +1724,6 @@ async fn send_share_ops_request(
         .send()
         .await
         .context("send router share batch sync")
-}
-
-fn should_retry_legacy_share_sync(
-    status: reqwest::StatusCode,
-    body: &str,
-    ops: &[ShareSyncOperation],
-) -> bool {
-    status == reqwest::StatusCode::UNAUTHORIZED
-        && body.contains("signature verification failed")
-        && ops.iter().any(|op| {
-            op.share
-                .as_ref()
-                .is_some_and(|share| share.config_revision > 0)
-        })
-}
-
-fn legacy_share_sync_ops(mut ops: Vec<ShareSyncOperation>) -> Vec<ShareSyncOperation> {
-    for op in &mut ops {
-        if let Some(share) = op.share.as_mut() {
-            share.auto_start = false;
-            share.config_revision = 0;
-        }
-    }
-    ops
 }
 
 pub async fn notify_runtime_refresh(
@@ -1422,6 +1754,7 @@ pub async fn notify_runtime_refresh(
         &nonce,
     )?;
     let request = ShareRuntimeRefreshRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
         timestamp_ms,
         nonce,
@@ -1465,6 +1798,7 @@ pub async fn batch_sync_share_request_logs(
         &nonce,
     )?;
     let request = ShareRequestLogBatchSyncRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
         timestamp_ms,
         nonce,
@@ -1568,7 +1902,7 @@ pub fn share_edit_events_url(config: &ServerConfig) -> anyhow::Result<String> {
         &nonce,
     )?;
     Ok(format!(
-        "{api_base}/v1/shares/edit-events?installationId={}&timestampMs={timestamp_ms}&nonce={}&signature={}",
+        "{api_base}/v1/shares/edit-events?protocolEpoch={PROTOCOL_EPOCH}&installationId={}&timestampMs={timestamp_ms}&nonce={}&signature={}",
         url_encode(&identity.installation_id),
         url_encode(&nonce),
         url_encode(&signature),
@@ -1600,6 +1934,7 @@ async fn issue_lease(
         &nonce,
     )?;
     let request = IssueLeaseRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
         requested_subdomain,
         tunnel_type: tunnel_type.to_string(),
@@ -1651,6 +1986,7 @@ pub fn signed_request<T: Serialize>(
     let nonce = nonce();
     let signature = sign_payload(identity, action, &payload, timestamp_ms, &nonce)?;
     Ok(SignedRequest {
+        protocol_epoch: PROTOCOL_EPOCH.to_string(),
         installation_id: identity.installation_id.clone(),
         timestamp_ms,
         nonce,
@@ -1678,8 +2014,8 @@ pub fn sign_payload<T: Serialize>(
     let signing_key = SigningKey::from_bytes(&secret);
     let payload_json = serde_json::to_string(payload).context("serialize signed payload")?;
     let canonical = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        identity.installation_id, action, payload_json, timestamp_ms, nonce
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        PROTOCOL_EPOCH, identity.installation_id, action, payload_json, timestamp_ms, nonce
     );
     Ok(STANDARD.encode(signing_key.sign(canonical.as_bytes()).to_bytes()))
 }
@@ -1702,8 +2038,13 @@ pub fn sign_lease_request(
         .map_err(|_| anyhow::anyhow!("invalid router private key length"))?;
     let signing_key = SigningKey::from_bytes(&secret);
     let canonical = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        identity.installation_id, requested_subdomain, tunnel_type, timestamp_ms, nonce
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        PROTOCOL_EPOCH,
+        identity.installation_id,
+        requested_subdomain,
+        tunnel_type,
+        timestamp_ms,
+        nonce
     );
     Ok(STANDARD.encode(signing_key.sign(canonical.as_bytes()).to_bytes()))
 }
@@ -1733,6 +2074,7 @@ fn build_register_installation_request(
         timestamp_ms,
     )?;
     Ok(RegisterInstallationRequest {
+        protocol_epoch: PROTOCOL_EPOCH.to_string(),
         public_key: identity.public_key.clone(),
         platform: platform.to_string(),
         app_version: app_version.to_string(),
@@ -1758,6 +2100,7 @@ fn build_legacy_register_installation_request(
         timestamp_ms,
     )?;
     Ok(RegisterInstallationRequest {
+        protocol_epoch: PROTOCOL_EPOCH.to_string(),
         public_key: identity.public_key.clone(),
         platform: platform.to_string(),
         app_version: app_version.to_string(),
@@ -1775,6 +2118,7 @@ fn build_unsigned_legacy_register_installation_request(
     instance_nonce: String,
 ) -> RegisterInstallationRequest {
     RegisterInstallationRequest {
+        protocol_epoch: PROTOCOL_EPOCH.to_string(),
         public_key: identity.public_key.clone(),
         platform: platform.to_string(),
         app_version: app_version.to_string(),
@@ -1800,7 +2144,8 @@ fn sign_registration_v2(
         .map_err(|_| anyhow::anyhow!("invalid router private key length"))?;
     let signing_key = SigningKey::from_bytes(&secret);
     let canonical = format!(
-        "register_installation_v2\n{}\n{}\n{}\n{}\n{}",
+        "{}\nregister_installation_v2\n{}\n{}\n{}\n{}\n{}",
+        PROTOCOL_EPOCH,
         identity.public_key.trim(),
         platform.trim(),
         app_version,
@@ -1828,7 +2173,8 @@ fn sign_registration_recovery(
         .map_err(|_| anyhow::anyhow!("invalid router private key length"))?;
     let signing_key = SigningKey::from_bytes(&secret);
     let canonical = format!(
-        "{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
+        PROTOCOL_EPOCH,
         identity.installation_id,
         identity.public_key.trim(),
         platform.trim(),
@@ -2002,7 +2348,8 @@ mod tests {
         let signature = STANDARD.decode(signature).unwrap();
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
-        let canonical = "inst-1\nshare_delete\n{\"shareId\":\"share-1\"}\n123\nnonce-1";
+        let canonical =
+            "namespace-flat-1\ninst-1\nshare_delete\n{\"shareId\":\"share-1\"}\n123\nnonce-1";
 
         verifying_key
             .verify(canonical.as_bytes(), &signature)
@@ -2040,7 +2387,7 @@ mod tests {
         let signature = STANDARD.decode(&request.signature).unwrap();
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
-        let canonical = "inst-prune\nshare_prune_v1\n[\"share-b\",\"share-a\"]\n123\nprune-nonce";
+        let canonical = "namespace-flat-1\ninst-prune\nshare_prune_v1\n[\"share-b\",\"share-a\"]\n123\nprune-nonce";
 
         verifying_key
             .verify(canonical.as_bytes(), &signature)
@@ -2073,7 +2420,7 @@ mod tests {
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
         let canonical = format!(
-            "register_installation_v2\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
+            "{PROTOCOL_EPOCH}\nregister_installation_v2\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
             identity.public_key
         );
 
@@ -2104,7 +2451,7 @@ mod tests {
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
         let canonical = format!(
-            "register_installation_v2\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
+            "{PROTOCOL_EPOCH}\nregister_installation_v2\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
             identity.public_key
         );
 
@@ -2114,7 +2461,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_registration_retry_preserves_old_router_canonical_format() {
+    fn registration_recovery_signature_is_epoch_scoped() {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-existing".into();
 
@@ -2135,7 +2482,7 @@ mod tests {
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
         let canonical = format!(
-            "inst-existing\nregister_installation\n{}\nlinux\n1.2.3\nlegacy-nonce\n456",
+            "{PROTOCOL_EPOCH}\ninst-existing\nregister_installation\n{}\nlinux\n1.2.3\nlegacy-nonce\n456",
             identity.public_key
         );
 
@@ -2152,7 +2499,7 @@ mod tests {
         let request = build_installation_heartbeat_request(&identity, "boot-123").unwrap();
         let payload_json = serde_json::to_string(&request.payload).unwrap();
         let canonical = format!(
-            "inst-heartbeat\ninstallation_heartbeat_v1\n{}\n{}\n{}",
+            "{PROTOCOL_EPOCH}\ninst-heartbeat\ninstallation_heartbeat_v1\n{}\n{}\n{}",
             payload_json, request.timestamp_ms, request.nonce
         );
         let public_key = STANDARD.decode(&identity.public_key).unwrap();
@@ -2197,7 +2544,7 @@ mod tests {
         assert_eq!(
             registration.signature.as_deref(),
             Some(
-                "ZZXnKtvGo8dPqW7oRNH6p878npyjH7AOjQHnFEegYdgbtSmx0GYMVdVOehycNZxxkKgTuyBfM176MjtNsZhqDg=="
+                "nlRT3f2KJ0oZaI84N/naU1WYGv/bS7Pz0X7I0hDKxQg2U0RZ/eZhmpZ4yaCcTARWq7TRvaGbUe7vejXPnmkcBA=="
             )
         );
 
@@ -2212,7 +2559,7 @@ mod tests {
         assert_eq!(
             legacy.signature.as_deref(),
             Some(
-                "Xa7QqLps3PE6UpT8xeTZTR7DP/2FQnJIUEZGl5dkK672YWMBzXBrm4UwXtc1YsgnUUYH+4e0gxgpugZEfbBMDQ=="
+                "+SCyz8ys5tyXjoTXYkzIyb9n/LBovygmFHz4wHoDF7uJF7jNKh7egVmaUGK9E34nyWytM1fPTyoMrl+TRh4tCg=="
             )
         );
 
@@ -2232,9 +2579,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             signature,
-            "SKGGtibTy3D/Fbnclkw2sLlq3q+LtiLfELbnDTlj+mT68pGPpULSJjKM9J/5LKcFysxaA87tuesjPD9WhEOmDw=="
+            "Ax5dl8lsVWD1wh/8qxs72+hrPtRjjMdJzX/22gQDLxpwClbmIcUThVrGVQH5n1hVuwZsvKfYuoLCINMuGbg8Cg=="
         );
         let value = serde_json::to_value(SignedRequest {
+            protocol_epoch: PROTOCOL_EPOCH.to_string(),
             installation_id: identity.installation_id,
             timestamp_ms: 1_700_000_000_456,
             nonce: "fixture-heartbeat-123".into(),
@@ -2287,7 +2635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_v2_exposes_fallback_eligible_rejection_to_state() {
+    async fn registration_v2_rejection_does_not_enable_legacy_fallback() {
         async fn handler(
             State(requests): State<Arc<Mutex<Vec<Value>>>>,
             Json(request): Json<Value>,
@@ -2318,7 +2666,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(error.allows_legacy_fallback());
+        assert!(!error.allows_legacy_fallback());
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["proofVersion"], 2);
@@ -2882,54 +3230,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_share_sync_omits_versioned_fields_from_signed_payload() {
-        let ops = vec![ShareSyncOperation {
-            kind: "upsert".to_string(),
-            share_id: None,
-            share: Some(ShareDescriptor {
-                auto_start: true,
-                config_revision: 7,
-                ..ShareDescriptor::default()
-            }),
-        }];
-        let serialized = serde_json::to_string(&ops).unwrap();
-        assert!(serialized.contains("autoStart"));
-        assert!(serialized.contains("configRevision"));
-
-        let legacy = legacy_share_sync_ops(ops);
-        let serialized = serde_json::to_string(&legacy).unwrap();
-        assert!(!serialized.contains("autoStart"));
-        assert!(!serialized.contains("configRevision"));
-    }
-
-    #[test]
-    fn legacy_share_sync_retry_is_limited_to_versioned_signature_failures() {
-        let ops = vec![ShareSyncOperation {
-            kind: "upsert".to_string(),
-            share_id: None,
-            share: Some(ShareDescriptor {
-                config_revision: 1,
-                ..ShareDescriptor::default()
-            }),
-        }];
-        assert!(should_retry_legacy_share_sync(
-            reqwest::StatusCode::UNAUTHORIZED,
-            r#"{"message":"signature verification failed"}"#,
-            &ops,
-        ));
-        assert!(!should_retry_legacy_share_sync(
-            reqwest::StatusCode::UNAUTHORIZED,
-            r#"{"message":"installation not found"}"#,
-            &ops,
-        ));
-        assert!(!should_retry_legacy_share_sync(
-            reqwest::StatusCode::FORBIDDEN,
-            r#"{"message":"signature verification failed"}"#,
-            &ops,
-        ));
-    }
-
-    #[test]
     fn signed_payload_rejects_tampered_canonical_payload() {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-1".to_string();
@@ -2998,7 +3298,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_signature_matches_router_legacy_format() {
+    fn lease_signature_is_epoch_scoped() {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-1".to_string();
         let signature = sign_lease_request(&identity, "share-a", "http", 123, "nonce-1").unwrap();
@@ -3009,7 +3309,7 @@ mod tests {
         let signature = STANDARD.decode(signature).unwrap();
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
-        let canonical = "inst-1\nshare-a\nhttp\n123\nnonce-1";
+        let canonical = "namespace-flat-1\ninst-1\nshare-a\nhttp\n123\nnonce-1";
 
         verifying_key
             .verify(canonical.as_bytes(), &signature)
@@ -3055,7 +3355,7 @@ mod tests {
         let signature = STANDARD.decode(signature).unwrap();
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
-        let canonical = "inst-1\nshare_claim_subdomain\n{\"shareId\":\"share-1\",\"subdomain\":\"share-sub\",\"ownerEmail\":\"owner@example.com\"}\n123\nnonce-1";
+        let canonical = "namespace-flat-1\ninst-1\nshare_claim_subdomain\n{\"shareId\":\"share-1\",\"subdomain\":\"share-sub\",\"ownerEmail\":\"owner@example.com\"}\n123\nnonce-1";
 
         verifying_key
             .verify(canonical.as_bytes(), &signature)

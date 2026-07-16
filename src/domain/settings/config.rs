@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
 const CONFIG_FILE_NAME: &str = "server.json";
+pub const ROUTER_CONTROL_DB_FILE_NAME: &str = "router-control.sqlite";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -649,6 +650,10 @@ pub struct UpdateUpstreamProxyInput {
 
 pub fn config_path(config_dir: &Path) -> std::path::PathBuf {
     config_dir.join(CONFIG_FILE_NAME)
+}
+
+pub fn router_control_db_path(config_dir: &Path) -> std::path::PathBuf {
+    config_dir.join(ROUTER_CONTROL_DB_FILE_NAME)
 }
 
 pub fn normalize_email(email: &str) -> anyhow::Result<String> {

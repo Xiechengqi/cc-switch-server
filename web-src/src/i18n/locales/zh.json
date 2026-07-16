@@ -3195,6 +3195,8 @@
     "more": "更多",
     "remotePort": "远端端口",
     "tunnelHealth": "隧道状态",
+    "transportState": "传输阶段",
+    "tunnelGeneration": "隧道代际",
     "quota": "配额",
     "requestLogs": "请求记录",
     "requestLogsHint": "最近 10 条 share 请求",

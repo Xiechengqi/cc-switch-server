@@ -65,8 +65,10 @@ use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::Path;
 use axum::extract::Query;
+use axum::extract::Request;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
@@ -508,6 +510,10 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/v1beta/*path", any(proxy_gemini))
         .route("/gemini/v1/*path", any(proxy_gemini))
         .route("/gemini/v1beta/*path", any(proxy_gemini))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            verify_router_ingress,
+        ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
@@ -531,6 +537,107 @@ pub fn app_router(state: ServerState) -> Router {
         }
     }
     app
+}
+
+async fn verify_router_ingress(
+    State(state): State<ServerState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    use crate::clients::router::ingress::{INGRESS_CONTEXT_HEADER, INGRESS_SIGNATURE_HEADER};
+
+    let encoded = request
+        .headers()
+        .get(INGRESS_CONTEXT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let signature = request
+        .headers()
+        .get(INGRESS_SIGNATURE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    for name in [
+        INGRESS_CONTEXT_HEADER,
+        INGRESS_SIGNATURE_HEADER,
+        "x-cc-switch-share-id",
+        "x-cc-switch-share-subdomain",
+        "x-cc-switch-user-email",
+        "x-cc-switch-user-country",
+        "x-cc-switch-request-id",
+        "x-cc-switch-web-user-email",
+        "x-cc-switch-web-role",
+        "x-cc-switch-installation-id",
+        "x-cc-switch-client-tunnel-subdomain",
+    ] {
+        request.headers_mut().remove(name);
+    }
+
+    let context = match (encoded, signature) {
+        (None, None) => return next.run(request).await,
+        (Some(encoded), Some(signature)) => {
+            let config = state.config.read().await;
+            let Some(identity) = config.registered_router_identity() else {
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+            let Some(control_secret) = identity.control_secret.as_deref() else {
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+            let router_id = match crate::clients::router::client::tunnel_router_id(&config) {
+                Ok(router_id) => router_id,
+                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+            };
+            match crate::clients::router::ingress::verify(
+                &encoded,
+                &signature,
+                control_secret,
+                &router_id,
+                &identity.installation_id,
+                chrono::Utc::now().timestamp_millis(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(error = %error, "router ingress context rejected");
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+            }
+        }
+        _ => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let headers = request.headers_mut();
+    for (name, value) in [
+        ("x-cc-switch-share-id", context.share_id.as_deref()),
+        (
+            "x-cc-switch-share-subdomain",
+            context.public_host.split('.').next(),
+        ),
+        ("x-cc-switch-user-email", context.user_email.as_deref()),
+        ("x-cc-switch-user-country", context.user_country.as_deref()),
+        ("x-cc-switch-request-id", Some(context.request_id.as_str())),
+    ] {
+        if let Some(value) = value.and_then(|value| value.parse().ok()) {
+            headers.insert(name, value);
+        }
+    }
+    if context.share_id.is_none() {
+        for (name, value) in [
+            ("x-cc-switch-web-user-email", context.user_email.as_deref()),
+            ("x-cc-switch-web-role", context.user_role.as_deref()),
+            (
+                "x-cc-switch-installation-id",
+                Some(context.installation_id.as_str()),
+            ),
+            (
+                "x-cc-switch-client-tunnel-subdomain",
+                context.public_host.split('.').next(),
+            ),
+        ] {
+            if let Some(value) = value.and_then(|value| value.parse().ok()) {
+                headers.insert(name, value);
+            }
+        }
+    }
+    next.run(request).await
 }
 
 async fn embedded_web_asset(method: Method, uri: Uri) -> Response {
