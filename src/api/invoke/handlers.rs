@@ -467,6 +467,8 @@ pub(in crate::api) async fn web_share_upsert_input(
         web_optional_string_any(value, &["marketAccessMode", "market_access_mode"]);
     let access_by_app = web_optional_deserialize(value, "accessByApp")?.unwrap_or_default();
     let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
+    let for_sale_official_price_percent_by_app =
+        web_optional_deserialize(value, "forSaleOfficialPricePercentByApp")?.unwrap_or_default();
 
     Ok(UpsertShareInput {
         id: web_optional_string_any(value, &["id", "shareId", "share_id"]),
@@ -500,7 +502,7 @@ pub(in crate::api) async fn web_share_upsert_input(
         sale_market_kind: web_optional_string_any(value, &["saleMarketKind", "sale_market_kind"]),
         access_by_app,
         app_settings,
-        for_sale_official_price_percent_by_app: BTreeMap::new(),
+        for_sale_official_price_percent_by_app,
         official_price_percent: None,
         auto_start: web_optional_bool(value, &["autoStart", "auto_start"]),
         description: web_optional_string_any(value, &["description"]),
@@ -873,6 +875,8 @@ pub(in crate::api) async fn web_save_provider_share(
         web_optional_deserialize::<Vec<String>>(value, "sharedWithEmails")?.unwrap_or_default();
     let access_by_app = web_optional_deserialize(value, "accessByApp")?.unwrap_or_default();
     let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
+    let for_sale_official_price_percent_by_app =
+        web_optional_deserialize(value, "forSaleOfficialPricePercentByApp")?.unwrap_or_default();
     let token_limit = web_optional_i64(value, &["tokenLimit", "token_limit"])
         .ok_or_else(|| ApiError::bad_request("tokenLimit is required"))?;
     let parallel_limit = web_optional_i64(value, &["parallelLimit", "parallel_limit"])
@@ -901,6 +905,9 @@ pub(in crate::api) async fn web_save_provider_share(
                 shared_with_emails: Some(shared_with_emails),
                 access_by_app: Some(access_by_app),
                 app_settings: Some(app_settings),
+                for_sale_official_price_percent_by_app: Some(
+                    for_sale_official_price_percent_by_app,
+                ),
                 token_limit: Some(token_limit),
                 parallel_limit: Some(parallel_limit),
                 expires_at: Some(expires_at),

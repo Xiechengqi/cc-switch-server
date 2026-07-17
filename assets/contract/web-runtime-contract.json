@@ -770,7 +770,7 @@
       "implemented": true,
       "feature": "settings",
       "endpoint": "GET /api/admin/version",
-      "notes": "Web invoke bridge for admin version/upgrade metadata; works on client tunnel where /api/admin/version may be unavailable."
+      "notes": "Web invoke bridge for admin version/upgrade metadata. Pass checkRemote=true to query GitHub Releases; default is local runtime info only."
     },
     {
       "name": "restart_server_service",
@@ -1209,7 +1209,7 @@
       "implemented": true,
       "feature": "settings",
       "endpoint": "GET /api/config",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "notes": "Server web runtime shim for desktop-synced settings UI; includes upgradePolicy from server.json."
     },
     {
       "name": "get_owner_payout_profile",

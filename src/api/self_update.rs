@@ -84,6 +84,25 @@ pub(in crate::api) struct AdminUpgradeStatusResponse {
     pub logs: Vec<UpgradeLogEntry>,
 }
 
+pub(in crate::api) async fn build_admin_runtime_version_response(
+    state: &ServerState,
+) -> AdminVersionResponse {
+    let upgrade_capable = ensure_binary_writable().is_ok();
+    AdminVersionResponse {
+        build: build_info(),
+        binary_path: BINARY_INSTALL_PATH,
+        rollback_path: BINARY_ROLLBACK_PATH,
+        rollback_available: rollback_available(),
+        process_id: std::process::id(),
+        process_instance_id: state.process_instance_id.clone(),
+        uptime_secs: state.started_at.elapsed().as_secs(),
+        restart_pending: state.upgrade.is_restart_pending().await,
+        upgrade_capable,
+        service: crate::self_update::version::detect_service_status(),
+        latest: crate::self_update::version::default_latest_release_meta(),
+    }
+}
+
 pub(in crate::api) async fn build_admin_version_response(
     state: &ServerState,
 ) -> AdminVersionResponse {

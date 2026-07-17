@@ -113,7 +113,11 @@
     "enable": "有効化",
     "share": {
       "ownerNotConfigured": "先に Client Owner を設定してください",
-      "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。"
+      "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。",
+      "officialPricePercent": "モデル価格（公式価格に対する割合）",
+      "officialPricePercentPlaceholder": "空欄の場合は Token Market の価格を使用",
+      "officialPricePercentHint": "1 から 100 の整数のみ入力できます。",
+      "officialPricePercentInvalid": "モデル価格は 1 から 100 の整数で入力してください。"
     },
     "inUse": "使用中",
     "editProvider": "プロバイダーを編集",

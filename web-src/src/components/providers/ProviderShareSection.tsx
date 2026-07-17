@@ -188,6 +188,7 @@ export function ProviderShareSection({
   const [shareToEmails, setShareToEmails] = useState<string[]>([]);
   const [tokenLimitInput, setTokenLimitInput] = useState("");
   const [parallelLimitInput, setParallelLimitInput] = useState("");
+  const [officialPricePercentInput, setOfficialPricePercentInput] = useState("");
   const [expiresInSecsInput, setExpiresInSecsInput] = useState(
     String(permanentExpiresInSecs()),
   );
@@ -286,6 +287,11 @@ export function ProviderShareSection({
 
     setTokenLimitInput(formatShareLimitInput(share?.tokenLimit));
     setParallelLimitInput(formatShareLimitInput(share?.parallelLimit));
+    const officialPricePercent =
+      share?.forSaleOfficialPricePercentByApp?.[shareableApp];
+    setOfficialPricePercentInput(
+      Number.isInteger(officialPricePercent) ? String(officialPricePercent) : "",
+    );
 
     const permanent = share ? isPermanentExpiry(share.expiresAt) : true;
     setIsPermanent(permanent);
@@ -356,6 +362,16 @@ export function ProviderShareSection({
     forSaleValue === "Yes" &&
     saleMarketKind === "share" &&
     normalizedSelectedShareMarketEmail.length === 0;
+  const salePricingEligible =
+    forSaleValue === "Yes" && saleMarketKind === "token";
+  const salePricingVisible = shareRunning && salePricingEligible;
+  const salePricingInvalid =
+    officialPricePercentInput !== "" &&
+    !/^(?:[1-9]|[1-9][0-9]|100)$/.test(officialPricePercentInput);
+  const salePricingPayload =
+    salePricingEligible && officialPricePercentInput !== ""
+      ? { [shareableApp]: Number(officialPricePercentInput) }
+      : {};
 
   const resolveTokenLimit = () =>
     tokenLimitInput.trim() ? Number(tokenLimitInput) : UNLIMITED_TOKEN_LIMIT;
@@ -461,7 +477,7 @@ export function ProviderShareSection({
       );
       return false;
     }
-    if (shareToInvalid || marketInvalid) {
+    if (shareToInvalid || marketInvalid || salePricingInvalid) {
       toast.error(
         t("provider.share.invalidConfiguration", {
           defaultValue: "请修正远程分享配置后再保存",
@@ -495,6 +511,7 @@ export function ProviderShareSection({
       marketAccessMode: aclPayload.marketAccessMode,
       accessByApp: aclPayload.accessByApp,
       appSettings: aclPayload.appSettings,
+      forSaleOfficialPricePercentByApp: salePricingPayload,
       tokenLimit,
       parallelLimit,
       expiresAt: nextExpiresAt,
@@ -518,6 +535,11 @@ export function ProviderShareSection({
       return;
     }
     if (share && isShareRunning(share)) {
+      const persistedPrice =
+        share.forSaleOfficialPricePercentByApp?.[shareableApp];
+      setOfficialPricePercentInput(
+        Number.isInteger(persistedPrice) ? String(persistedPrice) : "",
+      );
       await disableMutation.mutateAsync(share.id);
     }
   };
@@ -761,6 +783,7 @@ export function ProviderShareSection({
                         setConfirmFreeOpen(true);
                       } else {
                         setForSaleValue(next);
+                        if (next !== "Yes") setOfficialPricePercentInput("");
                         setShareDraftDirty(true);
                       }
                     }}
@@ -805,6 +828,7 @@ export function ProviderShareSection({
                           disabled={marketDisabled || busy}
                           onChange={() => {
                             setSaleMarketKind(value);
+                            if (value !== "token") setOfficialPricePercentInput("");
                             setShareDraftDirty(true);
                             if (value === "token") {
                               setMarketAccessMode("all");
@@ -831,6 +855,53 @@ export function ProviderShareSection({
                     ))}
                   </div>
                 </div>
+
+                {salePricingVisible ? (
+                  <div className="space-y-2 md:col-span-2">
+                    <Label htmlFor="provider-share-official-price-percent">
+                      {t("provider.share.officialPricePercent", {
+                        defaultValue: "模型定价（官方价的百分比）",
+                      })}
+                    </Label>
+                    <Input
+                      id="provider-share-official-price-percent"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      maxLength={3}
+                      value={officialPricePercentInput}
+                      disabled={busy}
+                      aria-invalid={salePricingInvalid}
+                      className={cn(salePricingInvalid && "border-destructive")}
+                      placeholder={t(
+                        "provider.share.officialPricePercentPlaceholder",
+                        {
+                          defaultValue: "留空则使用 Token Market 默认定价",
+                        },
+                      )}
+                      onChange={(event) => {
+                        setOfficialPricePercentInput(event.target.value);
+                        setShareDraftDirty(true);
+                      }}
+                    />
+                    <p
+                      className={cn(
+                        "text-xs",
+                        salePricingInvalid
+                          ? "text-destructive"
+                          : "text-muted-foreground",
+                      )}
+                    >
+                      {salePricingInvalid
+                        ? t("provider.share.officialPricePercentInvalid", {
+                            defaultValue: "模型定价必须是 1-100 的整数。",
+                          })
+                        : t("provider.share.officialPricePercentHint", {
+                            defaultValue: "只允许 1-100 的整数。",
+                          })}
+                    </p>
+                  </div>
+                ) : null}
 
                 {saleMarketKind === "token" ? (
                   <MarketSelectorField
@@ -1103,6 +1174,7 @@ export function ProviderShareSection({
         variant="info"
         onConfirm={() => {
           setForSaleValue("Free");
+          setOfficialPricePercentInput("");
           setShareDraftDirty(true);
           setConfirmFreeOpen(false);
         }}

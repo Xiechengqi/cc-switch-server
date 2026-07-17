@@ -133,8 +133,6 @@ pub struct ProviderMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_model_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_sale_official_price_percent: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_dispatch_limit_percent: Option<u32>,
     #[serde(default)]
     pub api_format: Option<String>,
@@ -534,7 +532,6 @@ mod tests {
         assert!(value.get("costMultiplier").is_none());
         assert!(value.get("pricingModelSource").is_none());
         assert!(value.get("quotaDispatchLimitPercent").is_none());
-        assert!(value.get("forSaleOfficialPricePercent").is_none());
         assert!(value.get("testConfig").is_none());
     }
 

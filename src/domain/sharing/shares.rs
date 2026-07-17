@@ -880,11 +880,13 @@ impl ShareStore {
         share_id: &str,
         patch: ShareSettingsPatch,
     ) -> Result<Share, SharePatchError> {
-        let share = self
+        let index = self
             .shares
-            .iter_mut()
-            .find(|item| item.id == share_id)
+            .iter()
+            .position(|item| item.id == share_id)
             .ok_or(SharePatchError::NotFound)?;
+        let mut share = self.shares[index].clone();
+        let pricing_was_explicit = patch.for_sale_official_price_percent_by_app.is_some();
 
         if let Some(owner_email) = patch.owner_email {
             let owner_email = normalize_optional_email(Some(owner_email))
@@ -904,7 +906,7 @@ impl ShareStore {
             share.description = description.map(|value| value.trim().to_string());
         }
         if let Some(for_sale) = patch.for_sale {
-            apply_router_for_sale_patch(share, &for_sale);
+            apply_router_for_sale_patch(&mut share, &for_sale);
         }
         if let Some(sale_market_kind) = patch.sale_market_kind {
             share.sale_market_kind = normalize_non_empty(sale_market_kind, "token");
@@ -940,9 +942,23 @@ impl ShareStore {
             share.auto_start = auto_start;
         }
 
-        mark_share_config_pending(share);
+        let pricing_eligible = share.for_sale
+            && !share.free_access
+            && share.sale_market_kind.trim().eq_ignore_ascii_case("token");
+        if !pricing_eligible {
+            if pricing_was_explicit && !share.for_sale_official_price_percent_by_app.is_empty() {
+                return Err(SharePatchError::Invalid(
+                    "share official price percent requires forSale=Yes and saleMarketKind=token"
+                        .to_string(),
+                ));
+            }
+            share.for_sale_official_price_percent_by_app.clear();
+        }
+        crate::domain::sharing::invariants::validate_share_import(&share)?;
+        mark_share_config_pending(&mut share);
+        self.shares[index] = share.clone();
 
-        Ok(share.clone())
+        Ok(share)
     }
 
     pub fn canonicalize_primary_app_settings(
@@ -1633,6 +1649,100 @@ mod tests {
         assert!(updated.free_access);
         assert!(!updated.for_sale);
         assert_eq!(share_router_for_sale_label(&updated), "Free");
+    }
+
+    #[test]
+    fn apply_settings_patch_persists_valid_token_market_pricing() {
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("share-priced");
+        input.sale_market_kind = Some("token".to_string());
+        let share = store.upsert(input).expect("upsert");
+
+        let updated = store
+            .apply_settings_patch(
+                &share.id,
+                ShareSettingsPatch {
+                    for_sale_official_price_percent_by_app: Some(BTreeMap::from([(
+                        "codex".to_string(),
+                        80,
+                    )])),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .expect("apply pricing");
+
+        assert_eq!(
+            updated.for_sale_official_price_percent_by_app,
+            BTreeMap::from([("codex".to_string(), 80)])
+        );
+    }
+
+    #[test]
+    fn apply_settings_patch_rejects_invalid_pricing_without_partial_mutation() {
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("share-invalid-price");
+        input.sale_market_kind = Some("token".to_string());
+        let share = store.upsert(input).expect("upsert");
+
+        for pricing in [
+            BTreeMap::from([("codex".to_string(), 0)]),
+            BTreeMap::from([("codex".to_string(), 101)]),
+            BTreeMap::from([("claude".to_string(), 80)]),
+        ] {
+            let result = store.apply_settings_patch(
+                &share.id,
+                ShareSettingsPatch {
+                    description: Some(Some("must not persist".to_string())),
+                    for_sale_official_price_percent_by_app: Some(pricing),
+                    ..ShareSettingsPatch::default()
+                },
+            );
+            assert!(matches!(result, Err(SharePatchError::Invalid(_))));
+            let stored = store.get(&share.id).expect("stored share");
+            assert_eq!(stored.description, None);
+            assert!(stored.for_sale_official_price_percent_by_app.is_empty());
+        }
+    }
+
+    #[test]
+    fn sale_mode_transition_clears_pricing_and_rejects_contradictory_payload() {
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("share-price-transition");
+        input.sale_market_kind = Some("token".to_string());
+        input.for_sale_official_price_percent_by_app = BTreeMap::from([("codex".to_string(), 75)]);
+        let share = store.upsert(input).expect("upsert");
+
+        let rejected = store.apply_settings_patch(
+            &share.id,
+            ShareSettingsPatch {
+                for_sale: Some("No".to_string()),
+                for_sale_official_price_percent_by_app: Some(BTreeMap::from([(
+                    "codex".to_string(),
+                    75,
+                )])),
+                ..ShareSettingsPatch::default()
+            },
+        );
+        assert!(matches!(rejected, Err(SharePatchError::Invalid(_))));
+        assert_eq!(
+            store
+                .get(&share.id)
+                .expect("stored share")
+                .for_sale_official_price_percent_by_app
+                .get("codex"),
+            Some(&75)
+        );
+
+        let updated = store
+            .apply_settings_patch(
+                &share.id,
+                ShareSettingsPatch {
+                    sale_market_kind: Some("share".to_string()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .expect("switch market kind");
+        assert!(updated.for_sale_official_price_percent_by_app.is_empty());
     }
 
     #[test]

@@ -2,7 +2,7 @@ import { useTranslation } from "react-i18next";
 import type { ShareRecord, TunnelConfig, TunnelInfo } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { ShareCard, type ShareProviderSalePricing } from "./ShareCard";
+import { ShareCard } from "./ShareCard";
 
 interface ShareListProps {
   shares: ShareRecord[];
@@ -12,7 +12,6 @@ interface ShareListProps {
   isLoading: boolean;
   error: string | null;
   pendingAction?: string | null;
-  providerSalePricing?: ShareProviderSalePricing[];
   providerNameByKey?: Record<string, string>;
   providerAccountByKey?: Record<string, string>;
   readOnly?: boolean;
@@ -32,7 +31,6 @@ export function ShareList({
   isLoading,
   error,
   pendingAction,
-  providerSalePricing,
   providerNameByKey,
   providerAccountByKey,
   readOnly = false,
@@ -122,7 +120,6 @@ export function ShareList({
           tunnelConfig={tunnelConfig}
           tunnelConfigured={tunnelConfigured}
           pendingAction={pendingAction}
-          providerSalePricing={providerSalePricing}
           readOnly={readOnly}
           hideRuntimeActions={hideRuntimeActions}
           onDelete={onDelete ?? (() => undefined)}

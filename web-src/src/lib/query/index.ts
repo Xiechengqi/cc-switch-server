@@ -4,4 +4,4 @@ export * from "./mutations";
 export * from "./proxy";
 export * from "./share";
 export * from "./emailAuth";
-export * from "./subscription";
+export * from "./upgradePolicy";

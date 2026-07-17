@@ -133,11 +133,9 @@ pub struct LatestReleaseMeta {
     pub error: Option<String>,
 }
 
-pub async fn fetch_latest_release_meta(client: &reqwest::Client) -> LatestReleaseMeta {
-    let url = release_binary_url();
-    let local_commit_id = build_info().commit_id;
-    let mut meta = LatestReleaseMeta {
-        binary_url: url.to_string(),
+pub fn default_latest_release_meta() -> LatestReleaseMeta {
+    LatestReleaseMeta {
+        binary_url: release_binary_url().to_string(),
         available: false,
         commit_id: None,
         commit_short: None,
@@ -145,7 +143,14 @@ pub async fn fetch_latest_release_meta(client: &reqwest::Client) -> LatestReleas
         etag: None,
         content_length: None,
         error: None,
-    };
+    }
+}
+
+pub async fn fetch_latest_release_meta(client: &reqwest::Client) -> LatestReleaseMeta {
+    let url = release_binary_url();
+    let local_commit_id = build_info().commit_id;
+    let mut meta = default_latest_release_meta();
+    meta.binary_url = url.to_string();
 
     match fetch_latest_release_commit(client).await {
         Ok(commit_id) => {

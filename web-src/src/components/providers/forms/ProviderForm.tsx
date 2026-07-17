@@ -122,7 +122,7 @@ import {
   useManagedAuth,
 } from "./hooks";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { useSettingsQuery, useSharesQuery } from "@/lib/query";
+import { useSettingsQuery } from "@/lib/query";
 import {
   CLAUDE_DEFAULT_CONFIG,
   CODEX_DEFAULT_CONFIG,
@@ -180,10 +180,6 @@ type PresetEntry = {
     | OpenClawProviderPreset
     | HermesProviderPreset;
 };
-
-function matchesPricingApp(appId: AppId) {
-  return appId === "claude" || appId === "codex" || appId === "gemini";
-}
 
 const codexApiFormatFromWireApi = (
   wireApi: string | undefined,
@@ -340,7 +336,6 @@ function ProviderFormFull({
   const isEditMode = Boolean(initialData);
   const queryClient = useQueryClient();
   const { data: settingsData } = useSettingsQuery();
-  const { data: sharesForProviderPricing = [] } = useSharesQuery();
   const showCommonConfigNotice =
     !serverWeb &&
     settingsData != null &&
@@ -395,20 +390,15 @@ function ProviderFormFull({
     enabled: boolean;
     costMultiplier?: string;
     pricingModelSource: PricingModelSourceOption;
-    forSaleOfficialPricePercent?: number;
     quotaDispatchLimitPercent?: number;
   }>(() => ({
     enabled: hasPricingConfigOverride(initialData?.meta),
     costMultiplier: initialData?.meta?.costMultiplier ?? undefined,
-    forSaleOfficialPricePercent: initialData?.meta?.forSaleOfficialPricePercent,
     quotaDispatchLimitPercent: initialData?.meta?.quotaDispatchLimitPercent,
     pricingModelSource: normalizePricingSource(
       initialData?.meta?.pricingModelSource,
     ),
   }));
-  const showProviderForSalePricing =
-    matchesPricingApp(appId) &&
-    sharesForProviderPricing.some((share) => share.forSale === "Yes");
 
   const { category } = useProviderCategory({
     appId,
@@ -452,8 +442,6 @@ function ProviderFormFull({
     setPricingConfig({
       enabled: hasPricingConfigOverride(initialData?.meta),
       costMultiplier: initialData?.meta?.costMultiplier ?? undefined,
-      forSaleOfficialPricePercent:
-        initialData?.meta?.forSaleOfficialPricePercent,
       quotaDispatchLimitPercent: initialData?.meta?.quotaDispatchLimitPercent,
       pricingModelSource: normalizePricingSource(
         initialData?.meta?.pricingModelSource,
@@ -2179,13 +2167,6 @@ function ProviderFormFull({
       testConfig: _ignoredTestConfig,
       ...baseMetaWithoutPricing
     } = baseMeta ?? {};
-    const forSaleOfficialPricePercent =
-      pricingConfig.forSaleOfficialPricePercent;
-    const validForSaleOfficialPricePercent =
-      Number.isInteger(forSaleOfficialPricePercent) &&
-      forSaleOfficialPricePercent !== undefined &&
-      forSaleOfficialPricePercent >= 1 &&
-      forSaleOfficialPricePercent <= 100;
     const quotaDispatchLimitPercent = pricingConfig.quotaDispatchLimitPercent;
     const validQuotaDispatchLimitPercent =
       supportsQuotaDispatchLimit &&
@@ -2314,9 +2295,6 @@ function ProviderFormFull({
         pricingConfig.enabled && pricingConfig.pricingModelSource !== "inherit"
           ? pricingConfig.pricingModelSource
           : undefined,
-      forSaleOfficialPricePercent: validForSaleOfficialPricePercent
-        ? forSaleOfficialPricePercent
-        : undefined,
       quotaDispatchLimitPercent: validQuotaDispatchLimitPercent
         ? quotaDispatchLimitPercent
         : undefined,
@@ -2903,46 +2881,6 @@ function ProviderFormFull({
                             })}
                       </p>
                     )}
-                </div>
-              ) : undefined
-            }
-            websiteSideSlot={
-              showProviderForSalePricing ? (
-                <div className="space-y-2">
-                  <Label htmlFor="for-sale-official-price-percent">
-                    {t("providerAdvanced.forSaleOfficialPricePercent", {
-                      defaultValue: "模型定价（官方价的百分比）",
-                    })}
-                  </Label>
-                  <Input
-                    id="for-sale-official-price-percent"
-                    type="number"
-                    min="1"
-                    max="100"
-                    step="1"
-                    inputMode="numeric"
-                    value={pricingConfig.forSaleOfficialPricePercent ?? ""}
-                    onChange={(event) => {
-                      const raw = event.target.value;
-                      setPricingConfig((current) => ({
-                        ...current,
-                        forSaleOfficialPricePercent:
-                          raw === "" ? undefined : Number.parseInt(raw, 10),
-                      }));
-                    }}
-                    placeholder={t(
-                      "providerAdvanced.forSaleOfficialPricePercentPlaceholder",
-                      {
-                        defaultValue: "默认留空则使用 Market 定价",
-                      },
-                    )}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    {t("providerAdvanced.forSaleOfficialPricePercentHint", {
-                      defaultValue:
-                        "只允许 1-100 的整数。非空时优先于 Share 页模型定价。",
-                    })}
-                  </p>
                 </div>
               ) : undefined
             }

@@ -132,7 +132,11 @@
       "saveError": "保存分享配置失败：{{error}}",
       "routerFromSettingsHint": "使用设置 → 分享中的默认 Router 节点创建 share。",
       "ownerNotConfigured": "请先配置 Client Owner",
-      "ownerManagedHint": "Share Owner 与 Client Owner 保持一致。可在「设置 → 分享」通过安装签名的 Owner 换绑进行修改。"
+      "ownerManagedHint": "Share Owner 与 Client Owner 保持一致。可在「设置 → 分享」通过安装签名的 Owner 换绑进行修改。",
+      "officialPricePercent": "模型定价（官方价的百分比）",
+      "officialPricePercentPlaceholder": "留空则使用 Token Market 默认定价",
+      "officialPricePercentHint": "只允许 1-100 的整数。",
+      "officialPricePercentInvalid": "模型定价必须是 1-100 的整数。"
     },
     "inUse": "使用中",
     "clickToClearCurrent": "点击取消启用",
@@ -518,7 +522,7 @@
       "title": "升级策略",
       "description": "控制 Router 代升级与后台自动检查更新行为。",
       "delegateTitle": "授权 Router Owner 代升级",
-      "delegateDescription": "开启后，Router Web 中 client owner 可对这台 server 执行强制升级。",
+      "delegateDescription": "开启后，Router Web 中 Router owner 可对这台 server 执行强制升级。",
       "autoUpgradeTitle": "自动升级",
       "autoUpgradeDescription": "定时检查 GitHub Releases，仅当本地版本落后于最新版本时才执行升级。",
       "intervalTitle": "自动检查间隔（分钟）",

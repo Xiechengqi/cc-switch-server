@@ -44,13 +44,6 @@ import {
   resolveShareTunnelInfo,
 } from "@/utils/shareUtils";
 
-export interface ShareProviderSalePricing {
-  app: "claude" | "codex" | "gemini";
-  label: string;
-  providerName?: string;
-  percent?: number;
-}
-
 interface ShareCardProps {
   share: ShareRecord;
   /**
@@ -63,7 +56,6 @@ interface ShareCardProps {
   tunnelConfig: TunnelConfig;
   tunnelConfigured: boolean;
   pendingAction?: string | null;
-  providerSalePricing?: ShareProviderSalePricing[];
   readOnly?: boolean;
   hideRuntimeActions?: boolean;
   onDelete: (share: ShareRecord) => void;
@@ -71,8 +63,6 @@ interface ShareCardProps {
   onDisable: (share: ShareRecord) => void;
   onResetUsage: (share: ShareRecord) => Promise<void> | void;
 }
-
-const EMPTY_PROVIDER_SALE_PRICING: ShareProviderSalePricing[] = [];
 
 export function ShareCard({
   share,
@@ -82,7 +72,6 @@ export function ShareCard({
   tunnelConfig,
   tunnelConfigured,
   pendingAction,
-  providerSalePricing = EMPTY_PROVIDER_SALE_PRICING,
   readOnly = false,
   hideRuntimeActions = false,
   onDelete,

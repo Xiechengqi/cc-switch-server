@@ -1,4 +1,5 @@
 import type { Settings } from "@/types";
+import { DEFAULT_UPGRADE_POLICY } from "@/lib/upgradePolicyDefaults";
 
 /** Mirrors `default_ui_settings()` in `src/core/ui_settings.rs` for server web fallback. */
 export const SERVER_DEFAULT_SETTINGS: Settings = {
@@ -35,4 +36,5 @@ export const SERVER_DEFAULT_SETTINGS: Settings = {
   },
   backupIntervalHours: 24,
   backupRetainCount: 10,
+  upgradePolicy: DEFAULT_UPGRADE_POLICY,
 };

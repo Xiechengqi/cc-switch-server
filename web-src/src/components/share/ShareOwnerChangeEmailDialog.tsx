@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Server } from "lucide-react";
+import { Server, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { TunnelConfig } from "@/lib/api";
 import { useEmailAuthChangeOwnerEmailMutation } from "@/lib/query/emailAuth";
@@ -7,6 +7,7 @@ import { normalizeShareRouterDomain } from "@/utils/shareRouter";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -112,7 +113,7 @@ export function ShareOwnerChangeEmailDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md">
-        <DialogHeader>
+        <DialogHeader className="relative pr-12">
           <DialogTitle>
             {t("share.ownerChange.title", {
               defaultValue: "Change Owner Email",
@@ -124,6 +125,12 @@ export function ShareOwnerChangeEmailDialog({
                 "Choose a router, enter the new owner email, then confirm. Server installation credentials authorize this change without email verification.",
             })}
           </DialogDescription>
+          <DialogClose
+            className="absolute right-0 top-0 rounded-full p-1.5 hover:bg-muted transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2"
+            aria-label={t("common.close", { defaultValue: "Close" })}
+          >
+            <X className="h-4 w-4 text-muted-foreground" />
+          </DialogClose>
         </DialogHeader>
 
         <div className="space-y-5 px-6 py-5">
@@ -230,6 +237,13 @@ export function ShareOwnerChangeEmailDialog({
         </div>
 
         <DialogFooter className="gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+          >
+            {t("common.close", { defaultValue: "Close" })}
+          </Button>
           {step === "email" ? (
             <Button
               type="button"

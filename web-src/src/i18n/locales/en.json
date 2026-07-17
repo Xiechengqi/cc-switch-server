@@ -128,7 +128,11 @@
       "saveError": "Failed to save share settings: {{error}}",
       "routerFromSettingsHint": "New shares use the default router from Settings → Share.",
       "ownerNotConfigured": "Configure Client Owner first",
-      "ownerManagedHint": "Share Owner always matches Client Owner. Change it from Settings → Share via installation-signed owner transfer."
+      "ownerManagedHint": "Share Owner always matches Client Owner. Change it from Settings → Share via installation-signed owner transfer.",
+      "officialPricePercent": "Model pricing (% of official price)",
+      "officialPricePercentPlaceholder": "Leave empty to use Token Market pricing",
+      "officialPricePercentHint": "Enter an integer from 1 to 100.",
+      "officialPricePercentInvalid": "Model pricing must be an integer from 1 to 100."
     },
     "inUse": "In Use",
     "clickToClearCurrent": "Click to disable",
@@ -514,7 +518,7 @@
       "title": "Upgrade Policy",
       "description": "Control router-delegated upgrades and background auto-upgrade checks.",
       "delegateTitle": "Allow router owner to upgrade",
-      "delegateDescription": "When enabled, the client owner can force-upgrade this server from Router Web.",
+      "delegateDescription": "When enabled, the router owner can force-upgrade this server from Router Web.",
       "autoUpgradeTitle": "Auto upgrade",
       "autoUpgradeDescription": "Periodically check GitHub Releases and upgrade only when the local version is behind.",
       "intervalTitle": "Auto-check interval (minutes)",

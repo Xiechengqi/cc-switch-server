@@ -2736,6 +2736,9 @@ async fn provider_share_settings_are_saved_atomically() {
                             "expiresAt": "2030-01-01T00:00:00Z"
                         }
                     },
+                    "forSaleOfficialPricePercentByApp": {
+                        "codex": 80
+                    },
                     "tokenLimit": 123,
                     "parallelLimit": 4,
                     "expiresAt": "2030-01-01T00:00:00Z"
@@ -2755,6 +2758,10 @@ async fn provider_share_settings_are_saved_atomically() {
     assert_eq!(saved["saleMarketKind"].as_str(), Some("token"));
     assert_eq!(saved["tokenLimit"].as_u64(), Some(123));
     assert_eq!(saved["parallelLimit"].as_u64(), Some(4));
+    assert_eq!(
+        saved["forSaleOfficialPricePercentByApp"]["codex"].as_u64(),
+        Some(80)
+    );
     assert_eq!(saved["expiresAt"].as_i64(), Some(1_893_456_000_000));
     assert_eq!(
         saved["acl"]["sharedWithEmails"][0].as_str(),
@@ -2773,6 +2780,10 @@ async fn provider_share_settings_are_saved_atomically() {
         .mutate_shares(|store| store.get("share-provider-save").cloned())
         .await
         .unwrap();
+    assert_eq!(
+        stored.for_sale_official_price_percent_by_app.get("codex"),
+        Some(&80)
+    );
     assert_eq!(stored.router_synced_revision, stored.config_revision);
     assert!(stored.router_last_sync_error.is_none());
 }

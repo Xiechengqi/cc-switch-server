@@ -32,7 +32,6 @@ import {
   SHARE_PROVIDER_AUTH_PROVIDERS,
   type ManagedAuthStatusByProvider,
 } from "./providerOptions";
-import type { Provider } from "@/types";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -43,12 +42,6 @@ import {
   verifyRouterEmailCode,
   type RouterSessionStatus,
 } from "@/lib/routerAuth";
-
-const SHARE_PROVIDER_APPS = [
-  { app: "claude", label: "Claude" },
-  { app: "codex", label: "Codex" },
-  { app: "gemini", label: "Gemini" },
-] as const;
 
 interface SharePageProps {
   defaultApp?: AppId;
@@ -134,22 +127,6 @@ export function SharePage({
       geminiProvidersQuery.data,
     ],
   );
-  const providerSalePricing = useMemo(
-    () =>
-      SHARE_PROVIDER_APPS.map(({ app, label }) => {
-        const data = providerQueries[app];
-        const provider: Provider | undefined =
-          data?.providers?.[data.currentProviderId];
-        return {
-          app,
-          label,
-          providerName: provider?.name,
-          percent: provider?.meta?.forSaleOfficialPricePercent,
-        };
-      }),
-    [providerQueries],
-  );
-
   const tunnelQueries = useQueries({
     queries: shares.map((share) => ({
       queryKey: shareKeys.tunnelStatus(share.id),
@@ -290,7 +267,6 @@ export function SharePage({
           isLoading={isLoading}
           error={error ? extractErrorMessage(error) : null}
           pendingAction={pendingActionShareId}
-          providerSalePricing={providerSalePricing}
           providerNameByKey={providerNameByKey}
           providerAccountByKey={providerAccountByKey}
           readOnly={effectiveReadOnly}

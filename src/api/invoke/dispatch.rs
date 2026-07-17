@@ -61,9 +61,17 @@ async fn web_invoke_dispatch(
             response["processInstanceId"] = json!(state.process_instance_id.clone());
             Ok(response)
         }
-        "get_admin_version_info" => Ok(json!(
-            crate::api::self_update::build_admin_version_response(state).await
-        )),
+        "get_admin_version_info" => {
+            let check_remote = args
+                .get("checkRemote")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Ok(json!(if check_remote {
+                crate::api::self_update::build_admin_version_response(state).await
+            } else {
+                crate::api::self_update::build_admin_runtime_version_response(state).await
+            }))
+        }
         "restart_server_service" => {
             let response =
                 crate::api::self_update::admin_restart(State(state.clone()), headers.clone())

@@ -50,8 +50,17 @@ impl UiSettingsStore {
             server_config.router.domain.as_deref(),
             server_config.router.url.as_deref(),
         );
+        let upgrade_policy = server_config.upgrade_policy.clone().normalize();
         if let Value::Object(ref mut map) = settings {
             map.insert("shareRouterDomain".into(), json!(resolved_domain));
+            map.insert(
+                "upgradePolicy".into(),
+                json!({
+                    "delegateUpgradeToRouterOwner": upgrade_policy.delegate_upgrade_to_router_owner,
+                    "autoUpgradeEnabled": upgrade_policy.auto_upgrade_enabled,
+                    "autoUpgradeCheckIntervalMinutes": upgrade_policy.auto_upgrade_check_interval_minutes,
+                }),
+            );
         }
         settings
     }
@@ -411,6 +420,12 @@ mod tests {
         assert_eq!(
             settings["shareRouterDomain"].as_str(),
             Some("sgptokenswitch.cc")
+        );
+        assert_eq!(settings["upgradePolicy"]["delegateUpgradeToRouterOwner"], json!(true));
+        assert_eq!(settings["upgradePolicy"]["autoUpgradeEnabled"], json!(false));
+        assert_eq!(
+            settings["upgradePolicy"]["autoUpgradeCheckIntervalMinutes"],
+            json!(60)
         );
     }
 

@@ -1,5 +1,5 @@
+import { Loader2, Shield } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Shield } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -13,42 +13,33 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import {
-  loadUpgradePolicy,
-  saveUpgradePolicy,
-  type UpgradePolicy,
-} from "@/lib/server-legacy-api";
+  useSaveUpgradePolicyMutation,
+  useUpgradePolicyQuery,
+} from "@/lib/query/upgradePolicy";
+import type { UpgradePolicy } from "@/types";
 
 export function ServerUpgradePolicySettings() {
   const { t } = useTranslation();
-  const [policy, setPolicy] = useState<UpgradePolicy | null>(null);
-  const [busy, setBusy] = useState(false);
+  const { policy, isLoading } = useUpgradePolicyQuery();
+  const saveMutation = useSaveUpgradePolicyMutation();
+  const busy = saveMutation.isPending;
+  const controlsDisabled = busy || isLoading;
+  const [intervalDraft, setIntervalDraft] = useState(
+    policy.autoUpgradeCheckIntervalMinutes,
+  );
 
   useEffect(() => {
-    loadUpgradePolicy()
-      .then(setPolicy)
-      .catch((error) => {
-        console.error("Failed to load upgrade policy:", error);
-      });
-  }, []);
+    setIntervalDraft(policy.autoUpgradeCheckIntervalMinutes);
+  }, [policy.autoUpgradeCheckIntervalMinutes]);
 
   async function updatePolicy(patch: Partial<UpgradePolicy>) {
-    if (!policy) return;
-    const previous = policy;
     const next = { ...policy, ...patch };
-    setPolicy(next);
-    setBusy(true);
     try {
-      const saved = await saveUpgradePolicy(next);
-      setPolicy(saved);
+      await saveMutation.mutateAsync(next);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
-      setPolicy(previous);
-    } finally {
-      setBusy(false);
     }
   }
-
-  if (!policy) return null;
 
   return (
     <Accordion type="multiple" defaultValue={[]} className="w-full">
@@ -65,14 +56,19 @@ export function ServerUpgradePolicySettings() {
               </h3>
               <p className="text-sm text-muted-foreground font-normal">
                 {t("settings.upgradePolicy.description", {
-                  defaultValue:
-                    "控制 Router 代升级与后台自动检查更新行为。",
+                  defaultValue: "控制 Router 代升级与后台自动检查更新行为。",
                 })}
               </p>
             </div>
           </div>
         </AccordionTrigger>
         <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+          {isLoading ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              {t("common.loading", { defaultValue: "加载中" })}
+            </div>
+          ) : null}
           <div className="space-y-6">
             <div className="flex items-center justify-between gap-4">
               <div className="space-y-1">
@@ -84,15 +80,15 @@ export function ServerUpgradePolicySettings() {
                 <p className="text-xs text-muted-foreground">
                   {t("settings.upgradePolicy.delegateDescription", {
                     defaultValue:
-                      "开启后，Router Web 中 client owner 可对这台 server 执行强制升级。",
+                      "开启后，Router Web 中 Router owner 可对这台 server 执行强制升级。",
                   })}
                 </p>
               </div>
               <Switch
                 checked={policy.delegateUpgradeToRouterOwner}
-                disabled={busy}
+                disabled={controlsDisabled}
                 onCheckedChange={(checked) =>
-                  updatePolicy({ delegateUpgradeToRouterOwner: checked })
+                  void updatePolicy({ delegateUpgradeToRouterOwner: checked })
                 }
               />
             </div>
@@ -113,9 +109,9 @@ export function ServerUpgradePolicySettings() {
               </div>
               <Switch
                 checked={policy.autoUpgradeEnabled}
-                disabled={busy}
+                disabled={controlsDisabled}
                 onCheckedChange={(checked) =>
-                  updatePolicy({ autoUpgradeEnabled: checked })
+                  void updatePolicy({ autoUpgradeEnabled: checked })
                 }
               />
             </div>
@@ -138,21 +134,19 @@ export function ServerUpgradePolicySettings() {
                 min={5}
                 max={1440}
                 className="w-28"
-                disabled={busy || !policy.autoUpgradeEnabled}
-                value={policy.autoUpgradeCheckIntervalMinutes}
+                disabled={controlsDisabled || !policy.autoUpgradeEnabled}
+                value={intervalDraft}
                 onChange={(event) => {
                   const value = Number.parseInt(event.target.value, 10);
                   if (!Number.isFinite(value)) return;
-                  setPolicy({
-                    ...policy,
-                    autoUpgradeCheckIntervalMinutes: value,
-                  });
+                  setIntervalDraft(value);
                 }}
                 onBlur={() => {
                   const minutes = Math.min(
                     1440,
-                    Math.max(5, policy.autoUpgradeCheckIntervalMinutes || 60),
+                    Math.max(5, intervalDraft || 60),
                   );
+                  setIntervalDraft(minutes);
                   if (minutes !== policy.autoUpgradeCheckIntervalMinutes) {
                     void updatePolicy({
                       autoUpgradeCheckIntervalMinutes: minutes,

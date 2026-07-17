@@ -869,8 +869,16 @@ export async function loadRuntimeVersionInfo(): Promise<RuntimeVersionInfo> {
   return invokeCommand<RuntimeVersionInfo>("get_build_info");
 }
 
+export async function loadAdminRuntimeVersionInfo(): Promise<AdminVersionInfo> {
+  return invokeCommand<AdminVersionInfo>("get_admin_version_info", {
+    checkRemote: false,
+  });
+}
+
 export async function loadAdminVersionInfo(): Promise<AdminVersionInfo> {
-  return invokeCommand<AdminVersionInfo>("get_admin_version_info");
+  return invokeCommand<AdminVersionInfo>("get_admin_version_info", {
+    checkRemote: true,
+  });
 }
 
 export async function restartServerService(): Promise<void> {
@@ -892,11 +900,9 @@ export async function startServerUpgrade(input: {
   return { taskId: result.taskId };
 }
 
-export interface UpgradePolicy {
-  delegateUpgradeToRouterOwner: boolean;
-  autoUpgradeEnabled: boolean;
-  autoUpgradeCheckIntervalMinutes: number;
-}
+import type { UpgradePolicy } from "@/types";
+
+export type { UpgradePolicy };
 
 export async function loadUpgradePolicy(): Promise<UpgradePolicy> {
   return invokeCommand<UpgradePolicy>("get_upgrade_policy");

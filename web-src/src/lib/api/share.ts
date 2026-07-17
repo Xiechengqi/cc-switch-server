@@ -182,6 +182,7 @@ export interface SaveProviderShareParams {
   sharedWithEmails: string[];
   accessByApp: ShareAccessByApp;
   appSettings: ShareAppSettingsByApp;
+  forSaleOfficialPricePercentByApp: Record<string, number>;
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: string;

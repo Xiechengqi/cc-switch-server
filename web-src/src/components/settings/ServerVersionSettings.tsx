@@ -42,6 +42,7 @@ import {
 } from "@/lib/sse";
 import {
   loadAdminVersionInfo,
+  loadAdminRuntimeVersionInfo,
   loadBuildInfo,
   loadRuntimeVersionInfo,
   loadUpgradeStatus,
@@ -290,7 +291,14 @@ function buildVersionCardSubtitle(
     info.latest?.commitShort,
   );
 
-  if (info.latest?.commitId && info.latest.updateAvailable && latest !== "--") {
+  if (!info.latest?.commitId) {
+    return t("settings.serverVersion.currentVersionOnly", {
+      current,
+      defaultValue: "当前 {{current}}",
+    });
+  }
+
+  if (info.latest.updateAvailable && latest !== "--") {
     return t("settings.serverVersion.versionCardUpdateAvailable", {
       current,
       latest,
@@ -365,10 +373,29 @@ export function ServerVersionSettings() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const adminInfo = await loadAdminVersionInfo();
-      applyVersionInfo(adminInfo);
+      const localInfo = await loadAdminRuntimeVersionInfo();
+      setInfo((previous) => {
+        const localCommitChanged = Boolean(
+          previous?.commitId &&
+            localInfo.commitId &&
+            previous.commitId !== localInfo.commitId,
+        );
+        const next: AdminVersionInfo = {
+          ...localInfo,
+          latest:
+            !localCommitChanged && previous?.latest?.commitId != null
+              ? previous.latest
+              : localInfo.latest,
+        };
+        const capturedAtMs = Date.now();
+        uptimeAnchorRef.current = {
+          uptimeSecs: next.uptimeSecs,
+          capturedAtMs,
+        };
+        setRuntimeTickMs(capturedAtMs);
+        return next;
+      });
       setUsingBuildInfoFallback(false);
-      writeAdminVersionInfoCache(adminInfo);
     } catch {
       try {
         const build = await loadBuildInfo();
