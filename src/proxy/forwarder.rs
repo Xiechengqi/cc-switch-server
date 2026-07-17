@@ -185,7 +185,7 @@ async fn forward_with_attempt(
         }
     };
     drop(providers);
-    validate_codex_allowed_client(&stored, route, &headers)?;
+    validate_codex_allowed_client(&stored, route, &headers, request_context.share_id.is_some())?;
     let started = Instant::now();
     if cursor::agentservice_driver_requested(&stored) {
         let adapter_request =
@@ -1185,7 +1185,7 @@ pub async fn forward_codex_responses_ws(
             message: "Codex Responses WebSocket is disabled for this provider; use POST /v1/responses (SSE) until the incident rollback is cleared".to_string(),
         });
     }
-    validate_codex_allowed_client(&stored, route, &headers)?;
+    validate_codex_allowed_client(&stored, route, &headers, request_context.share_id.is_some())?;
     refresh_managed_account_if_needed(&state, app, &stored).await?;
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(app, stored.provider_type);
@@ -1386,7 +1386,14 @@ pub async fn forward_images_generations(
         }
         ProviderType::CodexOAuth => {
             drop(share_invocation_guard);
-            forward_codex_images_generations(state, stored, headers, body).await
+            forward_codex_images_generations(
+                state,
+                stored,
+                headers,
+                body,
+                request_context.share_id.is_some(),
+            )
+            .await
         }
         _ => Err(ProxyError::bad_request(
             "image generation requires a grok_oauth provider or codex_oauth provider with image generation enabled",
@@ -1515,9 +1522,10 @@ async fn forward_codex_images_generations(
     stored: StoredProvider,
     headers: HeaderMap,
     body: Bytes,
+    share_request: bool,
 ) -> Result<Response, ProxyError> {
     refresh_managed_account_if_needed(&state, AppKind::Codex, &stored).await?;
-    validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers)?;
+    validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers, share_request)?;
     let prepared = codex_images_generation_request(&body)?;
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
@@ -3335,7 +3343,11 @@ fn validate_codex_allowed_client(
     stored: &StoredProvider,
     route: ProxyRoute,
     headers: &HeaderMap,
+    share_request: bool,
 ) -> Result<(), ProxyError> {
+    if share_request {
+        return Ok(());
+    }
     if stored.provider_type != ProviderType::CodexOAuth
         || !matches!(
             route,
@@ -5745,14 +5757,16 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         let mut headers = HeaderMap::new();
         headers.insert("originator", HeaderValue::from_static("postman"));
         headers.insert("user-agent", HeaderValue::from_static("PostmanRuntime/7"));
-        let error = validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers)
-            .unwrap_err();
+        let error =
+            validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers, false)
+                .unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
 
         headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
         headers.insert("user-agent", HeaderValue::from_static("curl/8.0"));
-        let error = validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers)
-            .unwrap_err();
+        let error =
+            validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers, false)
+                .unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
 
         headers.insert(
@@ -5761,7 +5775,21 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 "codex_cli_rs/0.144.1 (Ubuntu 22.04.0; x86_64) xterm-256color",
             ),
         );
-        validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers).unwrap();
+        validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn codex_oauth_client_gate_allows_share_requests_without_originator() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({}),
+            Some("acct-1"),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("curl/8.0"));
+        validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers, true).unwrap();
     }
 
     #[test]
