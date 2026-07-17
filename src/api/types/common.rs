@@ -55,6 +55,7 @@ pub(in crate::api) struct SetupResponse {
     pub(in crate::api) router_url: Option<String>,
     pub(in crate::api) client_tunnel_subdomain: Option<String>,
     pub(in crate::api) client_tunnel_claim_status: Option<String>,
+    pub(in crate::api) setup_completion_notification_status: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(in crate::api) warnings: Vec<String>,
     pub(in crate::api) message: String,
@@ -74,6 +75,7 @@ impl SetupResponse {
             router_url: outcome.router_url,
             client_tunnel_subdomain: outcome.client_tunnel_subdomain,
             client_tunnel_claim_status: outcome.client_tunnel_claim_status,
+            setup_completion_notification_status: outcome.setup_completion_notification_status,
             warnings: outcome.warnings,
             message: outcome.message,
             session_token: outcome.session_token,

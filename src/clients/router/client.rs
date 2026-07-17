@@ -21,12 +21,15 @@ const ROUTER_LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const ROUTER_TUNNEL_CONTROL_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const ROUTER_INSTALLATION_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTER_SETUP_COMPLETED_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_CONTROL_PLANE_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_REGISTER_RESPONSE_BODY_LIMIT: usize = 16 * 1024;
 const ROUTER_ERROR_BODY_LIMIT: usize = 512;
 const ROUTER_SHARE_PRUNE_MAX_IDS: usize = 10_000;
 const REGISTRATION_PROOF_VERSION: u8 = 2;
 const INSTALLATION_HEARTBEAT_PROTOCOL_VERSION: u8 = 1;
+const INSTALLATION_SETUP_COMPLETED_PROTOCOL_VERSION: u8 = 1;
+const INSTALLATION_SETUP_COMPLETED_ACTION: &str = "installation_setup_completed_v1";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +110,41 @@ pub enum InstallationHeartbeatError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum InstallationSetupCompletedError {
+    #[error("send router installation setup-completed request: {0}")]
+    Request(#[source] reqwest::Error),
+    #[error("router installation setup-completed request failed: {status}: {body}")]
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+        retry_after_ms: Option<i64>,
+    },
+    #[error("parse router installation setup-completed response: {0}")]
+    InvalidResponse(String),
+}
+
+impl InstallationSetupCompletedError {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Rejected {
+                status: reqwest::StatusCode::BAD_REQUEST
+                    | reqwest::StatusCode::FORBIDDEN
+                    | reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                ..
+            }
+        )
+    }
+
+    pub fn retry_after_ms(&self) -> Option<i64> {
+        match self {
+            Self::Rejected { retry_after_ms, .. } => *retry_after_ms,
+            Self::Request(_) | Self::InvalidResponse(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum ClientTunnelClaimError {
     #[error("send router client tunnel claim: {0}")]
     Request(#[source] reqwest::Error),
@@ -161,6 +199,57 @@ pub struct InstallationHeartbeatPayload {
     pub boot_id: String,
     pub app_version: String,
     pub commit_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstallationSetupCompletedPayload {
+    pub protocol_version: u8,
+    pub setup_id: String,
+    pub password_hint: String,
+}
+
+impl InstallationSetupCompletedPayload {
+    pub fn new(setup_id: String, password_hint: String) -> anyhow::Result<Self> {
+        validate_setup_id(&setup_id)?;
+        validate_password_hint(&password_hint)?;
+        Ok(Self {
+            protocol_version: INSTALLATION_SETUP_COMPLETED_PROTOCOL_VERSION,
+            setup_id,
+            password_hint,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InstallationSetupCompletedEnvelope {
+    setup: InstallationSetupCompletedPayload,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InstallationSetupCompletedResponse {
+    ok: bool,
+    status: String,
+    setup_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallationSetupCompletedAckStatus {
+    Queued,
+    AlreadyRecorded,
+    SuppressedDisabled,
+}
+
+impl InstallationSetupCompletedAckStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::AlreadyRecorded => "already_recorded",
+            Self::SuppressedDisabled => "suppressed_disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -746,6 +835,176 @@ pub async fn send_installation_heartbeat(
         .await
         .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
     Err(classify_installation_heartbeat_failure(status, &body))
+}
+
+pub async fn send_installation_setup_completed(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    setup: InstallationSetupCompletedPayload,
+) -> Result<InstallationSetupCompletedAckStatus, InstallationSetupCompletedError> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| {
+            InstallationSetupCompletedError::InvalidResponse(
+                "router api base is not configured".to_string(),
+            )
+        })?
+        .trim_end_matches('/');
+    let identity = config.registered_router_identity().ok_or_else(|| {
+        InstallationSetupCompletedError::InvalidResponse(
+            "router installation is not registered".to_string(),
+        )
+    })?;
+    let requested_setup_id = setup.setup_id.clone();
+    let request = build_installation_setup_completed_request(identity, setup)
+        .map_err(|error| InstallationSetupCompletedError::InvalidResponse(error.to_string()))?;
+    let response = http
+        .post(format!("{api_base}/v1/installations/setup-completed"))
+        .json(&request)
+        .timeout(ROUTER_SETUP_COMPLETED_TIMEOUT)
+        .send()
+        .await
+        .map_err(InstallationSetupCompletedError::Request)?;
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after_ms = parse_retry_after_ms(response.headers());
+        let body = read_bounded_router_error_body(response)
+            .await
+            .map_err(InstallationSetupCompletedError::Request)?;
+        return Err(InstallationSetupCompletedError::Rejected {
+            status,
+            body,
+            retry_after_ms,
+        });
+    }
+    let response = response
+        .json::<InstallationSetupCompletedResponse>()
+        .await
+        .map_err(|error| InstallationSetupCompletedError::InvalidResponse(error.to_string()))?;
+    if !response.ok {
+        return Err(InstallationSetupCompletedError::InvalidResponse(
+            "router returned ok=false".to_string(),
+        ));
+    }
+    validate_setup_id(&response.setup_id).map_err(|error| {
+        InstallationSetupCompletedError::InvalidResponse(format!(
+            "router acknowledgement setup id is invalid: {error}"
+        ))
+    })?;
+    match response.status.as_str() {
+        "queued" if response.setup_id == requested_setup_id => {
+            Ok(InstallationSetupCompletedAckStatus::Queued)
+        }
+        "already_recorded" => {
+            if response.setup_id != requested_setup_id {
+                tracing::info!(
+                    requested_setup_id = %requested_setup_id,
+                    recorded_setup_id = %response.setup_id,
+                    "router already recorded installation setup completion under another setup id"
+                );
+            }
+            Ok(InstallationSetupCompletedAckStatus::AlreadyRecorded)
+        }
+        "suppressed_disabled" => {
+            if response.setup_id != requested_setup_id {
+                tracing::info!(
+                    requested_setup_id = %requested_setup_id,
+                    recorded_setup_id = %response.setup_id,
+                    "router suppressed an existing installation setup completion under another setup id"
+                );
+            }
+            Ok(InstallationSetupCompletedAckStatus::SuppressedDisabled)
+        }
+        "queued" => Err(InstallationSetupCompletedError::InvalidResponse(format!(
+            "router acknowledgement setup id '{}' does not match request",
+            response.setup_id
+        ))),
+        status => Err(InstallationSetupCompletedError::InvalidResponse(format!(
+            "unsupported acknowledgement status '{status}'"
+        ))),
+    }
+}
+
+fn build_installation_setup_completed_request(
+    identity: &RouterIdentity,
+    setup: InstallationSetupCompletedPayload,
+) -> anyhow::Result<SignedRequest<InstallationSetupCompletedEnvelope>> {
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    build_installation_setup_completed_request_at(identity, setup, timestamp_ms, nonce)
+}
+
+fn build_installation_setup_completed_request_at(
+    identity: &RouterIdentity,
+    setup: InstallationSetupCompletedPayload,
+    timestamp_ms: i64,
+    nonce: String,
+) -> anyhow::Result<SignedRequest<InstallationSetupCompletedEnvelope>> {
+    let signature = sign_payload(
+        identity,
+        INSTALLATION_SETUP_COMPLETED_ACTION,
+        &setup,
+        timestamp_ms,
+        &nonce,
+    )?;
+    Ok(SignedRequest {
+        protocol_epoch: PROTOCOL_EPOCH.to_string(),
+        installation_id: identity.installation_id.clone(),
+        timestamp_ms,
+        nonce,
+        signature,
+        payload: InstallationSetupCompletedEnvelope { setup },
+    })
+}
+
+fn validate_password_hint(password_hint: &str) -> anyhow::Result<()> {
+    let bytes = password_hint.as_bytes();
+    if bytes.len() != 8 || !password_hint.is_ascii() {
+        bail!("password hint must contain exactly 8 ASCII characters");
+    }
+    if !bytes[1..7].iter().all(|byte| *byte == b'*') {
+        bail!("password hint middle characters must be masked");
+    }
+    for byte in [bytes[0], bytes[7]] {
+        if byte != b'*' && !byte.is_ascii_alphanumeric() {
+            bail!("password hint visible characters must be ASCII alphanumeric");
+        }
+    }
+    Ok(())
+}
+
+fn validate_setup_id(setup_id: &str) -> anyhow::Result<()> {
+    let bytes = setup_id.as_bytes();
+    let hyphens = [8, 13, 18, 23];
+    if bytes.len() != 36
+        || !setup_id.is_ascii()
+        || bytes.iter().enumerate().any(|(index, byte)| {
+            if hyphens.contains(&index) {
+                *byte != b'-'
+            } else {
+                !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase()
+            }
+        })
+        || bytes[14] != b'4'
+        || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+    {
+        bail!("setup id must be a lowercase hyphenated UUID v4");
+    }
+    Ok(())
+}
+
+fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    const MIN_RETRY_AFTER_SECS: u64 = 1;
+    const MAX_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?
+        .clamp(MIN_RETRY_AFTER_SECS, MAX_RETRY_AFTER_SECS);
+    Some((seconds as i64).saturating_mul(1_000))
 }
 
 fn classify_installation_heartbeat_failure(
@@ -2484,6 +2743,231 @@ mod tests {
         let second = sign_payload(&identity, "share_delete", &payload, 123, "nonce-2").unwrap();
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn setup_completed_request_matches_cross_repository_signature_fixture() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        let identity = RouterIdentity {
+            installation_id: "fixture-installation".to_string(),
+            public_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+            private_key: STANDARD.encode(signing_key.to_bytes()),
+            control_secret: None,
+        };
+        let setup = InstallationSetupCompletedPayload::new(
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+            "p******w".to_string(),
+        )
+        .unwrap();
+
+        let request = build_installation_setup_completed_request_at(
+            &identity,
+            setup,
+            1_700_000_000_789,
+            "fixture-setup-123".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.signature,
+            "q48WYcP91n3DWTvRyw9WysgC9AN5T3GM/2DyaDz18x2yKzyz/4iBkbXD+DYup6MtBtSGi+vEuaWhtO8kC4znCg=="
+        );
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["protocolEpoch"], PROTOCOL_EPOCH);
+        assert_eq!(value["installationId"], "fixture-installation");
+        assert_eq!(value["timestampMs"], 1_700_000_000_789_i64);
+        assert_eq!(value["nonce"], "fixture-setup-123");
+        assert_eq!(value["setup"]["protocolVersion"], 1);
+        assert_eq!(
+            value["setup"]["setupId"],
+            "123e4567-e89b-42d3-a456-426614174000"
+        );
+        assert_eq!(value["setup"]["passwordHint"], "p******w");
+        assert!(value["setup"].get("passwordLength").is_none());
+    }
+
+    #[test]
+    fn setup_completed_payload_rejects_noncanonical_ids_and_hints() {
+        assert!(InstallationSetupCompletedPayload::new(
+            "123E4567-E89B-42D3-A456-426614174000".to_string(),
+            "p******w".to_string(),
+        )
+        .is_err());
+        assert!(InstallationSetupCompletedPayload::new(
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+            "p*****w".to_string(),
+        )
+        .is_err());
+        assert!(InstallationSetupCompletedPayload::new(
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+            "!******?".to_string(),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn setup_completed_acknowledgement_validates_status_setup_id_rules() {
+        async fn already_recorded() -> Json<Value> {
+            Json(json!({
+                "ok": true,
+                "status": "already_recorded",
+                "setupId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            }))
+        }
+
+        let app = Router::new().route("/v1/installations/setup-completed", post(already_recorded));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "fixture-installation".to_string();
+        config.router.identity = Some(identity);
+        let setup = InstallationSetupCompletedPayload::new(
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+            "p******w".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            send_installation_setup_completed(&reqwest::Client::new(), &config, setup)
+                .await
+                .unwrap(),
+            InstallationSetupCompletedAckStatus::AlreadyRecorded
+        );
+        server.abort();
+
+        async fn mismatched_queued() -> Json<Value> {
+            Json(json!({
+                "ok": true,
+                "status": "queued",
+                "setupId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            }))
+        }
+        let app = Router::new().route("/v1/installations/setup-completed", post(mismatched_queued));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        config.router.url = Some(format!("http://{addr}"));
+        let setup = InstallationSetupCompletedPayload::new(
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+            "p******w".to_string(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            send_installation_setup_completed(&reqwest::Client::new(), &config, setup).await,
+            Err(InstallationSetupCompletedError::InvalidResponse(_))
+        ));
+        server.abort();
+
+        async fn mismatched_suppressed() -> Json<Value> {
+            Json(json!({
+                "ok": true,
+                "status": "suppressed_disabled",
+                "setupId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            }))
+        }
+        let app = Router::new().route(
+            "/v1/installations/setup-completed",
+            post(mismatched_suppressed),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        config.router.url = Some(format!("http://{addr}"));
+        let setup = InstallationSetupCompletedPayload::new(
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+            "p******w".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            send_installation_setup_completed(&reqwest::Client::new(), &config, setup)
+                .await
+                .unwrap(),
+            InstallationSetupCompletedAckStatus::SuppressedDisabled
+        );
+        server.abort();
+
+        async fn malformed_existing_id() -> Json<Value> {
+            Json(json!({
+                "ok": true,
+                "status": "already_recorded",
+                "setupId": "legacy-marker"
+            }))
+        }
+        let app = Router::new().route(
+            "/v1/installations/setup-completed",
+            post(malformed_existing_id),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        config.router.url = Some(format!("http://{addr}"));
+        let setup = InstallationSetupCompletedPayload::new(
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+            "p******w".to_string(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            send_installation_setup_completed(&reqwest::Client::new(), &config, setup).await,
+            Err(InstallationSetupCompletedError::InvalidResponse(message))
+                if message.contains("setup id is invalid")
+        ));
+        server.abort();
+    }
+
+    #[test]
+    fn setup_completed_error_classification_keeps_rollout_failures_retryable() {
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!InstallationSetupCompletedError::Rejected {
+                status,
+                body: "retry".to_string(),
+                retry_after_ms: None,
+            }
+            .is_terminal());
+        }
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(InstallationSetupCompletedError::Rejected {
+                status,
+                body: "terminal".to_string(),
+                retry_after_ms: None,
+            }
+            .is_terminal());
+        }
+    }
+
+    #[test]
+    fn setup_completed_retry_after_seconds_are_clamped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "0".parse().unwrap());
+        assert_eq!(parse_retry_after_ms(&headers), Some(1_000));
+
+        headers.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
+        assert_eq!(parse_retry_after_ms(&headers), Some(3_600_000));
+
+        headers.insert(reqwest::header::RETRY_AFTER, "999999".parse().unwrap());
+        assert_eq!(parse_retry_after_ms(&headers), Some(24 * 60 * 60 * 1_000));
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after_ms(&headers), None);
     }
 
     #[test]

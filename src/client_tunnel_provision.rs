@@ -544,6 +544,8 @@ pub(crate) async fn mark_claim_success(state: &ServerState, config: &mut ServerC
     if let Err(error) = state.save_shares().await {
         tracing::warn!(error = %error, "persist router registered flag failed");
     }
+    state.deliver_setup_completion_after_claim().await;
+    *config = state.config_snapshot().await;
 }
 
 async fn record_claim_failure(state: &ServerState, config: &ServerConfig, message: String) {

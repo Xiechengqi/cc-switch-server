@@ -1004,6 +1004,11 @@ export async function bootstrapServerSetup(input: {
   apiToken?: string;
   clientTunnelSubdomain?: string;
   clientTunnelClaimStatus?: string;
+  setupCompletionNotificationStatus?:
+    | "waiting_for_claim"
+    | "pending"
+    | "acknowledged"
+    | "terminal_failed";
   warnings?: string[];
 }> {
   return jsonFetch("/api/setup/bootstrap", {
@@ -1026,6 +1031,11 @@ export type SetupCompletionResponse = {
   ok: boolean;
   clientTunnelSubdomain?: string;
   clientTunnelClaimStatus?: string;
+  setupCompletionNotificationStatus?:
+    | "waiting_for_claim"
+    | "pending"
+    | "acknowledged"
+    | "terminal_failed";
   warnings?: string[];
   message?: string;
 };

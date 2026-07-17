@@ -8,6 +8,7 @@ use anyhow::Context;
 use futures_util::StreamExt;
 use rand::RngCore;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, RwLock};
 use tokio::time::{sleep, timeout_at, Duration, Instant};
 
@@ -45,6 +46,7 @@ use crate::domain::providers::store::ProviderStore;
 use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
     mask_proxy_url, PayoutProfile, PayoutProfileState, RouterIdentity, ServerConfig,
+    SetupCompletionNotificationStatus,
 };
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::router_contract::{
@@ -61,6 +63,8 @@ use crate::proxy::cursor::session::CursorSessionManager;
 
 const ROUTER_INSTALLATION_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_SHARE_SYNC_BATCH_SIZE: usize = 100;
+const SETUP_COMPLETION_RETRY_BASE_MS: i64 = 30_000;
+const SETUP_COMPLETION_RETRY_MAX_MS: i64 = 30 * 60_000;
 
 #[derive(Debug)]
 pub struct ServerStateInner {
@@ -89,7 +93,9 @@ pub struct ServerStateInner {
     pub share_in_flight: Arc<ShareInFlightTracker>,
     pub control_nonces: Arc<ControlNonceCache>,
     router_registration_flight: AsyncMutex<Option<Arc<RouterRegistrationFlight>>>,
+    setup_flight: AsyncMutex<()>,
     router_share_sync: AsyncMutex<()>,
+    setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
     pub http_client: RwLock<reqwest::Client>,
     pub events: broadcast::Sender<ServerEvent>,
@@ -745,7 +751,9 @@ impl ServerStateInner {
             share_in_flight: Arc::new(ShareInFlightTracker::default()),
             control_nonces: Arc::new(ControlNonceCache::default()),
             router_registration_flight: AsyncMutex::new(None),
+            setup_flight: AsyncMutex::new(()),
             router_share_sync: AsyncMutex::new(()),
+            setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
             http_client: RwLock::new(http_client),
             events,
@@ -792,6 +800,7 @@ impl ServerStateInner {
     pub async fn replace_config(&self, mut config: ServerConfig) -> anyhow::Result<()> {
         let mut current = self.config.write().await;
         preserve_router_identity_from_stale_snapshot(&current, &mut config);
+        preserve_setup_completion_from_stale_snapshot(&current, &mut config);
         let http_client = build_http_client(&config, self.bind_addr)?;
         config.save(&self.config_dir)?;
         *self.http_client.write().await = http_client;
@@ -811,6 +820,166 @@ impl ServerStateInner {
 
     pub async fn config_snapshot(&self) -> ServerConfig {
         self.config.read().await.clone()
+    }
+
+    pub(crate) async fn lock_setup(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.setup_flight.lock().await
+    }
+
+    pub(crate) async fn deliver_setup_completion_after_claim(&self) {
+        if let Err(error) = self.deliver_setup_completion_notification(true).await {
+            tracing::warn!(
+                error = %error,
+                "persist setup-completed notification state after client claim failed"
+            );
+        }
+    }
+
+    pub(crate) async fn retry_pending_setup_completion_notification(&self) {
+        let authoritative_claim = {
+            let config = self.config.read().await;
+            config.has_registered_router_identity()
+                && matches!(
+                    config.client.tunnel_status.as_deref(),
+                    Some("claimed_remote" | "connected" | "active" | "running")
+                )
+        };
+        if let Err(error) = self
+            .deliver_setup_completion_notification(authoritative_claim)
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                "retry setup-completed notification state update failed"
+            );
+        }
+    }
+
+    async fn deliver_setup_completion_notification(
+        &self,
+        authoritative_claim: bool,
+    ) -> anyhow::Result<()> {
+        let _flight = self.setup_completion_notification_flight.lock().await;
+        let now_ms = now_ms_i64();
+        let (config, setup) = {
+            let mut config = self.config.write().await;
+            let Some(notification) = config.setup_completion_notification.as_mut() else {
+                return Ok(());
+            };
+            match notification.status {
+                SetupCompletionNotificationStatus::Acknowledged
+                | SetupCompletionNotificationStatus::TerminalFailed => return Ok(()),
+                SetupCompletionNotificationStatus::WaitingForClaim if !authoritative_claim => {
+                    return Ok(())
+                }
+                SetupCompletionNotificationStatus::Pending
+                    if notification
+                        .next_attempt_at_ms
+                        .is_some_and(|next_attempt_at_ms| next_attempt_at_ms > now_ms) =>
+                {
+                    return Ok(())
+                }
+                SetupCompletionNotificationStatus::WaitingForClaim
+                | SetupCompletionNotificationStatus::Pending => {}
+            }
+
+            let Some(password_hint) = notification.password_hint.clone() else {
+                notification.status = SetupCompletionNotificationStatus::TerminalFailed;
+                notification.updated_at_ms = now_ms;
+                notification.next_attempt_at_ms = None;
+                notification.last_error =
+                    Some("setup-completed notification password hint is missing".to_string());
+                config.save(&self.config_dir)?;
+                return Ok(());
+            };
+            let setup = match client::InstallationSetupCompletedPayload::new(
+                notification.setup_id.clone(),
+                password_hint,
+            ) {
+                Ok(setup) => setup,
+                Err(error) => {
+                    notification.status = SetupCompletionNotificationStatus::TerminalFailed;
+                    notification.updated_at_ms = now_ms;
+                    notification.next_attempt_at_ms = None;
+                    notification.last_error = Some(error.to_string());
+                    config.save(&self.config_dir)?;
+                    return Ok(());
+                }
+            };
+            notification.status = SetupCompletionNotificationStatus::Pending;
+            notification.attempt_count = notification.attempt_count.saturating_add(1);
+            notification.updated_at_ms = now_ms;
+            notification.last_attempt_at_ms = Some(now_ms);
+            notification.next_attempt_at_ms = Some(now_ms.saturating_add(
+                setup_completion_retry_delay_ms(&notification.setup_id, notification.attempt_count),
+            ));
+            notification.router_ack_status = None;
+            notification.last_error = None;
+            config.save(&self.config_dir)?;
+            (config.clone(), setup)
+        };
+
+        let setup_id = setup.setup_id.clone();
+        let http_client = self.http_client().await;
+        let result = client::send_installation_setup_completed(&http_client, &config, setup).await;
+        let completed_at_ms = now_ms_i64();
+        let mut config = self.config.write().await;
+        let Some(notification) = config.setup_completion_notification.as_mut() else {
+            return Ok(());
+        };
+        if notification.setup_id != setup_id {
+            return Ok(());
+        }
+        match result {
+            Ok(ack) => {
+                notification.status = SetupCompletionNotificationStatus::Acknowledged;
+                notification.password_hint = None;
+                notification.updated_at_ms = completed_at_ms;
+                notification.acknowledged_at_ms = Some(completed_at_ms);
+                notification.next_attempt_at_ms = None;
+                notification.router_ack_status = Some(ack.as_str().to_string());
+                notification.last_error = None;
+                tracing::info!(
+                    setup_id = %setup_id,
+                    router_status = ack.as_str(),
+                    "router durably acknowledged installation setup completion"
+                );
+            }
+            Err(error) if error.is_terminal() => {
+                notification.status = SetupCompletionNotificationStatus::TerminalFailed;
+                notification.updated_at_ms = completed_at_ms;
+                notification.next_attempt_at_ms = None;
+                notification.router_ack_status = None;
+                notification.last_error = Some(error.to_string());
+                tracing::warn!(
+                    setup_id = %setup_id,
+                    error = %error,
+                    "router permanently rejected installation setup completion"
+                );
+            }
+            Err(error) => {
+                notification.status = SetupCompletionNotificationStatus::Pending;
+                notification.updated_at_ms = completed_at_ms;
+                if let Some(retry_after_ms) = error.retry_after_ms() {
+                    let router_retry_at_ms = completed_at_ms.saturating_add(retry_after_ms);
+                    notification.next_attempt_at_ms = Some(
+                        notification
+                            .next_attempt_at_ms
+                            .unwrap_or_default()
+                            .max(router_retry_at_ms),
+                    );
+                }
+                notification.last_error = Some(error.to_string());
+                tracing::warn!(
+                    setup_id = %setup_id,
+                    error = %error,
+                    next_attempt_at_ms = ?notification.next_attempt_at_ms,
+                    "router setup-completed notification remains pending"
+                );
+            }
+        }
+        config.save(&self.config_dir)?;
+        Ok(())
     }
 
     pub(crate) async fn lock_router_share_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -2063,6 +2232,103 @@ fn preserve_router_identity_from_stale_snapshot(
     }
 }
 
+fn preserve_setup_completion_from_stale_snapshot(
+    current: &ServerConfig,
+    incoming: &mut ServerConfig,
+) {
+    let Some(current_notification) = current.setup_completion_notification.as_ref() else {
+        return;
+    };
+    let Some(incoming_notification) = incoming.setup_completion_notification.as_mut() else {
+        incoming.setup_completion_notification = Some(current_notification.clone());
+        return;
+    };
+    if incoming_notification.setup_id != current_notification.setup_id {
+        if incoming_notification.created_at_ms <= current_notification.created_at_ms {
+            *incoming_notification = current_notification.clone();
+        }
+        return;
+    }
+
+    let current_rank = setup_completion_status_rank(current_notification.status);
+    let incoming_rank = setup_completion_status_rank(incoming_notification.status);
+    let mut merged = if current_rank >= incoming_rank {
+        current_notification.clone()
+    } else {
+        incoming_notification.clone()
+    };
+    merged.attempt_count = merged
+        .attempt_count
+        .max(current_notification.attempt_count)
+        .max(incoming_notification.attempt_count);
+    merged.created_at_ms = [
+        current_notification.created_at_ms,
+        incoming_notification.created_at_ms,
+    ]
+    .into_iter()
+    .filter(|value| *value > 0)
+    .min()
+    .unwrap_or_default();
+    merged.updated_at_ms = merged
+        .updated_at_ms
+        .max(current_notification.updated_at_ms)
+        .max(incoming_notification.updated_at_ms);
+    merged.last_attempt_at_ms = current_notification
+        .last_attempt_at_ms
+        .into_iter()
+        .chain(incoming_notification.last_attempt_at_ms)
+        .max();
+    if merged.status == SetupCompletionNotificationStatus::Acknowledged {
+        merged.password_hint = None;
+        merged.next_attempt_at_ms = None;
+        merged.last_error = None;
+        merged.router_ack_status = current_notification
+            .router_ack_status
+            .clone()
+            .or_else(|| incoming_notification.router_ack_status.clone());
+        merged.acknowledged_at_ms = current_notification
+            .acknowledged_at_ms
+            .into_iter()
+            .chain(incoming_notification.acknowledged_at_ms)
+            .max();
+    } else if merged.status == SetupCompletionNotificationStatus::TerminalFailed {
+        merged.next_attempt_at_ms = None;
+        merged.router_ack_status = None;
+    } else {
+        merged.router_ack_status = None;
+        merged.next_attempt_at_ms = current_notification
+            .next_attempt_at_ms
+            .into_iter()
+            .chain(incoming_notification.next_attempt_at_ms)
+            .max();
+    }
+    *incoming_notification = merged;
+}
+
+const fn setup_completion_status_rank(status: SetupCompletionNotificationStatus) -> u8 {
+    match status {
+        SetupCompletionNotificationStatus::WaitingForClaim => 0,
+        SetupCompletionNotificationStatus::Pending => 1,
+        SetupCompletionNotificationStatus::TerminalFailed => 2,
+        SetupCompletionNotificationStatus::Acknowledged => 3,
+    }
+}
+
+fn setup_completion_retry_delay_ms(setup_id: &str, attempt_count: u32) -> i64 {
+    let exponent = attempt_count.saturating_sub(1).min(10);
+    let base = SETUP_COMPLETION_RETRY_BASE_MS
+        .saturating_mul(1_i64 << exponent)
+        .min(SETUP_COMPLETION_RETRY_MAX_MS.saturating_mul(5) / 6);
+    let digest = Sha256::digest(format!("{setup_id}\n{attempt_count}").as_bytes());
+    let jitter_seed = u64::from_be_bytes(digest[..8].try_into().unwrap_or_default());
+    let jitter_limit = (base / 5).max(1) as u64;
+    base.saturating_add((jitter_seed % (jitter_limit + 1)) as i64)
+}
+
+fn now_ms_i64() -> i64 {
+    crate::infra::time::now_ms().min(i64::MAX as u128) as i64
+}
+
 pub fn build_provider_http_client(
     proxy_url: &str,
     bind_addr: SocketAddr,
@@ -2195,6 +2461,8 @@ pub async fn restore_tunnels(state: ServerState) {
     for share_id in auto_start_share_ids {
         ensure_share_tunnel_running_for(state.clone(), &share_id, "startup_restore").await;
     }
+
+    state.retry_pending_setup_completion_notification().await;
 
     if !registration_completed {
         if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
@@ -2392,6 +2660,7 @@ async fn run_installation_heartbeat_once(
             *last_failure_warning = None;
             *last_endpoint_warning = None;
             record_installation_heartbeat_success(state).await;
+            state.retry_pending_setup_completion_notification().await;
         }
         Err(client::InstallationHeartbeatError::EndpointUnavailable { status, body }) => {
             let recovery_error = if config
@@ -4407,7 +4676,7 @@ mod tests {
     use crate::domain::sharing::shares::{Share, ShareAcl, UpsertShareInput};
     use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
     use axum::extract::State as AxumState;
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::http::StatusCode;
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::{json, Value};
@@ -5505,6 +5774,366 @@ mod tests {
         assert_eq!(stale.owner.email.as_deref(), Some("new-owner@example.com"));
         assert_eq!(stale.router.identity, current.router.identity);
         assert_eq!(stale.router.last_registered_at_ms, Some(200));
+    }
+
+    #[test]
+    fn stale_config_snapshot_cannot_regress_setup_completion_state() {
+        use crate::domain::settings::config::SetupCompletionNotificationState;
+
+        let mut current = ServerConfig::empty();
+        let mut acknowledged = SetupCompletionNotificationState::new(
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+            "p******w".to_string(),
+            100,
+        );
+        acknowledged.status = SetupCompletionNotificationStatus::Acknowledged;
+        acknowledged.attempt_count = 3;
+        acknowledged.updated_at_ms = 300;
+        acknowledged.last_attempt_at_ms = Some(250);
+        acknowledged.acknowledged_at_ms = Some(300);
+        acknowledged.router_ack_status = Some("suppressed_disabled".to_string());
+        acknowledged.password_hint = None;
+        current.setup_completion_notification = Some(acknowledged.clone());
+
+        let mut stale = current.clone();
+        let mut pending = SetupCompletionNotificationState::new(
+            acknowledged.setup_id.clone(),
+            "p******w".to_string(),
+            100,
+        );
+        pending.status = SetupCompletionNotificationStatus::Pending;
+        pending.attempt_count = 1;
+        pending.updated_at_ms = 150;
+        pending.last_attempt_at_ms = Some(150);
+        pending.next_attempt_at_ms = Some(180);
+        stale.setup_completion_notification = Some(pending);
+
+        preserve_setup_completion_from_stale_snapshot(&current, &mut stale);
+
+        let merged = stale.setup_completion_notification.unwrap();
+        assert_eq!(
+            merged.status,
+            SetupCompletionNotificationStatus::Acknowledged
+        );
+        assert_eq!(merged.attempt_count, 3);
+        assert_eq!(merged.last_attempt_at_ms, Some(250));
+        assert_eq!(merged.acknowledged_at_ms, Some(300));
+        assert_eq!(
+            merged.router_ack_status.as_deref(),
+            Some("suppressed_disabled")
+        );
+        assert!(merged.password_hint.is_none());
+        assert!(merged.next_attempt_at_ms.is_none());
+        assert!(merged.last_error.is_none());
+    }
+
+    #[test]
+    fn older_different_setup_id_cannot_replace_newer_notification() {
+        use crate::domain::settings::config::SetupCompletionNotificationState;
+
+        let mut current = ServerConfig::empty();
+        current.setup_completion_notification = Some(SetupCompletionNotificationState::new(
+            "123e4567-e89b-42d3-a456-426614174000".to_string(),
+            "n******w".to_string(),
+            200,
+        ));
+        let mut stale = current.clone();
+        stale.setup_completion_notification = Some(SetupCompletionNotificationState::new(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            "o******d".to_string(),
+            100,
+        ));
+
+        preserve_setup_completion_from_stale_snapshot(&current, &mut stale);
+
+        assert_eq!(
+            stale
+                .setup_completion_notification
+                .as_ref()
+                .unwrap()
+                .setup_id,
+            "123e4567-e89b-42d3-a456-426614174000"
+        );
+    }
+
+    #[test]
+    fn setup_completion_retry_backoff_is_bounded_and_jitter_is_stable() {
+        let setup_id = "123e4567-e89b-42d3-a456-426614174000";
+        let first = setup_completion_retry_delay_ms(setup_id, 1);
+        assert_eq!(first, setup_completion_retry_delay_ms(setup_id, 1));
+        assert!(first >= SETUP_COMPLETION_RETRY_BASE_MS);
+        assert!(first <= SETUP_COMPLETION_RETRY_BASE_MS * 6 / 5);
+        let capped = setup_completion_retry_delay_ms(setup_id, u32::MAX);
+        assert!(capped <= SETUP_COMPLETION_RETRY_MAX_MS);
+        assert!(capped >= SETUP_COMPLETION_RETRY_MAX_MS * 5 / 6);
+    }
+
+    #[tokio::test]
+    async fn setup_completion_transient_failure_stays_pending_without_exposing_password() {
+        async fn unavailable(
+            Json(request): Json<Value>,
+        ) -> (
+            StatusCode,
+            [(axum::http::HeaderName, &'static str); 1],
+            Json<Value>,
+        ) {
+            assert_eq!(request["setup"]["passwordHint"], "s******9");
+            assert!(request["setup"].get("passwordLength").is_none());
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "3600")],
+                Json(json!({"message": "temporarily unavailable"})),
+            )
+        }
+
+        let app = Router::new().route("/v1/installations/setup-completed", post(unavailable));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "fixture-installation".to_string();
+        config.router.identity = Some(identity);
+        config.set_password("supersecret9").unwrap();
+        config.setup_completion_notification = Some(
+            crate::domain::settings::config::SetupCompletionNotificationState::new(
+                "123e4567-e89b-42d3-a456-426614174000".to_string(),
+                "s******9".to_string(),
+                100,
+            ),
+        );
+        state.replace_config(config).await.unwrap();
+
+        state
+            .deliver_setup_completion_notification(true)
+            .await
+            .unwrap();
+
+        let config = state.config_snapshot().await;
+        let notification = config.setup_completion_notification.unwrap();
+        assert_eq!(
+            notification.status,
+            SetupCompletionNotificationStatus::Pending
+        );
+        assert_eq!(notification.attempt_count, 1);
+        assert!(notification
+            .next_attempt_at_ms
+            .zip(notification.last_attempt_at_ms)
+            .is_some_and(|(next, last)| next.saturating_sub(last) >= 60 * 60 * 1_000));
+        assert!(notification
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("429")));
+        let persisted = std::fs::read_to_string(crate::domain::settings::config::config_path(
+            &state.config_dir,
+        ))
+        .unwrap();
+        assert!(!persisted.contains("supersecret9"));
+        assert!(persisted.contains("s******9"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn setup_completion_acknowledgement_clears_persisted_hint() {
+        async fn suppressed(Json(request): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "ok": true,
+                "status": "suppressed_disabled",
+                "setupId": request["setup"]["setupId"]
+            }))
+        }
+
+        let app = Router::new().route("/v1/installations/setup-completed", post(suppressed));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "fixture-installation".to_string();
+        config.router.identity = Some(identity);
+        config.setup_completion_notification = Some(
+            crate::domain::settings::config::SetupCompletionNotificationState::new(
+                "123e4567-e89b-42d3-a456-426614174000".to_string(),
+                "p******w".to_string(),
+                100,
+            ),
+        );
+        state.replace_config(config).await.unwrap();
+
+        state
+            .deliver_setup_completion_notification(true)
+            .await
+            .unwrap();
+
+        let config = state.config_snapshot().await;
+        let notification = config.setup_completion_notification.unwrap();
+        assert_eq!(
+            notification.status,
+            SetupCompletionNotificationStatus::Acknowledged
+        );
+        assert!(notification.password_hint.is_none());
+        assert!(notification.acknowledged_at_ms.is_some());
+        assert_eq!(
+            notification.router_ack_status.as_deref(),
+            Some("suppressed_disabled")
+        );
+        assert!(notification.next_attempt_at_ms.is_none());
+        let persisted = std::fs::read_to_string(crate::domain::settings::config::config_path(
+            &state.config_dir,
+        ))
+        .unwrap();
+        assert!(!persisted.contains("p******w"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_waiting_notification_from_persisted_authoritative_claim() {
+        async fn already_suppressed(
+            AxumState(requests): AxumState<Arc<AtomicUsize>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            requests.fetch_add(1, AtomicOrdering::SeqCst);
+            Json(json!({
+                "ok": true,
+                "status": "suppressed_disabled",
+                "setupId": request["setup"]["setupId"]
+            }))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/installations/setup-completed",
+                post(already_suppressed),
+            )
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "fixture-installation".to_string();
+        config.router.identity = Some(identity);
+        config.client.tunnel_status = Some("claimed_remote".to_string());
+        config.setup_completion_notification = Some(
+            crate::domain::settings::config::SetupCompletionNotificationState::new(
+                "123e4567-e89b-42d3-a456-426614174000".to_string(),
+                "p******w".to_string(),
+                100,
+            ),
+        );
+        state.replace_config(config).await.unwrap();
+        let config_dir = state.config_dir.clone();
+        drop(state);
+
+        let restarted = test_state_at(config_dir);
+        restarted
+            .retry_pending_setup_completion_notification()
+            .await;
+
+        let notification = restarted
+            .config_snapshot()
+            .await
+            .setup_completion_notification
+            .unwrap();
+        assert_eq!(
+            notification.status,
+            SetupCompletionNotificationStatus::Acknowledged
+        );
+        assert!(notification.password_hint.is_none());
+        assert_eq!(
+            notification.router_ack_status.as_deref(),
+            Some("suppressed_disabled")
+        );
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+
+        let skipped_state = test_state();
+        let mut skipped = skipped_state.config_snapshot().await;
+        skipped.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "fixture-installation-skipped".to_string();
+        skipped.router.identity = Some(identity);
+        skipped.client.tunnel_status = Some("claim_skipped".to_string());
+        skipped.setup_completion_notification = Some(
+            crate::domain::settings::config::SetupCompletionNotificationState::new(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                "p******w".to_string(),
+                100,
+            ),
+        );
+        skipped_state.replace_config(skipped).await.unwrap();
+        let config_dir = skipped_state.config_dir.clone();
+        drop(skipped_state);
+        let restarted_skipped = test_state_at(config_dir);
+
+        restarted_skipped
+            .retry_pending_setup_completion_notification()
+            .await;
+
+        assert_eq!(
+            restarted_skipped
+                .config_snapshot()
+                .await
+                .setup_completion_notification
+                .unwrap()
+                .status,
+            SetupCompletionNotificationStatus::WaitingForClaim
+        );
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+
+        let lost_response_state = test_state();
+        let mut lost_response = lost_response_state.config_snapshot().await;
+        lost_response.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "fixture-installation-lost-response".to_string();
+        lost_response.router.identity = Some(identity);
+        lost_response.client.tunnel_status = Some("claimed_remote".to_string());
+        let mut notification =
+            crate::domain::settings::config::SetupCompletionNotificationState::new(
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+                "p******w".to_string(),
+                100,
+            );
+        notification.status = SetupCompletionNotificationStatus::Pending;
+        notification.attempt_count = 1;
+        notification.last_attempt_at_ms = Some(100);
+        notification.next_attempt_at_ms = Some(100);
+        lost_response.setup_completion_notification = Some(notification);
+        lost_response_state
+            .replace_config(lost_response)
+            .await
+            .unwrap();
+        let config_dir = lost_response_state.config_dir.clone();
+        drop(lost_response_state);
+        let restarted_lost_response = test_state_at(config_dir);
+
+        restarted_lost_response
+            .retry_pending_setup_completion_notification()
+            .await;
+
+        let notification = restarted_lost_response
+            .config_snapshot()
+            .await
+            .setup_completion_notification
+            .unwrap();
+        assert_eq!(
+            notification.status,
+            SetupCompletionNotificationStatus::Acknowledged
+        );
+        assert_eq!(
+            notification.router_ack_status.as_deref(),
+            Some("suppressed_disabled")
+        );
+        assert!(notification.password_hint.is_none());
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 2);
+        server.abort();
     }
 
     #[tokio::test]

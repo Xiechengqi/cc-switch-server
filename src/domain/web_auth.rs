@@ -450,6 +450,7 @@ mod tests {
                 tunnel_subdomain: Some("owner".to_string()),
                 ..ClientConfig::default()
             },
+            setup_completion_notification: None,
             upstream_proxy: Default::default(),
             upgrade_policy: Default::default(),
         };

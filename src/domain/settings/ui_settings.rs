@@ -413,6 +413,7 @@ mod tests {
                 ..Default::default()
             },
             client: Default::default(),
+            setup_completion_notification: None,
             upstream_proxy: Default::default(),
             upgrade_policy: Default::default(),
         };
@@ -421,8 +422,14 @@ mod tests {
             settings["shareRouterDomain"].as_str(),
             Some("sgptokenswitch.cc")
         );
-        assert_eq!(settings["upgradePolicy"]["delegateUpgradeToRouterOwner"], json!(true));
-        assert_eq!(settings["upgradePolicy"]["autoUpgradeEnabled"], json!(false));
+        assert_eq!(
+            settings["upgradePolicy"]["delegateUpgradeToRouterOwner"],
+            json!(true)
+        );
+        assert_eq!(
+            settings["upgradePolicy"]["autoUpgradeEnabled"],
+            json!(false)
+        );
         assert_eq!(
             settings["upgradePolicy"]["autoUpgradeCheckIntervalMinutes"],
             json!(60)

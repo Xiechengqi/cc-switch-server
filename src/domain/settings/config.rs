@@ -24,9 +24,72 @@ pub struct ServerConfig {
     pub router: RouterConfig,
     pub client: ClientConfig,
     #[serde(default)]
+    pub setup_completion_notification: Option<SetupCompletionNotificationState>,
+    #[serde(default)]
     pub upstream_proxy: UpstreamProxyConfig,
     #[serde(default)]
     pub upgrade_policy: UpgradePolicyConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupCompletionNotificationStatus {
+    WaitingForClaim,
+    Pending,
+    Acknowledged,
+    TerminalFailed,
+}
+
+impl SetupCompletionNotificationStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingForClaim => "waiting_for_claim",
+            Self::Pending => "pending",
+            Self::Acknowledged => "acknowledged",
+            Self::TerminalFailed => "terminal_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupCompletionNotificationState {
+    pub setup_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_hint: Option<String>,
+    pub status: SetupCompletionNotificationStatus,
+    #[serde(default)]
+    pub attempt_count: u32,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_ack_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl SetupCompletionNotificationState {
+    pub fn new(setup_id: String, password_hint: String, now_ms: i64) -> Self {
+        Self {
+            setup_id,
+            password_hint: Some(password_hint),
+            status: SetupCompletionNotificationStatus::WaitingForClaim,
+            attempt_count: 0,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            last_attempt_at_ms: None,
+            next_attempt_at_ms: None,
+            acknowledged_at_ms: None,
+            router_ack_status: None,
+            last_error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +401,7 @@ impl ServerConfig {
             owner: OwnerConfig::default(),
             router: RouterConfig::default(),
             client: ClientConfig::default(),
+            setup_completion_notification: None,
             upstream_proxy: UpstreamProxyConfig::default(),
             upgrade_policy: UpgradePolicyConfig::default(),
         }
@@ -531,6 +595,7 @@ impl ServerConfig {
                 tunnel_status: Some("claimed".to_string()),
                 last_heartbeat_ms: None,
             },
+            setup_completion_notification: None,
             upstream_proxy: UpstreamProxyConfig::default(),
             upgrade_policy: UpgradePolicyConfig::default(),
         })

@@ -66,7 +66,7 @@ export async function getCodexBankedResetStatus(
   });
 }
 
-/** @deprecated The server reset-credit surface is read-only. */
+/** Send Codex banked-reset invite emails through the upstream referral API. */
 export async function sendCodexBankedResetInvite(
   accountId: string | null | undefined,
   emails: string[],
@@ -80,7 +80,7 @@ export async function sendCodexBankedResetInvite(
   );
 }
 
-/** @deprecated The server reset-credit surface is read-only. */
+/** Consume one Codex banked-reset credit through the upstream API. */
 export async function consumeCodexBankedReset(
   accountId: string | null | undefined,
   creditId: string,

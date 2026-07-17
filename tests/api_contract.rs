@@ -15,7 +15,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
-use axum::Router;
+use axum::{Json, Router};
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -2930,8 +2930,160 @@ async fn setup_bootstrap_issues_session_token_without_prior_login() {
 }
 
 #[tokio::test]
+async fn offline_setup_exposes_waiting_notification_without_persisting_plaintext_password() {
+    let state = test_state();
+    let config_dir = state.config_dir.clone();
+    let app = app_router(state.clone());
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/setup",
+            json!({
+                "password": "setup-secret-9",
+                "ownerEmail": "owner@example.com",
+                "routerUrl": "http://127.0.0.1:9",
+                "clientTunnelSubdomain": "ownerabcde",
+                "options": { "allowOffline": true }
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["clientTunnelClaimStatus"], "skipped");
+    assert_eq!(
+        body["setupCompletionNotificationStatus"],
+        "waiting_for_claim"
+    );
+    assert!(body["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|warning| warning.contains("authoritative Router client claim")))));
+
+    let persisted = std::fs::read_to_string(config_dir.join("server.json")).unwrap();
+    assert!(!persisted.contains("setup-secret-9"));
+    let persisted: Value = serde_json::from_str(&persisted).unwrap();
+    let notification = &persisted["setupCompletionNotification"];
+    assert_eq!(notification["status"], "waiting_for_claim");
+    assert_eq!(notification["passwordHint"], "s******9");
+    let setup_id = notification["setupId"].as_str().unwrap();
+    assert_eq!(setup_id.len(), 36);
+    assert_eq!(setup_id.as_bytes()[14], b'4');
+    assert!(matches!(setup_id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+    assert_eq!(notification["attemptCount"], 0);
+    assert!(notification["lastAttemptAtMs"].is_null());
+    assert!(notification["nextAttemptAtMs"].is_null());
+    assert!(state
+        .config_snapshot()
+        .await
+        .verify_password("setup-secret-9"));
+}
+
+#[tokio::test]
+async fn setup_completed_delivery_failure_does_not_fail_authoritative_setup() {
+    async fn available() -> Json<Value> {
+        Json(json!({"available": true}))
+    }
+    async fn register() -> Json<Value> {
+        Json(json!({
+            "installationId": "installation-setup-test",
+            "controlSecret": "control-secret"
+        }))
+    }
+    async fn bind_owner() -> Json<Value> {
+        Json(json!({
+            "ok": true,
+            "ownerEmail": "owner@example.com",
+            "ownerVerified": true,
+            "alreadyBound": false
+        }))
+    }
+    async fn owner() -> Json<Value> {
+        Json(json!({
+            "ok": true,
+            "ownerEmail": "owner@example.com",
+            "ownerVerified": true
+        }))
+    }
+    async fn claimed() -> Json<Value> {
+        Json(json!({"ok": true}))
+    }
+    async fn setup_completed(
+        State(requests): State<Arc<AtomicUsize>>,
+        axum::Json(request): axum::Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        requests.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(request["setup"]["protocolVersion"], 1);
+        assert_eq!(request["setup"]["passwordHint"], "s******9");
+        assert!(request["setup"].get("passwordLength").is_none());
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"message": "mail queue temporarily unavailable"})),
+        )
+    }
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/v1/client-tunnel/subdomain-availability", get(available))
+        .route("/v1/installations/register", post(register))
+        .route("/v1/installations/bind-owner-email", post(bind_owner))
+        .route("/v1/installations/owner-email", get(owner))
+        .route("/v1/installations/client-tunnel/claim", post(claimed))
+        .route("/v1/installations/setup-completed", post(setup_completed))
+        .with_state(requests.clone());
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let router_server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = test_state();
+    let app = app_router(state.clone());
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/setup",
+            json!({
+                "password": "setup-secret-9",
+                "ownerEmail": "owner@example.com",
+                "routerUrl": format!("http://{router_addr}"),
+                "clientTunnelSubdomain": "ownerabcde",
+                "options": { "allowOffline": false }
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["clientTunnelClaimStatus"], "claimed");
+    assert_eq!(body["setupCompletionNotificationStatus"], "pending");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let config = state.config_snapshot().await;
+    assert_eq!(
+        config.client.tunnel_status.as_deref(),
+        Some("claimed_remote")
+    );
+    let notification = config.setup_completion_notification.unwrap();
+    assert_eq!(notification.status.as_str(), "pending");
+    assert_eq!(notification.attempt_count, 1);
+    assert!(notification
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("503")));
+    router_server.abort();
+}
+
+#[tokio::test]
 async fn setup_validate_is_dry_run_without_persisting_config() {
-    let app = app_router(test_state());
+    let state = test_state();
+    let app = app_router(state.clone());
 
     let response = app
         .clone()
@@ -2952,6 +3104,12 @@ async fn setup_validate_is_dry_run_without_persisting_config() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     assert_eq!(body["dryRun"].as_bool(), Some(true));
+    assert!(body["setupCompletionNotificationStatus"].is_null());
+    assert!(state
+        .config_snapshot()
+        .await
+        .setup_completion_notification
+        .is_none());
 
     let status = json_body(
         app.oneshot(

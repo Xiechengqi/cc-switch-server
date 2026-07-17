@@ -6,7 +6,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::clients::oauth::codex_reset_credits::{
-    codex_authenticated_get, fetch_reset_credit_details, merge_reset_credit_snapshot,
+    codex_authenticated_get, fetch_invite_eligibility_fields, fetch_reset_credit_details,
+    merge_invite_eligibility_into_snapshot, merge_reset_credit_snapshot,
     normalize_imported_snapshot, parse_usage_available_count,
 };
 use crate::clients::oauth::kiro_device::{
@@ -198,26 +199,33 @@ async fn refresh_codex_quota(
     let workspace_id = codex_account_id(account);
     let usage_request = codex_authenticated_get(
         http,
-        CHATGPT_USAGE_URL,
+        &format!("{CHATGPT_USAGE_URL}?supports_rewardless_invites=true"),
         access_token,
         workspace_id.as_deref(),
         request_timeout,
     );
-    let (body, reset_credit_details) = tokio::join!(
+    let (body, reset_credit_details, invite_fields) = tokio::join!(
         request_json(account.provider_type, usage_request, now_ms),
         fetch_reset_credit_details(http, access_token, workspace_id.as_deref(), request_timeout,),
+        fetch_invite_eligibility_fields(
+            http,
+            access_token,
+            workspace_id.as_deref(),
+            request_timeout,
+        ),
     );
     let body = body?;
     let usage: CodexUsageResponse = serde_json::from_value(body.clone())
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
     let previous_reset_credits = codex_banked_reset_status_from_account(account);
-    let reset_credits = merge_reset_credit_snapshot(
+    let mut reset_credits = merge_reset_credit_snapshot(
         parse_usage_available_count(&body),
         reset_credit_details,
         previous_reset_credits.as_ref(),
         workspace_id.as_deref(),
         now_ms,
     );
+    merge_invite_eligibility_into_snapshot(&mut reset_credits, invite_fields);
 
     let usage_plan_type = usage
         .plan_type
@@ -1075,17 +1083,21 @@ fn codex_window_used_fraction(window: &CodexRateLimitWindow) -> Option<f64> {
     }
 
     let mut normalized = used_percent.clamp(0.0, 100.0);
-    if let (Some(reset_after), Some(limit_secs)) =
-        (window.reset_after_seconds, window.limit_window_seconds)
-    {
-        if limit_secs > 0 && reset_after >= 0 {
-            let remaining_ratio = (reset_after as f64 / limit_secs as f64).clamp(0.0, 1.0);
-            let remaining_percent = remaining_ratio * 100.0;
-            if remaining_ratio > 0.85
-                && normalized > 50.0
-                && (remaining_percent - normalized).abs() < 25.0
-            {
-                normalized = (100.0 - normalized).clamp(0.0, 100.0);
+    // TokenRouter uses upstream used_percent directly for weekly windows. Only the
+    // short session (5h) window can report consumed quota as remaining after reset.
+    if codex_window_role(window.limit_window_seconds) == CodexWindowRole::Session {
+        if let (Some(reset_after), Some(limit_secs)) =
+            (window.reset_after_seconds, window.limit_window_seconds)
+        {
+            if limit_secs > 0 && reset_after >= 0 {
+                let remaining_ratio = (reset_after as f64 / limit_secs as f64).clamp(0.0, 1.0);
+                let remaining_percent = remaining_ratio * 100.0;
+                if remaining_ratio > 0.85
+                    && normalized > 50.0
+                    && (remaining_percent - normalized).abs() < 25.0
+                {
+                    normalized = (100.0 - normalized).clamp(0.0, 100.0);
+                }
             }
         }
     }
@@ -2378,6 +2390,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_usage_keeps_seven_day_exhaustion_at_full_utilization() {
+        let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
+            primary_window: Some(CodexRateLimitWindow {
+                used_percent: Some(4.0),
+                limit_window_seconds: Some(18_000),
+                reset_after_seconds: Some(8_657),
+                reset_at: Some(1_700_000_000),
+            }),
+            secondary_window: Some(CodexRateLimitWindow {
+                used_percent: Some(100.0),
+                limit_window_seconds: Some(604_800),
+                reset_after_seconds: Some(518_400),
+                reset_at: Some(1_700_500_000),
+            }),
+        }));
+
+        assert_eq!(
+            tiers
+                .iter()
+                .find(|tier| tier.name == "seven_day")
+                .and_then(|tier| tier.utilization),
+            Some(1.0)
+        );
+    }
+
+    #[test]
     fn codex_usage_corrects_remaining_percent_when_window_was_just_reset() {
         let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
             primary_window: Some(CodexRateLimitWindow {
@@ -2630,7 +2668,7 @@ mod tests {
             status.get("nextExpiresAt").and_then(Value::as_str),
             Some("2026-07-10T00:00:00.000Z")
         );
-        assert_eq!(status.get("readOnly").and_then(Value::as_bool), Some(true));
+        assert!(status.get("readOnly").is_none());
         assert!(status.get("queriedAt").is_some_and(Value::is_null));
     }
 
