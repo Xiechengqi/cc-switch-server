@@ -336,7 +336,10 @@ function creditTimeSummary(
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
-function formatCreditDate(value: string | null | undefined, locale: string) {
+function formatCreditDate(
+  value: string | number | null | undefined,
+  locale: string,
+) {
   if (!value) return null;
   const text = String(value).trim();
   if (!text) return null;
