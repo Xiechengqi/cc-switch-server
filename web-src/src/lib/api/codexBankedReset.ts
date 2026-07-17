@@ -26,26 +26,8 @@ export interface CodexBankedResetStatus {
   detailsStale?: boolean;
   detailsError?: string | null;
   nextExpiresAt?: string | number | null;
-  /** Compatibility timestamp used by snapshots written before split freshness metadata. */
   queriedAt?: string | number | null;
-  /** Compatibility source used by snapshots written before count/details were split. */
   source?: string | null;
-  /** @deprecated Referral actions are not part of the server reset-credit UI. */
-  referralKey?: string;
-  /** @deprecated Referral actions are not part of the server reset-credit UI. */
-  inviteEligibility?: unknown;
-  /** @deprecated Referral actions are not part of the server reset-credit UI. */
-  inviteEligibilityError?: string | null;
-  /** @deprecated Referral actions are not part of the server reset-credit UI. */
-  eligibilityRules?: string[];
-  /** @deprecated Referral actions are not part of the server reset-credit UI. */
-  requiresConsent?: boolean;
-}
-
-export interface CodexBankedResetInviteResult {
-  invites: unknown[];
-  failedEmails: string[];
-  message?: string | null;
 }
 
 export interface CodexBankedResetConsumeResult {
@@ -66,21 +48,6 @@ export async function getCodexBankedResetStatus(
   });
 }
 
-/** Send Codex banked-reset invite emails through the upstream referral API. */
-export async function sendCodexBankedResetInvite(
-  accountId: string | null | undefined,
-  emails: string[],
-): Promise<CodexBankedResetInviteResult> {
-  return invokeCommand<CodexBankedResetInviteResult>(
-    "codex_banked_reset_invite",
-    {
-      accountId: accountId || null,
-      emails,
-    },
-  );
-}
-
-/** Consume one Codex banked-reset credit through the upstream API. */
 export async function consumeCodexBankedReset(
   accountId: string | null | undefined,
   creditId: string,
@@ -96,6 +63,5 @@ export async function consumeCodexBankedReset(
 
 export const codexBankedResetApi = {
   getCodexBankedResetStatus,
-  sendCodexBankedResetInvite,
   consumeCodexBankedReset,
 };

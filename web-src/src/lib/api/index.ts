@@ -76,7 +76,6 @@ export type {
 export type {
   CodexBankedResetConsumeResult,
   CodexBankedResetCredit,
-  CodexBankedResetInviteResult,
   CodexBankedResetStatus,
 } from "./codexBankedReset";
 export {

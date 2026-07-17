@@ -1948,53 +1948,9 @@ async fn web_invoke_dispatch(
                 "remainingCredits": result.remaining_credits,
             }))
         }
-        "codex_banked_reset_invite" => {
-            let account_id = web_optional_string_any(&args, &["accountId", "account_id"]);
-            let emails = string_array_from_args(&args, &["emails"]);
-            let (_account_id, account) =
-                resolve_codex_oauth_account_for_banked_reset(&state, account_id.as_deref()).await?;
-            let access_token = account
-                .access_token
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ApiError::bad_request("codex oauth account requires an access token")
-                })?;
-            let workspace_id =
-                crate::domain::accounts::store::effective_codex_workspace_id(&account);
-            let emails =
-                crate::clients::oauth::codex_reset_credits::normalize_invite_emails(&emails)
-                    .map_err(|error| ApiError::bad_request(error.message()))?;
-            let http = state.http_client().await;
-            let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
-            let timeout = std::time::Duration::from_millis(timeout_ms.max(1_000) as u64);
-            let raw = crate::clients::oauth::codex_reset_credits::send_reset_invite(
-                &http,
-                access_token,
-                workspace_id.as_deref(),
-                &emails,
-                timeout,
-            )
-            .await
-            .map_err(|error| ApiError::bad_gateway(error.message()))?;
-            let failed_emails = raw
-                .get("failed_emails")
-                .or_else(|| raw.get("failedEmails"))
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|value| value.as_str().map(str::to_string))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            Ok(json!({
-                "invites": raw.get("invites").cloned().unwrap_or_else(|| json!([])),
-                "failedEmails": failed_emails,
-                "message": raw.get("message").and_then(Value::as_str),
-            }))
-        }
+        "codex_banked_reset_invite" => Err(ApiError::not_implemented(
+            "codex banked reset invite is no longer available on cc-switch-server",
+        )),
         "open_provider_terminal" => Err(ApiError::not_implemented(
             "open_provider_terminal is not available in server web runtime",
         )),
@@ -2014,18 +1970,6 @@ async fn resolve_codex_oauth_account_for_banked_reset(
         .filter(|account| account.provider_type == ProviderType::CodexOAuth)
         .ok_or_else(|| ApiError::not_found("codex oauth account not found"))?;
     Ok((account.id.clone(), account.clone()))
-}
-
-fn string_array_from_args(args: &Value, keys: &[&str]) -> Vec<String> {
-    for key in keys {
-        if let Some(array) = args.get(*key).and_then(Value::as_array) {
-            return array
-                .iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect();
-        }
-    }
-    Vec::new()
 }
 
 fn grok_oauth_default_models() -> Vec<Value> {

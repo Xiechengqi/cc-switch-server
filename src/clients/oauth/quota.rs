@@ -6,8 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::clients::oauth::codex_reset_credits::{
-    codex_authenticated_get, fetch_invite_eligibility_fields, fetch_reset_credit_details,
-    merge_invite_eligibility_into_snapshot, merge_reset_credit_snapshot,
+    codex_authenticated_get, fetch_reset_credit_details, merge_reset_credit_snapshot,
     normalize_imported_snapshot, parse_usage_available_count,
 };
 use crate::clients::oauth::kiro_device::{
@@ -204,28 +203,21 @@ async fn refresh_codex_quota(
         workspace_id.as_deref(),
         request_timeout,
     );
-    let (body, reset_credit_details, invite_fields) = tokio::join!(
+    let (body, reset_credit_details) = tokio::join!(
         request_json(account.provider_type, usage_request, now_ms),
         fetch_reset_credit_details(http, access_token, workspace_id.as_deref(), request_timeout,),
-        fetch_invite_eligibility_fields(
-            http,
-            access_token,
-            workspace_id.as_deref(),
-            request_timeout,
-        ),
     );
     let body = body?;
     let usage: CodexUsageResponse = serde_json::from_value(body.clone())
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
     let previous_reset_credits = codex_banked_reset_status_from_account(account);
-    let mut reset_credits = merge_reset_credit_snapshot(
+    let reset_credits = merge_reset_credit_snapshot(
         parse_usage_available_count(&body),
         reset_credit_details,
         previous_reset_credits.as_ref(),
         workspace_id.as_deref(),
         now_ms,
     );
-    merge_invite_eligibility_into_snapshot(&mut reset_credits, invite_fields);
 
     let usage_plan_type = usage
         .plan_type

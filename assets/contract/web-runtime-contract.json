@@ -385,9 +385,9 @@
     {
       "name": "codex_banked_reset_invite",
       "support": "shim",
-      "implemented": true,
+      "implemented": false,
       "feature": "settings",
-      "notes": "Server web runtime shim."
+      "notes": "Invite activity removed; reset-only surface remains."
     },
     {
       "name": "codex_banked_reset_status",

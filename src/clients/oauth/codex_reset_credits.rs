@@ -9,14 +9,6 @@ pub(crate) const CHATGPT_RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 pub(crate) const CHATGPT_RESET_CREDIT_CONSUME_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
-const CHATGPT_REFERRAL_INVITE_URL: &str = "https://chatgpt.com/backend-api/wham/referrals/invite";
-const CHATGPT_INVITE_ELIGIBILITY_URL: &str =
-    "https://chatgpt.com/backend-api/referrals/invite/eligibility";
-const CHATGPT_ELIGIBILITY_RULES_URL: &str =
-    "https://chatgpt.com/backend-api/wham/referrals/eligibility_rules";
-const CODEX_REFERRAL_KEY: &str = "codex_referral_persistent_invite";
-const CODEX_INVITE_SUPPORTS_REWARDLESS: &str = "true";
-const MAX_INVITE_EMAILS: usize = 5;
 const DETAILS_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -179,7 +171,6 @@ pub(crate) enum BankedResetActionError {
     RequestFailed,
     UpstreamHttp(u16, String),
     InvalidJson,
-    InvalidEmails(String),
 }
 
 impl BankedResetActionError {
@@ -189,7 +180,6 @@ impl BankedResetActionError {
             Self::RequestFailed => "upstream request failed".to_string(),
             Self::UpstreamHttp(status, body) => format!("upstream returned {status}: {body}"),
             Self::InvalidJson => "upstream returned invalid json".to_string(),
-            Self::InvalidEmails(message) => message.clone(),
         }
     }
 }
@@ -218,54 +208,6 @@ fn generate_redeem_request_id() -> String {
         &hex[16..20],
         &hex[20..32]
     )
-}
-
-pub(crate) fn normalize_invite_emails(
-    emails: &[String],
-) -> Result<Vec<String>, BankedResetActionError> {
-    let mut unique = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for email in emails {
-        let trimmed = email.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let key = trimmed.to_ascii_lowercase();
-        if seen.insert(key) {
-            unique.push(trimmed.to_string());
-        }
-    }
-    if unique.is_empty() {
-        return Err(BankedResetActionError::InvalidEmails(
-            "at least one email is required".to_string(),
-        ));
-    }
-    if unique.len() > MAX_INVITE_EMAILS {
-        return Err(BankedResetActionError::InvalidEmails(format!(
-            "at most {MAX_INVITE_EMAILS} emails are allowed"
-        )));
-    }
-    for email in &unique {
-        if !is_valid_invite_email(email) {
-            return Err(BankedResetActionError::InvalidEmails(format!(
-                "invalid email: {email}"
-            )));
-        }
-    }
-    Ok(unique)
-}
-
-fn is_valid_invite_email(email: &str) -> bool {
-    let Some((local, domain)) = email.split_once('@') else {
-        return false;
-    };
-    !local.is_empty()
-        && !domain.is_empty()
-        && !local.contains('@')
-        && domain.contains('.')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
-        && !domain.contains("..")
 }
 
 async fn request_upstream_json(
@@ -369,126 +311,6 @@ pub(crate) async fn consume_reset_credit(
         available_count,
         remaining_credits,
     })
-}
-
-pub(crate) async fn send_reset_invite(
-    http: &reqwest::Client,
-    access_token: &str,
-    workspace_id: Option<&str>,
-    emails: &[String],
-    request_timeout: Duration,
-) -> Result<Value, BankedResetActionError> {
-    let emails = normalize_invite_emails(emails)?;
-    let timeout = request_timeout.min(ACTION_TIMEOUT);
-    let payload = json!({
-        "referral_key": CODEX_REFERRAL_KEY,
-        "emails": emails,
-    });
-    let request = codex_authenticated_post(
-        http,
-        CHATGPT_REFERRAL_INVITE_URL,
-        access_token,
-        workspace_id,
-        payload,
-        timeout,
-    );
-    request_upstream_json(request).await
-}
-
-pub(crate) async fn fetch_invite_eligibility_fields(
-    http: &reqwest::Client,
-    access_token: &str,
-    workspace_id: Option<&str>,
-    request_timeout: Duration,
-) -> Value {
-    let timeout = request_timeout.min(ACTION_TIMEOUT);
-    let eligibility_request = codex_authenticated_get(
-        http,
-        &format!(
-            "{CHATGPT_INVITE_ELIGIBILITY_URL}?referral_key={CODEX_REFERRAL_KEY}&supports_rewardless_invites={CODEX_INVITE_SUPPORTS_REWARDLESS}"
-        ),
-        access_token,
-        workspace_id,
-        timeout,
-    );
-    let rules_request = codex_authenticated_get(
-        http,
-        &format!("{CHATGPT_ELIGIBILITY_RULES_URL}?referral_key={CODEX_REFERRAL_KEY}"),
-        access_token,
-        workspace_id,
-        timeout,
-    );
-    let (eligibility, rules) = tokio::join!(
-        request_upstream_json(eligibility_request),
-        request_upstream_json(rules_request)
-    );
-    let eligibility = eligibility.ok();
-    let rules = rules.ok();
-    let requires_consent = eligibility
-        .as_ref()
-        .and_then(|value| value.get("requires_explicit_confirmation"))
-        .or_else(|| {
-            eligibility
-                .as_ref()
-                .and_then(|value| value.get("requiresExplicitConfirmation"))
-        })
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let eligibility_rules = rules
-        .as_ref()
-        .and_then(|value| value.get("rules"))
-        .and_then(Value::as_array)
-        .map(|items| normalize_invite_rules(items))
-        .unwrap_or_default();
-    let invite_eligibility_error = if eligibility.is_some() && rules.is_some() {
-        None
-    } else {
-        Some("CODEX_INVITE_RESET_REFERRAL_UNAVAILABLE".to_string())
-    };
-    json!({
-        "referralKey": CODEX_REFERRAL_KEY,
-        "requiresConsent": requires_consent,
-        "eligibilityRules": eligibility_rules,
-        "inviteEligibilityError": invite_eligibility_error,
-    })
-}
-
-fn normalize_invite_rules(items: &[Value]) -> Vec<String> {
-    let mut rules = Vec::new();
-    for item in items {
-        if let Some(text) = item.as_str() {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                rules.push(trimmed.to_string());
-            }
-            continue;
-        }
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        for key in ["text", "description", "message", "title"] {
-            if let Some(text) = object.get(key).and_then(Value::as_str) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    rules.push(trimmed.to_string());
-                    break;
-                }
-            }
-        }
-    }
-    rules
-}
-
-pub(crate) fn merge_invite_eligibility_into_snapshot(snapshot: &mut Value, invite: Value) {
-    let Some(snapshot_object) = snapshot.as_object_mut() else {
-        return;
-    };
-    let Some(invite_object) = invite.as_object() else {
-        return;
-    };
-    for (key, value) in invite_object {
-        snapshot_object.insert(key.clone(), value.clone());
-    }
 }
 
 pub(crate) fn parse_usage_available_count(usage: &Value) -> Option<i64> {
@@ -796,9 +618,8 @@ pub(crate) fn merge_reset_credit_snapshot(
 
     let count_fetched_at = available_count.map(|_| now_ms);
     let next_expires_at = next_available_expiry(&credits);
-    // Reaching this merge means the Codex account supports the read-only probe.
-    // Missing eligibility-gated fields are represented as unknown, not as a
-    // disabled feature.
+    // Reaching this merge means the Codex account supports reset-credit probing.
+    // Missing detail fields are represented as unknown, not as a disabled feature.
     let enabled = true;
     let source = if details_available {
         "upstream"
@@ -1376,23 +1197,5 @@ mod tests {
         assert_eq!(imported["countFetchedAt"], 1234);
         assert_eq!(imported["detailsFetchedAt"], 1234);
         assert_eq!(imported["queriedAt"], 1234);
-    }
-
-    #[test]
-    fn normalize_invite_emails_deduplicates_and_validates() {
-        let emails = normalize_invite_emails(&[
-            " Friend@Example.com ".to_string(),
-            "friend@example.com".to_string(),
-            "other@example.com".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(
-            emails,
-            vec![
-                "Friend@Example.com".to_string(),
-                "other@example.com".to_string()
-            ]
-        );
-        assert!(normalize_invite_emails(&["bad-email".to_string()]).is_err());
     }
 }
