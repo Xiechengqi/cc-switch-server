@@ -633,11 +633,19 @@ async fn run_tunnel_actor(
         let lease = match tokio::time::timeout(LEASE_ISSUE_TIMEOUT, lease_fn(lease_request)).await {
             Ok(Ok(lease)) => lease,
             Ok(Err(error)) => {
-                if lease_issue_requires_new_rotation(&error) {
-                    router_generation = next_router_generation_after_lease_error(
-                        error.to_string().as_str(),
+                let error_message = error.to_string();
+                let previous_router_generation = router_generation;
+                let previous_router_active_generation = router_active_generation;
+                (router_generation, router_active_generation) =
+                    sync_router_generations_after_lease_error(
+                        &error_message,
                         router_generation,
+                        router_active_generation,
                     );
+                if router_generation != previous_router_generation
+                    || router_active_generation != previous_router_active_generation
+                    || lease_issue_requires_new_rotation(&error)
+                {
                     rotation_id = new_rotation_id();
                 }
                 set_status_for_generation(
@@ -647,9 +655,11 @@ async fn run_tunnel_actor(
                         key: key.clone(),
                         kind: kind.clone(),
                         status: "retrying".to_string(),
-                        last_error: Some(error.to_string()),
+                        last_error: Some(error_message),
                         generation,
                         desired_generation: generation,
+                        router_generation,
+                        router_active_generation,
                         transport_state: Some(TransportState::Candidate.as_str().to_string()),
                         start_reason: Some(reason.clone()),
                         spec_id: Some(spec_id.clone()),
@@ -1336,11 +1346,47 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_RECONNECT_BACKOFF)
 }
 
-fn lease_issue_requires_new_rotation(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
+fn lease_issue_message_requires_new_rotation(message: &str) -> bool {
     message.contains("rotationId belongs to an expired or retired lease")
         || message.contains("generation must be newer than persisted generation")
         || message.contains("route already has a non-expired candidate rotation")
+        || message.contains("route generation changed: expected ")
+}
+
+fn lease_issue_requires_new_rotation(error: &anyhow::Error) -> bool {
+    lease_issue_message_requires_new_rotation(&error.to_string())
+}
+
+fn parse_route_active_generation_from_lease_error(message: &str) -> Option<u64> {
+    message
+        .split("route generation changed: expected ")
+        .nth(1)?
+        .split(", active ")
+        .nth(1)?
+        .split(|character: char| !character.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn sync_router_generations_after_lease_error(
+    message: &str,
+    router_generation: u64,
+    router_active_generation: u64,
+) -> (u64, u64) {
+    if let Some(active_generation) = parse_route_active_generation_from_lease_error(message) {
+        return (
+            active_generation.saturating_add(1).max(router_generation),
+            active_generation,
+        );
+    }
+    if lease_issue_message_requires_new_rotation(message) {
+        return (
+            next_router_generation_after_lease_error(message, router_generation),
+            router_active_generation,
+        );
+    }
+    (router_generation, router_active_generation)
 }
 
 fn next_router_generation_after_lease_error(message: &str, current: u64) -> u64 {
@@ -1972,6 +2018,31 @@ mod tests {
                 4,
             ),
             5,
+        );
+    }
+
+    #[test]
+    fn sync_router_generations_after_route_generation_changed_error() {
+        let message = "router namespace tunnel lease failed: 409 Conflict: {\"message\":\"route generation changed: expected 6, active 0\"}";
+        assert_eq!(
+            sync_router_generations_after_lease_error(message, 7, 6),
+            (7, 0),
+        );
+        assert_eq!(
+            sync_router_generations_after_lease_error(message, 2, 6),
+            (2, 0),
+        );
+    }
+
+    #[test]
+    fn sync_router_generations_after_persisted_generation_error() {
+        assert_eq!(
+            sync_router_generations_after_lease_error(
+                "generation must be newer than persisted generation 5",
+                2,
+                4,
+            ),
+            (6, 4),
         );
     }
 }
