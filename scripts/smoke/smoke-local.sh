@@ -52,7 +52,7 @@ fi
 echo "== setup =="
 curl -fsS -X POST \
   -H "Content-Type: application/json" \
-  -d '{"password":"password123","ownerEmail":"owner@example.com","routerUrl":"http://127.0.0.1:9","clientTunnelSubdomain":"ownertest"}' \
+  -d '{"password":"password123","ownerEmail":"owner@example.com","routerUrl":"http://127.0.0.1:9","clientTunnelSubdomain":"ownertest","options":{"allowOffline":true}}' \
   "$SERVER_URL/api/setup"
 echo
 

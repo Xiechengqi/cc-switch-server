@@ -885,6 +885,7 @@ impl ServerStateInner {
 
             let Some(password_hint) = notification.password_hint.clone() else {
                 notification.status = SetupCompletionNotificationStatus::TerminalFailed;
+                notification.password_hint = None;
                 notification.updated_at_ms = now_ms;
                 notification.next_attempt_at_ms = None;
                 notification.last_error =
@@ -899,6 +900,7 @@ impl ServerStateInner {
                 Ok(setup) => setup,
                 Err(error) => {
                     notification.status = SetupCompletionNotificationStatus::TerminalFailed;
+                    notification.password_hint = None;
                     notification.updated_at_ms = now_ms;
                     notification.next_attempt_at_ms = None;
                     notification.last_error = Some(error.to_string());
@@ -947,6 +949,7 @@ impl ServerStateInner {
             }
             Err(error) if error.is_terminal() => {
                 notification.status = SetupCompletionNotificationStatus::TerminalFailed;
+                notification.password_hint = None;
                 notification.updated_at_ms = completed_at_ms;
                 notification.next_attempt_at_ms = None;
                 notification.router_ack_status = None;
@@ -2292,6 +2295,7 @@ fn preserve_setup_completion_from_stale_snapshot(
             .chain(incoming_notification.acknowledged_at_ms)
             .max();
     } else if merged.status == SetupCompletionNotificationStatus::TerminalFailed {
+        merged.password_hint = None;
         merged.next_attempt_at_ms = None;
         merged.router_ack_status = None;
     } else {
@@ -5932,6 +5936,63 @@ mod tests {
         .unwrap();
         assert!(!persisted.contains("supersecret9"));
         assert!(persisted.contains("s******9"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn setup_completion_terminal_rejection_clears_persisted_hint() {
+        async fn rejected(Json(request): Json<Value>) -> (StatusCode, Json<Value>) {
+            assert_eq!(request["setup"]["passwordHint"], "p******w");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"message": "invalid setup completion"})),
+            )
+        }
+
+        let app = Router::new().route("/v1/installations/setup-completed", post(rejected));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = client::generate_identity_without_installation();
+        identity.installation_id = "fixture-installation".to_string();
+        config.router.identity = Some(identity);
+        config.setup_completion_notification = Some(
+            crate::domain::settings::config::SetupCompletionNotificationState::new(
+                "123e4567-e89b-42d3-a456-426614174000".to_string(),
+                "p******w".to_string(),
+                100,
+            ),
+        );
+        state.replace_config(config).await.unwrap();
+
+        state
+            .deliver_setup_completion_notification(true)
+            .await
+            .unwrap();
+
+        let notification = state
+            .config_snapshot()
+            .await
+            .setup_completion_notification
+            .unwrap();
+        assert_eq!(
+            notification.status,
+            SetupCompletionNotificationStatus::TerminalFailed
+        );
+        assert!(notification.password_hint.is_none());
+        assert!(notification.next_attempt_at_ms.is_none());
+        assert!(notification
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("422")));
+        let persisted = std::fs::read_to_string(crate::domain::settings::config::config_path(
+            &state.config_dir,
+        ))
+        .unwrap();
+        assert!(!persisted.contains("p******w"));
         server.abort();
     }
 
