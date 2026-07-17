@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { Gift, Loader2, RefreshCw, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import {
   Select,
   SelectContent,
@@ -39,6 +40,7 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const [selectedCreditId, setSelectedCreditId] = React.useState<string>("");
+  const [consumeConfirmOpen, setConsumeConfirmOpen] = React.useState(false);
 
   const queryKey = React.useMemo(
     () => resetQueryKey(accountId, workspaceId),
@@ -127,9 +129,16 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
 
   const handleConsume = () => {
     if (!selectedCreditId) return;
-    const confirmed = window.confirm(t("codexBankedReset.consumeConfirm"));
-    if (!confirmed) return;
+    setConsumeConfirmOpen(true);
+  };
+
+  const handleConsumeConfirm = () => {
+    if (!selectedCreditId) {
+      setConsumeConfirmOpen(false);
+      return;
+    }
     consumeMutation.mutate(selectedCreditId);
+    setConsumeConfirmOpen(false);
   };
 
   const selectedCredit = availableCredits.find(
@@ -304,6 +313,16 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
           </Button>
         </div>
       )}
+      <ConfirmDialog
+        isOpen={consumeConfirmOpen}
+        title={t("codexBankedReset.useReset")}
+        message={t("codexBankedReset.consumeConfirm")}
+        confirmText={t("codexBankedReset.useReset")}
+        cancelText={t("common.cancel")}
+        variant="destructive"
+        onConfirm={handleConsumeConfirm}
+        onCancel={() => setConsumeConfirmOpen(false)}
+      />
     </section>
   );
 };
