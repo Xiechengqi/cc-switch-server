@@ -320,7 +320,7 @@ pub fn default_stream_check_config() -> Value {
         "maxRetries": 2,
         "degradedThresholdMs": 6000,
         "claudeModel": "claude-haiku-4-5-20251001",
-        "codexModel": "gpt-5.5@low",
+        "codexModel": "gpt-5.6-sol@low",
         "geminiModel": "gemini-3.5-flash",
         "testPrompt": "Who are you?",
     })

@@ -335,7 +335,7 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
         ProviderType::CodexOAuth => ProviderDefaults {
             base_url: "https://chatgpt.com/backend-api/codex",
             api_format: "openai_responses",
-            model: "gpt-5.5",
+            model: "gpt-5.6-sol",
             key: "OPENAI_API_KEY",
             aws_region: None,
         },

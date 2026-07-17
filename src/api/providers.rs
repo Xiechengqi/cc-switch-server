@@ -782,7 +782,7 @@ fn extract_codex_model_from_settings(settings: &serde_json::Value) -> Option<Str
 fn normalize_codex_oauth_test_model(model: &str) -> String {
     let trimmed = model.trim();
     if trimmed.is_empty() {
-        return "gpt-5.5@low".to_string();
+        return "gpt-5.6-sol@low".to_string();
     }
     if trimmed.contains('@') || trimmed.contains('#') {
         return trimmed.to_string();
@@ -981,7 +981,7 @@ mod tests {
                 id: "p1".to_string(),
                 name: "OpenAI OAuth".to_string(),
                 settings_config: json!({
-                    "config": "model = \"gpt-5.5\"\n"
+                    "config": "model = \"gpt-5.6-sol\"\n"
                 }),
                 category: Some("official".to_string()),
                 meta: None,
@@ -993,7 +993,7 @@ mod tests {
 
         assert_eq!(
             provider_test_model(AppKind::Codex, &stored, None, None),
-            "gpt-5.5@low"
+            "gpt-5.6-sol@low"
         );
     }
 
@@ -1005,7 +1005,7 @@ mod tests {
                 id: "p1".to_string(),
                 name: "OpenAI OAuth".to_string(),
                 settings_config: json!({
-                    "config": "model = \"gpt-5.5\"\n"
+                    "config": "model = \"gpt-5.6-sol\"\n"
                 }),
                 category: Some("official".to_string()),
                 meta: None,
@@ -1020,7 +1020,7 @@ mod tests {
 
         assert_eq!(
             value.get("model").and_then(serde_json::Value::as_str),
-            Some("gpt-5.5")
+            Some("gpt-5.6-sol")
         );
         assert_eq!(
             value

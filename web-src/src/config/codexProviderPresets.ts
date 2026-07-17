@@ -169,11 +169,11 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     isOfficial: true,
     category: "official",
     auth: {},
-    config: `model = "gpt-5.5"`,
+    config: `model = "gpt-5.6-sol"`,
     providerType: "codex_oauth",
     testConfig: {
       enabled: true,
-      testModel: "gpt-5.5@low",
+      testModel: "gpt-5.6-sol@low",
     },
     theme: {
       icon: "codex",

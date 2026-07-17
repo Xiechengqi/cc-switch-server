@@ -43,7 +43,7 @@ fn default_claude_model() -> String {
 }
 
 fn default_codex_model() -> String {
-    "gpt-5.5@low".to_string()
+    "gpt-5.6-sol@low".to_string()
 }
 
 fn default_gemini_model() -> String {
