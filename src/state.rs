@@ -1860,6 +1860,25 @@ impl ServerStateInner {
         provider_type: ProviderType,
         account_id: Option<&str>,
     ) -> Result<(), ManagedAccountRefreshError> {
+        self.refresh_managed_account_inner(provider_type, account_id, false)
+            .await
+    }
+
+    pub async fn refresh_managed_account_now(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: Option<&str>,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        self.refresh_managed_account_inner(provider_type, account_id, true)
+            .await
+    }
+
+    async fn refresh_managed_account_inner(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: Option<&str>,
+        force: bool,
+    ) -> Result<(), ManagedAccountRefreshError> {
         let now = crate::infra::time::now_ms() as i64;
         let account = {
             let accounts = self.accounts.read().await;
@@ -1870,9 +1889,10 @@ impl ServerStateInner {
         let Some(account) = account else {
             return Ok(());
         };
-        if !account_needs_native_refresh(&account, now) {
+        if !force && !account_needs_native_refresh(&account, now) {
             return Ok(());
         }
+        let access_token_before_lock = account.access_token.clone();
 
         let _refresh_guard = self
             .account_refresh_locks
@@ -1886,7 +1906,10 @@ impl ServerStateInner {
                 .cloned()
         }
         .ok_or(ManagedAccountRefreshError::NotFound)?;
-        if !account_needs_native_refresh(&account, now) {
+        if force && account.access_token != access_token_before_lock {
+            return Ok(());
+        }
+        if !force && !account_needs_native_refresh(&account, now) {
             return Ok(());
         }
 

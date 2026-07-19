@@ -23,6 +23,10 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const COMPUTER_USE_BETA: &str = "computer-use-2024-10-22";
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
+const EFFORT_BETA: &str = "effort-2025-11-24";
+const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
+const TOKEN_COUNTING_BETA: &str = "token-counting-2024-11-01";
 const KNOWN_SAFE_CLIENT_BETAS: &[&str] = &[
     "prompt-caching-2024-07-31",
     "token-efficient-tools-2025-02-19",
@@ -57,11 +61,70 @@ pub(crate) fn apply_forward_contract(
     body: &mut Bytes,
     client_headers: &HeaderMap,
     identity_seed: &str,
+    context_1m_requested: bool,
     retry_stage: Option<ClaudeBodyRetryStage>,
+) -> Result<ClaudeForwardContract, ProxyError> {
+    apply_forward_contract_inner(
+        url,
+        body,
+        client_headers,
+        identity_seed,
+        context_1m_requested,
+        retry_stage,
+        false,
+    )
+}
+
+pub(crate) fn apply_count_tokens_forward_contract(
+    url: &mut String,
+    body: &mut Bytes,
+    client_headers: &HeaderMap,
+    identity_seed: &str,
+    context_1m_requested: bool,
+) -> Result<ClaudeForwardContract, ProxyError> {
+    apply_forward_contract_inner(
+        url,
+        body,
+        client_headers,
+        identity_seed,
+        context_1m_requested,
+        None,
+        true,
+    )
+}
+
+pub(crate) fn normalize_count_tokens_body(body: &mut Bytes) -> Result<(), ProxyError> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let mut value = serde_json::from_slice(body).map_err(|error| {
+        ProxyError::bad_request(format!(
+            "Claude count_tokens request body must be valid json: {error}"
+        ))
+    })?;
+    let _ = take_internal_anthropic_betas(&mut value);
+    remove_generation_fields_for_count_tokens(&mut value);
+    *body = Bytes::from(serde_json::to_vec(&value).map_err(|error| {
+        ProxyError::bad_request(format!(
+            "Claude count_tokens request body encode failed: {error}"
+        ))
+    })?);
+    Ok(())
+}
+
+fn apply_forward_contract_inner(
+    url: &mut String,
+    body: &mut Bytes,
+    client_headers: &HeaderMap,
+    identity_seed: &str,
+    context_1m_requested: bool,
+    retry_stage: Option<ClaudeBodyRetryStage>,
+    is_count_tokens: bool,
 ) -> Result<ClaudeForwardContract, ProxyError> {
     *url = ensure_claude_oauth_beta_query(url);
     let mut session_id = claude_session_id_from_headers(client_headers);
     let mut body_shape = None;
+    let mut internal_betas = Vec::new();
     if !body.is_empty() {
         let mut value = serde_json::from_slice(body).map_err(|error| {
             ProxyError::bad_request(format!(
@@ -74,31 +137,58 @@ pub(crate) fn apply_forward_contract(
         if let Some(session_id) = session_id.as_deref() {
             ensure_claude_metadata_user_id(&mut value, identity_seed, session_id);
         }
-        value = ensure_claude_code_identity(value);
+        value = normalize_claude_code_identity(value);
         if let Some(stage) = retry_stage {
-            value = apply_body_retry_stage(value, stage);
+            apply_body_retry_stage_unsigned(&mut value, stage);
         }
+        normalize_claude_sampling(&mut value);
+        internal_betas = take_internal_anthropic_betas(&mut value);
+        if is_count_tokens {
+            remove_generation_fields_for_count_tokens(&mut value);
+        }
+        value = sign_claude_oauth_messages_body(value);
         body_shape = Some(value.clone());
         *body = Bytes::from(serde_json::to_vec(&value).map_err(|error| {
             ProxyError::bad_request(format!("claude oauth request body encode failed: {error}"))
         })?);
     }
     let mut headers = claude_cli_headers(session_id.as_deref(), identity_seed, body_shape.as_ref());
-    headers.push(anthropic_beta_header(client_headers, body_shape.as_ref()));
+    headers.push((
+        "anthropic-beta",
+        build_anthropic_beta_value(
+            client_headers,
+            body_shape.as_ref(),
+            &internal_betas,
+            context_1m_requested,
+            true,
+            is_count_tokens,
+        ),
+    ));
     Ok(ClaudeForwardContract {
         headers,
         session_id,
     })
 }
 
-pub(super) fn anthropic_beta_header(
-    client_headers: &HeaderMap,
-    body: Option<&Value>,
-) -> (&'static str, String) {
-    (
-        "anthropic-beta",
-        build_anthropic_beta_value(client_headers, body, true),
-    )
+fn remove_generation_fields_for_count_tokens(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "stream",
+        "stop_sequences",
+        "service_tier",
+        "thinking",
+        "output_config",
+        "context_management",
+        "tool_choice",
+    ] {
+        object.remove(key);
+    }
 }
 
 fn claude_cli_headers(
@@ -191,7 +281,7 @@ fn sign_claude_oauth_messages_body(mut body: Value) -> Value {
     body
 }
 
-fn ensure_claude_code_identity(mut body: Value) -> Value {
+fn normalize_claude_code_identity(mut body: Value) -> Value {
     if body
         .get("system")
         .and_then(|v| v.as_array())
@@ -202,7 +292,7 @@ fn ensure_claude_code_identity(mut body: Value) -> Value {
     {
         ensure_claude_tools_array(&mut body);
         ensure_claude_defaults(&mut body);
-        return sign_claude_oauth_messages_body(body);
+        return body;
     }
 
     let is_claude_code_system = system_matches_claude_code_template(&body);
@@ -233,6 +323,12 @@ fn ensure_claude_code_identity(mut body: Value) -> Value {
     body["system"] = Value::Array(blocks);
     ensure_claude_tools_array(&mut body);
     ensure_claude_defaults(&mut body);
+    body
+}
+
+fn ensure_claude_code_identity(body: Value) -> Value {
+    let mut body = normalize_claude_code_identity(body);
+    normalize_claude_sampling(&mut body);
     sign_claude_oauth_messages_body(body)
 }
 
@@ -241,21 +337,25 @@ fn ensure_claude_oauth_billing_header_system(body: Value) -> Value {
 }
 
 fn apply_body_retry_stage(mut body: Value, stage: ClaudeBodyRetryStage) -> Value {
+    apply_body_retry_stage_unsigned(&mut body, stage);
+    sign_claude_oauth_messages_body(body)
+}
+
+fn apply_body_retry_stage_unsigned(body: &mut Value, stage: ClaudeBodyRetryStage) {
     match stage {
         ClaudeBodyRetryStage::Thinking => {
-            downgrade_thinking_blocks_for_retry(&mut body);
+            downgrade_thinking_blocks_for_retry(body);
         }
         ClaudeBodyRetryStage::SignatureSensitive => {
-            downgrade_thinking_blocks_for_retry(&mut body);
-            downgrade_signature_sensitive_blocks_for_retry(&mut body);
+            downgrade_thinking_blocks_for_retry(body);
+            downgrade_signature_sensitive_blocks_for_retry(body);
         }
         ClaudeBodyRetryStage::WebSearchHistory => {
-            downgrade_thinking_blocks_for_retry(&mut body);
-            downgrade_signature_sensitive_blocks_for_retry(&mut body);
-            filter_web_search_history_blocks(&mut body);
+            downgrade_thinking_blocks_for_retry(body);
+            downgrade_signature_sensitive_blocks_for_retry(body);
+            filter_web_search_history_blocks(body);
         }
     }
-    sign_claude_oauth_messages_body(body)
 }
 
 fn ensure_claude_tools_array(body: &mut Value) {
@@ -278,9 +378,6 @@ fn ensure_claude_defaults(body: &mut Value) {
     object
         .entry("max_tokens".to_string())
         .or_insert_with(|| serde_json::json!(128_000));
-    object
-        .entry("temperature".to_string())
-        .or_insert_with(|| serde_json::json!(1));
     if thinking_uses_context_management {
         object
             .entry("context_management".to_string())
@@ -289,6 +386,25 @@ fn ensure_claude_defaults(body: &mut Value) {
                     "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
                 })
             });
+    }
+}
+
+fn normalize_claude_sampling(body: &mut Value) {
+    let thinking_active = body
+        .pointer("/thinking/type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "enabled" | "adaptive" | "auto"));
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if thinking_active {
+        object.insert("temperature".to_string(), serde_json::json!(1));
+        object.remove("top_p");
+        object.remove("top_k");
+    } else {
+        object
+            .entry("temperature".to_string())
+            .or_insert_with(|| serde_json::json!(1));
     }
 }
 
@@ -596,58 +712,145 @@ fn bigram_counts(text: &str) -> HashMap<(char, char), usize> {
 fn build_anthropic_beta_value(
     headers: &HeaderMap,
     body: Option<&Value>,
+    internal_betas: &[String],
+    context_1m_requested: bool,
     is_claude_oauth: bool,
+    is_count_tokens: bool,
 ) -> String {
     let mut betas = vec![CLAUDE_CODE_BETA.to_string()];
     if is_claude_oauth {
         betas.push(CLAUDE_OAUTH_BETA.to_string());
     }
 
-    if let Some(beta) = headers
+    let client_betas = headers
         .get("anthropic-beta")
         .and_then(|value| value.to_str().ok())
-    {
-        let mut dropped_count = 0_u32;
-        let mut first_dropped = None;
-        for item in beta
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
+        .into_iter()
+        .flat_map(|beta| {
+            beta.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+        });
+    let mut dropped_count = 0_u32;
+    for item in client_betas.chain(internal_betas.iter().map(String::as_str)) {
+        if is_claude_oauth
+            && !beta_allowed_for_request(item, body, context_1m_requested, is_count_tokens)
         {
-            if is_claude_oauth && !is_known_safe_client_beta(item) {
-                dropped_count = dropped_count.saturating_add(1);
-                first_dropped.get_or_insert(item);
-                continue;
-            }
-            if !betas.iter().any(|existing| existing == item) {
-                betas.push(item.to_string());
-            }
+            dropped_count = dropped_count.saturating_add(1);
+            crate::metrics::record_claude_beta_decision(if is_request_shape_beta(item) {
+                "dropped_model"
+            } else {
+                "dropped_unknown"
+            });
+            continue;
         }
-        if dropped_count > 0 {
-            tracing::debug!(
-                dropped_count,
-                first_beta = first_dropped.unwrap_or_default(),
-                "dropping unapproved client anthropic-beta values for Claude OAuth"
-            );
+        if is_claude_oauth {
+            crate::metrics::record_claude_beta_decision(if is_request_shape_beta(item) {
+                "allowed_shape"
+            } else {
+                "allowed_client"
+            });
         }
+        push_beta(&mut betas, item);
+    }
+    if dropped_count > 0 {
+        tracing::debug!(
+            dropped_count,
+            "dropping unapproved anthropic-beta values for Claude OAuth"
+        );
     }
 
     if is_claude_oauth {
         if body.is_some_and(body_has_thinking) {
+            crate::metrics::record_claude_beta_decision("allowed_shape");
             push_beta(&mut betas, INTERLEAVED_THINKING_BETA);
         }
         if body.is_some_and(body_has_streaming_tools) {
+            crate::metrics::record_claude_beta_decision("allowed_shape");
             push_beta(&mut betas, FINE_GRAINED_TOOL_STREAMING_BETA);
         }
         if body.is_some_and(body_has_computer_use_tool) {
+            crate::metrics::record_claude_beta_decision("allowed_shape");
             push_beta(&mut betas, COMPUTER_USE_BETA);
         }
         if body.is_some_and(body_has_context_management) {
+            crate::metrics::record_claude_beta_decision("allowed_shape");
             push_beta(&mut betas, CONTEXT_MANAGEMENT_BETA);
+        }
+        if body.is_some_and(body_has_effort) {
+            crate::metrics::record_claude_beta_decision("allowed_shape");
+            push_beta(&mut betas, EFFORT_BETA);
+        }
+        if body.is_some_and(body_has_extended_cache_ttl) {
+            crate::metrics::record_claude_beta_decision("allowed_shape");
+            push_beta(&mut betas, EXTENDED_CACHE_TTL_BETA);
+        }
+        if context_1m_requested {
+            crate::metrics::record_claude_beta_decision("allowed_shape");
+            push_beta(&mut betas, CONTEXT_1M_BETA);
+        }
+        if is_count_tokens {
+            crate::metrics::record_claude_beta_decision("allowed_shape");
+            push_beta(&mut betas, TOKEN_COUNTING_BETA);
         }
     }
 
     betas.join(",")
+}
+
+fn is_request_shape_beta(beta: &str) -> bool {
+    matches!(
+        beta,
+        CONTEXT_1M_BETA | EFFORT_BETA | EXTENDED_CACHE_TTL_BETA | TOKEN_COUNTING_BETA
+    )
+}
+
+fn beta_allowed_for_request(
+    beta: &str,
+    body: Option<&Value>,
+    context_1m_requested: bool,
+    is_count_tokens: bool,
+) -> bool {
+    match beta {
+        CONTEXT_1M_BETA => context_1m_requested,
+        EFFORT_BETA => body.is_some_and(body_has_effort),
+        EXTENDED_CACHE_TTL_BETA => body.is_some_and(body_has_extended_cache_ttl),
+        TOKEN_COUNTING_BETA => is_count_tokens,
+        _ => is_known_safe_client_beta(beta),
+    }
+}
+
+fn take_internal_anthropic_betas(body: &mut Value) -> Vec<String> {
+    let Some(object) = body.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut betas = Vec::new();
+    for key in ["anthropic_beta", "betas"] {
+        let Some(value) = object.remove(key) else {
+            continue;
+        };
+        match value {
+            Value::Array(items) => {
+                betas.extend(items.into_iter().filter_map(|item| {
+                    item.as_str()
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_string)
+                }));
+            }
+            Value::String(value) => {
+                betas.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_string),
+                );
+            }
+            _ => {}
+        }
+    }
+    betas
 }
 
 fn is_known_safe_client_beta(beta: &str) -> bool {
@@ -669,7 +872,28 @@ fn push_beta(betas: &mut Vec<String>, beta: &str) {
 }
 
 fn body_has_thinking(body: &Value) -> bool {
-    body.get("thinking").is_some_and(|value| !value.is_null())
+    body.pointer("/thinking/type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "enabled" | "adaptive" | "auto"))
+}
+
+fn body_has_effort(body: &Value) -> bool {
+    body.pointer("/output_config/effort")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn body_has_extended_cache_ttl(body: &Value) -> bool {
+    match body {
+        Value::Array(items) => items.iter().any(body_has_extended_cache_ttl),
+        Value::Object(object) => {
+            object
+                .get("cache_control")
+                .is_some_and(|cache| cache.get("ttl").and_then(Value::as_str) == Some("1h"))
+                || object.values().any(body_has_extended_cache_ttl)
+        }
+        _ => false,
+    }
 }
 
 fn body_has_streaming_tools(body: &Value) -> bool {
@@ -959,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_defaults_preserve_explicit_values() {
+    fn claude_defaults_preserve_explicit_values_except_invalid_thinking_sampling() {
         let result = ensure_claude_oauth_billing_header_system(json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 4096,
@@ -970,7 +1194,7 @@ mod tests {
         }));
 
         assert_eq!(result["max_tokens"], json!(4096));
-        assert_eq!(result["temperature"], json!(0));
+        assert_eq!(result["temperature"], json!(1));
         assert_eq!(result["context_management"], json!({"edits": []}));
     }
 
@@ -1026,6 +1250,49 @@ mod tests {
     }
 
     #[test]
+    fn haiku_non_cc_client_still_gets_full_mimicry() {
+        let result = ensure_claude_oauth_billing_header_system(json!({
+            "model": "claude-haiku-4-5-20251001",
+            "system": "Be concise.",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        let system = result["system"].as_array().unwrap();
+        assert!(system[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(BILLING_PREFIX));
+        assert_eq!(system[1]["text"], json!(CLAUDE_CODE_IDENTITY_TEXT));
+        assert_eq!(result["messages"][0]["content"], json!("Be concise."));
+        assert_eq!(result["tools"], json!([]));
+        assert_eq!(result["temperature"], json!(1));
+    }
+
+    #[test]
+    fn thinking_sampling_is_normalized_without_affecting_non_thinking_requests() {
+        let thinking = ensure_claude_oauth_billing_header_system(json!({
+            "model": "claude-sonnet-4-6",
+            "thinking": {"type": "adaptive"},
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 40,
+            "messages": []
+        }));
+        assert_eq!(thinking["temperature"], json!(1));
+        assert!(thinking.get("top_p").is_none());
+        assert!(thinking.get("top_k").is_none());
+
+        let non_thinking = ensure_claude_oauth_billing_header_system(json!({
+            "model": "claude-haiku-4-5",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "messages": []
+        }));
+        assert_eq!(non_thinking["temperature"], json!(0.2));
+        assert_eq!(non_thinking["top_p"], json!(0.9));
+    }
+
+    #[test]
     fn existing_billing_header_is_re_signed_without_adding_blocks() {
         let original_text =
             "x-anthropic-billing-header: cc_version=2.1; cch=abcde;\n\nYou are Claude Code.";
@@ -1046,7 +1313,7 @@ mod tests {
     #[test]
     fn anthropic_beta_for_claude_oauth_includes_oauth_marker() {
         let headers = HeaderMap::new();
-        let beta = build_anthropic_beta_value(&headers, None, true);
+        let beta = build_anthropic_beta_value(&headers, None, &[], false, true, false);
         assert_eq!(beta, "claude-code-20250219,oauth-2025-04-20");
     }
 
@@ -1060,7 +1327,7 @@ mod tests {
             ),
         );
         let body = json!({"thinking": {"type": "enabled"}});
-        let beta = build_anthropic_beta_value(&headers, Some(&body), true);
+        let beta = build_anthropic_beta_value(&headers, Some(&body), &[], false, true, false);
         assert_eq!(
             beta,
             "claude-code-20250219,oauth-2025-04-20,prompt-caching-2024-07-31,token-efficient-tools-2025-02-19,interleaved-thinking-2025-05-14"
@@ -1077,7 +1344,7 @@ mod tests {
             axum::http::HeaderValue::from_static("custom-beta"),
         );
 
-        let beta = build_anthropic_beta_value(&headers, None, false);
+        let beta = build_anthropic_beta_value(&headers, None, &[], false, false, false);
 
         assert_eq!(beta, "claude-code-20250219,custom-beta");
     }
@@ -1086,11 +1353,52 @@ mod tests {
     fn anthropic_beta_for_claude_oauth_tracks_context_management() {
         let headers = HeaderMap::new();
         let body = json!({"context_management": {"edits": []}});
-        let beta = build_anthropic_beta_value(&headers, Some(&body), true);
+        let beta = build_anthropic_beta_value(&headers, Some(&body), &[], false, true, false);
 
         assert!(beta
             .split(',')
             .any(|value| value == CONTEXT_MANAGEMENT_BETA));
+    }
+
+    #[test]
+    fn internal_beta_fields_are_removed_and_shape_betas_are_resolved() {
+        let headers = HeaderMap::new();
+        let mut body = json!({
+            "model": "claude-opus-4-6",
+            "anthropic_beta": [CONTEXT_1M_BETA, "custom-beta"],
+            "betas": [EFFORT_BETA],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "system": [{
+                "type": "text",
+                "text": "cached",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }]
+        });
+        let internal = take_internal_anthropic_betas(&mut body);
+        let beta = build_anthropic_beta_value(&headers, Some(&body), &internal, true, true, false);
+
+        assert!(body.get("anthropic_beta").is_none());
+        assert!(body.get("betas").is_none());
+        assert!(beta.contains(CONTEXT_1M_BETA));
+        assert!(beta.contains(EFFORT_BETA));
+        assert!(beta.contains(EXTENDED_CACHE_TTL_BETA));
+        assert!(!beta.contains("custom-beta"));
+    }
+
+    #[test]
+    fn context_1m_beta_requires_explicit_model_capability() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static(CONTEXT_1M_BETA),
+        );
+
+        let blocked = build_anthropic_beta_value(&headers, None, &[], false, true, false);
+        let allowed = build_anthropic_beta_value(&headers, None, &[], true, true, false);
+
+        assert!(!blocked.contains(CONTEXT_1M_BETA));
+        assert!(allowed.contains(CONTEXT_1M_BETA));
     }
 
     #[test]
@@ -1153,7 +1461,8 @@ mod tests {
         );
 
         let contract =
-            apply_forward_contract(&mut url, &mut body, &headers, "account-123", None).unwrap();
+            apply_forward_contract(&mut url, &mut body, &headers, "account-123", false, None)
+                .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         let session_id = contract.session_id.as_deref().unwrap();
 
@@ -1201,12 +1510,64 @@ mod tests {
             br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":false}"#,
         );
 
-        apply_forward_contract(&mut url, &mut body, &headers, "account-123", None).unwrap();
+        apply_forward_contract(&mut url, &mut body, &headers, "account-123", false, None).unwrap();
         let text = std::str::from_utf8(&body).unwrap();
 
         assert!(text.find("\"model\"").unwrap() < text.find("\"max_tokens\"").unwrap());
         assert!(text.find("\"max_tokens\"").unwrap() < text.find("\"messages\"").unwrap());
         assert!(text.find("\"messages\"").unwrap() < text.find("\"stream\"").unwrap());
+    }
+
+    #[test]
+    fn count_tokens_contract_filters_generation_fields_and_signs_final_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static("prompt-caching-2024-07-31,unknown-beta"),
+        );
+        let mut url = "https://api.anthropic.com/v1/messages/count_tokens".to_string();
+        let mut body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-6","max_tokens":4096,"temperature":0.2,"top_p":0.9,"top_k":40,"stream":true,"stop_sequences":["x"],"anthropic_beta":["effort-2025-11-24"],"output_config":{"effort":"high"},"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+
+        let contract = apply_count_tokens_forward_contract(
+            &mut url,
+            &mut body,
+            &headers,
+            "account-123",
+            false,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        for field in [
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "stream",
+            "stop_sequences",
+            "anthropic_beta",
+            "betas",
+            "thinking",
+            "output_config",
+            "context_management",
+            "tool_choice",
+        ] {
+            assert!(value.get(field).is_none(), "unexpected field: {field}");
+        }
+        let beta = contract
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "anthropic-beta")
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        assert!(beta.contains(TOKEN_COUNTING_BETA));
+        assert!(beta.contains("prompt-caching-2024-07-31"));
+        assert!(!beta.contains(EFFORT_BETA));
+        assert!(!beta.contains("unknown-beta"));
+
+        let signed_again = sign_claude_oauth_messages_body(value.clone());
+        assert_eq!(value, signed_again, "CCH must sign the final filtered body");
     }
 
     #[test]
@@ -1304,7 +1665,7 @@ mod tests {
                 {"name": "computer", "type": "computer_use_20250124"}
             ]
         });
-        let beta = build_anthropic_beta_value(&headers, Some(&body), true);
+        let beta = build_anthropic_beta_value(&headers, Some(&body), &[], false, true, false);
 
         assert!(beta.contains(INTERLEAVED_THINKING_BETA));
         assert!(beta.contains(FINE_GRAINED_TOOL_STREAMING_BETA));

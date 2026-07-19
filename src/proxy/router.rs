@@ -12,6 +12,7 @@ use super::ProxyError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyRoute {
     ClaudeMessages,
+    ClaudeCountTokens,
     CodexChatCompletions,
     CodexResponses,
     CodexResponsesCompact,
@@ -21,7 +22,7 @@ pub enum ProxyRoute {
 impl ProxyRoute {
     pub fn app(self) -> AppKind {
         match self {
-            Self::ClaudeMessages => AppKind::Claude,
+            Self::ClaudeMessages | Self::ClaudeCountTokens => AppKind::Claude,
             Self::CodexChatCompletions | Self::CodexResponses | Self::CodexResponsesCompact => {
                 AppKind::Codex
             }
@@ -32,6 +33,7 @@ impl ProxyRoute {
     pub fn path(self, gemini_path: Option<String>) -> String {
         match self {
             Self::ClaudeMessages => "/v1/messages".to_string(),
+            Self::ClaudeCountTokens => "/v1/messages/count_tokens".to_string(),
             Self::CodexChatCompletions => "/v1/chat/completions".to_string(),
             Self::CodexResponses => "/v1/responses".to_string(),
             Self::CodexResponsesCompact => "/v1/responses/compact".to_string(),
@@ -114,6 +116,37 @@ pub(super) fn select_provider_with_account_inflight_excluding(
             ..ProviderSelectionOptions::default()
         },
     )
+}
+
+pub(super) fn select_provider_for_claude_count_tokens(
+    store: &ProviderStore,
+    accounts: &AccountStore,
+    failover: &mut FailoverStore,
+    headers: &HeaderMap,
+    account_in_flight: &AccountInFlightSnapshot,
+    excluded_provider_ids: &BTreeSet<String>,
+) -> Result<ProviderRouteSelection, ProxyError> {
+    select_provider_with_optional_filter(
+        store,
+        accounts,
+        failover,
+        AppKind::Claude,
+        headers,
+        ProviderSelectionOptions {
+            provider_filter: Some(provider_supports_claude_count_tokens),
+            account_in_flight: Some(account_in_flight),
+            excluded_provider_ids: Some(excluded_provider_ids),
+            ..ProviderSelectionOptions::default()
+        },
+    )
+}
+
+pub(super) fn provider_supports_claude_count_tokens(provider: &StoredProvider) -> bool {
+    provider.app == AppKind::Claude
+        && matches!(
+            provider.provider_type,
+            ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth
+        )
 }
 
 pub(super) fn select_provider_for_type(
@@ -1016,5 +1049,44 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn count_tokens_selection_rejects_transform_providers() {
+        let mut unsupported = provider(AppKind::Claude, "codex-first");
+        unsupported.provider_type = ProviderType::Codex;
+        unsupported.provider_type_id = "codex".to_string();
+        let supported = claude_oauth_provider("claude-native", "acct-1", None);
+        let store = ProviderStore {
+            providers: vec![unsupported, supported],
+        };
+        let mut accounts = AccountStore::default();
+        accounts.upsert(claude_oauth_account("acct-1"));
+        let tracker = AccountInFlightTracker::default();
+        let mut failover = FailoverStore::default();
+
+        let selected = select_provider_for_claude_count_tokens(
+            &store,
+            &accounts,
+            &mut failover,
+            &HeaderMap::new(),
+            &tracker.snapshot(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(selected.provider.provider.id, "claude-native");
+
+        let mut pinned = HeaderMap::new();
+        pinned.insert("x-cc-provider-id", HeaderValue::from_static("codex-first"));
+        let error = select_provider_for_claude_count_tokens(
+            &store,
+            &accounts,
+            &mut failover,
+            &pinned,
+            &tracker.snapshot(),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
     }
 }

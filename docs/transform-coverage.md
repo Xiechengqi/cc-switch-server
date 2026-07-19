@@ -1,6 +1,6 @@
 # Transform/Streaming Coverage Tracker
 
-Date: 2026-07-13
+Date: 2026-07-19
 
 This tracker follows Phase X / X7. It records server-side test coverage against the desktop transform and streaming suites without importing desktop-only behavior.
 
@@ -52,6 +52,16 @@ This tracker follows Phase X / X7. It records server-side test coverage against 
 | Responses -> Anthropic cache creation, stream and non-stream | Covered | `responses_anthropic_usage_round_trip_preserves_cache_creation`, `stream_snapshots_convert_between_sse_formats` |
 | Anthropic -> Responses/Chat inclusive input restoration | Covered | `responses_anthropic_usage_round_trip_preserves_cache_creation`, `response_snapshots_convert_anthropic_to_openai_responses_and_chat` |
 
+## Stateful cross-protocol streaming
+
+| Area | Status | Server evidence |
+| --- | --- | --- |
+| Generic SSE framing across arbitrary network chunks | Covered | `StreamEventTransformer`, `framing_is_stable_across_every_chunk_boundary_and_crlf` |
+| Responses parallel function calls and output-index mapping | Covered | `responses_parallel_tools_preserve_packed_done_arguments` |
+| Packed `function_call_arguments.done` fallback | Covered | `responses_parallel_tools_preserve_packed_done_arguments`, `responses_done_does_not_duplicate_streamed_arguments` |
+| OpenAI Chat parallel tool lifecycle | Covered | `ChatAnthropicState` shares per-tool open/delta/stop state with the Responses bridge |
+| EOF incomplete event handling | Covered | `eof_half_json_is_a_protocol_error` plus bounded protocol-error metric labels |
+
 ## Codex v2 protocol hardening
 
 | Area | Status | Server evidence |
@@ -66,8 +76,8 @@ This tracker follows Phase X / X7. It records server-side test coverage against 
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Streaming tool-call delta reassembly, including parallel calls | Partial | Protocol-level tool-call deltas now covered in both directions; true cross-chunk reassembly still requires stateful stream buffering above the stateless adapter transform hook. |
-| SSE frame boundary slicing (half frame, multi-frame, CRLF) | Covered (Y2) | `SseLineBuffer` + DeepSeek stream fixture; adapter CRLF multi-frame test retained |
+| Streaming tool-call delta reassembly, including parallel calls | Covered | Per-request Responses/Chat lifecycle state tracks open blocks, output-index mapping, argument deltas and packed done fallback. |
+| SSE frame boundary slicing (half frame, multi-frame, CRLF) | Covered | `StreamEventTransformer` buffers every transformed protocol; `SseLineBuffer` remains for native DeepSeek parsing. |
 | Full stop/finish reason matrix across OpenAI Responses, Chat, Anthropic, Gemini streams | Partial | Non-streaming matrix plus key stream finish_reason paths covered; remaining provider-specific finish reasons can be added as fixtures. |
 | Image and file block matrix across all request directions | Partial | Responses->Chat and existing Anthropic/Gemini paths covered; expand to edge cases. |
 | Desktop-only semantics | Not applicable | MCP, Skills, desktop profile/session UI behavior remain excluded by server product boundary. |

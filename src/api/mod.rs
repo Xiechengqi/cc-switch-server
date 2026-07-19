@@ -449,6 +449,11 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/models", get(proxy_models))
         .route("/v1/messages", post(proxy_claude_messages))
         .route("/claude/v1/messages", post(proxy_claude_messages))
+        .route("/v1/messages/count_tokens", post(proxy_claude_count_tokens))
+        .route(
+            "/claude/v1/messages/count_tokens",
+            post(proxy_claude_count_tokens),
+        )
         .route("/v1/chat/completions", post(proxy_codex_chat_completions))
         .route(
             "/v1/v1/chat/completions",
@@ -835,6 +840,16 @@ async fn proxy_claude_messages(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     proxy::forward(state, ProxyRoute::ClaudeMessages, None, headers, body)
+        .await
+        .map_err(ApiError::proxy)
+}
+
+async fn proxy_claude_count_tokens(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward(state, ProxyRoute::ClaudeCountTokens, None, headers, body)
         .await
         .map_err(ApiError::proxy)
 }

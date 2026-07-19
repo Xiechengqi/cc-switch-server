@@ -43,7 +43,8 @@ use super::request_governance::{
     ResponseDecodeResult,
 };
 use super::router::{
-    account_concurrency_for_provider, select_provider, select_provider_for_codex_image_generation,
+    account_concurrency_for_provider, provider_supports_claude_count_tokens, select_provider,
+    select_provider_for_claude_count_tokens, select_provider_for_codex_image_generation,
     select_provider_with_account_inflight_excluding, ProxyRoute,
 };
 use super::streaming::{ClaudeSseErrorDetector, StreamUsageAccumulator};
@@ -149,6 +150,12 @@ async fn forward_with_attempt(
         request_context.share_id.as_deref()
     {
         let (stored, _share_name) = select_share_provider(&providers, &shares, app, share_id)?;
+        if route == ProxyRoute::ClaudeCountTokens && !provider_supports_claude_count_tokens(&stored)
+        {
+            return Err(ProxyError::bad_request(
+                "Claude count_tokens requires a native Anthropic provider",
+            ));
+        }
         let snapshot = state.account_in_flight.snapshot();
         let guard = acquire_account_in_flight(&state, &stored, &accounts_for_selection, &snapshot)?;
         (stored, guard)
@@ -160,16 +167,27 @@ async fn forward_with_attempt(
                 .try_mutate_failover_best_effort_if_changed(
                     "failover selection state",
                     |failover| {
-                        select_provider_with_account_inflight_excluding(
-                            &providers,
-                            &accounts_for_selection,
-                            failover,
-                            app,
-                            &headers,
-                            &snapshot,
-                            &attempt_context.excluded_provider_ids,
-                        )
-                        .map(|selected| {
+                        let selected = if route == ProxyRoute::ClaudeCountTokens {
+                            select_provider_for_claude_count_tokens(
+                                &providers,
+                                &accounts_for_selection,
+                                failover,
+                                &headers,
+                                &snapshot,
+                                &attempt_context.excluded_provider_ids,
+                            )
+                        } else {
+                            select_provider_with_account_inflight_excluding(
+                                &providers,
+                                &accounts_for_selection,
+                                failover,
+                                app,
+                                &headers,
+                                &snapshot,
+                                &attempt_context.excluded_provider_ids,
+                            )
+                        };
+                        selected.map(|selected| {
                             let changed = selected.failover_state_changed;
                             (selected.provider, changed)
                         })
@@ -320,14 +338,36 @@ async fn forward_with_attempt(
             replace_or_push_header(&mut target_headers, name, value);
         }
     }
+    if route == ProxyRoute::ClaudeCountTokens && stored.provider_type != ProviderType::ClaudeOAuth {
+        super::claude_oauth::normalize_count_tokens_body(&mut adapter_request.body)?;
+        adapter_request.stream_requested = false;
+        replace_or_push_header(
+            &mut target_headers,
+            "anthropic-beta",
+            "token-counting-2024-11-01".to_string(),
+        );
+    }
     if app == AppKind::Claude && stored.provider_type == ProviderType::ClaudeOAuth {
-        let contract = super::claude_oauth::apply_forward_contract(
-            &mut url,
-            &mut adapter_request.body,
-            &headers,
-            &claude_oauth_identity_seed(&stored),
-            claude_body_retry_stage,
-        )?;
+        let context_1m_requested = adapter_request_requests_claude_context_1m(&adapter_request);
+        let contract = if route == ProxyRoute::ClaudeCountTokens {
+            adapter_request.stream_requested = false;
+            super::claude_oauth::apply_count_tokens_forward_contract(
+                &mut url,
+                &mut adapter_request.body,
+                &headers,
+                &claude_oauth_identity_seed(&stored),
+                context_1m_requested,
+            )?
+        } else {
+            super::claude_oauth::apply_forward_contract(
+                &mut url,
+                &mut adapter_request.body,
+                &headers,
+                &claude_oauth_identity_seed(&stored),
+                context_1m_requested,
+                claude_body_retry_stage,
+            )?
+        };
         if request_context.session_id.is_none() {
             request_context.session_id = contract.session_id.clone();
         }
@@ -348,6 +388,13 @@ async fn forward_with_attempt(
     }
     let mut target_headers = owned_headers(target_headers);
     apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
+    if route == ProxyRoute::ClaudeCountTokens && stored.provider_type != ProviderType::ClaudeOAuth {
+        replace_or_push_owned_header(
+            &mut target_headers,
+            "anthropic-beta".to_string(),
+            "token-counting-2024-11-01".to_string(),
+        );
+    }
 
     let http_client = forward_http_client(&state, &stored).await?;
     let request = build_upstream_post_request(
@@ -402,6 +449,9 @@ async fn forward_with_attempt(
         Ok(upstream) => upstream,
         Err(error) => {
             record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            if route == ProxyRoute::ClaudeCountTokens {
+                crate::metrics::record_claude_count_tokens_outcome("network_error");
+            }
             if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
                 crate::metrics::record_claude_retry("transport", "send_error");
                 let next_attempt = attempt_context.next(
@@ -427,6 +477,30 @@ async fn forward_with_attempt(
     let mut status_code = status.as_u16();
     let mut response_headers = upstream.headers().clone();
     strip_hop_by_hop_response_headers(&mut response_headers);
+    if route == ProxyRoute::ClaudeCountTokens
+        && stored.provider_type == ProviderType::ClaudeOAuth
+        && status == StatusCode::UNAUTHORIZED
+        && attempt_context.attempt == 0
+    {
+        state
+            .refresh_managed_account_now(stored.provider_type, managed_account_id(&stored))
+            .await
+            .map_err(managed_account_refresh_error_to_proxy_error)?;
+        crate::metrics::record_claude_count_tokens_outcome("auth_refresh");
+        let next_attempt = attempt_context.next(None, None);
+        drop(upstream);
+        drop(account_in_flight_guard);
+        drop(share_invocation_guard);
+        return Box::pin(forward_with_attempt(
+            state,
+            route,
+            retry_gemini_path,
+            headers,
+            raw_body_for_retry,
+            next_attempt,
+        ))
+        .await;
+    }
     maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
     maybe_mark_grok_cooldown(&state, &stored, status, &response_headers).await;
     let mut content_type = response_headers
@@ -604,32 +678,36 @@ async fn forward_with_attempt(
         };
         let decoded = decode_response_body_for_proxy(&response_headers, bytes);
         maybe_mark_codex_rate_limited(&state, &stored, &decoded.body).await;
-        let usage = adapter.parse_usage(&decoded.body, &stored, route);
-        let share_id_for_record = request_context.share_id.clone();
-        let user_email_for_record = request_context.user_email.clone();
-        log_usage(
-            &state,
-            &stored,
-            status_code,
-            started.elapsed().as_millis(),
-            model_metadata(&adapter_request),
-            usage,
-            UsageLogContext {
-                is_streaming: adapter_request.stream_requested,
-                stream_status: adapter_request
-                    .stream_requested
-                    .then(|| "rate_limited".to_string()),
-                ..request_context
-            },
-        )
-        .await;
-        record_share_invocation_result(
-            &state,
-            share_id_for_record.as_deref(),
-            user_email_for_record.as_deref(),
-            usage,
-        )
-        .await;
+        if route == ProxyRoute::ClaudeCountTokens {
+            crate::metrics::record_claude_count_tokens_outcome("rate_limited");
+        } else {
+            let usage = adapter.parse_usage(&decoded.body, &stored, route);
+            let share_id_for_record = request_context.share_id.clone();
+            let user_email_for_record = request_context.user_email.clone();
+            log_usage(
+                &state,
+                &stored,
+                status_code,
+                started.elapsed().as_millis(),
+                model_metadata(&adapter_request),
+                usage,
+                UsageLogContext {
+                    is_streaming: adapter_request.stream_requested,
+                    stream_status: adapter_request
+                        .stream_requested
+                        .then(|| "rate_limited".to_string()),
+                    ..request_context
+                },
+            )
+            .await;
+            record_share_invocation_result(
+                &state,
+                share_id_for_record.as_deref(),
+                user_email_for_record.as_deref(),
+                usage,
+            )
+            .await;
+        }
         record_provider_outcome(
             &state,
             &stored,
@@ -798,12 +876,10 @@ async fn forward_with_attempt(
         )
         .await;
 
-        let stream_adapter = adapter;
         let stream_stored = stored.clone();
         let interrupted_update_armed = Arc::new(AtomicBool::new(true));
         let stream_state = StreamForwardState {
             inner,
-            adapter: stream_adapter,
             stored: stream_stored,
             state: state.clone(),
             route,
@@ -820,7 +896,11 @@ async fn forward_with_attempt(
                 &stored, route,
             ),
             codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher::default(),
-            custom_tool_names: adapter_request.custom_tool_names.clone(),
+            stream_transform: super::stream_transforms::StreamEventTransformer::new(
+                &stored,
+                route,
+                adapter_request.custom_tool_names.clone(),
+            ),
             timeouts,
             upstream_open_until_ms: reset_header_open_until_ms(&response_headers),
             pending_chunk,
@@ -900,15 +980,10 @@ async fn forward_with_attempt(
                         )
                         .await;
                     }
-                    let transformed = stream_state
-                        .adapter
-                        .transform_stream_event_for_request(
-                            chunk,
-                            &stream_state.stored,
-                            stream_state.route,
-                            &stream_state.custom_tool_names,
-                        )
-                        .map_err(std::io::Error::other)?;
+                    let transformed = match stream_state.stream_transform.push(chunk) {
+                        Ok(transformed) => transformed,
+                        Err(error) => return stream_state.terminate_transform_error(error).await,
+                    };
                     let transformed = stream_state
                         .codex_custom_tool_stream_patcher
                         .push(transformed);
@@ -944,21 +1019,35 @@ async fn forward_with_attempt(
                             )
                             .await;
                         }
-                        let transformed = stream_state
-                            .adapter
-                            .transform_stream_event_for_request(
-                                chunk,
-                                &stream_state.stored,
-                                stream_state.route,
-                                &stream_state.custom_tool_names,
-                            )
-                            .map_err(std::io::Error::other)?;
+                        let transformed = match stream_state.stream_transform.push(chunk) {
+                            Ok(transformed) => transformed,
+                            Err(error) => {
+                                return stream_state.terminate_transform_error(error).await
+                            }
+                        };
+                        let tail = match stream_state.stream_transform.finish() {
+                            Ok(tail) => tail,
+                            Err(error) => {
+                                return stream_state.terminate_transform_error(error).await
+                            }
+                        };
+                        let transformed = join_bytes(transformed, tail);
                         let transformed = stream_state
                             .codex_custom_tool_stream_patcher
                             .push(transformed);
                         return Ok(Some((transformed, stream_state)));
                     }
-                    let custom_tail = stream_state.codex_custom_tool_stream_patcher.finish();
+                    let transform_tail = match stream_state.stream_transform.finish() {
+                        Ok(tail) => tail,
+                        Err(error) => return stream_state.terminate_transform_error(error).await,
+                    };
+                    let transformed_tail = stream_state
+                        .codex_custom_tool_stream_patcher
+                        .push(transform_tail);
+                    let custom_tail = join_bytes(
+                        transformed_tail,
+                        stream_state.codex_custom_tool_stream_patcher.finish(),
+                    );
                     if !custom_tail.is_empty() {
                         return Ok(Some((custom_tail, stream_state)));
                     }
@@ -1055,6 +1144,9 @@ async fn forward_with_attempt(
         Ok(bytes) => bytes,
         Err(error) => {
             record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            if route == ProxyRoute::ClaudeCountTokens {
+                crate::metrics::record_claude_count_tokens_outcome("network_error");
+            }
             if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
                 crate::metrics::record_claude_retry("transport", "body_read_error");
                 let next_attempt = attempt_context.next(
@@ -1079,7 +1171,9 @@ async fn forward_with_attempt(
     let decoded = decode_response_body_for_proxy(&response_headers, bytes);
     let mut preserve_content_encoding = decoded.preserve_content_encoding;
     let mut bytes = decoded.body;
-    let next_body_retry_stage = if stored.provider_type == ProviderType::ClaudeOAuth {
+    let next_body_retry_stage = if route == ProxyRoute::ClaudeMessages
+        && stored.provider_type == ProviderType::ClaudeOAuth
+    {
         claude_non_stream_retry_stage(
             status,
             &bytes,
@@ -1112,30 +1206,38 @@ async fn forward_with_attempt(
     if version_gate_rewritten {
         preserve_content_encoding = false;
     }
-    let usage = adapter.parse_usage(&bytes, &stored, route);
+    let usage = if route == ProxyRoute::ClaudeCountTokens {
+        TokenUsage::default()
+    } else {
+        adapter.parse_usage(&bytes, &stored, route)
+    };
     let bytes = adapter.transform_response_for_request(bytes, &stored, route, &adapter_request)?;
     let share_id_for_record = request_context.share_id.clone();
-    let user_email_for_record = request_context.user_email.clone();
-    log_usage(
-        &state,
-        &stored,
-        status_code,
-        started.elapsed().as_millis(),
-        model_metadata(&adapter_request),
-        usage,
-        UsageLogContext {
-            is_streaming: false,
-            ..request_context
-        },
-    )
-    .await;
-    record_share_invocation_result(
-        &state,
-        share_id_for_record.as_deref(),
-        user_email_for_record.as_deref(),
-        usage,
-    )
-    .await;
+    if route == ProxyRoute::ClaudeCountTokens {
+        crate::metrics::record_claude_count_tokens_outcome(count_tokens_metric_outcome(status));
+    } else {
+        let user_email_for_record = request_context.user_email.clone();
+        log_usage(
+            &state,
+            &stored,
+            status_code,
+            started.elapsed().as_millis(),
+            model_metadata(&adapter_request),
+            usage,
+            UsageLogContext {
+                is_streaming: false,
+                ..request_context
+            },
+        )
+        .await;
+        record_share_invocation_result(
+            &state,
+            share_id_for_record.as_deref(),
+            user_email_for_record.as_deref(),
+            usage,
+        )
+        .await;
+    }
     record_provider_outcome(
         &state,
         &stored,
@@ -3394,15 +3496,10 @@ fn claude_body_retry_stage_for_error_message(
 }
 
 fn claude_sse_error_detector_for(
-    stored: &StoredProvider,
+    _stored: &StoredProvider,
     route: ProxyRoute,
 ) -> Option<ClaudeSseErrorDetector> {
-    (route == ProxyRoute::ClaudeMessages
-        && matches!(
-            stored.provider_type,
-            ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth
-        ))
-    .then(ClaudeSseErrorDetector::default)
+    (route == ProxyRoute::ClaudeMessages).then(ClaudeSseErrorDetector::default)
 }
 
 fn claude_sse_error_outcome(
@@ -3430,6 +3527,19 @@ fn share_usage_tokens(usage: TokenUsage) -> u64 {
             (None, None) => None,
         })
         .unwrap_or(0)
+}
+
+fn join_bytes(first: Bytes, second: Bytes) -> Bytes {
+    if first.is_empty() {
+        return second;
+    }
+    if second.is_empty() {
+        return first;
+    }
+    let mut joined = Vec::with_capacity(first.len() + second.len());
+    joined.extend_from_slice(&first);
+    joined.extend_from_slice(&second);
+    Bytes::from(joined)
 }
 
 async fn refresh_managed_account_if_needed(
@@ -3706,7 +3816,7 @@ fn apply_account_header_overrides(
             ))
         })?;
         let normalized_name = header_name.as_str();
-        if account_header_override_blocked(normalized_name) {
+        if account_header_override_blocked(normalized_name, stored.provider_type) {
             return Err(ProxyError::bad_request(format!(
                 "account {} extra header cannot override proxy-controlled header: {normalized_name}",
                 account.id
@@ -3723,9 +3833,23 @@ fn apply_account_header_overrides(
     Ok(())
 }
 
-fn account_header_override_blocked(name: &str) -> bool {
+fn account_header_override_blocked(name: &str, provider_type: ProviderType) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    if provider_type == ProviderType::ClaudeOAuth
+        && (matches!(
+            normalized.as_str(),
+            "anthropic-beta"
+                | "anthropic-version"
+                | "x-app"
+                | "sec-fetch-mode"
+                | "anthropic-dangerous-direct-browser-access"
+                | "x-claude-code-session-id"
+        ) || normalized.starts_with("x-stainless-"))
+    {
+        return true;
+    }
     matches!(
-        name.to_ascii_lowercase().as_str(),
+        normalized.as_str(),
         "authorization"
             | "proxy-authorization"
             | "host"
@@ -3848,6 +3972,23 @@ fn codex_oauth_upstream_session_id(session_id: &str) -> Option<String> {
         .unwrap_or(session_id)
         .trim();
     (!session_id.is_empty()).then(|| session_id.to_string())
+}
+
+fn adapter_request_requests_claude_context_1m(request: &adapters::AdapterRequest) -> bool {
+    let explicitly_requested = request
+        .requested_model
+        .as_deref()
+        .is_some_and(model_requests_claude_context_1m);
+    let provider_declared = request
+        .actual_model_source
+        .as_deref()
+        .is_some_and(|source| source != "request");
+    explicitly_requested && provider_declared
+}
+
+fn model_requests_claude_context_1m(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.ends_with("[1m]") || model.ends_with("-1m")
 }
 
 fn append_codex_oauth_session_headers(
@@ -4116,7 +4257,6 @@ fn response_instruction_text_for_codex(value: &Value) -> Option<String> {
 
 struct StreamForwardState {
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
-    adapter: adapters::GenericForwardingAdapter,
     stored: StoredProvider,
     state: ServerState,
     route: ProxyRoute,
@@ -4131,7 +4271,7 @@ struct StreamForwardState {
     codex_completed_output_patcher: CodexCompletedOutputPatcher,
     codex_pending_function_call_patcher: CodexPendingFunctionCallPatcher,
     codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher,
-    custom_tool_names: BTreeSet<String>,
+    stream_transform: super::stream_transforms::StreamEventTransformer,
     timeouts: StreamTimeoutConfig,
     upstream_open_until_ms: Option<u128>,
     pending_chunk: Option<Bytes>,
@@ -4156,6 +4296,48 @@ impl StreamForwardState {
         match self.next_timeout_kind() {
             StreamTimeoutKind::FirstByte => self.timeouts.first_byte,
             StreamTimeoutKind::Idle => self.timeouts.idle,
+        }
+    }
+
+    async fn terminate_transform_error(
+        mut self,
+        error: ProxyError,
+    ) -> Result<Option<(Bytes, Self)>, std::io::Error> {
+        let usage = std::mem::take(&mut self.usage).finish();
+        let status = error.status.as_u16();
+        update_stream_usage(
+            &self.state,
+            &self.stored,
+            &self.request_id,
+            status,
+            self.started.elapsed().as_millis(),
+            self.first_token_ms,
+            usage,
+            Some("transform_error"),
+        )
+        .await;
+        record_share_invocation_result(
+            &self.state,
+            self.share_id.as_deref(),
+            self.user_email.as_deref(),
+            usage,
+        )
+        .await;
+        record_provider_outcome(
+            &self.state,
+            &self.stored,
+            ProviderOutcome::Failure {
+                status_code: status,
+            },
+        )
+        .await;
+        self.interrupted_update_armed
+            .store(false, Ordering::Relaxed);
+        self.terminal_frame_sent = true;
+        let message = error.client_message().to_string();
+        match stream_terminal_error_frame(self.route, &message, status) {
+            Some(frame) => Ok(Some((frame, self))),
+            None => Err(std::io::Error::other(message)),
         }
     }
 }
@@ -4953,7 +5135,9 @@ fn request_context_from_headers(headers: &HeaderMap) -> UsageLogContext {
 
 fn session_id_from_request(route: ProxyRoute, headers: &HeaderMap, body: &[u8]) -> Option<String> {
     optional_header(headers, "x-cc-switch-session-id").or_else(|| match route {
-        ProxyRoute::ClaudeMessages => claude_session_id_from_request(headers, body),
+        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens => {
+            claude_session_id_from_request(headers, body)
+        }
         ProxyRoute::CodexChatCompletions
         | ProxyRoute::CodexResponses
         | ProxyRoute::CodexResponsesCompact => codex_oauth_session_id_from_request(headers, body),
@@ -5145,6 +5329,17 @@ fn stream_terminal_error_frame(
                 }
             })
         ))),
+        ProxyRoute::ClaudeCountTokens => None,
+    }
+}
+
+fn count_tokens_metric_outcome(status: StatusCode) -> &'static str {
+    match status {
+        status if status.is_success() => "success",
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "auth_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+        status if status.is_client_error() => "client_error",
+        _ => "upstream_error",
     }
 }
 
@@ -5277,6 +5472,57 @@ mod tests {
                 ("x-extra", "1".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn claude_oauth_account_headers_cannot_override_signed_contract() {
+        for name in [
+            "anthropic-beta",
+            "Anthropic-Version",
+            "x-app",
+            "sec-fetch-mode",
+            "anthropic-dangerous-direct-browser-access",
+            "x-claude-code-session-id",
+            "x-stainless-runtime",
+        ] {
+            assert!(account_header_override_blocked(
+                name,
+                ProviderType::ClaudeOAuth
+            ));
+        }
+        assert!(!account_header_override_blocked(
+            "x-provider-feature",
+            ProviderType::ClaudeOAuth
+        ));
+        assert!(!account_header_override_blocked(
+            "anthropic-beta",
+            ProviderType::ClaudeAuth
+        ));
+    }
+
+    #[test]
+    fn context_1m_model_suffix_is_explicit_and_case_insensitive() {
+        assert!(model_requests_claude_context_1m("Claude-Opus-4-6[1M]"));
+        assert!(model_requests_claude_context_1m("claude-sonnet-4-6-1m"));
+        assert!(!model_requests_claude_context_1m("claude-opus-4-6"));
+        assert!(!model_requests_claude_context_1m("claude-1m-preview-extra"));
+
+        let mut request = adapters::AdapterRequest {
+            body: Bytes::new(),
+            upstream_endpoint: None,
+            upstream_headers: Vec::new(),
+            model: Some("claude-opus-4-6".to_string()),
+            requested_model: Some("Claude-Opus-4-6[1M]".to_string()),
+            actual_model: Some("claude-opus-4-6".to_string()),
+            actual_model_source: Some("model_catalog".to_string()),
+            pricing_model: None,
+            stream_requested: false,
+            custom_tool_names: BTreeSet::new(),
+        };
+        assert!(adapter_request_requests_claude_context_1m(&request));
+
+        request.actual_model_source = Some("request".to_string());
+        assert!(!adapter_request_requests_claude_context_1m(&request));
     }
 
     #[test]

@@ -56,7 +56,6 @@ fn optimize_thinking(body: &mut Value) {
     if uses_adaptive_thinking(&model) {
         body["thinking"] = json!({"type": "adaptive"});
         body["output_config"] = json!({"effort": "max"});
-        append_beta(body, "context-1m-2025-08-07");
         return;
     }
 
@@ -257,11 +256,7 @@ mod tests {
             assert_eq!(body["thinking"]["type"], "adaptive");
             assert!(body["thinking"].get("budget_tokens").is_none());
             assert_eq!(body["output_config"]["effort"], "max");
-            assert!(body["anthropic_beta"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| item.as_str() == Some("context-1m-2025-08-07")));
+            assert!(body.get("anthropic_beta").is_none());
         }
     }
 

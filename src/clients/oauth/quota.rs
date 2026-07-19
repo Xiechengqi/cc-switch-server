@@ -289,15 +289,24 @@ async fn refresh_claude_quota(
         .header(USER_AGENT, claude_cli_user_agent())
         .header("x-app", "cli")
         .timeout(request_timeout);
-    let (body, plan_label, bootstrap_profile) = tokio::join!(
+    let (body, profile_lookup, bootstrap_profile) = tokio::join!(
         request_json(account.provider_type, usage_request, now_ms),
-        fetch_claude_plan_label(http, access_token, request_timeout),
+        fetch_claude_profile_lookup(http, access_token, request_timeout),
         fetch_claude_bootstrap_profile_with_timeout(http, access_token, request_timeout, now_ms,),
     );
     let body = body?;
+    let plan_label = profile_lookup
+        .as_ref()
+        .and_then(|lookup| lookup.plan_label.clone());
     let quota = parse_claude_quota(&body, plan_label, now_ms);
     let subscription_level = quota.credential_message.clone();
-    let profile = merge_profile_overlay(account.profile.as_ref(), bootstrap_profile);
+    let bootstrap_merged = merge_profile_overlay(account.profile.as_ref(), bootstrap_profile);
+    let existing = bootstrap_merged.as_ref().or(account.profile.as_ref());
+    let profile = merge_profile_overlay(
+        existing,
+        profile_lookup.and_then(|lookup| lookup.profile_overlay),
+    )
+    .or(bootstrap_merged);
     Ok(update_from_quota(
         quota,
         subscription_level,
@@ -1489,11 +1498,17 @@ fn parse_cursor_imported_quota(
     })
 }
 
-async fn fetch_claude_plan_label(
+#[derive(Debug, Clone, PartialEq)]
+struct ClaudeProfileLookup {
+    plan_label: Option<String>,
+    profile_overlay: Option<Value>,
+}
+
+async fn fetch_claude_profile_lookup(
     http: &reqwest::Client,
     access_token: &str,
     request_timeout: Duration,
-) -> Option<String> {
+) -> Option<ClaudeProfileLookup> {
     let response = http
         .get(CLAUDE_PROFILE_URL)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
@@ -1510,9 +1525,56 @@ async fn fetch_claude_plan_label(
         return None;
     }
     let body = response.json::<Value>().await.ok()?;
-    body.pointer("/organization/organization_type")
+    parse_claude_profile_lookup(&body)
+}
+
+fn parse_claude_profile_lookup(body: &Value) -> Option<ClaudeProfileLookup> {
+    let organization = body.get("organization")?.as_object()?;
+    let organization_type = organization
+        .get("organization_type")
         .and_then(Value::as_str)
-        .map(format_claude_plan_label)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let plan_label = organization_type.map(format_claude_plan_label);
+    let mut overlay = serde_json::Map::new();
+    for (target, source) in [
+        ("organizationUUID", "uuid"),
+        ("organizationName", "name"),
+        ("organizationType", "organization_type"),
+        ("organizationRateLimitTier", "rate_limit_tier"),
+    ] {
+        if let Some(value) = organization
+            .get(source)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            overlay.insert(target.to_string(), Value::String(value.to_string()));
+        }
+    }
+    if let Some(billing_source) = organization
+        .get("billing_type")
+        .and_then(Value::as_str)
+        .and_then(normalize_claude_billing_source)
+    {
+        overlay.insert("billingSource".to_string(), Value::String(billing_source));
+    }
+    (plan_label.is_some() || !overlay.is_empty()).then(|| ClaudeProfileLookup {
+        plan_label,
+        profile_overlay: (!overlay.is_empty()).then_some(Value::Object(overlay)),
+    })
+}
+
+fn normalize_claude_billing_source(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(match value.to_ascii_lowercase().as_str() {
+        "apple_subscription" => "apple_subscription".to_string(),
+        "stripe_subscription" => "stripe_subscription".to_string(),
+        _ => value.to_string(),
+    })
 }
 
 async fn fetch_chatgpt_account_lookup(
@@ -2792,6 +2854,37 @@ mod tests {
         .unwrap();
         assert_eq!(merged["providerType"], "claude_oauth");
         assert_eq!(merged["accountUUID"], "acct-1");
+    }
+
+    #[test]
+    fn claude_profile_lookup_keeps_plan_and_billing_source_independent() {
+        let lookup = parse_claude_profile_lookup(&json!({
+            "organization": {
+                "uuid": "org-1",
+                "name": "Example",
+                "organization_type": "team",
+                "rate_limit_tier": "tier-2",
+                "billing_type": "apple_subscription"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(lookup.plan_label.as_deref(), Some("team"));
+        let profile = lookup.profile_overlay.unwrap();
+        assert_eq!(profile["organizationUUID"], "org-1");
+        assert_eq!(profile["organizationName"], "Example");
+        assert_eq!(profile["billingSource"], "apple_subscription");
+        assert!(profile.get("planType").is_none());
+        assert!(profile.get("subscriptionExpiresAt").is_none());
+
+        let unknown = parse_claude_profile_lookup(&json!({
+            "organization": {"billing_type": "future_partner"}
+        }))
+        .unwrap();
+        assert_eq!(
+            unknown.profile_overlay.unwrap()["billingSource"],
+            "future_partner"
+        );
     }
 
     fn imported_account(provider_type: ProviderType, raw: Value) -> Account {

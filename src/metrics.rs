@@ -108,6 +108,30 @@ pub fn record_claude_bootstrap(result: &str) {
     .increment(1);
 }
 
+pub fn record_claude_beta_decision(decision: &'static str) {
+    metrics::counter!(
+        "cc_switch_claude_beta_decision_total",
+        "decision" => decision
+    )
+    .increment(1);
+}
+
+pub fn record_claude_count_tokens_outcome(outcome: &'static str) {
+    metrics::counter!(
+        "cc_switch_claude_count_tokens_total",
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+pub fn record_stream_transform_protocol_error(kind: &'static str) {
+    metrics::counter!(
+        "cc_switch_stream_transform_protocol_error_total",
+        "kind" => kind
+    )
+    .increment(1);
+}
+
 fn describe() {
     metrics::describe_gauge!(
         "cc_switch_account_inflight",
@@ -140,6 +164,18 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_claude_bootstrap_total",
         "Best-effort Claude CLI bootstrap enrichment results"
+    );
+    metrics::describe_counter!(
+        "cc_switch_claude_beta_decision_total",
+        "Bounded Claude beta policy decisions"
+    );
+    metrics::describe_counter!(
+        "cc_switch_claude_count_tokens_total",
+        "Claude count-tokens request outcomes"
+    );
+    metrics::describe_counter!(
+        "cc_switch_stream_transform_protocol_error_total",
+        "Bounded cross-protocol stream transform errors"
     );
 }
 

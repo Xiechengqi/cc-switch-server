@@ -145,6 +145,7 @@ pub(super) fn protocol_for_route(
             CursorResponseFormat::AnthropicMessages,
             "anthropic_messages",
         )),
+        ProxyRoute::ClaudeCountTokens => None,
         ProxyRoute::CodexChatCompletions => Some((
             InboundProtocol::OpenAiChat,
             CursorResponseFormat::OpenAiChatCompletions,

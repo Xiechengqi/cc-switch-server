@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1725,6 +1725,144 @@ async fn non_stream_proxy_timeout_records_bad_gateway() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let text = body_text(response).await;
     assert!(text.contains("proxy upstream request failed"));
+}
+
+#[tokio::test]
+async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+    let captured_for_handler = Arc::clone(&captured);
+    let upstream = Router::new().route(
+        "/v1/messages/count_tokens",
+        post(move |headers: HeaderMap, body: Bytes| {
+            let captured = Arc::clone(&captured_for_handler);
+            async move {
+                let body = serde_json::from_slice::<Value>(&body).unwrap();
+                *captured.lock().unwrap() = Some((headers, body));
+                if captured
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|(_, body)| body["model"] == "rate-limit-model")
+                {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({"type": "error", "error": {"type": "rate_limit_error"}})),
+                    )
+                } else {
+                    (StatusCode::OK, Json(json!({"input_tokens": 37})))
+                }
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = test_state();
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "claude-count-oauth".to_string(),
+            name: "Claude Count OAuth".to_string(),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": format!("http://{upstream_addr}"),
+                    "ANTHROPIC_AUTH_TOKEN": "oauth-test-token"
+                }
+            }),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("claude_oauth".to_string()),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+
+    let response = app_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/claude/v1/messages/count_tokens")
+                .header("x-cc-provider-id", "claude-count-oauth")
+                .header("anthropic-beta", "prompt-caching-2024-07-31,unknown-beta")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 4096,
+                        "temperature": 0.2,
+                        "top_p": 0.9,
+                        "stream": true,
+                        "output_config": {"effort": "high"},
+                        "anthropic_beta": ["effort-2025-11-24"],
+                        "messages": [{"role": "user", "content": "count me"}]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["input_tokens"], 37);
+    let (headers, body) = captured.lock().unwrap().take().unwrap();
+    let beta = headers
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    assert!(beta.contains("token-counting-2024-11-01"));
+    assert!(beta.contains("prompt-caching-2024-07-31"));
+    assert!(!beta.contains("unknown-beta"));
+    assert!(!beta.contains("effort-2025-11-24"));
+    for field in [
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "stream",
+        "output_config",
+        "anthropic_beta",
+    ] {
+        assert!(body.get(field).is_none(), "unexpected field: {field}");
+    }
+    assert!(body["system"][0]["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("cch=")));
+    assert!(state
+        .usage_snapshot()
+        .await
+        .logs
+        .iter()
+        .all(|log| log.provider_id != "claude-count-oauth"));
+
+    let response = app_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("x-cc-provider-id", "claude-count-oauth")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"rate-limit-model","messages":[{"role":"user","content":"count me"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(state
+        .usage_snapshot()
+        .await
+        .logs
+        .iter()
+        .all(|log| log.provider_id != "claude-count-oauth"));
 }
 
 #[tokio::test]

@@ -14,6 +14,7 @@ const serverFiles = [
   "src/proxy/transforms.rs",
   "src/proxy/streaming.rs",
   "src/proxy/adapters.rs",
+  "src/proxy/stream_transforms.rs",
 ];
 
 const targetRatio = Number(process.env.CC_SWITCH_TRANSFORM_COVERAGE_TARGET || 0.85);

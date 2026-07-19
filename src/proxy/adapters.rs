@@ -826,7 +826,7 @@ fn header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UpstreamFormat {
+pub(super) enum UpstreamFormat {
     AnthropicMessages,
     OpenAiResponses,
     OpenAiChat,
@@ -1064,7 +1064,7 @@ fn transform_stream_event_for_downstream(
     }
 }
 
-fn transform_stream_value(
+pub(super) fn transform_stream_value(
     upstream_format: UpstreamFormat,
     downstream_format: UpstreamFormat,
     value: &Value,
@@ -1135,7 +1135,7 @@ fn stream_json_payload(line: &str) -> Option<&str> {
     line.starts_with('{').then_some(line)
 }
 
-fn encode_stream_frames(frames: &[transforms::StreamFrame]) -> String {
+pub(super) fn encode_stream_frames(frames: &[transforms::StreamFrame]) -> String {
     let mut output = String::new();
     for frame in frames {
         if let Some(event) = frame.event {
@@ -1168,7 +1168,7 @@ fn looks_like_error_response(value: &Value) -> bool {
         || value.get("errorMessage").is_some()
 }
 
-fn upstream_format_for_route(
+pub(super) fn upstream_format_for_route(
     stored: &StoredProvider,
     route: Option<ProxyRoute>,
     body: &[u8],
@@ -1275,9 +1275,11 @@ fn explicit_upstream_format(stored: &StoredProvider) -> Option<ExplicitUpstreamF
     }
 }
 
-fn downstream_format_for_route(route: ProxyRoute) -> UpstreamFormat {
+pub(super) fn downstream_format_for_route(route: ProxyRoute) -> UpstreamFormat {
     match route {
-        ProxyRoute::ClaudeMessages => UpstreamFormat::AnthropicMessages,
+        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens => {
+            UpstreamFormat::AnthropicMessages
+        }
         ProxyRoute::CodexResponses | ProxyRoute::CodexResponsesCompact => {
             UpstreamFormat::OpenAiResponses
         }
@@ -3074,6 +3076,11 @@ fn wildcard_model_match(pattern: &str, value: &str) -> bool {
 fn route_aliases(route: ProxyRoute) -> &'static [&'static str] {
     match route {
         ProxyRoute::ClaudeMessages => &["claude_messages", "messages", "/v1/messages"],
+        ProxyRoute::ClaudeCountTokens => &[
+            "claude_count_tokens",
+            "count_tokens",
+            "/v1/messages/count_tokens",
+        ],
         ProxyRoute::CodexChatCompletions => &[
             "codex_chat_completions",
             "chat_completions",
@@ -4701,6 +4708,39 @@ mod tests {
             expected_model: Some("claude-sonnet-4"),
             expected_stream: true,
         });
+    }
+
+    #[test]
+    fn codex_chat_to_anthropic_uses_direct_request_bridge() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::Claude,
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.example",
+                    "ANTHROPIC_API_KEY": "secret"
+                }
+            }),
+        );
+        let request = adapter_for(AppKind::Codex, ProviderType::Claude)
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br#"{"model":"claude-sonnet-4-6","messages":[{"role":"system","content":"policy"},{"role":"user","content":"hello"}],"max_tokens":64}"#,
+                ),
+                &stored,
+                ProxyRoute::CodexChatCompletions,
+                None,
+            )
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(body["system"], json!("policy"));
+        assert_eq!(body["messages"][0]["role"], json!("user"));
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{"type": "text", "text": "hello"}])
+        );
+        assert!(body.get("input").is_none());
     }
 
     #[test]

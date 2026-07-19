@@ -16,6 +16,7 @@ pub(crate) mod kiro;
 mod request_governance;
 mod responses_wire;
 mod router;
+mod stream_transforms;
 mod streaming;
 mod thinking;
 mod transforms;
