@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Context;
+use chrono::{Datelike, TimeZone, Utc, Weekday};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,12 +13,99 @@ use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, share_expires_at_rfc3339, ShareAppAccess,
-    ShareAppSettings, ShareSettingsPatch,
+    ShareAppSettings, ShareSettingsPatch, ShareTokenPeriod, ShareUserGrant, ShareUserPolicy,
+    ShareUserUsage, ShareUserUsageBucket,
 };
 use crate::domain::usage::store::UsageStore;
 use crate::infra::time::now_ms;
 
 const SHARES_FILE_NAME: &str = "shares.json";
+
+impl ShareUserUsage {
+    pub fn tokens_for(&self, period: ShareTokenPeriod, now_ms: i64) -> u64 {
+        match period {
+            ShareTokenPeriod::Lifetime => self.lifetime.tokens_used,
+            ShareTokenPeriod::Day => current_bucket_tokens(&self.day, utc_day_start_ms(now_ms)),
+            ShareTokenPeriod::Week => current_bucket_tokens(&self.week, utc_week_start_ms(now_ms)),
+            ShareTokenPeriod::CalendarMonth => {
+                current_bucket_tokens(&self.calendar_month, utc_calendar_month_start_ms(now_ms))
+            }
+        }
+    }
+
+    fn record(&mut self, tokens: u64, now_ms: i64) {
+        record_bucket(&mut self.lifetime, 0, tokens);
+        record_bucket(&mut self.day, utc_day_start_ms(now_ms), tokens);
+        record_bucket(&mut self.week, utc_week_start_ms(now_ms), tokens);
+        record_bucket(
+            &mut self.calendar_month,
+            utc_calendar_month_start_ms(now_ms),
+            tokens,
+        );
+    }
+}
+
+fn current_bucket_tokens(bucket: &ShareUserUsageBucket, expected_start_ms: i64) -> u64 {
+    if bucket.started_at_ms == expected_start_ms {
+        bucket.tokens_used
+    } else {
+        0
+    }
+}
+
+fn record_bucket(bucket: &mut ShareUserUsageBucket, start_ms: i64, tokens: u64) {
+    if bucket.started_at_ms != start_ms {
+        *bucket = ShareUserUsageBucket {
+            started_at_ms: start_ms,
+            ..ShareUserUsageBucket::default()
+        };
+    }
+    bucket.tokens_used = bucket.tokens_used.saturating_add(tokens);
+    bucket.requests_count = bucket.requests_count.saturating_add(1);
+}
+
+fn utc_datetime(now_ms: i64) -> chrono::DateTime<Utc> {
+    Utc.timestamp_millis_opt(now_ms)
+        .single()
+        .unwrap_or_else(Utc::now)
+}
+
+fn utc_day_start_ms(now_ms: i64) -> i64 {
+    utc_datetime(now_ms)
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("UTC midnight is valid")
+        .and_utc()
+        .timestamp_millis()
+}
+
+fn utc_week_start_ms(now_ms: i64) -> i64 {
+    let now = utc_datetime(now_ms);
+    let days = match now.weekday() {
+        Weekday::Mon => 0,
+        Weekday::Tue => 1,
+        Weekday::Wed => 2,
+        Weekday::Thu => 3,
+        Weekday::Fri => 4,
+        Weekday::Sat => 5,
+        Weekday::Sun => 6,
+    };
+    (now.date_naive() - chrono::Duration::days(days))
+        .and_hms_opt(0, 0, 0)
+        .expect("UTC week boundary is valid")
+        .and_utc()
+        .timestamp_millis()
+}
+
+fn utc_calendar_month_start_ms(now_ms: i64) -> i64 {
+    let now = utc_datetime(now_ms);
+    chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+        .expect("UTC month boundary is valid")
+        .and_hms_opt(0, 0, 0)
+        .expect("UTC month midnight is valid")
+        .and_utc()
+        .timestamp_millis()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -149,6 +237,8 @@ pub struct Share {
     pub config_revision: u64,
     #[serde(default)]
     pub router_synced_revision: u64,
+    #[serde(default)]
+    pub user_grants: BTreeMap<String, ShareUserGrant>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -235,6 +325,8 @@ pub struct UpsertShareInput {
     pub runtime_snapshot: Option<Value>,
     #[serde(default)]
     pub market_grant: Option<ShareMarketGrantStatus>,
+    #[serde(default)]
+    pub user_grants: BTreeMap<String, ShareUserGrant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +422,7 @@ impl ShareStore {
                     existing.last_error.clone(),
                     existing.config_revision,
                     existing.router_synced_revision,
+                    existing.user_grants.clone(),
                 )
             });
 
@@ -345,12 +438,26 @@ impl ShareStore {
             last_error,
             config_revision,
             router_synced_revision,
-        ) = preserved.unwrap_or((0, 0, Vec::new(), 0, None, None, None, None, 0, 0));
+            preserved_user_grants,
+        ) = preserved.unwrap_or((
+            0,
+            0,
+            Vec::new(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            BTreeMap::new(),
+        ));
         let created_at_ms = if created_at_ms > 0 {
             created_at_ms
         } else {
             crate::infra::time::now_ms()
         };
+        let explicit_user_grants = (!input.user_grants.is_empty()).then_some(input.user_grants);
 
         let share = Share {
             id: share_id,
@@ -393,9 +500,18 @@ impl ShareStore {
             router_url,
             config_revision: config_revision.saturating_add(1).max(1),
             router_synced_revision,
+            user_grants: preserved_user_grants.clone(),
         };
 
         let mut share = share;
+        if let Some(user_grants) = explicit_user_grants.as_ref() {
+            share.user_grants = normalize_user_grants(
+                user_grants,
+                &preserved_user_grants,
+                share.owner_email.as_deref(),
+            )?;
+        }
+        reconcile_user_grants(&mut share, explicit_user_grants.as_ref());
         share.router_last_sync_error = None;
 
         self.cancel_pending_router_delete(&share.id);
@@ -578,6 +694,11 @@ impl ShareStore {
         let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
         share.tokens_used = 0;
         share.requests_count = 0;
+        let reset_at = now_ms();
+        for grant in share.user_grants.values_mut() {
+            grant.usage = ShareUserUsage::default();
+            grant.updated_at_ms = reset_at;
+        }
         if share.status == "exhausted" {
             share.status = "paused".to_string();
             share.enabled = false;
@@ -597,6 +718,7 @@ impl ShareStore {
     pub fn validate_for_invocation(
         &mut self,
         share_id: &str,
+        user_email: Option<&str>,
         now_ms: i64,
     ) -> Result<ShareInvocation, ShareInvocationRejection> {
         let Some(share) = self.shares.iter_mut().find(|item| item.id == share_id) else {
@@ -647,6 +769,37 @@ impl ShareStore {
             });
         }
 
+        let normalized_user_email = user_email
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let user_grant = normalized_user_email
+            .as_deref()
+            .and_then(|email| share.user_grants.get(email))
+            .filter(|grant| grant.active);
+        if let Some(grant) = user_grant {
+            if grant
+                .policy
+                .expires_at
+                .is_some_and(|expires_at| share_expired(expires_at, now_ms))
+            {
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::UserExpired,
+                    message: "This user's Share access has expired.".to_string(),
+                    status_changed: false,
+                });
+            }
+            if grant.policy.token_limit.is_some_and(|limit| {
+                grant.usage.tokens_for(grant.policy.token_period, now_ms) >= limit
+            }) {
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::UserExhausted,
+                    message: "This user's Share token quota has been exhausted.".to_string(),
+                    status_changed: false,
+                });
+            }
+        }
+
         Ok(ShareInvocation {
             share_id: share.id.clone(),
             share_name: share
@@ -654,10 +807,22 @@ impl ShareStore {
                 .clone()
                 .unwrap_or_else(|| share.id.clone()),
             parallel_limit: share.parallel_limit,
+            user_email: normalized_user_email,
+            user_parallel_limit: user_grant.and_then(|grant| grant.policy.parallel_limit),
         })
     }
 
     pub fn record_invocation_result(&mut self, share_id: &str, tokens: u64) -> Option<Share> {
+        self.record_user_invocation_result(share_id, None, tokens, now_ms() as i64)
+    }
+
+    pub fn record_user_invocation_result(
+        &mut self,
+        share_id: &str,
+        user_email: Option<&str>,
+        tokens: u64,
+        recorded_at_ms: i64,
+    ) -> Option<Share> {
         let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
         share.requests_count = share.requests_count.saturating_add(1);
         share.tokens_used = share.tokens_used.saturating_add(tokens);
@@ -667,6 +832,16 @@ impl ShareStore {
         {
             share.status = "exhausted".to_string();
             share.enabled = false;
+        }
+        if let Some(email) = user_email
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+        {
+            if let Some(grant) = share.user_grants.get_mut(&email) {
+                grant.usage.record(tokens, recorded_at_ms);
+                grant.updated_at_ms = now_ms();
+            }
         }
         if let Some(snapshot) = share.runtime_snapshot.as_mut() {
             if let Some(object) = snapshot.as_object_mut() {
@@ -767,11 +942,25 @@ impl ShareStore {
         let mut updated = Vec::new();
         for share in &mut self.shares {
             if bind_share_to_client_owner(share, &owner_email) {
+                reconcile_user_grants(share, None);
                 mark_share_config_pending(share);
                 updated.push(share.clone());
             }
         }
         Ok(updated)
+    }
+
+    pub fn migrate_user_grants_from_acl(&mut self) -> Vec<Share> {
+        let mut updated = Vec::new();
+        for share in &mut self.shares {
+            let previous = share.user_grants.clone();
+            reconcile_user_grants(share, None);
+            if share.user_grants != previous {
+                mark_share_config_pending(share);
+                updated.push(share.clone());
+            }
+        }
+        updated
     }
 
     fn sync_owner_email_snapshot(share: &mut Share, owner_email: &str) {
@@ -938,9 +1127,19 @@ impl ShareStore {
         if let Some(expires_at) = patch.expires_at {
             share.expires_at = parse_share_expiration(&expires_at)?;
         }
+        let explicit_user_grants = patch.user_grants;
+        if let Some(user_grants) = explicit_user_grants.as_ref() {
+            share.user_grants = normalize_user_grants(
+                user_grants,
+                &share.user_grants,
+                share.owner_email.as_deref(),
+            )?;
+        }
         if let Some(auto_start) = patch.auto_start {
             share.auto_start = auto_start;
         }
+
+        reconcile_user_grants(&mut share, explicit_user_grants.as_ref());
 
         let pricing_eligible = share.for_sale
             && !share.free_access
@@ -1105,6 +1304,35 @@ impl ShareStore {
         self.shares.clone()
     }
 
+    pub fn refresh_runtime_snapshots_for_providers(
+        &mut self,
+        provider_keys: &BTreeSet<(AppKind, String)>,
+        providers: &ProviderStore,
+        accounts: Option<&AccountStore>,
+        usage: &UsageStore,
+    ) -> Vec<String> {
+        let mut updated_ids = Vec::new();
+        for share in &mut self.shares {
+            let uses_provider = if share.bindings.is_empty() {
+                provider_keys.contains(&(share.app, share.provider_id.clone()))
+            } else {
+                share.bindings.iter().any(|binding| {
+                    provider_keys.contains(&(binding.app, binding.provider_id.clone()))
+                })
+            };
+            if !uses_provider {
+                continue;
+            }
+
+            share.runtime_snapshot = Some(runtime_snapshot_for_share(
+                share, providers, accounts, usage,
+            ));
+            mark_share_config_pending(share);
+            updated_ids.push(share.id.clone());
+        }
+        updated_ids
+    }
+
     pub fn mark_router_sync(
         &mut self,
         share_id: &str,
@@ -1221,6 +1449,8 @@ pub struct ShareInvocation {
     pub share_id: String,
     pub share_name: String,
     pub parallel_limit: Option<u32>,
+    pub user_email: Option<String>,
+    pub user_parallel_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1243,6 +1473,9 @@ pub enum ShareRejectReason {
     Expired,
     Exhausted,
     ParallelLimit,
+    UserExpired,
+    UserExhausted,
+    UserParallelLimit,
 }
 
 impl ShareRejectReason {
@@ -1253,6 +1486,9 @@ impl ShareRejectReason {
             Self::Expired => "Expired",
             Self::Exhausted => "Exhausted",
             Self::ParallelLimit => "ParallelLimit",
+            Self::UserExpired => "UserExpired",
+            Self::UserExhausted => "UserExhausted",
+            Self::UserParallelLimit => "UserParallelLimit",
         }
     }
 }
@@ -1440,6 +1676,253 @@ fn normalize_verified_email(email: &str) -> Result<String, SharePatchError> {
     Ok(email)
 }
 
+fn default_user_policy(share: &Share) -> ShareUserPolicy {
+    ShareUserPolicy {
+        parallel_limit: share.parallel_limit,
+        token_limit: share.token_limit,
+        token_period: ShareTokenPeriod::Lifetime,
+        expires_at: share.expires_at,
+    }
+}
+
+fn new_user_grant(share: &Share, email: String, role: &str) -> ShareUserGrant {
+    let now = now_ms();
+    ShareUserGrant {
+        email,
+        role: role.to_string(),
+        active: true,
+        policy: default_user_policy(share),
+        usage: Default::default(),
+        created_at_ms: now,
+        updated_at_ms: now,
+        revoked_at_ms: None,
+        revision: 1,
+    }
+}
+
+fn normalize_user_grants(
+    incoming: &BTreeMap<String, ShareUserGrant>,
+    existing: &BTreeMap<String, ShareUserGrant>,
+    owner_email: Option<&str>,
+) -> Result<BTreeMap<String, ShareUserGrant>, SharePatchError> {
+    let now = now_ms();
+    let owner = owner_email.map(|value| value.trim().to_ascii_lowercase());
+    let mut normalized = existing.clone();
+    for grant in normalized.values_mut() {
+        if grant.role != "owner" && grant.active {
+            grant.active = false;
+            grant.revoked_at_ms = Some(now);
+            grant.updated_at_ms = now;
+            grant.revision = grant.revision.saturating_add(1).max(1);
+        }
+    }
+
+    for (key, incoming_grant) in incoming {
+        let email = normalize_verified_email(if incoming_grant.email.trim().is_empty() {
+            key
+        } else {
+            &incoming_grant.email
+        })?;
+        if owner.as_deref() == Some(email.as_str()) && incoming_grant.role != "owner" {
+            return Err(SharePatchError::Invalid(
+                "share owner cannot also be a ShareTo user".to_string(),
+            ));
+        }
+        if incoming_grant.policy.parallel_limit == Some(0)
+            || incoming_grant.policy.token_limit == Some(0)
+        {
+            return Err(SharePatchError::Invalid(
+                "user limits must be positive or unlimited".to_string(),
+            ));
+        }
+        let previous = existing.get(&email);
+        let mut grant = incoming_grant.clone();
+        grant.email = email.clone();
+        grant.role = if owner.as_deref() == Some(email.as_str()) {
+            "owner".to_string()
+        } else {
+            "shareto".to_string()
+        };
+        grant.active = true;
+        grant.usage = previous.map(|item| item.usage.clone()).unwrap_or_default();
+        grant.created_at_ms = previous
+            .map(|item| item.created_at_ms)
+            .filter(|value| *value > 0)
+            .unwrap_or(now);
+        grant.updated_at_ms = now;
+        grant.revoked_at_ms = None;
+        grant.revision = previous
+            .map(|item| item.revision.saturating_add(1))
+            .unwrap_or(1)
+            .max(1);
+        normalized.insert(email, grant);
+    }
+    Ok(normalized)
+}
+
+fn reconcile_user_grants(
+    share: &mut Share,
+    explicit_user_grants: Option<&BTreeMap<String, ShareUserGrant>>,
+) {
+    let policy_template = default_user_policy(share);
+    let owner = share
+        .owner_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    if let Some(owner) = owner.as_ref() {
+        let now = now_ms();
+        let grant = share
+            .user_grants
+            .entry(owner.clone())
+            .or_insert_with(|| ShareUserGrant {
+                email: owner.clone(),
+                role: "owner".to_string(),
+                active: true,
+                policy: policy_template.clone(),
+                usage: Default::default(),
+                created_at_ms: now_ms(),
+                updated_at_ms: now_ms(),
+                revoked_at_ms: None,
+                revision: 1,
+            });
+        if grant.email != *owner
+            || grant.role != "owner"
+            || !grant.active
+            || grant.revoked_at_ms.is_some()
+        {
+            grant.updated_at_ms = now;
+            grant.revision = grant.revision.saturating_add(1).max(1);
+        }
+        grant.email = owner.clone();
+        grant.role = "owner".to_string();
+        grant.active = true;
+        grant.revoked_at_ms = None;
+
+        for (email, grant) in &mut share.user_grants {
+            if email != owner && grant.role == "owner" {
+                grant.role = "shareto".to_string();
+                grant.updated_at_ms = now;
+                grant.revision = grant.revision.saturating_add(1).max(1);
+            }
+        }
+    }
+
+    if explicit_user_grants.is_none() {
+        let desired_emails = share_acl_emails(share);
+        let now = now_ms();
+        for email in &desired_emails {
+            if let Some(grant) = share.user_grants.get_mut(email) {
+                if grant.role == "shareto" && !grant.active {
+                    grant.active = true;
+                    grant.revoked_at_ms = None;
+                    grant.updated_at_ms = now;
+                    grant.revision = grant.revision.saturating_add(1).max(1);
+                }
+            } else {
+                share.user_grants.insert(
+                    email.clone(),
+                    new_user_grant(share, email.clone(), "shareto"),
+                );
+            }
+        }
+        for grant in share
+            .user_grants
+            .values_mut()
+            .filter(|grant| grant.role == "shareto" && grant.active)
+        {
+            if !desired_emails.contains(&grant.email) {
+                grant.active = false;
+                grant.revoked_at_ms = Some(now);
+                grant.updated_at_ms = now;
+                grant.revision = grant.revision.saturating_add(1).max(1);
+            }
+        }
+    } else {
+        let previous_direct = share
+            .user_grants
+            .values()
+            .filter(|grant| grant.role == "shareto")
+            .map(|grant| grant.email.clone())
+            .collect::<BTreeSet<_>>();
+        share
+            .acl
+            .shared_with_emails
+            .retain(|email| !previous_direct.contains(&email.trim().to_ascii_lowercase()));
+        for access in share.access_by_app.values_mut() {
+            access
+                .shared_with_emails
+                .retain(|email| !previous_direct.contains(&email.trim().to_ascii_lowercase()));
+        }
+        for settings in share.app_settings.values_mut() {
+            settings
+                .shared_with_emails
+                .retain(|email| !previous_direct.contains(&email.trim().to_ascii_lowercase()));
+        }
+        for grant in share
+            .user_grants
+            .values()
+            .filter(|grant| grant.active && grant.role == "shareto")
+        {
+            insert_email(&mut share.acl.shared_with_emails, grant.email.clone());
+            for access in share.access_by_app.values_mut() {
+                insert_email(&mut access.shared_with_emails, grant.email.clone());
+            }
+            for settings in share.app_settings.values_mut() {
+                insert_email(&mut settings.shared_with_emails, grant.email.clone());
+            }
+        }
+        let desired_emails = share_acl_emails(share);
+        for email in desired_emails {
+            if share
+                .user_grants
+                .get(&email)
+                .is_some_and(|grant| grant.active)
+            {
+                continue;
+            }
+            if let Some(grant) = share.user_grants.get_mut(&email) {
+                grant.active = true;
+                grant.revoked_at_ms = None;
+                grant.updated_at_ms = now_ms();
+                grant.revision = grant.revision.saturating_add(1).max(1);
+            } else {
+                share
+                    .user_grants
+                    .insert(email.clone(), new_user_grant(share, email, "shareto"));
+            }
+        }
+    }
+}
+
+fn share_acl_emails(share: &Share) -> BTreeSet<String> {
+    let owner = share
+        .owner_email
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+    share
+        .acl
+        .shared_with_emails
+        .iter()
+        .chain(
+            share
+                .access_by_app
+                .values()
+                .flat_map(|access| access.shared_with_emails.iter()),
+        )
+        .chain(
+            share
+                .app_settings
+                .values()
+                .flat_map(|settings| settings.shared_with_emails.iter()),
+        )
+        .map(|email| email.trim().to_ascii_lowercase())
+        .filter(|email| !email.is_empty() && owner.as_deref() != Some(email.as_str()))
+        .collect()
+}
+
 pub fn normalize_share_subdomain(subdomain: &str) -> Result<String, &'static str> {
     let value = subdomain.trim().to_ascii_lowercase();
     crate::domain::router::ShareSlug::parse(&value)
@@ -1523,6 +2006,31 @@ mod tests {
         )
         .unwrap();
         assert!(tombstone.has_legacy_router_target());
+    }
+
+    #[test]
+    fn account_metadata_refresh_follows_effective_share_bindings() {
+        let mut input = codex_share_input("share-multi-app");
+        input.provider_id = "codex-managed".to_string();
+        input.provider_type = ProviderType::CodexOAuth;
+        input.bindings = vec![ShareBinding {
+            app: AppKind::Codex,
+            provider_id: "codex-managed".to_string(),
+            provider_type: ProviderType::CodexOAuth,
+        }];
+        let mut store = ShareStore::default();
+        let original = store.upsert(input).unwrap();
+        let provider_keys = BTreeSet::from([(AppKind::Codex, "codex-managed".to_string())]);
+
+        let updated = store.refresh_runtime_snapshots_for_providers(
+            &provider_keys,
+            &ProviderStore::default(),
+            None,
+            &UsageStore::default(),
+        );
+
+        assert_eq!(updated, vec!["share-multi-app"]);
+        assert!(store.get("share-multi-app").unwrap().config_revision > original.config_revision);
     }
 
     #[test]
@@ -1611,6 +2119,7 @@ mod tests {
             bindings: Vec::new(),
             runtime_snapshot: None,
             market_grant: None,
+            user_grants: BTreeMap::new(),
         }
     }
 
@@ -1629,6 +2138,240 @@ mod tests {
             },
         );
         app_settings
+    }
+
+    fn test_timestamp_ms(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
+        Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .expect("valid UTC test timestamp")
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn new_owner_and_shareto_grants_snapshot_total_share_limits() {
+        let expires_at = test_timestamp_ms(2030, 1, 1, 0, 0);
+        let mut input = codex_share_input("grant-defaults");
+        input.token_limit = Some(50_000);
+        input.parallel_limit = Some(7);
+        input.expires_at = Some(expires_at);
+        input.acl = Some(ShareAcl {
+            shared_with_emails: vec!["User@Example.com".to_string()],
+            ..ShareAcl::default()
+        });
+
+        let share = ShareStore::default().upsert(input).unwrap();
+        let expected = ShareUserPolicy {
+            parallel_limit: Some(7),
+            token_limit: Some(50_000),
+            token_period: ShareTokenPeriod::Lifetime,
+            expires_at: Some(expires_at),
+        };
+
+        assert_eq!(share.user_grants["owner@example.com"].policy, expected);
+        assert_eq!(share.user_grants["user@example.com"].policy, expected);
+        assert_eq!(share.user_grants["owner@example.com"].role, "owner");
+        assert_eq!(share.user_grants["user@example.com"].role, "shareto");
+    }
+
+    #[test]
+    fn user_usage_uses_utc_day_week_and_calendar_month_boundaries() {
+        let sunday = test_timestamp_ms(2026, 7, 19, 23, 59);
+        let monday = test_timestamp_ms(2026, 7, 20, 0, 0);
+        let january_end = test_timestamp_ms(2027, 1, 31, 23, 59);
+        let february = test_timestamp_ms(2027, 2, 1, 0, 0);
+        let mut usage = ShareUserUsage::default();
+
+        usage.record(11, sunday);
+        assert_eq!(usage.tokens_for(ShareTokenPeriod::Lifetime, monday), 11);
+        assert_eq!(usage.tokens_for(ShareTokenPeriod::Day, sunday), 11);
+        assert_eq!(usage.tokens_for(ShareTokenPeriod::Day, monday), 0);
+        assert_eq!(usage.tokens_for(ShareTokenPeriod::Week, sunday), 11);
+        assert_eq!(usage.tokens_for(ShareTokenPeriod::Week, monday), 0);
+
+        usage.record(13, january_end);
+        assert_eq!(
+            usage.tokens_for(ShareTokenPeriod::CalendarMonth, january_end),
+            13
+        );
+        assert_eq!(
+            usage.tokens_for(ShareTokenPeriod::CalendarMonth, february),
+            0
+        );
+        assert_eq!(usage.tokens_for(ShareTokenPeriod::Lifetime, february), 24);
+    }
+
+    #[test]
+    fn user_quota_isolated_from_other_users_and_total_quota_remains_authoritative() {
+        let now = test_timestamp_ms(2026, 7, 19, 12, 0);
+        let mut input = codex_share_input("user-quota");
+        input.token_limit = Some(100);
+        input.acl = Some(ShareAcl {
+            shared_with_emails: vec![
+                "alice@example.com".to_string(),
+                "bob@example.com".to_string(),
+            ],
+            ..ShareAcl::default()
+        });
+        let mut store = ShareStore::default();
+        store.upsert(input).unwrap();
+        store
+            .shares
+            .first_mut()
+            .unwrap()
+            .user_grants
+            .get_mut("alice@example.com")
+            .unwrap()
+            .policy = ShareUserPolicy {
+            token_limit: Some(5),
+            token_period: ShareTokenPeriod::Day,
+            ..ShareUserPolicy::default()
+        };
+
+        store.record_user_invocation_result("user-quota", Some("alice@example.com"), 5, now);
+        assert_eq!(
+            store
+                .validate_for_invocation("user-quota", Some("alice@example.com"), now)
+                .unwrap_err()
+                .reason,
+            ShareRejectReason::UserExhausted
+        );
+        assert!(store
+            .validate_for_invocation("user-quota", Some("bob@example.com"), now)
+            .is_ok());
+        assert_eq!(store.get("user-quota").unwrap().status, "active");
+
+        let reset = store.reset_usage("user-quota").unwrap();
+        assert_eq!(
+            reset.user_grants["alice@example.com"]
+                .usage
+                .tokens_for(ShareTokenPeriod::Lifetime, now),
+            0
+        );
+        assert!(store
+            .validate_for_invocation("user-quota", Some("alice@example.com"), now)
+            .is_ok());
+
+        store.record_user_invocation_result("user-quota", Some("bob@example.com"), 95, now);
+        store.record_user_invocation_result("user-quota", Some("alice@example.com"), 5, now);
+        let rejection = store
+            .validate_for_invocation("user-quota", Some("bob@example.com"), now)
+            .unwrap_err();
+        assert_eq!(rejection.reason, ShareRejectReason::Inactive);
+        assert_eq!(store.get("user-quota").unwrap().status, "exhausted");
+    }
+
+    #[test]
+    fn app_scoped_acl_grants_revoke_and_restore_policy_history() {
+        let now = test_timestamp_ms(2026, 7, 19, 12, 0);
+        let mut store = ShareStore::default();
+        store.upsert(codex_share_input("market-user")).unwrap();
+
+        let added = store
+            .apply_settings_patch(
+                "market-user",
+                ShareSettingsPatch {
+                    app_settings: Some(codex_app_settings(vec!["buyer@example.com"])),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(added.user_grants["buyer@example.com"].active);
+        store.record_user_invocation_result("market-user", Some("buyer@example.com"), 17, now);
+
+        let revoked = store
+            .apply_settings_patch(
+                "market-user",
+                ShareSettingsPatch {
+                    app_settings: Some(codex_app_settings(Vec::new())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(!revoked.user_grants["buyer@example.com"].active);
+        assert_eq!(
+            revoked.user_grants["buyer@example.com"]
+                .usage
+                .tokens_for(ShareTokenPeriod::Lifetime, now),
+            17
+        );
+
+        let restored = store
+            .apply_settings_patch(
+                "market-user",
+                ShareSettingsPatch {
+                    app_settings: Some(codex_app_settings(vec!["buyer@example.com"])),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(restored.user_grants["buyer@example.com"].active);
+        assert_eq!(
+            restored.user_grants["buyer@example.com"]
+                .usage
+                .tokens_for(ShareTokenPeriod::Lifetime, now),
+            17
+        );
+    }
+
+    #[test]
+    fn invocation_completion_records_usage_after_grant_is_revoked() {
+        let now = test_timestamp_ms(2026, 7, 19, 12, 0);
+        let mut input = codex_share_input("revoked-inflight-user");
+        input.acl = Some(ShareAcl {
+            shared_with_emails: vec!["user@example.com".to_string()],
+            ..ShareAcl::default()
+        });
+        let mut store = ShareStore::default();
+        store.upsert(input).unwrap();
+        store
+            .apply_settings_patch(
+                "revoked-inflight-user",
+                ShareSettingsPatch {
+                    shared_with_emails: Some(Vec::new()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+
+        store.record_user_invocation_result(
+            "revoked-inflight-user",
+            Some("user@example.com"),
+            23,
+            now,
+        );
+
+        let grant = &store.get("revoked-inflight-user").unwrap().user_grants["user@example.com"];
+        assert!(!grant.active);
+        assert_eq!(grant.usage.tokens_for(ShareTokenPeriod::Lifetime, now), 23);
+    }
+
+    #[test]
+    fn explicit_user_policies_fill_new_acl_users_with_default_policy() {
+        let mut store = ShareStore::default();
+        let share = store
+            .upsert(codex_share_input("explicit-market-user"))
+            .unwrap();
+        let owner_grant = share.user_grants["owner@example.com"].clone();
+
+        let updated = store
+            .apply_settings_patch(
+                "explicit-market-user",
+                ShareSettingsPatch {
+                    app_settings: Some(codex_app_settings(vec!["buyer@example.com"])),
+                    user_grants: Some(BTreeMap::from([(
+                        "owner@example.com".to_string(),
+                        owner_grant,
+                    )])),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+
+        assert!(updated.user_grants["buyer@example.com"].active);
+        assert_eq!(
+            updated.user_grants["buyer@example.com"].policy,
+            default_user_policy(&updated)
+        );
     }
 
     #[test]
@@ -1778,6 +2521,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 
@@ -1814,7 +2558,7 @@ mod tests {
         let _ = store.upsert(codex_share_input("expired")).unwrap();
         store.shares[0].expires_at = Some(999);
         let rejection = store
-            .validate_for_invocation("expired", 1_000_000)
+            .validate_for_invocation("expired", None, 1_000_000)
             .unwrap_err();
         assert_eq!(rejection.reason, ShareRejectReason::Expired);
         assert_eq!(
@@ -1829,7 +2573,7 @@ mod tests {
         let _ = store.upsert(paused).unwrap();
         store.pause("paused").unwrap();
         let rejection = store
-            .validate_for_invocation("paused", 1_000_000)
+            .validate_for_invocation("paused", None, 1_000_000)
             .unwrap_err();
         assert_eq!(rejection.reason, ShareRejectReason::Inactive);
         assert!(rejection.formatted_message().contains("[Inactive]"));
@@ -1847,7 +2591,7 @@ mod tests {
             limited.tokens_used = 10;
         }
         let rejection = store
-            .validate_for_invocation("limited", 1_000_000)
+            .validate_for_invocation("limited", None, 1_000_000)
             .unwrap_err();
         assert_eq!(rejection.reason, ShareRejectReason::Exhausted);
         assert_eq!(
@@ -1914,6 +2658,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 
@@ -1954,6 +2699,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 
@@ -2028,6 +2774,7 @@ mod tests {
             router_url: None,
             config_revision: 0,
             router_synced_revision: 0,
+            user_grants: BTreeMap::new(),
         };
         assert_eq!(store.import_shares(vec![share]), 1);
         let updated = store
@@ -2081,6 +2828,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 
@@ -2163,6 +2911,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: Some(json!({"shareId": "s1"})),
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
         let stored = store
@@ -2269,6 +3018,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 
@@ -2345,6 +3095,7 @@ mod tests {
                     last_error: None,
                     updated_at_ms: Some(123),
                 }),
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 
@@ -2434,6 +3185,7 @@ mod tests {
                     last_error: None,
                     updated_at_ms: Some(100),
                 }),
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 
@@ -2678,6 +3430,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 
@@ -2732,10 +3485,101 @@ mod tests {
             .shared_with_emails
             .iter()
             .any(|email| email == "previous@example.com"));
+        assert_eq!(
+            share
+                .user_grants
+                .values()
+                .filter(|grant| grant.role == "owner")
+                .count(),
+            1
+        );
+        assert_eq!(share.user_grants["client@example.com"].role, "owner");
+        let previous_owner = &share.user_grants["previous@example.com"];
+        assert_eq!(previous_owner.role, "shareto");
+        assert!(previous_owner.active);
+        let revision = share.config_revision;
         assert!(store
             .bind_all_to_client_owner("client@example.com")
             .unwrap()
             .is_empty());
+        assert!(store.migrate_user_grants_from_acl().is_empty());
+        assert_eq!(store.get("owner-bind").unwrap().config_revision, revision);
+    }
+
+    #[test]
+    fn old_share_json_migrates_user_grants_once_and_marks_router_sync_pending() {
+        let expires_at = test_timestamp_ms(2030, 1, 1, 0, 0);
+        let mut input = codex_share_input("legacy-user-grants");
+        input.token_limit = Some(50_000);
+        input.parallel_limit = Some(7);
+        input.expires_at = Some(expires_at);
+        input.acl = Some(ShareAcl {
+            shared_with_emails: vec!["user@example.com".to_string()],
+            ..ShareAcl::default()
+        });
+        let mut store = ShareStore::default();
+        store.upsert(input).unwrap();
+        let mut value = serde_json::to_value(store).unwrap();
+        value["shares"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("userGrants");
+        let mut loaded: ShareStore = serde_json::from_value(value).unwrap();
+        let previous_revision = loaded.shares[0].config_revision;
+
+        let migrated = loaded.migrate_user_grants_from_acl();
+
+        assert_eq!(migrated.len(), 1);
+        let share = loaded.get("legacy-user-grants").unwrap();
+        assert_eq!(share.config_revision, previous_revision + 1);
+        assert_eq!(share.router_synced_revision, 0);
+        let expected = ShareUserPolicy {
+            parallel_limit: Some(7),
+            token_limit: Some(50_000),
+            token_period: ShareTokenPeriod::Lifetime,
+            expires_at: Some(expires_at),
+        };
+        assert_eq!(share.user_grants["owner@example.com"].policy, expected);
+        assert_eq!(share.user_grants["user@example.com"].policy, expected);
+        assert!(loaded.migrate_user_grants_from_acl().is_empty());
+        assert_eq!(
+            loaded.get("legacy-user-grants").unwrap().config_revision,
+            previous_revision + 1
+        );
+    }
+
+    #[test]
+    fn grant_migration_repairs_stale_owner_role_without_rebinding_owner() {
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("stale-owner-role");
+        input.owner_email = Some("previous@example.com".to_string());
+        store.upsert(input).unwrap();
+
+        let share = store.shares.first_mut().unwrap();
+        share.owner_email = Some("client@example.com".to_string());
+        insert_email(
+            &mut share.acl.shared_with_emails,
+            "previous@example.com".to_string(),
+        );
+        let previous_revision = share.config_revision;
+
+        let migrated = store.migrate_user_grants_from_acl();
+
+        assert_eq!(migrated.len(), 1);
+        let share = store.get("stale-owner-role").unwrap();
+        assert_eq!(share.config_revision, previous_revision + 1);
+        assert_eq!(
+            share
+                .user_grants
+                .values()
+                .filter(|grant| grant.role == "owner")
+                .count(),
+            1
+        );
+        assert_eq!(share.user_grants["client@example.com"].role, "owner");
+        assert_eq!(share.user_grants["previous@example.com"].role, "shareto");
+        assert!(share.user_grants["previous@example.com"].active);
+        assert!(store.migrate_user_grants_from_acl().is_empty());
     }
 
     #[test]
@@ -2857,6 +3701,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 

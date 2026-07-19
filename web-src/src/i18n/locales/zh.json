@@ -460,7 +460,20 @@
       "quotaSettingsSummary": "间隔 {{interval}} 分钟 · 超时 {{timeout}} 秒",
       "quotaSettingsSaved": "OAuth 用量刷新设置已保存",
       "copilotDescription": "管理 GitHub Copilot 账号",
-      "codexOauthDescription": "管理 ChatGPT 账号"
+      "codexOauthDescription": "管理 ChatGPT 账号",
+      "subscriptionExpiry": {
+        "title": "订阅账号到期时间",
+        "notSet": "未设置",
+        "notAvailable": "暂未获取",
+        "automatic": "自动获取",
+        "manual": "手动设置",
+        "save": "保存到期时间",
+        "clear": "清除到期时间",
+        "saved": "订阅账号到期时间已保存",
+        "cleared": "订阅账号到期时间已清除",
+        "saveFailed": "保存订阅账号到期时间失败：{{error}}",
+        "unknownError": "未知错误"
+      }
     },
     "serverSecurity": {
       "changePasswordTitle": "密码修改",

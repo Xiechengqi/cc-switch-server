@@ -480,6 +480,8 @@ mod tests {
                 quota_refreshed_at: None,
                 quota_next_refresh_at: None,
                 expires_at: None,
+                manual_subscription_expires_at_ms: None,
+                manual_subscription_expiry_updated_at_ms: None,
                 rate_limited_until: None,
                 last_refresh_error: None,
                 refresh_consecutive_failures: 0,
@@ -684,6 +686,7 @@ mod tests {
             router_url: None,
             config_revision: 0,
             router_synced_revision: 0,
+            user_grants: BTreeMap::new(),
         }
     }
 

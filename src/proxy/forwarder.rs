@@ -131,7 +131,12 @@ async fn forward_with_attempt(
     let provider_failover_allowed =
         request_context.share_id.is_none() && !headers.contains_key("x-cc-provider-id");
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-        let (share_name, guard) = validate_and_acquire_share_invocation(&state, &share_id).await?;
+        let (share_name, guard) = validate_and_acquire_share_invocation(
+            &state,
+            &share_id,
+            request_context.user_email.as_deref(),
+        )
+        .await?;
         request_context.share_name = Some(share_name);
         Some(guard)
     } else {
@@ -601,6 +606,7 @@ async fn forward_with_attempt(
         maybe_mark_codex_rate_limited(&state, &stored, &decoded.body).await;
         let usage = adapter.parse_usage(&decoded.body, &stored, route);
         let share_id_for_record = request_context.share_id.clone();
+        let user_email_for_record = request_context.user_email.clone();
         log_usage(
             &state,
             &stored,
@@ -617,7 +623,13 @@ async fn forward_with_attempt(
             },
         )
         .await;
-        record_share_invocation_result(&state, share_id_for_record.as_deref(), usage).await;
+        record_share_invocation_result(
+            &state,
+            share_id_for_record.as_deref(),
+            user_email_for_record.as_deref(),
+            usage,
+        )
+        .await;
         record_provider_outcome(
             &state,
             &stored,
@@ -798,6 +810,7 @@ async fn forward_with_attempt(
             request_id,
             status_code,
             share_id: request_context.share_id.clone(),
+            user_email: request_context.user_email.clone(),
             started,
             first_token_ms: None,
             received_any_chunk: false,
@@ -964,6 +977,7 @@ async fn forward_with_attempt(
                     record_share_invocation_result(
                         &stream_state.state,
                         stream_state.share_id.as_deref(),
+                        stream_state.user_email.as_deref(),
                         usage,
                     )
                     .await;
@@ -1001,6 +1015,7 @@ async fn forward_with_attempt(
                     record_share_invocation_result(
                         &stream_state.state,
                         stream_state.share_id.as_deref(),
+                        stream_state.user_email.as_deref(),
                         usage,
                     )
                     .await;
@@ -1100,6 +1115,7 @@ async fn forward_with_attempt(
     let usage = adapter.parse_usage(&bytes, &stored, route);
     let bytes = adapter.transform_response_for_request(bytes, &stored, route, &adapter_request)?;
     let share_id_for_record = request_context.share_id.clone();
+    let user_email_for_record = request_context.user_email.clone();
     log_usage(
         &state,
         &stored,
@@ -1113,7 +1129,13 @@ async fn forward_with_attempt(
         },
     )
     .await;
-    record_share_invocation_result(&state, share_id_for_record.as_deref(), usage).await;
+    record_share_invocation_result(
+        &state,
+        share_id_for_record.as_deref(),
+        user_email_for_record.as_deref(),
+        usage,
+    )
+    .await;
     record_provider_outcome(
         &state,
         &stored,
@@ -1146,7 +1168,12 @@ pub async fn forward_codex_responses_ws(
     let app = route.app();
     let mut request_context = request_context_from_headers(&headers);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-        let (share_name, guard) = validate_and_acquire_share_invocation(&state, &share_id).await?;
+        let (share_name, guard) = validate_and_acquire_share_invocation(
+            &state,
+            &share_id,
+            request_context.user_email.as_deref(),
+        )
+        .await?;
         request_context.share_name = Some(share_name);
         Some(guard)
     } else {
@@ -1229,6 +1256,7 @@ pub async fn forward_codex_responses_ws(
         ResponsesWebsocketMode::Codex
     };
     let share_id = request_context.share_id.clone();
+    let user_email = request_context.user_email.clone();
     let state_for_share = state.clone();
     let response = ws.on_upgrade(move |socket| async move {
         let _share_invocation_guard = share_invocation_guard;
@@ -1247,6 +1275,7 @@ pub async fn forward_codex_responses_ws(
         record_share_invocation_result(
             &state_for_share,
             share_id.as_deref(),
+            user_email.as_deref(),
             TokenUsage::default(),
         )
         .await;
@@ -1274,7 +1303,12 @@ pub async fn forward_grok_media(
     let body = decode_request_body_for_proxy(&headers, body)?;
     let mut request_context = request_context_from_headers(&headers);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-        let (share_name, guard) = validate_and_acquire_share_invocation(&state, &share_id).await?;
+        let (share_name, guard) = validate_and_acquire_share_invocation(
+            &state,
+            &share_id,
+            request_context.user_email.as_deref(),
+        )
+        .await?;
         request_context.share_name = Some(share_name);
         Some(guard)
     } else {
@@ -1326,6 +1360,7 @@ pub async fn forward_grok_media(
         headers,
         body,
         request_context.share_id,
+        request_context.user_email,
         share_invocation_guard,
     )
     .await
@@ -1339,7 +1374,12 @@ pub async fn forward_images_generations(
     let body = decode_request_body_for_proxy(&headers, body)?;
     let mut request_context = request_context_from_headers(&headers);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-        let (share_name, guard) = validate_and_acquire_share_invocation(&state, &share_id).await?;
+        let (share_name, guard) = validate_and_acquire_share_invocation(
+            &state,
+            &share_id,
+            request_context.user_email.as_deref(),
+        )
+        .await?;
         request_context.share_name = Some(share_name);
         Some(guard)
     } else {
@@ -1380,18 +1420,19 @@ pub async fn forward_images_generations(
                 headers,
                 body,
                 request_context.share_id,
+                request_context.user_email,
                 share_invocation_guard,
             )
             .await
         }
         ProviderType::CodexOAuth => {
-            drop(share_invocation_guard);
             forward_codex_images_generations(
                 state,
                 stored,
                 headers,
                 body,
-                request_context.share_id.is_some(),
+                request_context,
+                share_invocation_guard,
             )
             .await
         }
@@ -1409,6 +1450,7 @@ async fn forward_grok_media_with_stored(
     headers: HeaderMap,
     body: Bytes,
     share_id: Option<String>,
+    user_email: Option<String>,
     _share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
     refresh_managed_account_if_needed(&state, AppKind::Codex, &stored).await?;
@@ -1494,7 +1536,13 @@ async fn forward_grok_media_with_stored(
         provider_outcome_from_status_and_headers(status_code, &response_headers),
     )
     .await;
-    record_share_invocation_result(&state, share_id.as_deref(), TokenUsage::default()).await;
+    record_share_invocation_result(
+        &state,
+        share_id.as_deref(),
+        user_email.as_deref(),
+        TokenUsage::default(),
+    )
+    .await;
     let mut response = Response::new(Body::from(response_body));
     *response.status_mut() = status;
     if let Some(content_type) = content_type {
@@ -1522,10 +1570,16 @@ async fn forward_codex_images_generations(
     stored: StoredProvider,
     headers: HeaderMap,
     body: Bytes,
-    share_request: bool,
+    request_context: UsageLogContext,
+    _share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
     refresh_managed_account_if_needed(&state, AppKind::Codex, &stored).await?;
-    validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers, share_request)?;
+    validate_codex_allowed_client(
+        &stored,
+        ProxyRoute::CodexResponses,
+        &headers,
+        request_context.share_id.is_some(),
+    )?;
     let prepared = codex_images_generation_request(&body)?;
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
@@ -1594,6 +1648,13 @@ async fn forward_codex_images_generations(
     )
     .await;
     if !status.is_success() {
+        record_share_invocation_result(
+            &state,
+            request_context.share_id.as_deref(),
+            request_context.user_email.as_deref(),
+            TokenUsage::default(),
+        )
+        .await;
         let mut response = Response::new(Body::from(decoded.body));
         *response.status_mut() = status;
         if let Some(content_type) = content_type {
@@ -1630,8 +1691,15 @@ async fn forward_codex_images_generations(
         UsageLogContext {
             is_streaming: prepared.stream,
             stream_status: Some("completed".to_string()),
-            ..request_context_from_headers(&headers)
+            ..request_context.clone()
         },
+    )
+    .await;
+    record_share_invocation_result(
+        &state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        TokenUsage::default(),
     )
     .await;
     let mut response = Response::new(Body::from(image_response.body));
@@ -2414,6 +2482,7 @@ async fn forward_claude_deepseek(
         )
         .await;
         let share_id = request_context.share_id.clone();
+        let user_email = request_context.user_email.clone();
         let sse_stream = deepseek::deepseek_bytes_stream_to_claude_sse(
             upstream.bytes_stream(),
             response_model,
@@ -2421,14 +2490,25 @@ async fn forward_claude_deepseek(
         );
         let stream = async_stream::stream! {
             let _share_invocation_guard = share_invocation_guard;
-            let mut usage = StreamUsageAccumulator::default();
+            let mut interrupt_guard = ShareStreamInterruptGuard {
+                armed: true,
+                state: state.clone(),
+                stored: stored.clone(),
+                request_id: request_id.clone(),
+                status_code,
+                share_id: share_id.clone(),
+                user_email: user_email.clone(),
+                started,
+                first_token_ms: None,
+                usage: StreamUsageAccumulator::default(),
+            };
             let mut first_token_ms = None;
             tokio::pin!(sse_stream);
             while let Some(chunk) = sse_stream.next().await {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        let usage = usage.finish();
+                        let usage = std::mem::take(&mut interrupt_guard.usage).finish();
                         update_stream_usage(
                             &state,
                             &stored,
@@ -2440,19 +2520,26 @@ async fn forward_claude_deepseek(
                             Some("upstream_error"),
                         )
                         .await;
-                        record_share_invocation_result(&state, share_id.as_deref(), usage).await;
+                        record_share_invocation_result(
+                            &state,
+                            share_id.as_deref(),
+                            user_email.as_deref(),
+                            usage,
+                        ).await;
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                        interrupt_guard.disarm();
                         yield Err::<Bytes, std::io::Error>(error);
                         return;
                     }
                 };
-                usage.push(&chunk);
+                interrupt_guard.usage.push(&chunk);
                 if first_token_ms.is_none() && !chunk.is_empty() {
                     first_token_ms = Some(started.elapsed().as_millis());
+                    interrupt_guard.first_token_ms = first_token_ms;
                 }
                 yield Ok::<Bytes, std::io::Error>(chunk);
             }
-            let usage = usage.finish();
+            let usage = std::mem::take(&mut interrupt_guard.usage).finish();
             update_stream_usage(
                 &state,
                 &stored,
@@ -2464,8 +2551,14 @@ async fn forward_claude_deepseek(
                 Some("completed"),
             )
             .await;
-            record_share_invocation_result(&state, share_id.as_deref(), usage).await;
+            record_share_invocation_result(
+                &state,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                usage,
+            ).await;
             record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
+            interrupt_guard.disarm();
         };
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = StatusCode::OK;
@@ -2482,6 +2575,13 @@ async fn forward_claude_deepseek(
         deepseek::claude_message_json(&text, &response_model, input_tokens, output_tokens);
     let bytes =
         serde_json::to_vec(&message).map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+    let usage = TokenUsage {
+        input_tokens: Some(u64::from(input_tokens)),
+        output_tokens: Some(u64::from(output_tokens)),
+        ..Default::default()
+    };
+    let share_id_for_record = request_context.share_id.clone();
+    let user_email_for_record = request_context.user_email.clone();
     log_usage(
         &state,
         &stored,
@@ -2493,12 +2593,15 @@ async fn forward_claude_deepseek(
             actual_model: Some(deepseek_model),
             ..Default::default()
         },
-        TokenUsage {
-            input_tokens: Some(u64::from(input_tokens)),
-            output_tokens: Some(u64::from(output_tokens)),
-            ..Default::default()
-        },
+        usage,
         request_context,
+    )
+    .await;
+    record_share_invocation_result(
+        &state,
+        share_id_for_record.as_deref(),
+        user_email_for_record.as_deref(),
+        usage,
     )
     .await;
     record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
@@ -2692,6 +2795,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         .map(Bytes::from)
         .map_err(ProxyError::bad_gateway)?;
     let share_id_for_record = request_context.share_id.clone();
+    let user_email_for_record = request_context.user_email.clone();
     log_usage(
         &state,
         &stored,
@@ -2705,7 +2809,13 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         },
     )
     .await;
-    record_share_invocation_result(&state, share_id_for_record.as_deref(), usage).await;
+    record_share_invocation_result(
+        &state,
+        share_id_for_record.as_deref(),
+        user_email_for_record.as_deref(),
+        usage,
+    )
+    .await;
     record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
 
     let mut response = Response::new(Body::from(response_bytes));
@@ -2762,6 +2872,7 @@ async fn forward_claude_kiro_stream(
     )
     .await;
     let share_id = request_context.share_id.clone();
+    let user_email = request_context.user_email.clone();
     let stream = kiro::kiro_event_stream_to_claude_sse(
         upstream.bytes_stream(),
         model,
@@ -2770,24 +2881,25 @@ async fn forward_claude_kiro_stream(
     );
     let stream = async_stream::stream! {
         let _share_invocation_guard = share_invocation_guard;
-        let mut interrupt_guard = KiroStreamInterruptGuard {
+        let mut interrupt_guard = ShareStreamInterruptGuard {
             armed: true,
             state: state.clone(),
             stored: stored.clone(),
             request_id: request_id.clone(),
             status_code,
             share_id: share_id.clone(),
+            user_email: user_email.clone(),
             started,
             first_token_ms: None,
+            usage: StreamUsageAccumulator::default(),
         };
-        let mut usage = StreamUsageAccumulator::default();
         let mut first_token_ms = None;
         tokio::pin!(stream);
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    let usage = usage.finish();
+                    let usage = std::mem::take(&mut interrupt_guard.usage).finish();
                     update_stream_usage(
                         &state,
                         &stored,
@@ -2799,14 +2911,19 @@ async fn forward_claude_kiro_stream(
                         Some("upstream_error"),
                     )
                     .await;
-                    record_share_invocation_result(&state, share_id.as_deref(), usage).await;
+                    record_share_invocation_result(
+                        &state,
+                        share_id.as_deref(),
+                        user_email.as_deref(),
+                        usage,
+                    ).await;
                     record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
                     interrupt_guard.disarm();
                     yield Err::<Bytes, std::io::Error>(error);
                     return;
                 }
             };
-            usage.push(&chunk);
+            interrupt_guard.usage.push(&chunk);
             if first_token_ms.is_none() && !chunk.is_empty() {
                 let elapsed = started.elapsed().as_millis();
                 first_token_ms = Some(elapsed);
@@ -2825,7 +2942,7 @@ async fn forward_claude_kiro_stream(
             }
             yield Ok::<Bytes, std::io::Error>(chunk);
         }
-        let usage = usage.finish();
+        let usage = std::mem::take(&mut interrupt_guard.usage).finish();
         update_stream_usage(
             &state,
             &stored,
@@ -2837,7 +2954,12 @@ async fn forward_claude_kiro_stream(
             Some("completed"),
         )
         .await;
-        record_share_invocation_result(&state, share_id.as_deref(), usage).await;
+        record_share_invocation_result(
+            &state,
+            share_id.as_deref(),
+            user_email.as_deref(),
+            usage,
+        ).await;
         record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
         interrupt_guard.disarm();
     };
@@ -2849,24 +2971,26 @@ async fn forward_claude_kiro_stream(
     Ok(response)
 }
 
-struct KiroStreamInterruptGuard {
+struct ShareStreamInterruptGuard {
     armed: bool,
     state: ServerState,
     stored: StoredProvider,
     request_id: String,
     status_code: u16,
     share_id: Option<String>,
+    user_email: Option<String>,
     started: Instant,
     first_token_ms: Option<u128>,
+    usage: StreamUsageAccumulator,
 }
 
-impl KiroStreamInterruptGuard {
+impl ShareStreamInterruptGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for KiroStreamInterruptGuard {
+impl Drop for ShareStreamInterruptGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -2876,6 +3000,8 @@ impl Drop for KiroStreamInterruptGuard {
         let request_id = self.request_id.clone();
         let status_code = self.status_code;
         let share_id = self.share_id.clone();
+        let user_email = self.user_email.clone();
+        let usage = std::mem::take(&mut self.usage).finish();
         let duration_ms = self.started.elapsed().as_millis();
         let first_token_ms = self.first_token_ms;
         tokio::spawn(async move {
@@ -2886,11 +3012,17 @@ impl Drop for KiroStreamInterruptGuard {
                 status_code,
                 duration_ms,
                 first_token_ms,
-                Default::default(),
+                usage,
                 Some("interrupted"),
             )
             .await;
-            record_share_invocation_result(&state, share_id.as_deref(), Default::default()).await;
+            record_share_invocation_result(
+                &state,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                usage,
+            )
+            .await;
             record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
         });
     }
@@ -2968,9 +3100,10 @@ fn account_concurrency_proxy_error(stored: &StoredProvider) -> ProxyError {
 async fn validate_and_acquire_share_invocation(
     state: &ServerState,
     share_id: &str,
+    user_email: Option<&str>,
 ) -> Result<(String, ShareInFlightGuard), ProxyError> {
     let validation = state
-        .validate_share_invocation(share_id, crate::infra::time::now_ms() as i64)
+        .validate_share_invocation(share_id, user_email, crate::infra::time::now_ms() as i64)
         .await;
 
     let invocation = match validation {
@@ -2980,10 +3113,22 @@ async fn validate_and_acquire_share_invocation(
 
     let guard = state
         .share_in_flight
-        .try_acquire(&invocation.share_id, invocation.parallel_limit)
-        .ok_or_else(|| {
+        .try_acquire_for_user(
+            &invocation.share_id,
+            invocation.parallel_limit,
+            invocation.user_email.as_deref(),
+            invocation.user_parallel_limit,
+        )
+        .map_err(|limit| {
             share_rejection_to_proxy_error(ShareInvocationRejection {
-                reason: ShareRejectReason::ParallelLimit,
+                reason: match limit {
+                    crate::state::ShareInFlightAcquireError::ShareLimit => {
+                        ShareRejectReason::ParallelLimit
+                    }
+                    crate::state::ShareInFlightAcquireError::UserLimit => {
+                        ShareRejectReason::UserParallelLimit
+                    }
+                },
                 message:
                     "Share parallel limit has been reached. Wait for an in-flight request to finish."
                         .to_string(),
@@ -2996,10 +3141,14 @@ async fn validate_and_acquire_share_invocation(
 fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyError {
     let status = match rejection.reason {
         ShareRejectReason::NotFound => StatusCode::NOT_FOUND,
-        ShareRejectReason::ParallelLimit => StatusCode::TOO_MANY_REQUESTS,
-        ShareRejectReason::Inactive | ShareRejectReason::Expired | ShareRejectReason::Exhausted => {
-            StatusCode::FORBIDDEN
+        ShareRejectReason::ParallelLimit | ShareRejectReason::UserParallelLimit => {
+            StatusCode::TOO_MANY_REQUESTS
         }
+        ShareRejectReason::Inactive
+        | ShareRejectReason::Expired
+        | ShareRejectReason::Exhausted
+        | ShareRejectReason::UserExpired
+        | ShareRejectReason::UserExhausted => StatusCode::FORBIDDEN,
     };
     ProxyError {
         status,
@@ -3010,6 +3159,7 @@ fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyE
 pub(super) async fn record_share_invocation_result(
     state: &ServerState,
     share_id: Option<&str>,
+    user_email: Option<&str>,
     usage: TokenUsage,
 ) {
     let Some(share_id) = share_id else {
@@ -3017,7 +3167,12 @@ pub(super) async fn record_share_invocation_result(
     };
     state
         .mutate_shares_debounced(|shares| {
-            shares.record_invocation_result(share_id, share_usage_tokens(usage));
+            shares.record_user_invocation_result(
+                share_id,
+                user_email,
+                share_usage_tokens(usage),
+                crate::infra::time::now_ms() as i64,
+            );
         })
         .await;
 }
@@ -3968,6 +4123,7 @@ struct StreamForwardState {
     request_id: String,
     status_code: u16,
     share_id: Option<String>,
+    user_email: Option<String>,
     started: Instant,
     first_token_ms: Option<u128>,
     received_any_chunk: bool,
@@ -4637,6 +4793,8 @@ impl Drop for StreamForwardState {
         let request_id = self.request_id.clone();
         let status_code = self.status_code;
         let share_id = self.share_id.clone();
+        let user_email = self.user_email.clone();
+        let usage = std::mem::take(&mut self.usage).finish();
         let duration_ms = self.started.elapsed().as_millis();
         let first_token_ms = self.first_token_ms;
         tokio::spawn(async move {
@@ -4647,11 +4805,17 @@ impl Drop for StreamForwardState {
                 status_code,
                 duration_ms,
                 first_token_ms,
-                Default::default(),
+                usage,
                 Some("interrupted"),
             )
             .await;
-            record_share_invocation_result(&state, share_id.as_deref(), Default::default()).await;
+            record_share_invocation_result(
+                &state,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                usage,
+            )
+            .await;
             record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
         });
     }

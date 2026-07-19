@@ -262,6 +262,7 @@ mod tests {
                         }],
                         runtime_snapshot: None,
                         market_grant: None,
+                        user_grants: BTreeMap::new(),
                     })
                     .unwrap()
             })

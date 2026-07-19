@@ -456,7 +456,20 @@
       "quotaSettingsSummary": "Interval {{interval}} min · timeout {{timeout}} sec",
       "quotaSettingsSaved": "OAuth usage refresh settings saved",
       "copilotDescription": "Manage GitHub Copilot accounts",
-      "codexOauthDescription": "Manage ChatGPT accounts"
+      "codexOauthDescription": "Manage ChatGPT accounts",
+      "subscriptionExpiry": {
+        "title": "Subscription account expiry",
+        "notSet": "Not set",
+        "notAvailable": "Not available yet",
+        "automatic": "Automatic",
+        "manual": "Manual",
+        "save": "Save expiry",
+        "clear": "Clear expiry",
+        "saved": "Subscription account expiry saved",
+        "cleared": "Subscription account expiry cleared",
+        "saveFailed": "Failed to save subscription account expiry: {{error}}",
+        "unknownError": "Unknown error"
+      }
     },
     "serverSecurity": {
       "changePasswordTitle": "Change Password",
@@ -3062,7 +3075,7 @@
     "id": "ID",
     "tokenLimit": "Token Limit",
     "parallelLimit": "Max Concurrency",
-      "parallelLimitHint": "Claude / Codex / Gemini share this concurrency cap, or set unlimited.",
+    "parallelLimitHint": "Claude / Codex / Gemini share this concurrency cap, or set unlimited.",
     "unlimited": "Unlimited",
     "saveTokenLimit": "Save Limit",
     "saveParallelLimit": "Save Concurrency",

@@ -20,6 +20,35 @@ export type ShareAccessByApp = Partial<
 
 export type ShareSaleMarketKind = "token" | "share";
 
+export type ShareTokenPeriod = "lifetime" | "day" | "week" | "calendarMonth";
+
+export type ShareUserPolicy = {
+  parallelLimit?: number;
+  tokenLimit?: number;
+  tokenPeriod: ShareTokenPeriod;
+  expiresAt?: number;
+};
+
+export type ShareUserUsageBucket = {
+  startedAtMs: number;
+  tokensUsed: number;
+  requestsCount: number;
+};
+
+export type ShareUserGrant = {
+  email: string;
+  role: "owner" | "shareto";
+  active: boolean;
+  policy: ShareUserPolicy;
+  usage?: Partial<Record<ShareTokenPeriod, ShareUserUsageBucket>>;
+  createdAtMs?: number;
+  updatedAtMs?: number;
+  revokedAtMs?: number;
+  revision?: number;
+};
+
+export type ShareUserGrantMap = Record<string, ShareUserGrant>;
+
 export type ShareAppSettings = {
   forSale: "Yes" | "No" | "Free";
   saleMarketKind: ShareSaleMarketKind;
@@ -65,6 +94,7 @@ export interface ShareRecord {
   configRevision: number;
   routerSyncedRevision: number;
   routerLastSyncError?: string | null;
+  userGrants: ShareUserGrantMap;
 }
 
 export interface CreateShareParams {
@@ -81,6 +111,7 @@ export interface CreateShareParams {
   marketAccessMode?: "selected" | "all";
   accessByApp?: ShareAccessByApp;
   appSettings?: ShareAppSettingsByApp;
+  userGrants?: ShareUserGrantMap;
 }
 
 export const SHARE_APP_TYPES: ReadonlyArray<keyof ShareBindings> = [
@@ -169,6 +200,7 @@ export interface UpdateShareAclParams {
   accessByApp?: ShareAccessByApp;
   appSettings?: ShareAppSettingsByApp;
   saleMarketKind?: ShareSaleMarketKind;
+  userGrants?: ShareUserGrantMap;
 }
 
 /** Complete settings payload saved atomically from a Provider edit page. */
@@ -186,6 +218,7 @@ export interface SaveProviderShareParams {
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: string;
+  userGrants: ShareUserGrantMap;
 }
 
 export interface UpdateShareTokenLimitParams {

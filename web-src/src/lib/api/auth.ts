@@ -35,6 +35,18 @@ export interface ManagedAuthAccount {
   github_domain: string;
   workspaces?: Array<{ id: string; name: string }>;
   selected_workspace_id?: string | null;
+  subscriptionExpiry: ManagedAuthSubscriptionExpiry;
+}
+
+export type ManagedAuthSubscriptionExpiryCapability =
+  "automatic" | "manual_required" | "research_pending" | "not_applicable";
+
+export interface ManagedAuthSubscriptionExpiry {
+  capability: ManagedAuthSubscriptionExpiryCapability;
+  manualExpiresAt: string | null;
+  effectiveExpiresAt: string | null;
+  source: "automatic" | "manual" | null;
+  kind: "subscription" | "billing_period" | null;
 }
 
 export interface ManagedAuthStatus {
@@ -272,6 +284,21 @@ export async function authSetWorkspace(
   });
 }
 
+export async function authSetManualSubscriptionExpiry(
+  authProvider: ManagedAuthProvider,
+  accountId: string,
+  expiresAt: string | null,
+): Promise<ManagedAuthAccount> {
+  return invokeCommand<ManagedAuthAccount>(
+    "auth_set_manual_subscription_expiry",
+    {
+      authProvider,
+      accountId,
+      expiresAt,
+    },
+  );
+}
+
 export async function authLogout(
   authProvider: ManagedAuthProvider,
 ): Promise<void> {
@@ -289,7 +316,9 @@ export async function importGrokAuthJson(
 }
 
 export async function importCursorLocalAuth(): Promise<ImportCursorLocalAuthResponse> {
-  return invokeCommand<ImportCursorLocalAuthResponse>("cursor_import_local_auth");
+  return invokeCommand<ImportCursorLocalAuthResponse>(
+    "cursor_import_local_auth",
+  );
 }
 
 export async function importKiroCredentials(

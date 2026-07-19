@@ -221,6 +221,10 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
       readNumber(record, "routerSyncedRevision", "router_synced_revision") ?? 0,
     routerLastSyncError:
       readString(record, "routerLastSyncError", "router_last_sync_error") ?? null,
+    userGrants:
+      (record.userGrants as ShareRecord["userGrants"]) ??
+      (record.user_grants as ShareRecord["userGrants"]) ??
+      {},
   };
 }
 

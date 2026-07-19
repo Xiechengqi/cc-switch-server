@@ -36,6 +36,18 @@ export function useManagedAuth(
     staleTime: 30000,
   });
 
+  const invalidateManagedAccountViews = useCallback(
+    () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey }),
+        queryClient.invalidateQueries({ queryKey: ["subscription"] }),
+        queryClient.invalidateQueries({ queryKey: [authProvider, "quota"] }),
+        queryClient.invalidateQueries({ queryKey: ["providers"] }),
+        queryClient.invalidateQueries({ queryKey: ["share"] }),
+      ]),
+    [authProvider, queryClient],
+  );
+
   const stopPolling = useCallback(() => {
     if (pollingIntervalRef.current) {
       clearInterval(pollingIntervalRef.current);
@@ -137,7 +149,7 @@ export function useManagedAuth(
         default_account_id: null,
         accounts: [],
       });
-      await queryClient.invalidateQueries({ queryKey });
+      await invalidateManagedAccountViews();
     },
     onError: async (e) => {
       console.error("[ManagedAuth] Failed to logout:", e);
@@ -154,7 +166,7 @@ export function useManagedAuth(
       setDeviceCode(null);
       setError(null);
       await refetchStatus();
-      await queryClient.invalidateQueries({ queryKey });
+      await invalidateManagedAccountViews();
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to remove account:", e);
@@ -167,7 +179,7 @@ export function useManagedAuth(
       authApi.authSetDefaultAccount(authProvider, accountId),
     onSuccess: async () => {
       await refetchStatus();
-      await queryClient.invalidateQueries({ queryKey });
+      await invalidateManagedAccountViews();
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to set default account:", e);
@@ -184,7 +196,7 @@ export function useManagedAuth(
       ),
     onSuccess: async () => {
       await refetchStatus();
-      await queryClient.invalidateQueries({ queryKey });
+      await invalidateManagedAccountViews();
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to set workspace:", e);
@@ -220,9 +232,7 @@ export function useManagedAuth(
       setError(null);
       stopPolling();
       startLoginMutation.mutate(
-        oauthFlowMode ||
-          options?.codexCallbackUrl ||
-          options?.kiroLoginProvider
+        oauthFlowMode || options?.codexCallbackUrl || options?.kiroLoginProvider
           ? {
               oauthFlowMode,
               codexCallbackUrl: options?.codexCallbackUrl,
@@ -249,9 +259,14 @@ export function useManagedAuth(
     setDeviceCode(null);
     setError(null);
     if (activeDeviceCode) {
-      void authApi.authCancelLogin(authProvider, activeDeviceCode).catch((e) => {
-        console.warn("[ManagedAuth] Failed to cancel remote auth session:", e);
-      });
+      void authApi
+        .authCancelLogin(authProvider, activeDeviceCode)
+        .catch((e) => {
+          console.warn(
+            "[ManagedAuth] Failed to cancel remote auth session:",
+            e,
+          );
+        });
     }
   }, [authProvider, deviceCode?.device_code, stopPolling]);
 

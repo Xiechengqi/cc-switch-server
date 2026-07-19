@@ -67,6 +67,8 @@ export type {
 export type {
   ManagedAuthProvider,
   ManagedAuthAccount,
+  ManagedAuthSubscriptionExpiry,
+  ManagedAuthSubscriptionExpiryCapability,
   ManagedAuthStatus,
   ManagedAuthDeviceCodeResponse,
   ImportGrokAuthJsonResponse,

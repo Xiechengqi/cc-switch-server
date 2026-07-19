@@ -3,6 +3,9 @@ use serde_json::{json, Value};
 
 use super::types::AccountQuotaResponse;
 use crate::domain::accounts::store::{Account, AccountQuota, AccountQuotaTier};
+use crate::domain::accounts::subscription_expiry::{
+    resolved_subscription_expiry, SubscriptionExpirySource,
+};
 use crate::domain::providers::model::ProviderType;
 
 /// Convert stored account quota (0–1 utilization fractions) into the desktop
@@ -10,17 +13,14 @@ use crate::domain::providers::model::ProviderType;
 #[allow(dead_code)]
 pub(in crate::api) fn subscription_quota_from_account(account: &Account, tool: &str) -> Value {
     let credential_status = account_credential_status(account);
-    let Some(quota) = account.quota.as_ref() else {
+    if account.quota.is_none()
+        && resolved_subscription_expiry(account)
+            .expires_at_ms
+            .is_none()
+    {
         return subscription_quota_not_found(tool);
-    };
-    subscription_quota_from_parts(
-        tool,
-        credential_status,
-        quota,
-        account.quota_refreshed_at,
-        account.last_refresh_error.as_deref(),
-        account.subscription_level.as_deref(),
-    )
+    }
+    subscription_quota_from_parts(account, tool, credential_status, account.quota.as_ref())
 }
 
 pub(in crate::api) fn subscription_quota_from_response(
@@ -30,17 +30,14 @@ pub(in crate::api) fn subscription_quota_from_response(
 ) -> Value {
     let credential_status = account_credential_status(account);
     let quota = response.quota.as_ref().or(account.quota.as_ref());
-    let Some(quota) = quota else {
+    if quota.is_none()
+        && resolved_subscription_expiry(account)
+            .expires_at_ms
+            .is_none()
+    {
         return subscription_quota_not_found(tool);
-    };
-    subscription_quota_from_parts(
-        tool,
-        credential_status,
-        quota,
-        account.quota_refreshed_at,
-        account.last_refresh_error.as_deref(),
-        account.subscription_level.as_deref(),
-    )
+    }
+    subscription_quota_from_parts(account, tool, credential_status, quota)
 }
 
 pub(in crate::api) fn cached_oauth_quota_from_response(
@@ -106,39 +103,31 @@ pub(in crate::api) fn subscription_quota_not_found(tool: &str) -> Value {
 }
 
 fn subscription_quota_from_parts(
+    account: &Account,
     tool: &str,
     credential_status: &str,
-    quota: &AccountQuota,
-    queried_at: Option<i64>,
-    last_refresh_error: Option<&str>,
-    subscription_level: Option<&str>,
+    quota: Option<&AccountQuota>,
 ) -> Value {
     if credential_status == "not_found" {
         return subscription_quota_not_found(tool);
     }
 
     let queried_at = quota
-        .extra_usage
+        .and_then(|quota| quota.extra_usage.as_ref())
         .as_ref()
         .and_then(|extra| extra.get("queriedAt").and_then(Value::as_i64))
-        .or(queried_at)
+        .or(account.quota_refreshed_at)
         .filter(|value| *value > 0);
 
-    let subscription = quota
-        .extra_usage
-        .as_ref()
-        .and_then(|extra| extra.get("subscription"))
-        .cloned()
-        .filter(|value| !value.is_null());
+    let subscription = subscription_for_ui(account, quota);
 
     let credential_message = quota
-        .credential_message
-        .clone()
-        .or_else(|| subscription_level.map(str::to_string));
+        .and_then(|quota| quota.credential_message.clone())
+        .or_else(|| account.subscription_level.clone());
 
-    let success = quota.success && credential_status == "valid";
+    let success = credential_status == "valid" && quota.is_some_and(|quota| quota.success);
     let queried_at = queried_at.or_else(|| {
-        if success || !quota.tiers.is_empty() {
+        if success || quota.is_some_and(|quota| !quota.tiers.is_empty()) {
             Some(crate::infra::time::now_ms() as i64)
         } else {
             None
@@ -147,12 +136,13 @@ fn subscription_quota_from_parts(
     let error = if success {
         Value::Null
     } else {
-        last_refresh_error
+        account
+            .last_refresh_error
+            .as_deref()
             .map(|message| Value::String(message.to_string()))
             .or_else(|| {
                 quota
-                    .credential_message
-                    .as_ref()
+                    .and_then(|quota| quota.credential_message.as_ref())
                     .map(|message| Value::String(message.clone()))
             })
             .unwrap_or(Value::Null)
@@ -165,14 +155,54 @@ fn subscription_quota_from_parts(
         "subscription": subscription,
         "success": success,
         "tiers": quota
-            .tiers
+            .map(|quota| quota.tiers.as_slice())
+            .unwrap_or_default()
             .iter()
             .map(subscription_tier_from_account_tier)
             .collect::<Vec<_>>(),
-        "extraUsage": extra_usage_for_ui(quota.extra_usage.as_ref()),
+        "extraUsage": extra_usage_for_ui(quota.and_then(|quota| quota.extra_usage.as_ref())),
         "error": error,
         "queriedAt": queried_at,
     })
+}
+
+fn subscription_for_ui(account: &Account, quota: Option<&AccountQuota>) -> Option<Value> {
+    let existing = quota
+        .and_then(|quota| quota.extra_usage.as_ref())
+        .and_then(|extra| extra.get("subscription"))
+        .cloned()
+        .filter(|value| !value.is_null());
+    let resolved = resolved_subscription_expiry(account);
+    let Some(expires_at_ms) = resolved.expires_at_ms else {
+        return existing;
+    };
+    let expires_at = Utc
+        .timestamp_millis_opt(expires_at_ms)
+        .single()
+        .map(|value| value.to_rfc3339())?;
+    let mut subscription = existing
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let object = subscription
+        .as_object_mut()
+        .expect("subscription was normalized to an object");
+    object.insert("expiresAt".to_string(), Value::String(expires_at));
+    if resolved.source == Some(SubscriptionExpirySource::Manual) {
+        object.insert(
+            "expiresSource".to_string(),
+            Value::String("manual".to_string()),
+        );
+        object.insert(
+            "expiresKind".to_string(),
+            Value::String("billing_period".to_string()),
+        );
+    }
+    if !object.contains_key("planLabel") {
+        if let Some(plan_label) = account.subscription_level.as_ref() {
+            object.insert("planLabel".to_string(), Value::String(plan_label.clone()));
+        }
+    }
+    Some(subscription)
 }
 
 fn subscription_tier_from_account_tier(tier: &AccountQuotaTier) -> Value {
@@ -279,6 +309,8 @@ mod tests {
             quota_refreshed_at: Some(1_700_000_000_000),
             quota_next_refresh_at: None,
             expires_at: None,
+            manual_subscription_expires_at_ms: None,
+            manual_subscription_expiry_updated_at_ms: None,
             rate_limited_until: None,
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
@@ -366,5 +398,32 @@ mod tests {
         assert_eq!(cached["authProvider"], "codex_oauth");
         assert_eq!(cached["quota"]["tiers"][0]["utilization"], 25.0);
         assert_eq!(cached["nextRefreshAt"], json!(1_700_000_300_000i64));
+    }
+
+    #[test]
+    fn manual_subscription_expiry_is_synthesized_without_mutating_quota_storage() {
+        let mut account = sample_account(AccountQuota::default());
+        account.provider_type = ProviderType::ClaudeOAuth;
+        account.subscription_level = Some("Claude Pro".to_string());
+        account.quota = None;
+        account.quota_refreshed_at = None;
+        account.manual_subscription_expires_at_ms = Some(1_786_924_800_000);
+        account.manual_subscription_expiry_updated_at_ms = Some(1_784_000_000_000);
+        account.last_refresh_error = Some("upstream quota unavailable".to_string());
+
+        let quota = subscription_quota_from_account(&account, "claude_oauth");
+
+        assert_eq!(quota["credentialStatus"], "valid");
+        assert_eq!(quota["success"], false);
+        assert_eq!(quota["credentialMessage"], "Claude Pro");
+        assert_eq!(
+            quota["subscription"]["expiresAt"],
+            "2026-08-17T00:00:00+00:00"
+        );
+        assert_eq!(quota["subscription"]["expiresSource"], "manual");
+        assert_eq!(quota["subscription"]["expiresKind"], "billing_period");
+        assert_eq!(quota["error"], "upstream quota unavailable");
+        assert!(quota["queriedAt"].is_null());
+        assert!(account.quota.is_none());
     }
 }

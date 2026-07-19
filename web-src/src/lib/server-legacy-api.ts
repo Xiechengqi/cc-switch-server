@@ -373,6 +373,7 @@ export interface ShareRecord {
   routerLastSyncedAtMs?: number | null;
   routerLastSyncError?: string | null;
   routerUrl?: string | null;
+  userGrants?: import("@/lib/api/share").ShareUserGrantMap;
 }
 
 export interface UpsertShareInput {
@@ -403,6 +404,7 @@ export interface UpsertShareInput {
   bindings?: ShareBinding[];
   runtimeSnapshot?: unknown;
   marketGrant?: ShareMarketGrantStatus | null;
+  userGrants?: import("@/lib/api/share").ShareUserGrantMap;
 }
 
 export interface ShareConnectInfo {

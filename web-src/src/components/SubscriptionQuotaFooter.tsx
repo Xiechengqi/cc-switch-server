@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
 import { useSubscriptionQuota } from "@/lib/query/subscription";
 import type { QuotaTier, SubscriptionQuota } from "@/types/subscription";
+import { cn } from "@/lib/utils";
 import {
   PROVIDER_REFRESH_TITLE_KEY,
   resolveQuotaQueriedAt,
@@ -321,12 +322,29 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
 
   // API 调用失败
   if (!quota.success) {
+    const expirySummary = quota.subscription?.expiresAt
+      ? formatQuotaSummary(quota, [], t, now)
+      : null;
+    const hasQueryError = Boolean(quota.error) || !expirySummary;
+    const statusText = [
+      quota.error || (hasQueryError ? t("subscription.queryFailed") : null),
+      expirySummary,
+    ]
+      .filter(Boolean)
+      .join(" · ");
     if (inline) {
       return (
         <div className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-2 text-xs rounded-lg border border-border-default bg-card px-3 py-2 shadow-sm">
-          <div className="flex min-w-0 items-center gap-1.5 text-red-500 dark:text-red-400">
-            <AlertCircle size={12} />
-            <span className="break-words">{t("subscription.queryFailed")}</span>
+          <div
+            className={cn(
+              "flex min-w-0 items-center gap-1.5",
+              hasQueryError
+                ? "text-red-500 dark:text-red-400"
+                : "text-muted-foreground",
+            )}
+          >
+            {hasQueryError ? <AlertCircle size={12} /> : <Clock size={12} />}
+            <span className="break-words">{statusText}</span>
           </div>
           <button
             onClick={() => void handleRefresh()}
@@ -342,9 +360,16 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     return (
       <div className="mt-3 rounded-xl border border-border-default bg-card px-4 py-3 shadow-sm">
         <div className="flex items-center justify-between gap-2 text-xs">
-          <div className="flex items-center gap-2 text-red-500 dark:text-red-400">
-            <AlertCircle size={14} />
-            <span>{quota.error || t("subscription.queryFailed")}</span>
+          <div
+            className={cn(
+              "flex items-center gap-2",
+              hasQueryError
+                ? "text-red-500 dark:text-red-400"
+                : "text-muted-foreground",
+            )}
+          >
+            {hasQueryError ? <AlertCircle size={14} /> : <Clock size={14} />}
+            <span>{statusText}</span>
           </div>
           <button
             onClick={() => void handleRefresh()}

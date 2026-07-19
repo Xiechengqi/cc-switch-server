@@ -377,7 +377,20 @@
       "description": "在 Claude Code 中使用您的其他訂閱，請注意合規風險。",
       "beta": "Beta",
       "copilotDescription": "管理 GitHub Copilot 帳號",
-      "codexOauthDescription": "管理 ChatGPT 帳號"
+      "codexOauthDescription": "管理 ChatGPT 帳號",
+      "subscriptionExpiry": {
+        "title": "訂閱帳號到期時間",
+        "notSet": "尚未設定",
+        "notAvailable": "暫未取得",
+        "automatic": "自動取得",
+        "manual": "手動設定",
+        "save": "儲存到期時間",
+        "clear": "清除到期時間",
+        "saved": "訂閱帳號到期時間已儲存",
+        "cleared": "訂閱帳號到期時間已清除",
+        "saveFailed": "儲存訂閱帳號到期時間失敗：{{error}}",
+        "unknownError": "未知錯誤"
+      }
     },
     "serverSecurity": {
       "changePasswordTitle": "密碼修改",

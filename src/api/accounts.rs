@@ -1452,7 +1452,7 @@ pub(in crate::api) async fn delete_account(
     Path(id): Path<String>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let deleted = state
+    let (deleted, removed_account) = state
         .try_mutate_accounts_immediate(|store| {
             let provider_type = store
                 .accounts
@@ -1460,14 +1460,34 @@ pub(in crate::api) async fn delete_account(
                 .find(|item| item.id == id)
                 .map(|item| item.provider_type);
             match provider_type {
-                Some(provider_type) => manager_for(provider_type)
-                    .revoke_or_delete(store, &id)
-                    .map_err(ApiError::bad_request),
-                None => Ok(false),
+                Some(provider_type) => {
+                    let was_default = store
+                        .accounts
+                        .iter()
+                        .find(|account| account.provider_type == provider_type)
+                        .is_some_and(|account| account.id == id);
+                    let deleted = manager_for(provider_type)
+                        .revoke_or_delete(store, &id)
+                        .map_err(ApiError::bad_request)?;
+                    Ok((deleted, Some((provider_type, was_default))))
+                }
+                None => Ok((false, None)),
             }
         })
         .await
         .map_err(ApiError::internal)??;
+    if deleted {
+        if let Some((provider_type, was_default)) = removed_account {
+            state
+                .refresh_account_subscription_metadata_after_removal(
+                    provider_type,
+                    &id,
+                    was_default,
+                )
+                .await
+                .map_err(ApiError::internal)?;
+        }
+    }
     Ok(Json(DeleteResponse { ok: true, deleted }))
 }
 
@@ -1727,6 +1747,7 @@ pub(in crate::api) async fn account_quota(
     .await
     {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
+            let account_before_quota_refresh = active_account.clone();
             let account = state
                 .try_mutate_accounts_immediate(|store| {
                     store
@@ -1735,6 +1756,13 @@ pub(in crate::api) async fn account_quota(
                 })
                 .await
                 .map_err(ApiError::internal)??;
+            state
+                .refresh_automatic_subscription_metadata_if_changed(
+                    &account_before_quota_refresh,
+                    &account,
+                )
+                .await
+                .map_err(ApiError::internal)?;
             state.emit_oauth_quota_updated_event(&account, true);
             Ok(Json(AccountQuotaResponse {
                 ok: true,

@@ -248,6 +248,14 @@
       "notes": "Reorders provider accounts so the selected account is treated as default."
     },
     {
+      "name": "auth_set_manual_subscription_expiry",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /web-api/invoke/auth_set_manual_subscription_expiry",
+      "notes": "Sets or clears the account-owned subscription billing-period end only for account types classified as manual_required."
+    },
+    {
       "name": "auth_set_workspace",
       "support": "native",
       "implemented": true,

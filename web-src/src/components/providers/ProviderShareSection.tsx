@@ -9,7 +9,12 @@ import {
   Share2,
   X,
 } from "lucide-react";
-import type { AppId, PublicMarket, ShareSaleMarketKind } from "@/lib/api";
+import type {
+  AppId,
+  PublicMarket,
+  ShareSaleMarketKind,
+} from "@/lib/api";
+import type { ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -24,9 +29,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { EmailTagsInput } from "@/components/ui/tags-input";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
+import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { shareApi } from "@/lib/api/share";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
@@ -186,6 +191,7 @@ export function ProviderShareSection({
   const [selectedShareMarketEmail, setSelectedShareMarketEmail] = useState("");
   const [marketSelectKey, setMarketSelectKey] = useState(0);
   const [shareToEmails, setShareToEmails] = useState<string[]>([]);
+  const [userGrants, setUserGrants] = useState<ShareUserGrantMap>({});
   const [tokenLimitInput, setTokenLimitInput] = useState("");
   const [parallelLimitInput, setParallelLimitInput] = useState("");
   const [officialPricePercentInput, setOfficialPricePercentInput] = useState("");
@@ -274,7 +280,46 @@ export function ProviderShareSection({
     const allEmails = normalizeShareEmails(
       appAccess?.sharedWithEmails ?? share?.sharedWithEmails ?? [],
     );
-    setShareToEmails(splitShareToEmails(allEmails, allMarketEmailSet));
+    const directEmails = splitShareToEmails(allEmails, allMarketEmailSet);
+    setShareToEmails(directEmails);
+
+    const defaultPolicy: ShareUserPolicy = {
+      parallelLimit:
+        share && normalizeShareLimitValue(share.parallelLimit) >= 0
+          ? normalizeShareLimitValue(share.parallelLimit)
+          : undefined,
+      tokenLimit:
+        share && normalizeShareLimitValue(share.tokenLimit) >= 0
+          ? normalizeShareLimitValue(share.tokenLimit)
+          : undefined,
+      tokenPeriod: "lifetime",
+      expiresAt:
+        share?.expiresAt && !isPermanentExpiry(share.expiresAt)
+          ? new Date(share.expiresAt).getTime()
+          : undefined,
+    };
+    const existingGrants = share?.userGrants ?? {};
+    const nextGrants: ShareUserGrantMap = { ...existingGrants };
+    const normalizedOwner = ownerEmail.trim().toLowerCase();
+    if (normalizedOwner && !nextGrants[normalizedOwner]) {
+      nextGrants[normalizedOwner] = {
+        email: normalizedOwner,
+        role: "owner",
+        active: true,
+        policy: { ...defaultPolicy },
+      };
+    }
+    for (const email of allEmails) {
+      if (!nextGrants[email]) {
+        nextGrants[email] = {
+          email,
+          role: "shareto",
+          active: true,
+          policy: { ...defaultPolicy },
+        };
+      }
+    }
+    setUserGrants(nextGrants);
 
     const tokenEmails = allEmails.filter((email) =>
       usageMarketEmailSet.has(email),
@@ -408,6 +453,72 @@ export function ProviderShareSection({
     return new Date(Date.now() + seconds * 1000).toISOString();
   };
 
+  const userGrantDefaultPolicy: ShareUserPolicy = {
+    parallelLimit:
+      resolveParallelLimitForSave() >= 0
+        ? resolveParallelLimitForSave()
+        : undefined,
+    tokenLimit:
+      resolveTokenLimitForSave() >= 0 ? resolveTokenLimitForSave() : undefined,
+    tokenPeriod: "lifetime",
+    expiresAt: isPermanent ? undefined : new Date(resolveExpiresAt()).getTime(),
+  };
+
+  const effectiveMarketGrantEmails =
+    forSaleValue !== "Yes"
+      ? []
+      : saleMarketKind === "share"
+        ? [normalizedSelectedShareMarketEmail].filter(Boolean)
+        : marketAccessMode === "selected"
+          ? normalizedSelectedMarketEmails
+          : [];
+  const selectedMarketGrantEmails = new Set(effectiveMarketGrantEmails);
+
+  const buildUserGrantsForAcl = (
+    source: ShareUserGrantMap,
+    aclEmails: string[],
+  ) => {
+    const allowedEmails = new Set(
+      normalizeShareEmails([normalizedOwnerEmail, ...aclEmails]),
+    );
+    const next: ShareUserGrantMap = {};
+    for (const email of allowedEmails) {
+      const previous = source[email];
+      next[email] = {
+        ...previous,
+        email,
+        role: email === normalizedOwnerEmail ? "owner" : "shareto",
+        active: true,
+        policy: previous?.policy ?? { ...userGrantDefaultPolicy },
+      };
+    }
+    return next;
+  };
+
+  const userGrantsForAcl = (aclEmails: string[]) =>
+    buildUserGrantsForAcl(userGrants, aclEmails);
+
+  const syncUserGrantsForMarketEmails = (marketEmails: string[]) => {
+    const aclEmails = normalizeShareEmails([...shareToEmails, ...marketEmails]);
+    setUserGrants((current) => buildUserGrantsForAcl(current, aclEmails));
+  };
+
+  const displayedUserGrants = buildUserGrantsForAcl(userGrants, [
+    ...shareToEmails,
+    ...effectiveMarketGrantEmails,
+  ]);
+
+  const handleUserGrantsChange = (nextGrants: ShareUserGrantMap) => {
+    setUserGrants(nextGrants);
+    setShareToEmails(
+      Object.values(nextGrants)
+        .filter((grant) => grant.active !== false && grant.role === "shareto")
+        .filter((grant) => !selectedMarketGrantEmails.has(grant.email))
+        .map((grant) => grant.email),
+    );
+    setShareDraftDirty(true);
+  };
+
   const buildAclPayload = (
     tokenLimit: number,
     parallelLimit: number,
@@ -449,6 +560,7 @@ export function ProviderShareSection({
       parallelLimit,
       resolveExpiresAt(),
     );
+    const payloadUserGrants = userGrantsForAcl(aclPayload.sharedWithEmails);
     const created = await createMutation.mutateAsync({
       bindings: { [shareableApp]: providerId },
       forSale: forSaleValue,
@@ -464,6 +576,7 @@ export function ProviderShareSection({
       marketAccessMode: aclPayload.marketAccessMode,
       accessByApp: aclPayload.accessByApp,
       appSettings: aclPayload.appSettings,
+      userGrants: payloadUserGrants,
     });
     return created;
   };
@@ -501,6 +614,7 @@ export function ProviderShareSection({
       parallelLimit,
       nextExpiresAt,
     );
+    const payloadUserGrants = userGrantsForAcl(aclPayload.sharedWithEmails);
     await saveMutation.mutateAsync({
       shareId: share.id,
       subdomain: subdomainInput.trim(),
@@ -515,6 +629,7 @@ export function ProviderShareSection({
       tokenLimit,
       parallelLimit,
       expiresAt: nextExpiresAt,
+      userGrants: payloadUserGrants,
     });
     setShareDraftDirty(false);
     return true;
@@ -915,10 +1030,14 @@ export function ProviderShareSection({
                     onRetryMarkets={() => void refetchMarkets()}
                     onMarketAccessModeChange={(value) => {
                       setMarketAccessMode(value);
+                      syncUserGrantsForMarketEmails(
+                        value === "selected" ? normalizedSelectedMarketEmails : [],
+                      );
                       setShareDraftDirty(true);
                     }}
                     onSelectedMarketEmailsChange={(emails) => {
                       setSelectedMarketEmails(emails);
+                      syncUserGrantsForMarketEmails(emails);
                       setShareDraftDirty(true);
                     }}
                     onMarketSelectKeyChange={setMarketSelectKey}
@@ -933,35 +1052,21 @@ export function ProviderShareSection({
                     onRetryMarkets={() => void refetchMarkets()}
                     onSelectedShareMarketEmailChange={(email) => {
                       setSelectedShareMarketEmail(email);
+                      syncUserGrantsForMarketEmails(email ? [email] : []);
                       setShareDraftDirty(true);
                     }}
                     invalid={marketInvalid}
                   />
                 )}
 
-                <div className="space-y-2 md:col-span-2">
-                  <Label>
-                    {t("share.sharedWithEmails", { defaultValue: "Share To" })}
-                  </Label>
-                  <div className="text-xs text-muted-foreground">
-                    {shareAppDisplayLabel(shareableApp)} ·{" "}
-                    {t("share.createDialog.shareToHint", {
-                      defaultValue: "可访问邮箱；留空则仅 owner 可见。",
-                    })}
-                  </div>
-                  <EmailTagsInput
-                    value={shareToEmails}
-                    invalid={shareToInvalid}
-                    disabled={busy}
-                    onChange={(emails) => {
-                      setShareToEmails(emails);
-                      setShareDraftDirty(true);
-                    }}
-                    placeholder={t("share.sharedWithEmailsPlaceholder", {
-                      defaultValue: "friend@example.com",
-                    })}
-                  />
-                </div>
+                <ShareUserGrantsEditor
+                  value={displayedUserGrants}
+                  ownerEmail={normalizedOwnerEmail}
+                  defaultPolicy={userGrantDefaultPolicy}
+                  protectedEmails={selectedMarketGrantEmails}
+                  disabled={busy}
+                  onChange={handleUserGrantsChange}
+                />
 
                 <div className="space-y-2">
                   <Label htmlFor="provider-share-token-limit">

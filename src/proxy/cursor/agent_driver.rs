@@ -221,8 +221,13 @@ pub async fn forward_agentservice(
                 },
             )
             .await;
-            record_share_invocation_result(&state, request_context.share_id.as_deref(), usage)
-                .await;
+            record_share_invocation_result(
+                &state,
+                request_context.share_id.as_deref(),
+                request_context.user_email.as_deref(),
+                usage,
+            )
+            .await;
             record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code))
                 .await;
             let mut response = Response::new(Body::from(body));
@@ -277,6 +282,7 @@ async fn stream_response(
     )
     .await;
     let share_id = request_context.share_id.clone();
+    let user_email = request_context.user_email.clone();
     let first_token_ms_shared = Arc::new(AtomicU64::new(0));
     let interrupted_guard = CursorStreamInterruptGuard {
         armed: Arc::new(AtomicBool::new(true)),
@@ -285,6 +291,7 @@ async fn stream_response(
         request_id: request_id.clone(),
         status_code: StatusCode::OK.as_u16(),
         share_id: share_id.clone(),
+        user_email: user_email.clone(),
         started,
         first_token_ms: first_token_ms_shared.clone(),
         session_entry: Some(session_entry.clone()),
@@ -423,7 +430,8 @@ async fn stream_response(
             Some(final_stream_status),
         )
         .await;
-        record_share_invocation_result(&state, share_id.as_deref(), usage).await;
+        record_share_invocation_result(&state, share_id.as_deref(), user_email.as_deref(), usage)
+            .await;
         let outcome = if final_stream_status == "failed" {
             ProviderOutcome::NetworkFailure
         } else {
@@ -1394,6 +1402,7 @@ struct CursorStreamInterruptGuard {
     request_id: String,
     status_code: u16,
     share_id: Option<String>,
+    user_email: Option<String>,
     started: Instant,
     first_token_ms: Arc<AtomicU64>,
     session_entry: Option<Arc<tokio::sync::Mutex<CursorSession>>>,
@@ -1422,6 +1431,7 @@ impl Drop for CursorStreamInterruptGuard {
         let request_id = self.request_id.clone();
         let status_code = self.status_code;
         let share_id = self.share_id.clone();
+        let user_email = self.user_email.clone();
         let duration_ms = self.started.elapsed().as_millis();
         let first_token_ms = self.first_token_ms();
         let session_entry = self.session_entry.take();
@@ -1437,8 +1447,13 @@ impl Drop for CursorStreamInterruptGuard {
                 Some("interrupted"),
             )
             .await;
-            record_share_invocation_result(&state, share_id.as_deref(), TokenUsage::default())
-                .await;
+            record_share_invocation_result(
+                &state,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                TokenUsage::default(),
+            )
+            .await;
             record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
             if let Some(entry) = session_entry {
                 state

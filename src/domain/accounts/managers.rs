@@ -13,6 +13,9 @@ use crate::domain::accounts::oauth::{
     OAuthProfileStrategy, OAuthQuotaStrategy, OAuthSupportStage,
 };
 use crate::domain::accounts::store::{Account, AccountQuota, AccountStore, UpsertAccountInput};
+use crate::domain::accounts::subscription_expiry::{
+    subscription_expiry_capability, SubscriptionExpiryCapability,
+};
 use crate::domain::providers::model::ProviderType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -46,6 +49,7 @@ pub struct AccountManagerCapability {
     pub profile_strategy: Option<OAuthProfileStrategy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_strategy: Option<OAuthQuotaStrategy>,
+    pub subscription_expiry_capability: SubscriptionExpiryCapability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -524,6 +528,7 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
         server_native_stage: oauth_spec.map(|spec| spec.stage),
         profile_strategy: oauth_spec.map(|spec| spec.profile_strategy),
         quota_strategy: oauth_spec.map(|spec| spec.quota_strategy),
+        subscription_expiry_capability: subscription_expiry_capability(provider_type),
     }
 }
 
@@ -711,6 +716,30 @@ mod tests {
         assert_eq!(
             capability.server_native_stage,
             Some(OAuthSupportStage::NativeRefreshProfile)
+        );
+        assert_eq!(
+            capability.subscription_expiry_capability,
+            SubscriptionExpiryCapability::Automatic
+        );
+    }
+
+    #[test]
+    fn account_capabilities_expose_subscription_expiry_policy() {
+        assert_eq!(
+            capability_for(ProviderType::ClaudeOAuth).subscription_expiry_capability,
+            SubscriptionExpiryCapability::ManualRequired
+        );
+        assert_eq!(
+            capability_for(ProviderType::OllamaCloud).subscription_expiry_capability,
+            SubscriptionExpiryCapability::Automatic
+        );
+        assert_eq!(
+            capability_for(ProviderType::CursorOAuth).subscription_expiry_capability,
+            SubscriptionExpiryCapability::ResearchPending
+        );
+        assert_eq!(
+            capability_for(ProviderType::DeepSeekApi).subscription_expiry_capability,
+            SubscriptionExpiryCapability::NotApplicable
         );
     }
 

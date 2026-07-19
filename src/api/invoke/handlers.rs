@@ -5,7 +5,7 @@ use crate::domain::providers::current_provider;
 
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch,
+    descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch, ShareUserGrant,
 };
 use crate::domain::usage::store::UsageLog;
 
@@ -469,6 +469,9 @@ pub(in crate::api) async fn web_share_upsert_input(
     let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
     let for_sale_official_price_percent_by_app =
         web_optional_deserialize(value, "forSaleOfficialPricePercentByApp")?.unwrap_or_default();
+    let user_grants =
+        web_optional_deserialize::<BTreeMap<String, ShareUserGrant>>(value, "userGrants")?
+            .unwrap_or_default();
 
     Ok(UpsertShareInput {
         id: web_optional_string_any(value, &["id", "shareId", "share_id"]),
@@ -509,6 +512,7 @@ pub(in crate::api) async fn web_share_upsert_input(
         bindings,
         runtime_snapshot: None,
         market_grant: None,
+        user_grants,
     })
 }
 
@@ -843,6 +847,7 @@ pub(in crate::api) async fn web_update_share_acl(
 
     let patch = ShareSettingsPatch {
         shared_with_emails: web_optional_deserialize(value, "sharedWithEmails")?,
+        user_grants: web_optional_deserialize(value, "userGrants")?,
         market_access_mode: web_optional_string_any(value, &["marketAccessMode"]),
         access_by_app: web_optional_deserialize(value, "accessByApp")?,
         app_settings: web_optional_deserialize(value, "appSettings")?,
@@ -877,6 +882,9 @@ pub(in crate::api) async fn web_save_provider_share(
     let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
     let for_sale_official_price_percent_by_app =
         web_optional_deserialize(value, "forSaleOfficialPricePercentByApp")?.unwrap_or_default();
+    let user_grants =
+        web_optional_deserialize::<BTreeMap<String, ShareUserGrant>>(value, "userGrants")?
+            .unwrap_or_default();
     let token_limit = web_optional_i64(value, &["tokenLimit", "token_limit"])
         .ok_or_else(|| ApiError::bad_request("tokenLimit is required"))?;
     let parallel_limit = web_optional_i64(value, &["parallelLimit", "parallel_limit"])
@@ -911,6 +919,7 @@ pub(in crate::api) async fn web_save_provider_share(
                 token_limit: Some(token_limit),
                 parallel_limit: Some(parallel_limit),
                 expires_at: Some(expires_at),
+                user_grants: Some(user_grants),
                 ..ShareSettingsPatch::default()
             },
         )
@@ -2068,6 +2077,13 @@ pub(in crate::api) fn account_authenticated_at(account: &Account) -> i64 {
     account.quota_refreshed_at.unwrap_or(0)
 }
 
+fn subscription_expiry_rfc3339(timestamp_ms: Option<i64>) -> Option<String> {
+    timestamp_ms.and_then(|timestamp_ms| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
+            .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    })
+}
+
 pub(in crate::api) fn map_managed_auth_account(
     account: &Account,
     provider_label: &str,
@@ -2076,6 +2092,22 @@ pub(in crate::api) fn map_managed_auth_account(
     let workspaces = crate::domain::accounts::store::codex_workspace_options(account);
     let selected_workspace_id =
         crate::domain::accounts::store::effective_codex_workspace_id(account);
+    let subscription_expiry =
+        crate::domain::accounts::subscription_expiry::resolved_subscription_expiry(account);
+    let manual_expires_at = (subscription_expiry.capability
+        == crate::domain::accounts::subscription_expiry::SubscriptionExpiryCapability::ManualRequired)
+        .then_some(account.manual_subscription_expires_at_ms)
+        .flatten()
+        .and_then(|timestamp_ms| subscription_expiry_rfc3339(Some(timestamp_ms)));
+    let effective_expires_at = subscription_expiry_rfc3339(subscription_expiry.expires_at_ms);
+    let expiry_kind = subscription_expiry.source.map(|source| match source {
+        crate::domain::accounts::subscription_expiry::SubscriptionExpirySource::Automatic => {
+            "subscription"
+        }
+        crate::domain::accounts::subscription_expiry::SubscriptionExpirySource::Manual => {
+            "billing_period"
+        }
+    });
     json!({
         "id": account.id,
         "provider": provider_label,
@@ -2086,7 +2118,14 @@ pub(in crate::api) fn map_managed_auth_account(
         "is_default": default_account_id == Some(account.id.as_str()),
         "github_domain": "github.com",
         "workspaces": workspaces,
-        "selected_workspace_id": selected_workspace_id
+        "selected_workspace_id": selected_workspace_id,
+        "subscriptionExpiry": {
+            "capability": subscription_expiry.capability,
+            "manualExpiresAt": manual_expires_at,
+            "effectiveExpiresAt": effective_expires_at,
+            "source": subscription_expiry.source,
+            "kind": expiry_kind,
+        }
     })
 }
 
@@ -2535,8 +2574,13 @@ pub(in crate::api) async fn web_managed_auth_set_default_account(
     require_session(&state, &headers).await?;
     let provider_type = web_auth_provider_type(args)?;
     let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
-    state
+    let default_changed = state
         .try_mutate_accounts_immediate(|store| {
+            let default_changed = store
+                .accounts
+                .iter()
+                .find(|account| account.provider_type == provider_type)
+                .is_none_or(|account| account.id != account_id);
             let Some(index) = store.accounts.iter().position(|account| {
                 account.id == account_id && account.provider_type == provider_type
             }) else {
@@ -2549,11 +2593,73 @@ pub(in crate::api) async fn web_managed_auth_set_default_account(
                 .position(|item| item.provider_type == provider_type)
                 .unwrap_or(store.accounts.len());
             store.accounts.insert(insert_at, account);
-            Ok(())
+            Ok(default_changed)
         })
         .await
         .map_err(ApiError::internal)??;
+    if default_changed {
+        state
+            .refresh_account_subscription_metadata(provider_type, None)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     Ok(Value::Null)
+}
+
+pub(in crate::api) async fn web_managed_auth_set_manual_subscription_expiry(
+    state: ServerState,
+    headers: HeaderMap,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    require_session(&state, &headers).await?;
+    let provider_type = web_auth_provider_type(args)?;
+    let provider_label = managed_auth_provider_label(provider_type);
+    let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
+    let expires_at = args
+        .get("expiresAt")
+        .or_else(|| args.get("expires_at"))
+        .ok_or_else(|| ApiError::bad_request("expiresAt is required"))?;
+    let expires_at_ms = match expires_at {
+        Value::Null => None,
+        Value::String(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(ApiError::bad_request(
+                    "expiresAt must be an RFC3339 timestamp or null",
+                ));
+            }
+            Some(
+                chrono::DateTime::parse_from_rfc3339(value)
+                    .map_err(|_| {
+                        ApiError::bad_request("expiresAt must be a valid RFC3339 timestamp")
+                    })?
+                    .timestamp_millis(),
+            )
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "expiresAt must be an RFC3339 timestamp or null",
+            ));
+        }
+    };
+
+    state
+        .set_manual_subscription_expiry_and_sync(provider_type, &account_id, expires_at_ms)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(|error| match error {
+            crate::domain::accounts::store::ManualSubscriptionExpiryError::NotFound(_) => {
+                ApiError::not_found("account not found")
+            }
+            crate::domain::accounts::store::ManualSubscriptionExpiryError::Unsupported(_) => {
+                ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+            }
+            crate::domain::accounts::store::ManualSubscriptionExpiryError::InvalidTimestamp => {
+                ApiError::bad_request(error)
+            }
+        })?;
+
+    web_managed_auth_account_by_id(&state, &account_id, provider_label).await
 }
 
 pub(in crate::api) async fn web_managed_auth_set_workspace(
@@ -2577,13 +2683,29 @@ pub(in crate::api) async fn web_managed_auth_set_workspace(
         .account_refresh_locks
         .lock(ProviderType::CodexOAuth, &account_id)
         .await;
-    let account = state
+    let (account_before_workspace_change, account) = state
         .try_mutate_accounts_immediate(|store| {
-            store.select_codex_workspace(&account_id, &workspace_id)
+            let before = store
+                .accounts
+                .iter()
+                .find(|account| {
+                    account.id == account_id && account.provider_type == ProviderType::CodexOAuth
+                })
+                .cloned()
+                .ok_or_else(|| "codex account not found".to_string())?;
+            let account = store.select_codex_workspace(&account_id, &workspace_id)?;
+            Ok::<_, String>((before, account))
         })
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::bad_request)?;
+    state
+        .refresh_automatic_subscription_metadata_if_changed(
+            &account_before_workspace_change,
+            &account,
+        )
+        .await
+        .map_err(ApiError::internal)?;
     Ok(map_managed_auth_account(
         &account,
         managed_auth_provider_label(ProviderType::CodexOAuth),

@@ -29,7 +29,9 @@ use cc_switch_server::api::{
     control_signature, control_signature_for_method, refresh_share_usage_items,
 };
 use cc_switch_server::cli::Cli;
-use cc_switch_server::domain::accounts::store::{AccountQuota, UpsertAccountInput};
+use cc_switch_server::domain::accounts::store::{
+    AccountQuota, AccountRefreshUpdate, UpsertAccountInput,
+};
 use cc_switch_server::domain::failover::UpdateFailoverAppInput;
 use cc_switch_server::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
@@ -3799,6 +3801,684 @@ async fn setup_and_login(app: &Router) -> String {
         .to_string()
 }
 
+#[tokio::test]
+async fn managed_auth_manual_subscription_expiry_updates_account_and_share_metadata() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-claude-expiry",
+                ProviderType::ClaudeOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "claude-expiry-provider".to_string(),
+            name: "Claude Expiry Provider".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("claude_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("claude_oauth".to_string()),
+                    account_id: Some("acct-claude-expiry".to_string()),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+    let mut share_input = test_share_input(
+        "share-claude-expiry",
+        "claude-expiry-provider",
+        ProviderType::ClaudeOAuth,
+    );
+    share_input.app = AppKind::Claude;
+    let share = state
+        .mutate_shares_immediate(|shares| shares.upsert(share_input).unwrap())
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_manual_subscription_expiry",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-expiry",
+                "expiresAt": "2026-08-17T00:00:00Z"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = json_body(response).await;
+    assert_eq!(
+        account["subscriptionExpiry"]["capability"],
+        "manual_required"
+    );
+    assert_eq!(account["subscriptionExpiry"]["source"], "manual");
+    assert_eq!(
+        account["subscriptionExpiry"]["manualExpiresAt"],
+        "2026-08-17T00:00:00.000Z"
+    );
+    assert_eq!(
+        account["subscriptionExpiry"]["effectiveExpiresAt"],
+        "2026-08-17T00:00:00.000Z"
+    );
+    assert_eq!(account["subscriptionExpiry"]["kind"], "billing_period");
+
+    let stored = state
+        .find_account_by_id("acct-claude-expiry")
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.manual_subscription_expires_at_ms,
+        Some(1_786_924_800_000)
+    );
+    assert!(stored
+        .manual_subscription_expiry_updated_at_ms
+        .is_some_and(|value| value > 0));
+    let updated_share = state
+        .mutate_shares(|shares| shares.get("share-claude-expiry").cloned().unwrap())
+        .await;
+    assert!(updated_share.config_revision > share.config_revision);
+    assert!(updated_share.router_synced_revision < updated_share.config_revision);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_manual_subscription_expiry",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-expiry",
+                "expiresAt": "2026-08-17T00:00:00Z"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let unchanged_revision = state
+        .mutate_shares(|shares| shares.get("share-claude-expiry").unwrap().config_revision)
+        .await;
+    assert_eq!(unchanged_revision, updated_share.config_revision);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_manual_subscription_expiry",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-expiry",
+                "expiresAt": null
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = json_body(response).await;
+    assert!(account["subscriptionExpiry"]["manualExpiresAt"].is_null());
+    assert!(account["subscriptionExpiry"]["effectiveExpiresAt"].is_null());
+    assert!(account["subscriptionExpiry"]["source"].is_null());
+
+    let response = app_router(state.clone())
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_manual_subscription_expiry",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-expiry",
+                "expiresAt": "2020-01-01T00:00:00Z"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = json_body(response).await;
+    assert_eq!(
+        account["subscriptionExpiry"]["effectiveExpiresAt"],
+        "2020-01-01T00:00:00.000Z"
+    );
+}
+
+#[tokio::test]
+async fn managed_auth_list_accounts_returns_sanitized_subscription_views() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            let mut input = test_account_input("acct-claude-sanitized", ProviderType::ClaudeOAuth);
+            input.id_token = Some("id-token-secret".to_string());
+            input.api_key = Some("api-key-secret".to_string());
+            input.raw = Some(json!({"secret": "raw-secret"}));
+            accounts.upsert(input);
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_list_accounts",
+            json!({"authProvider": "claude_oauth"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let accounts = json_body(response).await;
+    let account = &accounts.as_array().unwrap()[0];
+    assert_eq!(account["id"], "acct-claude-sanitized");
+    assert_eq!(
+        account["subscriptionExpiry"]["capability"],
+        "manual_required"
+    );
+    for sensitive_key in [
+        "accessToken",
+        "refreshToken",
+        "idToken",
+        "apiKey",
+        "raw",
+        "profile",
+        "extraHeaders",
+    ] {
+        assert!(
+            account.get(sensitive_key).is_none(),
+            "leaked {sensitive_key}"
+        );
+    }
+    let body = account.to_string();
+    for secret in [
+        "access-token",
+        "refresh-token",
+        "id-token-secret",
+        "api-key-secret",
+        "raw-secret",
+    ] {
+        assert!(!body.contains(secret), "leaked secret value");
+    }
+}
+
+#[tokio::test]
+async fn managed_auth_manual_subscription_expiry_rejects_non_manual_accounts() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-codex-expiry",
+                ProviderType::CodexOAuth,
+            ));
+            accounts.upsert(test_account_input(
+                "acct-cursor-expiry",
+                ProviderType::CursorOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_manual_subscription_expiry",
+            json!({
+                "authProvider": "codex_oauth",
+                "accountId": "acct-codex-expiry",
+                "expiresAt": "2026-08-17T00:00:00Z"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(json_body(response).await["error"]
+        .as_str()
+        .unwrap()
+        .contains("not supported"));
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_manual_subscription_expiry",
+            json!({
+                "authProvider": "cursor_oauth",
+                "accountId": "acct-cursor-expiry",
+                "expiresAt": "2026-08-17T00:00:00Z"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(json_body(response).await["error"]
+        .as_str()
+        .unwrap()
+        .contains("not supported"));
+}
+
+#[tokio::test]
+async fn managed_auth_default_account_change_refreshes_only_unbound_provider_shares() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-claude-default-a",
+                ProviderType::ClaudeOAuth,
+            ));
+            accounts.upsert(test_account_input(
+                "acct-claude-default-b",
+                ProviderType::ClaudeOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    for (provider_id, account_id) in [
+        ("claude-unbound", None),
+        ("claude-explicit", Some("acct-claude-default-a")),
+    ] {
+        upsert_test_provider(
+            &state,
+            AppKind::Claude,
+            Provider {
+                id: provider_id.to_string(),
+                name: provider_id.to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("claude_oauth".to_string()),
+                    auth_binding: account_id.map(|account_id| AuthBinding {
+                        source: Some("managed_account".to_string()),
+                        auth_provider: Some("claude_oauth".to_string()),
+                        account_id: Some(account_id.to_string()),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+        )
+        .await;
+        let mut share_input = test_share_input(
+            &format!("share-{provider_id}"),
+            provider_id,
+            ProviderType::ClaudeOAuth,
+        );
+        share_input.app = AppKind::Claude;
+        state
+            .mutate_shares_immediate(|shares| shares.upsert(share_input).unwrap())
+            .await
+            .unwrap();
+    }
+    let (unbound_revision, explicit_revision) = state
+        .mutate_shares(|shares| {
+            (
+                shares.get("share-claude-unbound").unwrap().config_revision,
+                shares.get("share-claude-explicit").unwrap().config_revision,
+            )
+        })
+        .await;
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_default_account",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-default-b"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (updated_unbound_revision, updated_explicit_revision) = state
+        .mutate_shares(|shares| {
+            (
+                shares.get("share-claude-unbound").unwrap().config_revision,
+                shares.get("share-claude-explicit").unwrap().config_revision,
+            )
+        })
+        .await;
+    assert!(updated_unbound_revision > unbound_revision);
+    assert_eq!(updated_explicit_revision, explicit_revision);
+}
+
+#[tokio::test]
+async fn managed_auth_account_removal_refreshes_explicit_and_default_bound_shares() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-claude-removed",
+                ProviderType::ClaudeOAuth,
+            ));
+            accounts
+                .set_manual_subscription_expiry(
+                    "acct-claude-removed",
+                    Some(1_786_924_800_000),
+                    1_700_000_000_000,
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    for (provider_id, account_id) in [
+        ("claude-remove-default", None),
+        ("claude-remove-explicit", Some("acct-claude-removed")),
+    ] {
+        upsert_test_provider(
+            &state,
+            AppKind::Claude,
+            Provider {
+                id: provider_id.to_string(),
+                name: provider_id.to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("claude_oauth".to_string()),
+                    auth_binding: account_id.map(|account_id| AuthBinding {
+                        source: Some("managed_account".to_string()),
+                        auth_provider: Some("claude_oauth".to_string()),
+                        account_id: Some(account_id.to_string()),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+        )
+        .await;
+        let mut share_input = test_share_input(
+            &format!("share-{provider_id}"),
+            provider_id,
+            ProviderType::ClaudeOAuth,
+        );
+        share_input.app = AppKind::Claude;
+        state
+            .mutate_shares_immediate(|shares| shares.upsert(share_input).unwrap())
+            .await
+            .unwrap();
+    }
+    let revisions_before = state
+        .mutate_shares(|shares| {
+            [
+                "share-claude-remove-default",
+                "share-claude-remove-explicit",
+            ]
+            .map(|share_id| shares.get(share_id).unwrap().config_revision)
+        })
+        .await;
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_remove_account",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-removed"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(state
+        .find_account_by_id("acct-claude-removed")
+        .await
+        .is_none());
+    let revisions_after = state
+        .mutate_shares(|shares| {
+            [
+                "share-claude-remove-default",
+                "share-claude-remove-explicit",
+            ]
+            .map(|share_id| shares.get(share_id).unwrap().config_revision)
+        })
+        .await;
+    assert!(revisions_after[0] > revisions_before[0]);
+    assert!(revisions_after[1] > revisions_before[1]);
+}
+
+#[tokio::test]
+async fn automatic_subscription_expiry_refreshes_share_only_when_effective_value_changes() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-codex-auto-expiry",
+                ProviderType::CodexOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    upsert_test_provider(
+        &state,
+        AppKind::Codex,
+        Provider {
+            id: "codex-auto-expiry-provider".to_string(),
+            name: "Codex Auto Expiry Provider".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("codex_oauth".to_string()),
+                    account_id: Some("acct-codex-auto-expiry".to_string()),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+    let share = state
+        .mutate_shares_immediate(|shares| {
+            shares
+                .upsert(test_share_input(
+                    "share-codex-auto-expiry",
+                    "codex-auto-expiry-provider",
+                    ProviderType::CodexOAuth,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    let before = state
+        .find_account_by_id("acct-codex-auto-expiry")
+        .await
+        .unwrap();
+    let after = state
+        .mutate_accounts_immediate(|accounts| {
+            accounts
+                .mark_refresh_success(
+                    "acct-codex-auto-expiry",
+                    AccountRefreshUpdate {
+                        quota: Some(AccountQuota {
+                            success: true,
+                            credential_message: None,
+                            tiers: Vec::new(),
+                            extra_usage: Some(json!({
+                                "subscription": {
+                                    "expiresAt": "2026-08-17T00:00:00Z"
+                                }
+                            })),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+    assert!(state
+        .refresh_automatic_subscription_metadata_if_changed(&before, &after)
+        .await
+        .unwrap());
+    let changed_revision = state
+        .mutate_shares(|shares| {
+            shares
+                .get("share-codex-auto-expiry")
+                .unwrap()
+                .config_revision
+        })
+        .await;
+    assert!(changed_revision > share.config_revision);
+
+    assert!(!state
+        .refresh_automatic_subscription_metadata_if_changed(&after, &after)
+        .await
+        .unwrap());
+    let unchanged_revision = state
+        .mutate_shares(|shares| {
+            shares
+                .get("share-codex-auto-expiry")
+                .unwrap()
+                .config_revision
+        })
+        .await;
+    assert_eq!(unchanged_revision, changed_revision);
+}
+
+#[tokio::test]
+async fn codex_workspace_change_clears_subscription_expiry_and_refreshes_share() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            let mut input =
+                test_account_input("acct-codex-workspace-expiry", ProviderType::CodexOAuth);
+            input.profile = Some(json!({
+                "verifiedOpenAiClaims": {
+                    "chatgpt_account_id": "workspace-default",
+                    "organizations": [
+                        {"id": "workspace-team", "name": "Team"}
+                    ]
+                },
+                "selectedChatgptAccountId": "workspace-default"
+            }));
+            input.quota = Some(AccountQuota {
+                success: true,
+                credential_message: None,
+                tiers: Vec::new(),
+                extra_usage: Some(json!({
+                    "subscription": {
+                        "expiresAt": "2026-08-17T00:00:00Z"
+                    }
+                })),
+            });
+            accounts.upsert(input);
+        })
+        .await
+        .unwrap();
+    upsert_test_provider(
+        &state,
+        AppKind::Codex,
+        Provider {
+            id: "codex-workspace-expiry-provider".to_string(),
+            name: "Codex Workspace Expiry Provider".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("codex_oauth".to_string()),
+                    account_id: Some("acct-codex-workspace-expiry".to_string()),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+    let share = state
+        .mutate_shares_immediate(|shares| {
+            shares
+                .upsert(test_share_input(
+                    "share-codex-workspace-expiry",
+                    "codex-workspace-expiry-provider",
+                    ProviderType::CodexOAuth,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_workspace",
+            json!({
+                "authProvider": "codex_oauth",
+                "accountId": "acct-codex-workspace-expiry",
+                "workspaceId": "workspace-team"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = json_body(response).await;
+    assert!(account["subscriptionExpiry"]["effectiveExpiresAt"].is_null());
+    let updated_revision = state
+        .mutate_shares(|shares| {
+            shares
+                .get("share-codex-workspace-expiry")
+                .unwrap()
+                .config_revision
+        })
+        .await;
+    assert!(updated_revision > share.config_revision);
+}
+
+fn test_account_input(account_id: &str, provider_type: ProviderType) -> UpsertAccountInput {
+    UpsertAccountInput {
+        id: Some(account_id.to_string()),
+        provider_type,
+        email: Some(format!("{account_id}@example.com")),
+        access_token: Some("access-token".to_string()),
+        refresh_token: Some("refresh-token".to_string()),
+        id_token: None,
+        token_type: Some("Bearer".to_string()),
+        api_key: None,
+        extra_headers: None,
+        scopes: Vec::new(),
+        profile: None,
+        raw: None,
+        subscription_level: Some("Pro".to_string()),
+        entitlement_status: None,
+        quota_percent: None,
+        quota: None,
+        quota_refreshed_at: None,
+        quota_next_refresh_at: None,
+        expires_at: None,
+        rate_limited_until: None,
+        last_refresh_error: None,
+    }
+}
+
 async fn spawn_broken_chunked_upstream() -> std::net::SocketAddr {
     spawn_broken_chunked_status_upstream("200 OK", "text/event-stream").await
 }
@@ -4224,6 +4904,7 @@ fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) ->
         bindings: Vec::new(),
         runtime_snapshot: None,
         market_grant: None,
+        user_grants: BTreeMap::new(),
     }
 }
 

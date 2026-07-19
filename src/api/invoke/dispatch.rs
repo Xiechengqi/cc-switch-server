@@ -882,10 +882,8 @@ async fn web_invoke_dispatch(
         }
         "auth_list_accounts" => {
             let provider_type = web_optional_auth_provider_type(&args)?;
-            let accounts = state
-                .accounts
-                .read()
-                .await
+            let accounts = state.accounts.read().await;
+            let mapped = accounts
                 .accounts
                 .iter()
                 .filter(|account| {
@@ -893,9 +891,20 @@ async fn web_invoke_dispatch(
                         .map(|provider_type| account.provider_type == provider_type)
                         .unwrap_or(true)
                 })
-                .cloned()
+                .map(|account| {
+                    let default_account_id = accounts
+                        .accounts
+                        .iter()
+                        .find(|candidate| candidate.provider_type == account.provider_type)
+                        .map(|candidate| candidate.id.as_str());
+                    map_managed_auth_account(
+                        account,
+                        managed_auth_provider_label(account.provider_type),
+                        default_account_id,
+                    )
+                })
                 .collect::<Vec<_>>();
-            Ok(json!(accounts))
+            Ok(json!(mapped))
         }
         "auth_start_login" => {
             web_managed_auth_start_login(state.clone(), headers.clone(), &args).await
@@ -911,6 +920,10 @@ async fn web_invoke_dispatch(
         }
         "auth_set_default_account" => {
             web_managed_auth_set_default_account(state.clone(), headers.clone(), &args).await
+        }
+        "auth_set_manual_subscription_expiry" => {
+            web_managed_auth_set_manual_subscription_expiry(state.clone(), headers.clone(), &args)
+                .await
         }
         "auth_set_workspace" => {
             web_managed_auth_set_workspace(state.clone(), headers.clone(), &args).await
@@ -1906,7 +1919,7 @@ async fn web_invoke_dispatch(
             let credit_id =
                 web_optional_string_any(&args, &["creditId", "credit_id"]).unwrap_or_default();
             let (account_id, account) =
-                resolve_codex_oauth_account_for_banked_reset(&state, account_id.as_deref()).await?;
+                resolve_codex_oauth_account_for_banked_reset(state, account_id.as_deref()).await?;
             let access_token = account
                 .access_token
                 .as_deref()
@@ -1948,9 +1961,6 @@ async fn web_invoke_dispatch(
                 "remainingCredits": result.remaining_credits,
             }))
         }
-        "codex_banked_reset_invite" => Err(ApiError::not_implemented(
-            "codex banked reset invite is no longer available on cc-switch-server",
-        )),
         "open_provider_terminal" => Err(ApiError::not_implemented(
             "open_provider_terminal is not available in server web runtime",
         )),

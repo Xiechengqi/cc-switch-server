@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::accounts::store::{Account, AccountQuotaTier, AccountStore};
+use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
 use crate::domain::providers::model::{classify_provider, AppKind, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
@@ -41,6 +42,81 @@ pub struct ShareSettingsPatch {
     pub expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareTokenPeriod {
+    #[default]
+    Lifetime,
+    Day,
+    Week,
+    CalendarMonth,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<u64>,
+    #[serde(default)]
+    pub token_period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsageBucket {
+    #[serde(default)]
+    pub started_at_ms: i64,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub requests_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsage {
+    #[serde(default)]
+    pub lifetime: ShareUserUsageBucket,
+    #[serde(default)]
+    pub day: ShareUserUsageBucket,
+    #[serde(default)]
+    pub week: ShareUserUsageBucket,
+    #[serde(default)]
+    pub calendar_month: ShareUserUsageBucket,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserGrant {
+    pub email: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default)]
+    pub policy: ShareUserPolicy,
+    #[serde(default)]
+    pub usage: ShareUserUsage,
+    #[serde(default)]
+    pub created_at_ms: u128,
+    #[serde(default)]
+    pub updated_at_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at_ms: Option<u128>,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -103,6 +179,8 @@ pub struct ShareDescriptor {
     pub auto_start: bool,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub user_grants: BTreeMap<String, ShareUserGrant>,
 }
 
 fn is_zero_revision(value: &u64) -> bool {
@@ -571,6 +649,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         model_health,
         auto_start: share.auto_start,
         config_revision: share.config_revision,
+        user_grants: share.user_grants.clone(),
     }
 }
 
@@ -754,49 +833,39 @@ fn account_for_provider<'a>(
 }
 
 fn account_subscription_expires_at(account: &Account) -> Option<String> {
-    account
-        .quota
-        .as_ref()
-        .and_then(|quota| quota.extra_usage.as_ref())
-        .and_then(subscription_expires_at_from_extra)
+    let expires_at_ms = resolved_subscription_expiry(account).expires_at_ms?;
+    Utc.timestamp_millis_opt(expires_at_ms)
+        .single()
+        .map(|value| value.to_rfc3339())
 }
 
 fn account_subscription_remaining_ms(account: &Account) -> Option<i64> {
-    account
-        .quota
-        .as_ref()
-        .and_then(|quota| quota.extra_usage.as_ref())
-        .and_then(subscription_remaining_ms_from_extra)
-}
-
-fn subscription_expires_at_from_extra(value: &Value) -> Option<String> {
-    [
-        "/subscriptionPeriodEnd",
-        "/subscription/expiresAt",
-        "/subscription/expires_at",
-        "/raw/SubscriptionPeriodEnd/Time",
-        "/raw/subscriptionPeriodEnd/time",
-    ]
-    .iter()
-    .find_map(|pointer| {
-        value
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
-}
-
-fn subscription_remaining_ms_from_extra(value: &Value) -> Option<i64> {
-    value
-        .pointer("/subscriptionRemainingMs")
-        .and_then(Value::as_i64)
+    resolved_subscription_expiry(account)
+        .expires_at_ms
+        .map(|expires_at_ms| {
+            expires_at_ms
+                .saturating_sub(crate::infra::time::now_ms().min(i64::MAX as u128) as i64)
+                .max(0)
+        })
 }
 
 fn upstream_quota_from_account(account: &Account) -> Option<ShareUpstreamQuota> {
-    let quota = account.quota.as_ref()?;
-    if quota.tiers.is_empty() && !quota.success {
+    let subscription_period_end = account_subscription_expires_at(account);
+    let Some(quota) = account.quota.as_ref() else {
+        return subscription_period_end.map(|subscription_period_end| ShareUpstreamQuota {
+            status: "ok".to_string(),
+            plan: account.subscription_level.clone(),
+            queried_at: None,
+            subscription_period_end: Some(subscription_period_end),
+            availability: Some("available".to_string()),
+            blocked_until: None,
+            blocked_reason: None,
+            blocked_scope: None,
+            dispatch_limit_percent: None,
+            tiers: Vec::new(),
+        });
+    };
+    if quota.tiers.is_empty() && !quota.success && subscription_period_end.is_none() {
         return None;
     }
     let plan = quota
@@ -811,7 +880,7 @@ fn upstream_quota_from_account(account: &Account) -> Option<ShareUpstreamQuota> 
         },
         plan,
         queried_at: account.quota_refreshed_at,
-        subscription_period_end: account_subscription_expires_at(account),
+        subscription_period_end,
         availability: Some("available".to_string()),
         blocked_until: None,
         blocked_reason: None,
@@ -1220,6 +1289,40 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_uses_manual_account_billing_expiry_without_changing_share_expiry() {
+        let share = test_share(ProviderType::ClaudeOAuth, Some(5.0));
+        let providers = ProviderStore {
+            providers: vec![test_provider(ProviderType::ClaudeOAuth)],
+        };
+        let mut account = test_account(ProviderType::ClaudeOAuth);
+        account.quota = None;
+        account.manual_subscription_expires_at_ms = Some(1_786_924_800_000);
+        account.manual_subscription_expiry_updated_at_ms = Some(1_784_000_000_000);
+        let accounts = AccountStore {
+            accounts: vec![account],
+        };
+
+        let descriptor =
+            descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
+        let provider = descriptor.app_providers.codex.first().unwrap();
+
+        assert_eq!(
+            provider.subscription_expires_at.as_deref(),
+            Some("2026-08-17T00:00:00+00:00")
+        );
+        assert!(provider.subscription_remaining_ms.is_some());
+        assert_eq!(provider.quota.as_ref().unwrap().status, "ok");
+        assert_eq!(
+            provider
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.subscription_period_end.as_deref()),
+            Some("2026-08-17T00:00:00+00:00")
+        );
+        assert_eq!(descriptor.expires_at, UNLIMITED_SHARE_EXPIRES_AT);
+    }
+
+    #[test]
     fn descriptor_maps_codex_quota_tiers_for_router_share_card() {
         let share = test_share(ProviderType::CodexOAuth, Some(1.0));
         let providers = ProviderStore {
@@ -1479,6 +1582,7 @@ mod tests {
             router_url: None,
             config_revision: 0,
             router_synced_revision: 0,
+            user_grants: BTreeMap::new(),
         }
     }
 
@@ -1512,6 +1616,8 @@ mod tests {
             quota_refreshed_at: Some(1_000),
             quota_next_refresh_at: Some(2_000),
             expires_at: None,
+            manual_subscription_expires_at_ms: None,
+            manual_subscription_expiry_updated_at_ms: None,
             rate_limited_until: None,
             last_refresh_error: None,
             refresh_consecutive_failures: 0,

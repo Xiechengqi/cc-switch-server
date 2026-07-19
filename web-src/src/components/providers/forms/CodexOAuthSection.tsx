@@ -31,6 +31,7 @@ import {
 } from "@/config/constants";
 import { isRemoteWebMode } from "@/lib/api/auth";
 import CodexBankedResetPanel from "./CodexBankedResetPanel";
+import { AccountSubscriptionExpiryControl } from "@/components/settings/AccountSubscriptionExpiryControl";
 
 interface CodexOAuthSectionProps {
   className?: string;
@@ -297,7 +298,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             {accounts.map((account) => (
               <div
                 key={account.id}
-                className="flex items-center justify-between rounded-md border bg-muted/30 p-2"
+                className="flex flex-wrap items-center justify-between rounded-md border bg-muted/30 p-2"
               >
                 <div className="flex min-w-0 items-center gap-2">
                   <User className="h-5 w-5 shrink-0 text-muted-foreground" />
@@ -340,6 +341,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                     <X className="h-4 w-4" />
                   </Button>
                 </div>
+                <AccountSubscriptionExpiryControl account={account} />
               </div>
             ))}
           </div>

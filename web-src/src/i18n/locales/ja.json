@@ -390,7 +390,20 @@
       "quotaRefreshIntervalInvalid": "更新間隔は 1 分以上の整数である必要があります",
       "quotaRefreshIntervalSaved": "使用量の更新間隔を保存しました",
       "copilotDescription": "GitHub Copilot アカウントを管理します",
-      "codexOauthDescription": "ChatGPT アカウントを管理します"
+      "codexOauthDescription": "ChatGPT アカウントを管理します",
+      "subscriptionExpiry": {
+        "title": "サブスクリプションアカウントの有効期限",
+        "notSet": "未設定",
+        "notAvailable": "未取得",
+        "automatic": "自動取得",
+        "manual": "手動設定",
+        "save": "有効期限を保存",
+        "clear": "有効期限をクリア",
+        "saved": "サブスクリプションアカウントの有効期限を保存しました",
+        "cleared": "サブスクリプションアカウントの有効期限をクリアしました",
+        "saveFailed": "サブスクリプションアカウントの有効期限を保存できませんでした：{{error}}",
+        "unknownError": "不明なエラー"
+      }
     },
     "serverSecurity": {
       "changePasswordTitle": "パスワード変更",

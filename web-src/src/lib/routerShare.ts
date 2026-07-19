@@ -14,6 +14,7 @@ export interface RouterShareSettingsPatch {
   parallelLimit?: number;
   expiresAt?: string;
   autoStart?: boolean;
+  userGrants?: import("@/lib/api/share").ShareUserGrantMap;
 }
 
 export interface RouterShareSettingsUpdateResponse {

@@ -382,12 +382,26 @@ pub(crate) async fn refresh_share_usage_item(
     .await
     {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
+            let account_before_quota_refresh = active_account.clone();
             let updated = state
                 .mutate_accounts_debounced(|accounts| {
                     accounts.mark_refresh_success(&active_account.id, update)
                 })
                 .await;
             if let Some(ref account) = updated {
+                if let Err(error) = state
+                    .refresh_automatic_subscription_metadata_if_changed(
+                        &account_before_quota_refresh,
+                        account,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        account_id = %account.id,
+                        %error,
+                        "control quota refresh could not persist subscription metadata change"
+                    );
+                }
                 state.emit_oauth_quota_updated_event(account, true);
             }
             ControlRefreshShareUsageItem {

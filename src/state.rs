@@ -39,7 +39,9 @@ use crate::clients::router::tunnel::{
 use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::AccountRefreshLocks;
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
-use crate::domain::accounts::store::{Account, AccountRefreshUpdate, AccountStore};
+use crate::domain::accounts::store::{
+    Account, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
+};
 use crate::domain::failover::FailoverStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
@@ -317,6 +319,13 @@ pub struct ShareInFlightTracker {
 pub struct ShareInFlightGuard {
     tracker: Arc<ShareInFlightTracker>,
     share_id: String,
+    user_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareInFlightAcquireError {
+    ShareLimit,
+    UserLimit,
 }
 
 #[derive(Debug, Default)]
@@ -366,36 +375,66 @@ impl ShareInFlightTracker {
         share_id: &str,
         parallel_limit: Option<u32>,
     ) -> Option<ShareInFlightGuard> {
-        let mut counts = self.counts.lock().ok()?;
+        self.try_acquire_for_user(share_id, parallel_limit, None, None)
+            .ok()
+    }
+
+    pub fn try_acquire_for_user(
+        self: &Arc<Self>,
+        share_id: &str,
+        parallel_limit: Option<u32>,
+        user_email: Option<&str>,
+        user_parallel_limit: Option<u32>,
+    ) -> Result<ShareInFlightGuard, ShareInFlightAcquireError> {
+        let mut counts = self
+            .counts
+            .lock()
+            .map_err(|_| ShareInFlightAcquireError::ShareLimit)?;
         let current = *counts.get(share_id).unwrap_or(&0);
         if parallel_limit.is_some_and(|limit| current >= limit) {
-            return None;
+            return Err(ShareInFlightAcquireError::ShareLimit);
+        }
+        let user_key =
+            user_email.map(|email| format!("{share_id}\u{1f}{}", email.to_ascii_lowercase()));
+        if let Some(user_key) = user_key.as_deref() {
+            let user_current = *counts.get(user_key).unwrap_or(&0);
+            if user_parallel_limit.is_some_and(|limit| user_current >= limit) {
+                return Err(ShareInFlightAcquireError::UserLimit);
+            }
         }
         counts.insert(share_id.to_string(), current.saturating_add(1));
-        Some(ShareInFlightGuard {
+        if let Some(user_key) = user_key.as_deref() {
+            let current = *counts.get(user_key).unwrap_or(&0);
+            counts.insert(user_key.to_string(), current.saturating_add(1));
+        }
+        Ok(ShareInFlightGuard {
             tracker: self.clone(),
             share_id: share_id.to_string(),
+            user_key,
         })
     }
 
-    fn release(&self, share_id: &str) {
+    fn release(&self, share_id: &str, user_key: Option<&str>) {
         let Ok(mut counts) = self.counts.lock() else {
             return;
         };
-        let Some(current) = counts.get_mut(share_id) else {
-            return;
-        };
-        if *current <= 1 {
-            counts.remove(share_id);
-        } else {
-            *current -= 1;
+        for key in std::iter::once(share_id).chain(user_key) {
+            let Some(current) = counts.get_mut(key) else {
+                continue;
+            };
+            if *current <= 1 {
+                counts.remove(key);
+            } else {
+                *current -= 1;
+            }
         }
     }
 }
 
 impl Drop for ShareInFlightGuard {
     fn drop(&mut self) {
-        self.tracker.release(&self.share_id);
+        self.tracker
+            .release(&self.share_id, self.user_key.as_deref());
     }
 }
 
@@ -698,17 +737,29 @@ impl ServerStateInner {
         let pricing = ModelPricingStore::load_or_default(&config_dir)?;
         let usage = UsageStore::load_or_default(&config_dir)?;
         let mut shares = ShareStore::load_or_default(&config_dir)?;
+        let mut shares_changed = false;
         if let Some(owner_email) = config.owner.email.as_deref() {
             let migrated = shares
                 .bind_all_to_client_owner(owner_email)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             if !migrated.is_empty() {
-                shares.save(&config_dir)?;
+                shares_changed = true;
                 tracing::info!(
                     migrated_shares = migrated.len(),
                     "bound historical share owners to the client owner"
                 );
             }
+        }
+        let migrated_grants = shares.migrate_user_grants_from_acl();
+        if !migrated_grants.is_empty() {
+            shares_changed = true;
+            tracing::info!(
+                migrated_shares = migrated_grants.len(),
+                "initialized user policies for historical shares"
+            );
+        }
+        if shares_changed {
+            shares.save(&config_dir)?;
         }
         let ui_settings = UiSettingsStore::load_or_default(&config_dir)?;
         log_capture.apply_config(
@@ -1445,6 +1496,192 @@ impl ServerStateInner {
         Ok(result)
     }
 
+    pub async fn set_manual_subscription_expiry_and_sync(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        expires_at_ms: Option<i64>,
+    ) -> anyhow::Result<Result<Account, ManualSubscriptionExpiryError>> {
+        let updated_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let result = self
+            .try_mutate_accounts_immediate(|store| {
+                let previous_effective_expiry = store
+                    .accounts
+                    .iter()
+                    .find(|account| {
+                        account.id == account_id && account.provider_type == provider_type
+                    })
+                    .ok_or_else(|| ManualSubscriptionExpiryError::NotFound(account_id.to_string()))
+                    .map(|account| {
+                        crate::domain::accounts::subscription_expiry::resolved_subscription_expiry(
+                            account,
+                        )
+                        .expires_at_ms
+                    })?;
+                let account = store.set_manual_subscription_expiry(
+                    account_id,
+                    expires_at_ms,
+                    updated_at_ms,
+                )?;
+                Ok((account, previous_effective_expiry))
+            })
+            .await?;
+        let (account, previous_effective_expiry) = match result {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        let effective_expiry =
+            crate::domain::accounts::subscription_expiry::resolved_subscription_expiry(&account)
+                .expires_at_ms;
+        if previous_effective_expiry == effective_expiry {
+            return Ok(Ok(account));
+        }
+
+        self.emit_oauth_quota_updated_event(&account, true);
+        self.refresh_account_subscription_metadata(provider_type, Some(account_id))
+            .await?;
+        Ok(Ok(account))
+    }
+
+    pub async fn refresh_account_subscription_metadata(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        changed_account_id: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let providers = self.providers.read().await.clone();
+        let accounts = self.accounts.read().await.clone();
+        let default_account_id = accounts
+            .accounts
+            .iter()
+            .find(|account| account.provider_type == provider_type)
+            .map(|account| account.id.as_str());
+        let include_unbound = changed_account_id.is_none()
+            || changed_account_id.is_some_and(|account_id| default_account_id == Some(account_id));
+        let provider_keys = providers
+            .providers
+            .iter()
+            .filter(|provider| provider.provider_type == provider_type)
+            .filter(|provider| {
+                let bound_account_id = provider
+                    .provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.auth_binding.as_ref())
+                    .and_then(|binding| binding.account_id.as_deref());
+                match (changed_account_id, bound_account_id) {
+                    (Some(changed), Some(bound)) => changed == bound,
+                    (Some(_), None) => include_unbound,
+                    (None, None) => true,
+                    (None, Some(_)) => false,
+                }
+            })
+            .map(|provider| (provider.app, provider.provider.id.clone()))
+            .collect::<BTreeSet<_>>();
+        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys)
+            .await
+    }
+
+    pub async fn refresh_account_subscription_metadata_after_removal(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        was_default: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        let providers = self.providers.read().await.clone();
+        let provider_keys = providers
+            .providers
+            .iter()
+            .filter(|provider| provider.provider_type == provider_type)
+            .filter(|provider| {
+                let bound_account_id = provider
+                    .provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.auth_binding.as_ref())
+                    .and_then(|binding| binding.account_id.as_deref());
+                bound_account_id == Some(account_id) || (was_default && bound_account_id.is_none())
+            })
+            .map(|provider| (provider.app, provider.provider.id.clone()))
+            .collect::<BTreeSet<_>>();
+        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys)
+            .await
+    }
+
+    async fn refresh_share_subscription_metadata_for_provider_keys(
+        self: &Arc<Self>,
+        provider_keys: BTreeSet<(AppKind, String)>,
+    ) -> anyhow::Result<Vec<String>> {
+        if provider_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let providers = self.providers.read().await.clone();
+        let accounts = self.accounts.read().await.clone();
+        let usage = self.usage.read().await.clone();
+        let share_ids = self
+            .mutate_shares_immediate(|shares| {
+                shares.refresh_runtime_snapshots_for_providers(
+                    &provider_keys,
+                    &providers,
+                    Some(&accounts),
+                    &usage,
+                )
+            })
+            .await?;
+        if share_ids.is_empty() {
+            return Ok(share_ids);
+        }
+
+        self.emit_event(
+            ServerEvent::new("share.changed", "share")
+                .message("account_subscription_expiry_updated"),
+        );
+        if self
+            .config_snapshot()
+            .await
+            .has_registered_router_identity()
+        {
+            let state = self.clone();
+            let pending_ids = share_ids.clone();
+            tokio::spawn(async move {
+                if let Err(error) = sync_shares_to_router(&state, &pending_ids).await {
+                    tracing::warn!(
+                        share_count = pending_ids.len(),
+                        %error,
+                        "router share subscription metadata sync remains pending"
+                    );
+                }
+            });
+        }
+        Ok(share_ids)
+    }
+
+    pub async fn refresh_automatic_subscription_metadata_if_changed(
+        self: &Arc<Self>,
+        before: &Account,
+        after: &Account,
+    ) -> anyhow::Result<bool> {
+        use crate::domain::accounts::subscription_expiry::{
+            resolved_subscription_expiry, subscription_expiry_capability,
+            SubscriptionExpiryCapability,
+        };
+
+        if before.id != after.id
+            || before.provider_type != after.provider_type
+            || subscription_expiry_capability(after.provider_type)
+                != SubscriptionExpiryCapability::Automatic
+            || resolved_subscription_expiry(before).expires_at_ms
+                == resolved_subscription_expiry(after).expires_at_ms
+        {
+            return Ok(false);
+        }
+
+        self.save_accounts().await?;
+        self.refresh_account_subscription_metadata(after.provider_type, Some(&after.id))
+            .await?;
+        Ok(true)
+    }
+
     pub async fn mutate_accounts_debounced<R>(
         self: &Arc<Self>,
         mutate: impl FnOnce(&mut AccountStore) -> R,
@@ -2070,10 +2307,11 @@ impl ServerStateInner {
     pub async fn validate_share_invocation(
         self: &Arc<Self>,
         share_id: &str,
+        user_email: Option<&str>,
         now_ms: i64,
     ) -> Result<ShareInvocation, ShareInvocationRejection> {
         let result = self
-            .mutate_shares(|shares| shares.validate_for_invocation(share_id, now_ms))
+            .mutate_shares(|shares| shares.validate_for_invocation(share_id, user_email, now_ms))
             .await;
         if result
             .as_ref()
@@ -3155,14 +3393,28 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
     .await
     {
         Ok(QuotaRefreshResult::Updated { update, .. }) => {
+            let account_before_quota_refresh = active_account.clone();
             let account = {
                 let mut store = state.accounts.write().await;
                 store
                     .mark_refresh_success(&active_account.id, update)
                     .unwrap_or(active_account)
             };
-            emit_oauth_quota_updated(state, &account, true);
             save_accounts_debounced(state);
+            if let Err(error) = state
+                .refresh_automatic_subscription_metadata_if_changed(
+                    &account_before_quota_refresh,
+                    &account,
+                )
+                .await
+            {
+                tracing::warn!(
+                    account_id = %account.id,
+                    %error,
+                    "background quota refresh could not persist subscription metadata change"
+                );
+            }
+            emit_oauth_quota_updated(state, &account, true);
         }
         Ok(QuotaRefreshResult::SkippedCooldown { .. }) => {
             if account_mutated {
@@ -3846,6 +4098,48 @@ async fn sync_one_share_to_router_locked(
     result
 }
 
+pub(crate) async fn sync_shares_to_router(
+    state: &ServerState,
+    share_ids: &[String],
+) -> anyhow::Result<()> {
+    if share_ids.is_empty() {
+        return Ok(());
+    }
+    let _sync = state.lock_router_share_sync().await;
+    let config = state.config_snapshot().await;
+    if !config.has_registered_router_identity() {
+        anyhow::bail!("router installation is not registered");
+    }
+    let requested_ids = share_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let active_ids = {
+        let store = state.shares.read().await;
+        requested_ids
+            .into_iter()
+            .filter(|share_id| {
+                store.get(share_id).is_some()
+                    && !store.has_pending_router_delete_for_share(share_id)
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let operations = build_router_share_upsert_ops(state, &active_ids).await;
+    if operations.is_empty() {
+        return Ok(());
+    }
+
+    let http_client = state.http_client().await;
+    for chunk in operations.chunks(ROUTER_SHARE_SYNC_BATCH_SIZE) {
+        let chunk = chunk.to_vec();
+        match client::push_share_ops(&http_client, &config, chunk.clone()).await {
+            Ok(()) => mark_router_share_upserts_synced(state, &config, &chunk).await,
+            Err(error) => {
+                mark_router_share_upserts_failed(state, &config, &chunk, error.to_string()).await;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn spawn_router_share_delete_retry(state: ServerState, tombstone: ShareDeleteTombstone) {
     tokio::spawn(async move {
         if let Err(error) = retry_router_share_deletes(&state, &[tombstone.clone()]).await {
@@ -4078,6 +4372,37 @@ async fn mark_router_share_upserts_synced(
             store.last_router_error = None;
             for (share_id, revision) in &revisions {
                 store.mark_router_sync(share_id, *revision, router_base.clone(), Ok(now));
+            }
+        })
+        .await;
+}
+
+async fn mark_router_share_upserts_failed(
+    state: &ServerState,
+    config: &ServerConfig,
+    operations: &[ShareSyncOperation],
+    message: String,
+) {
+    let revisions = operations
+        .iter()
+        .filter_map(|operation| {
+            operation
+                .share
+                .as_ref()
+                .map(|share| (share.share_id.clone(), share.config_revision))
+        })
+        .collect::<Vec<_>>();
+    let router_base = config.router_api_base().map(str::to_string);
+    state
+        .mutate_shares_debounced(|store| {
+            store.last_router_error = Some(message.clone());
+            for (share_id, revision) in &revisions {
+                store.mark_router_sync(
+                    share_id,
+                    *revision,
+                    router_base.clone(),
+                    Err(message.clone()),
+                );
             }
         })
         .await;
@@ -4718,6 +5043,7 @@ mod tests {
             bindings: Vec::new(),
             runtime_snapshot: None,
             market_grant: None,
+            user_grants: BTreeMap::new(),
         }
     }
 
@@ -4873,6 +5199,61 @@ mod tests {
         state.replace_config(config).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn multi_share_metadata_sync_uses_one_router_batch() {
+        let (router_url, router, server) =
+            spawn_share_prune_mock_router(Vec::<String>::new(), StatusCode::OK).await;
+        let state = test_state();
+        configure_registered_test_router(&state, &router_url, "inst-metadata-batch").await;
+        create_router_shares(&state, "metadata", 2).await;
+        let share_ids = vec!["metadata0".to_string(), "metadata1".to_string()];
+
+        sync_shares_to_router(&state, &share_ids).await.unwrap();
+
+        assert_eq!(router.batch_sizes.lock().await.as_slice(), &[2]);
+        let shares = state.shares.read().await;
+        for share_id in share_ids {
+            let share = shares.get(&share_id).unwrap();
+            assert_eq!(share.router_synced_revision, share.config_revision);
+            assert!(share.router_last_sync_error.is_none());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_multi_share_metadata_sync_keeps_all_revisions_pending() {
+        async fn handler() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"message": "temporarily unavailable"})),
+            )
+        }
+
+        let app = Router::new().route("/v1/shares/batch-sync", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        configure_registered_test_router(
+            &state,
+            &format!("http://{address}"),
+            "inst-metadata-failure",
+        )
+        .await;
+        create_router_shares(&state, "pendingmeta", 2).await;
+        let share_ids = vec!["pendingmeta0".to_string(), "pendingmeta1".to_string()];
+
+        assert!(sync_shares_to_router(&state, &share_ids).await.is_err());
+
+        let shares = state.shares.read().await;
+        for share_id in share_ids {
+            let share = shares.get(&share_id).unwrap();
+            assert!(share.router_synced_revision < share.config_revision);
+            assert!(share.router_last_sync_error.is_some());
+        }
+        server.abort();
+    }
+
     fn copilot_account_fixture(expires_at: Option<i64>) -> Account {
         Account {
             id: "acct-copilot".to_string(),
@@ -4905,6 +5286,8 @@ mod tests {
             quota_refreshed_at: None,
             quota_next_refresh_at: None,
             expires_at,
+            manual_subscription_expires_at_ms: None,
+            manual_subscription_expiry_updated_at_ms: None,
             rate_limited_until: None,
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
@@ -5031,6 +5414,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
 
@@ -5448,6 +5832,7 @@ mod tests {
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 market_grant: None,
+                user_grants: BTreeMap::new(),
             })
             .unwrap();
         let mut consecutive_failures = 0;
@@ -7419,6 +7804,32 @@ mod tests {
     }
 
     #[test]
+    fn share_in_flight_tracker_intersects_share_and_user_limits() {
+        let tracker = Arc::new(ShareInFlightTracker::default());
+        let alice = tracker
+            .try_acquire_for_user("share-1", Some(2), Some("Alice@Example.com"), Some(1))
+            .expect("alice should acquire her first slot");
+        assert!(matches!(
+            tracker.try_acquire_for_user("share-1", Some(2), Some("alice@example.com"), Some(1)),
+            Err(ShareInFlightAcquireError::UserLimit)
+        ));
+
+        let bob = tracker
+            .try_acquire_for_user("share-1", Some(2), Some("bob@example.com"), Some(2))
+            .expect("bob should use the remaining total slot");
+        assert!(matches!(
+            tracker.try_acquire_for_user("share-1", Some(2), Some("charlie@example.com"), Some(2)),
+            Err(ShareInFlightAcquireError::ShareLimit)
+        ));
+
+        drop(alice);
+        assert!(tracker
+            .try_acquire_for_user("share-1", Some(2), Some("charlie@example.com"), Some(1))
+            .is_ok());
+        drop(bob);
+    }
+
+    #[test]
     fn account_in_flight_tracker_enforces_limit_and_snapshots_load() {
         let tracker = Arc::new(AccountInFlightTracker::default());
         let guard = tracker
@@ -7532,6 +7943,7 @@ mod tests {
             router_url: None,
             config_revision: 0,
             router_synced_revision: 0,
+            user_grants: std::collections::BTreeMap::new(),
         }
     }
 }

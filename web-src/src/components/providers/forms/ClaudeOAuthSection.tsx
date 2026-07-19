@@ -25,6 +25,7 @@ import { useClaudeOauth } from "./hooks/useClaudeOauth";
 import { copyText } from "@/lib/clipboard";
 import { Input } from "@/components/ui/input";
 import type { ClaudeOAuthFlowMode } from "./hooks/useClaudeOauth";
+import { AccountSubscriptionExpiryControl } from "@/components/settings/AccountSubscriptionExpiryControl";
 
 interface ClaudeOAuthSectionProps {
   className?: string;
@@ -181,7 +182,7 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
             {accounts.map((account) => (
               <div
                 key={account.id}
-                className="flex items-center justify-between rounded-md border bg-muted/30 p-2"
+                className="flex flex-wrap items-center justify-between rounded-md border bg-muted/30 p-2"
               >
                 <div className="flex min-w-0 items-center gap-2">
                   <User className="h-5 w-5 shrink-0 text-muted-foreground" />
@@ -224,6 +225,7 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
                     <X className="h-4 w-4" />
                   </Button>
                 </div>
+                <AccountSubscriptionExpiryControl account={account} />
               </div>
             ))}
           </div>
