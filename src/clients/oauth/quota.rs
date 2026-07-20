@@ -195,17 +195,24 @@ async fn refresh_codex_quota(
     request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
-    let workspace_id = codex_account_id(account);
+    let request_workspace_id = codex_account_id(account);
+    let trusted_workspace_id =
+        crate::domain::accounts::store::effective_codex_workspace_id(account);
     let usage_request = codex_authenticated_get(
         http,
         &format!("{CHATGPT_USAGE_URL}?supports_rewardless_invites=true"),
         access_token,
-        workspace_id.as_deref(),
+        request_workspace_id.as_deref(),
         request_timeout,
     );
     let (body, reset_credit_details) = tokio::join!(
         request_json(account.provider_type, usage_request, now_ms),
-        fetch_reset_credit_details(http, access_token, workspace_id.as_deref(), request_timeout,),
+        fetch_reset_credit_details(
+            http,
+            access_token,
+            request_workspace_id.as_deref(),
+            request_timeout,
+        ),
     );
     let body = body?;
     let usage: CodexUsageResponse = serde_json::from_value(body.clone())
@@ -215,7 +222,7 @@ async fn refresh_codex_quota(
         parse_usage_available_count(&body),
         reset_credit_details,
         previous_reset_credits.as_ref(),
-        workspace_id.as_deref(),
+        request_workspace_id.as_deref(),
         now_ms,
     );
 
@@ -225,21 +232,59 @@ async fn refresh_codex_quota(
         .map(normalize_chatgpt_plan_type)
         .filter(|value| !value.is_empty());
     let usage_plan_label = usage_plan_type.as_deref().map(format_chatgpt_plan_label);
-    let account_lookup =
-        fetch_chatgpt_account_lookup(http, access_token, workspace_id.as_deref(), request_timeout)
-            .await;
-    let subscription_lookup = fetch_chatgpt_subscription_lookup(
+    let usage_allowed = usage
+        .rate_limit
+        .as_ref()
+        .and_then(|rate_limit| rate_limit.allowed);
+    let usage_limit_reached = usage
+        .rate_limit
+        .as_ref()
+        .and_then(|rate_limit| rate_limit.limit_reached);
+    let account_lookup = fetch_chatgpt_account_lookup(
         http,
         access_token,
-        workspace_id.as_deref(),
+        trusted_workspace_id.as_deref(),
+        now_ms,
         request_timeout,
     )
     .await;
-    let subscription = merge_subscription_lookup(account_lookup, subscription_lookup);
-    let subscription_level = subscription
+    let subscription_lookup = fetch_chatgpt_subscription_lookup(
+        http,
+        access_token,
+        trusted_workspace_id.as_deref(),
+        request_timeout,
+    )
+    .await;
+    let account_lookup_plan_type = account_lookup
         .as_ref()
-        .and_then(|item| item.plan_label.clone())
-        .or_else(|| usage_plan_label.clone());
+        .and_then(|lookup| lookup.plan_type.clone());
+    let subscription_lookup_plan_type = subscription_lookup
+        .as_ref()
+        .and_then(|lookup| lookup.plan_type.clone());
+    let resolution = reconcile_chatgpt_subscription(
+        usage_plan_type.as_deref(),
+        usage_allowed,
+        trusted_workspace_id.is_some(),
+        account_lookup,
+        subscription_lookup,
+        now_ms,
+    );
+    if !resolution.discarded_reasons.is_empty() {
+        tracing::warn!(
+            account_id = %account.id,
+            request_workspace_id = ?request_workspace_id,
+            trusted_workspace_id = ?trusted_workspace_id,
+            usage_plan_type = ?usage_plan_type,
+            discarded_reasons = ?resolution.discarded_reasons,
+            "discarded inconsistent ChatGPT subscription metadata"
+        );
+    }
+    let subscription = resolution.subscription;
+    let subscription_level = usage_plan_label.or_else(|| {
+        subscription
+            .as_ref()
+            .and_then(|item| item.plan_label.clone())
+    });
     let subscription_json = subscription.as_ref().map(|item| {
         json!({
             "planType": item.plan_type,
@@ -259,6 +304,17 @@ async fn refresh_codex_quota(
         extra_usage: Some(json!({
             "raw": body,
             "subscription": subscription_json,
+            "subscriptionEvidence": {
+                "requestWorkspaceId": request_workspace_id,
+                "trustedWorkspaceId": trusted_workspace_id,
+                "workspaceVerified": trusted_workspace_id.is_some(),
+                "usagePlanType": usage_plan_type,
+                "usageAllowed": usage_allowed,
+                "usageLimitReached": usage_limit_reached,
+                "accountsCheckPlanType": account_lookup_plan_type,
+                "subscriptionsPlanType": subscription_lookup_plan_type,
+                "discardedReasons": resolution.discarded_reasons,
+            },
             "bankedReset": reset_credits,
             "queriedAt": now_ms,
         })),
@@ -1892,6 +1948,7 @@ async fn fetch_chatgpt_account_lookup(
     http: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
+    now_ms: i64,
     request_timeout: Duration,
 ) -> Option<ChatGptSubscriptionLookup> {
     let response = http
@@ -1908,7 +1965,7 @@ async fn fetch_chatgpt_account_lookup(
         return None;
     }
     let body = response.json::<Value>().await.ok()?;
-    parse_chatgpt_accounts_check_lookup(&body, account_id)
+    parse_chatgpt_accounts_check_lookup(&body, account_id, now_ms)
 }
 
 async fn fetch_chatgpt_subscription_lookup(
@@ -1950,29 +2007,34 @@ struct ChatGptSubscriptionLookup {
 fn parse_chatgpt_accounts_check_lookup(
     body: &Value,
     account_id: Option<&str>,
+    now_ms: i64,
 ) -> Option<ChatGptSubscriptionLookup> {
     let accounts = body.get("accounts")?.as_object()?;
     let account_id = account_id.map(str::trim).filter(|value| !value.is_empty());
 
     if let Some(account_id) = account_id {
         if let Some(account) = accounts.get(account_id) {
-            if let Some(lookup) = chatgpt_lookup_from_account(account) {
-                return Some(lookup);
-            }
+            return chatgpt_account_is_usable(account, now_ms)
+                .then(|| chatgpt_lookup_from_account(account))
+                .flatten();
         }
         for account in accounts.values() {
             if chatgpt_account_matches_id(account, account_id) {
-                if let Some(lookup) = chatgpt_lookup_from_account(account) {
-                    return Some(lookup);
-                }
+                return chatgpt_account_is_usable(account, now_ms)
+                    .then(|| chatgpt_lookup_from_account(account))
+                    .flatten();
             }
         }
+        return None;
     }
 
     let mut default_candidate = None;
     let mut paid_candidate = None;
     let mut any_candidate = None;
     for account in accounts.values() {
+        if !chatgpt_account_is_usable(account, now_ms) {
+            continue;
+        }
         let Some(lookup) = chatgpt_lookup_from_account(account) else {
             continue;
         };
@@ -2011,12 +2073,13 @@ fn parse_chatgpt_subscription_lookup(body: &Value) -> Option<ChatGptSubscription
     if plan_type.is_none() && plan_label.is_none() && expires_at.is_none() {
         return None;
     }
+    let has_expiry = expires_at.is_some();
     Some(ChatGptSubscriptionLookup {
         plan_type,
         plan_label,
         expires_at,
-        expires_source: Some("subscriptions_active_until".to_string()),
-        expires_kind: Some("subscription".to_string()),
+        expires_source: has_expiry.then(|| "subscriptions_active_until".to_string()),
+        expires_kind: has_expiry.then(|| "subscription".to_string()),
     })
 }
 
@@ -2039,13 +2102,123 @@ fn chatgpt_lookup_from_account(account: &Value) -> Option<ChatGptSubscriptionLoo
     if plan_type.is_none() && plan_label.is_none() && expires_at.is_none() {
         return None;
     }
+    let has_expiry = expires_at.is_some();
     Some(ChatGptSubscriptionLookup {
         plan_type,
         plan_label,
         expires_at,
-        expires_source: Some("accounts_check_entitlement".to_string()),
-        expires_kind: Some("subscription".to_string()),
+        expires_source: has_expiry.then(|| "accounts_check_entitlement".to_string()),
+        expires_kind: has_expiry.then(|| "subscription".to_string()),
     })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ChatGptSubscriptionResolution {
+    subscription: Option<ChatGptSubscriptionLookup>,
+    discarded_reasons: Vec<String>,
+}
+
+fn reconcile_chatgpt_subscription(
+    usage_plan_type: Option<&str>,
+    usage_allowed: Option<bool>,
+    trusted_workspace: bool,
+    account_lookup: Option<ChatGptSubscriptionLookup>,
+    subscription_lookup: Option<ChatGptSubscriptionLookup>,
+    now_ms: i64,
+) -> ChatGptSubscriptionResolution {
+    let usage_plan_type = usage_plan_type
+        .map(normalize_chatgpt_plan_type)
+        .filter(|value| !value.is_empty());
+    let mut discarded_reasons = Vec::new();
+    let account_lookup = constrain_chatgpt_subscription_lookup(
+        account_lookup,
+        usage_plan_type.as_deref(),
+        usage_allowed,
+        trusted_workspace,
+        now_ms,
+        "accounts_check",
+        &mut discarded_reasons,
+    );
+    let mut subscription_lookup = constrain_chatgpt_subscription_lookup(
+        subscription_lookup,
+        usage_plan_type.as_deref(),
+        usage_allowed,
+        trusted_workspace,
+        now_ms,
+        "subscriptions",
+        &mut discarded_reasons,
+    );
+
+    if usage_plan_type.is_none()
+        && account_lookup
+            .as_ref()
+            .and_then(|lookup| lookup.plan_type.as_deref())
+            .zip(
+                subscription_lookup
+                    .as_ref()
+                    .and_then(|lookup| lookup.plan_type.as_deref()),
+            )
+            .is_some_and(|(left, right)| !chatgpt_plan_types_match(left, right))
+    {
+        subscription_lookup = None;
+        discarded_reasons.push("subscription_sources_plan_mismatch".to_string());
+    }
+
+    let mut subscription = merge_subscription_lookup(account_lookup, subscription_lookup);
+    if let Some(usage_plan_type) = usage_plan_type {
+        let resolved = subscription.get_or_insert_with(ChatGptSubscriptionLookup::default);
+        resolved.plan_label = Some(format_chatgpt_plan_label(&usage_plan_type));
+        resolved.plan_type = Some(usage_plan_type);
+    }
+
+    ChatGptSubscriptionResolution {
+        subscription,
+        discarded_reasons,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn constrain_chatgpt_subscription_lookup(
+    mut lookup: Option<ChatGptSubscriptionLookup>,
+    usage_plan_type: Option<&str>,
+    usage_allowed: Option<bool>,
+    trusted_workspace: bool,
+    now_ms: i64,
+    source: &str,
+    discarded_reasons: &mut Vec<String>,
+) -> Option<ChatGptSubscriptionLookup> {
+    let item = lookup.as_mut()?;
+    if usage_plan_type
+        .zip(item.plan_type.as_deref())
+        .is_some_and(|(usage_plan, lookup_plan)| !chatgpt_plan_types_match(usage_plan, lookup_plan))
+    {
+        discarded_reasons.push(format!("{source}_plan_mismatch"));
+        return None;
+    }
+
+    if item.expires_at.is_some() && !trusted_workspace {
+        item.clear_expiry();
+        discarded_reasons.push(format!("{source}_untrusted_workspace_expiry"));
+    } else if item
+        .expires_at
+        .as_deref()
+        .is_some_and(|expires_at| chatgpt_expiry_is_past(expires_at, now_ms))
+        && usage_allowed == Some(true)
+        && usage_plan_type.is_some_and(chatgpt_plan_is_paid)
+    {
+        item.clear_expiry();
+        discarded_reasons.push(format!("{source}_expired_while_usage_available"));
+    }
+
+    lookup
+}
+
+impl ChatGptSubscriptionLookup {
+    fn clear_expiry(&mut self) {
+        self.expires_at = None;
+        self.expires_source = None;
+        self.expires_kind = None;
+    }
 }
 
 fn merge_subscription_lookup(
@@ -2085,6 +2258,84 @@ fn chatgpt_account_matches_id(account: &Value, account_id: &str) -> bool {
     ]
     .iter()
     .any(|path| account.pointer(path).and_then(Value::as_str) == Some(account_id))
+}
+
+fn chatgpt_account_is_usable(account: &Value, now_ms: i64) -> bool {
+    if [
+        Some(account),
+        account.get("account"),
+        account.get("entitlement"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(has_chatgpt_account_inactive_marker)
+    {
+        return false;
+    }
+
+    account
+        .pointer("/entitlement/expires_at")
+        .and_then(Value::as_str)
+        .and_then(rfc3339_to_unix_ms)
+        .is_none_or(|expires_at_ms| expires_at_ms > now_ms)
+}
+
+fn has_chatgpt_account_inactive_marker(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if ["deactivated", "is_deactivated", "disabled", "is_disabled"]
+        .into_iter()
+        .any(|key| object.get(key).and_then(Value::as_bool) == Some(true))
+    {
+        return true;
+    }
+    if ["deactivated_at", "disabled_at", "deleted_at"]
+        .into_iter()
+        .any(|key| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    {
+        return true;
+    }
+    ["status", "state"].into_iter().any(|key| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "deactivated" | "disabled" | "deleted" | "inactive" | "suspended" | "expired"
+                )
+            })
+    })
+}
+
+fn chatgpt_expiry_is_past(expires_at: &str, now_ms: i64) -> bool {
+    rfc3339_to_unix_ms(expires_at).is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+}
+
+fn chatgpt_plan_is_paid(plan: &str) -> bool {
+    chatgpt_plan_family(plan) != "free"
+}
+
+fn chatgpt_plan_types_match(left: &str, right: &str) -> bool {
+    chatgpt_plan_family(left) == chatgpt_plan_family(right)
+}
+
+fn chatgpt_plan_family(plan: &str) -> String {
+    match normalize_chatgpt_plan_type(plan).as_str() {
+        "team" | "business" | "self_serve_business" | "self_serve_business_usage_based" => {
+            "business".to_string()
+        }
+        "enterprise" | "hc" | "enterprise_cbp_usage_based" => "enterprise".to_string(),
+        "edu" | "education" | "edu_plus" | "edu_pro" => "edu".to_string(),
+        "prolite" | "pro_lite" => "pro_lite".to_string(),
+        normalized => normalized.to_string(),
+    }
 }
 
 fn codex_account_id(account: &Account) -> Option<String> {
@@ -2130,6 +2381,10 @@ struct CodexUsageResponse {
 
 #[derive(Debug, Deserialize)]
 struct CodexRateLimit {
+    #[serde(default)]
+    allowed: Option<bool>,
+    #[serde(default)]
+    limit_reached: Option<bool>,
     primary_window: Option<CodexRateLimitWindow>,
     secondary_window: Option<CodexRateLimitWindow>,
 }
@@ -2374,7 +2629,9 @@ fn format_chatgpt_plan_label(plan: &str) -> String {
         "prolite" | "pro_lite" => "ChatGPT Pro 5x".to_string(),
         "pro" => "ChatGPT Pro 20x".to_string(),
         "team" => "ChatGPT Team".to_string(),
-        "business" | "self_serve_business_usage_based" => "ChatGPT Business".to_string(),
+        "business" | "self_serve_business" | "self_serve_business_usage_based" => {
+            "ChatGPT Business".to_string()
+        }
         "enterprise" | "hc" | "enterprise_cbp_usage_based" => "ChatGPT Enterprise".to_string(),
         "edu" | "education" | "edu_plus" | "edu_pro" => "ChatGPT Edu".to_string(),
         _ => plan.trim().to_string(),
@@ -2703,6 +2960,8 @@ mod tests {
     #[test]
     fn codex_usage_maps_one_percent_window_without_scaling_bug() {
         let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
+            allowed: None,
+            limit_reached: None,
             primary_window: Some(CodexRateLimitWindow {
                 used_percent: Some(1.0),
                 limit_window_seconds: Some(18_000),
@@ -2719,6 +2978,8 @@ mod tests {
     #[test]
     fn codex_usage_parse_keeps_percent_as_account_percent() {
         let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
+            allowed: None,
+            limit_reached: None,
             primary_window: Some(CodexRateLimitWindow {
                 used_percent: Some(42.0),
                 limit_window_seconds: Some(18_000),
@@ -2757,6 +3018,8 @@ mod tests {
     #[test]
     fn codex_usage_keeps_seven_day_exhaustion_at_full_utilization() {
         let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
+            allowed: None,
+            limit_reached: None,
             primary_window: Some(CodexRateLimitWindow {
                 used_percent: Some(4.0),
                 limit_window_seconds: Some(18_000),
@@ -2783,6 +3046,8 @@ mod tests {
     #[test]
     fn codex_usage_corrects_remaining_percent_when_window_was_just_reset() {
         let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
+            allowed: None,
+            limit_reached: None,
             primary_window: Some(CodexRateLimitWindow {
                 used_percent: Some(100.0),
                 limit_window_seconds: Some(18_000),
@@ -2816,6 +3081,8 @@ mod tests {
     #[test]
     fn codex_usage_swaps_reversed_weekly_primary_window() {
         let tiers = codex_tiers_from_rate_limit(Some(CodexRateLimit {
+            allowed: None,
+            limit_reached: None,
             primary_window: Some(CodexRateLimitWindow {
                 used_percent: Some(36.0),
                 limit_window_seconds: Some(604_800),
@@ -2834,6 +3101,240 @@ mod tests {
         assert_eq!(tiers[0].utilization, Some(0.04));
         assert_eq!(tiers[1].name, "seven_day");
         assert_eq!(tiers[1].utilization, Some(0.36));
+    }
+
+    #[test]
+    fn chatgpt_accounts_check_skips_expired_and_inactive_fallbacks() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
+        let body = json!({
+            "accounts": {
+                "expired-business": {
+                    "account": {
+                        "id": "expired-business",
+                        "plan_type": "self_serve_business_usage_based",
+                        "is_default": true
+                    },
+                    "entitlement": {
+                        "expires_at": "2026-03-26T14:55:16Z"
+                    }
+                },
+                "suspended-pro": {
+                    "account": {
+                        "id": "suspended-pro",
+                        "plan_type": "pro",
+                        "status": "suspended"
+                    },
+                    "entitlement": {
+                        "expires_at": "2026-08-01T00:00:00Z"
+                    }
+                },
+                "active-plus": {
+                    "account": {
+                        "id": "active-plus",
+                        "plan_type": "plus",
+                        "is_default": false
+                    },
+                    "entitlement": {
+                        "expires_at": "2026-08-20T00:00:00Z"
+                    }
+                }
+            }
+        });
+
+        let lookup = parse_chatgpt_accounts_check_lookup(&body, None, now_ms).unwrap();
+
+        assert_eq!(lookup.plan_type.as_deref(), Some("plus"));
+        assert_eq!(
+            lookup.expires_at.as_deref(),
+            Some("2026-08-20T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn chatgpt_accounts_check_does_not_cross_fallback_for_trusted_workspace() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
+        let body = json!({
+            "accounts": {
+                "expired-business": {
+                    "account": {
+                        "id": "expired-business",
+                        "plan_type": "business"
+                    },
+                    "entitlement": {
+                        "expires_at": "2026-03-26T14:55:16Z"
+                    }
+                },
+                "active-plus": {
+                    "account": {
+                        "id": "active-plus",
+                        "plan_type": "plus"
+                    },
+                    "entitlement": {
+                        "expires_at": "2026-08-20T00:00:00Z"
+                    }
+                }
+            }
+        });
+
+        assert!(
+            parse_chatgpt_accounts_check_lookup(&body, Some("expired-business"), now_ms).is_none()
+        );
+        assert!(parse_chatgpt_accounts_check_lookup(&body, Some("missing"), now_ms).is_none());
+    }
+
+    #[test]
+    fn codex_subscription_reconciliation_keeps_plus_over_expired_business() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
+        let account_lookup = chatgpt_lookup_from_account(&json!({
+            "account": {"plan_type": "self_serve_business_usage_based"},
+            "entitlement": {"expires_at": "2026-03-26T14:55:16Z"}
+        }));
+
+        let resolution = reconcile_chatgpt_subscription(
+            Some("plus"),
+            Some(true),
+            false,
+            account_lookup,
+            None,
+            now_ms,
+        );
+        let subscription = resolution.subscription.unwrap();
+
+        assert_eq!(subscription.plan_type.as_deref(), Some("plus"));
+        assert_eq!(subscription.plan_label.as_deref(), Some("ChatGPT Plus"));
+        assert!(subscription.expires_at.is_none());
+        assert_eq!(
+            resolution.discarded_reasons,
+            vec!["accounts_check_plan_mismatch"]
+        );
+    }
+
+    #[test]
+    fn codex_subscription_reconciliation_matches_production_plus_evidence() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T07:28:58Z").unwrap();
+        let accounts_check = json!({
+            "accounts": {
+                "expired-business": {
+                    "account": {
+                        "id": "expired-business",
+                        "plan_type": "self_serve_business_usage_based",
+                        "is_default": true
+                    },
+                    "entitlement": {
+                        "expires_at": "2026-03-26T14:55:16Z"
+                    }
+                }
+            }
+        });
+        let account_lookup = parse_chatgpt_accounts_check_lookup(&accounts_check, None, now_ms);
+        assert!(account_lookup.is_none());
+
+        let resolution = reconcile_chatgpt_subscription(
+            Some("plus"),
+            Some(true),
+            false,
+            account_lookup,
+            None,
+            now_ms,
+        );
+        let subscription = resolution.subscription.unwrap();
+
+        assert_eq!(subscription.plan_type.as_deref(), Some("plus"));
+        assert_eq!(subscription.plan_label.as_deref(), Some("ChatGPT Plus"));
+        assert!(subscription.expires_at.is_none());
+        assert!(subscription.expires_source.is_none());
+        assert!(subscription.expires_kind.is_none());
+    }
+
+    #[test]
+    fn codex_subscription_reconciliation_requires_trusted_workspace_for_expiry() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
+        let account_lookup = chatgpt_lookup_from_account(&json!({
+            "account": {"plan_type": "plus"},
+            "entitlement": {"expires_at": "2026-08-20T00:00:00Z"}
+        }));
+
+        let resolution = reconcile_chatgpt_subscription(
+            Some("plus"),
+            Some(true),
+            false,
+            account_lookup,
+            None,
+            now_ms,
+        );
+        let subscription = resolution.subscription.unwrap();
+
+        assert_eq!(subscription.plan_label.as_deref(), Some("ChatGPT Plus"));
+        assert!(subscription.expires_at.is_none());
+        assert!(subscription.expires_source.is_none());
+        assert_eq!(
+            resolution.discarded_reasons,
+            vec!["accounts_check_untrusted_workspace_expiry"]
+        );
+    }
+
+    #[test]
+    fn codex_subscription_reconciliation_accepts_matching_trusted_expiry() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
+        let account_lookup = chatgpt_lookup_from_account(&json!({
+            "account": {"plan_type": "plus"},
+            "entitlement": {"expires_at": "2026-08-20T00:00:00Z"}
+        }));
+
+        let resolution = reconcile_chatgpt_subscription(
+            Some("plus"),
+            Some(true),
+            true,
+            account_lookup,
+            None,
+            now_ms,
+        );
+        let subscription = resolution.subscription.unwrap();
+
+        assert_eq!(
+            subscription.expires_at.as_deref(),
+            Some("2026-08-20T00:00:00+00:00")
+        );
+        assert_eq!(
+            subscription.expires_source.as_deref(),
+            Some("accounts_check_entitlement")
+        );
+        assert!(resolution.discarded_reasons.is_empty());
+    }
+
+    #[test]
+    fn codex_subscription_reconciliation_drops_past_expiry_when_usage_is_available() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
+        let subscription_lookup = parse_chatgpt_subscription_lookup(&json!({
+            "plan_type": "plus",
+            "active_until": "2026-07-01T00:00:00Z"
+        }));
+
+        let resolution = reconcile_chatgpt_subscription(
+            Some("plus"),
+            Some(true),
+            true,
+            None,
+            subscription_lookup,
+            now_ms,
+        );
+        let subscription = resolution.subscription.unwrap();
+
+        assert_eq!(subscription.plan_label.as_deref(), Some("ChatGPT Plus"));
+        assert!(subscription.expires_at.is_none());
+        assert_eq!(
+            resolution.discarded_reasons,
+            vec!["subscriptions_expired_while_usage_available"]
+        );
+    }
+
+    #[test]
+    fn chatgpt_subscription_sources_only_exist_with_expiry() {
+        let lookup = parse_chatgpt_subscription_lookup(&json!({"plan_type": "plus"})).unwrap();
+
+        assert!(lookup.expires_at.is_none());
+        assert!(lookup.expires_source.is_none());
+        assert!(lookup.expires_kind.is_none());
     }
 
     #[test]

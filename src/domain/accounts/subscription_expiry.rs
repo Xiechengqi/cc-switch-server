@@ -298,4 +298,34 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn codex_reconciled_snapshot_without_expiry_clears_share_expiry() {
+        let codex = account(
+            ProviderType::CodexOAuth,
+            Some(json!({
+                "subscription": {
+                    "planType": "plus",
+                    "planLabel": "ChatGPT Plus",
+                    "expiresAt": null,
+                    "expiresSource": null,
+                    "expiresKind": null
+                },
+                "subscriptionEvidence": {
+                    "usagePlanType": "plus",
+                    "usageAllowed": true,
+                    "discardedReasons": ["accounts_check_plan_mismatch"]
+                }
+            })),
+        );
+
+        assert_eq!(
+            resolved_subscription_expiry(&codex),
+            ResolvedSubscriptionExpiry {
+                capability: SubscriptionExpiryCapability::Automatic,
+                expires_at_ms: None,
+                source: None,
+            }
+        );
+    }
 }
