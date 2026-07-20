@@ -1,7 +1,9 @@
 use std::process::Command;
 use std::time::Duration;
 
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::build_info::build_info;
 
@@ -22,6 +24,10 @@ pub const SERVICE_LOG_PATH: &str = "/var/log/cc-switch-server.log";
 const GITHUB_LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/Xiechengqi/cc-switch-server/releases/tags/latest";
 const GITHUB_REPO_API: &str = "https://api.github.com/repos/Xiechengqi/cc-switch-server";
+const RELEASE_REQUEST_ATTEMPTS: usize = 3;
+const RELEASE_RETRY_BASE_DELAY: Duration = Duration::from_millis(750);
+const RELEASE_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const RELEASE_ERROR_BODY_LIMIT: usize = 512;
 
 #[derive(Debug, Deserialize)]
 struct GithubLatestRelease {
@@ -55,12 +61,8 @@ pub fn release_binary_url() -> &'static str {
     }
 }
 
-pub(crate) fn release_binary_url_for_commit(commit_id: &str) -> String {
-    format!(
-        "{}?cc-switch-commit={}",
-        release_binary_url(),
-        normalize_commit_id(commit_id)
-    )
+pub(crate) fn release_binary_url_for_cache_key(cache_key: &str) -> String {
+    format!("{}?cc-switch-upgrade={}", release_binary_url(), cache_key)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -372,30 +374,171 @@ pub fn backup_installed_binary() -> Result<(), SelfUpdateError> {
 
 pub async fn fetch_release_checksum(
     client: &reqwest::Client,
-    commit_id: &str,
+    cache_key: &str,
 ) -> Result<String, SelfUpdateError> {
     let url = format!(
-        "{}.sha256?cc-switch-commit={}",
+        "{}.sha256?cc-switch-upgrade={}",
         release_binary_url(),
-        normalize_commit_id(commit_id)
+        cache_key
     );
-    let response = client
-        .get(&url)
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|err| SelfUpdateError::Internal(format!("checksum request failed: {err}")))?;
-    if !response.status().is_success() {
-        return Err(SelfUpdateError::Internal(format!(
-            "checksum HTTP {}",
-            response.status()
-        )));
-    }
+    let response =
+        request_release_asset(client, &url, Duration::from_secs(15), "checksum request").await?;
     let body = response
         .text()
         .await
         .map_err(|err| SelfUpdateError::Internal(format!("read checksum failed: {err}")))?;
     parse_release_checksum(&body)
+}
+
+pub(crate) async fn request_release_asset(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<reqwest::Response, SelfUpdateError> {
+    for attempt in 1..=RELEASE_REQUEST_ATTEMPTS {
+        match client.get(url).timeout(timeout).send().await {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+                let retryable = is_retryable_release_status(status);
+                let details = release_error_details(response).await;
+                if retryable && attempt < RELEASE_REQUEST_ATTEMPTS {
+                    let delay = release_retry_delay(&headers, attempt);
+                    warn!(
+                        operation,
+                        status = %status,
+                        attempt,
+                        max_attempts = RELEASE_REQUEST_ATTEMPTS,
+                        retry_in_ms = delay.as_millis(),
+                        details = %details,
+                        "release asset request will retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                let attempts = if retryable {
+                    format!(" after {attempt} attempts")
+                } else {
+                    String::new()
+                };
+                return Err(SelfUpdateError::Internal(format!(
+                    "{operation} HTTP {status}{attempts}{details}"
+                )));
+            }
+            Err(error) => {
+                if attempt < RELEASE_REQUEST_ATTEMPTS {
+                    let delay = exponential_release_retry_delay(attempt);
+                    warn!(
+                        operation,
+                        attempt,
+                        max_attempts = RELEASE_REQUEST_ATTEMPTS,
+                        retry_in_ms = delay.as_millis(),
+                        error = %error,
+                        "release asset request failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(SelfUpdateError::Internal(format!(
+                    "{operation} failed after {attempt} attempts: {error}"
+                )));
+            }
+        }
+    }
+    unreachable!("release request loop always returns")
+}
+
+fn is_retryable_release_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn release_retry_delay(headers: &HeaderMap, attempt: usize) -> Duration {
+    let retry_after = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    retry_after
+        .unwrap_or_else(|| exponential_release_retry_delay(attempt))
+        .min(RELEASE_RETRY_MAX_DELAY)
+}
+
+fn exponential_release_retry_delay(attempt: usize) -> Duration {
+    let multiplier = 1u32 << attempt.saturating_sub(1).min(4);
+    RELEASE_RETRY_BASE_DELAY
+        .saturating_mul(multiplier)
+        .min(RELEASE_RETRY_MAX_DELAY)
+}
+
+async fn release_error_details(mut response: reqwest::Response) -> String {
+    let headers = response.headers().clone();
+    let mut details = release_error_header_details(&headers);
+    let mut bytes = Vec::with_capacity(RELEASE_ERROR_BODY_LIMIT);
+    let mut body_error = None;
+    while bytes.len() < RELEASE_ERROR_BODY_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = RELEASE_ERROR_BODY_LIMIT - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if chunk.len() > remaining {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                body_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    let body = String::from_utf8_lossy(&bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !body.is_empty() {
+        details.push(format!("body={body:?}"));
+    }
+    if let Some(error) = body_error {
+        details.push(format!("body_read_error={error:?}"));
+    }
+    if details.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", details.join("; "))
+    }
+}
+
+fn release_error_header_details(headers: &HeaderMap) -> Vec<String> {
+    const HEADER_NAMES: [&str; 8] = [
+        "retry-after",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-used",
+        "x-ratelimit-reset",
+        "x-ratelimit-resource",
+        "x-github-request-id",
+        "date",
+    ];
+    HEADER_NAMES
+        .into_iter()
+        .filter_map(|name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!("{name}={:?}", value.trim()))
+        })
+        .collect()
 }
 
 fn parse_release_checksum(body: &str) -> Result<String, SelfUpdateError> {
@@ -485,7 +628,48 @@ pub fn rollback_available() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Response, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+
     use super::*;
+
+    async fn throttled_then_ok(State(attempts): State<Arc<AtomicUsize>>) -> Response<Body> {
+        let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt < RELEASE_REQUEST_ATTEMPTS {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("retry-after", "0")
+                .header("x-ratelimit-remaining", "0")
+                .body(Body::from("API rate limit exceeded"))
+                .unwrap();
+        }
+        Response::new(Body::from("release asset"))
+    }
+
+    async fn always_throttled() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("retry-after", "0")
+            .header("x-ratelimit-remaining", "0")
+            .header("x-github-request-id", "request-123")
+            .body(Body::from("API rate limit exceeded"))
+            .unwrap()
+    }
+
+    async fn serve_test_app(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/asset"), server)
+    }
 
     #[test]
     fn commits_equal_matches_full_and_short_prefix() {
@@ -515,10 +699,99 @@ mod tests {
     }
 
     #[test]
-    fn release_asset_urls_are_cache_busted_by_target_commit() {
-        let commit = "AABBCCDDEEFF00112233445566778899AABBCCDD";
-        assert!(release_binary_url_for_commit(commit)
-            .ends_with("?cc-switch-commit=aabbccddeeff00112233445566778899aabbccdd"));
+    fn release_asset_urls_are_cache_busted_by_upgrade_task() {
+        assert!(
+            release_binary_url_for_cache_key("task-123").ends_with("?cc-switch-upgrade=task-123")
+        );
+    }
+
+    #[test]
+    fn release_asset_retries_only_transient_or_throttled_statuses() {
+        for status in [
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(is_retryable_release_status(status), "{status}");
+        }
+        assert!(!is_retryable_release_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!is_retryable_release_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+    }
+
+    #[test]
+    fn release_retry_after_is_honored_with_a_bounded_delay() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "60".parse().unwrap());
+        assert_eq!(release_retry_delay(&headers, 1), RELEASE_RETRY_MAX_DELAY);
+
+        headers.insert(reqwest::header::RETRY_AFTER, "2".parse().unwrap());
+        assert_eq!(release_retry_delay(&headers, 1), Duration::from_secs(2));
+        assert_eq!(
+            release_retry_delay(&HeaderMap::new(), 2),
+            Duration::from_millis(1500)
+        );
+    }
+
+    #[test]
+    fn release_error_headers_include_github_rate_limit_context() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1784532645".parse().unwrap());
+        headers.insert("x-github-request-id", "request-123".parse().unwrap());
+        let details = release_error_header_details(&headers).join("; ");
+        assert!(details.contains("x-ratelimit-remaining=\"0\""));
+        assert!(details.contains("x-ratelimit-reset=\"1784532645\""));
+        assert!(details.contains("x-github-request-id=\"request-123\""));
+    }
+
+    #[tokio::test]
+    async fn release_asset_request_retries_throttling_then_returns_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/asset", get(throttled_then_ok))
+            .with_state(attempts.clone());
+        let (url, server) = serve_test_app(app).await;
+
+        let response = request_release_asset(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(1),
+            "test asset",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.text().await.unwrap(), "release asset");
+        assert_eq!(attempts.load(Ordering::SeqCst), RELEASE_REQUEST_ATTEMPTS);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn release_asset_request_reports_throttling_details_after_retries() {
+        let app = Router::new().route("/asset", get(always_throttled));
+        let (url, server) = serve_test_app(app).await;
+
+        let error = request_release_asset(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(1),
+            "test asset",
+        )
+        .await
+        .expect_err("persistent throttling must fail with diagnostics")
+        .to_string();
+
+        assert!(error.contains("HTTP 403 Forbidden after 3 attempts"));
+        assert!(error.contains("x-ratelimit-remaining=\"0\""));
+        assert!(error.contains("x-github-request-id=\"request-123\""));
+        assert!(error.contains("body=\"API rate limit exceeded\""));
+        server.abort();
     }
 
     #[test]

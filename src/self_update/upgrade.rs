@@ -18,8 +18,9 @@ use tracing::warn;
 
 use crate::self_update::restart::schedule_upgrade_restart;
 use crate::self_update::version::{
-    backup_installed_binary, commits_equal, fetch_latest_release_commit, fetch_release_checksum,
-    release_binary_url_for_commit, SelfUpdateError, BINARY_ROLLBACK_PATH, BINARY_STAGING_PATH,
+    backup_installed_binary, commits_equal, fetch_release_checksum,
+    release_binary_url_for_cache_key, request_release_asset, SelfUpdateError, BINARY_ROLLBACK_PATH,
+    BINARY_STAGING_PATH,
 };
 
 const LOG_CHANNEL_CAPACITY: usize = 256;
@@ -313,40 +314,12 @@ async fn run_upgrade(
         handle,
         1,
         UpgradeLogLevel::Info,
-        format!("upgrade requested by {actor}; resolving release metadata"),
+        format!("upgrade requested by {actor}; fetching release checksum"),
         Some(progress_pct(1, 0)),
     )
     .await;
-    let target_commit = match fetch_latest_release_commit(&client).await {
-        Ok(commit) => commit,
-        Err(error) => {
-            let error = SelfUpdateError::Internal(format!("release metadata failed: {error}"));
-            emit(
-                registry,
-                handle,
-                1,
-                UpgradeLogLevel::Error,
-                error.to_string(),
-                None,
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    *handle.target_commit_id.lock().await = Some(target_commit.clone());
-    if !force && commits_equal(&target_commit, crate::build_info::build_info().commit_id) {
-        emit(
-            registry,
-            handle,
-            7,
-            UpgradeLogLevel::Success,
-            format!("already running release {target_commit}; no upgrade needed"),
-            Some(100),
-        )
-        .await;
-        return Ok(UpgradeRunOutcome::Complete);
-    }
-    let expected_checksum = match fetch_release_checksum(&client, &target_commit).await {
+    let release_cache_key = handle.task_id.as_str();
+    let expected_checksum = match fetch_release_checksum(&client, release_cache_key).await {
         Ok(checksum) => checksum,
         Err(error) => {
             emit(
@@ -366,13 +339,13 @@ async fn run_upgrade(
         handle,
         1,
         UpgradeLogLevel::Success,
-        format!("release {target_commit} metadata and checksum verified"),
+        "release checksum fetched and parsed",
         Some(progress_pct(1, 100)),
     )
     .await;
 
     let target = Path::new(BINARY_STAGING_PATH);
-    let binary_url = release_binary_url_for_commit(&target_commit);
+    let binary_url = release_binary_url_for_cache_key(release_cache_key);
     cleanup_tmp(target);
     emit(
         registry,
@@ -477,19 +450,23 @@ async fn run_upgrade(
         Some(progress_pct(4, 40)),
     )
     .await;
-    if let Err(error) = sanity_exec(target, &target_commit).await {
-        cleanup_tmp(target);
-        emit(
-            registry,
-            handle,
-            4,
-            UpgradeLogLevel::Error,
-            format!("sanity check failed: {error}"),
-            None,
-        )
-        .await;
-        return Err(error);
-    }
+    let target_commit = match sanity_exec(target).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            cleanup_tmp(target);
+            emit(
+                registry,
+                handle,
+                4,
+                UpgradeLogLevel::Error,
+                format!("sanity check failed: {error}"),
+                None,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    *handle.target_commit_id.lock().await = Some(target_commit.clone());
     emit(
         registry,
         handle,
@@ -499,6 +476,20 @@ async fn run_upgrade(
         Some(progress_pct(4, 100)),
     )
     .await;
+
+    if !force && commits_equal(&target_commit, crate::build_info::build_info().commit_id) {
+        cleanup_tmp(target);
+        emit(
+            registry,
+            handle,
+            7,
+            UpgradeLogLevel::Success,
+            format!("already running release {target_commit}; no upgrade needed"),
+            Some(100),
+        )
+        .await;
+        return Ok(UpgradeRunOutcome::Complete);
+    }
 
     if let Err(error) = backup_installed_binary() {
         cleanup_tmp(target);
@@ -597,18 +588,7 @@ async fn download_with_progress(
     registry: &UpgradeRegistry,
     handle: &UpgradeHandle,
 ) -> Result<u64, SelfUpdateError> {
-    let response = client
-        .get(url)
-        .timeout(DOWNLOAD_TIMEOUT)
-        .send()
-        .await
-        .map_err(|err| SelfUpdateError::Internal(format!("download request failed: {err}")))?;
-    if !response.status().is_success() {
-        return Err(SelfUpdateError::Internal(format!(
-            "download HTTP {}",
-            response.status()
-        )));
-    }
+    let response = request_release_asset(client, url, DOWNLOAD_TIMEOUT, "binary download").await?;
     let total = response.content_length();
     let mut file = tokio::fs::File::create(target)
         .await
@@ -695,7 +675,7 @@ fn chmod_exec(path: &Path) -> Result<(), SelfUpdateError> {
         .map_err(|err| SelfUpdateError::Internal(format!("chmod staged file failed: {err}")))
 }
 
-async fn sanity_exec(path: &Path, expected_commit: &str) -> Result<(), SelfUpdateError> {
+async fn sanity_exec(path: &Path) -> Result<String, SelfUpdateError> {
     let output = tokio::time::timeout(SANITY_TIMEOUT, Command::new(path).arg("--help").output())
         .await
         .map_err(|_| SelfUpdateError::Internal("sanity --help timed out".into()))?
@@ -719,31 +699,27 @@ async fn sanity_exec(path: &Path, expected_commit: &str) -> Result<(), SelfUpdat
             output.status
         )));
     }
-    validate_staged_version_output(&output.stdout, expected_commit)
+    validate_staged_version_output(&output.stdout)
 }
 
-fn validate_staged_version_output(
-    stdout: &[u8],
-    expected_commit: &str,
-) -> Result<(), SelfUpdateError> {
+fn validate_staged_version_output(stdout: &[u8]) -> Result<String, SelfUpdateError> {
     let value: serde_json::Value = serde_json::from_slice(stdout).map_err(|err| {
         SelfUpdateError::Internal(format!("parse staged binary version output failed: {err}"))
     })?;
     let actual_commit = value
         .get("commitId")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if !commits_equal(actual_commit, expected_commit) {
-        return Err(SelfUpdateError::Internal(format!(
-            "staged binary commit mismatch: expected {expected_commit}, got {}",
-            if actual_commit.is_empty() {
-                "missing commitId"
-            } else {
-                actual_commit
-            }
-        )));
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !(7..=40).contains(&actual_commit.len())
+        || !actual_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(SelfUpdateError::Internal(
+            "staged binary version output has an invalid commitId".into(),
+        ));
     }
-    Ok(())
+    Ok(actual_commit)
 }
 
 fn sha256_of_file(path: &Path) -> Result<String, SelfUpdateError> {
@@ -966,17 +942,20 @@ mod tests {
     }
 
     #[test]
-    fn staged_version_must_match_release_target() {
+    fn staged_version_must_contain_a_valid_commit() {
         let expected = "aabbccddeeff00112233445566778899aabbccdd";
-        let matching = serde_json::json!({ "commitId": expected });
-        validate_staged_version_output(matching.to_string().as_bytes(), expected).unwrap();
+        let matching = serde_json::json!({ "commitId": expected.to_ascii_uppercase() });
+        assert_eq!(
+            validate_staged_version_output(matching.to_string().as_bytes()).unwrap(),
+            expected
+        );
 
-        let stale = serde_json::json!({
-            "commitId": "bbbbbbbbbbbb00112233445566778899aabbccdd"
-        });
-        let error = validate_staged_version_output(stale.to_string().as_bytes(), expected)
-            .expect_err("stale release asset must be rejected before restart");
-        assert!(error.to_string().contains("staged binary commit mismatch"));
+        for invalid in ["", "main", "not-a-commit", "abc123"] {
+            let output = serde_json::json!({ "commitId": invalid });
+            let error = validate_staged_version_output(output.to_string().as_bytes())
+                .expect_err("invalid staged commit must be rejected before restart");
+            assert!(error.to_string().contains("invalid commitId"));
+        }
     }
 
     #[test]
