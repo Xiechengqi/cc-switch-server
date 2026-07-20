@@ -49,6 +49,11 @@ export const TIER_I18N_KEYS: Record<string, string> = {
   premium: "subscription.copilotPremium",
   // Kiro OAuth
   kiro_agentic_requests: "subscription.kiroAgenticRequests",
+  grok_credits: "subscription.grokCredits",
+  grok_monthly: "subscription.grokMonthly",
+  grok_on_demand: "subscription.grokOnDemand",
+  grok_prepaid: "subscription.grokPrepaid",
+  grok_spending_limit: "subscription.grokSpendingLimit",
 };
 
 /** 根据使用百分比返回颜色 class */
@@ -125,6 +130,11 @@ const COMPACT_TIER_LABELS: Record<string, string> = {
   seven_day_sonnet: "7d Sonnet",
   premium: "Premium",
   kiro_agentic_requests: "Kiro",
+  grok_credits: "Credits",
+  grok_monthly: "Monthly",
+  grok_on_demand: "On-demand",
+  grok_prepaid: "Prepaid",
+  grok_spending_limit: "Limit",
   cursor_credits: "Usage",
   cursor_included_usage: "Usage",
 };
@@ -192,7 +202,11 @@ export function formatQuotaSummary(
   const segments = [
     planLabel,
     quota.subscription
-      ? formatExpireDistance(quota.subscription.expiresAt, nowMs)
+      ? quota.subscription.expiresAt
+        ? formatExpireDistance(quota.subscription.expiresAt, nowMs)
+        : t
+          ? t("subscription.expiryUnknown")
+          : "expire unknown"
       : null,
     ...tiers.map((tier) => formatCompactTier(tier, t, nowMs)),
   ].filter((segment): segment is string => Boolean(segment));

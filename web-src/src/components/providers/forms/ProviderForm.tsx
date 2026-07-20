@@ -24,6 +24,7 @@ import type {
   CodexCatalogModel,
   CodexChatReasoning,
   ClaudeApiKeyField,
+  ModelRoutingMapping,
 } from "@/types";
 import {
   providerPresets,
@@ -154,6 +155,17 @@ const isGrokOauthProviderType = (providerType?: string | null) =>
   providerType === PROVIDER_TYPES.GROK_OAUTH || providerType === "grok_oauth";
 
 const CURSOR_DEFAULT_UPSTREAM_MODEL = "composer-2.5";
+
+const endpointUsesHost = (endpoint: string, host: string): boolean => {
+  try {
+    return new URL(endpoint).hostname.toLowerCase() === host;
+  } catch {
+    return false;
+  }
+};
+
+const endpointUsesAnyHost = (endpoint: string, hosts: string[]): boolean =>
+  hosts.some((host) => endpointUsesHost(endpoint, host));
 
 const stripClaudeOneMMarkerForConfig = (model: string): string => {
   const trimmedEnd = model.trimEnd();
@@ -918,6 +930,27 @@ function ProviderFormFull({
     isGrokOauthProviderType(selectedCodexPresetProviderType) ||
     isGrokOauthProviderType(templatePreset?.providerType) ||
     isGrokOauthProviderType(initialData?.meta?.providerType);
+  const isNativeClaudeProvider =
+    appId === "claude" &&
+    (currentProviderType === PROVIDER_TYPES.CLAUDE_OAUTH ||
+      !currentProviderType ||
+      currentProviderType === "claude") &&
+    (!baseUrl.trim() || endpointUsesHost(baseUrl, "api.anthropic.com"));
+  const isCodexOauthProvider = isOpenAIOAuthProviderType(currentProviderType);
+  const isNativeCodexProvider =
+    appId === "codex" &&
+    ((isCodexOauthProvider &&
+      (!codexBaseUrl.trim() ||
+        endpointUsesAnyHost(codexBaseUrl, [
+          "chatgpt.com",
+          "api.openai.com",
+        ]))) ||
+      ((!currentProviderType || currentProviderType === "codex") &&
+        (!codexBaseUrl.trim() ||
+          endpointUsesHost(codexBaseUrl, "api.openai.com"))));
+  const requiresSingleClaudeModel =
+    appId === "claude" && !isNativeClaudeProvider;
+  const requiresSingleCodexModel = appId === "codex" && !isNativeCodexProvider;
 
   useEffect(() => {
     if (!isGrokOauthProvider || selectedGrokAccountId) {
@@ -961,6 +994,7 @@ function ProviderFormFull({
         ? "third_party"
         : category;
       const shouldPersistCodexLocalRouting =
+        requiresSingleCodexModel ||
         saveCategory !== "official" ||
         isCursorApiKeyPreset ||
         isCursorOauthProviderForConfig ||
@@ -969,15 +1003,23 @@ function ProviderFormFull({
         shouldPersistCodexLocalRouting && (codexConfig ?? "").trim()
           ? setCodexWireApi(codexConfig ?? "", "responses")
           : (codexConfig ?? "");
-      const normalizedCatalogModels =
-        shouldPersistCodexLocalRouting && localCodexApiFormat === "openai_chat"
-          ? normalizeCodexCatalogModelsForSave(codexCatalogModels)
-          : [];
+      const normalizedCatalogModels = requiresSingleCodexModel
+        ? normalizeCodexCatalogModelsForSave(codexCatalogModels)
+        : [];
 
-      if (normalizedCatalogModels.length > 0) {
+      const trimmedSingleUpstreamModel =
+        codexSingleUpstreamModel.trim() ||
+        (isGrokOauthProvider
+          ? "grok-4.5"
+          : isCursorOauthProviderForConfig || isCursorApiKeyPreset
+            ? CURSOR_DEFAULT_UPSTREAM_MODEL
+            : isOllamaCloudProviderForConfig
+              ? "kimi-k2.7-code"
+              : "");
+      if (requiresSingleCodexModel && trimmedSingleUpstreamModel) {
         normalizedCodexConfig = setCodexModelNameInConfig(
           normalizedCodexConfig,
-          normalizedCatalogModels[0].model,
+          trimmedSingleUpstreamModel,
         );
       }
 
@@ -988,22 +1030,18 @@ function ProviderFormFull({
         auth: unknown;
         config: string;
         modelCatalog?: { models: CodexCatalogModel[] };
-        modelMapping?: { mode: "single"; upstreamModel: string };
+        modelMapping?:
+          | { mode: "single"; upstreamModel: string }
+          | { mode: "passthrough" };
       };
 
       if (normalizedCatalogModels.length > 0) {
         configObj.modelCatalog = { models: normalizedCatalogModels };
       }
 
-      const trimmedSingleUpstreamModel =
-        codexSingleUpstreamModel.trim() ||
-        (isCursorOauthProviderForConfig || isCursorApiKeyPreset
-          ? CURSOR_DEFAULT_UPSTREAM_MODEL
-          : isOllamaCloudProviderForConfig
-            ? "kimi-k2.7-code"
-            : "");
-
-      if (trimmedSingleUpstreamModel) {
+      if (isNativeCodexProvider) {
+        configObj.modelMapping = { mode: "passthrough" };
+      } else if (trimmedSingleUpstreamModel) {
         configObj.modelMapping = {
           mode: "single",
           upstreamModel: trimmedSingleUpstreamModel,
@@ -1022,8 +1060,11 @@ function ProviderFormFull({
       initialData?.meta?.providerType,
       isCursorApiKeyPreset,
       isCursorOauthProviderForConfig,
+      isGrokOauthProvider,
+      isNativeCodexProvider,
       isOllamaCloudProviderForConfig,
       localCodexApiFormat,
+      requiresSingleCodexModel,
       templatePreset?.providerType,
     ],
   );
@@ -1787,6 +1828,41 @@ function ProviderFormFull({
         return;
       }
     }
+    const claudeActualModel =
+      singleUpstreamModel.trim() ||
+      (isCursorOauthProvider || isCursorApiKeyPreset
+        ? CURSOR_DEFAULT_UPSTREAM_MODEL
+        : "") ||
+      claudeModel.trim() ||
+      defaultSonnetModel.trim() ||
+      defaultOpusModel.trim() ||
+      defaultFableModel.trim() ||
+      defaultHaikuModel.trim();
+    const codexActualModel =
+      codexSingleUpstreamModel.trim() ||
+      (isGrokOauthProvider
+        ? "grok-4.5"
+        : isCursorOauthProvider || isCursorApiKeyPreset
+          ? CURSOR_DEFAULT_UPSTREAM_MODEL
+          : isOllamaCloudProvider
+            ? "kimi-k2.7-code"
+            : "");
+    if (requiresSingleClaudeModel && !claudeActualModel) {
+      toast.error(
+        t("providerForm.singleUpstreamModelRequired", {
+          defaultValue: "请填写真实模型",
+        }),
+      );
+      return;
+    }
+    if (requiresSingleCodexModel && !codexActualModel) {
+      toast.error(
+        t("providerForm.singleUpstreamModelRequired", {
+          defaultValue: "请填写真实模型",
+        }),
+      );
+      return;
+    }
     // OMO Other Fields JSON：B 类（格式错了保存下去数据就坏了）
     if (
       appId === "opencode" &&
@@ -1986,7 +2062,9 @@ function ProviderFormFull({
           defaultFableModel.trim() ||
           defaultHaikuModel.trim();
 
-        if (!isClaudeOauthProvider && upstreamModel) {
+        if (isNativeClaudeProvider) {
+          configObj.modelMapping = { mode: "passthrough" };
+        } else if (upstreamModel) {
           const normalizedUpstream = upstreamModel.trim();
           const displayModel =
             stripClaudeOneMMarkerForConfig(normalizedUpstream);
@@ -2004,8 +2082,6 @@ function ProviderFormFull({
           env.ANTHROPIC_DEFAULT_FABLE_MODEL = normalizedUpstream;
           env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME = displayModel;
           delete env.ANTHROPIC_SMALL_FAST_MODEL;
-        } else if (isClaudeOauthProvider) {
-          delete configObj.modelMapping;
         }
 
         settingsConfig = JSON.stringify(configObj);
@@ -2495,7 +2571,7 @@ function ProviderFormFull({
         auth: Record<string, unknown>;
         config: string;
         modelCatalog?: { models: CodexCatalogModel[] };
-        modelMapping?: { mode: "single"; upstreamModel: string };
+        modelMapping?: ModelRoutingMapping;
       } = { auth, config };
       if (preset.modelCatalog?.length) {
         settingsConfig.modelCatalog = { models: preset.modelCatalog };
@@ -2508,7 +2584,9 @@ function ProviderFormFull({
         auth,
         config,
         preset.modelCatalog ?? [],
-        preset.modelMapping?.upstreamModel ?? "",
+        preset.modelMapping?.mode === "single"
+          ? preset.modelMapping.upstreamModel
+          : "",
       );
       setCodexChatReasoning(preset.codexChatReasoning ?? {});
       setLocalCodexApiFormat(
@@ -2998,6 +3076,7 @@ function ProviderFormFull({
               onAutoSelectChange={setEndpointAutoSelect}
               showEndpointTools
               shouldShowModelSelector
+              requiresSingleModel={requiresSingleClaudeModel}
               claudeModel={claudeModel}
               singleUpstreamModel={singleUpstreamModel}
               defaultHaikuModel={defaultHaikuModel}
@@ -3068,6 +3147,7 @@ function ProviderFormFull({
               onCodexImageToolStripPolicyChange={setCodexImageToolStripPolicy}
               codexWebsocketEnabled={codexWebsocketEnabled}
               onCodexWebsocketChange={setCodexWebsocketEnabled}
+              requiresSingleModel={requiresSingleCodexModel}
               singleUpstreamModel={codexSingleUpstreamModel}
               onSingleUpstreamModelChange={setCodexSingleUpstreamModel}
               speedTestEndpoints={speedTestEndpoints}

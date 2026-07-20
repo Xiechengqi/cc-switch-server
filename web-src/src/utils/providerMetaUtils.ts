@@ -118,6 +118,7 @@ export function isManagedOauthProvider(
   return (
     provider.meta?.providerType === PROVIDER_TYPES.GITHUB_COPILOT ||
     isOpenAIOAuthProviderType(provider.meta?.providerType) ||
+    provider.meta?.providerType === PROVIDER_TYPES.GROK_OAUTH ||
     provider.meta?.providerType === PROVIDER_TYPES.CLAUDE_OAUTH ||
     provider.meta?.providerType === PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH ||
     isAntigravityFamily ||

@@ -29,7 +29,6 @@ function pickCodexApiKey(
 
 function singleModelMappingFromConfig(
   config: Record<string, unknown> | undefined,
-  catalogModels: CodexCatalogModel[],
 ): string {
   const mapping = config?.modelMapping;
   if (
@@ -42,14 +41,7 @@ function singleModelMappingFromConfig(
     return (mapping as any).upstreamModel.trim();
   }
 
-  const upstreamModels = catalogModels
-    .map((item) => (item.upstreamModel || item.model || "").trim())
-    .filter(Boolean);
-  if (upstreamModels.length === 0) return "";
-  if (upstreamModels.every((model) => model === upstreamModels[0])) {
-    return upstreamModels[0];
-  }
-  return upstreamModels[0];
+  return "";
 }
 
 /**
@@ -117,10 +109,7 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
         .filter((item: CodexCatalogModel) => item.model.trim());
       setCodexCatalogModels(normalizedCatalogModels);
       setCodexSingleUpstreamModel(
-        singleModelMappingFromConfig(
-          config as Record<string, unknown>,
-          normalizedCatalogModels,
-        ),
+        singleModelMappingFromConfig(config as Record<string, unknown>),
       );
 
       // 提取 Base URL

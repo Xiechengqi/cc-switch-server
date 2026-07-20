@@ -3323,6 +3323,7 @@ fn account_quota_refresh_candidate(account: &Account) -> bool {
         | ProviderType::KiroOAuth
         | ProviderType::CursorOAuth
         | ProviderType::CursorApiKey
+        | ProviderType::GrokOAuth
         | ProviderType::OllamaCloud => {
             account
                 .access_token
@@ -5335,6 +5336,19 @@ mod tests {
 
         let expiring = copilot_account_fixture(Some(now_ms + 59_000));
         assert!(cached_copilot_auth_from_account(&expiring, &domain, now_ms).is_none());
+    }
+
+    #[test]
+    fn grok_oauth_accounts_are_background_quota_refresh_candidates() {
+        let mut account = copilot_account_fixture(None);
+        account.provider_type = ProviderType::GrokOAuth;
+
+        assert!(account_quota_refresh_candidate(&account));
+
+        account.access_token = None;
+        account.refresh_token = None;
+        account.api_key = None;
+        assert!(!account_quota_refresh_candidate(&account));
     }
 
     #[test]

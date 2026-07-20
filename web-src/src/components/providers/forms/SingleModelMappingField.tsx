@@ -16,6 +16,7 @@ interface SingleModelMappingFieldProps {
   onFetchModels?: () => void;
   input?: ReactNode;
   className?: string;
+  required?: boolean;
 }
 
 export function SingleModelMappingField({
@@ -28,6 +29,7 @@ export function SingleModelMappingField({
   onFetchModels,
   input,
   className,
+  required = false,
 }: SingleModelMappingFieldProps) {
   const { t } = useTranslation();
 
@@ -75,6 +77,11 @@ export function SingleModelMappingField({
           {t("providerForm.singleUpstreamModelLabel", {
             defaultValue: "真实模型",
           })}
+          {required && (
+            <span className="ml-1 text-destructive" aria-hidden="true">
+              *
+            </span>
+          )}
         </FormLabel>
         {input ?? (
           <ModelInputWithFetch

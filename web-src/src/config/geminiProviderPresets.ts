@@ -123,11 +123,11 @@ export const geminiProviderPresets: GeminiProviderPreset[] = [
     settingsConfig: {
       env: {
         GOOGLE_GEMINI_BASE_URL: "https://api.x.ai/v1",
-        GEMINI_MODEL: "grok-4.3",
+        GEMINI_MODEL: "grok-4.5",
       },
     },
     baseURL: "https://api.x.ai/v1",
-    model: "grok-4.3",
+    model: "grok-4.5",
     description: "Grok OAuth",
     category: "official",
     providerType: "grok_oauth",

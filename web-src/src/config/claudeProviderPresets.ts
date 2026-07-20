@@ -99,6 +99,9 @@ export const providerPresets: ProviderPreset[] = [
     websiteUrl: "https://www.anthropic.com/claude-code",
     settingsConfig: {
       env: {},
+      modelMapping: {
+        mode: "passthrough",
+      },
     },
     isOfficial: true, // 明确标识为官方预设
     category: "official",
@@ -125,6 +128,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_SONNET_MODEL: "gpt-5.6-sol",
         ANTHROPIC_DEFAULT_OPUS_MODEL: "gpt-5.6-sol",
       },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "gpt-5.6-sol",
+      },
     },
     isOfficial: true,
     category: "official",
@@ -145,10 +152,14 @@ export const providerPresets: ProviderPreset[] = [
     settingsConfig: {
       env: {
         ANTHROPIC_BASE_URL: "https://api.x.ai/v1",
-        ANTHROPIC_MODEL: "grok-4.3",
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: "grok-3-mini",
-        ANTHROPIC_DEFAULT_SONNET_MODEL: "grok-4.3",
-        ANTHROPIC_DEFAULT_OPUS_MODEL: "grok-4.3",
+        ANTHROPIC_MODEL: "grok-4.5",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "grok-4.5",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "grok-4.5",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "grok-4.5",
+      },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "grok-4.5",
       },
     },
     isOfficial: true,
@@ -176,6 +187,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4-8",
         ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "claude-opus-4-8",
         ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-4-8",
+      },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "claude-sonnet-4-8",
       },
     },
     isOfficial: true,
@@ -299,6 +314,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-4-6-thinking",
         ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Claude Opus 4.6 (Thinking)",
       },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "claude-sonnet-4-6",
+      },
     },
     isOfficial: true,
     category: "official",
@@ -327,6 +346,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-4-6-thinking",
         ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Claude Opus 4.6 (Thinking)",
       },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "claude-sonnet-4-6",
+      },
     },
     isOfficial: true,
     category: "official",
@@ -352,6 +375,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5",
         ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-sonnet-5",
       },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "claude-sonnet-5",
+      },
     },
     category: "third_party",
     apiFormat: "openai_chat",
@@ -370,6 +397,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_HAIKU_MODEL: "deepseek-v4-flash",
         ANTHROPIC_DEFAULT_SONNET_MODEL: "deepseek-v4-flash",
         ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro",
+      },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "deepseek-v4-flash",
       },
     },
     category: "cn_official",
@@ -399,6 +430,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_SONNET_MODEL: "global.anthropic.claude-sonnet-5",
         ANTHROPIC_DEFAULT_OPUS_MODEL: "global.anthropic.claude-opus-4-8",
         CLAUDE_CODE_USE_BEDROCK: "1",
+      },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "global.anthropic.claude-opus-4-8",
       },
     },
     category: "cloud_provider",
@@ -438,6 +473,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_OPUS_MODEL: "global.anthropic.claude-opus-4-8",
         CLAUDE_CODE_USE_BEDROCK: "1",
       },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "global.anthropic.claude-opus-4-8",
+      },
     },
     category: "cloud_provider",
     templateValues: {
@@ -463,6 +502,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_SONNET_MODEL: "anthropic/claude-sonnet-4.6",
         ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic/claude-opus-4.7",
       },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "anthropic/claude-sonnet-4.6",
+      },
     },
     category: "aggregator",
     icon: "openrouter",
@@ -480,6 +523,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_HAIKU_MODEL: "moonshotai/kimi-k2.5",
         ANTHROPIC_DEFAULT_SONNET_MODEL: "moonshotai/kimi-k2.5",
         ANTHROPIC_DEFAULT_OPUS_MODEL: "moonshotai/kimi-k2.5",
+      },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "moonshotai/kimi-k2.5",
       },
     },
     category: "aggregator",
@@ -499,6 +546,10 @@ export const providerPresets: ProviderPreset[] = [
         ANTHROPIC_DEFAULT_HAIKU_MODEL: "deepseek-v4-flash",
         ANTHROPIC_DEFAULT_SONNET_MODEL: "deepseek-v4-flash",
         ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro",
+      },
+      modelMapping: {
+        mode: "single",
+        upstreamModel: "deepseek-v4-flash",
       },
     },
     category: "cn_official",

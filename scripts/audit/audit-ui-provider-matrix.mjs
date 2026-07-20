@@ -13,8 +13,12 @@ const files = {
  providerMatrix: path.join(repoRoot, "src/domain/providers/matrix.rs"),
  provider: path.join(repoRoot, "src/domain/providers/model.rs"),
  accountManagers: path.join(repoRoot, "src/domain/accounts/managers.rs"),
- accountRefresh: path.join(repoRoot, "src/clients/oauth/refresh.rs"),
+  accountRefresh: path.join(repoRoot, "src/clients/oauth/refresh.rs"),
   oauthClients: path.join(repoRoot, "src/domain/accounts/oauth.rs"),
+  providerCard: path.join(repoRoot, "web-src/src/components/providers/ProviderCard.tsx"),
+  providerMeta: path.join(repoRoot, "web-src/src/utils/providerMetaUtils.ts"),
+  subscriptionQuery: path.join(repoRoot, "web-src/src/lib/query/subscription.ts"),
+  subscriptionView: path.join(repoRoot, "web-src/src/components/SubscriptionQuotaFooter.tsx"),
 };
 
 function read(file) {
@@ -144,6 +148,10 @@ function audit() {
   const accountManagers = read(files.accountManagers);
   const accountRefresh = read(files.accountRefresh);
   const oauthClients = read(files.oauthClients);
+  const providerCard = read(files.providerCard);
+  const providerMeta = read(files.providerMeta);
+  const subscriptionQuery = read(files.subscriptionQuery);
+  const subscriptionView = read(files.subscriptionView);
 
   const hasLegacyWebProviderSchema = web.includes("const fallbackProviderTypesByApp =");
   let providerTypesByApp = null;
@@ -183,6 +191,22 @@ function audit() {
   const capabilityAppSet = new Set(capabilityApps);
   const uiTypes = new Set(Object.values(providerTypesByApp).flat());
   const errors = [];
+
+  for (const [source, marker, label] of [
+    [providerMeta, "provider.meta?.providerType === PROVIDER_TYPES.GROK_OAUTH", "managed OAuth recognition"],
+    [providerMeta, 'return "grok_oauth"', "Grok quota source"],
+    [providerCard, 'quotaSource === "grok_oauth"', "Grok quota card dispatch"],
+    [providerCard, "<GrokOauthQuotaFooter", "Grok quota footer"],
+    [providerCard, "return PROVIDER_TYPES.GROK_OAUTH", "Grok account-status mapping"],
+    [subscriptionQuery, "useGrokOauthQuota", "Grok quota query"],
+    [subscriptionQuery, 'credentialStatus !== "not_found"', "OAuth first-load refresh"],
+    [subscriptionView, "grok_credits", "Grok credits tier"],
+    [subscriptionView, "grok_spending_limit", "Grok spending-limit tier"],
+  ]) {
+    if (!source.includes(marker)) {
+      errors.push(`web UI is missing ${label}`);
+    }
+  }
 
   assertUnique(adapterProviderTypes, "adapter all_provider_types", errors);
   assertUnique(matrixProviderTypes, "provider_matrix all_provider_types", errors);

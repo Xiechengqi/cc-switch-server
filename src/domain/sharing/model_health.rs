@@ -246,6 +246,16 @@ fn requested_model_from_log_or_provider(log: &UsageLog, provider: &StoredProvide
 
 fn actual_model_for_provider(provider: &StoredProvider, requested_model: &str) -> String {
     let settings = &provider.provider.settings_config;
+    if let Some(policy) = crate::domain::providers::model_routing::policy_from_settings(settings) {
+        return match policy.mode {
+            crate::domain::providers::model_routing::ModelRoutingMode::Single => policy
+                .upstream_model
+                .unwrap_or_else(|| requested_model.to_string()),
+            crate::domain::providers::model_routing::ModelRoutingMode::Passthrough => {
+                requested_model.to_string()
+            }
+        };
+    }
     if let Some(mapped) = settings
         .pointer(&format!(
             "/modelMapping/{}",
@@ -270,12 +280,12 @@ fn default_model_for_provider(provider: &StoredProvider) -> Option<String> {
     let settings = &provider.provider.settings_config;
     let env = settings.get("env");
     [
+        "/modelMapping/upstreamModel",
         "/env/ANTHROPIC_MODEL",
         "/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
         "/env/OPENAI_MODEL",
         "/env/GEMINI_MODEL",
         "/env/GOOGLE_GEMINI_MODEL",
-        "/modelMapping/upstreamModel",
     ]
     .into_iter()
     .find_map(|pointer| {

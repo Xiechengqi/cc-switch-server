@@ -145,6 +145,7 @@ interface ClaudeFormFieldsProps {
 
   // Model Selector
   shouldShowModelSelector: boolean;
+  requiresSingleModel?: boolean;
   claudeModel: string;
   singleUpstreamModel?: string;
   defaultHaikuModel: string;
@@ -232,6 +233,7 @@ export function ClaudeFormFields({
   onAutoSelectChange,
   showEndpointTools = true,
   shouldShowModelSelector,
+  requiresSingleModel = true,
   claudeModel,
   singleUpstreamModel = "",
   defaultHaikuModel,
@@ -776,6 +778,39 @@ export function ClaudeFormFields({
         />
       )}
 
+      {requiresSingleModel && (
+        <SingleModelMappingField
+          id="claudeSingleUpstreamModel"
+          value={
+            singleUpstreamModel ||
+            claudeModel ||
+            defaultSonnetModel ||
+            defaultOpusModel ||
+            defaultFableModel ||
+            defaultHaikuModel
+          }
+          onChange={(value) =>
+            onModelChange("MODEL_MAPPING_SINGLE_UPSTREAM", value)
+          }
+          isLoading={modelFetchLoading}
+          onFetchModels={handleModelFetchClick}
+          required
+          input={renderModelInput(
+            "claudeSingleUpstreamModel",
+            singleUpstreamModel ||
+              claudeModel ||
+              defaultSonnetModel ||
+              defaultOpusModel ||
+              defaultFableModel ||
+              defaultHaikuModel,
+            "MODEL_MAPPING_SINGLE_UPSTREAM",
+            t("providerForm.singleUpstreamModelPlaceholder", {
+              defaultValue: "例如: composer-2.5",
+            }),
+          )}
+        />
+      )}
+
       {shouldShowModelSelector && (
         <Collapsible open={advancedExpanded} onOpenChange={setAdvancedExpanded}>
           <CollapsibleTrigger asChild>
@@ -873,38 +908,6 @@ export function ClaudeFormFields({
                 })}
               </p>
             </div>
-
-            {!isClaudeOauthPreset && (
-              <SingleModelMappingField
-                id="claudeSingleUpstreamModel"
-                value={
-                  singleUpstreamModel ||
-                  claudeModel ||
-                  defaultSonnetModel ||
-                  defaultOpusModel ||
-                  defaultFableModel ||
-                  defaultHaikuModel
-                }
-                onChange={(value) =>
-                  onModelChange("MODEL_MAPPING_SINGLE_UPSTREAM", value)
-                }
-                isLoading={modelFetchLoading}
-                onFetchModels={handleModelFetchClick}
-                input={renderModelInput(
-                  "claudeSingleUpstreamModel",
-                  singleUpstreamModel ||
-                    claudeModel ||
-                    defaultSonnetModel ||
-                    defaultOpusModel ||
-                    defaultFableModel ||
-                    defaultHaikuModel,
-                  "MODEL_MAPPING_SINGLE_UPSTREAM",
-                  t("providerForm.singleUpstreamModelPlaceholder", {
-                    defaultValue: "例如: composer-2.5",
-                  }),
-                )}
-              />
-            )}
 
             <CustomUserAgentField
               id="claude-custom-user-agent"

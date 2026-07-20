@@ -38,6 +38,7 @@ export function providerLabel(providerType: string): string {
     claude_oauth: "Claude OAuth",
     codex: "OpenAI/Codex",
     codex_oauth: "OpenAI OAuth",
+    grok_oauth: "Grok OAuth",
     gemini: "Gemini API",
     gemini_cli: "Gemini OAuth/CLI",
     openrouter: "OpenRouter",

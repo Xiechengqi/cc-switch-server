@@ -301,6 +301,12 @@ async fn forward_with_attempt(
         if request_context.session_id.is_none() {
             request_context.session_id = contract.session_id.clone();
         }
+        if adapter_request.actual_model.as_deref() != Some(contract.actual_model.as_str()) {
+            adapter_request.actual_model_source = Some("grok_model_normalization".to_string());
+        }
+        adapter_request.model = Some(contract.actual_model.clone());
+        adapter_request.actual_model = Some(contract.actual_model.clone());
+        adapter_request.pricing_model = Some(contract.actual_model.clone());
         Some(contract)
     } else {
         None
@@ -1357,6 +1363,9 @@ pub async fn forward_codex_responses_ws(
     } else {
         ResponsesWebsocketMode::Codex
     };
+    let websocket_upstream_model = crate::domain::providers::model_routing::single_upstream_model(
+        &stored.provider.settings_config,
+    );
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let state_for_share = state.clone();
@@ -1369,6 +1378,7 @@ pub async fn forward_codex_responses_ws(
             ws_url,
             ws_mode,
             session_id,
+            websocket_upstream_model,
         )
         .await
         {
@@ -2137,6 +2147,7 @@ async fn bridge_responses_websocket(
     ws_url: String,
     mode: ResponsesWebsocketMode,
     grok_session_id: Option<String>,
+    single_upstream_model: Option<String>,
 ) -> Result<(), ProxyError> {
     let mut request = ws_url.into_client_request().map_err(|error| {
         ProxyError::bad_gateway(format!("build responses websocket request: {error}"))
@@ -2171,9 +2182,12 @@ async fn bridge_responses_websocket(
     let client_to_upstream = async {
         while let Some(message) = downstream_read.next().await {
             let message = message.map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
-            let Some(message) =
-                axum_ws_message_to_tungstenite(message, mode, grok_session_id.as_deref())
-            else {
+            let Some(message) = axum_ws_message_to_tungstenite(
+                message,
+                mode,
+                grok_session_id.as_deref(),
+                single_upstream_model.as_deref(),
+            ) else {
                 break;
             };
             upstream_write
@@ -2312,21 +2326,34 @@ fn axum_ws_message_to_tungstenite(
     message: AxumWsMessage,
     mode: ResponsesWebsocketMode,
     grok_session_id: Option<&str>,
+    single_upstream_model: Option<&str>,
 ) -> Option<TungsteniteMessage> {
     match message {
         AxumWsMessage::Text(text) => {
-            if matches!(mode, ResponsesWebsocketMode::Grok) {
-                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                    if let Ok(text) =
-                        serde_json::to_string(&super::grok::ws_message_body(value, grok_session_id))
-                    {
-                        return Some(TungsteniteMessage::Text(text));
-                    }
-                }
-            }
+            let text = transform_responses_websocket_request(
+                &text,
+                mode,
+                grok_session_id,
+                single_upstream_model,
+            )
+            .unwrap_or(text);
             Some(TungsteniteMessage::Text(text))
         }
-        AxumWsMessage::Binary(bytes) => Some(TungsteniteMessage::Binary(bytes.to_vec())),
+        AxumWsMessage::Binary(bytes) => {
+            let transformed = std::str::from_utf8(&bytes).ok().and_then(|text| {
+                transform_responses_websocket_request(
+                    text,
+                    mode,
+                    grok_session_id,
+                    single_upstream_model,
+                )
+            });
+            Some(TungsteniteMessage::Binary(
+                transformed
+                    .map(String::into_bytes)
+                    .unwrap_or_else(|| bytes.to_vec()),
+            ))
+        }
         AxumWsMessage::Ping(bytes) => Some(TungsteniteMessage::Ping(bytes.to_vec())),
         AxumWsMessage::Pong(bytes) => Some(TungsteniteMessage::Pong(bytes.to_vec())),
         AxumWsMessage::Close(frame) => Some(TungsteniteMessage::Close(frame.map(|frame| {
@@ -2335,6 +2362,38 @@ fn axum_ws_message_to_tungstenite(
                 reason: frame.reason.to_string().into(),
             }
         }))),
+    }
+}
+
+fn transform_responses_websocket_request(
+    text: &str,
+    mode: ResponsesWebsocketMode,
+    grok_session_id: Option<&str>,
+    single_upstream_model: Option<&str>,
+) -> Option<String> {
+    if !matches!(mode, ResponsesWebsocketMode::Grok) && single_upstream_model.is_none() {
+        return None;
+    }
+    let mut value = serde_json::from_str::<Value>(text).ok()?;
+    if let Some(model) = single_upstream_model {
+        enforce_responses_websocket_model(&mut value, model);
+    }
+    if matches!(mode, ResponsesWebsocketMode::Grok) {
+        value = super::grok::ws_message_body(value, grok_session_id);
+    }
+    serde_json::to_string(&value).ok()
+}
+
+fn enforce_responses_websocket_model(value: &mut Value, model: &str) {
+    let target = if value.get("type").and_then(Value::as_str) == Some("response.create") {
+        value.get_mut("response")
+    } else if value.get("type").is_none() {
+        Some(value)
+    } else {
+        None
+    };
+    if let Some(target) = target.and_then(Value::as_object_mut) {
+        target.insert("model".to_string(), Value::String(model.to_string()));
     }
 }
 
@@ -2526,22 +2585,34 @@ async fn forward_claude_deepseek(
         share_invocation_guard,
         started,
     } = options;
+    let (body, model_selection) =
+        adapters::apply_provider_model_routing(body, &stored, ProxyRoute::ClaudeMessages);
     let request_body: Value = serde_json::from_slice(&body)
         .map_err(|error| ProxyError::bad_request(format!("invalid Claude JSON body: {error}")))?;
-    let response_model = request_body
+    let routed_model = request_body
         .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ProxyError::bad_request("missing model"))?
         .to_string();
+    let response_model = model_selection
+        .requested_model
+        .clone()
+        .unwrap_or_else(|| routed_model.clone());
     let stream_requested = request_body
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let prompt = deepseek::build_prompt(&request_body)?;
     let input_tokens = deepseek::estimate_billable_user_input_tokens(&request_body);
-    let deepseek_model = deepseek::map_model(&response_model);
+    let deepseek_model = deepseek::map_model(&routed_model);
+    let model_metadata = routed_model_metadata(
+        &response_model,
+        &deepseek_model,
+        model_selection.actual_model_source.as_deref(),
+        "deepseek_model_normalization",
+    );
 
     refresh_managed_account_if_needed(&state, AppKind::Claude, &stored).await?;
     let upstream = state
@@ -2566,12 +2637,7 @@ async fn forward_claude_deepseek(
             &stored,
             status_code,
             started.elapsed().as_millis(),
-            UsageModelMetadata {
-                model: Some(response_model.clone()),
-                requested_model: Some(response_model.clone()),
-                actual_model: Some(deepseek_model.clone()),
-                ..Default::default()
-            },
+            model_metadata.clone(),
             TokenUsage {
                 input_tokens: Some(u64::from(input_tokens)),
                 ..Default::default()
@@ -2689,12 +2755,7 @@ async fn forward_claude_deepseek(
         &stored,
         status_code,
         started.elapsed().as_millis(),
-        UsageModelMetadata {
-            model: Some(response_model.clone()),
-            requested_model: Some(response_model),
-            actual_model: Some(deepseek_model),
-            ..Default::default()
-        },
+        model_metadata,
         usage,
         request_context,
     )
@@ -2739,15 +2800,30 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         share_invocation_guard,
         started,
     } = options;
+    let (body, model_selection) =
+        adapters::apply_provider_model_routing(body, &stored, ProxyRoute::ClaudeMessages);
     let request_body: Value = serde_json::from_slice(&body)
         .map_err(|error| ProxyError::bad_request(format!("invalid Claude JSON body: {error}")))?;
-    let model = request_body
+    let routed_model = request_body
         .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ProxyError::bad_request("missing model"))?
         .to_string();
+    let response_model = model_selection
+        .requested_model
+        .clone()
+        .unwrap_or_else(|| routed_model.clone());
+    let actual_model = kiro::map_model(&routed_model)
+        .ok_or_else(|| ProxyError::bad_request(format!("Kiro OAuth 不支持该模型: {routed_model}")))?
+        .to_string();
+    let model_metadata = routed_model_metadata(
+        &response_model,
+        &actual_model,
+        model_selection.actual_model_source.as_deref(),
+        "kiro_model_normalization",
+    );
     let stream_requested = request_body
         .get("stream")
         .and_then(Value::as_bool)
@@ -2812,7 +2888,8 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             state,
             stored,
             upstream,
-            model,
+            response_model,
+            model_metadata,
             request_body,
             tool_name_map: prepared.tool_name_map,
             request_context,
@@ -2839,7 +2916,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             &stored,
             status_code,
             started.elapsed().as_millis(),
-            claude_kiro_model_metadata(&model),
+            model_metadata.clone(),
             TokenUsage::default(),
             UsageLogContext {
                 is_streaming: stream_requested,
@@ -2864,7 +2941,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
 
     let message = match kiro::kiro_event_bytes_to_claude_json(
         &bytes,
-        &model,
+        &response_model,
         &prepared.tool_name_map,
         &request_body,
     ) {
@@ -2876,7 +2953,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                 &stored,
                 proxy_error.status.as_u16(),
                 started.elapsed().as_millis(),
-                claude_kiro_model_metadata(&model),
+                model_metadata.clone(),
                 TokenUsage::default(),
                 UsageLogContext {
                     is_streaming: false,
@@ -2903,7 +2980,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         &stored,
         status_code,
         started.elapsed().as_millis(),
-        claude_kiro_model_metadata(&model),
+        model_metadata,
         usage,
         UsageLogContext {
             is_streaming: false,
@@ -2933,7 +3010,8 @@ struct ClaudeKiroStreamOptions {
     state: ServerState,
     stored: StoredProvider,
     upstream: reqwest::Response,
-    model: String,
+    response_model: String,
+    model_metadata: UsageModelMetadata,
     request_body: Value,
     tool_name_map: std::collections::HashMap<String, String>,
     request_context: UsageLogContext,
@@ -2950,7 +3028,8 @@ async fn forward_claude_kiro_stream(
         state,
         stored,
         upstream,
-        model,
+        response_model,
+        model_metadata,
         request_body,
         tool_name_map,
         request_context,
@@ -2964,7 +3043,7 @@ async fn forward_claude_kiro_stream(
         &stored,
         status_code,
         started.elapsed().as_millis(),
-        claude_kiro_model_metadata(&model),
+        model_metadata,
         TokenUsage::default(),
         UsageLogContext {
             is_streaming: true,
@@ -2977,7 +3056,7 @@ async fn forward_claude_kiro_stream(
     let user_email = request_context.user_email.clone();
     let stream = kiro::kiro_event_stream_to_claude_sse(
         upstream.bytes_stream(),
-        model,
+        response_model,
         tool_name_map,
         &request_body,
     );
@@ -3130,13 +3209,18 @@ impl Drop for ShareStreamInterruptGuard {
     }
 }
 
-fn claude_kiro_model_metadata(model: &str) -> UsageModelMetadata {
+fn routed_model_metadata(
+    requested_model: &str,
+    actual_model: &str,
+    policy_source: Option<&str>,
+    fallback_source: &str,
+) -> UsageModelMetadata {
     UsageModelMetadata {
-        model: Some(model.to_string()),
-        requested_model: Some(model.to_string()),
-        actual_model: None,
-        actual_model_source: None,
-        pricing_model: Some(model.to_string()),
+        model: Some(requested_model.to_string()),
+        requested_model: Some(requested_model.to_string()),
+        actual_model: Some(actual_model.to_string()),
+        actual_model_source: Some(policy_source.unwrap_or(fallback_source).to_string()),
+        pricing_model: Some(actual_model.to_string()),
     }
 }
 
@@ -6389,6 +6473,105 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             }
             other => panic!("unexpected websocket message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn grok_websocket_single_model_matches_http_routing_policy() {
+        for requested in [Some("gpt-5.5"), Some("grok-4.3"), Some("grok"), None] {
+            let request = match requested {
+                Some(model) => json!({
+                    "type": "response.create",
+                    "response": {"model": model, "input": "ping"}
+                }),
+                None => json!({
+                    "type": "response.create",
+                    "response": {"input": "ping"}
+                }),
+            };
+            let transformed = transform_responses_websocket_request(
+                &request.to_string(),
+                ResponsesWebsocketMode::Grok,
+                Some("session-1"),
+                Some("grok-4.5"),
+            )
+            .unwrap();
+            let value: Value = serde_json::from_str(&transformed).unwrap();
+
+            assert_eq!(
+                value.pointer("/response/model").and_then(Value::as_str),
+                Some("grok-4.5")
+            );
+        }
+    }
+
+    #[test]
+    fn grok_websocket_uses_edited_single_model() {
+        let transformed = transform_responses_websocket_request(
+            r#"{"model":"gpt-5.5","input":"ping"}"#,
+            ResponsesWebsocketMode::Grok,
+            None,
+            Some("grok-custom"),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&transformed).unwrap();
+
+        assert_eq!(
+            value.pointer("/response/model").and_then(Value::as_str),
+            Some("grok-custom")
+        );
+    }
+
+    #[test]
+    fn special_claude_paths_resolve_single_model_before_vendor_normalization() {
+        let kiro = stored_provider(
+            AppKind::Claude,
+            ProviderType::KiroOAuth,
+            json!({
+                "modelMapping": {
+                    "mode": "single",
+                    "upstreamModel": "claude-opus-4-8"
+                }
+            }),
+            Some("kiro-account"),
+        );
+        let (kiro_body, kiro_selection) = adapters::apply_provider_model_routing(
+            Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#),
+            &kiro,
+            ProxyRoute::ClaudeMessages,
+        );
+        let kiro_body: Value = serde_json::from_slice(&kiro_body).unwrap();
+        let kiro_routed = kiro_body.get("model").and_then(Value::as_str).unwrap();
+        assert_eq!(
+            kiro_selection.requested_model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(kiro_routed, "claude-opus-4-8");
+        assert_eq!(kiro::map_model(kiro_routed), Some("claude-opus-4.8"));
+
+        let deepseek = stored_provider(
+            AppKind::Claude,
+            ProviderType::DeepSeekAccount,
+            json!({
+                "modelMapping": {
+                    "mode": "single",
+                    "upstreamModel": "deepseek-v4-pro"
+                }
+            }),
+            Some("deepseek-account"),
+        );
+        let (deepseek_body, deepseek_selection) = adapters::apply_provider_model_routing(
+            Bytes::from_static(br#"{"model":"claude-haiku-4-5","messages":[]}"#),
+            &deepseek,
+            ProxyRoute::ClaudeMessages,
+        );
+        let deepseek_body: Value = serde_json::from_slice(&deepseek_body).unwrap();
+        let deepseek_routed = deepseek_body.get("model").and_then(Value::as_str).unwrap();
+        assert_eq!(
+            deepseek_selection.requested_model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(deepseek_routed, "deepseek-v4-pro");
+        assert_eq!(deepseek::map_model(deepseek_routed), "deepseek-v4-pro");
     }
 
     #[test]

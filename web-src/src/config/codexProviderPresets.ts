@@ -6,7 +6,7 @@ import type {
   CodexApiFormat,
   CodexCatalogModel,
   CodexChatReasoning,
-  SingleModelMapping,
+  ModelRoutingMapping,
 } from "../types";
 import type { PresetTheme } from "./claudeProviderPresets";
 
@@ -43,7 +43,7 @@ export interface CodexProviderPreset {
   requiresOAuth?: boolean;
   // Codex Chat 本地路由模式下的模型目录
   modelCatalog?: CodexCatalogModel[];
-  modelMapping?: SingleModelMapping;
+  modelMapping?: ModelRoutingMapping;
   // Codex Responses -> Chat Completions reasoning capability defaults
   codexChatReasoning?: CodexChatReasoning;
   // 供应商单独的模型测试配置（预设默认值，创建时初始化）
@@ -170,6 +170,9 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     category: "official",
     auth: {},
     config: `model = "gpt-5.6-sol"`,
+    modelMapping: {
+      mode: "passthrough",
+    },
     providerType: "codex_oauth",
     testConfig: {
       enabled: true,
@@ -189,17 +192,22 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     isOfficial: true,
     category: "official",
     auth: {},
-    config: generateThirdPartyConfig("Grok", "https://api.x.ai/v1", "grok-4.3"),
+    config: generateThirdPartyConfig("Grok", "https://api.x.ai/v1", "grok-4.5"),
     providerType: "grok_oauth",
     requiresOAuth: true,
     modelCatalog: modelCatalog([
+      "grok-4.5",
       "grok-4.3",
       "grok-4.20-multi-agent",
       "grok-3-mini",
     ]),
     testConfig: {
       enabled: true,
-      testModel: "grok-4.3",
+      testModel: "grok-4.5",
+    },
+    modelMapping: {
+      mode: "single",
+      upstreamModel: "grok-4.5",
     },
     theme: {
       icon: "codex",
@@ -314,6 +322,10 @@ export const codexProviderPresets: CodexProviderPreset[] = [
       "https://openrouter.ai/api/v1",
       "gpt-5.4",
     ),
+    modelMapping: {
+      mode: "single",
+      upstreamModel: "gpt-5.4",
+    },
     category: "aggregator",
     icon: "openrouter",
     iconColor: "#6566F1",
@@ -328,6 +340,10 @@ export const codexProviderPresets: CodexProviderPreset[] = [
       "https://integrate.api.nvidia.com/v1",
       "moonshotai/kimi-k2.5",
     ),
+    modelMapping: {
+      mode: "single",
+      upstreamModel: "moonshotai/kimi-k2.5",
+    },
     endpointCandidates: ["https://integrate.api.nvidia.com/v1"],
     apiFormat: "openai_chat",
     modelCatalog: modelCatalog([
@@ -358,6 +374,10 @@ export const codexProviderPresets: CodexProviderPreset[] = [
       "https://api.deepseek.com",
       "deepseek-v4-flash",
     ),
+    modelMapping: {
+      mode: "single",
+      upstreamModel: "deepseek-v4-flash",
+    },
     endpointCandidates: ["https://api.deepseek.com"],
     apiFormat: "openai_chat",
     modelCatalog: modelCatalog([

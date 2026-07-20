@@ -15,6 +15,7 @@ use super::{join_url, setting, transforms, ProxyError, ProxyRoute};
 use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
 use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::usage::store::{
     usage_from_json_with_semantics, InputTokenSemantics, TokenUsage,
@@ -221,9 +222,16 @@ impl GenericForwardingAdapter {
         let (body, model, upstream_headers) = if stored.provider_type == ProviderType::GitHubCopilot
         {
             let (body, mut model) = apply_request_preprocessors(body, stored, route);
-            let (body, upstream_headers, model_source) =
+            let (mut body, upstream_headers, model_source) =
                 maybe_apply_copilot_preflight(body, stored, copilot_metadata)?;
-            if let Some(source) = model_source {
+            if policy_from_settings(&stored.provider.settings_config).is_some() {
+                let requested_model = model.requested_model.clone();
+                let (routed_body, mut routed_model) =
+                    apply_request_preprocessors(body, stored, route);
+                routed_model.requested_model = requested_model;
+                body = routed_body;
+                model = routed_model;
+            } else if let Some(source) = model_source {
                 if let Some(actual_model) = model_from_body(&body) {
                     model.actual_model = Some(actual_model.clone());
                     model.actual_model_source = Some(source.to_string());
@@ -2256,11 +2264,11 @@ pub(super) fn codex_config_base_url(
 }
 
 #[derive(Debug, Clone, Default)]
-struct ModelSelection {
-    requested_model: Option<String>,
-    actual_model: Option<String>,
-    actual_model_source: Option<String>,
-    pricing_model: Option<String>,
+pub(super) struct ModelSelection {
+    pub requested_model: Option<String>,
+    pub actual_model: Option<String>,
+    pub actual_model_source: Option<String>,
+    pub pricing_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2663,6 +2671,14 @@ fn apply_request_preprocessors(
     )
 }
 
+pub(super) fn apply_provider_model_routing(
+    body: Bytes,
+    stored: &StoredProvider,
+    route: ProxyRoute,
+) -> (Bytes, ModelSelection) {
+    apply_request_preprocessors(body, stored, Some(route))
+}
+
 fn maybe_apply_copilot_preflight(
     body: Bytes,
     stored: &StoredProvider,
@@ -2767,6 +2783,26 @@ fn resolve_model_mapping(
     let mapping = settings
         .get("modelMapping")
         .or_else(|| settings.get("model_mapping"));
+    if let Some(policy) = policy_from_settings(settings) {
+        match policy.mode {
+            ModelRoutingMode::Single => {
+                if let Some(actual_model) = policy.upstream_model {
+                    return Some(ModelMappingDecision {
+                        actual_model,
+                        source: "model_mapping_single",
+                        pricing_model: None,
+                    });
+                }
+            }
+            ModelRoutingMode::Passthrough => {
+                return requested_model.map(|requested_model| ModelMappingDecision {
+                    actual_model: requested_model.to_string(),
+                    source: "model_mapping_passthrough",
+                    pricing_model: None,
+                });
+            }
+        }
+    }
     if let Some(requested_model) = requested_model {
         if let Some(decision) =
             mapping.and_then(|mapping| direct_model_mapping(mapping, requested_model))
@@ -3595,6 +3631,51 @@ mod tests {
     }
 
     #[test]
+    fn copilot_preflight_cannot_override_authoritative_single_model() {
+        let adapter = adapter_for(AppKind::Claude, ProviderType::GitHubCopilot);
+        let stored = stored_provider(
+            AppKind::Claude,
+            ProviderType::GitHubCopilot,
+            json!({
+                "env": {"ANTHROPIC_AUTH_TOKEN": "copilot-token"},
+                "modelCatalog": {
+                    "models": [{"id": "claude-sonnet-4.6-1m"}]
+                },
+                "modelMapping": {
+                    "mode": "single",
+                    "upstreamModel": "claude-sonnet-5"
+                }
+            }),
+        );
+        let request = adapter
+            .transform_request_for_route_with_metadata(
+                Bytes::from_static(
+                    br#"{"model":"claude-sonnet-4-6[1m]","messages":[{"role":"user","content":"ping"}],"stream":false}"#,
+                ),
+                &stored,
+                ProxyRoute::ClaudeMessages,
+                None,
+                &CopilotRequestMetadata::default(),
+            )
+            .unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(
+            request.requested_model.as_deref(),
+            Some("claude-sonnet-4-6[1m]")
+        );
+        assert_eq!(request.actual_model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            request.actual_model_source.as_deref(),
+            Some("model_mapping_single")
+        );
+        assert_eq!(
+            value.get("model").and_then(Value::as_str),
+            Some("claude-sonnet-5")
+        );
+    }
+
+    #[test]
     fn cross_protocol_static_contracts_are_native_when_transform_and_endpoint_are_closed() {
         let cases = [
             (
@@ -3957,6 +4038,116 @@ mod tests {
                 .resolve_endpoint(ProxyRoute::ClaudeMessages, None, &stored)
                 .unwrap(),
             "https://example.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn single_mode_overrides_every_legacy_mapping_layer() {
+        let adapter = adapter_for(AppKind::Claude, ProviderType::OpenRouter);
+        let stored = stored_provider(
+            AppKind::Claude,
+            ProviderType::OpenRouter,
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
+                    "ANTHROPIC_MODEL": "env-model"
+                },
+                "modelCatalog": {
+                    "models": [{
+                        "model": "client-model",
+                        "upstreamModel": "catalog-model"
+                    }]
+                },
+                "modelMapping": {
+                    "mode": "single",
+                    "upstreamModel": "single-model",
+                    "client-model": "direct-model",
+                    "rules": [{
+                        "match": "client-*",
+                        "upstreamModel": "rule-model"
+                    }]
+                }
+            }),
+        );
+
+        let request = adapter
+            .transform_request(
+                Bytes::from_static(br#"{"model":"client-model","messages":[],"stream":false}"#),
+                &stored,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(
+            value.get("model").and_then(Value::as_str),
+            Some("single-model")
+        );
+        assert_eq!(request.requested_model.as_deref(), Some("client-model"));
+        assert_eq!(request.actual_model.as_deref(), Some("single-model"));
+        assert_eq!(
+            request.actual_model_source.as_deref(),
+            Some("model_mapping_single")
+        );
+        assert_eq!(request.pricing_model.as_deref(), Some("single-model"));
+    }
+
+    #[test]
+    fn single_mode_injects_model_when_request_omits_it() {
+        let (body, selection) = apply_model_mapping(
+            Bytes::from_static(br#"{"stream":false}"#),
+            &json!({
+                "modelMapping": {
+                    "mode": "single",
+                    "upstreamModel": "grok-4.5"
+                }
+            }),
+            ModelMappingContext {
+                app: AppKind::Codex,
+                route: Some(ProxyRoute::CodexResponses),
+                provider_type: ProviderType::GrokOAuth,
+            },
+        );
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value.get("model").and_then(Value::as_str), Some("grok-4.5"));
+        assert_eq!(selection.requested_model, None);
+        assert_eq!(selection.actual_model.as_deref(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn passthrough_mode_ignores_stale_legacy_mappings() {
+        let (body, selection) = apply_model_mapping(
+            Bytes::from_static(br#"{"model":"gpt-5.6-sol"}"#),
+            &json!({
+                "modelMapping": {
+                    "mode": "passthrough",
+                    "upstreamModel": "stale-model",
+                    "gpt-5.6-sol": "stale-direct-model"
+                },
+                "modelCatalog": {
+                    "models": [{
+                        "model": "gpt-5.6-sol",
+                        "upstreamModel": "stale-catalog-model"
+                    }]
+                }
+            }),
+            ModelMappingContext {
+                app: AppKind::Codex,
+                route: Some(ProxyRoute::CodexResponses),
+                provider_type: ProviderType::CodexOAuth,
+            },
+        );
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            value.get("model").and_then(Value::as_str),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(selection.requested_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(selection.actual_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            selection.actual_model_source.as_deref(),
+            Some("model_mapping_passthrough")
         );
     }
 

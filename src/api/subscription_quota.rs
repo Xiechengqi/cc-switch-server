@@ -401,6 +401,42 @@ mod tests {
     }
 
     #[test]
+    fn grok_quota_exposes_plan_and_usage_without_using_token_expiry() {
+        let mut account = sample_account(AccountQuota {
+            success: true,
+            credential_message: Some("SuperGrok".to_string()),
+            tiers: vec![AccountQuotaTier {
+                name: "grok_credits".to_string(),
+                utilization: Some(0.75),
+                used: Some(75.0),
+                limit: Some(100.0),
+                unit: Some("credits".to_string()),
+                resets_at: None,
+            }],
+            extra_usage: Some(json!({
+                "queriedAt": 1_700_000_000_000i64,
+                "subscription": {
+                    "planType": "SuperGrok",
+                    "planLabel": "SuperGrok",
+                    "expiresAt": Value::Null,
+                    "expiryCapability": "research_pending"
+                }
+            })),
+        });
+        account.provider_type = ProviderType::GrokOAuth;
+        account.subscription_level = Some("SuperGrok".to_string());
+        account.expires_at = Some(1_786_924_800_000);
+
+        let quota = subscription_quota_from_account(&account, "grok_oauth");
+
+        assert_eq!(quota["credentialMessage"], "SuperGrok");
+        assert_eq!(quota["tiers"][0]["utilization"], 75.0);
+        assert_eq!(quota["tiers"][0]["used"], 75.0);
+        assert_eq!(quota["subscription"]["planLabel"], "SuperGrok");
+        assert!(quota["subscription"]["expiresAt"].is_null());
+    }
+
+    #[test]
     fn manual_subscription_expiry_is_synthesized_without_mutating_quota_storage() {
         let mut account = sample_account(AccountQuota::default());
         account.provider_type = ProviderType::ClaudeOAuth;

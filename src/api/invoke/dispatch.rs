@@ -332,10 +332,15 @@ async fn web_invoke_dispatch(
         }
         "add_provider" | "update_provider" => {
             let app = web_arg_app(&args)?;
-            let provider: Provider = web_arg_value(&args, "provider")?;
+            let mut provider: Provider = web_arg_value(&args, "provider")?;
             if provider.name.trim().is_empty() {
                 return Err(ApiError::bad_request("provider name is required"));
             }
+            crate::domain::providers::model_routing::normalize_and_validate_provider_model_routing(
+                app,
+                &mut provider,
+            )
+            .map_err(ApiError::bad_request)?;
             state
                 .mutate_providers_immediate(|providers| providers.upsert(app, provider))
                 .await
@@ -1984,6 +1989,7 @@ async fn resolve_codex_oauth_account_for_banked_reset(
 
 fn grok_oauth_default_models() -> Vec<Value> {
     [
+        ("grok-4.5", "Grok 4.5"),
         ("grok-4.3", "Grok 4.3"),
         ("grok-build-0.1", "Grok Build 0.1"),
         ("grok-composer-2.5-fast", "Grok Composer 2.5 Fast"),

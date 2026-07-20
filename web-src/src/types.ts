@@ -225,6 +225,14 @@ export interface SingleModelMapping {
   upstreamModel: string;
 }
 
+export interface PassthroughModelMapping {
+  mode: "passthrough";
+}
+
+export type ModelRoutingMapping =
+  | SingleModelMapping
+  | PassthroughModelMapping;
+
 // Claude 认证字段类型
 export type ClaudeApiKeyField = "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY";
 

@@ -424,7 +424,7 @@ fn thinking_config_for_model(model_id: &str) -> Option<KiroThinkingConfig> {
     })
 }
 
-fn map_model(model: &str) -> Option<&'static str> {
+pub(super) fn map_model(model: &str) -> Option<&'static str> {
     let m = model.to_ascii_lowercase();
     if m.contains("sonnet") {
         if m.contains("4-8") || m.contains("4.8") {

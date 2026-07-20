@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{ProxyError, ProxyRoute};
+use crate::domain::providers::model_routing::DEFAULT_GROK_MODEL;
 
-const DEFAULT_GROK_MODEL: &str = "grok-4.5";
 const GROK_API_BASE: &str = "https://api.x.ai/v1";
 const GROK_CLI_CHAT_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const GROK_WS_URL: &str = "wss://api.x.ai/v1/responses";
@@ -21,6 +21,7 @@ static GROK_TURN_IDX: AtomicU64 = AtomicU64::new(1);
 pub(super) struct GrokForwardContract {
     pub session_id: Option<String>,
     pub headers: Vec<(&'static str, String)>,
+    pub actual_model: String,
 }
 
 pub(super) fn apply_forward_contract(
@@ -83,6 +84,7 @@ pub(super) fn apply_forward_contract(
     Ok(GrokForwardContract {
         session_id,
         headers,
+        actual_model: model,
     })
 }
 
@@ -824,6 +826,23 @@ mod tests {
             "grok-4.20-0309-non-reasoning"
         );
         assert_eq!(normalize_grok_model("grok-custom"), "grok-custom");
+    }
+
+    #[test]
+    fn forward_contract_reports_the_final_upstream_model() {
+        let mut body = json_body(json!({"model": "grok-latest", "input": "ping"}));
+        let contract = apply_forward_contract(
+            &mut body,
+            &HeaderMap::new(),
+            ProxyRoute::CodexResponses,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(contract.actual_model, DEFAULT_GROK_MODEL);
+        assert_eq!(request_model(&body).as_deref(), Some(DEFAULT_GROK_MODEL));
     }
 
     #[test]

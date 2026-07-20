@@ -16,6 +16,7 @@ import { ProviderIcon } from "@/components/ProviderIcon";
 import SubscriptionQuotaFooter from "@/components/SubscriptionQuotaFooter";
 import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
+import GrokOauthQuotaFooter from "@/components/GrokOauthQuotaFooter";
 import ClaudeOauthQuotaFooter from "@/components/ClaudeOauthQuotaFooter";
 import GeminiOauthQuotaFooter from "@/components/GeminiOauthQuotaFooter";
 import KiroOauthQuotaFooter from "@/components/KiroOauthQuotaFooter";
@@ -174,6 +175,7 @@ const quotaSourceToAuthProvider = (
 ): ManagedAuthProvider | null => {
   if (quotaSource === "copilot") return PROVIDER_TYPES.GITHUB_COPILOT;
   if (quotaSource === "codex_oauth") return PROVIDER_TYPES.CODEX_OAUTH;
+  if (quotaSource === "grok_oauth") return PROVIDER_TYPES.GROK_OAUTH;
   if (quotaSource === "claude_oauth") return PROVIDER_TYPES.CLAUDE_OAUTH;
   if (quotaSource === "google_gemini_oauth")
     return PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH;
@@ -507,6 +509,14 @@ export function ProviderCard({
               />
             ) : quotaSource === "codex_oauth" ? (
               <CodexOauthQuotaFooter
+                meta={provider.meta}
+                appId={appId}
+                providerId={provider.id}
+                inline={true}
+                isCurrent={isCurrent}
+              />
+            ) : quotaSource === "grok_oauth" ? (
+              <GrokOauthQuotaFooter
                 meta={provider.meta}
                 appId={appId}
                 providerId={provider.id}

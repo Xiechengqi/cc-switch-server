@@ -4153,6 +4153,41 @@ async fn managed_auth_list_accounts_returns_sanitized_subscription_views() {
 }
 
 #[tokio::test]
+async fn managed_oauth_quota_rejects_cross_provider_account_binding() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-codex-cross-binding",
+                ProviderType::CodexOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/get_cached_oauth_quota",
+            json!({
+                "authProvider": "grok_oauth",
+                "accountId": "acct-codex-cross-binding"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("account does not belong to grok_oauth")));
+}
+
+#[tokio::test]
 async fn managed_auth_manual_subscription_expiry_rejects_non_manual_accounts() {
     let state = test_state();
     let app = app_router(state.clone());

@@ -22,9 +22,15 @@ pub(in crate::api) async fn create_provider(
     if input.provider.name.trim().is_empty() {
         return Err(ApiError::bad_request("provider name is required"));
     }
+    let mut provider = input.provider;
+    crate::domain::providers::model_routing::normalize_and_validate_provider_model_routing(
+        input.app,
+        &mut provider,
+    )
+    .map_err(ApiError::bad_request)?;
 
     let stored = state
-        .mutate_providers_immediate(|store| store.upsert(input.app, input.provider))
+        .mutate_providers_immediate(|store| store.upsert(input.app, provider))
         .await
         .map_err(ApiError::internal)?;
 
@@ -50,15 +56,20 @@ pub(in crate::api) async fn import_providers(
     Json(input): Json<ImportProvidersRequest>,
 ) -> Result<Json<ImportProvidersResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    for item in &input.providers {
+    let mut providers = input.providers;
+    for item in &mut providers {
         if item.provider.name.trim().is_empty() {
             return Err(ApiError::bad_request("provider name is required"));
         }
+        crate::domain::providers::model_routing::normalize_and_validate_provider_model_routing(
+            item.app,
+            &mut item.provider,
+        )
+        .map_err(ApiError::bad_request)?;
     }
     let imported = state
         .mutate_providers_immediate(|store| {
-            input
-                .providers
+            providers
                 .into_iter()
                 .map(|item| {
                     store.upsert(item.app, item.provider);
@@ -643,8 +654,14 @@ pub(in crate::api) async fn create_provider_from_preset(
         .into_iter()
         .find(|item| item.name == input.name)
         .ok_or_else(|| ApiError::not_found("provider preset not found"))?;
+    let mut provider = fixture.provider.clone();
+    crate::domain::providers::model_routing::normalize_and_validate_provider_model_routing(
+        input.app,
+        &mut provider,
+    )
+    .map_err(ApiError::bad_request)?;
     let stored = state
-        .mutate_providers_immediate(|store| store.upsert(input.app, fixture.provider.clone()))
+        .mutate_providers_immediate(|store| store.upsert(input.app, provider))
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(CreateProviderResponse { ok: true, stored }))

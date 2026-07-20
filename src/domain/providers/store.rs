@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::providers::model::{classify_provider, AppKind, Provider, ProviderType};
+use crate::domain::providers::model_routing::normalize_provider_model_routing;
 
 const PROVIDERS_FILE_NAME: &str = "providers.json";
 
@@ -42,8 +43,48 @@ impl ProviderStore {
 
         let content = fs::read_to_string(&providers_path)
             .with_context(|| format!("read providers {}", providers_path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("parse providers {}", providers_path.display()))
+        let mut store: Self = serde_json::from_str(&content)
+            .with_context(|| format!("parse providers {}", providers_path.display()))?;
+        let mut normalized = 0usize;
+        let mut unresolved = 0usize;
+        for stored in &mut store.providers {
+            let mut changed = false;
+            let provider_type = classify_provider(stored.app, &stored.provider);
+            if stored.provider_type != provider_type
+                || stored.provider_type_id != provider_type.as_str()
+            {
+                stored.provider_type = provider_type;
+                stored.provider_type_id = provider_type.as_str().to_string();
+                changed = true;
+            }
+            let result = normalize_provider_model_routing(stored.app, &mut stored.provider);
+            if result.changed {
+                changed = true;
+            }
+            if changed {
+                normalized += 1;
+            }
+            if result.required && !result.resolved {
+                unresolved += 1;
+                tracing::warn!(
+                    app = stored.app.as_str(),
+                    provider_id = %stored.provider.id,
+                    provider_name = %stored.provider.name,
+                    "provider model routing could not be inferred; configure one actual upstream model"
+                );
+            }
+        }
+        if normalized > 0 {
+            store
+                .save(config_dir)
+                .context("save normalized provider model routing")?;
+            tracing::info!(
+                normalized_entries = normalized,
+                unresolved_entries = unresolved,
+                "normalized provider model routing policies"
+            );
+        }
+        Ok(store)
     }
 
     pub fn save(&self, config_dir: &Path) -> anyhow::Result<()> {
@@ -58,6 +99,16 @@ impl ProviderStore {
     pub fn upsert(&mut self, app: AppKind, mut provider: Provider) -> StoredProvider {
         if provider.id.trim().is_empty() {
             provider.id = generate_provider_id(app);
+        }
+
+        let routing = normalize_provider_model_routing(app, &mut provider);
+        if routing.required && !routing.resolved {
+            tracing::warn!(
+                app = app.as_str(),
+                provider_id = %provider.id,
+                provider_name = %provider.name,
+                "provider saved without a resolvable actual upstream model"
+            );
         }
 
         let provider_type = classify_provider(app, &provider);
@@ -231,5 +282,49 @@ mod tests {
 
         assert_eq!(loaded.providers.len(), 1);
         assert_eq!(loaded.providers[0].provider_type, ProviderType::CodexOAuth);
+    }
+
+    #[test]
+    fn load_migrates_and_persists_legacy_model_routing() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-provider-routing-migration-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            providers_path(&config_dir),
+            serde_json::to_vec_pretty(&json!({
+                "providers": [{
+                    "app": "codex",
+                    "provider": {
+                        "id": "grok-1",
+                        "name": "Grok OAuth",
+                        "settingsConfig": {"config": "model = \"grok-4.3\""},
+                        "meta": {"providerType": "grok_oauth"}
+                    },
+                    "providerType": "codex",
+                    "providerTypeId": "codex"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = ProviderStore::load_or_default(&config_dir).unwrap();
+        assert_eq!(loaded.providers[0].provider_type, ProviderType::GrokOAuth);
+        assert_eq!(
+            loaded.providers[0].provider.settings_config["modelMapping"],
+            json!({"mode": "single", "upstreamModel": "grok-4.5"})
+        );
+
+        let reloaded = ProviderStore::load_or_default(&config_dir).unwrap();
+        assert_eq!(
+            reloaded.providers[0].provider.settings_config["modelMapping"],
+            json!({"mode": "single", "upstreamModel": "grok-4.5"})
+        );
+        fs::remove_dir_all(config_dir).unwrap();
     }
 }

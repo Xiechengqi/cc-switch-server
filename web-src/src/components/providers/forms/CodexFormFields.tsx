@@ -91,6 +91,7 @@ interface CodexFormFieldsProps {
   onCodexChatReasoningChange?: (value: CodexChatReasoning) => void;
 
   // Model Mapping
+  requiresSingleModel?: boolean;
   singleUpstreamModel: string;
   onSingleUpstreamModelChange: (value: string) => void;
 
@@ -146,6 +147,7 @@ export function CodexFormFields({
   onApiFormatChange,
   codexChatReasoning = {},
   onCodexChatReasoningChange,
+  requiresSingleModel = true,
   singleUpstreamModel,
   onSingleUpstreamModelChange,
   speedTestEndpoints,
@@ -169,10 +171,10 @@ export function CodexFormFields({
     codexChatReasoning.supportsThinking === true ||
     codexChatReasoning.supportsEffort === true;
   const supportsEffort = codexChatReasoning.supportsEffort === true;
-  const shouldShowModelMapping = needsLocalRouting && !isCodexOfficialPreset;
+  const shouldShowModelMapping = requiresSingleModel;
 
   // 高级区在有任何可见配置时自动展开（仅折叠→展开，不会自动折叠）：自定义 UA /
-  // 请求覆盖 / 已填模型映射 / 原生 Responses（需维护 catalog）/ 已配置思考能力。
+  // 请求覆盖 / 原生 Responses（需维护 catalog）/ 已配置思考能力。
   const hasRequestOverrides = Boolean(
     localProxyHeadersOverride.trim() || localProxyBodyOverride.trim(),
   );
@@ -331,6 +333,18 @@ export function CodexFormFields({
           isFullUrl={isFullUrl}
           onFullUrlChange={onFullUrlChange}
           onManageClick={() => onEndpointModalToggle(true)}
+        />
+      )}
+
+      {shouldShowModelMapping && (
+        <SingleModelMappingField
+          id="codexSingleUpstreamModel"
+          value={singleUpstreamModel}
+          onChange={onSingleUpstreamModelChange}
+          fetchedModels={fetchedModels}
+          isLoading={isFetchingModels}
+          onFetchModels={handleFetchModels}
+          required
         />
       )}
 
@@ -506,20 +520,6 @@ export function CodexFormFields({
                 />
               </div>
             </div>
-
-            {/* 模型映射：所有客户端请求模型统一转发到同一个上游真实模型 */}
-            {shouldShowModelMapping && (
-              <div className="border-t border-border-default pt-3">
-                <SingleModelMappingField
-                  id="codexSingleUpstreamModel"
-                  value={singleUpstreamModel}
-                  onChange={onSingleUpstreamModelChange}
-                  fetchedModels={fetchedModels}
-                  isLoading={isFetchingModels}
-                  onFetchModels={handleFetchModels}
-                />
-              </div>
-            )}
 
             <div
               className={cn(

@@ -299,17 +299,28 @@ pub(in crate::api) async fn web_cached_oauth_quota(
     refresh: bool,
     force: Option<bool>,
 ) -> Result<Value, ApiError> {
+    require_session(state, headers).await?;
+    let expected_provider_type = web_optional_auth_provider_type(args)?;
     let account_id = web_resolve_account_id(state, args).await?;
     let Some(account_id) = account_id else {
         return Ok(Value::Null);
     };
-    let auth_provider = web_optional_string_any(args, &["authProvider", "auth_provider"])
-        .or_else(|| {
-            web_optional_auth_provider_type(args)
-                .ok()
-                .flatten()
-                .map(|provider_type| managed_auth_provider_label(provider_type).to_string())
-        })
+    if let Some(expected_provider_type) = expected_provider_type {
+        let actual_provider_type = state
+            .find_account_by_id(&account_id)
+            .await
+            .map(|account| account.provider_type)
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
+        if actual_provider_type != expected_provider_type {
+            return Err(ApiError::bad_request(format!(
+                "account does not belong to {}",
+                managed_auth_provider_label(expected_provider_type)
+            )));
+        }
+    }
+    let auth_provider = expected_provider_type
+        .map(|provider_type| managed_auth_provider_label(provider_type).to_string())
+        .or_else(|| web_optional_string_any(args, &["authProvider", "auth_provider"]))
         .unwrap_or_else(|| "unknown".to_string());
     let provider_id = web_optional_string_any(args, &["providerId", "provider_id"]);
     let app_type = web_optional_string_any(args, &["appType", "app_type", "app"]);

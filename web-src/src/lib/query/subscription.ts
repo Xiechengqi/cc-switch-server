@@ -29,7 +29,9 @@ async function fetchOauthQuotaWithFallback(
     appId,
     providerId,
   );
-  if (cached?.quota) return cached.quota;
+  if (cached?.quota && cached.quota.credentialStatus !== "not_found") {
+    return cached.quota;
+  }
   const refreshed = await subscriptionApi.refreshOauthQuota(
     authProvider,
     accountId,
@@ -69,6 +71,10 @@ export function useSubscriptionQuota(
 export interface UseCodexOauthQuotaOptions {
   enabled?: boolean;
   autoQuery?: boolean;
+}
+
+export interface UseGrokOauthQuotaOptions {
+  enabled?: boolean;
 }
 
 export interface UseClaudeOauthQuotaOptions {
@@ -127,6 +133,28 @@ export function useCodexOauthQuota(
     queryKey: [authProvider, "quota", accountId ?? "default"],
     queryFn: async () =>
       fetchOauthQuotaWithFallback(authProvider, accountId, meta?.providerType),
+    enabled,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+export function useGrokOauthQuota(
+  meta: ProviderMeta | undefined,
+  options: UseGrokOauthQuotaOptions = {},
+) {
+  const { enabled = true } = options;
+  const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.GROK_OAUTH);
+  return useQuery({
+    queryKey: [PROVIDER_TYPES.GROK_OAUTH, "quota", accountId ?? "default"],
+    queryFn: async () =>
+      fetchOauthQuotaWithFallback(
+        PROVIDER_TYPES.GROK_OAUTH,
+        accountId,
+        meta?.providerType,
+      ),
     enabled,
     refetchInterval: false,
     refetchOnWindowFocus: false,
