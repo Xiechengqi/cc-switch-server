@@ -275,10 +275,7 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
                     <X className="h-4 w-4" />
                   </Button>
                 </div>
-                <AccountSubscriptionExpiryControl
-                  account={account}
-                  context="next_payment"
-                />
+                <AccountSubscriptionExpiryControl account={account} />
               </div>
             ))}
           </div>

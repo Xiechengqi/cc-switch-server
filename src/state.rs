@@ -42,6 +42,7 @@ use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{
     Account, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
 };
+use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::failover::FailoverStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
@@ -1533,14 +1534,125 @@ impl ServerStateInner {
         let effective_expiry =
             crate::domain::accounts::subscription_expiry::resolved_subscription_expiry(&account)
                 .expires_at_ms;
+        self.emit_oauth_quota_updated_event(&account, true);
+        if previous_effective_expiry == effective_expiry {
+            return Ok(Ok(account));
+        }
+        self.refresh_account_subscription_metadata(provider_type, Some(account_id))
+            .await?;
+        Ok(Ok(account))
+    }
+
+    pub async fn set_subscription_expiry_rule_and_sync(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        draft: Option<SubscriptionExpiryRuleDraft>,
+    ) -> anyhow::Result<Result<Account, ManualSubscriptionExpiryError>> {
+        use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry_at;
+
+        let updated_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let result = self
+            .try_mutate_accounts_immediate(|store| {
+                let previous_effective_expiry = store
+                    .accounts
+                    .iter()
+                    .find(|account| {
+                        account.id == account_id && account.provider_type == provider_type
+                    })
+                    .ok_or_else(|| ManualSubscriptionExpiryError::NotFound(account_id.to_string()))
+                    .map(|account| {
+                        resolved_subscription_expiry_at(account, updated_at_ms).expires_at_ms
+                    })?;
+                let account =
+                    store.set_subscription_expiry_rule(account_id, draft, updated_at_ms)?;
+                Ok((account, previous_effective_expiry))
+            })
+            .await?;
+        let (account, previous_effective_expiry) = match result {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        let effective_expiry =
+            resolved_subscription_expiry_at(&account, updated_at_ms).expires_at_ms;
+        self.emit_oauth_quota_updated_event(&account, true);
         if previous_effective_expiry == effective_expiry {
             return Ok(Ok(account));
         }
 
-        self.emit_oauth_quota_updated_event(&account, true);
         self.refresh_account_subscription_metadata(provider_type, Some(account_id))
             .await?;
         Ok(Ok(account))
+    }
+
+    pub async fn reconcile_recurring_subscription_metadata(
+        self: &Arc<Self>,
+        previous_ms: Option<i64>,
+        now_ms: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry_at;
+
+        let accounts = self.accounts.read().await.clone();
+        let changed_accounts = accounts
+            .accounts
+            .iter()
+            .filter(|account| account.manual_subscription_expiry_rule.is_some())
+            .filter(|account| {
+                previous_ms.is_none_or(|previous_ms| {
+                    resolved_subscription_expiry_at(account, previous_ms).expires_at_ms
+                        != resolved_subscription_expiry_at(account, now_ms).expires_at_ms
+                })
+            })
+            .map(|account| {
+                (
+                    account.provider_type.as_str().to_string(),
+                    account.id.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if changed_accounts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut default_account_ids = BTreeMap::new();
+        for account in &accounts.accounts {
+            default_account_ids
+                .entry(account.provider_type.as_str())
+                .or_insert(account.id.as_str());
+        }
+        let providers = self.providers.read().await.clone();
+        let provider_keys = providers
+            .providers
+            .iter()
+            .filter(|provider| {
+                let bound_account_id = provider
+                    .provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.auth_binding.as_ref())
+                    .and_then(|binding| binding.account_id.as_deref());
+                let account_id = bound_account_id.or_else(|| {
+                    default_account_ids
+                        .get(provider.provider_type.as_str())
+                        .copied()
+                });
+                account_id.is_some_and(|account_id| {
+                    changed_accounts
+                        .contains(&(provider.provider_type.as_str().to_string(), account_id))
+                })
+            })
+            .map(|provider| (provider.app, provider.provider.id.clone()))
+            .collect::<BTreeSet<_>>();
+        for account in accounts.accounts.iter().filter(|account| {
+            changed_accounts.contains(&(
+                account.provider_type.as_str().to_string(),
+                account.id.as_str(),
+            ))
+        }) {
+            self.emit_oauth_quota_updated_event(account, true);
+        }
+        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys, true)
+            .await
     }
 
     pub async fn refresh_account_subscription_metadata(
@@ -1577,7 +1689,7 @@ impl ServerStateInner {
             })
             .map(|provider| (provider.app, provider.provider.id.clone()))
             .collect::<BTreeSet<_>>();
-        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys)
+        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys, false)
             .await
     }
 
@@ -1603,13 +1715,14 @@ impl ServerStateInner {
             })
             .map(|provider| (provider.app, provider.provider.id.clone()))
             .collect::<BTreeSet<_>>();
-        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys)
+        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys, false)
             .await
     }
 
     async fn refresh_share_subscription_metadata_for_provider_keys(
         self: &Arc<Self>,
         provider_keys: BTreeSet<(AppKind, String)>,
+        only_if_expiry_changed: bool,
     ) -> anyhow::Result<Vec<String>> {
         if provider_keys.is_empty() {
             return Ok(Vec::new());
@@ -1620,12 +1733,21 @@ impl ServerStateInner {
         let usage = self.usage.read().await.clone();
         let share_ids = self
             .mutate_shares_immediate(|shares| {
-                shares.refresh_runtime_snapshots_for_providers(
-                    &provider_keys,
-                    &providers,
-                    Some(&accounts),
-                    &usage,
-                )
+                if only_if_expiry_changed {
+                    shares.refresh_subscription_expiry_snapshots_for_providers(
+                        &provider_keys,
+                        &providers,
+                        Some(&accounts),
+                        &usage,
+                    )
+                } else {
+                    shares.refresh_runtime_snapshots_for_providers(
+                        &provider_keys,
+                        &providers,
+                        Some(&accounts),
+                        &usage,
+                    )
+                }
             })
             .await?;
         if share_ids.is_empty() {
@@ -3214,8 +3336,23 @@ pub fn spawn_share_edit_event_listener(state: ServerState) {
 
 pub fn spawn_account_quota_refresh(state: ServerState) {
     tokio::spawn(async move {
+        let mut previous_expiry_scan_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        if let Err(error) = state
+            .reconcile_recurring_subscription_metadata(None, previous_expiry_scan_ms)
+            .await
+        {
+            tracing::warn!(%error, "startup subscription expiry reconciliation failed");
+        }
         sleep(Duration::from_secs(60)).await;
         loop {
+            let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            if let Err(error) = state
+                .reconcile_recurring_subscription_metadata(Some(previous_expiry_scan_ms), now_ms)
+                .await
+            {
+                tracing::warn!(%error, "periodic subscription expiry reconciliation failed");
+            }
+            previous_expiry_scan_ms = now_ms;
             refresh_due_native_account_tokens(&state).await;
             refresh_due_account_quotas(&state).await;
             let delay = next_account_quota_refresh_delay(&state).await;
@@ -3307,7 +3444,7 @@ async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
     let delay_ms = next_due
         .map(|due| due.saturating_sub(now).max(0) as u64)
         .unwrap_or(interval_ms as u64);
-    Duration::from_millis(delay_ms.clamp(1_000, interval_ms as u64))
+    Duration::from_millis(delay_ms.clamp(1_000, (interval_ms as u64).min(60_000)))
 }
 
 fn account_quota_refresh_candidate(account: &Account) -> bool {
@@ -5310,6 +5447,7 @@ mod tests {
             expires_at,
             manual_subscription_expires_at_ms: None,
             manual_subscription_expiry_updated_at_ms: None,
+            manual_subscription_expiry_rule: None,
             rate_limited_until: None,
             last_refresh_error: None,
             refresh_consecutive_failures: 0,

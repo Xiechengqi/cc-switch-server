@@ -1333,6 +1333,39 @@ impl ShareStore {
         updated_ids
     }
 
+    pub fn refresh_subscription_expiry_snapshots_for_providers(
+        &mut self,
+        provider_keys: &BTreeSet<(AppKind, String)>,
+        providers: &ProviderStore,
+        accounts: Option<&AccountStore>,
+        usage: &UsageStore,
+    ) -> Vec<String> {
+        let mut updated_ids = Vec::new();
+        for share in &mut self.shares {
+            let uses_provider = if share.bindings.is_empty() {
+                provider_keys.contains(&(share.app, share.provider_id.clone()))
+            } else {
+                share.bindings.iter().any(|binding| {
+                    provider_keys.contains(&(binding.app, binding.provider_id.clone()))
+                })
+            };
+            if !uses_provider {
+                continue;
+            }
+
+            let next_snapshot = runtime_snapshot_for_share(share, providers, accounts, usage);
+            if subscription_expiry_fingerprint(share.runtime_snapshot.as_ref())
+                == subscription_expiry_fingerprint(Some(&next_snapshot))
+            {
+                continue;
+            }
+            share.runtime_snapshot = Some(next_snapshot);
+            mark_share_config_pending(share);
+            updated_ids.push(share.id.clone());
+        }
+        updated_ids
+    }
+
     pub fn mark_router_sync(
         &mut self,
         share_id: &str,
@@ -1434,6 +1467,39 @@ fn runtime_snapshot_for_share(
         "modelHealth": descriptor.model_health,
         "updatedAtMs": now_ms(),
     })
+}
+
+fn subscription_expiry_fingerprint(snapshot: Option<&Value>) -> Vec<String> {
+    fn collect(value: &Value, path: &str, entries: &mut Vec<String>) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    let child_path = format!("{path}/{key}");
+                    if matches!(
+                        key.as_str(),
+                        "subscriptionExpiresAt" | "subscriptionPeriodEnd"
+                    ) {
+                        entries.push(format!("{child_path}={value}"));
+                    } else {
+                        collect(value, &child_path, entries);
+                    }
+                }
+            }
+            Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    collect(value, &format!("{path}/{index}"), entries);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut entries = Vec::new();
+    if let Some(snapshot) = snapshot {
+        collect(snapshot, "", &mut entries);
+    }
+    entries.sort();
+    entries
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2031,6 +2097,46 @@ mod tests {
 
         assert_eq!(updated, vec!["share-multi-app"]);
         assert!(store.get("share-multi-app").unwrap().config_revision > original.config_revision);
+    }
+
+    #[test]
+    fn subscription_expiry_fingerprint_ignores_volatile_remaining_time() {
+        let first = json!({
+            "subscriptionExpiresAt": "2026-08-10T23:59:59Z",
+            "subscriptionRemainingMs": 1000,
+            "updatedAtMs": 10,
+            "upstreamProvider": {
+                "subscriptionExpiresAt": "2026-08-10T23:59:59Z",
+                "quota": {"subscriptionPeriodEnd": "2026-08-10T23:59:59Z"}
+            }
+        });
+        let same_expiry = json!({
+            "subscriptionExpiresAt": "2026-08-10T23:59:59Z",
+            "subscriptionRemainingMs": 1,
+            "updatedAtMs": 20,
+            "upstreamProvider": {
+                "subscriptionExpiresAt": "2026-08-10T23:59:59Z",
+                "quota": {"subscriptionPeriodEnd": "2026-08-10T23:59:59Z"}
+            }
+        });
+        let next_period = json!({
+            "subscriptionExpiresAt": "2026-09-10T23:59:59Z",
+            "subscriptionRemainingMs": 1000,
+            "updatedAtMs": 30,
+            "upstreamProvider": {
+                "subscriptionExpiresAt": "2026-09-10T23:59:59Z",
+                "quota": {"subscriptionPeriodEnd": "2026-09-10T23:59:59Z"}
+            }
+        });
+
+        assert_eq!(
+            subscription_expiry_fingerprint(Some(&first)),
+            subscription_expiry_fingerprint(Some(&same_expiry))
+        );
+        assert_ne!(
+            subscription_expiry_fingerprint(Some(&first)),
+            subscription_expiry_fingerprint(Some(&next_period))
+        );
     }
 
     #[test]

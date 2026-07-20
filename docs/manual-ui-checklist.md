@@ -74,6 +74,7 @@ Run the checks manually at:
 ## Accounts, OAuth, Quota
 
 - Manual/import-only account templates, refresh plan, quota refresh, Codex banked reset, Copilot/Kiro device flow, and OAuth preview/finish states are visible where supported.
+- Claude and Grok subscription expiry uses the same monthly/yearly rule control; monthly day, yearly month/day, IANA time zone, next occurrence, automatic Grok precedence, legacy-date migration, save/clear states, and narrow viewport wrapping are verified.
 - Real browser login is not shown as native until capability gates are explicitly opened after real credential validation.
 - Tokens and secrets are never echoed back after save/import.
 

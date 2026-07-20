@@ -253,7 +253,15 @@
       "implemented": true,
       "feature": "accounts",
       "endpoint": "POST /web-api/invoke/auth_set_manual_subscription_expiry",
-      "notes": "Sets or clears the account-owned subscription billing-period end only for account types classified as manual_required."
+      "notes": "Legacy compatibility command for one-time account subscription expiry timestamps. New UI writes recurring rules instead."
+    },
+    {
+      "name": "auth_set_subscription_expiry_rule",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /web-api/invoke/auth_set_subscription_expiry_rule",
+      "notes": "Sets or clears a monthly/yearly account-owned subscription expiry rule with an IANA time zone for manual-capable account types."
     },
     {
       "name": "auth_set_workspace",

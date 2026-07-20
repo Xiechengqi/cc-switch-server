@@ -930,6 +930,10 @@ async fn web_invoke_dispatch(
             web_managed_auth_set_manual_subscription_expiry(state.clone(), headers.clone(), &args)
                 .await
         }
+        "auth_set_subscription_expiry_rule" => {
+            web_managed_auth_set_subscription_expiry_rule(state.clone(), headers.clone(), &args)
+                .await
+        }
         "auth_set_workspace" => {
             web_managed_auth_set_workspace(state.clone(), headers.clone(), &args).await
         }

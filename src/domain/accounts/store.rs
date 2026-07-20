@@ -16,6 +16,9 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::oauth::{oauth_provider_spec, OAuthErrorKind};
+use crate::domain::accounts::subscription_expiry::{
+    SubscriptionExpiryRule, SubscriptionExpiryRuleDraft,
+};
 use crate::domain::providers::model::ProviderType;
 
 const ACCOUNTS_FILE_NAME: &str = "accounts.json";
@@ -81,6 +84,8 @@ pub struct Account {
     pub manual_subscription_expires_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_subscription_expiry_updated_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_subscription_expiry_rule: Option<SubscriptionExpiryRule>,
     #[serde(default)]
     pub rate_limited_until: Option<i64>,
     #[serde(default)]
@@ -307,6 +312,7 @@ impl AccountStore {
             expires_at: input.expires_at,
             manual_subscription_expires_at_ms: None,
             manual_subscription_expiry_updated_at_ms: None,
+            manual_subscription_expiry_rule: None,
             rate_limited_until: input.rate_limited_until,
             last_refresh_error: input.last_refresh_error,
             refresh_consecutive_failures: 0,
@@ -324,6 +330,8 @@ impl AccountStore {
                     existing.manual_subscription_expires_at_ms;
                 account.manual_subscription_expiry_updated_at_ms =
                     existing.manual_subscription_expiry_updated_at_ms;
+                account.manual_subscription_expiry_rule =
+                    existing.manual_subscription_expiry_rule.clone();
             }
             if input.extra_headers.is_none() {
                 account.extra_headers = existing.extra_headers.clone();
@@ -367,6 +375,38 @@ impl AccountStore {
 
         account.manual_subscription_expires_at_ms = expires_at_ms;
         account.manual_subscription_expiry_updated_at_ms = Some(updated_at_ms);
+        account.manual_subscription_expiry_rule = None;
+        Ok(account.clone())
+    }
+
+    pub fn set_subscription_expiry_rule(
+        &mut self,
+        account_id: &str,
+        draft: Option<SubscriptionExpiryRuleDraft>,
+        updated_at_ms: i64,
+    ) -> Result<Account, ManualSubscriptionExpiryError> {
+        use crate::domain::accounts::subscription_expiry::{
+            subscription_expiry_capability, supports_manual_expiry,
+        };
+
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|item| item.id == account_id)
+            .ok_or_else(|| ManualSubscriptionExpiryError::NotFound(account_id.to_string()))?;
+        if !supports_manual_expiry(subscription_expiry_capability(account.provider_type)) {
+            return Err(ManualSubscriptionExpiryError::Unsupported(
+                account.provider_type,
+            ));
+        }
+        let rule = draft
+            .map(|draft| draft.into_rule(updated_at_ms))
+            .transpose()
+            .map_err(|error| ManualSubscriptionExpiryError::InvalidRule(error.to_string()))?;
+
+        account.manual_subscription_expiry_rule = rule;
+        account.manual_subscription_expires_at_ms = None;
+        account.manual_subscription_expiry_updated_at_ms = None;
         Ok(account.clone())
     }
 
@@ -693,6 +733,7 @@ pub enum ManualSubscriptionExpiryError {
     NotFound(String),
     Unsupported(ProviderType),
     InvalidTimestamp,
+    InvalidRule(String),
 }
 
 impl std::fmt::Display for ManualSubscriptionExpiryError {
@@ -707,6 +748,7 @@ impl std::fmt::Display for ManualSubscriptionExpiryError {
             Self::InvalidTimestamp => {
                 formatter.write_str("subscription expiry timestamp must be after the Unix epoch")
             }
+            Self::InvalidRule(message) => formatter.write_str(message),
         }
     }
 }
@@ -1305,6 +1347,106 @@ mod tests {
             store.accounts[0].manual_subscription_expiry_updated_at_ms,
             None
         );
+        assert_eq!(store.accounts[0].manual_subscription_expiry_rule, None);
+    }
+
+    #[test]
+    fn recurring_subscription_rule_replaces_legacy_value_and_survives_refresh() {
+        use crate::domain::accounts::subscription_expiry::SubscriptionExpiryCadence;
+
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("claude-recurring".to_string());
+        store.upsert(input);
+        store
+            .set_manual_subscription_expiry(
+                "claude-recurring",
+                Some(1_786_924_800_000),
+                1_784_000_000_000,
+            )
+            .unwrap();
+
+        let account = store
+            .set_subscription_expiry_rule(
+                "claude-recurring",
+                Some(SubscriptionExpiryRuleDraft {
+                    cadence: SubscriptionExpiryCadence::Monthly,
+                    month: None,
+                    day: 10,
+                    time_zone: "Asia/Shanghai".to_string(),
+                }),
+                1_785_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(account.manual_subscription_expires_at_ms, None);
+        assert_eq!(account.manual_subscription_expiry_updated_at_ms, None);
+        assert_eq!(
+            account
+                .manual_subscription_expiry_rule
+                .as_ref()
+                .map(|rule| (rule.cadence, rule.day, rule.time_zone.as_str())),
+            Some((SubscriptionExpiryCadence::Monthly, 10, "Asia/Shanghai"))
+        );
+
+        let mut refreshed = fixture_input(ProviderType::ClaudeOAuth);
+        refreshed.id = Some("claude-recurring".to_string());
+        refreshed.access_token = Some("refreshed-token".to_string());
+        let account = store.upsert(refreshed);
+        assert!(account.manual_subscription_expiry_rule.is_some());
+
+        let persisted = serde_json::to_value(&store).unwrap();
+        assert_eq!(
+            persisted.pointer("/accounts/0/manualSubscriptionExpiryRule/cadence"),
+            Some(&json!("monthly"))
+        );
+        let reloaded: AccountStore = serde_json::from_value(persisted).unwrap();
+        assert_eq!(
+            reloaded.accounts[0].manual_subscription_expiry_rule,
+            account.manual_subscription_expiry_rule
+        );
+
+        let cleared = store
+            .set_subscription_expiry_rule("claude-recurring", None, 1_786_000_000_000)
+            .unwrap();
+        assert_eq!(cleared.manual_subscription_expiry_rule, None);
+        assert_eq!(cleared.manual_subscription_expires_at_ms, None);
+    }
+
+    #[test]
+    fn recurring_subscription_rule_rejects_unsupported_accounts_and_invalid_shapes() {
+        use crate::domain::accounts::subscription_expiry::SubscriptionExpiryCadence;
+
+        let mut store = AccountStore::default();
+        for provider_type in [ProviderType::ClaudeOAuth, ProviderType::CodexOAuth] {
+            let mut input = fixture_input(provider_type);
+            input.id = Some(provider_type.as_str().to_string());
+            store.upsert(input);
+        }
+        let monthly_with_month = SubscriptionExpiryRuleDraft {
+            cadence: SubscriptionExpiryCadence::Monthly,
+            month: Some(7),
+            day: 10,
+            time_zone: "UTC".to_string(),
+        };
+
+        assert!(matches!(
+            store.set_subscription_expiry_rule(
+                ProviderType::ClaudeOAuth.as_str(),
+                Some(monthly_with_month.clone()),
+                1_000,
+            ),
+            Err(ManualSubscriptionExpiryError::InvalidRule(_))
+        ));
+        assert!(matches!(
+            store.set_subscription_expiry_rule(
+                ProviderType::CodexOAuth.as_str(),
+                Some(monthly_with_month),
+                1_000,
+            ),
+            Err(ManualSubscriptionExpiryError::Unsupported(
+                ProviderType::CodexOAuth
+            ))
+        ));
     }
 
     #[test]

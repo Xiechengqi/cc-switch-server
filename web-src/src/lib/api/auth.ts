@@ -45,12 +45,33 @@ export type ManagedAuthSubscriptionExpiryCapability =
   | "research_pending"
   | "not_applicable";
 
+export type SubscriptionExpiryCadence = "monthly" | "yearly";
+
+export interface SubscriptionExpiryRuleDraft {
+  cadence: SubscriptionExpiryCadence;
+  month: number | null;
+  day: number;
+  timeZone: string;
+}
+
+export interface SubscriptionExpiryRule extends SubscriptionExpiryRuleDraft {
+  updatedAtMs: number;
+}
+
 export interface ManagedAuthSubscriptionExpiry {
   capability: ManagedAuthSubscriptionExpiryCapability;
+  rule: SubscriptionExpiryRule | null;
+  ruleNextExpiresAt: string | null;
+  automaticExpiresAt: string | null;
+  legacyManualExpiresAt: string | null;
   manualExpiresAt: string | null;
   effectiveExpiresAt: string | null;
-  source: "automatic" | "manual" | null;
-  kind: "subscription" | "billing_period" | null;
+  source: "automatic" | "recurring_rule" | "manual" | null;
+  kind:
+    | "subscription"
+    | "recurring_billing_period"
+    | "billing_period"
+    | null;
 }
 
 export interface ManagedAuthStatus {
@@ -299,6 +320,21 @@ export async function authSetManualSubscriptionExpiry(
       authProvider,
       accountId,
       expiresAt,
+    },
+  );
+}
+
+export async function authSetSubscriptionExpiryRule(
+  authProvider: ManagedAuthProvider,
+  accountId: string,
+  rule: SubscriptionExpiryRuleDraft | null,
+): Promise<ManagedAuthAccount> {
+  return invokeCommand<ManagedAuthAccount>(
+    "auth_set_subscription_expiry_rule",
+    {
+      authProvider,
+      accountId,
+      rule,
     },
   );
 }

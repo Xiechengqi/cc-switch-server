@@ -4094,6 +4094,169 @@ async fn managed_auth_manual_subscription_expiry_updates_account_and_share_metad
 }
 
 #[tokio::test]
+async fn managed_auth_recurring_subscription_expiry_rule_is_validated_and_synced() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-claude-recurring",
+                ProviderType::ClaudeOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "claude-recurring-provider".to_string(),
+            name: "Claude Recurring Provider".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("claude_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("claude_oauth".to_string()),
+                    account_id: Some("acct-claude-recurring".to_string()),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+    let mut share_input = test_share_input(
+        "share-claude-recurring",
+        "claude-recurring-provider",
+        ProviderType::ClaudeOAuth,
+    );
+    share_input.app = AppKind::Claude;
+    let initial_share = state
+        .mutate_shares_immediate(|shares| shares.upsert(share_input).unwrap())
+        .await
+        .unwrap();
+    let rule = json!({
+        "cadence": "monthly",
+        "month": null,
+        "day": 10,
+        "timeZone": "Asia/Shanghai"
+    });
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_subscription_expiry_rule",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-recurring",
+                "rule": rule.clone()
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = json_body(response).await;
+    assert_eq!(account["subscriptionExpiry"]["source"], "recurring_rule");
+    assert_eq!(
+        account["subscriptionExpiry"]["kind"],
+        "recurring_billing_period"
+    );
+    assert_eq!(account["subscriptionExpiry"]["rule"]["cadence"], "monthly");
+    assert!(account["subscriptionExpiry"]["rule"]["month"].is_null());
+    assert_eq!(account["subscriptionExpiry"]["rule"]["day"], 10);
+    assert_eq!(
+        account["subscriptionExpiry"]["rule"]["timeZone"],
+        "Asia/Shanghai"
+    );
+    assert_eq!(
+        account["subscriptionExpiry"]["ruleNextExpiresAt"],
+        account["subscriptionExpiry"]["effectiveExpiresAt"]
+    );
+    assert!(account["subscriptionExpiry"]["automaticExpiresAt"].is_null());
+    assert!(account["subscriptionExpiry"]["legacyManualExpiresAt"].is_null());
+    let stored = state
+        .find_account_by_id("acct-claude-recurring")
+        .await
+        .unwrap();
+    assert!(stored.manual_subscription_expiry_rule.is_some());
+    assert!(stored.manual_subscription_expires_at_ms.is_none());
+    let updated_share = state
+        .mutate_shares(|shares| shares.get("share-claude-recurring").cloned().unwrap())
+        .await;
+    assert!(updated_share.config_revision > initial_share.config_revision);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_subscription_expiry_rule",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-recurring",
+                "rule": rule
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let unchanged_revision = state
+        .mutate_shares(|shares| {
+            shares
+                .get("share-claude-recurring")
+                .unwrap()
+                .config_revision
+        })
+        .await;
+    assert_eq!(unchanged_revision, updated_share.config_revision);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_subscription_expiry_rule",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-recurring",
+                "rule": {
+                    "cadence": "monthly",
+                    "month": 7,
+                    "day": 10,
+                    "timeZone": "Asia/Shanghai"
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_subscription_expiry_rule",
+            json!({
+                "authProvider": "claude_oauth",
+                "accountId": "acct-claude-recurring",
+                "rule": null
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = json_body(response).await;
+    assert!(account["subscriptionExpiry"]["rule"].is_null());
+    assert!(account["subscriptionExpiry"]["effectiveExpiresAt"].is_null());
+    assert!(account["subscriptionExpiry"]["source"].is_null());
+}
+
+#[tokio::test]
 async fn managed_auth_grok_manual_subscription_expiry_is_available_as_fallback() {
     let state = test_state();
     let app = app_router(state.clone());

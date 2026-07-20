@@ -1323,6 +1323,59 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_derives_recurring_account_expiry_for_router_metadata() {
+        use crate::domain::accounts::subscription_expiry::{
+            resolved_subscription_expiry, SubscriptionExpiryCadence, SubscriptionExpiryRuleDraft,
+        };
+
+        let share = test_share(ProviderType::ClaudeOAuth, Some(5.0));
+        let providers = ProviderStore {
+            providers: vec![test_provider(ProviderType::ClaudeOAuth)],
+        };
+        let mut account = test_account(ProviderType::ClaudeOAuth);
+        account.quota = None;
+        account.manual_subscription_expiry_rule = Some(
+            SubscriptionExpiryRuleDraft {
+                cadence: SubscriptionExpiryCadence::Monthly,
+                month: None,
+                day: 10,
+                time_zone: "Asia/Shanghai".to_string(),
+            }
+            .into_rule(1_784_000_000_000)
+            .unwrap(),
+        );
+        let expected = Utc
+            .timestamp_millis_opt(
+                resolved_subscription_expiry(&account)
+                    .expires_at_ms
+                    .unwrap(),
+            )
+            .single()
+            .unwrap()
+            .to_rfc3339();
+        let accounts = AccountStore {
+            accounts: vec![account],
+        };
+
+        let descriptor =
+            descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
+        let provider = descriptor.app_providers.codex.first().unwrap();
+
+        assert_eq!(
+            provider.subscription_expires_at.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            provider
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.subscription_period_end.as_deref()),
+            Some(expected.as_str())
+        );
+        assert_eq!(descriptor.expires_at, UNLIMITED_SHARE_EXPIRES_AT);
+    }
+
+    #[test]
     fn descriptor_maps_codex_quota_tiers_for_router_share_card() {
         let share = test_share(ProviderType::CodexOAuth, Some(1.0));
         let providers = ProviderStore {
@@ -1618,6 +1671,7 @@ mod tests {
             expires_at: None,
             manual_subscription_expires_at_ms: None,
             manual_subscription_expiry_updated_at_ms: None,
+            manual_subscription_expiry_rule: None,
             rate_limited_until: None,
             last_refresh_error: None,
             refresh_consecutive_failures: 0,

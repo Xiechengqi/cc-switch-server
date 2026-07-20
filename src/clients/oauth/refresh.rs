@@ -737,6 +737,7 @@ mod tests {
             expires_at,
             manual_subscription_expires_at_ms: None,
             manual_subscription_expiry_updated_at_ms: None,
+            manual_subscription_expiry_rule: None,
             rate_limited_until: None,
             last_refresh_error: None,
             refresh_consecutive_failures: 0,

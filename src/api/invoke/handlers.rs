@@ -2103,22 +2103,34 @@ pub(in crate::api) fn map_managed_auth_account(
     let workspaces = crate::domain::accounts::store::codex_workspace_options(account);
     let selected_workspace_id =
         crate::domain::accounts::store::effective_codex_workspace_id(account);
-    let subscription_expiry =
-        crate::domain::accounts::subscription_expiry::resolved_subscription_expiry(account);
-    let manual_expires_at = crate::domain::accounts::subscription_expiry::supports_manual_expiry(
-        subscription_expiry.capability,
-    )
-    .then_some(account.manual_subscription_expires_at_ms)
-    .flatten()
-    .and_then(|timestamp_ms| subscription_expiry_rfc3339(Some(timestamp_ms)));
+    use crate::domain::accounts::subscription_expiry::{
+        automatic_subscription_expires_at_ms, recurring_subscription_expires_at_ms,
+        resolved_subscription_expiry_at, supports_manual_expiry, SubscriptionExpirySource,
+    };
+
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let subscription_expiry = resolved_subscription_expiry_at(account, now_ms);
+    let supports_manual = supports_manual_expiry(subscription_expiry.capability);
+    let legacy_manual_expires_at = supports_manual
+        .then_some(account.manual_subscription_expires_at_ms)
+        .flatten()
+        .and_then(|timestamp_ms| subscription_expiry_rfc3339(Some(timestamp_ms)));
+    let rule_next_expires_at = supports_manual
+        .then(|| recurring_subscription_expires_at_ms(account, now_ms))
+        .flatten()
+        .and_then(|timestamp_ms| subscription_expiry_rfc3339(Some(timestamp_ms)));
+    let automatic_expires_at = automatic_subscription_expires_at_ms(account)
+        .and_then(|timestamp_ms| subscription_expiry_rfc3339(Some(timestamp_ms)));
     let effective_expires_at = subscription_expiry_rfc3339(subscription_expiry.expires_at_ms);
+    let expiry_source = subscription_expiry.source.map(|source| match source {
+        SubscriptionExpirySource::Automatic => "automatic",
+        SubscriptionExpirySource::RecurringRule => "recurring_rule",
+        SubscriptionExpirySource::LegacyManual => "manual",
+    });
     let expiry_kind = subscription_expiry.source.map(|source| match source {
-        crate::domain::accounts::subscription_expiry::SubscriptionExpirySource::Automatic => {
-            "subscription"
-        }
-        crate::domain::accounts::subscription_expiry::SubscriptionExpirySource::Manual => {
-            "billing_period"
-        }
+        SubscriptionExpirySource::Automatic => "subscription",
+        SubscriptionExpirySource::RecurringRule => "recurring_billing_period",
+        SubscriptionExpirySource::LegacyManual => "billing_period",
     });
     json!({
         "id": account.id,
@@ -2133,9 +2145,13 @@ pub(in crate::api) fn map_managed_auth_account(
         "selected_workspace_id": selected_workspace_id,
         "subscriptionExpiry": {
             "capability": subscription_expiry.capability,
-            "manualExpiresAt": manual_expires_at,
+            "rule": if supports_manual { account.manual_subscription_expiry_rule.as_ref() } else { None },
+            "ruleNextExpiresAt": rule_next_expires_at,
+            "automaticExpiresAt": automatic_expires_at,
+            "legacyManualExpiresAt": legacy_manual_expires_at,
+            "manualExpiresAt": legacy_manual_expires_at,
             "effectiveExpiresAt": effective_expires_at,
-            "source": subscription_expiry.source,
+            "source": expiry_source,
             "kind": expiry_kind,
         }
     })
@@ -2667,6 +2683,54 @@ pub(in crate::api) async fn web_managed_auth_set_manual_subscription_expiry(
                 ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
             }
             crate::domain::accounts::store::ManualSubscriptionExpiryError::InvalidTimestamp => {
+                ApiError::bad_request(error)
+            }
+            crate::domain::accounts::store::ManualSubscriptionExpiryError::InvalidRule(_) => {
+                ApiError::bad_request(error)
+            }
+        })?;
+
+    web_managed_auth_account_by_id(&state, &account_id, provider_label).await
+}
+
+pub(in crate::api) async fn web_managed_auth_set_subscription_expiry_rule(
+    state: ServerState,
+    headers: HeaderMap,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    require_session(&state, &headers).await?;
+    let provider_type = web_auth_provider_type(args)?;
+    let provider_label = managed_auth_provider_label(provider_type);
+    let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
+    let rule = args
+        .get("rule")
+        .ok_or_else(|| ApiError::bad_request("rule is required"))?;
+    let draft = if rule.is_null() {
+        None
+    } else {
+        Some(
+            serde_json::from_value::<
+                crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft,
+            >(rule.clone())
+            .map_err(|error| {
+                ApiError::bad_request(format!("invalid subscription expiry rule: {error}"))
+            })?,
+        )
+    };
+
+    state
+        .set_subscription_expiry_rule_and_sync(provider_type, &account_id, draft)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(|error| match error {
+            crate::domain::accounts::store::ManualSubscriptionExpiryError::NotFound(_) => {
+                ApiError::not_found("account not found")
+            }
+            crate::domain::accounts::store::ManualSubscriptionExpiryError::Unsupported(_) => {
+                ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+            }
+            crate::domain::accounts::store::ManualSubscriptionExpiryError::InvalidTimestamp
+            | crate::domain::accounts::store::ManualSubscriptionExpiryError::InvalidRule(_) => {
                 ApiError::bad_request(error)
             }
         })?;

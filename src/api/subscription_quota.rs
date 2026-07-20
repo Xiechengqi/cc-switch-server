@@ -201,14 +201,29 @@ fn subscription_for_ui(account: &Account, quota: Option<&AccountQuota>) -> Optio
         "expiryCapability".to_string(),
         serde_json::to_value(resolved.capability).unwrap_or(Value::Null),
     );
-    if resolved.source == Some(SubscriptionExpirySource::Manual) {
+    if matches!(
+        resolved.source,
+        Some(SubscriptionExpirySource::RecurringRule | SubscriptionExpirySource::LegacyManual)
+    ) {
         object.insert(
             "expiresSource".to_string(),
-            Value::String("manual".to_string()),
+            Value::String(
+                match resolved.source {
+                    Some(SubscriptionExpirySource::RecurringRule) => "recurring_rule",
+                    _ => "manual",
+                }
+                .to_string(),
+            ),
         );
         object.insert(
             "expiresKind".to_string(),
-            Value::String("billing_period".to_string()),
+            Value::String(
+                match resolved.source {
+                    Some(SubscriptionExpirySource::RecurringRule) => "recurring_billing_period",
+                    _ => "billing_period",
+                }
+                .to_string(),
+            ),
         );
         object.insert(
             "expiryAvailability".to_string(),
@@ -343,6 +358,7 @@ mod tests {
             expires_at: None,
             manual_subscription_expires_at_ms: None,
             manual_subscription_expiry_updated_at_ms: None,
+            manual_subscription_expiry_rule: None,
             rate_limited_until: None,
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
@@ -540,6 +556,37 @@ mod tests {
         assert_eq!(quota["error"], "upstream quota unavailable");
         assert!(quota["queriedAt"].is_null());
         assert!(account.quota.is_none());
+    }
+
+    #[test]
+    fn recurring_subscription_expiry_is_synthesized_for_quota_ui() {
+        use crate::domain::accounts::subscription_expiry::{
+            SubscriptionExpiryCadence, SubscriptionExpiryRuleDraft,
+        };
+
+        let mut account = sample_account(AccountQuota::default());
+        account.provider_type = ProviderType::ClaudeOAuth;
+        account.quota = None;
+        account.manual_subscription_expiry_rule = Some(
+            SubscriptionExpiryRuleDraft {
+                cadence: SubscriptionExpiryCadence::Monthly,
+                month: None,
+                day: 10,
+                time_zone: "UTC".to_string(),
+            }
+            .into_rule(1_784_000_000_000)
+            .unwrap(),
+        );
+
+        let quota = subscription_quota_from_account(&account, "claude_oauth");
+
+        assert!(quota["subscription"]["expiresAt"].is_string());
+        assert_eq!(quota["subscription"]["expiresSource"], "recurring_rule");
+        assert_eq!(
+            quota["subscription"]["expiresKind"],
+            "recurring_billing_period"
+        );
+        assert_eq!(quota["subscription"]["expiryCapability"], "manual_required");
     }
 
     #[test]
