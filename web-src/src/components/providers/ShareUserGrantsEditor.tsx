@@ -250,7 +250,8 @@ export function ShareUserGrantsEditor({
       </div>
 
       <Dialog open={draft != null} onOpenChange={(open) => !open && setDraft(null)}>
-        <DialogContent className="max-w-xl" zIndex="nested">
+        {/* Provider editing uses a z-[60] FullScreenPanel. */}
+        <DialogContent className="max-w-xl" zIndex="top">
           <DialogHeader>
             <DialogTitle>
               {editingEmail
