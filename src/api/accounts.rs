@@ -1343,6 +1343,7 @@ async fn verify_and_mark_codex_account_input(
     if input.provider_type != ProviderType::CodexOAuth {
         return Ok(());
     }
+    crate::domain::accounts::store::clear_codex_workspace_provenance(&mut input.profile);
     let id_token = input
         .id_token
         .as_deref()

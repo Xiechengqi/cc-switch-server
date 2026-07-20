@@ -4016,7 +4016,6 @@ async fn managed_auth_manual_subscription_expiry_updates_account_and_share_metad
         "2026-08-17T00:00:00.000Z"
     );
     assert_eq!(account["subscriptionExpiry"]["kind"], "billing_period");
-
     let stored = state
         .find_account_by_id("acct-claude-expiry")
         .await
@@ -4092,6 +4091,112 @@ async fn managed_auth_manual_subscription_expiry_updates_account_and_share_metad
         account["subscriptionExpiry"]["effectiveExpiresAt"],
         "2020-01-01T00:00:00.000Z"
     );
+}
+
+#[tokio::test]
+async fn managed_auth_grok_manual_subscription_expiry_is_available_as_fallback() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-grok-expiry",
+                ProviderType::GrokOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "grok-expiry-provider".to_string(),
+            name: "Grok Expiry Provider".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("grok_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("grok_oauth".to_string()),
+                    account_id: Some("acct-grok-expiry".to_string()),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+    let mut share_input = test_share_input(
+        "share-grok-expiry",
+        "grok-expiry-provider",
+        ProviderType::GrokOAuth,
+    );
+    share_input.app = AppKind::Claude;
+    let initial_share = state
+        .mutate_shares_immediate(|shares| shares.upsert(share_input).unwrap())
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_manual_subscription_expiry",
+            json!({
+                "authProvider": "grok_oauth",
+                "accountId": "acct-grok-expiry",
+                "expiresAt": "2026-08-14T00:00:00Z"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = json_body(response).await;
+    assert_eq!(
+        account["subscriptionExpiry"]["capability"],
+        "automatic_or_manual"
+    );
+    assert_eq!(account["subscriptionExpiry"]["source"], "manual");
+    assert_eq!(
+        account["subscriptionExpiry"]["manualExpiresAt"],
+        "2026-08-14T00:00:00.000Z"
+    );
+    assert_eq!(
+        account["subscriptionExpiry"]["effectiveExpiresAt"],
+        "2026-08-14T00:00:00.000Z"
+    );
+    assert_eq!(account["subscriptionExpiry"]["kind"], "billing_period");
+    let updated_share = state
+        .mutate_shares(|shares| shares.get("share-grok-expiry").cloned().unwrap())
+        .await;
+    assert!(updated_share.config_revision > initial_share.config_revision);
+    assert!(updated_share.router_synced_revision < updated_share.config_revision);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_manual_subscription_expiry",
+            json!({
+                "authProvider": "grok_oauth",
+                "accountId": "acct-grok-expiry",
+                "expiresAt": null
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let account = json_body(response).await;
+    assert!(account["subscriptionExpiry"]["manualExpiresAt"].is_null());
+    assert!(account["subscriptionExpiry"]["effectiveExpiresAt"].is_null());
+    assert!(account["subscriptionExpiry"]["source"].is_null());
+    let cleared_share = state
+        .mutate_shares(|shares| shares.get("share-grok-expiry").cloned().unwrap())
+        .await;
+    assert!(cleared_share.config_revision > updated_share.config_revision);
 }
 
 #[tokio::test]

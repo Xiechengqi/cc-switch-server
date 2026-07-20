@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { AccountSubscriptionExpiryControl } from "@/components/settings/AccountSubscriptionExpiryControl";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -223,7 +224,7 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
             {accounts.map((account) => (
               <div
                 key={account.id}
-                className="flex items-center justify-between rounded-md border bg-muted/30 p-2"
+                className="flex flex-wrap items-center justify-between rounded-md border bg-muted/30 p-2"
               >
                 <div className="flex min-w-0 items-center gap-2">
                   <User className="h-5 w-5 shrink-0 text-muted-foreground" />
@@ -274,6 +275,10 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
                     <X className="h-4 w-4" />
                   </Button>
                 </div>
+                <AccountSubscriptionExpiryControl
+                  account={account}
+                  context="next_payment"
+                />
               </div>
             ))}
           </div>

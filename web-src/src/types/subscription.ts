@@ -31,14 +31,20 @@ export interface SubscriptionInfo {
   expiresAt?: string | null;
   expiresSource?: string | null;
   expiresKind?: SubscriptionExpiresKind | null;
+  expiryStale?: boolean | null;
   expiryCapability?:
     | "automatic"
+    | "automatic_or_manual"
     | "manual_required"
     | "research_pending"
     | "not_applicable"
     | null;
   expiryAvailability?:
-    "available" | "upstream_not_provided" | "probe_unavailable" | null;
+    | "available"
+    | "upstream_not_provided"
+    | "probe_unavailable"
+    | "workspace_unverified"
+    | null;
 }
 
 export type QuotaStatus =

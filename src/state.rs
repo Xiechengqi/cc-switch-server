@@ -1662,14 +1662,12 @@ impl ServerStateInner {
         after: &Account,
     ) -> anyhow::Result<bool> {
         use crate::domain::accounts::subscription_expiry::{
-            resolved_subscription_expiry, subscription_expiry_capability,
-            SubscriptionExpiryCapability,
+            resolved_subscription_expiry, subscription_expiry_capability, supports_automatic_expiry,
         };
 
         if before.id != after.id
             || before.provider_type != after.provider_type
-            || subscription_expiry_capability(after.provider_type)
-                != SubscriptionExpiryCapability::Automatic
+            || !supports_automatic_expiry(subscription_expiry_capability(after.provider_type))
             || resolved_subscription_expiry(before).expires_at_ms
                 == resolved_subscription_expiry(after).expires_at_ms
         {

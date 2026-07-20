@@ -199,8 +199,7 @@ async fn refresh_codex_quota(
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let request_workspace_id = codex_account_id(account);
-    let trusted_workspace_id =
-        crate::domain::accounts::store::effective_codex_workspace_id(account);
+    let mut trusted_workspace = crate::domain::accounts::store::trusted_codex_workspace(account);
     let usage_request = codex_authenticated_get(
         http,
         &format!("{CHATGPT_USAGE_URL}?supports_rewardless_invites=true"),
@@ -243,33 +242,117 @@ async fn refresh_codex_quota(
         .rate_limit
         .as_ref()
         .and_then(|rate_limit| rate_limit.limit_reached);
-    let account_lookup = fetch_chatgpt_account_lookup(
+    let signed_recovery = if trusted_workspace.is_none() {
+        recover_signed_codex_workspace(http, account, now_ms).await
+    } else {
+        None
+    };
+    let legacy_workspace_id = legacy_codex_workspace_candidate(account);
+    let mut profile_update = None;
+    let discovery_workspace_id = trusted_workspace
+        .as_ref()
+        .map(|workspace| workspace.id.clone())
+        .or_else(|| {
+            signed_recovery
+                .as_ref()
+                .map(|(workspace, _)| workspace.id.clone())
+        })
+        .or_else(|| legacy_workspace_id.clone());
+    let mut account_probe_workspace_id = discovery_workspace_id.clone();
+    let mut account_probe = fetch_chatgpt_account_lookup(
         http,
         access_token,
-        trusted_workspace_id.as_deref(),
+        discovery_workspace_id.as_deref(),
         now_ms,
         request_timeout,
     )
     .await;
-    let subscription_lookup = fetch_chatgpt_subscription_lookup(
+    if trusted_workspace.is_none() {
+        if chatgpt_probe_matches_usage(&account_probe, usage_plan_type.as_deref()) {
+            if let Some((workspace, profile)) = signed_recovery.as_ref().filter(|(workspace, _)| {
+                discovery_workspace_id.as_deref() == Some(workspace.id.as_str())
+            }) {
+                trusted_workspace = Some(workspace.clone());
+                profile_update = profile.clone();
+            } else if legacy_workspace_id.as_deref() == discovery_workspace_id.as_deref() {
+                let workspace_id = discovery_workspace_id
+                    .as_deref()
+                    .expect("discovery workspace was checked");
+                let (workspace, profile) =
+                    authenticated_codex_workspace_update(account, workspace_id, now_ms);
+                profile_update = profile;
+                trusted_workspace = Some(workspace);
+            }
+        } else if signed_recovery.is_some()
+            && legacy_workspace_id.is_some()
+            && legacy_workspace_id.as_deref() != discovery_workspace_id.as_deref()
+        {
+            account_probe_workspace_id = legacy_workspace_id.clone();
+            account_probe = fetch_chatgpt_account_lookup(
+                http,
+                access_token,
+                legacy_workspace_id.as_deref(),
+                now_ms,
+                request_timeout,
+            )
+            .await;
+            if chatgpt_probe_matches_usage(&account_probe, usage_plan_type.as_deref()) {
+                let workspace_id = legacy_workspace_id
+                    .as_deref()
+                    .expect("legacy workspace was checked");
+                let (workspace, profile) =
+                    authenticated_codex_workspace_update(account, workspace_id, now_ms);
+                profile_update = profile;
+                trusted_workspace = Some(workspace);
+            }
+        }
+    }
+    let subscription_request_workspace_id = trusted_workspace
+        .as_ref()
+        .map(|workspace| workspace.id.clone())
+        .or_else(|| account_probe_workspace_id.clone());
+    let subscription_probe = fetch_chatgpt_subscription_lookup(
         http,
         access_token,
-        trusted_workspace_id.as_deref(),
+        subscription_request_workspace_id.as_deref(),
         request_timeout,
     )
     .await;
-    let account_lookup_plan_type = account_lookup
+    if trusted_workspace.is_none()
+        && chatgpt_probe_matches_usage(&subscription_probe, usage_plan_type.as_deref())
+    {
+        if let Some((workspace, profile)) = signed_recovery.as_ref().filter(|(workspace, _)| {
+            subscription_request_workspace_id.as_deref() == Some(workspace.id.as_str())
+        }) {
+            trusted_workspace = Some(workspace.clone());
+            profile_update = profile.clone();
+        } else if legacy_workspace_id.as_deref() == subscription_request_workspace_id.as_deref() {
+            let workspace_id = subscription_request_workspace_id
+                .as_deref()
+                .expect("subscription discovery workspace was checked");
+            let (workspace, profile) =
+                authenticated_codex_workspace_update(account, workspace_id, now_ms);
+            trusted_workspace = Some(workspace);
+            profile_update = profile;
+        }
+    }
+    let trusted_workspace_id = trusted_workspace
+        .as_ref()
+        .map(|workspace| workspace.id.as_str());
+    let account_lookup_plan_type = account_probe
+        .lookup
         .as_ref()
         .and_then(|lookup| lookup.plan_type.clone());
-    let subscription_lookup_plan_type = subscription_lookup
+    let subscription_lookup_plan_type = subscription_probe
+        .lookup
         .as_ref()
         .and_then(|lookup| lookup.plan_type.clone());
     let resolution = reconcile_chatgpt_subscription(
         usage_plan_type.as_deref(),
         usage_allowed,
-        trusted_workspace_id.is_some(),
-        account_lookup,
-        subscription_lookup,
+        trusted_workspace.is_some(),
+        account_probe.lookup.clone(),
+        subscription_probe.lookup.clone(),
         now_ms,
     );
     if !resolution.discarded_reasons.is_empty() {
@@ -282,12 +365,28 @@ async fn refresh_codex_quota(
             "discarded inconsistent ChatGPT subscription metadata"
         );
     }
-    let subscription = resolution.subscription;
+    let (subscription, expiry_snapshot) = finalize_codex_subscription(
+        account,
+        resolution.subscription,
+        trusted_workspace.as_ref(),
+        usage_plan_type.as_deref(),
+        &account_probe,
+        &subscription_probe,
+        now_ms,
+    );
     let subscription_level = usage_plan_label.or_else(|| {
         subscription
             .as_ref()
             .and_then(|item| item.plan_label.clone())
     });
+    let expiry_availability = subscription
+        .as_ref()
+        .and_then(|item| item.expiry_availability.as_deref());
+    let expiry_warning_code = match expiry_availability {
+        Some("workspace_unverified") => Some("codex_subscription_workspace_unverified"),
+        Some("probe_unavailable") => Some("codex_subscription_probe_unavailable"),
+        _ => None,
+    };
     let subscription_json = subscription.as_ref().map(|item| {
         json!({
             "planType": item.plan_type,
@@ -295,6 +394,9 @@ async fn refresh_codex_quota(
             "expiresAt": item.expires_at,
             "expiresSource": item.expires_source,
             "expiresKind": item.expires_kind,
+            "expiryCapability": "automatic",
+            "expiryAvailability": item.expiry_availability,
+            "expiryStale": item.expiry_stale,
         })
     });
 
@@ -310,22 +412,30 @@ async fn refresh_codex_quota(
             "subscriptionEvidence": {
                 "requestWorkspaceId": request_workspace_id,
                 "trustedWorkspaceId": trusted_workspace_id,
-                "workspaceVerified": trusted_workspace_id.is_some(),
+                "trustedWorkspaceSource": trusted_workspace.as_ref().map(|workspace| &workspace.source),
+                "workspaceVerified": trusted_workspace.is_some(),
                 "usagePlanType": usage_plan_type,
                 "usageAllowed": usage_allowed,
                 "usageLimitReached": usage_limit_reached,
                 "accountsCheckPlanType": account_lookup_plan_type,
+                "accountsCheckStatus": account_probe.status.as_str(),
+                "accountsCheckHttpStatus": account_probe.http_status,
+                "subscriptionsRequestWorkspaceId": subscription_request_workspace_id,
                 "subscriptionsPlanType": subscription_lookup_plan_type,
+                "subscriptionsStatus": subscription_probe.status.as_str(),
+                "subscriptionsHttpStatus": subscription_probe.http_status,
                 "discardedReasons": resolution.discarded_reasons,
             },
+            "subscriptionExpirySnapshot": expiry_snapshot,
             "bankedReset": reset_credits,
+            "warningCodes": expiry_warning_code.into_iter().collect::<Vec<_>>(),
             "queriedAt": now_ms,
         })),
     };
     Ok(update_from_quota(
         quota,
         subscription_level,
-        None,
+        profile_update,
         now_ms,
         success_cooldown_ms,
     ))
@@ -1300,7 +1410,7 @@ fn grok_subscription_json(
         "expiresAt": expiry.as_ref().map(|(expires_at, _)| expires_at),
         "expiresSource": expiry.as_ref().map(|(_, source)| source),
         "expiresKind": expiry.as_ref().map(|_| "subscription"),
-        "expiryCapability": "automatic",
+        "expiryCapability": "automatic_or_manual",
         "expiryAvailability": if expiry.is_some() {
             "available"
         } else if subscriptions.issue.is_some() {
@@ -2610,14 +2720,61 @@ fn normalize_claude_billing_source(value: &str) -> Option<String> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatGptProbeStatus {
+    Success,
+    NotProvided,
+    SkippedNoTrustedWorkspace,
+    HttpError,
+    NetworkError,
+    ParseError,
+}
+
+impl ChatGptProbeStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::NotProvided => "not_provided",
+            Self::SkippedNoTrustedWorkspace => "skipped_no_trusted_workspace",
+            Self::HttpError => "http_error",
+            Self::NetworkError => "network_error",
+            Self::ParseError => "parse_error",
+        }
+    }
+
+    fn unavailable(self) -> bool {
+        matches!(
+            self,
+            Self::HttpError | Self::NetworkError | Self::ParseError
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChatGptSubscriptionProbe {
+    status: ChatGptProbeStatus,
+    http_status: Option<u16>,
+    lookup: Option<ChatGptSubscriptionLookup>,
+}
+
+impl ChatGptSubscriptionProbe {
+    fn skipped_no_trusted_workspace() -> Self {
+        Self {
+            status: ChatGptProbeStatus::SkippedNoTrustedWorkspace,
+            http_status: None,
+            lookup: None,
+        }
+    }
+}
+
 async fn fetch_chatgpt_account_lookup(
     http: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     now_ms: i64,
     request_timeout: Duration,
-) -> Option<ChatGptSubscriptionLookup> {
-    let response = http
+) -> ChatGptSubscriptionProbe {
+    let response = match http
         .get(CHATGPT_ACCOUNTS_CHECK_URL)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header("Origin", "https://chatgpt.com")
@@ -2626,12 +2783,46 @@ async fn fetch_chatgpt_account_lookup(
         .timeout(request_timeout)
         .send()
         .await
-        .ok()?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(error = %error, "ChatGPT accounts/check request failed");
+            return ChatGptSubscriptionProbe {
+                status: ChatGptProbeStatus::NetworkError,
+                http_status: None,
+                lookup: None,
+            };
+        }
+    };
     if !response.status().is_success() {
-        return None;
+        return ChatGptSubscriptionProbe {
+            status: ChatGptProbeStatus::HttpError,
+            http_status: Some(response.status().as_u16()),
+            lookup: None,
+        };
     }
-    let body = response.json::<Value>().await.ok()?;
-    parse_chatgpt_accounts_check_lookup(&body, account_id, now_ms)
+    let status = response.status().as_u16();
+    let body = match response.json::<Value>().await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::debug!(error = %error, "ChatGPT accounts/check response was invalid JSON");
+            return ChatGptSubscriptionProbe {
+                status: ChatGptProbeStatus::ParseError,
+                http_status: Some(status),
+                lookup: None,
+            };
+        }
+    };
+    let lookup = parse_chatgpt_accounts_check_lookup(&body, account_id, now_ms);
+    ChatGptSubscriptionProbe {
+        status: if lookup.is_some() {
+            ChatGptProbeStatus::Success
+        } else {
+            ChatGptProbeStatus::NotProvided
+        },
+        http_status: Some(status),
+        lookup,
+    }
 }
 
 async fn fetch_chatgpt_subscription_lookup(
@@ -2639,11 +2830,11 @@ async fn fetch_chatgpt_subscription_lookup(
     access_token: &str,
     account_id: Option<&str>,
     request_timeout: Duration,
-) -> Option<ChatGptSubscriptionLookup> {
-    let account_id = account_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let response = http
+) -> ChatGptSubscriptionProbe {
+    let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return ChatGptSubscriptionProbe::skipped_no_trusted_workspace();
+    };
+    let response = match http
         .get(CHATGPT_SUBSCRIPTIONS_URL)
         .query(&[("account_id", account_id)])
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
@@ -2653,12 +2844,46 @@ async fn fetch_chatgpt_subscription_lookup(
         .timeout(request_timeout)
         .send()
         .await
-        .ok()?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(error = %error, "ChatGPT subscriptions request failed");
+            return ChatGptSubscriptionProbe {
+                status: ChatGptProbeStatus::NetworkError,
+                http_status: None,
+                lookup: None,
+            };
+        }
+    };
     if !response.status().is_success() {
-        return None;
+        return ChatGptSubscriptionProbe {
+            status: ChatGptProbeStatus::HttpError,
+            http_status: Some(response.status().as_u16()),
+            lookup: None,
+        };
     }
-    let body = response.json::<Value>().await.ok()?;
-    parse_chatgpt_subscription_lookup(&body)
+    let status = response.status().as_u16();
+    let body = match response.json::<Value>().await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::debug!(error = %error, "ChatGPT subscriptions response was invalid JSON");
+            return ChatGptSubscriptionProbe {
+                status: ChatGptProbeStatus::ParseError,
+                http_status: Some(status),
+                lookup: None,
+            };
+        }
+    };
+    let lookup = parse_chatgpt_subscription_lookup(&body);
+    ChatGptSubscriptionProbe {
+        status: if lookup.is_some() {
+            ChatGptProbeStatus::Success
+        } else {
+            ChatGptProbeStatus::NotProvided
+        },
+        http_status: Some(status),
+        lookup,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2668,6 +2893,280 @@ struct ChatGptSubscriptionLookup {
     expires_at: Option<String>,
     expires_source: Option<String>,
     expires_kind: Option<String>,
+    expiry_availability: Option<String>,
+    expiry_stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexSubscriptionExpirySnapshot {
+    workspace_id: String,
+    plan_family: String,
+    expires_at: String,
+    source: String,
+    kind: String,
+    observed_at: i64,
+    stale: bool,
+}
+
+async fn recover_signed_codex_workspace(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+) -> Option<(
+    crate::domain::accounts::store::TrustedCodexWorkspace,
+    Option<Value>,
+)> {
+    let id_token = account
+        .id_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let claims = match crate::clients::oauth::openai_jwks::verify_openai_id_token_identity(
+        http, id_token,
+    )
+    .await
+    {
+        Ok(claims) => claims,
+        Err(error) => {
+            tracing::debug!(account_id = %account.id, error = %error, "could not recover Codex workspace from persisted ID token");
+            return None;
+        }
+    };
+    let mut profile = account.profile.clone();
+    crate::domain::accounts::store::set_verified_openai_claims(&mut profile, Some(claims));
+    let mut candidate = account.clone();
+    candidate.profile = profile.clone();
+    let workspace = crate::domain::accounts::store::trusted_codex_workspace(&candidate)?;
+    crate::domain::accounts::store::set_codex_workspace_provenance(
+        &mut profile,
+        &workspace.id,
+        "signed_id_token_migration",
+        now_ms,
+    );
+    Some((workspace, profile))
+}
+
+fn authenticated_codex_workspace_update(
+    account: &Account,
+    workspace_id: &str,
+    now_ms: i64,
+) -> (
+    crate::domain::accounts::store::TrustedCodexWorkspace,
+    Option<Value>,
+) {
+    let mut profile = account.profile.clone();
+    crate::domain::accounts::store::set_codex_workspace_provenance(
+        &mut profile,
+        workspace_id,
+        "authenticated_discovery",
+        now_ms,
+    );
+    (
+        crate::domain::accounts::store::TrustedCodexWorkspace {
+            id: workspace_id.to_string(),
+            source: "authenticated_discovery".to_string(),
+        },
+        profile,
+    )
+}
+
+fn legacy_codex_workspace_candidate(account: &Account) -> Option<String> {
+    const POINTERS: &[&str] = &[
+        "/accountId",
+        "/account_id",
+        "/chatgptAccountId",
+        "/chatgpt_account_id",
+        "/openai_auth/chatgpt_account_id",
+        "/openaiAuth/chatgptAccountId",
+        "/raw/chatgpt_account_id",
+        "/raw/openai_auth/chatgpt_account_id",
+    ];
+    let mut observations = Vec::new();
+    for value in [account.profile.as_ref(), account.raw.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        for pointer in POINTERS {
+            if let Some(candidate) = value
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                observations.push(candidate.to_string());
+            }
+        }
+    }
+    let mut unique = observations.clone();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != 1 {
+        return None;
+    }
+    let candidate = unique.pop().expect("one unique candidate was checked");
+    (account.id == candidate || observations.len() >= 2).then_some(candidate)
+}
+
+fn chatgpt_probe_matches_usage(
+    probe: &ChatGptSubscriptionProbe,
+    usage_plan_type: Option<&str>,
+) -> bool {
+    probe.status == ChatGptProbeStatus::Success
+        && usage_plan_type
+            .zip(
+                probe
+                    .lookup
+                    .as_ref()
+                    .and_then(|lookup| lookup.plan_type.as_deref()),
+            )
+            .is_some_and(|(usage_plan, probe_plan)| {
+                chatgpt_plan_types_match(usage_plan, probe_plan)
+            })
+}
+
+fn finalize_codex_subscription(
+    account: &Account,
+    subscription: Option<ChatGptSubscriptionLookup>,
+    trusted_workspace: Option<&crate::domain::accounts::store::TrustedCodexWorkspace>,
+    usage_plan_type: Option<&str>,
+    account_probe: &ChatGptSubscriptionProbe,
+    subscription_probe: &ChatGptSubscriptionProbe,
+    now_ms: i64,
+) -> (Option<ChatGptSubscriptionLookup>, Option<Value>) {
+    let mut subscription = subscription;
+    let availability = if trusted_workspace.is_none() {
+        "workspace_unverified"
+    } else if account_probe.status.unavailable() || subscription_probe.status.unavailable() {
+        "probe_unavailable"
+    } else {
+        "upstream_not_provided"
+    };
+
+    if let Some(item) = subscription.as_mut() {
+        if item.expires_at.is_some() {
+            item.expiry_availability = Some("available".to_string());
+            item.expiry_stale = false;
+            let snapshot = codex_expiry_snapshot_from_lookup(
+                item,
+                trusted_workspace,
+                usage_plan_type,
+                now_ms,
+                false,
+            );
+            return (subscription, snapshot.map(codex_expiry_snapshot_json));
+        }
+    }
+
+    if let Some(mut snapshot) = previous_codex_expiry_snapshot(account).filter(|snapshot| {
+        trusted_workspace.is_some_and(|workspace| workspace.id == snapshot.workspace_id)
+            && usage_plan_type
+                .map(chatgpt_plan_family)
+                .is_some_and(|family| family == snapshot.plan_family)
+            && !chatgpt_expiry_is_past(&snapshot.expires_at, now_ms)
+    }) {
+        snapshot.stale = true;
+        let item = subscription.get_or_insert_with(ChatGptSubscriptionLookup::default);
+        item.expires_at = Some(snapshot.expires_at.clone());
+        item.expires_source = Some(snapshot.source.clone());
+        item.expires_kind = Some(snapshot.kind.clone());
+        item.expiry_availability = Some("available".to_string());
+        item.expiry_stale = true;
+        return (subscription, Some(codex_expiry_snapshot_json(snapshot)));
+    }
+
+    if let Some(item) = subscription.as_mut() {
+        item.expiry_availability = Some(availability.to_string());
+        item.expiry_stale = false;
+    }
+    (subscription, None)
+}
+
+fn codex_expiry_snapshot_from_lookup(
+    lookup: &ChatGptSubscriptionLookup,
+    trusted_workspace: Option<&crate::domain::accounts::store::TrustedCodexWorkspace>,
+    usage_plan_type: Option<&str>,
+    observed_at: i64,
+    stale: bool,
+) -> Option<CodexSubscriptionExpirySnapshot> {
+    Some(CodexSubscriptionExpirySnapshot {
+        workspace_id: trusted_workspace?.id.clone(),
+        plan_family: chatgpt_plan_family(usage_plan_type?),
+        expires_at: lookup.expires_at.clone()?,
+        source: lookup.expires_source.clone()?,
+        kind: lookup
+            .expires_kind
+            .clone()
+            .unwrap_or_else(|| "subscription".to_string()),
+        observed_at,
+        stale,
+    })
+}
+
+fn previous_codex_expiry_snapshot(account: &Account) -> Option<CodexSubscriptionExpirySnapshot> {
+    let extra = account.quota.as_ref()?.extra_usage.as_ref()?;
+    if let Some(snapshot) = extra.get("subscriptionExpirySnapshot") {
+        return Some(CodexSubscriptionExpirySnapshot {
+            workspace_id: snapshot.get("workspaceId")?.as_str()?.trim().to_string(),
+            plan_family: snapshot.get("planFamily")?.as_str()?.trim().to_string(),
+            expires_at: normalize_rfc3339_string(snapshot.get("expiresAt")?.as_str()?)?,
+            source: snapshot
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("last_known_good")
+                .to_string(),
+            kind: snapshot
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("subscription")
+                .to_string(),
+            observed_at: snapshot
+                .get("observedAt")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            stale: snapshot
+                .get("stale")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    let subscription = extra.get("subscription")?;
+    let evidence = extra.get("subscriptionEvidence")?;
+    Some(CodexSubscriptionExpirySnapshot {
+        workspace_id: evidence
+            .get("trustedWorkspaceId")?
+            .as_str()?
+            .trim()
+            .to_string(),
+        plan_family: chatgpt_plan_family(evidence.get("usagePlanType")?.as_str()?),
+        expires_at: normalize_rfc3339_string(subscription.get("expiresAt")?.as_str()?)?,
+        source: subscription
+            .get("expiresSource")
+            .and_then(Value::as_str)
+            .unwrap_or("last_known_good")
+            .to_string(),
+        kind: subscription
+            .get("expiresKind")
+            .and_then(Value::as_str)
+            .unwrap_or("subscription")
+            .to_string(),
+        observed_at: extra
+            .get("queriedAt")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        stale: false,
+    })
+}
+
+fn codex_expiry_snapshot_json(snapshot: CodexSubscriptionExpirySnapshot) -> Value {
+    json!({
+        "workspaceId": snapshot.workspace_id,
+        "planFamily": snapshot.plan_family,
+        "expiresAt": snapshot.expires_at,
+        "source": snapshot.source,
+        "kind": snapshot.kind,
+        "observedAt": snapshot.observed_at,
+        "stale": snapshot.stale,
+    })
 }
 
 fn parse_chatgpt_accounts_check_lookup(
@@ -2746,6 +3245,8 @@ fn parse_chatgpt_subscription_lookup(body: &Value) -> Option<ChatGptSubscription
         expires_at,
         expires_source: has_expiry.then(|| "subscriptions_active_until".to_string()),
         expires_kind: has_expiry.then(|| "subscription".to_string()),
+        expiry_availability: None,
+        expiry_stale: false,
     })
 }
 
@@ -2775,6 +3276,8 @@ fn chatgpt_lookup_from_account(account: &Value) -> Option<ChatGptSubscriptionLoo
         expires_at,
         expires_source: has_expiry.then(|| "accounts_check_entitlement".to_string()),
         expires_kind: has_expiry.then(|| "subscription".to_string()),
+        expiry_availability: None,
+        expiry_stale: false,
     })
 }
 
@@ -4004,6 +4507,213 @@ mod tests {
     }
 
     #[test]
+    fn legacy_codex_workspace_candidate_requires_consistent_identity_evidence() {
+        let mut account = imported_account(ProviderType::CodexOAuth, json!({}));
+        account.id = "workspace-1".to_string();
+        account.profile = Some(json!({
+            "accountId": "workspace-1",
+            "chatgpt_account_id": "workspace-1"
+        }));
+        assert_eq!(
+            legacy_codex_workspace_candidate(&account).as_deref(),
+            Some("workspace-1")
+        );
+
+        account.profile = Some(json!({
+            "accountId": "workspace-1",
+            "chatgpt_account_id": "workspace-2"
+        }));
+        assert!(legacy_codex_workspace_candidate(&account).is_none());
+
+        account.id = "local-import-id".to_string();
+        account.profile = Some(json!({"chatgpt_account_id": "workspace-1"}));
+        assert!(legacy_codex_workspace_candidate(&account).is_none());
+    }
+
+    #[test]
+    fn authenticated_discovery_requires_matching_usage_plan() {
+        let matching = ChatGptSubscriptionProbe {
+            status: ChatGptProbeStatus::Success,
+            http_status: Some(200),
+            lookup: parse_chatgpt_subscription_lookup(&json!({"plan_type": "pro"})),
+        };
+        assert!(chatgpt_probe_matches_usage(&matching, Some("pro")));
+        assert!(!chatgpt_probe_matches_usage(&matching, Some("plus")));
+        assert!(!chatgpt_probe_matches_usage(&matching, None));
+
+        let failed = ChatGptSubscriptionProbe {
+            status: ChatGptProbeStatus::HttpError,
+            http_status: Some(403),
+            lookup: matching.lookup.clone(),
+        };
+        assert!(!chatgpt_probe_matches_usage(&failed, Some("pro")));
+    }
+
+    #[test]
+    fn codex_subscription_finalize_exposes_workspace_and_probe_states() {
+        let account = imported_account(ProviderType::CodexOAuth, json!({}));
+        let lookup = parse_chatgpt_subscription_lookup(&json!({"plan_type": "pro"}));
+        let success = ChatGptSubscriptionProbe {
+            status: ChatGptProbeStatus::Success,
+            http_status: Some(200),
+            lookup: lookup.clone(),
+        };
+        let skipped = ChatGptSubscriptionProbe::skipped_no_trusted_workspace();
+
+        let (subscription, snapshot) = finalize_codex_subscription(
+            &account,
+            lookup.clone(),
+            None,
+            Some("pro"),
+            &success,
+            &skipped,
+            rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap(),
+        );
+        assert_eq!(
+            subscription.unwrap().expiry_availability.as_deref(),
+            Some("workspace_unverified")
+        );
+        assert!(snapshot.is_none());
+
+        let trusted = crate::domain::accounts::store::TrustedCodexWorkspace {
+            id: "workspace-1".to_string(),
+            source: "verified_id_token".to_string(),
+        };
+        let failed = ChatGptSubscriptionProbe {
+            status: ChatGptProbeStatus::HttpError,
+            http_status: Some(404),
+            lookup: None,
+        };
+        let (subscription, _) = finalize_codex_subscription(
+            &account,
+            lookup,
+            Some(&trusted),
+            Some("pro"),
+            &success,
+            &failed,
+            rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap(),
+        );
+        assert_eq!(
+            subscription.unwrap().expiry_availability.as_deref(),
+            Some("probe_unavailable")
+        );
+    }
+
+    #[test]
+    fn codex_subscription_finalize_caches_only_same_workspace_and_plan() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
+        let mut account = imported_account(ProviderType::CodexOAuth, json!({}));
+        account.quota = Some(AccountQuota {
+            success: true,
+            extra_usage: Some(json!({
+                "subscriptionExpirySnapshot": {
+                    "workspaceId": "workspace-1",
+                    "planFamily": "pro",
+                    "expiresAt": "2026-08-20T00:00:00Z",
+                    "source": "subscriptions_active_until",
+                    "kind": "subscription",
+                    "observedAt": 123,
+                    "stale": false
+                }
+            })),
+            ..Default::default()
+        });
+        let trusted = crate::domain::accounts::store::TrustedCodexWorkspace {
+            id: "workspace-1".to_string(),
+            source: "verified_id_token".to_string(),
+        };
+        let failed = ChatGptSubscriptionProbe {
+            status: ChatGptProbeStatus::NetworkError,
+            http_status: None,
+            lookup: None,
+        };
+        let lookup = parse_chatgpt_subscription_lookup(&json!({"plan_type": "pro"}));
+
+        let (subscription, snapshot) = finalize_codex_subscription(
+            &account,
+            lookup.clone(),
+            Some(&trusted),
+            Some("pro"),
+            &failed,
+            &failed,
+            now_ms,
+        );
+        let subscription = subscription.unwrap();
+        assert_eq!(
+            subscription.expires_at.as_deref(),
+            Some("2026-08-20T00:00:00+00:00")
+        );
+        assert!(subscription.expiry_stale);
+        assert_eq!(snapshot.unwrap()["stale"], true);
+
+        let other_workspace = crate::domain::accounts::store::TrustedCodexWorkspace {
+            id: "workspace-2".to_string(),
+            source: "user_selected".to_string(),
+        };
+        let (subscription, snapshot) = finalize_codex_subscription(
+            &account,
+            lookup.clone(),
+            Some(&other_workspace),
+            Some("pro"),
+            &failed,
+            &failed,
+            now_ms,
+        );
+        assert!(subscription.unwrap().expires_at.is_none());
+        assert!(snapshot.is_none());
+
+        let (subscription, snapshot) = finalize_codex_subscription(
+            &account,
+            lookup,
+            Some(&trusted),
+            Some("plus"),
+            &failed,
+            &failed,
+            now_ms,
+        );
+        assert!(subscription.unwrap().expires_at.is_none());
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn codex_subscription_finalize_persists_fresh_active_until() {
+        let account = imported_account(ProviderType::CodexOAuth, json!({}));
+        let trusted = crate::domain::accounts::store::TrustedCodexWorkspace {
+            id: "workspace-1".to_string(),
+            source: "verified_id_token".to_string(),
+        };
+        let lookup = parse_chatgpt_subscription_lookup(&json!({
+            "plan_type": "pro",
+            "active_until": "2026-08-20T00:00:00Z"
+        }));
+        let success = ChatGptSubscriptionProbe {
+            status: ChatGptProbeStatus::Success,
+            http_status: Some(200),
+            lookup: lookup.clone(),
+        };
+        let (subscription, snapshot) = finalize_codex_subscription(
+            &account,
+            lookup,
+            Some(&trusted),
+            Some("pro"),
+            &success,
+            &success,
+            rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap(),
+        );
+
+        let subscription = subscription.unwrap();
+        assert_eq!(
+            subscription.expiry_availability.as_deref(),
+            Some("available")
+        );
+        assert!(!subscription.expiry_stale);
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot["workspaceId"], "workspace-1");
+        assert_eq!(snapshot["planFamily"], "pro");
+        assert_eq!(snapshot["stale"], false);
+    }
+
+    #[test]
     fn claude_usage_windows_parse_known_and_unknown_tiers() {
         let quota = parse_claude_quota(
             &json!({
@@ -4410,7 +5120,7 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.pointer("/subscription/expiryCapability"))
                 .and_then(Value::as_str),
-            Some("automatic")
+            Some("automatic_or_manual")
         );
 
         let observed_billing = json!({

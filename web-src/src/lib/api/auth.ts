@@ -39,7 +39,11 @@ export interface ManagedAuthAccount {
 }
 
 export type ManagedAuthSubscriptionExpiryCapability =
-  "automatic" | "manual_required" | "research_pending" | "not_applicable";
+  | "automatic"
+  | "automatic_or_manual"
+  | "manual_required"
+  | "research_pending"
+  | "not_applicable";
 
 export interface ManagedAuthSubscriptionExpiry {
   capability: ManagedAuthSubscriptionExpiryCapability;

@@ -197,6 +197,10 @@ fn subscription_for_ui(account: &Account, quota: Option<&AccountQuota>) -> Optio
         .as_object_mut()
         .expect("subscription was normalized to an object");
     object.insert("expiresAt".to_string(), Value::String(expires_at));
+    object.insert(
+        "expiryCapability".to_string(),
+        serde_json::to_value(resolved.capability).unwrap_or(Value::Null),
+    );
     if resolved.source == Some(SubscriptionExpirySource::Manual) {
         object.insert(
             "expiresSource".to_string(),
@@ -205,6 +209,10 @@ fn subscription_for_ui(account: &Account, quota: Option<&AccountQuota>) -> Optio
         object.insert(
             "expiresKind".to_string(),
             Value::String("billing_period".to_string()),
+        );
+        object.insert(
+            "expiryAvailability".to_string(),
+            Value::String("available".to_string()),
         );
     }
     if !object.contains_key("planLabel") {
@@ -473,6 +481,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_quota_preserves_expiry_probe_state_for_the_ui() {
+        let mut account = sample_account(AccountQuota {
+            success: true,
+            credential_message: Some("ChatGPT Pro 20x".to_string()),
+            tiers: Vec::new(),
+            extra_usage: Some(json!({
+                "queriedAt": 1_700_000_000_000i64,
+                "subscription": {
+                    "planType": "pro",
+                    "planLabel": "ChatGPT Pro 20x",
+                    "expiresAt": Value::Null,
+                    "expiryCapability": "automatic",
+                    "expiryAvailability": "workspace_unverified",
+                    "expiryStale": false
+                },
+                "warningCodes": ["codex_subscription_workspace_unverified"]
+            })),
+        });
+        account.provider_type = ProviderType::CodexOAuth;
+        account.subscription_level = Some("ChatGPT Pro 20x".to_string());
+
+        let quota = subscription_quota_from_account(&account, "codex_oauth");
+
+        assert_eq!(
+            quota["subscription"]["expiryAvailability"],
+            "workspace_unverified"
+        );
+        assert_eq!(
+            quota["warningCodes"],
+            json!(["codex_subscription_workspace_unverified"])
+        );
+        assert!(quota["subscription"]["expiresAt"].is_null());
+    }
+
+    #[test]
     fn manual_subscription_expiry_is_synthesized_without_mutating_quota_storage() {
         let mut account = sample_account(AccountQuota::default());
         account.provider_type = ProviderType::ClaudeOAuth;
@@ -497,5 +540,48 @@ mod tests {
         assert_eq!(quota["error"], "upstream quota unavailable");
         assert!(quota["queriedAt"].is_null());
         assert!(account.quota.is_none());
+    }
+
+    #[test]
+    fn grok_manual_expiry_replaces_missing_upstream_expiry_for_ui() {
+        let mut account = sample_account(AccountQuota {
+            success: true,
+            credential_message: Some("XPremium".to_string()),
+            extra_usage: Some(json!({
+                "subscription": {
+                    "planType": "XPremium",
+                    "planLabel": "XPremium",
+                    "expiresAt": Value::Null,
+                    "expiryCapability": "automatic_or_manual",
+                    "expiryAvailability": "upstream_not_provided"
+                }
+            })),
+            ..AccountQuota::default()
+        });
+        account.provider_type = ProviderType::GrokOAuth;
+        account.subscription_level = Some("XPremium".to_string());
+        account.manual_subscription_expires_at_ms = Some(1_786_924_800_000);
+
+        let quota = subscription_quota_from_account(&account, "grok_oauth");
+
+        assert_eq!(
+            quota["subscription"]["expiresAt"],
+            "2026-08-17T00:00:00+00:00"
+        );
+        assert_eq!(quota["subscription"]["expiresSource"], "manual");
+        assert_eq!(quota["subscription"]["expiresKind"], "billing_period");
+        assert_eq!(
+            quota["subscription"]["expiryCapability"],
+            "automatic_or_manual"
+        );
+        assert_eq!(quota["subscription"]["expiryAvailability"], "available");
+        assert_eq!(
+            account
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.extra_usage.as_ref())
+                .and_then(|extra| extra.pointer("/subscription/expiresAt")),
+            Some(&Value::Null)
+        );
     }
 }

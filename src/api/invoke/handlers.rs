@@ -2105,11 +2105,12 @@ pub(in crate::api) fn map_managed_auth_account(
         crate::domain::accounts::store::effective_codex_workspace_id(account);
     let subscription_expiry =
         crate::domain::accounts::subscription_expiry::resolved_subscription_expiry(account);
-    let manual_expires_at = (subscription_expiry.capability
-        == crate::domain::accounts::subscription_expiry::SubscriptionExpiryCapability::ManualRequired)
-        .then_some(account.manual_subscription_expires_at_ms)
-        .flatten()
-        .and_then(|timestamp_ms| subscription_expiry_rfc3339(Some(timestamp_ms)));
+    let manual_expires_at = crate::domain::accounts::subscription_expiry::supports_manual_expiry(
+        subscription_expiry.capability,
+    )
+    .then_some(account.manual_subscription_expires_at_ms)
+    .flatten()
+    .and_then(|timestamp_ms| subscription_expiry_rfc3339(Some(timestamp_ms)));
     let effective_expires_at = subscription_expiry_rfc3339(subscription_expiry.expires_at_ms);
     let expiry_kind = subscription_expiry.source.map(|source| match source {
         crate::domain::accounts::subscription_expiry::SubscriptionExpirySource::Automatic => {

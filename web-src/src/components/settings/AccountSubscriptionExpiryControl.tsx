@@ -22,6 +22,7 @@ import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface AccountSubscriptionExpiryControlProps {
   account: ManagedAuthAccount;
+  context?: "subscription" | "next_payment";
 }
 
 function toLocalDateTimeInput(value: string | null): string {
@@ -41,6 +42,7 @@ function toUtcIso(value: string): string | null {
 
 export function AccountSubscriptionExpiryControl({
   account,
+  context = "subscription",
 }: AccountSubscriptionExpiryControlProps) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
@@ -134,12 +136,21 @@ export function AccountSubscriptionExpiryControl({
     return null;
   }
 
-  const isManual = expiry.capability === "manual_required";
+  const supportsManual =
+    expiry.capability === "manual_required" ||
+    expiry.capability === "automatic_or_manual";
+  const title = t(
+    context === "next_payment"
+      ? "settings.authCenter.subscriptionExpiry.nextPaymentTitle"
+      : "settings.authCenter.subscriptionExpiry.title",
+  );
   const persistedInput = toLocalDateTimeInput(expiry.manualExpiresAt);
   const utcValue = toUtcIso(manualInput);
   const hasDraft = manualInput !== persistedInput;
   const distance = expiry.effectiveExpiresAt
-    ? formatExpireDistance(expiry.effectiveExpiresAt, now)
+    ? formatExpireDistance(expiry.effectiveExpiresAt, now, (key, options) =>
+        t(key, options),
+      )
     : null;
   const isSaving = mutation.isPending && mutation.variables !== null;
   const isClearing = mutation.isPending && mutation.variables === null;
@@ -148,29 +159,29 @@ export function AccountSubscriptionExpiryControl({
     <div className="mt-2 w-full space-y-2 border-t border-border/50 pt-2">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
         <CalendarClock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span className="font-medium">
-          {t("settings.authCenter.subscriptionExpiry.title")}
-        </span>
+        <span className="font-medium">{title}</span>
         <span className="text-muted-foreground">
           {effectiveLabel ??
             t(
-              isManual
+              supportsManual
                 ? "settings.authCenter.subscriptionExpiry.notSet"
                 : "settings.authCenter.subscriptionExpiry.notAvailable",
             )}
         </span>
         {distance && <span className="text-muted-foreground">{distance}</span>}
         <span className="text-muted-foreground">
-          {isManual
-            ? t("settings.authCenter.subscriptionExpiry.manual")
-            : t("settings.authCenter.subscriptionExpiry.automatic")}
+          {expiry.source === "automatic"
+            ? t("settings.authCenter.subscriptionExpiry.automatic")
+            : supportsManual
+              ? t("settings.authCenter.subscriptionExpiry.manual")
+              : t("settings.authCenter.subscriptionExpiry.automatic")}
         </span>
       </div>
 
-      {isManual && (
+      {supportsManual && (
         <div className="flex flex-wrap items-center gap-2">
           <Label htmlFor={inputId} className="sr-only">
-            {t("settings.authCenter.subscriptionExpiry.title")}
+            {title}
           </Label>
           <Input
             id={inputId}

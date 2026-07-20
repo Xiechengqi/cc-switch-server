@@ -730,6 +730,10 @@ mod tests {
             SubscriptionExpiryCapability::ManualRequired
         );
         assert_eq!(
+            capability_for(ProviderType::GrokOAuth).subscription_expiry_capability,
+            SubscriptionExpiryCapability::AutomaticOrManual
+        );
+        assert_eq!(
             capability_for(ProviderType::OllamaCloud).subscription_expiry_capability,
             SubscriptionExpiryCapability::Automatic
         );

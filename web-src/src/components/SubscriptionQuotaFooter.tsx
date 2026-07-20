@@ -3,7 +3,11 @@ import { RefreshCw, AlertCircle, Clock } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
 import { useSubscriptionQuota } from "@/lib/query/subscription";
-import type { QuotaTier, SubscriptionQuota } from "@/types/subscription";
+import type {
+  QuotaTier,
+  SubscriptionInfo,
+  SubscriptionQuota,
+} from "@/types/subscription";
 import { cn } from "@/lib/utils";
 import {
   PROVIDER_REFRESH_TITLE_KEY,
@@ -92,20 +96,66 @@ export function countdownStr(
 export function formatExpireDistance(
   expiresAt: string | null | undefined,
   nowMs = Date.now(),
+  t?: (key: string, options?: Record<string, unknown>) => string,
 ): string {
-  if (!expiresAt) return "expire unknown";
+  if (!expiresAt) return t ? t("subscription.expiryUnknown") : "expire unknown";
   const expiresMs = new Date(expiresAt).getTime();
-  if (!Number.isFinite(expiresMs)) return "expire unknown";
+  if (!Number.isFinite(expiresMs))
+    return t ? t("subscription.expiryUnknown") : "expire unknown";
   const diffMs = expiresMs - nowMs;
-  if (diffMs <= 0) return "expired";
+  if (diffMs <= 0) return t ? t("subscription.expired") : "expired";
 
   const minutes = Math.max(1, Math.floor(diffMs / (1000 * 60)));
-  if (minutes < 60) return `expire in ${minutes}m`;
+  if (minutes < 60) {
+    const time = `${minutes}m`;
+    return t ? t("subscription.expiresIn", { time }) : `expire in ${time}`;
+  }
 
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `expire in ${hours}h`;
+  if (hours < 24) {
+    const time = `${hours}h`;
+    return t ? t("subscription.expiresIn", { time }) : `expire in ${time}`;
+  }
 
-  return `expire in ${Math.floor(hours / 24)}d`;
+  const time = `${Math.floor(hours / 24)}d`;
+  return t ? t("subscription.expiresIn", { time }) : `expire in ${time}`;
+}
+
+function formatSubscriptionExpirySummary(
+  subscription: SubscriptionInfo,
+  t?: (key: string, options?: Record<string, unknown>) => string,
+  nowMs = Date.now(),
+): string | null {
+  if (subscription.expiresAt) {
+    const expiry = formatExpireDistance(subscription.expiresAt, nowMs, t);
+    if (!subscription.expiryStale) return expiry;
+    return `${expiry} ${t ? t("subscription.expiryCached") : "cached"}`;
+  }
+  if (subscription.expiryCapability === "automatic_or_manual") {
+    return t
+      ? t("subscription.expiryManualNotSet")
+      : "subscription expiry not set";
+  }
+  switch (subscription.expiryAvailability) {
+    case "upstream_not_provided":
+      return t
+        ? t("subscription.expiryNotProvided")
+        : "subscription expiry not provided";
+    case "probe_unavailable":
+      return t
+        ? t("subscription.expiryUnavailable")
+        : "subscription expiry unavailable";
+    case "workspace_unverified":
+      return t
+        ? t("subscription.expiryWorkspaceUnverified")
+        : "verify or select workspace";
+    default:
+      return subscription.expiryCapability === "not_applicable"
+        ? null
+        : t
+          ? t("subscription.expiryUnknown")
+          : "expire unknown";
+  }
 }
 
 /** 格式化重置时间为倒计时文本（带 i18n 模板） */
@@ -209,21 +259,7 @@ export function formatQuotaSummary(
   const segments = [
     planLabel,
     quota.subscription
-      ? quota.subscription.expiresAt
-        ? formatExpireDistance(quota.subscription.expiresAt, nowMs)
-        : quota.subscription.expiryAvailability === "upstream_not_provided"
-          ? t
-            ? t("subscription.expiryNotProvided")
-            : "subscription expiry not provided"
-          : quota.subscription.expiryAvailability === "probe_unavailable"
-            ? t
-              ? t("subscription.expiryUnavailable")
-              : "subscription expiry unavailable"
-            : quota.subscription.expiryCapability === "not_applicable"
-              ? null
-              : t
-                ? t("subscription.expiryUnknown")
-                : "expire unknown"
+      ? formatSubscriptionExpirySummary(quota.subscription, t, nowMs)
       : null,
     ...tiers.map((tier) => formatCompactTier(tier, t, nowMs)),
     quota.quotaStatus === "valid_non_numeric"

@@ -9,6 +9,7 @@ use crate::domain::providers::model::ProviderType;
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionExpiryCapability {
     Automatic,
+    AutomaticOrManual,
     ManualRequired,
     ResearchPending,
     NotApplicable,
@@ -34,7 +35,8 @@ pub struct ResolvedSubscriptionExpiry {
 pub fn subscription_expiry_capability(provider_type: ProviderType) -> SubscriptionExpiryCapability {
     match provider_type {
         ProviderType::ClaudeOAuth => SubscriptionExpiryCapability::ManualRequired,
-        ProviderType::CodexOAuth | ProviderType::GrokOAuth | ProviderType::OllamaCloud => {
+        ProviderType::GrokOAuth => SubscriptionExpiryCapability::AutomaticOrManual,
+        ProviderType::CodexOAuth | ProviderType::OllamaCloud => {
             SubscriptionExpiryCapability::Automatic
         }
         ProviderType::GeminiCli
@@ -56,10 +58,23 @@ pub fn subscription_expiry_capability(provider_type: ProviderType) -> Subscripti
     }
 }
 
+pub fn supports_automatic_expiry(capability: SubscriptionExpiryCapability) -> bool {
+    matches!(
+        capability,
+        SubscriptionExpiryCapability::Automatic | SubscriptionExpiryCapability::AutomaticOrManual
+    )
+}
+
+pub fn supports_manual_expiry(capability: SubscriptionExpiryCapability) -> bool {
+    matches!(
+        capability,
+        SubscriptionExpiryCapability::ManualRequired
+            | SubscriptionExpiryCapability::AutomaticOrManual
+    )
+}
+
 pub fn automatic_subscription_expires_at_ms(account: &Account) -> Option<i64> {
-    if subscription_expiry_capability(account.provider_type)
-        != SubscriptionExpiryCapability::Automatic
-    {
+    if !supports_automatic_expiry(subscription_expiry_capability(account.provider_type)) {
         return None;
     }
 
@@ -76,6 +91,18 @@ pub fn resolved_subscription_expiry(account: &Account) -> ResolvedSubscriptionEx
             automatic_subscription_expires_at_ms(account),
             Some(SubscriptionExpirySource::Automatic),
         ),
+        SubscriptionExpiryCapability::AutomaticOrManual => {
+            match automatic_subscription_expires_at_ms(account) {
+                Some(expires_at_ms) => (
+                    Some(expires_at_ms),
+                    Some(SubscriptionExpirySource::Automatic),
+                ),
+                None => (
+                    account.manual_subscription_expires_at_ms,
+                    Some(SubscriptionExpirySource::Manual),
+                ),
+            }
+        }
         SubscriptionExpiryCapability::ManualRequired => (
             account.manual_subscription_expires_at_ms,
             Some(SubscriptionExpirySource::Manual),
@@ -210,7 +237,8 @@ mod tests {
         for provider_type in ALL_PROVIDER_TYPES {
             let expected = match provider_type {
                 ProviderType::ClaudeOAuth => SubscriptionExpiryCapability::ManualRequired,
-                ProviderType::CodexOAuth | ProviderType::GrokOAuth | ProviderType::OllamaCloud => {
+                ProviderType::GrokOAuth => SubscriptionExpiryCapability::AutomaticOrManual,
+                ProviderType::CodexOAuth | ProviderType::OllamaCloud => {
                     SubscriptionExpiryCapability::Automatic
                 }
                 ProviderType::GeminiCli
@@ -310,6 +338,36 @@ mod tests {
                 capability: SubscriptionExpiryCapability::Automatic,
                 expires_at_ms: None,
                 source: None,
+            }
+        );
+    }
+
+    #[test]
+    fn grok_uses_manual_expiry_only_when_trusted_automatic_expiry_is_absent() {
+        let mut grok = account(ProviderType::GrokOAuth, None);
+        grok.manual_subscription_expires_at_ms = Some(1_786_924_800_000);
+        assert_eq!(
+            resolved_subscription_expiry(&grok),
+            ResolvedSubscriptionExpiry {
+                capability: SubscriptionExpiryCapability::AutomaticOrManual,
+                expires_at_ms: Some(1_786_924_800_000),
+                source: Some(SubscriptionExpirySource::Manual),
+            }
+        );
+
+        grok.quota = Some(AccountQuota {
+            success: true,
+            extra_usage: Some(json!({
+                "subscription": {"expiresAt": "2026-08-19T00:00:00Z"}
+            })),
+            ..AccountQuota::default()
+        });
+        assert_eq!(
+            resolved_subscription_expiry(&grok),
+            ResolvedSubscriptionExpiry {
+                capability: SubscriptionExpiryCapability::AutomaticOrManual,
+                expires_at_ms: Some(1_787_097_600_000),
+                source: Some(SubscriptionExpirySource::Automatic),
             }
         );
     }

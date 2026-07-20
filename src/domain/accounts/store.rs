@@ -197,6 +197,14 @@ pub struct CodexWorkspace {
 }
 
 const VERIFIED_OPENAI_CLAIMS_KEY: &str = "verifiedOpenAiClaims";
+const CODEX_WORKSPACE_PROVENANCE_KEY: &str = "codexWorkspaceProvenance";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedCodexWorkspace {
+    pub id: String,
+    pub source: String,
+}
 
 pub fn set_verified_openai_claims(profile: &mut Option<Value>, claims: Option<Value>) {
     if !profile.as_ref().is_some_and(Value::is_object) {
@@ -210,6 +218,39 @@ pub fn set_verified_openai_claims(profile: &mut Option<Value>, claims: Option<Va
     if let Some(claims) = claims {
         object.insert(VERIFIED_OPENAI_CLAIMS_KEY.to_string(), claims);
     }
+}
+
+pub fn clear_codex_workspace_provenance(profile: &mut Option<Value>) {
+    if let Some(object) = profile.as_mut().and_then(Value::as_object_mut) {
+        object.remove(CODEX_WORKSPACE_PROVENANCE_KEY);
+    }
+}
+
+pub fn set_codex_workspace_provenance(
+    profile: &mut Option<Value>,
+    workspace_id: &str,
+    source: &str,
+    verified_at_ms: i64,
+) {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return;
+    }
+    if !profile.as_ref().is_some_and(Value::is_object) {
+        *profile = Some(Value::Object(Map::new()));
+    }
+    let object = profile
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("Codex profile was normalized to an object");
+    object.insert(
+        CODEX_WORKSPACE_PROVENANCE_KEY.to_string(),
+        serde_json::json!({
+            "workspaceId": workspace_id,
+            "source": source,
+            "verifiedAt": verified_at_ms,
+        }),
+    );
 }
 
 impl AccountStore {
@@ -274,12 +315,10 @@ impl AccountStore {
 
         if let Some(existing) = self.accounts.iter_mut().find(|item| item.id == account.id) {
             use crate::domain::accounts::subscription_expiry::{
-                subscription_expiry_capability, SubscriptionExpiryCapability,
+                subscription_expiry_capability, supports_manual_expiry,
             };
-            if subscription_expiry_capability(existing.provider_type)
-                == SubscriptionExpiryCapability::ManualRequired
-                && subscription_expiry_capability(account.provider_type)
-                    == SubscriptionExpiryCapability::ManualRequired
+            if supports_manual_expiry(subscription_expiry_capability(existing.provider_type))
+                && supports_manual_expiry(subscription_expiry_capability(account.provider_type))
             {
                 account.manual_subscription_expires_at_ms =
                     existing.manual_subscription_expires_at_ms;
@@ -309,7 +348,7 @@ impl AccountStore {
         updated_at_ms: i64,
     ) -> Result<Account, ManualSubscriptionExpiryError> {
         use crate::domain::accounts::subscription_expiry::{
-            subscription_expiry_capability, SubscriptionExpiryCapability,
+            subscription_expiry_capability, supports_manual_expiry,
         };
 
         let account = self
@@ -317,9 +356,7 @@ impl AccountStore {
             .iter_mut()
             .find(|item| item.id == account_id)
             .ok_or_else(|| ManualSubscriptionExpiryError::NotFound(account_id.to_string()))?;
-        if subscription_expiry_capability(account.provider_type)
-            != SubscriptionExpiryCapability::ManualRequired
-        {
+        if !supports_manual_expiry(subscription_expiry_capability(account.provider_type)) {
             return Err(ManualSubscriptionExpiryError::Unsupported(
                 account.provider_type,
             ));
@@ -698,21 +735,67 @@ pub fn selected_codex_workspace_id(account: &Account) -> Option<String> {
 }
 
 pub fn effective_codex_workspace_id(account: &Account) -> Option<String> {
-    selected_codex_workspace_id(account).or_else(|| {
-        let default_id = account
-            .profile
-            .as_ref()
-            .and_then(|profile| profile.get(VERIFIED_OPENAI_CLAIMS_KEY))
-            .and_then(codex_account_id_from_value)?;
-        codex_workspace_options(account)
-            .iter()
-            .any(|workspace| workspace.id == default_id)
-            .then_some(default_id)
-    })
+    trusted_codex_workspace(account).map(|workspace| workspace.id)
+}
+
+pub fn trusted_codex_workspace(account: &Account) -> Option<TrustedCodexWorkspace> {
+    selected_codex_workspace_id(account)
+        .map(|id| TrustedCodexWorkspace {
+            id,
+            source: "user_selected".to_string(),
+        })
+        .or_else(|| {
+            let default_id = account
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.get(VERIFIED_OPENAI_CLAIMS_KEY))
+                .and_then(codex_account_id_from_value)?;
+            codex_workspace_options(account)
+                .iter()
+                .any(|workspace| workspace.id == default_id)
+                .then_some(TrustedCodexWorkspace {
+                    id: default_id,
+                    source: "verified_id_token".to_string(),
+                })
+        })
+        .or_else(|| {
+            let provenance = account
+                .profile
+                .as_ref()?
+                .get(CODEX_WORKSPACE_PROVENANCE_KEY)?;
+            let id = provenance
+                .get("workspaceId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?
+                .to_string();
+            let source = provenance
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("authenticated_discovery")
+                .to_string();
+            Some(TrustedCodexWorkspace { id, source })
+        })
 }
 
 pub fn codex_workspace_options(account: &Account) -> Vec<CodexWorkspace> {
     let mut workspaces = std::collections::BTreeMap::<String, String>::new();
+    if let Some(provenance) = account
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.get(CODEX_WORKSPACE_PROVENANCE_KEY))
+    {
+        if let Some(id) = provenance
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            workspaces.insert(id.to_string(), id.to_string());
+        }
+    }
     if let Some(value) = account
         .profile
         .as_ref()
@@ -771,6 +854,7 @@ fn preserve_codex_profile_state(existing: Option<&Value>, incoming: &mut Value) 
     };
     for key in [
         VERIFIED_OPENAI_CLAIMS_KEY,
+        CODEX_WORKSPACE_PROVENANCE_KEY,
         "selectedChatgptAccountId",
         "selectedWorkspace",
     ] {
@@ -1224,9 +1308,43 @@ mod tests {
     }
 
     #[test]
-    fn manual_subscription_expiry_is_restricted_to_manual_required_accounts() {
+    fn grok_upsert_preserves_manual_subscription_expiry_fallback() {
         let mut store = AccountStore::default();
-        for provider_type in [ProviderType::ClaudeOAuth, ProviderType::CodexOAuth] {
+        let mut input = fixture_input(ProviderType::GrokOAuth);
+        input.id = Some("grok-account".to_string());
+        store.upsert(input);
+        store
+            .set_manual_subscription_expiry(
+                "grok-account",
+                Some(1_787_097_600_000),
+                1_784_000_000_000,
+            )
+            .unwrap();
+
+        let mut refreshed = fixture_input(ProviderType::GrokOAuth);
+        refreshed.id = Some("grok-account".to_string());
+        refreshed.access_token = Some("refreshed-token".to_string());
+        let account = store.upsert(refreshed);
+
+        assert_eq!(account.access_token.as_deref(), Some("refreshed-token"));
+        assert_eq!(
+            account.manual_subscription_expires_at_ms,
+            Some(1_787_097_600_000)
+        );
+        assert_eq!(
+            account.manual_subscription_expiry_updated_at_ms,
+            Some(1_784_000_000_000)
+        );
+    }
+
+    #[test]
+    fn manual_subscription_expiry_is_restricted_to_manual_capable_accounts() {
+        let mut store = AccountStore::default();
+        for provider_type in [
+            ProviderType::ClaudeOAuth,
+            ProviderType::GrokOAuth,
+            ProviderType::CodexOAuth,
+        ] {
             let mut input = fixture_input(provider_type);
             input.id = Some(provider_type.as_str().to_string());
             store.upsert(input);
@@ -1242,6 +1360,18 @@ mod tests {
         assert_eq!(
             claude.manual_subscription_expires_at_ms,
             Some(1_786_924_800_000)
+        );
+
+        let grok = store
+            .set_manual_subscription_expiry(
+                ProviderType::GrokOAuth.as_str(),
+                Some(1_787_097_600_000),
+                1_784_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            grok.manual_subscription_expires_at_ms,
+            Some(1_787_097_600_000)
         );
 
         assert!(matches!(
@@ -1530,6 +1660,75 @@ mod tests {
         assert_eq!(
             effective_codex_workspace_id(&account).as_deref(),
             Some("workspace-z-default")
+        );
+    }
+
+    #[test]
+    fn codex_authenticated_provenance_is_a_trusted_workspace_option() {
+        let mut store = AccountStore::default();
+        let mut profile = Some(json!({"chatgpt_account_id": "workspace-1"}));
+        set_codex_workspace_provenance(&mut profile, "workspace-1", "authenticated_discovery", 123);
+        let account = store.upsert(UpsertAccountInput {
+            id: Some("acct-provenance".to_string()),
+            provider_type: ProviderType::CodexOAuth,
+            profile,
+            ..fixture_input(ProviderType::CodexOAuth)
+        });
+
+        assert_eq!(codex_workspace_options(&account).len(), 1);
+        assert_eq!(
+            trusted_codex_workspace(&account),
+            Some(TrustedCodexWorkspace {
+                id: "workspace-1".to_string(),
+                source: "authenticated_discovery".to_string(),
+            })
+        );
+        assert_eq!(
+            account
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.pointer("/codexWorkspaceProvenance/verifiedAt"))
+                .and_then(Value::as_i64),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn codex_verified_claims_take_precedence_and_provenance_can_be_scrubbed() {
+        let mut profile = Some(json!({}));
+        set_codex_workspace_provenance(
+            &mut profile,
+            "workspace-migrated",
+            "authenticated_discovery",
+            123,
+        );
+        set_verified_openai_claims(
+            &mut profile,
+            Some(json!({"chatgpt_account_id": "workspace-signed"})),
+        );
+        let mut account = AccountStore::default().upsert(UpsertAccountInput {
+            id: Some("acct-provenance-priority".to_string()),
+            provider_type: ProviderType::CodexOAuth,
+            profile,
+            ..fixture_input(ProviderType::CodexOAuth)
+        });
+
+        assert_eq!(
+            trusted_codex_workspace(&account),
+            Some(TrustedCodexWorkspace {
+                id: "workspace-signed".to_string(),
+                source: "verified_id_token".to_string(),
+            })
+        );
+        clear_codex_workspace_provenance(&mut account.profile);
+        assert!(account
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.get("codexWorkspaceProvenance"))
+            .is_none());
+        assert_eq!(
+            effective_codex_workspace_id(&account).as_deref(),
+            Some("workspace-signed")
         );
     }
 

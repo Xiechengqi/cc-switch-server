@@ -44,6 +44,23 @@ pub async fn verify_openai_id_token(
     http: &reqwest::Client,
     token: &str,
 ) -> Result<Value, OpenAiJwtError> {
+    verify_openai_id_token_with_expiry(http, token, true).await
+}
+
+/// Recover signed OpenAI identity claims from an expired persisted ID token.
+/// This is only suitable for workspace identity migration, never authentication.
+pub async fn verify_openai_id_token_identity(
+    http: &reqwest::Client,
+    token: &str,
+) -> Result<Value, OpenAiJwtError> {
+    verify_openai_id_token_with_expiry(http, token, false).await
+}
+
+async fn verify_openai_id_token_with_expiry(
+    http: &reqwest::Client,
+    token: &str,
+    validate_exp: bool,
+) -> Result<Value, OpenAiJwtError> {
     let header =
         decode_header(token).map_err(|error| OpenAiJwtError::InvalidHeader(error.to_string()))?;
     if header.alg != Algorithm::RS256 {
@@ -58,18 +75,23 @@ pub async fn verify_openai_id_token(
     let jwk = jwk.ok_or_else(|| OpenAiJwtError::UnknownKey(kid.clone()))?;
     let key = DecodingKey::from_jwk(&jwk)
         .map_err(|error| OpenAiJwtError::InvalidKey(error.to_string()))?;
+    let validation = openai_validation(validate_exp);
+    decode::<Value>(token, &key, &validation)
+        .map(|data| data.claims)
+        .map_err(|error| OpenAiJwtError::Verification(error.to_string()))
+}
+
+fn openai_validation(validate_exp: bool) -> Validation {
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&[openai_issuer()]);
     validation.set_audience(&[openai_client_id()]);
-    validation.validate_exp = true;
+    validation.validate_exp = validate_exp;
     validation.validate_nbf = true;
     validation.required_spec_claims = ["exp", "iss", "aud"]
         .into_iter()
         .map(str::to_string)
         .collect();
-    decode::<Value>(token, &key, &validation)
-        .map(|data| data.claims)
-        .map_err(|error| OpenAiJwtError::Verification(error.to_string()))
+    validation
 }
 
 async fn cached_key(kid: &str) -> Option<Jwk> {
@@ -147,5 +169,18 @@ mod tests {
             .block_on(verify_openai_id_token(&reqwest::Client::new(), token))
             .unwrap_err();
         assert!(matches!(error, OpenAiJwtError::UnsupportedAlgorithm));
+    }
+
+    #[test]
+    fn identity_migration_relaxes_only_expiry_validation() {
+        let login = openai_validation(true);
+        let migration = openai_validation(false);
+
+        assert!(login.validate_exp);
+        assert!(!migration.validate_exp);
+        assert!(migration.validate_nbf);
+        assert!(migration.required_spec_claims.contains("exp"));
+        assert!(migration.required_spec_claims.contains("iss"));
+        assert!(migration.required_spec_claims.contains("aud"));
     }
 }
