@@ -42,6 +42,9 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
   footer,
   contentClassName,
 }) => {
+  const scrollContainerRef = React.useRef<HTMLDivElement>(null);
+  const contentRef = React.useRef<HTMLDivElement>(null);
+
   React.useEffect(() => {
     if (isOpen) {
       document.body.style.overflow = "hidden";
@@ -81,6 +84,49 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
     window.addEventListener("keydown", handleKeyDown, false);
     return () => {
       window.removeEventListener("keydown", handleKeyDown, false);
+    };
+  }, [isOpen]);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+
+    const scrollContainer = scrollContainerRef.current;
+    const content = contentRef.current;
+    if (!scrollContainer || !content || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    let previousHeight = content.getBoundingClientRect().height;
+    let animationFrame: number | null = null;
+    const observer = new ResizeObserver(() => {
+      const nextHeight = content.getBoundingClientRect().height;
+      if (nextHeight >= previousHeight) {
+        previousHeight = nextHeight;
+        return;
+      }
+      previousHeight = nextHeight;
+
+      if (animationFrame !== null) {
+        cancelAnimationFrame(animationFrame);
+      }
+      animationFrame = requestAnimationFrame(() => {
+        animationFrame = null;
+        const maxScrollTop = Math.max(
+          0,
+          scrollContainer.scrollHeight - scrollContainer.clientHeight,
+        );
+        if (scrollContainer.scrollTop > maxScrollTop) {
+          scrollContainer.scrollTop = maxScrollTop;
+        }
+      });
+    });
+
+    observer.observe(content);
+    return () => {
+      observer.disconnect();
+      if (animationFrame !== null) {
+        cancelAnimationFrame(animationFrame);
+      }
     };
   }, [isOpen]);
 
@@ -147,8 +193,13 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
           </div>
 
           {/* Content */}
-          <div className="min-h-0 flex-1 overflow-y-auto scroll-overlay">
+          <div
+            ref={scrollContainerRef}
+            className="min-h-0 flex-1 overflow-y-auto scroll-overlay"
+            style={{ overflowAnchor: "none" }}
+          >
             <div
+              ref={contentRef}
               className={cn(
                 PAGE_SHELL_CLASS,
                 "space-y-6 py-6",

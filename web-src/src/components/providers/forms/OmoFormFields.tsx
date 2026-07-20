@@ -1122,7 +1122,9 @@ export function OmoFormFields({
           isOpen ? `${maxHeightClass} opacity-100` : "max-h-0 opacity-0",
         )}
       >
-        <div className="px-3 pb-3">{children}</div>
+        <div hidden={!isOpen} className="px-3 pb-3">
+          {children}
+        </div>
       </div>
     </div>
   );

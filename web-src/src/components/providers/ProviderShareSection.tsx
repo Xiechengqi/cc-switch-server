@@ -9,11 +9,7 @@ import {
   Share2,
   X,
 } from "lucide-react";
-import type {
-  AppId,
-  PublicMarket,
-  ShareSaleMarketKind,
-} from "@/lib/api";
+import type { AppId, PublicMarket, ShareSaleMarketKind } from "@/lib/api";
 import type { ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -34,6 +30,7 @@ import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton"
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { shareApi } from "@/lib/api/share";
 import { copyText } from "@/lib/clipboard";
+import { stableStringify } from "@/lib/stableStringify";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import {
@@ -107,7 +104,8 @@ export function ProviderSharePlaceholder() {
       <div className="border-t border-border/40 px-4 pb-4 pt-3">
         <p className="text-sm text-muted-foreground">
           {t("provider.share.addPagePlaceholder", {
-            defaultValue: "请先保存供应商；保存后重新打开编辑页即可配置远程分享。",
+            defaultValue:
+              "请先保存供应商；保存后重新打开编辑页即可配置远程分享。",
           })}
         </p>
       </div>
@@ -121,6 +119,7 @@ interface ProviderShareSectionProps {
   providerName: string;
   onOpenShareSettings?: () => void;
   onSaveHandlerChange?: (handler: ProviderShareSaveHandler | null) => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 export type ProviderShareSaveHandler = () => Promise<boolean>;
@@ -163,6 +162,7 @@ export function ProviderShareSection({
   providerName,
   onOpenShareSettings,
   onSaveHandlerChange,
+  onDirtyChange,
 }: ProviderShareSectionProps) {
   const { t } = useTranslation();
   const { share, state } = useProviderShare(appId, providerId);
@@ -180,21 +180,38 @@ export function ProviderShareSection({
 
   const [isShareOpen, setIsShareOpen] = useState(false);
   const [confirmFreeOpen, setConfirmFreeOpen] = useState(false);
-  const [shareDraftDirty, setShareDraftDirty] = useState(false);
+  // Limit/expiry touched flags live in refs. Incrementing this signal guarantees
+  // every same-value interaction still causes a fingerprint render.
+  const [, setShareDraftRevision] = useState(0);
+  const markShareDraftChanged = () => {
+    setShareDraftRevision((current) => current + 1);
+  };
+  const [shareDraftBaseline, setShareDraftBaseline] = useState<{
+    key: string;
+    fingerprint: string;
+  } | null>(null);
 
   const [subdomainInput, setSubdomainInput] = useState("");
   const [descriptionInput, setDescriptionInput] = useState("");
-  const [forSaleValue, setForSaleValue] = useState<"Yes" | "No" | "Free">("Yes");
-  const [saleMarketKind, setSaleMarketKind] = useState<ShareSaleMarketKind>("token");
-  const [marketAccessMode, setMarketAccessMode] = useState<"selected" | "all">("all");
-  const [selectedMarketEmails, setSelectedMarketEmails] = useState<string[]>([]);
+  const [forSaleValue, setForSaleValue] = useState<"Yes" | "No" | "Free">(
+    "Yes",
+  );
+  const [saleMarketKind, setSaleMarketKind] =
+    useState<ShareSaleMarketKind>("token");
+  const [marketAccessMode, setMarketAccessMode] = useState<"selected" | "all">(
+    "all",
+  );
+  const [selectedMarketEmails, setSelectedMarketEmails] = useState<string[]>(
+    [],
+  );
   const [selectedShareMarketEmail, setSelectedShareMarketEmail] = useState("");
   const [marketSelectKey, setMarketSelectKey] = useState(0);
   const [shareToEmails, setShareToEmails] = useState<string[]>([]);
   const [userGrants, setUserGrants] = useState<ShareUserGrantMap>({});
   const [tokenLimitInput, setTokenLimitInput] = useState("");
   const [parallelLimitInput, setParallelLimitInput] = useState("");
-  const [officialPricePercentInput, setOfficialPricePercentInput] = useState("");
+  const [officialPricePercentInput, setOfficialPricePercentInput] =
+    useState("");
   const [expiresInSecsInput, setExpiresInSecsInput] = useState(
     String(permanentExpiresInSecs()),
   );
@@ -205,11 +222,14 @@ export function ProviderShareSection({
   const tokenLimitTouchedRef = useRef(false);
   const parallelLimitTouchedRef = useRef(false);
   const expiresTouchedRef = useRef(false);
-  const providerSaveHandlerRef = useRef<ProviderShareSaveHandler>(async () => true);
+  const providerSaveHandlerRef = useRef<ProviderShareSaveHandler>(
+    async () => true,
+  );
 
   useEffect(() => {
     if (!onSaveHandlerChange) return;
-    const handler: ProviderShareSaveHandler = () => providerSaveHandlerRef.current();
+    const handler: ProviderShareSaveHandler = () =>
+      providerSaveHandlerRef.current();
     onSaveHandlerChange(handler);
     return () => onSaveHandlerChange(null);
   }, [onSaveHandlerChange]);
@@ -221,11 +241,16 @@ export function ProviderShareSection({
     share && share.routerSyncedRevision < share.configRevision,
   );
   const marketsQueryEnabled = shareExists && isShareOpen;
-  const { data: markets = [], isLoading: marketsLoading, error: marketsError, refetch: refetchMarkets } =
-    useShareMarketsQuery(marketsQueryEnabled);
+  const {
+    data: markets = [],
+    isLoading: marketsLoading,
+    error: marketsError,
+    refetch: refetchMarkets,
+  } = useShareMarketsQuery(marketsQueryEnabled);
 
   const usageMarkets = useMemo(
-    () => markets.filter((market) => (market.marketKind ?? "usage") !== "share"),
+    () =>
+      markets.filter((market) => (market.marketKind ?? "usage") !== "share"),
     [markets],
   );
   const shareMarkets = useMemo(
@@ -267,7 +292,6 @@ export function ProviderShareSection({
     tokenLimitTouchedRef.current = false;
     parallelLimitTouchedRef.current = false;
     expiresTouchedRef.current = false;
-    setShareDraftDirty(false);
 
     setDescriptionInput(share?.description?.trim() ?? "");
     setForSaleValue(share?.forSale ?? "Yes");
@@ -335,7 +359,9 @@ export function ProviderShareSection({
     const officialPricePercent =
       share?.forSaleOfficialPricePercentByApp?.[shareableApp];
     setOfficialPricePercentInput(
-      Number.isInteger(officialPricePercent) ? String(officialPricePercent) : "",
+      Number.isInteger(officialPricePercent)
+        ? String(officialPricePercent)
+        : "",
     );
 
     const permanent = share ? isPermanentExpiry(share.expiresAt) : true;
@@ -379,6 +405,83 @@ export function ProviderShareSection({
     enableMutation.isPending ||
     disableMutation.isPending ||
     saveMutation.isPending;
+
+  const shareDraftInitializationKey = `${appId}:${providerId}:${share?.id ?? "new"}`;
+  const shareDraftFingerprint = stableStringify({
+    subdomain: subdomainInput.trim(),
+    description: descriptionInput.trim(),
+    forSale: forSaleValue,
+    saleMarketKind,
+    marketAccessMode,
+    selectedMarketEmails: uniqueSortedEmails(
+      selectedMarketEmails
+        .map((email) => email.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+    selectedShareMarketEmail: selectedShareMarketEmail.trim().toLowerCase(),
+    shareToEmails: normalizeShareEmails(shareToEmails),
+    userGrants,
+    tokenLimit:
+      !tokenLimitTouchedRef.current && share
+        ? normalizeShareLimitValue(share.tokenLimit)
+        : tokenLimitInput.trim()
+          ? Number(tokenLimitInput)
+          : UNLIMITED_TOKEN_LIMIT,
+    parallelLimit:
+      !parallelLimitTouchedRef.current && share
+        ? normalizeShareLimitValue(share.parallelLimit)
+        : parallelLimitInput.trim()
+          ? Number(parallelLimitInput)
+          : UNLIMITED_PARALLEL_LIMIT,
+    officialPricePercent:
+      forSaleValue === "Yes" && saleMarketKind === "token"
+        ? officialPricePercentInput.trim()
+        : "",
+    expiry:
+      !expiresTouchedRef.current && share?.expiresAt
+        ? isPermanentExpiry(share.expiresAt)
+          ? { permanent: true }
+          : { persisted: share.expiresAt }
+        : isPermanent
+          ? { permanent: true }
+          : { permanent: false, seconds: expiresInSecsInput.trim() },
+  });
+  const shareDraftFingerprintRef = useRef(shareDraftFingerprint);
+  shareDraftFingerprintRef.current = shareDraftFingerprint;
+
+  useEffect(() => {
+    let secondFrame: number | null = null;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        setShareDraftBaseline({
+          key: shareDraftInitializationKey,
+          fingerprint: shareDraftFingerprintRef.current,
+        });
+      });
+    });
+
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame !== null) cancelAnimationFrame(secondFrame);
+    };
+  }, [shareDraftInitializationKey]);
+
+  const shareDraftDirty = Boolean(
+    share &&
+    shareDraftBaseline?.key === shareDraftInitializationKey &&
+    shareDraftBaseline.fingerprint !== shareDraftFingerprint,
+  );
+
+  useEffect(() => {
+    onDirtyChange?.(shareDraftDirty);
+  }, [onDirtyChange, shareDraftDirty]);
+
+  useEffect(
+    () => () => {
+      onDirtyChange?.(false);
+    },
+    [onDirtyChange],
+  );
 
   if (!shareableApp) {
     return null;
@@ -516,7 +619,7 @@ export function ProviderShareSection({
         .filter((grant) => !selectedMarketGrantEmails.has(grant.email))
         .map((grant) => grant.email),
     );
-    setShareDraftDirty(true);
+    markShareDraftChanged();
   };
 
   const buildAclPayload = (
@@ -631,7 +734,10 @@ export function ProviderShareSection({
       expiresAt: nextExpiresAt,
       userGrants: payloadUserGrants,
     });
-    setShareDraftDirty(false);
+    setShareDraftBaseline({
+      key: shareDraftInitializationKey,
+      fingerprint: shareDraftFingerprintRef.current,
+    });
     return true;
   };
 
@@ -659,9 +765,10 @@ export function ProviderShareSection({
     }
   };
 
-  const tunnelLabel = share?.tunnelUrl || share?.subdomain
-    ? formatShareRouterDisplay(share.tunnelUrl || share.subdomain || "")
-    : null;
+  const tunnelLabel =
+    share?.tunnelUrl || share?.subdomain
+      ? formatShareRouterDisplay(share.tunnelUrl || share.subdomain || "")
+      : null;
   const clientSubdomain = clientTunnel?.config?.subdomain?.trim() ?? "";
   const shareSlugPreview = subdomainInput.trim();
   const routerHost =
@@ -701,7 +808,9 @@ export function ProviderShareSection({
               htmlFor="provider-share-enabled"
               className="text-sm text-muted-foreground"
             >
-              {t("provider.share.enableShare", { defaultValue: "启用远程分享" })}
+              {t("provider.share.enableShare", {
+                defaultValue: "启用远程分享",
+              })}
             </Label>
             <Switch
               id="provider-share-enabled"
@@ -726,7 +835,10 @@ export function ProviderShareSection({
           isShareOpen ? "max-h-[5000px] opacity-100" : "max-h-0 opacity-0",
         )}
       >
-        <div className="space-y-4 border-t border-border/50 p-4">
+        <div
+          hidden={!isShareOpen}
+          className="space-y-4 border-t border-border/50 p-4"
+        >
           <p className="text-sm text-muted-foreground">
             {t("provider.share.sectionHint", {
               defaultValue:
@@ -835,7 +947,7 @@ export function ProviderShareSection({
                       onChange={(event) => {
                         subdomainManualRef.current = true;
                         setSubdomainInput(event.target.value);
-                        setShareDraftDirty(true);
+                        markShareDraftChanged();
                       }}
                     />
                     <SubdomainGeneratorButton
@@ -843,7 +955,7 @@ export function ProviderShareSection({
                       onGenerated={(value) => {
                         subdomainManualRef.current = true;
                         setSubdomainInput(value);
-                        setShareDraftDirty(true);
+                        markShareDraftChanged();
                       }}
                       onError={(message) => toast.error(message)}
                       suggest={() => shareApi.suggestShareSlug()}
@@ -880,7 +992,7 @@ export function ProviderShareSection({
                     disabled={busy}
                     onChange={(event) => {
                       setDescriptionInput(event.target.value);
-                      setShareDraftDirty(true);
+                      markShareDraftChanged();
                     }}
                   />
                 </div>
@@ -899,7 +1011,7 @@ export function ProviderShareSection({
                       } else {
                         setForSaleValue(next);
                         if (next !== "Yes") setOfficialPricePercentInput("");
-                        setShareDraftDirty(true);
+                        markShareDraftChanged();
                       }
                     }}
                   >
@@ -914,7 +1026,9 @@ export function ProviderShareSection({
                         {t("share.forSaleOptions.yes", { defaultValue: "是" })}
                       </SelectItem>
                       <SelectItem value="Free">
-                        {t("share.forSaleOptions.free", { defaultValue: "免费" })}
+                        {t("share.forSaleOptions.free", {
+                          defaultValue: "免费",
+                        })}
                       </SelectItem>
                     </SelectContent>
                   </Select>
@@ -922,7 +1036,9 @@ export function ProviderShareSection({
 
                 <div className="space-y-2">
                   <Label>
-                    {t("share.saleMarketKind.title", { defaultValue: "Market 类型" })}
+                    {t("share.saleMarketKind.title", {
+                      defaultValue: "Market 类型",
+                    })}
                   </Label>
                   <div className="flex flex-wrap items-center gap-4 pt-1">
                     {(["token", "share"] as const).map((value) => (
@@ -943,8 +1059,9 @@ export function ProviderShareSection({
                           disabled={marketDisabled || busy}
                           onChange={() => {
                             setSaleMarketKind(value);
-                            if (value !== "token") setOfficialPricePercentInput("");
-                            setShareDraftDirty(true);
+                            if (value !== "token")
+                              setOfficialPricePercentInput("");
+                            markShareDraftChanged();
                             if (value === "token") {
                               setMarketAccessMode("all");
                               setSelectedMarketEmails([]);
@@ -996,7 +1113,7 @@ export function ProviderShareSection({
                       )}
                       onChange={(event) => {
                         setOfficialPricePercentInput(event.target.value);
-                        setShareDraftDirty(true);
+                        markShareDraftChanged();
                       }}
                     />
                     <p
@@ -1031,21 +1148,25 @@ export function ProviderShareSection({
                     onMarketAccessModeChange={(value) => {
                       setMarketAccessMode(value);
                       syncUserGrantsForMarketEmails(
-                        value === "selected" ? normalizedSelectedMarketEmails : [],
+                        value === "selected"
+                          ? normalizedSelectedMarketEmails
+                          : [],
                       );
-                      setShareDraftDirty(true);
+                      markShareDraftChanged();
                     }}
                     onSelectedMarketEmailsChange={(emails) => {
                       setSelectedMarketEmails(emails);
                       syncUserGrantsForMarketEmails(emails);
-                      setShareDraftDirty(true);
+                      markShareDraftChanged();
                     }}
                     onMarketSelectKeyChange={setMarketSelectKey}
                   />
                 ) : (
                   <ShareMarketSelectorField
                     markets={shareMarkets}
-                    selectedShareMarketEmail={normalizedSelectedShareMarketEmail}
+                    selectedShareMarketEmail={
+                      normalizedSelectedShareMarketEmail
+                    }
                     disabled={marketDisabled || busy}
                     marketsLoading={marketsLoading}
                     marketsError={marketsErrorMessage}
@@ -1053,7 +1174,7 @@ export function ProviderShareSection({
                     onSelectedShareMarketEmailChange={(email) => {
                       setSelectedShareMarketEmail(email);
                       syncUserGrantsForMarketEmails(email ? [email] : []);
-                      setShareDraftDirty(true);
+                      markShareDraftChanged();
                     }}
                     invalid={marketInvalid}
                   />
@@ -1077,12 +1198,14 @@ export function ProviderShareSection({
                     type="number"
                     min={0}
                     disabled={busy}
-                    placeholder={t("share.unlimited", { defaultValue: "无上限" })}
+                    placeholder={t("share.unlimited", {
+                      defaultValue: "无上限",
+                    })}
                     value={tokenLimitInput}
                     onChange={(event) => {
                       tokenLimitTouchedRef.current = true;
                       setTokenLimitInput(event.target.value);
-                      setShareDraftDirty(true);
+                      markShareDraftChanged();
                     }}
                   />
                   <div className="flex flex-wrap gap-1.5">
@@ -1095,7 +1218,7 @@ export function ProviderShareSection({
                       onClick={() => {
                         tokenLimitTouchedRef.current = true;
                         setTokenLimitInput("");
-                        setShareDraftDirty(true);
+                        markShareDraftChanged();
                       }}
                     >
                       {t("share.unlimited", { defaultValue: "无上限" })}
@@ -1111,7 +1234,7 @@ export function ProviderShareSection({
                         onClick={() => {
                           tokenLimitTouchedRef.current = true;
                           setTokenLimitInput(String(preset));
-                          setShareDraftDirty(true);
+                          markShareDraftChanged();
                         }}
                       >
                         {preset.toLocaleString()}
@@ -1129,12 +1252,14 @@ export function ProviderShareSection({
                     type="number"
                     min={1}
                     disabled={busy}
-                    placeholder={t("share.unlimited", { defaultValue: "无上限" })}
+                    placeholder={t("share.unlimited", {
+                      defaultValue: "无上限",
+                    })}
                     value={parallelLimitInput}
                     onChange={(event) => {
                       parallelLimitTouchedRef.current = true;
                       setParallelLimitInput(event.target.value);
-                      setShareDraftDirty(true);
+                      markShareDraftChanged();
                     }}
                   />
                   <div className="flex flex-wrap gap-1.5">
@@ -1147,7 +1272,7 @@ export function ProviderShareSection({
                       onClick={() => {
                         parallelLimitTouchedRef.current = true;
                         setParallelLimitInput("");
-                        setShareDraftDirty(true);
+                        markShareDraftChanged();
                       }}
                     >
                       {t("share.unlimited", { defaultValue: "无上限" })}
@@ -1161,7 +1286,7 @@ export function ProviderShareSection({
                       onClick={() => {
                         parallelLimitTouchedRef.current = true;
                         setParallelLimitInput(String(DEFAULT_PARALLEL_LIMIT));
-                        setShareDraftDirty(true);
+                        markShareDraftChanged();
                       }}
                     >
                       {DEFAULT_PARALLEL_LIMIT}
@@ -1181,7 +1306,7 @@ export function ProviderShareSection({
                     onChange={(event) => {
                       expiresTouchedRef.current = true;
                       setExpiresInSecsInput(event.target.value);
-                      setShareDraftDirty(true);
+                      markShareDraftChanged();
                     }}
                   />
                   <div className="flex flex-wrap gap-1.5">
@@ -1196,7 +1321,7 @@ export function ProviderShareSection({
                         onClick={() => {
                           expiresTouchedRef.current = true;
                           setExpiresInSecsInput(String(preset.value));
-                          setShareDraftDirty(true);
+                          markShareDraftChanged();
                         }}
                       >
                         {t(preset.labelKey)}
@@ -1210,11 +1335,13 @@ export function ProviderShareSection({
                       disabled={busy}
                       onCheckedChange={(checked) => {
                         expiresTouchedRef.current = true;
-                        setShareDraftDirty(true);
+                        markShareDraftChanged();
                         const next = checked === true;
                         setIsPermanent(next);
                         if (next) {
-                          setExpiresInSecsInput(String(permanentExpiresInSecs()));
+                          setExpiresInSecsInput(
+                            String(permanentExpiresInSecs()),
+                          );
                         } else {
                           setExpiresInSecsInput(String(24 * 3600));
                         }
@@ -1224,7 +1351,9 @@ export function ProviderShareSection({
                       htmlFor="provider-share-expires-permanent"
                       className="cursor-pointer text-sm font-normal"
                     >
-                      {t("share.expiry.permanent", { defaultValue: "永久有效" })}
+                      {t("share.expiry.permanent", {
+                        defaultValue: "永久有效",
+                      })}
                     </Label>
                   </div>
                 </div>
@@ -1280,7 +1409,7 @@ export function ProviderShareSection({
         onConfirm={() => {
           setForSaleValue("Free");
           setOfficialPricePercentInput("");
-          setShareDraftDirty(true);
+          markShareDraftChanged();
           setConfirmFreeOpen(false);
         }}
         onCancel={() => setConfirmFreeOpen(false)}
@@ -1337,7 +1466,10 @@ function MarketSelectorField({
             }
             onMarketAccessModeChange("selected");
             onSelectedMarketEmailsChange(
-              uniqueSortedEmails([...selectedMarketEmails, value.toLowerCase()]),
+              uniqueSortedEmails([
+                ...selectedMarketEmails,
+                value.toLowerCase(),
+              ]),
             );
             onMarketSelectKeyChange((current) => current + 1);
           }}

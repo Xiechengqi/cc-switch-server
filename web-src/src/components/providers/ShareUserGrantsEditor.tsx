@@ -277,7 +277,7 @@ export function ShareUserGrantsEditor({
                 <Label>{t("share.userLimit.period", { defaultValue: "Token 周期" })}</Label>
                 <Select value={draft.tokenPeriod} onValueChange={(tokenPeriod: ShareTokenPeriod) => setDraft({ ...draft, tokenPeriod })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className="z-[120]">
                     {(Object.keys(periodLabels) as ShareTokenPeriod[]).map((period) => <SelectItem key={period} value={period}>{periodLabels[period]}</SelectItem>)}
                   </SelectContent>
                 </Select>

@@ -105,7 +105,10 @@ export function ProviderAdvancedConfig({
               : "max-h-0 opacity-0",
           )}
         >
-          <div className="border-t border-border/50 p-4 space-y-4">
+          <div
+            hidden={!isTestConfigOpen}
+            className="border-t border-border/50 p-4 space-y-4"
+          >
             <p className="text-sm text-muted-foreground">
               {t("providerAdvanced.testConfigDesc", {
                 defaultValue:
@@ -282,7 +285,10 @@ export function ProviderAdvancedConfig({
               : "max-h-0 opacity-0",
           )}
         >
-          <div className="border-t border-border/50 p-4 space-y-4">
+          <div
+            hidden={!isPricingConfigOpen}
+            className="border-t border-border/50 p-4 space-y-4"
+          >
             <p className="text-sm text-muted-foreground">
               {t("providerAdvanced.pricingConfigDesc", {
                 defaultValue:

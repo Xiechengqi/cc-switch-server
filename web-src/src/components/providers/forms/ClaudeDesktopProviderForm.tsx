@@ -68,6 +68,7 @@ import {
   type ClaudeDesktopDefaultRoute,
 } from "@/lib/api/providers";
 import { resolveManagedAccountId } from "@/lib/authBinding";
+import { stableStringify } from "@/lib/stableStringify";
 
 export type ClaudeDesktopProviderFormValues = ProviderFormData & {
   presetId?: string;
@@ -91,6 +92,7 @@ export interface ClaudeDesktopProviderFormProps {
   onSubmit: (values: ClaudeDesktopProviderFormValues) => Promise<void> | void;
   onCancel: () => void;
   onSubmittingChange?: (isSubmitting: boolean) => void;
+  onDirtyChange?: (dirty: boolean) => void;
   initialData?: {
     name?: string;
     websiteUrl?: string;
@@ -252,6 +254,7 @@ export function ClaudeDesktopProviderForm({
   onSubmit,
   onCancel,
   onSubmittingChange,
+  onDirtyChange,
   initialData,
   showButtons = true,
 }: ClaudeDesktopProviderFormProps) {
@@ -346,6 +349,76 @@ export function ClaudeDesktopProviderForm({
     defaultValues,
     mode: "onSubmit",
   });
+
+  const watchedFormValues = form.watch();
+  const draftUsesManagedOAuth =
+    activePreset?.requiresOAuth === true ||
+    activePreset?.providerType === "github_copilot" ||
+    activePreset?.providerType === "codex_oauth" ||
+    initialData?.meta?.providerType === "github_copilot" ||
+    initialData?.meta?.providerType === "codex_oauth";
+  const draftInitializationKey = stableStringify({ initialData });
+  const draftFingerprint = stableStringify({
+    form: {
+      name: watchedFormValues.name.trim(),
+      websiteUrl: watchedFormValues.websiteUrl?.trim() ?? "",
+      notes: watchedFormValues.notes?.trim() ?? "",
+      icon: watchedFormValues.icon?.trim() ?? "",
+      iconColor: watchedFormValues.iconColor?.trim() ?? "",
+    },
+    mode,
+    apiFormat: mode === "proxy" ? apiFormat : "anthropic",
+    baseUrl: baseUrl.trim().replace(/\/+$/, ""),
+    apiKey: draftUsesManagedOAuth ? undefined : apiKey.trim(),
+    apiKeyField: draftUsesManagedOAuth ? undefined : apiKeyField,
+    routes: routes.map((route) => ({
+      route: route.route.trim(),
+      model: route.model.trim(),
+      labelOverride: route.labelOverride.trim(),
+      supports1m: route.supports1m,
+    })),
+    selectedGitHubAccountId,
+    selectedCodexAccountId,
+    codexFastMode,
+  });
+  const draftFingerprintRef = useRef(draftFingerprint);
+  draftFingerprintRef.current = draftFingerprint;
+  const [draftBaseline, setDraftBaseline] = useState<{
+    key: string;
+    fingerprint: string;
+  } | null>(null);
+
+  useEffect(() => {
+    let secondFrame: number | null = null;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        setDraftBaseline({
+          key: draftInitializationKey,
+          fingerprint: draftFingerprintRef.current,
+        });
+      });
+    });
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame !== null) cancelAnimationFrame(secondFrame);
+    };
+  }, [draftInitializationKey]);
+
+  const draftDirty = Boolean(
+    draftBaseline?.key === draftInitializationKey &&
+    draftBaseline.fingerprint !== draftFingerprint,
+  );
+
+  useEffect(() => {
+    onDirtyChange?.(draftDirty);
+  }, [draftDirty, onDirtyChange]);
+
+  useEffect(
+    () => () => {
+      onDirtyChange?.(false);
+    },
+    [onDirtyChange],
+  );
 
   useEffect(() => {
     onSubmittingChange?.(form.formState.isSubmitting || isFetchingModels);

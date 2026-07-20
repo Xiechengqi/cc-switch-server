@@ -137,6 +137,7 @@ import {
 } from "./helpers/opencodeFormUtils";
 import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
+import { stableStringify } from "@/lib/stableStringify";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { PROVIDER_TYPES } from "@/config/constants";
 import { detectCodingPlanProvider } from "@/config/codingPlanProviders";
@@ -180,6 +181,14 @@ const parseObjectConfig = (raw: string): Record<string, unknown> => {
   return parsed && typeof parsed === "object" && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>)
     : {};
+};
+
+const normalizeJsonTextForFingerprint = (raw: string): unknown => {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw.trim();
+  }
 };
 
 type PresetEntry = {
@@ -304,6 +313,7 @@ export interface ProviderFormProps {
   onSubmit: (values: ProviderFormValues) => Promise<void> | void;
   onCancel: () => void;
   onSubmittingChange?: (isSubmitting: boolean) => void;
+  onDirtyChange?: (dirty: boolean) => void;
   initialData?: {
     name?: string;
     websiteUrl?: string;
@@ -334,6 +344,7 @@ function ProviderFormFull({
   onSubmit,
   onCancel,
   onSubmittingChange,
+  onDirtyChange,
   initialData,
   showButtons = true,
   isProxyTakeover = false,
@@ -510,12 +521,20 @@ function ProviderFormFull({
   });
   const { isSubmitting } = form.formState;
   const providerShareSaveRef = useRef<ProviderShareSaveHandler | null>(null);
+  const [providerShareDirty, setProviderShareDirty] = useState(false);
+  const [providerDraftBaseline, setProviderDraftBaseline] = useState<{
+    key: string;
+    fingerprint: string;
+  } | null>(null);
   const handleProviderShareSaveChange = useCallback(
     (handler: ProviderShareSaveHandler | null) => {
       providerShareSaveRef.current = handler;
     },
     [],
   );
+  const handleProviderShareDirtyChange = useCallback((dirty: boolean) => {
+    setProviderShareDirty(dirty);
+  }, []);
 
   const handleSettingsConfigChange = useCallback(
     (config: string) => {
@@ -1031,8 +1050,7 @@ function ProviderFormFull({
         config: string;
         modelCatalog?: { models: CodexCatalogModel[] };
         modelMapping?:
-          | { mode: "single"; upstreamModel: string }
-          | { mode: "passthrough" };
+          { mode: "single"; upstreamModel: string } | { mode: "passthrough" };
       };
 
       if (normalizedCatalogModels.length > 0) {
@@ -1494,6 +1512,183 @@ function ProviderFormFull({
 
   const shouldApplyLocalProxyRequestOverrides =
     (appId === "claude" || appId === "codex") && category !== "official";
+
+  const watchedProviderFormValues = form.watch();
+  const providerSettingsDraft = (() => {
+    if (appId === "codex") {
+      try {
+        return normalizeJsonTextForFingerprint(
+          buildCodexSettingsConfigString(),
+        );
+      } catch {
+        return {
+          auth: normalizeJsonTextForFingerprint(codexAuth),
+          config: codexConfig,
+          catalogModels: codexCatalogModels,
+          singleUpstreamModel: codexSingleUpstreamModel.trim(),
+        };
+      }
+    }
+
+    if (appId === "gemini") {
+      try {
+        return {
+          env: envStringToObj(geminiEnv),
+          config: geminiConfig.trim() ? JSON.parse(geminiConfig) : {},
+          model: geminiModel.trim(),
+        };
+      } catch {
+        return {
+          env: geminiEnv.trim(),
+          config: geminiConfig.trim(),
+          model: geminiModel.trim(),
+        };
+      }
+    }
+
+    if (appId === "opencode" && isAnyOmoCategory) {
+      return {
+        agents: omoDraft.omoAgents,
+        categories: category === "omo" ? omoDraft.omoCategories : undefined,
+        otherFields: normalizeJsonTextForFingerprint(
+          omoDraft.omoOtherFieldsStr,
+        ),
+      };
+    }
+
+    return normalizeJsonTextForFingerprint(
+      watchedProviderFormValues.settingsConfig,
+    );
+  })();
+  const providerDraftInitializationKey = stableStringify({
+    appId,
+    providerId,
+    initialData,
+  });
+  const providerDraftFingerprint = stableStringify({
+    form: {
+      name: watchedProviderFormValues.name.trim(),
+      websiteUrl: watchedProviderFormValues.websiteUrl?.trim() ?? "",
+      notes: watchedProviderFormValues.notes?.trim() ?? "",
+      icon: watchedProviderFormValues.icon?.trim() ?? "",
+      iconColor: watchedProviderFormValues.iconColor?.trim() ?? "",
+      settingsConfig: providerSettingsDraft,
+    },
+    category,
+    providerType: currentProviderType,
+    providerKey:
+      appId === "opencode" && !isAnyOmoCategory
+        ? opencodeForm.opencodeProviderKey.trim()
+        : appId === "openclaw"
+          ? openclawForm.openclawProviderKey.trim()
+          : appId === "hermes"
+            ? hermesForm.hermesProviderKey.trim()
+            : undefined,
+    endpointAutoSelect,
+    isFullUrl:
+      supportsFullUrl && category !== "official" ? localIsFullUrl : undefined,
+    testConfig: testConfig.enabled ? testConfig : undefined,
+    pricingConfig: pricingConfig.enabled
+      ? {
+          enabled: true,
+          costMultiplier: pricingConfig.costMultiplier,
+          pricingModelSource: pricingConfig.pricingModelSource,
+          quotaDispatchLimitPercent: supportsQuotaDispatchLimit
+            ? pricingConfig.quotaDispatchLimitPercent
+            : undefined,
+        }
+      : { enabled: false },
+    apiFormat:
+      appId === "claude"
+        ? localApiFormat
+        : appId === "codex"
+          ? localCodexApiFormat
+          : undefined,
+    apiKeyField: appId === "claude" ? localApiKeyField : undefined,
+    authAccounts: {
+      github: selectedGitHubAccountId,
+      codex: selectedCodexAccountId,
+      grok: selectedGrokAccountId,
+      claude: selectedClaudeAccountId,
+      gemini: selectedGeminiAccountId,
+      antigravity: selectedAntigravityAccountId,
+      cursor: selectedCursorAccountId,
+      kiro: selectedKiroAccountId,
+      deepseek: selectedDeepSeekAccountId,
+    },
+    claudeModels:
+      appId === "claude"
+        ? {
+            claudeModel,
+            singleUpstreamModel,
+            defaultHaikuModel,
+            defaultSonnetModel,
+            defaultOpusModel,
+            defaultFableModel,
+          }
+        : undefined,
+    codex:
+      appId === "codex"
+        ? {
+            fastMode: codexFastMode,
+            imageGenerationEnabled: codexImageGenerationEnabled,
+            imageToolStripPolicy: codexImageToolStripPolicy,
+            websocketEnabled: codexWebsocketEnabled,
+            chatReasoning: codexChatReasoning,
+          }
+        : undefined,
+    commonConfigEnabled:
+      appId === "claude"
+        ? useCommonConfig
+        : appId === "codex"
+          ? useCodexCommonConfigFlag
+          : appId === "gemini"
+            ? useGeminiCommonConfigFlag
+            : undefined,
+    customUserAgent: customUserAgent.trim(),
+    localProxyRequestOverrides: shouldApplyLocalProxyRequestOverrides
+      ? {
+          headers: normalizeJsonTextForFingerprint(localProxyHeadersOverride),
+          body: normalizeJsonTextForFingerprint(localProxyBodyOverride),
+        }
+      : undefined,
+  });
+  const providerDraftFingerprintRef = useRef(providerDraftFingerprint);
+  providerDraftFingerprintRef.current = providerDraftFingerprint;
+
+  useEffect(() => {
+    let secondFrame: number | null = null;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        setProviderDraftBaseline({
+          key: providerDraftInitializationKey,
+          fingerprint: providerDraftFingerprintRef.current,
+        });
+      });
+    });
+
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame !== null) cancelAnimationFrame(secondFrame);
+    };
+  }, [providerDraftInitializationKey]);
+
+  const providerDraftDirty = Boolean(
+    providerDraftBaseline?.key === providerDraftInitializationKey &&
+    providerDraftBaseline.fingerprint !== providerDraftFingerprint,
+  );
+  const effectiveFormDirty = providerDraftDirty || providerShareDirty;
+
+  useEffect(() => {
+    onDirtyChange?.(effectiveFormDirty);
+  }, [effectiveFormDirty, onDirtyChange]);
+
+  useEffect(
+    () => () => {
+      onDirtyChange?.(false);
+    },
+    [onDirtyChange],
+  );
 
   const handleSubmit = async (values: ProviderFormData) => {
     const overridesResult = shouldApplyLocalProxyRequestOverrides
@@ -2291,42 +2486,42 @@ function ProviderFormFull({
                 accountId: selectedGrokAccountId ?? undefined,
               }
             : isCodexOauthProvider || isCodexOfficialPreset
-            ? {
-                source: "managed_account",
-                authProvider: "codex_oauth",
-                accountId: selectedCodexAccountId ?? undefined,
-              }
-            : isClaudeOauthProvider
               ? {
                   source: "managed_account",
-                  authProvider: "claude_oauth",
-                  accountId: selectedClaudeAccountId ?? undefined,
+                  authProvider: "codex_oauth",
+                  accountId: selectedCodexAccountId ?? undefined,
                 }
-              : isGeminiOauthProvider || isGeminiOfficialPreset
+              : isClaudeOauthProvider
                 ? {
                     source: "managed_account",
-                    authProvider: "google_gemini_oauth",
-                    accountId: selectedGeminiAccountId ?? undefined,
+                    authProvider: "claude_oauth",
+                    accountId: selectedClaudeAccountId ?? undefined,
                   }
-                : isAntigravityOauthProvider || isGeminiAntigravityOauthPreset
+                : isGeminiOauthProvider || isGeminiOfficialPreset
                   ? {
                       source: "managed_account",
-                      authProvider: "antigravity_oauth",
-                      accountId: selectedAntigravityAccountId ?? undefined,
+                      authProvider: "google_gemini_oauth",
+                      accountId: selectedGeminiAccountId ?? undefined,
                     }
-                  : isKiroOauthProvider
+                  : isAntigravityOauthProvider || isGeminiAntigravityOauthPreset
                     ? {
                         source: "managed_account",
-                        authProvider: "kiro_oauth",
-                        accountId: selectedKiroAccountId ?? undefined,
+                        authProvider: "antigravity_oauth",
+                        accountId: selectedAntigravityAccountId ?? undefined,
                       }
-                    : isDeepSeekAccountProvider
+                    : isKiroOauthProvider
                       ? {
                           source: "managed_account",
-                          authProvider: "deepseek_account",
-                          accountId: selectedDeepSeekAccountId ?? undefined,
+                          authProvider: "kiro_oauth",
+                          accountId: selectedKiroAccountId ?? undefined,
                         }
-                      : undefined,
+                      : isDeepSeekAccountProvider
+                        ? {
+                            source: "managed_account",
+                            authProvider: "deepseek_account",
+                            accountId: selectedDeepSeekAccountId ?? undefined,
+                          }
+                        : undefined,
       // GitHub Copilot 多账号：保存关联的账号 ID
       githubAccountId:
         isCopilotProvider && selectedGitHubAccountId
@@ -3446,39 +3641,41 @@ function ProviderFormFull({
           ) : (
             <>
               {!serverWeb ? (
-              <CommonConfigEditor
-                value={form.getValues("settingsConfig")}
-                onChange={(value) => form.setValue("settingsConfig", value)}
-                label={t("provider.advancedConfigJson", {
-                  defaultValue: "高级配置JSON",
-                })}
-                useCommonConfig={useCommonConfig}
-                onCommonConfigToggle={handleCommonConfigToggle}
-                commonConfigSnippet={commonConfigSnippet}
-                onCommonConfigSnippetChange={handleCommonConfigSnippetChange}
-                commonConfigError={commonConfigError}
-                onEditClick={() => setIsCommonConfigModalOpen(true)}
-                isModalOpen={isCommonConfigModalOpen}
-                onModalClose={() => setIsCommonConfigModalOpen(false)}
-                onExtract={handleClaudeExtract}
-                isExtracting={isClaudeExtracting}
-              />
-              ) : (
-              <div className="space-y-2">
-                <Label htmlFor="settingsConfig">
-                  {t("provider.advancedConfigJson", {
+                <CommonConfigEditor
+                  value={form.getValues("settingsConfig")}
+                  onChange={(value) => form.setValue("settingsConfig", value)}
+                  label={t("provider.advancedConfigJson", {
                     defaultValue: "高级配置JSON",
                   })}
-                </Label>
-                <JsonEditor
-                  value={form.getValues("settingsConfig")}
-                  onChange={(config) => form.setValue("settingsConfig", config)}
-                  rows={14}
-                  showValidation={true}
-                  language="json"
-                  darkMode={isDarkMode}
+                  useCommonConfig={useCommonConfig}
+                  onCommonConfigToggle={handleCommonConfigToggle}
+                  commonConfigSnippet={commonConfigSnippet}
+                  onCommonConfigSnippetChange={handleCommonConfigSnippetChange}
+                  commonConfigError={commonConfigError}
+                  onEditClick={() => setIsCommonConfigModalOpen(true)}
+                  isModalOpen={isCommonConfigModalOpen}
+                  onModalClose={() => setIsCommonConfigModalOpen(false)}
+                  onExtract={handleClaudeExtract}
+                  isExtracting={isClaudeExtracting}
                 />
-              </div>
+              ) : (
+                <div className="space-y-2">
+                  <Label htmlFor="settingsConfig">
+                    {t("provider.advancedConfigJson", {
+                      defaultValue: "高级配置JSON",
+                    })}
+                  </Label>
+                  <JsonEditor
+                    value={form.getValues("settingsConfig")}
+                    onChange={(config) =>
+                      form.setValue("settingsConfig", config)
+                    }
+                    rows={14}
+                    showValidation={true}
+                    language="json"
+                    darkMode={isDarkMode}
+                  />
+                </div>
               )}
               {settingsConfigErrorField}
             </>
@@ -3504,6 +3701,7 @@ function ProviderFormFull({
               providerName={form.watch("name") || providerId}
               onOpenShareSettings={onOpenShareSettings}
               onSaveHandlerChange={handleProviderShareSaveChange}
+              onDirtyChange={handleProviderShareDirtyChange}
             />
           ) : isShareableApp(appId) ? (
             <ProviderSharePlaceholder />

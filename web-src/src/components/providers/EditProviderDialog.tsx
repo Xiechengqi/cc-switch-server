@@ -34,6 +34,11 @@ export function EditProviderDialog({
 }: EditProviderDialogProps) {
   const { t } = useTranslation();
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
+  const [isFormDirty, setIsFormDirty] = useState(false);
+
+  useEffect(() => {
+    setIsFormDirty(false);
+  }, [open, provider?.id]);
 
   // 默认使用传入的 provider.settingsConfig，若当前编辑对象是"当前生效供应商"，则尝试读取实时配置替换初始值
   const [liveSettings, setLiveSettings] = useState<Record<
@@ -232,7 +237,7 @@ export function EditProviderDialog({
         <Button
           type="submit"
           form="provider-form"
-          disabled={isFormSubmitting}
+          disabled={isFormSubmitting || !isFormDirty}
           className="bg-primary text-primary-foreground hover:bg-primary/90"
         >
           <Save className="h-4 w-4 mr-2" />
@@ -247,6 +252,7 @@ export function EditProviderDialog({
         onSubmit={handleSubmit}
         onCancel={() => onOpenChange(false)}
         onSubmittingChange={setIsFormSubmitting}
+        onDirtyChange={setIsFormDirty}
         initialData={initialData}
         showButtons={false}
         isProxyTakeover={isProxyTakeover}
