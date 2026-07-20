@@ -252,12 +252,12 @@ async fn refresh_codex_quota(
     let discovery_workspace_id = trusted_workspace
         .as_ref()
         .map(|workspace| workspace.id.clone())
+        .or_else(|| legacy_workspace_id.clone())
         .or_else(|| {
             signed_recovery
                 .as_ref()
                 .map(|(workspace, _)| workspace.id.clone())
-        })
-        .or_else(|| legacy_workspace_id.clone());
+        });
     let mut account_probe_workspace_id = discovery_workspace_id.clone();
     let mut account_probe = fetch_chatgpt_account_lookup(
         http,
@@ -268,40 +268,34 @@ async fn refresh_codex_quota(
     )
     .await;
     if trusted_workspace.is_none() {
-        if chatgpt_probe_matches_usage(&account_probe, usage_plan_type.as_deref()) {
-            if let Some((workspace, profile)) = signed_recovery.as_ref().filter(|(workspace, _)| {
-                discovery_workspace_id.as_deref() == Some(workspace.id.as_str())
-            }) {
+        let authenticated =
+            if chatgpt_probe_matches_usage(&account_probe, usage_plan_type.as_deref()) {
+                discovery_workspace_id
+                    .as_ref()
+                    .zip(account_probe.lookup.clone())
+                    .map(|(workspace_id, lookup)| ChatGptWorkspaceCandidate {
+                        workspace_id: workspace_id.clone(),
+                        lookup,
+                    })
+            } else {
+                unique_chatgpt_workspace_matching_usage(&account_probe, usage_plan_type.as_deref())
+            };
+        if let Some(authenticated) = authenticated {
+            account_probe_workspace_id = Some(authenticated.workspace_id.clone());
+            account_probe.status = ChatGptProbeStatus::Success;
+            account_probe.lookup = Some(authenticated.lookup);
+            if let Some((workspace, profile)) = signed_recovery
+                .as_ref()
+                .filter(|(workspace, _)| workspace.id == authenticated.workspace_id)
+            {
                 trusted_workspace = Some(workspace.clone());
                 profile_update = profile.clone();
-            } else if legacy_workspace_id.as_deref() == discovery_workspace_id.as_deref() {
-                let workspace_id = discovery_workspace_id
-                    .as_deref()
-                    .expect("discovery workspace was checked");
-                let (workspace, profile) =
-                    authenticated_codex_workspace_update(account, workspace_id, now_ms);
-                profile_update = profile;
-                trusted_workspace = Some(workspace);
-            }
-        } else if signed_recovery.is_some()
-            && legacy_workspace_id.is_some()
-            && legacy_workspace_id.as_deref() != discovery_workspace_id.as_deref()
-        {
-            account_probe_workspace_id = legacy_workspace_id.clone();
-            account_probe = fetch_chatgpt_account_lookup(
-                http,
-                access_token,
-                legacy_workspace_id.as_deref(),
-                now_ms,
-                request_timeout,
-            )
-            .await;
-            if chatgpt_probe_matches_usage(&account_probe, usage_plan_type.as_deref()) {
-                let workspace_id = legacy_workspace_id
-                    .as_deref()
-                    .expect("legacy workspace was checked");
-                let (workspace, profile) =
-                    authenticated_codex_workspace_update(account, workspace_id, now_ms);
+            } else {
+                let (workspace, profile) = authenticated_codex_workspace_update(
+                    account,
+                    &authenticated.workspace_id,
+                    now_ms,
+                );
                 profile_update = profile;
                 trusted_workspace = Some(workspace);
             }
@@ -417,6 +411,8 @@ async fn refresh_codex_quota(
                 "usagePlanType": usage_plan_type,
                 "usageAllowed": usage_allowed,
                 "usageLimitReached": usage_limit_reached,
+                "accountsCheckWorkspaceId": account_probe_workspace_id,
+                "accountsCheckWorkspaceCandidateCount": account_probe.workspace_candidates.len(),
                 "accountsCheckPlanType": account_lookup_plan_type,
                 "accountsCheckStatus": account_probe.status.as_str(),
                 "accountsCheckHttpStatus": account_probe.http_status,
@@ -2755,6 +2751,7 @@ struct ChatGptSubscriptionProbe {
     status: ChatGptProbeStatus,
     http_status: Option<u16>,
     lookup: Option<ChatGptSubscriptionLookup>,
+    workspace_candidates: Vec<ChatGptWorkspaceCandidate>,
 }
 
 impl ChatGptSubscriptionProbe {
@@ -2763,8 +2760,15 @@ impl ChatGptSubscriptionProbe {
             status: ChatGptProbeStatus::SkippedNoTrustedWorkspace,
             http_status: None,
             lookup: None,
+            workspace_candidates: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ChatGptWorkspaceCandidate {
+    workspace_id: String,
+    lookup: ChatGptSubscriptionLookup,
 }
 
 async fn fetch_chatgpt_account_lookup(
@@ -2791,6 +2795,7 @@ async fn fetch_chatgpt_account_lookup(
                 status: ChatGptProbeStatus::NetworkError,
                 http_status: None,
                 lookup: None,
+                workspace_candidates: Vec::new(),
             };
         }
     };
@@ -2799,6 +2804,7 @@ async fn fetch_chatgpt_account_lookup(
             status: ChatGptProbeStatus::HttpError,
             http_status: Some(response.status().as_u16()),
             lookup: None,
+            workspace_candidates: Vec::new(),
         };
     }
     let status = response.status().as_u16();
@@ -2810,9 +2816,11 @@ async fn fetch_chatgpt_account_lookup(
                 status: ChatGptProbeStatus::ParseError,
                 http_status: Some(status),
                 lookup: None,
+                workspace_candidates: Vec::new(),
             };
         }
     };
+    let workspace_candidates = parse_chatgpt_workspace_candidates(&body, now_ms);
     let lookup = parse_chatgpt_accounts_check_lookup(&body, account_id, now_ms);
     ChatGptSubscriptionProbe {
         status: if lookup.is_some() {
@@ -2822,6 +2830,7 @@ async fn fetch_chatgpt_account_lookup(
         },
         http_status: Some(status),
         lookup,
+        workspace_candidates,
     }
 }
 
@@ -2852,6 +2861,7 @@ async fn fetch_chatgpt_subscription_lookup(
                 status: ChatGptProbeStatus::NetworkError,
                 http_status: None,
                 lookup: None,
+                workspace_candidates: Vec::new(),
             };
         }
     };
@@ -2860,6 +2870,7 @@ async fn fetch_chatgpt_subscription_lookup(
             status: ChatGptProbeStatus::HttpError,
             http_status: Some(response.status().as_u16()),
             lookup: None,
+            workspace_candidates: Vec::new(),
         };
     }
     let status = response.status().as_u16();
@@ -2871,6 +2882,7 @@ async fn fetch_chatgpt_subscription_lookup(
                 status: ChatGptProbeStatus::ParseError,
                 http_status: Some(status),
                 lookup: None,
+                workspace_candidates: Vec::new(),
             };
         }
     };
@@ -2883,6 +2895,7 @@ async fn fetch_chatgpt_subscription_lookup(
         },
         http_status: Some(status),
         lookup,
+        workspace_candidates: Vec::new(),
     }
 }
 
@@ -2997,6 +3010,15 @@ fn legacy_codex_workspace_candidate(account: &Account) -> Option<String> {
             }
         }
     }
+    if let Some(account_id) = account
+        .access_token
+        .as_deref()
+        .and_then(crate::domain::accounts::oauth::chatgpt_account_id_from_jwt)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        observations.push(account_id);
+    }
     let mut unique = observations.clone();
     unique.sort();
     unique.dedup();
@@ -3004,7 +3026,7 @@ fn legacy_codex_workspace_candidate(account: &Account) -> Option<String> {
         return None;
     }
     let candidate = unique.pop().expect("one unique candidate was checked");
-    (account.id == candidate || observations.len() >= 2).then_some(candidate)
+    Some(candidate)
 }
 
 fn chatgpt_probe_matches_usage(
@@ -3167,6 +3189,67 @@ fn codex_expiry_snapshot_json(snapshot: CodexSubscriptionExpirySnapshot) -> Valu
         "observedAt": snapshot.observed_at,
         "stale": snapshot.stale,
     })
+}
+
+fn parse_chatgpt_workspace_candidates(body: &Value, now_ms: i64) -> Vec<ChatGptWorkspaceCandidate> {
+    let Some(accounts) = body.get("accounts").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut candidates = std::collections::BTreeMap::new();
+    for (map_id, account) in accounts {
+        if !chatgpt_account_is_usable(account, now_ms) {
+            continue;
+        }
+        let Some(lookup) = chatgpt_lookup_from_account(account) else {
+            continue;
+        };
+        let workspace_id = [
+            "/account/id",
+            "/account/account_id",
+            "/account/chatgpt_account_id",
+            "/account/organization_id",
+            "/id",
+            "/account_id",
+            "/chatgpt_account_id",
+            "/organization_id",
+        ]
+        .into_iter()
+        .find_map(|pointer| account.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(map_id)
+        .to_string();
+        if !workspace_id.is_empty() {
+            candidates.insert(
+                workspace_id.clone(),
+                ChatGptWorkspaceCandidate {
+                    workspace_id,
+                    lookup,
+                },
+            );
+        }
+    }
+    candidates.into_values().collect()
+}
+
+fn unique_chatgpt_workspace_matching_usage(
+    probe: &ChatGptSubscriptionProbe,
+    usage_plan_type: Option<&str>,
+) -> Option<ChatGptWorkspaceCandidate> {
+    let usage_plan_type = usage_plan_type?;
+    let mut matches = probe
+        .workspace_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .lookup
+                .plan_type
+                .as_deref()
+                .is_some_and(|plan| chatgpt_plan_types_match(usage_plan_type, plan))
+        })
+        .cloned();
+    let candidate = matches.next()?;
+    matches.next().is_none().then_some(candidate)
 }
 
 fn parse_chatgpt_accounts_check_lookup(
@@ -4527,7 +4610,41 @@ mod tests {
 
         account.id = "local-import-id".to_string();
         account.profile = Some(json!({"chatgpt_account_id": "workspace-1"}));
-        assert!(legacy_codex_workspace_candidate(&account).is_none());
+        assert_eq!(
+            legacy_codex_workspace_candidate(&account).as_deref(),
+            Some("workspace-1")
+        );
+    }
+
+    #[test]
+    fn accounts_check_discovers_one_active_workspace_matching_usage_plan() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
+        let body = json!({
+            "accounts": {
+                "old-business": {
+                    "account": {"id": "old-business", "plan_type": "business"},
+                    "entitlement": {"expires_at": "2026-03-01T00:00:00Z"}
+                },
+                "current-plus": {
+                    "account": {"id": "current-plus", "plan_type": "plus"}
+                },
+                "current-free": {
+                    "account": {"id": "current-free", "plan_type": "free"}
+                }
+            }
+        });
+        let lookup = parse_chatgpt_accounts_check_lookup(&body, None, now_ms);
+        let probe = ChatGptSubscriptionProbe {
+            status: ChatGptProbeStatus::Success,
+            http_status: Some(200),
+            lookup,
+            workspace_candidates: parse_chatgpt_workspace_candidates(&body, now_ms),
+        };
+
+        let candidate = unique_chatgpt_workspace_matching_usage(&probe, Some("plus")).unwrap();
+        assert_eq!(candidate.workspace_id, "current-plus");
+        assert_eq!(candidate.lookup.plan_type.as_deref(), Some("plus"));
+        assert!(unique_chatgpt_workspace_matching_usage(&probe, Some("pro")).is_none());
     }
 
     #[test]
@@ -4536,6 +4653,7 @@ mod tests {
             status: ChatGptProbeStatus::Success,
             http_status: Some(200),
             lookup: parse_chatgpt_subscription_lookup(&json!({"plan_type": "pro"})),
+            workspace_candidates: Vec::new(),
         };
         assert!(chatgpt_probe_matches_usage(&matching, Some("pro")));
         assert!(!chatgpt_probe_matches_usage(&matching, Some("plus")));
@@ -4545,6 +4663,7 @@ mod tests {
             status: ChatGptProbeStatus::HttpError,
             http_status: Some(403),
             lookup: matching.lookup.clone(),
+            workspace_candidates: Vec::new(),
         };
         assert!(!chatgpt_probe_matches_usage(&failed, Some("pro")));
     }
@@ -4557,6 +4676,7 @@ mod tests {
             status: ChatGptProbeStatus::Success,
             http_status: Some(200),
             lookup: lookup.clone(),
+            workspace_candidates: Vec::new(),
         };
         let skipped = ChatGptSubscriptionProbe::skipped_no_trusted_workspace();
 
@@ -4583,6 +4703,7 @@ mod tests {
             status: ChatGptProbeStatus::HttpError,
             http_status: Some(404),
             lookup: None,
+            workspace_candidates: Vec::new(),
         };
         let (subscription, _) = finalize_codex_subscription(
             &account,
@@ -4626,6 +4747,7 @@ mod tests {
             status: ChatGptProbeStatus::NetworkError,
             http_status: None,
             lookup: None,
+            workspace_candidates: Vec::new(),
         };
         let lookup = parse_chatgpt_subscription_lookup(&json!({"plan_type": "pro"}));
 
@@ -4690,6 +4812,7 @@ mod tests {
             status: ChatGptProbeStatus::Success,
             http_status: Some(200),
             lookup: lookup.clone(),
+            workspace_candidates: Vec::new(),
         };
         let (subscription, snapshot) = finalize_codex_subscription(
             &account,

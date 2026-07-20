@@ -1211,6 +1211,14 @@ pub fn identity_from_jwt(token: &str) -> Option<OAuthIdentity> {
     })
 }
 
+pub fn chatgpt_account_id_from_jwt(token: &str) -> Option<String> {
+    let claims = decode_jwt_claims(token)?;
+    string_at(
+        &claims,
+        &["/chatgpt_account_id", "/openai_auth/chatgpt_account_id"],
+    )
+}
+
 pub fn classify_oauth_error(status_code: Option<u16>, body: &str) -> OAuthErrorClassification {
     let body_lower = body.to_ascii_lowercase();
     let json_message = serde_json::from_str::<Value>(body)
@@ -2026,6 +2034,18 @@ mod tests {
             profile.get("subscriptionExpiresAt").and_then(Value::as_str),
             Some("2026-08-01T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn chatgpt_account_id_from_jwt_does_not_fall_back_to_user_subject() {
+        let nested = jwt(r#"{"sub":"user-1","openai_auth":{"chatgpt_account_id":"workspace-1"}}"#);
+        assert_eq!(
+            chatgpt_account_id_from_jwt(&nested).as_deref(),
+            Some("workspace-1")
+        );
+
+        let user_only = jwt(r#"{"sub":"user-1","user_id":"user-1"}"#);
+        assert!(chatgpt_account_id_from_jwt(&user_only).is_none());
     }
 
     #[test]
