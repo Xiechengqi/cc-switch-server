@@ -14,8 +14,8 @@ export interface CachedOauthQuota {
 }
 
 export const subscriptionApi = {
-  getQuota: (tool: string): Promise<SubscriptionQuota> =>
-    invokeCommand("get_subscription_quota", { tool }),
+  getQuota: (tool: string, force = false): Promise<SubscriptionQuota> =>
+    invokeCommand("get_subscription_quota", { tool, force }),
   getClaudeOauthQuota: (accountId: string | null): Promise<SubscriptionQuota> =>
     invokeCommand("get_claude_oauth_quota", { accountId }),
   getCodexOauthQuota: (accountId: string | null): Promise<SubscriptionQuota> =>
@@ -38,6 +38,7 @@ export const subscriptionApi = {
     providerType?: string | null,
     appType?: string | null,
     providerId?: string | null,
+    force = true,
   ): Promise<CachedOauthQuota | null> =>
     invokeCommand("refresh_oauth_quota", {
       authProvider,
@@ -45,5 +46,6 @@ export const subscriptionApi = {
       providerType: providerType || null,
       appType: appType || null,
       providerId: providerId || null,
+      force,
     }),
 };

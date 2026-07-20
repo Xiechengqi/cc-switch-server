@@ -1,6 +1,7 @@
 import React from "react";
 import { RefreshCw, AlertCircle, Clock } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import type { ProviderMeta } from "@/types";
 import { useCopilotQuota } from "@/lib/query/copilot";
 import { subscriptionApi } from "@/lib/api/subscription";
@@ -16,6 +17,7 @@ import {
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
+import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface CopilotQuotaFooterProps {
   meta?: ProviderMeta;
@@ -52,6 +54,8 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
+  const [manualRefreshLoading, setManualRefreshLoading] =
+    React.useState(false);
   const accountId = resolveManagedAccountId(
     meta,
     PROVIDER_TYPES.GITHUB_COPILOT,
@@ -62,12 +66,23 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
     isFetching: loading,
     refetch,
   } = useCopilotQuota(accountId, { enabled: true });
-  const effectiveLoading = loading;
   const handleRefresh = React.useCallback(async () => {
-    setLastManualRefreshAt(Date.now());
-    await subscriptionApi.refreshOauthQuota("github_copilot", accountId);
-    await refetch();
-  }, [accountId, refetch]);
+    if (manualRefreshLoading) return;
+    setManualRefreshLoading(true);
+    try {
+      await subscriptionApi.refreshOauthQuota("github_copilot", accountId);
+      await refetch();
+      setLastManualRefreshAt(Date.now());
+    } finally {
+      setManualRefreshLoading(false);
+    }
+  }, [accountId, manualRefreshLoading, refetch]);
+  const effectiveLoading = loading || manualRefreshLoading;
+  const reportRefreshError = React.useCallback(
+    (error: unknown) =>
+      toast.error(extractErrorMessage(error) || t("subscription.queryFailed")),
+    [t],
+  );
 
   const displayQueriedAt = resolveQuotaQueriedAt(
     quota?.queriedAt,
@@ -99,7 +114,7 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
             <span>{quota.error || t("subscription.queryFailed")}</span>
           </div>
           <button
-            onClick={() => handleRefresh()}
+            onClick={() => void handleRefresh().catch(reportRefreshError)}
             disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
             title={refreshTitle}
@@ -130,7 +145,7 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
           loading={effectiveLoading}
           onRefresh={(event) => {
             event.stopPropagation();
-            void handleRefresh();
+            void handleRefresh().catch(reportRefreshError);
           }}
           refreshTitle={refreshTitle}
           leading={
@@ -166,7 +181,7 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
             </span>
           )}
           <button
-            onClick={() => handleRefresh()}
+            onClick={() => void handleRefresh().catch(reportRefreshError)}
             disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
             title={refreshTitle}

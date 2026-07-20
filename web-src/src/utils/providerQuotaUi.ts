@@ -5,8 +5,11 @@ export function resolveQuotaQueriedAt(
   queriedAt: number | null | undefined,
   manualRefreshAt: number | null,
 ): number | null {
-  if (typeof queriedAt === "number" && Number.isFinite(queriedAt) && queriedAt > 0) {
-    return queriedAt;
-  }
-  return manualRefreshAt;
+  const persisted =
+    typeof queriedAt === "number" && Number.isFinite(queriedAt) && queriedAt > 0
+      ? queriedAt
+      : null;
+  if (persisted === null) return manualRefreshAt;
+  if (manualRefreshAt === null) return persisted;
+  return Math.max(persisted, manualRefreshAt);
 }

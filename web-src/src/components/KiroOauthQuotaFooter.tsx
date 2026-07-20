@@ -1,6 +1,7 @@
 import React from "react";
 import { Clock, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import type { ProviderMeta } from "@/types";
 import { useKiroOauthQuota } from "@/lib/query/subscription";
 import { subscriptionApi } from "@/lib/api/subscription";
@@ -18,6 +19,7 @@ import {
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
+import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface KiroOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -38,6 +40,8 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
+  const [manualRefreshLoading, setManualRefreshLoading] =
+    React.useState(false);
   const {
     data: quota,
     isFetching: loading,
@@ -45,10 +49,22 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
   } = useKiroOauthQuota(meta, { enabled: true });
   const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.KIRO_OAUTH);
   const handleRefresh = React.useCallback(async () => {
-    setLastManualRefreshAt(Date.now());
-    await subscriptionApi.refreshOauthQuota("kiro_oauth", accountId);
-    await refetch();
-  }, [accountId, refetch]);
+    if (manualRefreshLoading) return;
+    setManualRefreshLoading(true);
+    try {
+      await subscriptionApi.refreshOauthQuota("kiro_oauth", accountId);
+      await refetch();
+      setLastManualRefreshAt(Date.now());
+    } finally {
+      setManualRefreshLoading(false);
+    }
+  }, [accountId, manualRefreshLoading, refetch]);
+  const effectiveLoading = loading || manualRefreshLoading;
+  const reportRefreshError = React.useCallback(
+    (error: unknown) =>
+      toast.error(extractErrorMessage(error) || t("subscription.queryFailed")),
+    [t],
+  );
 
   const displayQueriedAt = resolveQuotaQueriedAt(
     quota?.queriedAt,
@@ -83,7 +99,7 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
     return (
       <SubscriptionQuotaView
         quota={quota}
-        loading={loading}
+        loading={effectiveLoading}
         refetch={handleRefresh}
         appIdForExpiredHint="kiro_oauth"
         inline={inline}
@@ -116,10 +132,10 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
               ? formatRelativeTime(displayQueriedAt, now, t)
               : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
           }
-          loading={loading}
+          loading={effectiveLoading}
           onRefresh={(event) => {
             event.stopPropagation();
-            void handleRefresh();
+            void handleRefresh().catch(reportRefreshError);
           }}
           refreshTitle={refreshTitle}
         />
@@ -177,12 +193,15 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
             </span>
           )}
           <button
-            onClick={() => handleRefresh()}
-            disabled={loading}
+            onClick={() => void handleRefresh().catch(reportRefreshError)}
+            disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
             title={refreshTitle}
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
           </button>
         </div>
       </div>

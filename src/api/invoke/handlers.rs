@@ -352,6 +352,7 @@ pub(in crate::api) async fn web_subscription_quota(
     state: &ServerState,
     headers: &HeaderMap,
     tool: &str,
+    force: bool,
 ) -> Result<Value, ApiError> {
     let Some(provider_type) = subscription_tool_provider_type(tool) else {
         return Err(ApiError::bad_request(format!(
@@ -373,7 +374,7 @@ pub(in crate::api) async fn web_subscription_quota(
         Path(account_id),
         Query(AccountQuotaQuery {
             refresh: Some(true),
-            force: None,
+            force: Some(force),
         }),
     )
     .await?

@@ -1,8 +1,14 @@
 import React from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { RefreshCw, AlertCircle, Clock } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import type { AppId } from "@/lib/api";
-import { useSubscriptionQuota } from "@/lib/query/subscription";
+import { subscriptionApi } from "@/lib/api/subscription";
+import {
+  subscriptionKeys,
+  useSubscriptionQuota,
+} from "@/lib/query/subscription";
 import type {
   QuotaTier,
   SubscriptionInfo,
@@ -14,6 +20,7 @@ import {
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
+import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface SubscriptionQuotaFooterProps {
   appId: AppId;
@@ -170,7 +177,12 @@ function formatResetTime(
 
 /** 不需要在 inline 模式显示的 tier */
 const HIDDEN_INLINE_TIERS = new Set(["seven_day_sonnet", "seven_day_omelette"]);
-const SUPPRESSED_TIERS = new Set(["seven_day_omelette"]);
+// Grok task counters are feature limits, not token/credit usage.
+const SUPPRESSED_TIERS = new Set([
+  "seven_day_omelette",
+  "grok_frequent",
+  "grok_occasional",
+]);
 
 const COMPACT_TIER_LABELS: Record<string, string> = {
   five_hour: "5h",
@@ -314,11 +326,24 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
+  const [manualRefreshLoading, setManualRefreshLoading] =
+    React.useState(false);
+  const effectiveLoading = loading || manualRefreshLoading;
 
   const handleRefresh = React.useCallback(async () => {
-    setLastManualRefreshAt(Date.now());
-    await refetch();
-  }, [refetch]);
+    if (manualRefreshLoading) return;
+    setManualRefreshLoading(true);
+    try {
+      await refetch();
+      setLastManualRefreshAt(Date.now());
+    } catch (error) {
+      toast.error(
+        extractErrorMessage(error) || t("subscription.queryFailed"),
+      );
+    } finally {
+      setManualRefreshLoading(false);
+    }
+  }, [manualRefreshLoading, refetch, t]);
 
   React.useEffect(() => {
     if (quota?.queriedAt && quota.queriedAt > 0) {
@@ -362,11 +387,14 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           </div>
           <button
             onClick={() => void handleRefresh()}
-            disabled={loading}
+            disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
             title={refreshTitle}
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
           </button>
         </div>
       );
@@ -385,11 +413,14 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           </div>
           <button
             onClick={() => void handleRefresh()}
-            disabled={loading}
+            disabled={effectiveLoading}
             className="p-1 rounded hover:bg-amber-100 dark:hover:bg-amber-800/30 transition-colors disabled:opacity-50 flex-shrink-0"
             title={refreshTitle}
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
           </button>
         </div>
       </div>
@@ -424,11 +455,14 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           </div>
           <button
             onClick={() => void handleRefresh()}
-            disabled={loading}
+            disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
             title={refreshTitle}
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
           </button>
         </div>
       );
@@ -449,11 +483,14 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           </div>
           <button
             onClick={() => void handleRefresh()}
-            disabled={loading}
+            disabled={effectiveLoading}
             className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors disabled:opacity-50 flex-shrink-0"
             title={refreshTitle}
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
           </button>
         </div>
       </div>
@@ -490,7 +527,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
               ? formatRelativeTime(displayQueriedAt, now, t)
               : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
           }
-          loading={loading}
+          loading={effectiveLoading}
           onRefresh={(event) => {
             event.stopPropagation();
             void handleRefresh();
@@ -522,11 +559,14 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           )}
           <button
             onClick={() => void handleRefresh()}
-            disabled={loading}
+            disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
             title={refreshTitle}
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
           </button>
         </div>
       </div>
@@ -668,10 +708,10 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
   isCurrent = false,
   autoQueryInterval = 5,
 }) => {
+  const queryClient = useQueryClient();
   const {
     data: quota,
     isFetching: loading,
-    refetch,
   } = useSubscriptionQuota(
     appId,
     isCurrent,
@@ -681,11 +721,16 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
 
   if (!isCurrent) return null;
 
+  const handleRefresh = async () => {
+    const refreshed = await subscriptionApi.getQuota(appId, true);
+    queryClient.setQueryData(subscriptionKeys.quota(appId), refreshed);
+  };
+
   return (
     <SubscriptionQuotaView
       quota={quota}
       loading={loading}
-      refetch={refetch}
+      refetch={handleRefresh}
       appIdForExpiredHint={appId}
       inline={inline}
     />

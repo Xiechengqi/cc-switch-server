@@ -1270,7 +1270,7 @@
       "support": "shim",
       "implemented": true,
       "feature": "settings",
-      "notes": "Server web runtime shim."
+      "notes": "Server web runtime shim. Background reads honor the quota cooldown; provider-card manual refresh passes force=true."
     },
     {
       "name": "get_tool_versions",
@@ -1531,7 +1531,7 @@
       "implemented": true,
       "feature": "accounts",
       "endpoint": "GET /api/accounts/:id/quota?refresh=true",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "notes": "Server web runtime shim for desktop-synced settings UI. Explicit refresh defaults to force=true so provider-card actions bypass the background quota cooldown."
     },
     {
       "name": "remove_custom_endpoint",

@@ -1075,7 +1075,7 @@ async fn web_invoke_dispatch(
             headers,
             &args,
             true,
-            web_optional_bool(&args, &["force"]),
+            Some(web_optional_bool(&args, &["force"]).unwrap_or(true)),
         )
         .await?),
         "get_cached_oauth_quota" => {
@@ -1865,7 +1865,8 @@ async fn web_invoke_dispatch(
         "check_provider_limits" => Ok(json!({ "ok": true, "withinLimits": true })),
         "get_subscription_quota" => {
             let tool = web_arg_string_any(&args, &["tool"])?;
-            Ok(web_subscription_quota(state, headers, &tool).await?)
+            let force = web_optional_bool(&args, &["force"]).unwrap_or(false);
+            Ok(web_subscription_quota(state, headers, &tool, force).await?)
         }
         "get_default_cost_multiplier" => Ok(json!(1.0)),
         "set_default_cost_multiplier" => Ok(Value::Null),

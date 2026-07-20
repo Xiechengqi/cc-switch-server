@@ -1,6 +1,7 @@
 import React from "react";
 import { Clock, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import type { ProviderMeta } from "@/types";
 import { useCursorOauthQuota } from "@/lib/query/subscription";
 import { subscriptionApi } from "@/lib/api/subscription";
@@ -18,6 +19,7 @@ import {
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
+import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface CursorOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -40,6 +42,8 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
+  const [manualRefreshLoading, setManualRefreshLoading] =
+    React.useState(false);
   const isCursorApiKey = meta?.providerType === PROVIDER_TYPES.CURSOR_APIKEY;
   const authProvider = isCursorApiKey
     ? PROVIDER_TYPES.CURSOR_APIKEY
@@ -53,16 +57,36 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     ? null
     : resolveManagedAccountId(meta, PROVIDER_TYPES.CURSOR_OAUTH);
   const handleRefresh = React.useCallback(async () => {
-    setLastManualRefreshAt(Date.now());
-    await subscriptionApi.refreshOauthQuota(
-      authProvider,
-      accountId,
-      meta?.providerType,
-      appId,
-      providerId,
-    );
-    await refetch();
-  }, [accountId, appId, authProvider, meta?.providerType, providerId, refetch]);
+    if (manualRefreshLoading) return;
+    setManualRefreshLoading(true);
+    try {
+      await subscriptionApi.refreshOauthQuota(
+        authProvider,
+        accountId,
+        meta?.providerType,
+        appId,
+        providerId,
+      );
+      await refetch();
+      setLastManualRefreshAt(Date.now());
+    } finally {
+      setManualRefreshLoading(false);
+    }
+  }, [
+    accountId,
+    appId,
+    authProvider,
+    manualRefreshLoading,
+    meta?.providerType,
+    providerId,
+    refetch,
+  ]);
+  const effectiveLoading = loading || manualRefreshLoading;
+  const reportRefreshError = React.useCallback(
+    (error: unknown) =>
+      toast.error(extractErrorMessage(error) || t("subscription.queryFailed")),
+    [t],
+  );
 
   const displayQueriedAt = resolveQuotaQueriedAt(
     quota?.queriedAt,
@@ -106,7 +130,7 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     return (
       <SubscriptionQuotaView
         quota={quota && membership ? { ...quota, tiers: [] } : quota}
-        loading={loading}
+        loading={effectiveLoading}
         refetch={handleRefresh}
         appIdForExpiredHint="cursor_oauth"
         inline={inline}
@@ -135,10 +159,10 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
               ? formatRelativeTime(displayQueriedAt, now, t)
               : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
           }
-          loading={loading}
+          loading={effectiveLoading}
           onRefresh={(event) => {
             event.stopPropagation();
-            void handleRefresh();
+            void handleRefresh().catch(reportRefreshError);
           }}
           refreshTitle={refreshTitle}
           leading={
@@ -184,12 +208,15 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
             </span>
           )}
           <button
-            onClick={() => handleRefresh()}
-            disabled={loading}
+            onClick={() => void handleRefresh().catch(reportRefreshError)}
+            disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
             title={refreshTitle}
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
           </button>
         </div>
       </div>

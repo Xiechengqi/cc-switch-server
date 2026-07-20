@@ -4457,6 +4457,78 @@ async fn managed_oauth_quota_rejects_cross_provider_account_binding() {
 }
 
 #[tokio::test]
+async fn managed_oauth_manual_refresh_defaults_to_forcing_the_upstream_strategy() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let previous_refresh_at = now_ms() as i64 - 60_000;
+    let cooldown_until = now_ms() as i64 + 600_000;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            let mut input =
+                test_account_input("acct-cursor-manual-refresh", ProviderType::CursorOAuth);
+            input.raw = Some(json!({
+                "billingOrQuotaSnapshot": {
+                    "stripeStatus": {"membershipType": "pro_plus"},
+                    "currentPeriodUsage": {
+                        "billingCycleEnd": 1_800_000_000_000i64,
+                        "planUsage": {
+                            "limit": 2000.0,
+                            "used": 500.0,
+                            "totalPercentUsed": 25.0
+                        }
+                    }
+                }
+            }));
+            input.quota = Some(AccountQuota::default());
+            input.quota_refreshed_at = Some(previous_refresh_at);
+            input.quota_next_refresh_at = Some(cooldown_until);
+            accounts.upsert(input);
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/refresh_oauth_quota",
+            json!({
+                "authProvider": "cursor_oauth",
+                "accountId": "acct-cursor-manual-refresh",
+                "force": false
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cached = json_body(response).await;
+    assert_eq!(cached["refreshedAt"].as_i64(), Some(previous_refresh_at));
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/refresh_oauth_quota",
+            json!({
+                "authProvider": "cursor_oauth",
+                "accountId": "acct-cursor-manual-refresh"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let refreshed = json_body(response).await;
+    assert_eq!(refreshed["source"], "refresh");
+    assert!(refreshed["refreshedAt"]
+        .as_i64()
+        .is_some_and(|value| value > previous_refresh_at));
+    assert_eq!(refreshed["quota"]["credentialMessage"], "Cursor Pro+");
+    assert_eq!(refreshed["quota"]["tiers"][0]["utilization"], 25.0);
+}
+
+#[tokio::test]
 async fn managed_auth_manual_subscription_expiry_rejects_non_manual_accounts() {
     let state = test_state();
     let app = app_router(state.clone());

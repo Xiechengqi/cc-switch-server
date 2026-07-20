@@ -1,6 +1,7 @@
 import React from "react";
 import { RefreshCw, AlertCircle, Clock } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import type { ProviderMeta } from "@/types";
 import type { AppId } from "@/lib/api";
 import { useOllamaQuota } from "@/lib/query/ollama";
@@ -12,6 +13,7 @@ import {
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
+import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface OllamaQuotaFooterProps {
   meta?: ProviderMeta;
@@ -47,6 +49,8 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
+  const [manualRefreshLoading, setManualRefreshLoading] =
+    React.useState(false);
   const queryClient = useQueryClient();
 
   const {
@@ -56,19 +60,31 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
   } = useOllamaQuota(providerId, { enabled: true, appId });
 
   const handleRefresh = React.useCallback(async () => {
-    setLastManualRefreshAt(Date.now());
-    await subscriptionApi.refreshOauthQuota(
-      "ollama_cloud",
-      providerId,
-      "ollama_cloud",
-      appId,
-      providerId,
-    );
-    await refetch();
-    queryClient.invalidateQueries({
-      queryKey: ["ollama", "quota", providerId],
-    });
-  }, [refetch, queryClient, providerId, appId]);
+    if (manualRefreshLoading) return;
+    setManualRefreshLoading(true);
+    try {
+      await subscriptionApi.refreshOauthQuota(
+        "ollama_cloud",
+        providerId,
+        "ollama_cloud",
+        appId,
+        providerId,
+      );
+      await refetch();
+      await queryClient.invalidateQueries({
+        queryKey: ["ollama", "quota", providerId],
+      });
+      setLastManualRefreshAt(Date.now());
+    } finally {
+      setManualRefreshLoading(false);
+    }
+  }, [appId, manualRefreshLoading, providerId, queryClient, refetch]);
+  const effectiveLoading = loading || manualRefreshLoading;
+  const reportRefreshError = React.useCallback(
+    (error: unknown) =>
+      toast.error(extractErrorMessage(error) || t("subscription.queryFailed")),
+    [t],
+  );
 
   const displayQueriedAt = resolveQuotaQueriedAt(
     cached?.refreshedAt ?? cached?.quota?.queriedAt ?? null,
@@ -112,12 +128,15 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
             <span>{quota.error || t("subscription.queryFailed")}</span>
           </div>
           <button
-            onClick={() => handleRefresh()}
-            disabled={loading}
+            onClick={() => void handleRefresh().catch(reportRefreshError)}
+            disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
             title={refreshTitle}
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
           </button>
         </div>
       );
@@ -142,10 +161,10 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
               ? formatRelativeTime(displayQueriedAt, now, t)
               : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
           }
-          loading={loading}
+          loading={effectiveLoading}
           onRefresh={(event) => {
             event.stopPropagation();
-            void handleRefresh();
+            void handleRefresh().catch(reportRefreshError);
           }}
           refreshTitle={refreshTitle}
         />
@@ -170,12 +189,15 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
             </span>
           )}
           <button
-            onClick={() => handleRefresh()}
-            disabled={loading}
+            onClick={() => void handleRefresh().catch(reportRefreshError)}
+            disabled={effectiveLoading}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
             title={refreshTitle}
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
           </button>
         </div>
       </div>
