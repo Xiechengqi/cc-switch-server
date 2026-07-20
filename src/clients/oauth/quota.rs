@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -16,6 +16,11 @@ use crate::domain::accounts::store::{
     Account, AccountQuota, AccountQuotaTier, AccountRefreshUpdate,
 };
 use crate::domain::claude_cli::claude_cli_user_agent;
+use crate::domain::grok_cli::{
+    GROK_CLI_CLIENT_IDENTIFIER, GROK_CLI_MONTHLY_BILLING_URL, GROK_CLI_TOKEN_AUTH,
+    GROK_CLI_USER_AGENT, GROK_CLI_USER_URL, GROK_CLI_VERSION, GROK_CLI_WEEKLY_BILLING_URL,
+    GROK_SUBSCRIPTIONS_URL, GROK_TASK_USAGE_URL,
+};
 use crate::domain::providers::model::ProviderType;
 
 pub const QUOTA_FAILURE_COOLDOWN_MS: i64 = 2 * 60 * 1000;
@@ -31,8 +36,6 @@ const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CHATGPT_ACCOUNTS_CHECK_URL: &str =
     "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
 const CHATGPT_SUBSCRIPTIONS_URL: &str = "https://chatgpt.com/backend-api/subscriptions";
-const GROK_USER_URL: &str = "https://cli-chat-proxy.grok.com/v1/user?include=subscription";
-const GROK_BILLING_CREDITS_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const GEMINI_LOAD_CODE_ASSIST_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const GEMINI_RETRIEVE_USER_QUOTA_URL: &str =
@@ -541,37 +544,90 @@ async fn refresh_grok_quota(
     request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
-    let user_probe = grok_probe_json(
-        http,
-        account,
-        GROK_USER_URL,
-        access_token,
-        request_timeout,
-        now_ms,
-    )
-    .await?;
-    let billing_probe = grok_probe_json(
-        http,
-        account,
-        GROK_BILLING_CREDITS_URL,
-        access_token,
-        request_timeout,
-        now_ms,
-    )
-    .await;
+    let (user_probe, weekly_probe, monthly_probe, task_probe) = tokio::join!(
+        grok_probe_json(
+            http,
+            account,
+            GROK_CLI_USER_URL,
+            access_token,
+            request_timeout,
+            now_ms,
+        ),
+        grok_probe_json(
+            http,
+            account,
+            GROK_CLI_WEEKLY_BILLING_URL,
+            access_token,
+            request_timeout,
+            now_ms,
+        ),
+        grok_probe_json(
+            http,
+            account,
+            GROK_CLI_MONTHLY_BILLING_URL,
+            access_token,
+            request_timeout,
+            now_ms,
+        ),
+        grok_probe_json(
+            http,
+            account,
+            GROK_TASK_USAGE_URL,
+            access_token,
+            request_timeout,
+            now_ms,
+        ),
+    );
+    let user_probe = user_probe?;
+    let weekly_probe = grok_optional_probe("weekly_billing", weekly_probe, true);
+    let monthly_probe = grok_optional_probe("monthly_billing", monthly_probe, true);
+    let task_probe = grok_optional_probe("task_usage", task_probe, false);
 
-    let (billing_body, billing_spending_limited, billing_error) = match billing_probe {
-        Ok(body) => (Some(body), false, None),
-        Err(error) if error.status_code == 402 => (None, true, None),
-        Err(error) => (None, false, Some(error)),
+    let needs_subscription_probe = grok_subscription_expiry_at(&user_probe).is_none()
+        && weekly_probe
+            .body
+            .as_ref()
+            .and_then(grok_subscription_expiry_at)
+            .is_none()
+        && monthly_probe
+            .body
+            .as_ref()
+            .and_then(grok_subscription_expiry_at)
+            .is_none();
+    let subscription_probe = if needs_subscription_probe {
+        grok_optional_probe(
+            "subscriptions",
+            grok_probe_json(
+                http,
+                account,
+                GROK_SUBSCRIPTIONS_URL,
+                access_token,
+                request_timeout,
+                now_ms,
+            )
+            .await,
+            false,
+        )
+    } else {
+        GrokProbe::skipped("subscription details already available")
     };
+
+    let billing_body = weekly_probe.body.as_ref().or(monthly_probe.body.as_ref());
     let subscription_level = grok_subscription_level(&user_probe)
+        .or_else(|| weekly_probe.body.as_ref().and_then(grok_subscription_level))
         .or_else(|| {
-            billing_body
+            monthly_probe
+                .body
                 .as_ref()
-                .and_then(|billing| grok_subscription_level(billing))
+                .and_then(grok_subscription_level)
         })
-        .or_else(|| grok_access_plan(&user_probe, billing_body.as_ref()))
+        .or_else(|| {
+            subscription_probe
+                .body
+                .as_ref()
+                .and_then(grok_subscription_level)
+        })
+        .or_else(|| grok_access_plan(&user_probe, billing_body))
         .or_else(|| account.subscription_level.clone())
         .or_else(|| account.entitlement_status.clone());
     let previous_billing_tiers = account
@@ -588,18 +644,27 @@ async fn refresh_grok_quota(
         .unwrap_or_default();
     let quota = grok_quota_from_probes(
         &user_probe,
-        billing_body.as_ref(),
+        GrokQuotaProbes {
+            weekly: &weekly_probe,
+            monthly: &monthly_probe,
+            task_usage: &task_probe,
+            subscriptions: &subscription_probe,
+        },
         subscription_level.clone(),
         now_ms,
-        billing_spending_limited,
         &previous_billing_tiers,
-        billing_error.as_ref().map(|error| error.message.as_str()),
     );
+    let quota_unavailable = quota
+        .extra_usage
+        .as_ref()
+        .and_then(|extra| extra.get("quotaStatus"))
+        .and_then(Value::as_str)
+        == Some("unavailable");
     let profile = merge_profile_overlay(
         account.profile.as_ref(),
         Some(grok_profile_from_user_probe(
             &user_probe,
-            billing_body.as_ref(),
+            billing_body,
             now_ms,
         )),
     );
@@ -612,13 +677,99 @@ async fn refresh_grok_quota(
     );
     update.email = grok_email(&user_probe);
     update.entitlement_status = grok_entitlement_status(&user_probe);
-    if let Some(error) = billing_error {
-        update.last_refresh_error = Some(error.message);
-        if let Some(next_refresh_at) = error.next_refresh_at {
+    let issues = [
+        weekly_probe.issue.as_ref(),
+        monthly_probe.issue.as_ref(),
+        task_probe.issue.as_ref(),
+        subscription_probe.issue.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if !issues.is_empty() {
+        if quota_unavailable {
+            update.last_refresh_error = Some(
+                issues
+                    .iter()
+                    .map(|issue| format!("{}: {}", issue.probe, issue.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        }
+        if let Some(next_refresh_at) = issues
+            .iter()
+            .filter_map(|issue| issue.next_refresh_at)
+            .min()
+        {
             update.quota_next_refresh_at = Some(next_refresh_at);
         }
     }
     Ok(update)
+}
+
+#[derive(Debug)]
+struct GrokProbeIssue {
+    probe: &'static str,
+    message: String,
+    next_refresh_at: Option<i64>,
+}
+
+#[derive(Debug)]
+struct GrokProbe {
+    body: Option<Value>,
+    issue: Option<GrokProbeIssue>,
+    spending_limited: bool,
+    status_code: Option<u16>,
+    skipped_reason: Option<&'static str>,
+}
+
+impl GrokProbe {
+    fn skipped(reason: &'static str) -> Self {
+        Self {
+            body: None,
+            issue: None,
+            spending_limited: false,
+            status_code: None,
+            skipped_reason: Some(reason),
+        }
+    }
+}
+
+fn grok_optional_probe(
+    probe: &'static str,
+    result: Result<Value, QuotaRefreshFailure>,
+    treats_402_as_spending_limit: bool,
+) -> GrokProbe {
+    match result {
+        Ok(body) => GrokProbe {
+            body: Some(body),
+            issue: None,
+            spending_limited: false,
+            status_code: Some(200),
+            skipped_reason: None,
+        },
+        Err(error) if treats_402_as_spending_limit && error.status_code == 402 => GrokProbe {
+            body: None,
+            issue: None,
+            spending_limited: true,
+            status_code: Some(402),
+            skipped_reason: None,
+        },
+        Err(error) => {
+            let status_code = error.status_code;
+            GrokProbe {
+                body: None,
+                issue: Some(GrokProbeIssue {
+                    probe,
+                    message: error.message,
+                    next_refresh_at: error.next_refresh_at,
+                }),
+                spending_limited: false,
+                status_code: Some(status_code),
+                skipped_reason: None,
+            }
+        }
+    }
 }
 
 async fn grok_probe_json(
@@ -629,57 +780,109 @@ async fn grok_probe_json(
     request_timeout: Duration,
     now_ms: i64,
 ) -> Result<Value, QuotaRefreshFailure> {
-    let mut request = http
-        .get(url)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(ACCEPT, "application/json")
-        .header(
-            USER_AGENT,
-            "grok-pager/0.2.93 grok-shell/0.2.93 (linux; x86_64)",
-        )
-        .header("x-xai-token-auth", "xai-grok-cli")
-        .header("x-grok-client-identifier", "grok-pager")
-        .header("x-grok-client-version", "0.2.93")
-        .header("x-grok-client-mode", "headless")
-        .timeout(request_timeout);
-    if let Some(email) = account
-        .email
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        request = request.header("x-email", email);
+    let mut attempt = 0_u64;
+    loop {
+        attempt += 1;
+        let mut request = http
+            .get(url)
+            .header(AUTHORIZATION, format!("Bearer {access_token}"))
+            .header(ACCEPT, "application/json")
+            .header(USER_AGENT, GROK_CLI_USER_AGENT)
+            .header("x-xai-token-auth", GROK_CLI_TOKEN_AUTH)
+            .header("x-grok-client-identifier", GROK_CLI_CLIENT_IDENTIFIER)
+            .header("x-grok-client-version", GROK_CLI_VERSION)
+            .header("x-grok-client-surface", "grok-cli")
+            .header("x-grok-client-mode", "headless")
+            .timeout(request_timeout);
+        if let Some(email) = account
+            .email
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.header("x-email", email);
+        }
+        if let Some(user_id) = grok_account_user_id(account) {
+            request = request.header("x-userid", user_id);
+        }
+        match request_json(account.provider_type, request, now_ms).await {
+            Err(error) if error.retryable && error.status_code == 502 && attempt < 3 => {
+                tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+            }
+            result => return result,
+        }
     }
-    if let Some(user_id) = grok_account_user_id(account) {
-        request = request.header("x-userid", user_id);
-    }
-    request_json(account.provider_type, request, now_ms).await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GrokQuotaProbes<'a> {
+    weekly: &'a GrokProbe,
+    monthly: &'a GrokProbe,
+    task_usage: &'a GrokProbe,
+    subscriptions: &'a GrokProbe,
 }
 
 fn grok_quota_from_probes(
     user: &Value,
-    billing: Option<&Value>,
+    probes: GrokQuotaProbes<'_>,
     subscription_level: Option<String>,
     now_ms: i64,
-    billing_spending_limited: bool,
     previous_billing_tiers: &[AccountQuotaTier],
-    billing_error: Option<&str>,
 ) -> AccountQuota {
+    let GrokQuotaProbes {
+        weekly,
+        monthly,
+        task_usage,
+        subscriptions,
+    } = probes;
     let subscription_access = grok_subscription_level(user)
-        .or_else(|| billing.and_then(grok_subscription_level))
+        .or_else(|| weekly.body.as_ref().and_then(grok_subscription_level))
+        .or_else(|| monthly.body.as_ref().and_then(grok_subscription_level))
+        .or_else(|| {
+            subscriptions
+                .body
+                .as_ref()
+                .and_then(grok_subscription_level)
+        })
         .is_some_and(|tier| {
             !matches!(tier.to_ascii_lowercase().as_str(), "free" | "none" | "null")
         });
-    let spending_limited = user
-        .pointer("/spendingLimitReached")
-        .or_else(|| user.pointer("/spending_limit_reached"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || billing_spending_limited
-        || billing
-            .is_some_and(|billing| grok_billing_reports_exhausted(billing, subscription_access));
-    let mut tiers = billing
-        .map(|billing| grok_billing_tiers(billing, subscription_access))
-        .unwrap_or_default();
+    let spending_limited =
+        user.pointer("/spendingLimitReached")
+            .or_else(|| user.pointer("/spending_limit_reached"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || weekly.spending_limited
+            || monthly.spending_limited
+            || weekly.body.as_ref().is_some_and(|billing| {
+                grok_billing_reports_exhausted(billing, subscription_access)
+            })
+            || monthly.body.as_ref().is_some_and(|billing| {
+                grok_billing_reports_exhausted(billing, subscription_access)
+            });
+    let mut tiers = Vec::new();
+    if let Some(body) = weekly.body.as_ref() {
+        merge_grok_tiers(
+            &mut tiers,
+            grok_weekly_billing_tiers(body, subscription_access),
+        );
+    }
+    if let Some(body) = monthly.body.as_ref() {
+        merge_grok_tiers(&mut tiers, grok_monthly_billing_tiers(body));
+    }
+    if let Some(body) = task_usage.body.as_ref() {
+        merge_grok_tiers(&mut tiers, grok_task_usage_tiers(body));
+    }
+    let current_tier_count = tiers.len();
+    let mut stale_tier_names = Vec::new();
+    for previous in previous_billing_tiers {
+        let should_preserve = (weekly.body.is_none() && grok_tier_is_weekly(&previous.name))
+            || (monthly.body.is_none() && grok_tier_is_monthly(&previous.name))
+            || (task_usage.body.is_none() && grok_tier_is_task(&previous.name));
+        if should_preserve && !tiers.iter().any(|tier| tier.name == previous.name) {
+            stale_tier_names.push(previous.name.clone());
+            tiers.push(previous.clone());
+        }
+    }
     if spending_limited && tiers.is_empty() {
         tiers.push(AccountQuotaTier {
             name: "grok_spending_limit".to_string(),
@@ -687,37 +890,252 @@ fn grok_quota_from_probes(
             resets_at: Some(now_ms.saturating_add(60 * 60_000)),
             ..Default::default()
         });
-    } else if billing.is_none() && !spending_limited {
-        tiers.extend_from_slice(previous_billing_tiers);
     }
+    let quota_issues = [
+        weekly.issue.as_ref(),
+        monthly.issue.as_ref(),
+        task_usage.issue.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let issues = quota_issues
+        .iter()
+        .copied()
+        .chain(subscriptions.issue.iter())
+        .collect::<Vec<_>>();
+    let quota_status = if spending_limited {
+        "spending_limited"
+    } else if weekly.body.is_none()
+        && monthly.body.is_none()
+        && current_tier_count == 0
+        && stale_tier_names.is_empty()
+    {
+        "unavailable"
+    } else if !quota_issues.is_empty() || !stale_tier_names.is_empty() {
+        "partial"
+    } else if current_tier_count > 0 {
+        "valid_numeric"
+    } else {
+        "valid_non_numeric"
+    };
+    let mut warning_codes = if quota_status == "valid_non_numeric" {
+        vec!["grok_numeric_quota_not_exposed"]
+    } else if quota_status == "partial" {
+        vec!["grok_quota_partial"]
+    } else if quota_status == "unavailable" {
+        vec!["grok_quota_unavailable"]
+    } else {
+        Vec::new()
+    };
+    if subscriptions.issue.is_some() {
+        warning_codes.push("grok_subscription_expiry_unavailable");
+    }
+    let subscription = grok_subscription_json(
+        user,
+        weekly.body.as_ref(),
+        monthly.body.as_ref(),
+        subscriptions,
+        subscription_level.clone(),
+    );
     AccountQuota {
-        success: true,
+        success: quota_status != "unavailable",
         credential_message: subscription_level.clone(),
         tiers,
         extra_usage: Some(json!({
             "provider": "grok",
             "user": user,
-            "billing": billing,
-            "billingError": billing_error,
-            "spendingLimitReached": spending_limited,
-            "subscription": {
-                "planType": subscription_level.clone(),
-                "planLabel": subscription_level,
-                "expiresAt": Value::Null,
-                "expiryCapability": "research_pending",
+            "weeklyBilling": weekly.body,
+            "monthlyBilling": monthly.body,
+            "quotaStatus": quota_status,
+            "warningCodes": warning_codes,
+            "warnings": issues.iter().map(|issue| format!("{}: {}", issue.probe, issue.message)).collect::<Vec<_>>(),
+            "staleTierNames": stale_tier_names,
+            "probes": {
+                "weeklyBilling": grok_probe_metadata(weekly),
+                "monthlyBilling": grok_probe_metadata(monthly),
+                "taskUsage": grok_probe_metadata(task_usage),
+                "subscriptions": grok_probe_metadata(subscriptions),
             },
+            "spendingLimitReached": spending_limited,
+            "subscription": subscription,
             "queriedAt": now_ms,
         })),
     }
 }
 
-fn grok_billing_tiers(body: &Value, subscription_access: bool) -> Vec<AccountQuotaTier> {
-    let resets_at = grok_timestamp_at(
+fn grok_probe_metadata(probe: &GrokProbe) -> Value {
+    json!({
+        "ok": probe.body.is_some(),
+        "statusCode": probe.status_code,
+        "spendingLimited": probe.spending_limited,
+        "error": probe.issue.as_ref().map(|issue| issue.message.as_str()),
+        "skippedReason": probe.skipped_reason,
+    })
+}
+
+fn grok_weekly_billing_tiers(body: &Value, subscription_access: bool) -> Vec<AccountQuotaTier> {
+    let resets_at = grok_billing_reset_at(body);
+    let mut tiers = Vec::new();
+    if let Some(percent) = grok_number_at(
         body,
         &[
+            "/config/creditUsagePercent",
+            "/config/credit_usage_percent",
+            "/creditUsagePercent",
+            "/credit_usage_percent",
+        ],
+    ) {
+        tiers.push(grok_percentage_tier(
+            "grok_weekly",
+            Some("Weekly credits".to_string()),
+            percent,
+            resets_at,
+        ));
+    }
+    let products = body
+        .pointer("/config/productUsage")
+        .or_else(|| body.pointer("/config/product_usage"))
+        .or_else(|| body.get("productUsage"))
+        .or_else(|| body.get("product_usage"))
+        .and_then(Value::as_array);
+    if let Some(products) = products {
+        for product in products {
+            let Some(label) = string_at(product, &["/product", "/name", "/productName"]) else {
+                continue;
+            };
+            let percent = grok_number_at(
+                product,
+                &[
+                    "/usagePercent",
+                    "/usage_percent",
+                    "/usedPercent",
+                    "/used_percent",
+                ],
+            )
+            .or_else(|| {
+                let (used, total, _) = grok_credit_bag_amounts(product)?;
+                let total = total.filter(|total| *total > 0.0)?;
+                Some(used.unwrap_or(0.0) / total * 100.0)
+            });
+            if let Some(percent) = percent {
+                tiers.push(grok_percentage_tier(
+                    &format!("grok_product_{}", grok_tier_slug(&label)),
+                    Some(label),
+                    percent,
+                    resets_at,
+                ));
+            }
+        }
+    }
+    if !tiers.iter().any(|tier| tier.name == "grok_weekly") {
+        for pointer in [
+            "/credits",
+            "/creditBalance",
+            "/usage",
+            "/config/credits",
+            "/config/includedCredits",
+            "/config/subscriptionCredits",
+            "/config/weeklyCredits",
+            "/config/sharedPool",
+        ] {
+            let Some(bag) = body.pointer(pointer) else {
+                continue;
+            };
+            let Some((used, total, remaining)) = grok_credit_bag_amounts(bag) else {
+                continue;
+            };
+            if let Some(total) = total.filter(|value| *value > 0.0) {
+                let used = used
+                    .or_else(|| remaining.map(|remaining| (total - remaining).max(0.0)))
+                    .unwrap_or(0.0);
+                tiers.push(grok_credit_tier("grok_weekly", used, total, resets_at));
+                break;
+            }
+        }
+    }
+    merge_grok_tiers(&mut tiers, grok_monthly_billing_tiers(body));
+    merge_grok_tiers(&mut tiers, grok_billing_tiers(body, subscription_access));
+    tiers
+}
+
+fn grok_monthly_billing_tiers(body: &Value) -> Vec<AccountQuotaTier> {
+    let limit_cents = grok_number_at(
+        body,
+        &[
+            "/config/monthlyLimit",
+            "/config/monthly_limit",
+            "/monthlyLimit",
+            "/monthly_limit",
+        ],
+    );
+    let used_cents = grok_number_at(
+        body,
+        &[
+            "/config/used",
+            "/used",
+            "/config/includedUsed",
+            "/config/included_used",
+            "/includedUsed",
+            "/included_used",
+            "/config/totalUsed",
+            "/config/total_used",
+            "/totalUsed",
+            "/total_used",
+        ],
+    );
+    let Some(limit_cents) = limit_cents.filter(|value| *value > 0.0) else {
+        return Vec::new();
+    };
+    let limit = limit_cents / 100.0;
+    let used = used_cents.unwrap_or(0.0).clamp(0.0, limit_cents) / 100.0;
+    vec![AccountQuotaTier {
+        name: "grok_monthly".to_string(),
+        label: Some("Monthly included".to_string()),
+        utilization: Some((used / limit).clamp(0.0, 1.0)),
+        used: Some(used),
+        limit: Some(limit),
+        unit: Some("USD".to_string()),
+        resets_at: grok_billing_reset_at(body),
+    }]
+}
+
+fn grok_task_usage_tiers(body: &Value) -> Vec<AccountQuotaTier> {
+    let mut tiers = Vec::new();
+    for (name, label, used_key, limit_key) in [
+        (
+            "grok_frequent",
+            "Frequent tasks",
+            "frequentUsage",
+            "frequentLimit",
+        ),
+        (
+            "grok_occasional",
+            "Occasional tasks",
+            "occasionalUsage",
+            "occasionalLimit",
+        ),
+    ] {
+        let used = grok_nested_number(body, used_key);
+        let limit = grok_nested_number(body, limit_key);
+        if let Some(limit) = limit.filter(|value| *value > 0.0) {
+            let used = used.unwrap_or(0.0).max(0.0);
+            let mut tier = grok_credit_tier(name, used, limit, None);
+            tier.label = Some(label.to_string());
+            tier.unit = Some("tasks".to_string());
+            tiers.push(tier);
+        }
+    }
+    tiers
+}
+
+fn grok_billing_reset_at(body: &Value) -> Option<i64> {
+    grok_timestamp_at(
+        body,
+        &[
+            "/config/currentPeriod/end",
             "/config/billingPeriodEnd",
             "/config/billing_period_end",
-            "/config/currentPeriod/end",
             "/config/resetAt",
             "/config/resetsAt",
             "/config/periodEnd",
@@ -732,29 +1150,272 @@ fn grok_billing_tiers(body: &Value, subscription_access: bool) -> Vec<AccountQuo
             "/usage/resetAt",
             "/data/resetAt",
         ],
+    )
+}
+
+fn grok_percentage_tier(
+    name: &str,
+    label: Option<String>,
+    percent: f64,
+    resets_at: Option<i64>,
+) -> AccountQuotaTier {
+    AccountQuotaTier {
+        name: name.to_string(),
+        label,
+        utilization: Some((percent / 100.0).clamp(0.0, 1.0)),
+        resets_at,
+        ..Default::default()
+    }
+}
+
+fn grok_credit_bag_amounts(value: &Value) -> Option<(Option<f64>, Option<f64>, Option<f64>)> {
+    if let Some(items) = value.as_array() {
+        return items.iter().find_map(grok_credit_bag_amounts);
+    }
+    let object = value.as_object()?;
+    let total = grok_number_from_object(object, &["total", "limit", "cap", "allocation", "amount"]);
+    let used = grok_number_from_object(object, &["used", "spent", "consumed", "usage"]);
+    let remaining = grok_number_from_object(object, &["remaining", "balance", "left"]);
+    if total.is_none() && used.is_none() && remaining.is_none() {
+        return object
+            .get("bags")
+            .or_else(|| object.get("items"))
+            .and_then(grok_credit_bag_amounts);
+    }
+    let used = used.or_else(|| match (total, remaining) {
+        (Some(total), Some(remaining)) => Some((total - remaining).max(0.0)),
+        _ => None,
+    });
+    let remaining = remaining.or_else(|| match (total, used) {
+        (Some(total), Some(used)) => Some((total - used).max(0.0)),
+        _ => None,
+    });
+    Some((used, total, remaining))
+}
+
+fn grok_number_from_object(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(grok_number_value))
+}
+
+fn grok_number_value(value: &Value) -> Option<f64> {
+    let value = value.get("val").unwrap_or(value);
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|value| value as f64))
+        .or_else(|| value.as_u64().map(|value| value as f64))
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+        .filter(|value| value.is_finite())
+}
+
+fn grok_nested_number(value: &Value, key: &str) -> Option<f64> {
+    match value {
+        Value::Object(object) => object.get(key).and_then(grok_number_value).or_else(|| {
+            object
+                .values()
+                .find_map(|value| grok_nested_number(value, key))
+        }),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|value| grok_nested_number(value, key)),
+        _ => None,
+    }
+}
+
+fn grok_tier_slug(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if slug.is_empty() {
+        "unknown".to_string()
+    } else {
+        slug
+    }
+}
+
+fn merge_grok_tiers(target: &mut Vec<AccountQuotaTier>, incoming: Vec<AccountQuotaTier>) {
+    for tier in incoming {
+        if let Some(existing) = target
+            .iter_mut()
+            .find(|existing| existing.name == tier.name)
+        {
+            *existing = tier;
+        } else {
+            target.push(tier);
+        }
+    }
+}
+
+fn grok_tier_is_weekly(name: &str) -> bool {
+    matches!(
+        name,
+        "grok_weekly" | "grok_credits" | "grok_on_demand" | "grok_prepaid" | "grok_spending_limit"
+    ) || name.starts_with("grok_product_")
+}
+
+fn grok_tier_is_monthly(name: &str) -> bool {
+    name == "grok_monthly"
+}
+
+fn grok_tier_is_task(name: &str) -> bool {
+    matches!(name, "grok_frequent" | "grok_occasional")
+}
+
+fn grok_subscription_json(
+    user: &Value,
+    weekly: Option<&Value>,
+    monthly: Option<&Value>,
+    subscriptions: &GrokProbe,
+    subscription_level: Option<String>,
+) -> Value {
+    let sources = [
+        ("grok_subscriptions", subscriptions.body.as_ref()),
+        ("grok_user", Some(user)),
+        ("grok_weekly_billing", weekly),
+        ("grok_monthly_billing", monthly),
+    ];
+    let expiry = sources.iter().find_map(|(source, value)| {
+        let expires_at = grok_subscription_expiry_at((*value)?)?;
+        let expires_at = Utc.timestamp_millis_opt(expires_at).single()?.to_rfc3339();
+        Some((expires_at, *source))
+    });
+    let status = sources
+        .iter()
+        .find_map(|(_, value)| grok_subscription_status((*value)?));
+    json!({
+        "planType": subscription_level.clone(),
+        "planLabel": subscription_level,
+        "status": status,
+        "expiresAt": expiry.as_ref().map(|(expires_at, _)| expires_at),
+        "expiresSource": expiry.as_ref().map(|(_, source)| source),
+        "expiresKind": expiry.as_ref().map(|_| "subscription"),
+        "expiryCapability": "automatic",
+        "expiryAvailability": if expiry.is_some() {
+            "available"
+        } else if subscriptions.issue.is_some() {
+            "probe_unavailable"
+        } else {
+            "upstream_not_provided"
+        },
+    })
+}
+
+fn grok_subscription_expiry_at(value: &Value) -> Option<i64> {
+    grok_subscription_object(value)
+        .and_then(|subscription| {
+            grok_timestamp_at(
+                subscription,
+                &[
+                    "/expiresAt",
+                    "/expires_at",
+                    "/activeUntil",
+                    "/active_until",
+                    "/subscriptionExpiresAt",
+                    "/subscription_expires_at",
+                    "/endAt",
+                    "/end_at",
+                ],
+            )
+        })
+        .or_else(|| {
+            // A top-level generic expiresAt is commonly the OAuth token expiry.
+            // Only the subscription-qualified root field is trusted here.
+            grok_timestamp_at(
+                value,
+                &["/subscriptionExpiresAt", "/subscription_expires_at"],
+            )
+        })
+}
+
+fn grok_subscription_status(value: &Value) -> Option<String> {
+    let subscription = grok_subscription_object(value)?;
+    string_at(
+        subscription,
+        &["/status", "/subscriptionStatus", "/subscription_status"],
+    )
+}
+
+fn grok_subscription_object(value: &Value) -> Option<&Value> {
+    if let Some(user) = value.get("user").filter(|value| value.is_object()) {
+        if let Some(subscription) = grok_subscription_object(user) {
+            return Some(subscription);
+        }
+    }
+    if let Some(subscription) = value.get("subscription").filter(|value| value.is_object()) {
+        return grok_subscription_is_current(subscription).then_some(subscription);
+    }
+    for subscriptions in [
+        value.get("subscriptions"),
+        value.pointer("/config/subscriptions"),
+        value.pointer("/data/subscriptions"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_array)
+    {
+        if let Some(active) = subscriptions
+            .iter()
+            .find(|subscription| grok_subscription_status_is_active(subscription))
+        {
+            return Some(active);
+        }
+        if let Some(without_status) = subscriptions.iter().find(|subscription| {
+            string_at(
+                subscription,
+                &["/status", "/subscriptionStatus", "/subscription_status"],
+            )
+            .is_none()
+        }) {
+            return Some(without_status);
+        }
+    }
+    if grok_subscription_status_is_active(value) {
+        return Some(value);
+    }
+    None
+}
+
+fn grok_subscription_is_current(value: &Value) -> bool {
+    let status = string_at(
+        value,
+        &["/status", "/subscriptionStatus", "/subscription_status"],
     );
-    let monthly_limit = grok_number_at(
-        body,
-        &[
-            "/config/monthlyLimit",
-            "/config/monthly_limit",
-            "/monthlyLimit",
-            "/monthly_limit",
-        ],
-    );
-    let included_used = grok_number_at(
-        body,
-        &[
-            "/config/includedUsed",
-            "/config/included_used",
-            "/includedUsed",
-            "/included_used",
-            "/config/totalUsed",
-            "/config/total_used",
-            "/totalUsed",
-            "/total_used",
-        ],
-    );
+    status
+        .as_deref()
+        .map(grok_status_name_is_active)
+        .unwrap_or(true)
+}
+
+fn grok_subscription_status_is_active(value: &Value) -> bool {
+    string_at(
+        value,
+        &["/status", "/subscriptionStatus", "/subscription_status"],
+    )
+    .as_deref()
+    .is_some_and(grok_status_name_is_active)
+}
+
+fn grok_status_name_is_active(status: &str) -> bool {
+    let normalized = status.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    matches!(
+        normalized.as_str(),
+        "active" | "subscription_status_active" | "trialing" | "subscription_status_trialing"
+    )
+}
+
+fn grok_billing_tiers(body: &Value, subscription_access: bool) -> Vec<AccountQuotaTier> {
+    let resets_at = grok_billing_reset_at(body);
     let on_demand_cap = grok_number_at(
         body,
         &[
@@ -783,10 +1444,6 @@ fn grok_billing_tiers(body: &Value, subscription_access: bool) -> Vec<AccountQuo
         ],
     );
     let mut tiers = Vec::new();
-    if let Some(limit) = monthly_limit.filter(|value| *value > 0.0) {
-        let used = included_used.unwrap_or(0.0).max(0.0);
-        tiers.push(grok_credit_tier("grok_monthly", used, limit, resets_at));
-    }
     if let Some(limit) = on_demand_cap.filter(|value| *value > 0.0) {
         tiers.push(grok_credit_tier(
             "grok_on_demand",
@@ -870,6 +1527,7 @@ fn grok_legacy_billing_tier(body: &Value) -> Option<AccountQuotaTier> {
     (inferred_used.is_some() || limit.is_some() || utilization.is_some()).then(|| {
         AccountQuotaTier {
             name: "grok_credits".to_string(),
+            label: Some("Credits".to_string()),
             utilization,
             used: inferred_used,
             limit,
@@ -882,6 +1540,7 @@ fn grok_legacy_billing_tier(body: &Value) -> Option<AccountQuotaTier> {
 fn grok_credit_tier(name: &str, used: f64, limit: f64, resets_at: Option<i64>) -> AccountQuotaTier {
     AccountQuotaTier {
         name: name.to_string(),
+        label: None,
         utilization: (limit > 0.0).then(|| (used / limit).clamp(0.0, 1.0)),
         used: Some(used),
         limit: Some(limit),
@@ -891,16 +1550,9 @@ fn grok_credit_tier(name: &str, used: f64, limit: f64, resets_at: Option<i64>) -
 }
 
 fn grok_number_at(value: &Value, pointers: &[&str]) -> Option<f64> {
-    pointers.iter().find_map(|pointer| {
-        let value = value.pointer(pointer)?;
-        let value = value.get("val").unwrap_or(value);
-        value
-            .as_f64()
-            .or_else(|| value.as_i64().map(|value| value as f64))
-            .or_else(|| value.as_u64().map(|value| value as f64))
-            .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
-            .filter(|value| value.is_finite())
-    })
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(grok_number_value))
 }
 
 fn grok_billing_reports_exhausted(body: &Value, subscription_access: bool) -> bool {
@@ -960,6 +1612,14 @@ fn grok_subscription_level(value: &Value) -> Option<String> {
             "/data/tier",
         ],
     )
+    .or_else(|| {
+        grok_subscription_object(value).and_then(|subscription| {
+            string_at(
+                subscription,
+                &["/tier", "/subscriptionTier", "/subscription_tier", "/plan"],
+            )
+        })
+    })
 }
 
 fn grok_access_plan(user: &Value, billing: Option<&Value>) -> Option<String> {
@@ -1373,6 +2033,7 @@ fn codex_tiers_from_rate_limit(rate_limit: Option<CodexRateLimit>) -> Vec<Accoun
                     .limit_window_seconds
                     .map(window_seconds_to_tier_name)
                     .unwrap_or_else(|| "unknown".to_string()),
+                label: None,
                 utilization: Some(utilization),
                 used: None,
                 limit: None,
@@ -1517,6 +2178,7 @@ fn push_claude_tier(tiers: &mut Vec<AccountQuotaTier>, name: &str, value: Option
     };
     tiers.push(AccountQuotaTier {
         name: normalize_claude_tier_name(name).to_string(),
+        label: None,
         utilization: Some(percent_to_fraction(utilization)),
         used: None,
         limit: None,
@@ -1553,6 +2215,7 @@ fn parse_gemini_quota(
         .into_iter()
         .map(|(name, remaining, reset_time)| AccountQuotaTier {
             name,
+            label: None,
             utilization: Some((1.0 - remaining).clamp(0.0, 1.0)),
             used: None,
             limit: None,
@@ -1698,6 +2361,7 @@ fn parse_copilot_imported_quota(
         credential_message: plan.as_deref().map(format_copilot_plan_label),
         tiers: vec![AccountQuotaTier {
             name: "premium".to_string(),
+            label: None,
             utilization: Some(utilization),
             used,
             limit: premium.entitlement,
@@ -1751,6 +2415,7 @@ fn parse_kiro_imported_quota(
             .or_else(|| Some("Kiro OAuth".to_string())),
         tiers: vec![AccountQuotaTier {
             name: "kiro_agentic_requests".to_string(),
+            label: None,
             utilization: Some(utilization),
             used: Some(current_usage),
             limit: Some(usage_limit),
@@ -1851,6 +2516,7 @@ fn parse_cursor_imported_quota(
         credential_message: plan,
         tiers: vec![AccountQuotaTier {
             name: name.to_string(),
+            label: None,
             utilization: Some(utilization),
             used,
             limit,
@@ -3716,14 +4382,19 @@ mod tests {
         assert_eq!(grok_subscription_level(&user).as_deref(), Some("SuperGrok"));
         assert_eq!(grok_entitlement_status(&user).as_deref(), Some("active"));
 
+        let weekly = grok_test_probe(billing.clone());
+        let skipped = GrokProbe::skipped("not needed");
         let quota = grok_quota_from_probes(
             &user,
-            Some(&billing),
+            GrokQuotaProbes {
+                weekly: &weekly,
+                monthly: &skipped,
+                task_usage: &skipped,
+                subscriptions: &skipped,
+            },
             Some("SuperGrok".to_string()),
             1_000,
-            false,
             &[],
-            None,
         );
         assert!(quota.success);
         assert_eq!(quota.credential_message.as_deref(), Some("SuperGrok"));
@@ -3739,7 +4410,7 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.pointer("/subscription/expiryCapability"))
                 .and_then(Value::as_str),
-            Some("research_pending")
+            Some("automatic")
         );
 
         let observed_billing = json!({
@@ -3756,14 +4427,15 @@ mod tests {
             }
         });
         let tiers = grok_billing_tiers(&observed_billing, false);
-        assert_eq!(tiers.len(), 3);
-        assert_eq!(tiers[0].name, "grok_monthly");
-        assert_eq!(tiers[0].used, Some(275.0));
-        assert_eq!(tiers[0].limit, Some(1000.0));
-        assert_eq!(tiers[1].name, "grok_on_demand");
-        assert_eq!(tiers[1].utilization, Some(0.35));
-        assert_eq!(tiers[2].name, "grok_prepaid");
-        assert_eq!(tiers[2].limit, Some(12.5));
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].name, "grok_on_demand");
+        assert_eq!(tiers[0].utilization, Some(0.35));
+        assert_eq!(tiers[1].name, "grok_prepaid");
+        assert_eq!(tiers[1].limit, Some(12.5));
+        let monthly = grok_monthly_billing_tiers(&observed_billing);
+        assert_eq!(monthly[0].used, Some(2.75));
+        assert_eq!(monthly[0].limit, Some(10.0));
+        assert_eq!(monthly[0].unit.as_deref(), Some("USD"));
 
         let billing_plan = json!({
             "config": {
@@ -3782,16 +4454,29 @@ mod tests {
                 "onDemandUsed": {"val": 0}
             }
         });
+        let weekly = grok_test_probe(paid_zero_cap);
+        let skipped = GrokProbe::skipped("not needed");
         let quota = grok_quota_from_probes(
             &json!({}),
-            Some(&paid_zero_cap),
+            GrokQuotaProbes {
+                weekly: &weekly,
+                monthly: &skipped,
+                task_usage: &skipped,
+                subscriptions: &skipped,
+            },
             Some("XPremiumPlus".to_string()),
             1_000,
-            false,
             &[],
-            None,
         );
         assert!(quota.tiers.is_empty());
+        assert_eq!(
+            quota
+                .extra_usage
+                .as_ref()
+                .and_then(|value| value.get("quotaStatus"))
+                .and_then(Value::as_str),
+            Some("valid_non_numeric")
+        );
         assert_eq!(
             quota
                 .extra_usage
@@ -3804,14 +4489,25 @@ mod tests {
 
     #[test]
     fn grok_spending_limit_is_a_successful_exhausted_quota_snapshot() {
+        let spending_limited = GrokProbe {
+            body: None,
+            issue: None,
+            spending_limited: true,
+            status_code: Some(402),
+            skipped_reason: None,
+        };
+        let skipped = GrokProbe::skipped("not needed");
         let quota = grok_quota_from_probes(
             &json!({"subscriptionTier": "SuperGrok"}),
-            None,
+            GrokQuotaProbes {
+                weekly: &spending_limited,
+                monthly: &skipped,
+                task_usage: &skipped,
+                subscriptions: &skipped,
+            },
             Some("SuperGrok".to_string()),
             1_000,
-            true,
             &[],
-            None,
         );
 
         assert!(quota.success);
@@ -3838,20 +4534,26 @@ mod tests {
     fn grok_billing_failure_preserves_the_previous_credit_tier() {
         let previous = AccountQuotaTier {
             name: "grok_credits".to_string(),
+            label: Some("Credits".to_string()),
             utilization: Some(0.25),
             used: Some(25.0),
             limit: Some(100.0),
             unit: Some("credits".to_string()),
             resets_at: None,
         };
+        let failed = grok_test_failed_probe("weekly_billing", "billing temporarily unavailable");
+        let skipped = GrokProbe::skipped("not needed");
         let quota = grok_quota_from_probes(
             &json!({"subscriptionTier": "SuperGrok"}),
-            None,
+            GrokQuotaProbes {
+                weekly: &failed,
+                monthly: &skipped,
+                task_usage: &skipped,
+                subscriptions: &skipped,
+            },
             Some("SuperGrok".to_string()),
             1_000,
-            false,
             std::slice::from_ref(&previous),
-            Some("billing temporarily unavailable"),
         );
 
         assert!(quota.success);
@@ -3860,14 +4562,155 @@ mod tests {
         assert_eq!(quota.tiers[0].utilization, previous.utilization);
         assert_eq!(quota.tiers[0].used, previous.used);
         assert_eq!(quota.tiers[0].limit, previous.limit);
-        assert_eq!(
-            quota
-                .extra_usage
-                .as_ref()
-                .and_then(|value| value.get("billingError"))
-                .and_then(Value::as_str),
-            Some("billing temporarily unavailable")
+        let extra = quota.extra_usage.as_ref().unwrap();
+        assert_eq!(extra["quotaStatus"], "partial");
+        assert_eq!(extra["staleTierNames"], json!(["grok_credits"]));
+        assert!(extra["warnings"][0]
+            .as_str()
+            .is_some_and(|warning| warning.contains("billing temporarily unavailable")));
+    }
+
+    #[test]
+    fn grok_parses_weekly_monthly_product_task_and_subscription_expiry() {
+        let weekly = json!({
+            "config": {
+                "currentPeriod": {
+                    "type": "WEEKLY",
+                    "end": "2026-07-27T00:00:00Z"
+                },
+                "creditUsagePercent": 12.5,
+                "productUsage": [{"product": "GrokBuild", "usagePercent": 25.0}],
+                "weeklyCredits": {"total": {"val": 1000}, "remaining": {"val": 875}}
+            }
+        });
+        let monthly = json!({
+            "config": {
+                "monthlyLimit": {"val": 15000},
+                "used": {"val": 7500},
+                "billingPeriodEnd": "2026-08-01T00:00:00Z"
+            }
+        });
+        let tasks = json!({
+            "frequentUsage": 2,
+            "frequentLimit": 10,
+            "occasionalUsage": 3,
+            "occasionalLimit": 30
+        });
+        let subscriptions = json!({
+            "subscriptions": [{
+                "tier": "XPremium",
+                "status": "SUBSCRIPTION_STATUS_ACTIVE",
+                "expiresAt": "2026-12-31T00:00:00Z"
+            }]
+        });
+        let weekly = grok_test_probe(weekly);
+        let monthly = grok_test_probe(monthly);
+        let tasks = grok_test_probe(tasks);
+        let subscriptions = grok_test_probe(subscriptions);
+        let quota = grok_quota_from_probes(
+            &json!({"subscriptionTier": "XPremium"}),
+            GrokQuotaProbes {
+                weekly: &weekly,
+                monthly: &monthly,
+                task_usage: &tasks,
+                subscriptions: &subscriptions,
+            },
+            Some("XPremium".to_string()),
+            1_000,
+            &[],
         );
+
+        assert!(quota.success);
+        let tier = |name: &str| quota.tiers.iter().find(|tier| tier.name == name).unwrap();
+        assert_eq!(tier("grok_weekly").utilization, Some(0.125));
+        assert_eq!(tier("grok_product_grokbuild").utilization, Some(0.25));
+        assert_eq!(tier("grok_monthly").used, Some(75.0));
+        assert_eq!(tier("grok_monthly").limit, Some(150.0));
+        assert_eq!(tier("grok_monthly").unit.as_deref(), Some("USD"));
+        assert_eq!(tier("grok_frequent").utilization, Some(0.2));
+        assert_eq!(tier("grok_occasional").utilization, Some(0.1));
+        let extra = quota.extra_usage.as_ref().unwrap();
+        assert_eq!(extra["quotaStatus"], "valid_numeric");
+        assert_eq!(
+            extra["subscription"]["expiresAt"],
+            "2026-12-31T00:00:00+00:00"
+        );
+        assert_eq!(extra["subscription"]["expiresKind"], "subscription");
+    }
+
+    #[test]
+    fn grok_does_not_treat_billing_period_or_inactive_subscription_as_expiry() {
+        let user = json!({"subscriptionTier": "XPremium"});
+        let monthly = json!({
+            "config": {
+                "billingPeriodEnd": "2030-01-01T00:00:00Z"
+            }
+        });
+        let inactive_subscriptions = grok_test_probe(json!({
+            "subscriptions": [{
+                "tier": "XPremium",
+                "status": "SUBSCRIPTION_STATUS_CANCELED",
+                "expiresAt": "2030-02-01T00:00:00Z"
+            }]
+        }));
+        let subscription = grok_subscription_json(
+            &user,
+            None,
+            Some(&monthly),
+            &inactive_subscriptions,
+            Some("XPremium".to_string()),
+        );
+
+        assert!(subscription["expiresAt"].is_null());
+        assert_eq!(subscription["expiryAvailability"], "upstream_not_provided");
+
+        let inactive = json!({
+            "subscription": {
+                "tier": "XPremium",
+                "status": "SUBSCRIPTION_STATUS_INACTIVE",
+                "expiresAt": "2030-03-01T00:00:00Z"
+            }
+        });
+        assert!(grok_subscription_expiry_at(&inactive).is_none());
+
+        let token_expiry = json!({
+            "subscriptionTier": "XPremium",
+            "expiresAt": "2030-04-01T00:00:00Z"
+        });
+        assert!(grok_subscription_expiry_at(&token_expiry).is_none());
+
+        let active = json!({
+            "subscription": {
+                "tier": "XPremium",
+                "status": "SUBSCRIPTION_STATUS_ACTIVE",
+                "expiresAt": "2030-05-01T00:00:00Z"
+            }
+        });
+        assert!(grok_subscription_expiry_at(&active).is_some());
+    }
+
+    fn grok_test_probe(body: Value) -> GrokProbe {
+        GrokProbe {
+            body: Some(body),
+            issue: None,
+            spending_limited: false,
+            status_code: Some(200),
+            skipped_reason: None,
+        }
+    }
+
+    fn grok_test_failed_probe(probe: &'static str, message: &str) -> GrokProbe {
+        GrokProbe {
+            body: None,
+            issue: Some(GrokProbeIssue {
+                probe,
+                message: message.to_string(),
+                next_refresh_at: Some(120_000),
+            }),
+            spending_limited: false,
+            status_code: Some(502),
+            skipped_reason: None,
+        }
     }
 
     fn imported_account(provider_type: ProviderType, raw: Value) -> Account {

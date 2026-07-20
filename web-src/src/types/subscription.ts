@@ -1,11 +1,9 @@
 export type CredentialStatus =
-  | "valid"
-  | "expired"
-  | "not_found"
-  | "parse_error";
+  "valid" | "expired" | "not_found" | "parse_error";
 
 export interface QuotaTier {
   name: string;
+  label?: string | null;
   utilization: number; // 0-100
   resetsAt: string | null;
   used?: number | null;
@@ -25,10 +23,7 @@ export interface ExtraUsage {
 }
 
 export type SubscriptionExpiresKind =
-  | "subscription"
-  | "billing_period"
-  | "quota_period"
-  | "unknown";
+  "subscription" | "billing_period" | "quota_period" | "unknown";
 
 export interface SubscriptionInfo {
   planType?: string | null;
@@ -36,7 +31,22 @@ export interface SubscriptionInfo {
   expiresAt?: string | null;
   expiresSource?: string | null;
   expiresKind?: SubscriptionExpiresKind | null;
+  expiryCapability?:
+    | "automatic"
+    | "manual_required"
+    | "research_pending"
+    | "not_applicable"
+    | null;
+  expiryAvailability?:
+    "available" | "upstream_not_provided" | "probe_unavailable" | null;
 }
+
+export type QuotaStatus =
+  | "valid_numeric"
+  | "valid_non_numeric"
+  | "partial"
+  | "unavailable"
+  | "spending_limited";
 
 export interface SubscriptionQuota {
   tool: string;
@@ -44,6 +54,10 @@ export interface SubscriptionQuota {
   credentialMessage: string | null;
   subscription?: SubscriptionInfo | null;
   success: boolean;
+  quotaStatus?: QuotaStatus | null;
+  warningCodes?: string[];
+  warnings?: string[];
+  staleTierNames?: string[];
   tiers: QuotaTier[];
   extraUsage: ExtraUsage | null;
   error: string | null;

@@ -2322,6 +2322,7 @@ fn codex_oauth_schema_fixture_preserves_future_native_fields() {
             tiers: vec![
                 cc_switch_server::domain::accounts::store::AccountQuotaTier {
                     name: "codex".to_string(),
+                    label: None,
                     utilization: Some(0.125),
                     used: Some(125.0),
                     limit: Some(1000.0),

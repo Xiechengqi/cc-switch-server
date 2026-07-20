@@ -84,6 +84,7 @@ pub(in crate::api) fn subscription_tool_label(provider_type: ProviderType) -> &'
         ProviderType::AntigravityOAuth => "antigravity_oauth",
         ProviderType::CursorOAuth => "cursor_oauth",
         ProviderType::KiroOAuth => "kiro_oauth",
+        ProviderType::GrokOAuth => "grok_oauth",
         _ => "unknown",
     }
 }
@@ -95,6 +96,10 @@ pub(in crate::api) fn subscription_quota_not_found(tool: &str) -> Value {
         "credentialMessage": Value::Null,
         "subscription": Value::Null,
         "success": false,
+        "quotaStatus": Value::Null,
+        "warningCodes": [],
+        "warnings": [],
+        "staleTierNames": [],
         "tiers": [],
         "extraUsage": Value::Null,
         "error": Value::Null,
@@ -120,6 +125,7 @@ fn subscription_quota_from_parts(
         .filter(|value| *value > 0);
 
     let subscription = subscription_for_ui(account, quota);
+    let quota_metadata = quota_metadata_for_ui(quota.and_then(|quota| quota.extra_usage.as_ref()));
 
     let credential_message = quota
         .and_then(|quota| quota.credential_message.clone())
@@ -154,6 +160,10 @@ fn subscription_quota_from_parts(
         "credentialMessage": credential_message,
         "subscription": subscription,
         "success": success,
+        "quotaStatus": quota_metadata.get("quotaStatus").cloned().unwrap_or(Value::Null),
+        "warningCodes": quota_metadata.get("warningCodes").cloned().unwrap_or_else(|| json!([])),
+        "warnings": quota_metadata.get("warnings").cloned().unwrap_or_else(|| json!([])),
+        "staleTierNames": quota_metadata.get("staleTierNames").cloned().unwrap_or_else(|| json!([])),
         "tiers": quota
             .map(|quota| quota.tiers.as_slice())
             .unwrap_or_default()
@@ -208,12 +218,26 @@ fn subscription_for_ui(account: &Account, quota: Option<&AccountQuota>) -> Optio
 fn subscription_tier_from_account_tier(tier: &AccountQuotaTier) -> Value {
     json!({
         "name": tier.name,
+        "label": tier.label,
         "utilization": utilization_for_ui(tier.utilization),
         "resetsAt": resets_at_for_ui(tier.resets_at),
         "used": tier.used,
         "limit": tier.limit,
         "unit": tier.unit,
     })
+}
+
+fn quota_metadata_for_ui(extra_usage: Option<&Value>) -> Value {
+    let Some(extra_usage) = extra_usage else {
+        return json!({});
+    };
+    let mut metadata = serde_json::Map::new();
+    for key in ["quotaStatus", "warningCodes", "warnings", "staleTierNames"] {
+        if let Some(value) = extra_usage.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(metadata)
 }
 
 fn extra_usage_for_ui(extra_usage: Option<&Value>) -> Value {
@@ -407,6 +431,7 @@ mod tests {
             credential_message: Some("SuperGrok".to_string()),
             tiers: vec![AccountQuotaTier {
                 name: "grok_credits".to_string(),
+                label: Some("Credits".to_string()),
                 utilization: Some(0.75),
                 used: Some(75.0),
                 limit: Some(100.0),
@@ -415,11 +440,16 @@ mod tests {
             }],
             extra_usage: Some(json!({
                 "queriedAt": 1_700_000_000_000i64,
+                "quotaStatus": "valid_numeric",
+                "warningCodes": [],
+                "warnings": [],
+                "staleTierNames": [],
                 "subscription": {
                     "planType": "SuperGrok",
                     "planLabel": "SuperGrok",
                     "expiresAt": Value::Null,
-                    "expiryCapability": "research_pending"
+                    "expiryCapability": "automatic",
+                    "expiryAvailability": "upstream_not_provided"
                 }
             })),
         });
@@ -432,7 +462,13 @@ mod tests {
         assert_eq!(quota["credentialMessage"], "SuperGrok");
         assert_eq!(quota["tiers"][0]["utilization"], 75.0);
         assert_eq!(quota["tiers"][0]["used"], 75.0);
+        assert_eq!(quota["tiers"][0]["label"], "Credits");
+        assert_eq!(quota["quotaStatus"], "valid_numeric");
         assert_eq!(quota["subscription"]["planLabel"], "SuperGrok");
+        assert_eq!(
+            quota["subscription"]["expiryAvailability"],
+            "upstream_not_provided"
+        );
         assert!(quota["subscription"]["expiresAt"].is_null());
     }
 

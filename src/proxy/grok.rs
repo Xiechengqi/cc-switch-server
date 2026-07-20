@@ -10,12 +10,14 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{ProxyError, ProxyRoute};
+use crate::domain::grok_cli::{
+    GROK_CLI_BASE_URL, GROK_CLI_CLIENT_IDENTIFIER, GROK_CLI_TOKEN_AUTH, GROK_CLI_USER_AGENT,
+    GROK_CLI_VERSION,
+};
 use crate::domain::providers::model_routing::DEFAULT_GROK_MODEL;
 
 const GROK_API_BASE: &str = "https://api.x.ai/v1";
-const GROK_CLI_CHAT_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const GROK_WS_URL: &str = "wss://api.x.ai/v1/responses";
-const GROK_CLI_USER_AGENT: &str = "grok-pager/0.2.93 grok-shell/0.2.93 (linux; x86_64)";
 static GROK_TURN_IDX: AtomicU64 = AtomicU64::new(1);
 
 pub(super) struct GrokForwardContract {
@@ -60,9 +62,12 @@ pub(super) fn apply_forward_contract(
         ),
     ];
     if cli_profile {
-        headers.push(("x-xai-token-auth", "xai-grok-cli".to_string()));
-        headers.push(("x-grok-client-identifier", "grok-pager".to_string()));
-        headers.push(("x-grok-client-version", "0.2.93".to_string()));
+        headers.push(("x-xai-token-auth", GROK_CLI_TOKEN_AUTH.to_string()));
+        headers.push((
+            "x-grok-client-identifier",
+            GROK_CLI_CLIENT_IDENTIFIER.to_string(),
+        ));
+        headers.push(("x-grok-client-version", GROK_CLI_VERSION.to_string()));
         headers.push((
             "x-authenticateresponse",
             "authenticate-response".to_string(),
@@ -102,11 +107,11 @@ pub(super) fn chat_upstream_url(resolved_url: &str, cli_profile: bool) -> String
     }
     let trimmed = resolved_url.trim();
     if let Some(path) = trimmed.strip_prefix(GROK_API_BASE) {
-        return format!("{GROK_CLI_CHAT_BASE}{path}");
+        return format!("{GROK_CLI_BASE_URL}{path}");
     }
     if let Some(path) = trimmed.strip_prefix("https://api.x.ai") {
         let path = path.strip_prefix("/v1").unwrap_or(path);
-        return format!("{GROK_CLI_CHAT_BASE}{path}");
+        return format!("{GROK_CLI_BASE_URL}{path}");
     }
     trimmed.to_string()
 }
@@ -859,6 +864,34 @@ mod tests {
             chat_upstream_url("https://api.x.ai/v1/responses", false),
             "https://api.x.ai/v1/responses"
         );
+    }
+
+    #[test]
+    fn cli_profile_uses_current_shared_grok_identity() {
+        let mut body = json_body(json!({"model": "grok-build", "input": "ping"}));
+        let contract = apply_forward_contract(
+            &mut body,
+            &HeaderMap::new(),
+            ProxyRoute::CodexResponses,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let header = |name: &str| {
+            contract
+                .headers
+                .iter()
+                .find_map(|(key, value)| (*key == name).then_some(value.as_str()))
+        };
+
+        assert_eq!(header("user-agent"), Some(GROK_CLI_USER_AGENT));
+        assert_eq!(
+            header("x-grok-client-identifier"),
+            Some(GROK_CLI_CLIENT_IDENTIFIER)
+        );
+        assert_eq!(header("x-grok-client-version"), Some(GROK_CLI_VERSION));
+        assert_eq!(header("x-xai-token-auth"), Some(GROK_CLI_TOKEN_AUTH));
     }
 
     #[test]

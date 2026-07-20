@@ -1285,6 +1285,7 @@ pub fn quota_from_provider_snapshot(
         credential_message: Some("quota parsed from provider snapshot".to_string()),
         tiers: vec![AccountQuotaTier {
             name: provider_type.as_str().to_string(),
+            label: None,
             utilization: Some((percent / 100.0).clamp(0.0, 1.0)),
             used: None,
             limit: None,

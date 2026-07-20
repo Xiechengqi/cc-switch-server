@@ -50,9 +50,12 @@ export const TIER_I18N_KEYS: Record<string, string> = {
   // Kiro OAuth
   kiro_agentic_requests: "subscription.kiroAgenticRequests",
   grok_credits: "subscription.grokCredits",
+  grok_weekly: "subscription.grokWeekly",
   grok_monthly: "subscription.grokMonthly",
   grok_on_demand: "subscription.grokOnDemand",
   grok_prepaid: "subscription.grokPrepaid",
+  grok_frequent: "subscription.grokFrequent",
+  grok_occasional: "subscription.grokOccasional",
   grok_spending_limit: "subscription.grokSpendingLimit",
 };
 
@@ -131,9 +134,12 @@ const COMPACT_TIER_LABELS: Record<string, string> = {
   premium: "Premium",
   kiro_agentic_requests: "Kiro",
   grok_credits: "Credits",
+  grok_weekly: "Weekly",
   grok_monthly: "Monthly",
   grok_on_demand: "On-demand",
   grok_prepaid: "Prepaid",
+  grok_frequent: "Frequent",
+  grok_occasional: "Occasional",
   grok_spending_limit: "Limit",
   cursor_credits: "Usage",
   cursor_included_usage: "Usage",
@@ -183,6 +189,7 @@ export function formatCompactTier(
   nowMs = Date.now(),
 ): string {
   const label =
+    tier.label?.trim() ||
     COMPACT_TIER_LABELS[tier.name] ||
     (t && TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name);
   const utilization = `${Math.round(tier.utilization)}%`;
@@ -204,11 +211,30 @@ export function formatQuotaSummary(
     quota.subscription
       ? quota.subscription.expiresAt
         ? formatExpireDistance(quota.subscription.expiresAt, nowMs)
-        : t
-          ? t("subscription.expiryUnknown")
-          : "expire unknown"
+        : quota.subscription.expiryAvailability === "upstream_not_provided"
+          ? t
+            ? t("subscription.expiryNotProvided")
+            : "subscription expiry not provided"
+          : quota.subscription.expiryAvailability === "probe_unavailable"
+            ? t
+              ? t("subscription.expiryUnavailable")
+              : "subscription expiry unavailable"
+            : quota.subscription.expiryCapability === "not_applicable"
+              ? null
+              : t
+                ? t("subscription.expiryUnknown")
+                : "expire unknown"
       : null,
     ...tiers.map((tier) => formatCompactTier(tier, t, nowMs)),
+    quota.quotaStatus === "valid_non_numeric"
+      ? t
+        ? t("subscription.numericQuotaNotExposed")
+        : "numeric quota not exposed"
+      : quota.quotaStatus === "partial"
+        ? t
+          ? t("subscription.quotaPartial")
+          : "partial quota data"
+        : null,
   ].filter((segment): segment is string => Boolean(segment));
 
   return segments.join(" · ");
@@ -336,13 +362,13 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
 
   // API 调用失败
   if (!quota.success) {
-    const expirySummary = quota.subscription?.expiresAt
+    const subscriptionSummary = quota.subscription
       ? formatQuotaSummary(quota, [], t, now)
       : null;
-    const hasQueryError = Boolean(quota.error) || !expirySummary;
+    const hasQueryError = Boolean(quota.error) || !subscriptionSummary;
     const statusText = [
       quota.error || (hasQueryError ? t("subscription.queryFailed") : null),
-      expirySummary,
+      subscriptionSummary,
     ]
       .filter(Boolean)
       .join(" · ");
@@ -399,7 +425,9 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   }
 
   // 成功获取数据
-  const allowUnknownTierNames = appIdForExpiredHint === "antigravity_oauth";
+  const allowUnknownTierNames =
+    appIdForExpiredHint === "antigravity_oauth" ||
+    appIdForExpiredHint === "grok_oauth";
   const tiers = (quota.tiers || []).filter((tier) => {
     if (!allowUnknownTierNames && !(tier.name in TIER_I18N_KEYS)) return false;
     if (visibleTierNames && !visibleTierNames.includes(tier.name)) return false;
@@ -509,9 +537,9 @@ export const TierBadge: React.FC<{
   tier: QuotaTier;
   t: (key: string, options?: Record<string, unknown>) => string;
 }> = ({ tier, t }) => {
-  const label = TIER_I18N_KEYS[tier.name]
-    ? t(TIER_I18N_KEYS[tier.name])
-    : tier.name;
+  const label =
+    tier.label?.trim() ||
+    (TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name);
   const countdown = countdownStr(tier.resetsAt);
 
   const hasUsd = tier.usedValueUsd != null && tier.maxValueUsd != null;
@@ -544,9 +572,9 @@ const TierBar: React.FC<{
   tier: QuotaTier;
   t: (key: string, options?: Record<string, unknown>) => string;
 }> = ({ tier, t }) => {
-  const label = TIER_I18N_KEYS[tier.name]
-    ? t(TIER_I18N_KEYS[tier.name])
-    : tier.name;
+  const label =
+    tier.label?.trim() ||
+    (TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name);
   const resetText = formatResetTime(tier.resetsAt, t);
 
   return (

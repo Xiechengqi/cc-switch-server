@@ -108,6 +108,8 @@ pub struct AccountQuota {
 #[serde(rename_all = "camelCase")]
 pub struct AccountQuotaTier {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default)]
     pub utilization: Option<f64>,
     #[serde(default)]
@@ -1336,6 +1338,7 @@ mod tests {
                     credential_message: Some("ok".to_string()),
                     tiers: vec![AccountQuotaTier {
                         name: provider_type.as_str().to_string(),
+                        label: None,
                         utilization: Some(0.235),
                         used: Some(235.0),
                         limit: Some(1000.0),

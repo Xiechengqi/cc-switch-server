@@ -1037,6 +1037,7 @@ pub(crate) fn quota_from_usage_limits(
         credential_message: plan.or_else(|| Some("Kiro OAuth".to_string())),
         tiers: vec![AccountQuotaTier {
             name: "kiro_agentic_requests".to_string(),
+            label: None,
             utilization: Some(utilization),
             used: Some(current_usage),
             limit: Some(usage_limit),

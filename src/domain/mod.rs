@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod claude_cli;
 pub mod failover;
+pub mod grok_cli;
 pub mod health;
 pub mod providers;
 pub mod router;

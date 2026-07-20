@@ -34,7 +34,7 @@ pub struct ResolvedSubscriptionExpiry {
 pub fn subscription_expiry_capability(provider_type: ProviderType) -> SubscriptionExpiryCapability {
     match provider_type {
         ProviderType::ClaudeOAuth => SubscriptionExpiryCapability::ManualRequired,
-        ProviderType::CodexOAuth | ProviderType::OllamaCloud => {
+        ProviderType::CodexOAuth | ProviderType::GrokOAuth | ProviderType::OllamaCloud => {
             SubscriptionExpiryCapability::Automatic
         }
         ProviderType::GeminiCli
@@ -42,8 +42,7 @@ pub fn subscription_expiry_capability(provider_type: ProviderType) -> Subscripti
         | ProviderType::AgyOAuth
         | ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
-        | ProviderType::CursorOAuth
-        | ProviderType::GrokOAuth => SubscriptionExpiryCapability::ResearchPending,
+        | ProviderType::CursorOAuth => SubscriptionExpiryCapability::ResearchPending,
         ProviderType::Claude
         | ProviderType::ClaudeAuth
         | ProviderType::Codex
@@ -103,6 +102,11 @@ fn automatic_expiry_paths(provider_type: ProviderType) -> &'static [&'static str
             "/subscriptionPeriodEnd",
             "/raw/SubscriptionPeriodEnd/Time",
             "/raw/subscriptionPeriodEnd/time",
+        ],
+        ProviderType::GrokOAuth => &[
+            "/subscription/expiresAt",
+            "/subscription/expires_at",
+            "/subscriptionExpiresAt",
         ],
         _ => &[],
     }
@@ -206,7 +210,7 @@ mod tests {
         for provider_type in ALL_PROVIDER_TYPES {
             let expected = match provider_type {
                 ProviderType::ClaudeOAuth => SubscriptionExpiryCapability::ManualRequired,
-                ProviderType::CodexOAuth | ProviderType::OllamaCloud => {
+                ProviderType::CodexOAuth | ProviderType::GrokOAuth | ProviderType::OllamaCloud => {
                     SubscriptionExpiryCapability::Automatic
                 }
                 ProviderType::GeminiCli
@@ -214,8 +218,7 @@ mod tests {
                 | ProviderType::AgyOAuth
                 | ProviderType::GitHubCopilot
                 | ProviderType::KiroOAuth
-                | ProviderType::CursorOAuth
-                | ProviderType::GrokOAuth => SubscriptionExpiryCapability::ResearchPending,
+                | ProviderType::CursorOAuth => SubscriptionExpiryCapability::ResearchPending,
                 _ => SubscriptionExpiryCapability::NotApplicable,
             };
             assert_eq!(subscription_expiry_capability(provider_type), expected);
@@ -223,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_resolver_reads_only_trusted_codex_and_ollama_paths() {
+    fn automatic_resolver_reads_only_trusted_subscription_paths() {
         let codex = account(
             ProviderType::CodexOAuth,
             Some(json!({
@@ -245,6 +248,18 @@ mod tests {
         assert_eq!(
             automatic_subscription_expires_at_ms(&ollama),
             Some(1_788_220_800_000)
+        );
+
+        let grok = account(
+            ProviderType::GrokOAuth,
+            Some(json!({
+                "subscription": {"expiresAt": "2026-08-19T00:00:00Z"},
+                "billingPeriodEnd": "2030-01-01T00:00:00Z"
+            })),
+        );
+        assert_eq!(
+            automatic_subscription_expires_at_ms(&grok),
+            Some(1_787_097_600_000)
         );
     }
 
