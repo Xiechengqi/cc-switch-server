@@ -24,6 +24,10 @@ import { DeepSeekAccountSection } from "@/components/providers/forms/DeepSeekAcc
 import { GeminiOAuthSection } from "@/components/providers/forms/GeminiOAuthSection";
 import { GrokOAuthSection } from "@/components/providers/forms/GrokOAuthSection";
 import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection";
+import {
+  ProviderPresetSelector,
+  type PresetEntry,
+} from "@/components/providers/forms/ProviderPresetSelector";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -57,10 +61,12 @@ import {
 } from "@/server/providerRegistry";
 import { SecretInput } from "@/server/ui/SecretInput";
 import type { ProviderMeta } from "@/types";
+import { setCodexBaseUrl } from "@/utils/providerConfigUtils";
 import {
   createDraftForProfile,
   defaultSingleModel,
   ensureObject,
+  providerPresetForProfile,
   readEndpoint,
   readUpstreamModel,
   setEndpoint,
@@ -224,6 +230,45 @@ function profileList(app: CoreProviderApp): ProviderRegistryProfile[] {
   );
 }
 
+function isLockedPresetProfile(profile: ProviderRegistryProfile): boolean {
+  return (
+    profile.formComposition !== "custom" && profile.formComposition !== "legacy"
+  );
+}
+
+function canonicalPresetEndpoint(
+  profile: ProviderRegistryProfile,
+  app: CoreProviderApp,
+  awsRegion = "us-east-1",
+): string {
+  const endpoint = readEndpoint(
+    createDraftForProfile(profile).settingsConfig,
+    app,
+  );
+  if (profile.formComposition !== "aws") return endpoint;
+  return endpoint.split("us-east-1").join(awsRegion.trim() || "us-east-1");
+}
+
+function presetEntriesForApp(app: CoreProviderApp): PresetEntry[] {
+  return profileList(app)
+    .filter((profile) => profile.formComposition !== "custom")
+    .map((profile) => {
+      const preset = providerPresetForProfile(profile);
+      if (!preset) {
+        throw new Error(`Provider preset ${profile.profileId} is unavailable`);
+      }
+      return { id: profile.profileId, preset };
+    });
+}
+
+const PRESET_CATEGORY_LABELS: Record<string, string> = {
+  official: "官方",
+  cn_official: "国内官方",
+  aggregator: "聚合服务",
+  third_party: "第三方",
+  custom: "自定义",
+};
+
 function actualSlot(
   resource: ProviderResource | undefined,
   canonical: string,
@@ -356,6 +401,24 @@ function buildEditorState(
       }
     : createDraftForProfile(profile);
   ensureObject(draft.settingsConfig, "env");
+  const awsRegion =
+    String(
+      (draft.settingsConfig.env as Record<string, unknown> | undefined)
+        ?.AWS_REGION ?? "us-east-1",
+    ).trim() || "us-east-1";
+  if (isLockedPresetProfile(profile)) {
+    const presetDraft = createDraftForProfile(profile);
+    const presetEndpoint = canonicalPresetEndpoint(profile, app, awsRegion);
+    draft.name = presetDraft.name;
+    draft.websiteUrl = presetDraft.websiteUrl;
+    setEndpoint(draft.settingsConfig, app, presetEndpoint);
+    if (app === "codex" && typeof draft.settingsConfig.config === "string") {
+      draft.settingsConfig.config = setCodexBaseUrl(
+        draft.settingsConfig.config,
+        presetEndpoint,
+      );
+    }
+  }
   const customBinding =
     profile.formComposition === "custom"
       ? (resource?.customBinding ?? clone(CUSTOM_DEFAULT_BINDINGS[app]))
@@ -369,11 +432,7 @@ function buildEditorState(
       readUpstreamModel(draft.settingsConfig) ??
       defaultSingleModel(profile.profileId),
     accountId: draft.meta.authBinding?.accountId ?? "",
-    awsRegion:
-      String(
-        (draft.settingsConfig.env as Record<string, unknown> | undefined)
-          ?.AWS_REGION ?? "us-east-1",
-      ).trim() || "us-east-1",
+    awsRegion,
     customBinding,
     credentials: buildCredentialEdits(profile, resource, isEditMode),
     extraHeaders: buildExtraHeaderEdits(draft.settingsConfig, resource),
@@ -525,6 +584,13 @@ function prepareSettingsForSubmit(
     profile.endpointPolicy === "override_allowed"
   ) {
     setEndpoint(settings, app, state.endpoint);
+  }
+  if (isLockedPresetProfile(profile)) {
+    const endpoint = canonicalPresetEndpoint(profile, app, state.awsRegion);
+    setEndpoint(settings, app, endpoint);
+    if (app === "codex" && typeof settings.config === "string") {
+      settings.config = setCodexBaseUrl(settings.config, endpoint);
+    }
   }
   if (profile.formComposition === "aws") {
     ensureObject(settings, "env").AWS_REGION = state.awsRegion.trim();
@@ -794,6 +860,7 @@ export function ServerProviderForm({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [initializationKey],
   );
+  const presetEntries = useMemo(() => presetEntriesForApp(appId), [appId]);
   const [state, setState] = useState<EditorState>(initial);
   const [baseline, setBaseline] = useState(() => stableStringify(initial));
   const [shareDirty, setShareDirty] = useState(false);
@@ -905,12 +972,17 @@ export function ServerProviderForm({
     }
     const settings = prepareSettingsForSubmit(state, profile, appId);
     const credentialPatches = collectCredentialPatches(state);
+    const presetDraft = isLockedPresetProfile(profile)
+      ? createDraftForProfile(profile)
+      : null;
     setSubmitting(true);
     onSubmittingChange?.(true);
     try {
       await onSubmit({
-        name: state.draft.name.trim(),
-        websiteUrl: state.draft.websiteUrl.trim() || undefined,
+        name: (presetDraft?.name ?? state.draft.name).trim(),
+        websiteUrl:
+          (presetDraft?.websiteUrl ?? state.draft.websiteUrl).trim() ||
+          undefined,
         notes: state.draft.notes.trim() || undefined,
         settingsConfig: JSON.stringify(settings),
         icon: state.draft.icon,
@@ -1138,8 +1210,9 @@ export function ServerProviderForm({
     profile.endpointPolicy === "override_allowed" ||
     Boolean(state.endpoint);
   const endpointEditable =
-    profile.endpointPolicy === "custom" ||
-    profile.endpointPolicy === "override_allowed";
+    !isLockedPresetProfile(profile) &&
+    (profile.endpointPolicy === "custom" ||
+      profile.endpointPolicy === "override_allowed");
   const showCodexOptions =
     driverForProfile(profile)?.driverId === "oauth.openai_codex";
 
@@ -1150,21 +1223,14 @@ export function ServerProviderForm({
       className="space-y-6 rounded-lg border border-border/50 bg-background/40 p-5"
     >
       {!isEditMode ? (
-        <Section title="供应商类型">
-          <Select value={state.profileId} onValueChange={selectProfile}>
-            <SelectTrigger className="w-full">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {profileList(appId).map((item) => (
-                <SelectItem key={item.profileId} value={item.profileId}>
-                  {item.label}
-                  {item.maturity === "experimental" ? " · 实验性" : ""}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </Section>
+        <ProviderPresetSelector
+          selectedPresetId={state.profileId}
+          presetEntries={presetEntries}
+          presetCategoryLabels={PRESET_CATEGORY_LABELS}
+          onPresetChange={selectProfile}
+          customPresetId={`${appId}.custom_http`}
+          category={state.draft.category}
+        />
       ) : (
         <div className="flex flex-wrap items-center gap-2 border-b border-border/50 pb-4">
           <Badge variant="outline">{profile.label}</Badge>
@@ -1328,6 +1394,12 @@ export function ServerProviderForm({
             <Input
               id="server-provider-name"
               value={state.draft.name}
+              readOnly={isLockedPresetProfile(profile)}
+              className={
+                isLockedPresetProfile(profile)
+                  ? "bg-muted/40 text-muted-foreground"
+                  : undefined
+              }
               onChange={(event) => updateDraft({ name: event.target.value })}
             />
           </div>
@@ -1337,6 +1409,12 @@ export function ServerProviderForm({
               id="server-provider-website"
               type="url"
               value={state.draft.websiteUrl}
+              readOnly={isLockedPresetProfile(profile)}
+              className={
+                isLockedPresetProfile(profile)
+                  ? "bg-muted/40 text-muted-foreground"
+                  : undefined
+              }
               onChange={(event) =>
                 updateDraft({ websiteUrl: event.target.value })
               }
@@ -1407,10 +1485,18 @@ export function ServerProviderForm({
               id="server-provider-aws-region"
               value={state.awsRegion}
               onChange={(event) =>
-                setState((current) => ({
-                  ...current,
-                  awsRegion: event.target.value,
-                }))
+                setState((current) => {
+                  const awsRegion = event.target.value;
+                  return {
+                    ...current,
+                    awsRegion,
+                    endpoint: canonicalPresetEndpoint(
+                      profile,
+                      appId,
+                      awsRegion,
+                    ),
+                  };
+                })
               }
               placeholder="us-east-1"
             />

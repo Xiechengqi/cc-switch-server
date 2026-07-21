@@ -447,8 +447,16 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/web-api/context", get(web_runtime_context))
         .route("/web-api/invoke/*command", post(web_invoke_compat))
         .route(
-            "/web-api/terminal/ws",
-            get(crate::api::terminal::terminal_ws),
+            "/web-api/terminal/stream",
+            get(crate::api::terminal::terminal_stream),
+        )
+        .route(
+            "/web-api/terminal/input",
+            post(crate::api::terminal::terminal_input),
+        )
+        .route(
+            "/web-api/terminal/resize",
+            post(crate::api::terminal::terminal_resize),
         )
         .route(
             "/web-api/terminal/session/end",

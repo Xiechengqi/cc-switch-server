@@ -24,6 +24,7 @@ Run the checks manually at:
 - Topbar actions remain clickable and do not cover page content.
 - Tables scroll horizontally when needed instead of overflowing the viewport.
 - Buttons and inputs keep stable dimensions while loading or changing state.
+- Input and textarea placeholder text stays visibly lighter than entered values in both themes.
 - No server-only hidden/excluded feature is visible.
 - No browser console or network error is ignored during manual inspection.
 
@@ -32,10 +33,13 @@ Run the checks manually at:
 - Provider list, current provider state, readiness, health, model, account binding, and quota/capability summaries are visible.
 - Create/edit/test/fetch-models/switch actions match server capability gates.
 - Add/Edit only offers Claude, Codex, and Gemini Profiles from the Server registry; OpenCode, OpenClaw, Hermes, Claude Desktop, raw env/TOML/auth editors, automatic failover, and outbound proxy controls never appear.
+- Add Provider uses the icon-based preset grid and exposes every visible, creatable Registry Profile exactly once, including Custom HTTP.
 - Fixed Profile identity cannot be changed by editing a name, URL, category, or compatibility metadata. Custom protocol/auth changes require preview/apply rebind; legacy records expose adopt or clone-as-custom actions instead of an unrestricted raw editor.
+- Fixed preset name, website, and API Endpoint are read-only and submit canonical preset values; Custom and legacy repair flows retain their intended editing controls.
 - Static secrets use keep/replace/clear without echoing the stored value. Managed Providers require an explicitly selected compatible account, and account/quota refresh does not mark the Provider draft dirty.
 - Provider and Share edits have independent dirty/save state. Saving or failing one section does not silently commit or reset the other, and the Provider Save button is disabled when the canonical draft has not changed.
 - S1 installations show a read-only migration status and blocker codes. The Web UI never applies, rolls back, or cleans the Provider store while the Server is running; it directs the operator to the offline CLI.
+- A fresh data directory is treated as S2 before the first Provider is saved and never shows the S1 migration warning.
 - Planned or diagnostic-only provider combinations are clearly gated and not presented as fully native.
 - Unknown legacy JSON is preserved read-only or blocks S2 cutover; it is not exposed as an editable Server field.
 
@@ -58,6 +62,7 @@ Run the checks manually at:
 ## Settings, Auth, Router, Backup
 
 - First setup, password login, API token, email code flow, router config, client tunnel, read-only routing status, and backup/restore are reachable.
+- Server Web has no standalone Routing tab; Settings → Advanced starts with the API Routing card, which is collapsed by default and retains the same status/actions when expanded.
 - Client Tunnel Owner is read-only; saving tunnel settings changes only tunnel fields and cannot bypass verified Client Owner change.
 - Settings → Share → Payout Information persists one EVM address, explicit USDC/USDT selection, and one or more BSC/Base/Arbitrum One networks; warnings prohibit secrets and identify the address as public/self-declared.
 - Payout clear requires confirmation; Router outage leaves the local save active and visibly reports pending/failed sync.

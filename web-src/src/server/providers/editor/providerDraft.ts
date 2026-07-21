@@ -11,6 +11,7 @@ import {
   type GeminiProviderPreset,
 } from "@/config/geminiProviderPresets";
 import type { ProviderCategory, ProviderMeta } from "@/types";
+import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import {
   anthropicApiKeyPreset,
   googleGeminiApiKeyPreset,
@@ -147,7 +148,7 @@ function apiFormatForProtocol(
   }
 }
 
-function presetForProfile(
+export function providerPresetForProfile(
   profile: ProviderRegistryProfile,
 ): ProviderPreset | CodexProviderPreset | GeminiProviderPreset | undefined {
   if (profile.profileId === "claude.anthropic_api_key") {
@@ -206,7 +207,7 @@ function settingsFromPreset(
 export function createDraftForProfile(
   profile: ProviderRegistryProfile,
 ): CoreProviderDraft {
-  const preset = presetForProfile(profile);
+  const preset = providerPresetForProfile(profile);
   const settingsConfig = settingsFromPreset(profile, preset);
   sanitizePresetSettings(settingsConfig);
   const driver = driverForProfile(profile);
@@ -276,7 +277,11 @@ export function readEndpoint(
   const value = env[ENDPOINT_ENV_KEYS[app]];
   if (typeof value === "string" && value.trim()) return value.trim();
   const direct = settings[ENDPOINT_ENV_KEYS[app]];
-  return typeof direct === "string" ? direct.trim() : "";
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  if (app === "codex" && typeof settings.config === "string") {
+    return extractCodexBaseUrl(settings.config)?.trim() ?? "";
+  }
+  return "";
 }
 
 export function setEndpoint(

@@ -94,37 +94,54 @@ struct MigrationManifest {
 
 pub fn preflight(config_dir: &Path) -> anyhow::Result<ProviderStorageMigrationReport> {
     let path = providers_path(config_dir);
-    if path.exists() {
-        let value: serde_json::Value = serde_json::from_slice(
-            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
-        )
-        .with_context(|| format!("parse {}", path.display()))?;
-        if super::store_v2::looks_like_s2(&value) {
-            let mut store = ProviderStore::load_or_default(config_dir)?;
-            let accounts = AccountStore::load_or_default(config_dir)?;
-            store.rebuild_runtime_index(&accounts)?;
-            return Ok(ProviderStorageMigrationReport {
-                source_format: ProviderStoreFormat::S2,
-                target_format: ProviderStoreFormat::S2,
-                key_source: key_source_label(store.storage_status().credential_key_source, false),
-                provider_count: store.providers.len(),
-                ready_count: store.providers.len(),
-                blocked_count: 0,
-                runtime_plan_parity: true,
-                reference_fingerprint: short_reference_fingerprint(config_dir)?,
-                can_apply: false,
-                items: store
-                    .providers
-                    .iter()
-                    .map(|stored| ProviderStorageMigrationItem {
-                        app: stored.app,
-                        provider_id: stored.provider.id.clone(),
-                        status: ProviderStorageMigrationItemStatus::Ready,
-                        blocker_codes: Vec::new(),
-                    })
-                    .collect(),
-            });
-        }
+    if !path.exists() {
+        let existing_key = load_root_key_if_present(config_dir)?;
+        let would_create_file_key = existing_key.is_none();
+        return Ok(ProviderStorageMigrationReport {
+            source_format: ProviderStoreFormat::S2,
+            target_format: ProviderStoreFormat::S2,
+            key_source: key_source_label(
+                existing_key.as_ref().map(|key| key.source),
+                would_create_file_key,
+            ),
+            provider_count: 0,
+            ready_count: 0,
+            blocked_count: 0,
+            runtime_plan_parity: true,
+            reference_fingerprint: short_reference_fingerprint(config_dir)?,
+            can_apply: false,
+            items: Vec::new(),
+        });
+    }
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    if super::store_v2::looks_like_s2(&value) {
+        let mut store = ProviderStore::load_or_default(config_dir)?;
+        let accounts = AccountStore::load_or_default(config_dir)?;
+        store.rebuild_runtime_index(&accounts)?;
+        return Ok(ProviderStorageMigrationReport {
+            source_format: ProviderStoreFormat::S2,
+            target_format: ProviderStoreFormat::S2,
+            key_source: key_source_label(store.storage_status().credential_key_source, false),
+            provider_count: store.providers.len(),
+            ready_count: store.providers.len(),
+            blocked_count: 0,
+            runtime_plan_parity: true,
+            reference_fingerprint: short_reference_fingerprint(config_dir)?,
+            can_apply: false,
+            items: store
+                .providers
+                .iter()
+                .map(|stored| ProviderStorageMigrationItem {
+                    app: stored.app,
+                    provider_id: stored.provider.id.clone(),
+                    status: ProviderStorageMigrationItemStatus::Ready,
+                    blocker_codes: Vec::new(),
+                })
+                .collect(),
+        });
     }
 
     let mut source = ProviderStore::load_or_default(config_dir)?;
@@ -534,6 +551,26 @@ mod tests {
         let rollback_outcome = rollback(&config_dir).unwrap();
         assert!(rollback_outcome.changed);
         assert_eq!(before, fs::read(providers_path(&config_dir)).unwrap());
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_directory_is_already_s2_without_creating_storage_files() {
+        let config_dir = test_dir("fresh-s2");
+
+        let report = preflight(&config_dir).unwrap();
+
+        assert_eq!(report.source_format, ProviderStoreFormat::S2);
+        assert_eq!(report.target_format, ProviderStoreFormat::S2);
+        assert_eq!(report.provider_count, 0);
+        assert_eq!(report.ready_count, 0);
+        assert_eq!(report.blocked_count, 0);
+        assert!(report.runtime_plan_parity);
+        assert!(!report.can_apply);
+        assert_eq!(report.key_source, "file_will_be_created");
+        assert!(!providers_path(&config_dir).exists());
+        assert!(!config_dir.join("accounts.key").exists());
+
         fs::remove_dir_all(config_dir).unwrap();
     }
 

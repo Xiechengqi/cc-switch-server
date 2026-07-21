@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { providerRegistry } from "@/server/providerRegistry";
 import {
   createDraftForProfile,
+  providerPresetForProfile,
   readEndpoint,
   readUpstreamModel,
   setEndpoint,
@@ -65,6 +66,17 @@ describe("Server Provider profile drafts", () => {
     }
   });
 
+  it("has an icon-selector preset for every non-custom creatable profile", () => {
+    for (const profile of creatable.filter(
+      (item) => item.formComposition !== "custom",
+    )) {
+      expect(
+        providerPresetForProfile(profile),
+        profile.profileId,
+      ).toBeDefined();
+    }
+  });
+
   it("updates only canonical endpoint and model fields", () => {
     const settings: Record<string, unknown> = {
       env: {},
@@ -80,6 +92,18 @@ describe("Server Provider profile drafts", () => {
       mode: "single",
       upstreamModel: "model-x",
     });
+  });
+
+  it("reads fixed Codex endpoints from the structured TOML provider section", () => {
+    const profile = providerRegistry.profiles.find(
+      (item) => item.profileId === "codex.openrouter",
+    );
+    expect(profile).toBeDefined();
+
+    const draft = createDraftForProfile(profile!);
+    expect(readEndpoint(draft.settingsConfig, "codex")).toBe(
+      "https://openrouter.ai/api/v1",
+    );
   });
 
   it("materializes non-secret AWS defaults without credential placeholders", () => {

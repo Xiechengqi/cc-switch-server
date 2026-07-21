@@ -26,15 +26,11 @@
     ],
     "streamPaths": [
       "/web-api/events",
+      "/web-api/terminal/stream",
       "/web-api/admin/upgrade/stream",
       "/web-api/debug/upgrade/stream"
     ],
-    "deniedPrefixes": [
-      "/api/",
-      "/v1/",
-      "/_ctl/",
-      "/_share-router/"
-    ],
+    "deniedPrefixes": ["/api/", "/v1/", "/_ctl/", "/_share-router/"],
     "authentication": "authorization_header",
     "queryTokensAllowed": false
   },
@@ -53,7 +49,7 @@
     },
     {
       "id": "settings",
-      "label": "Settings, auth, router, backup"
+      "label": "Settings, auth, advanced routing, backup"
     },
     {
       "id": "accounts",

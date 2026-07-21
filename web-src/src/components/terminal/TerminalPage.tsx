@@ -9,7 +9,12 @@ import "@fontsource/source-code-pro/latin-400.css";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
-import { jsonFetch, readWebSessionToken } from "@/lib/runtime";
+import { jsonFetch } from "@/lib/runtime";
+import {
+  consumeAuthenticatedSse,
+  isAbortError,
+  type ServerSentEvent,
+} from "@/lib/sse";
 
 export interface TerminalPageProps {
   onBackHome: () => void;
@@ -17,9 +22,17 @@ export interface TerminalPageProps {
 
 type ConnState = "connecting" | "replaying" | "live" | "closed" | "error";
 
+type TerminalMessage = {
+  t?: string;
+  d?: string;
+  m?: string;
+};
+
 const MIN_FONT = 12;
 const MAX_FONT = 18;
 const TARGET_COLS = 100;
+const INPUT_BATCH_MS = 12;
+const RESIZE_DEBOUNCE_MS = 100;
 
 function encodeBytes(data: string | Uint8Array): string {
   const bytes =
@@ -40,17 +53,34 @@ function decodeBase64(data: string): Uint8Array {
   return out;
 }
 
-function buildWsUrl(token: string): string {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const url = new URL(`${protocol}//${window.location.host}/web-api/terminal/ws`);
-  url.searchParams.set("token", token);
-  return url.toString();
-}
-
 function computeFontSize(width: number): number {
   if (width <= 0) return 14;
   const estimated = Math.floor(width / (TARGET_COLS * 0.6));
   return Math.min(MAX_FONT, Math.max(MIN_FONT, estimated || 14));
+}
+
+function parseTerminalMessage(event: ServerSentEvent): TerminalMessage | null {
+  if (event.event !== "terminal") return null;
+  try {
+    return JSON.parse(event.data) as TerminalMessage;
+  } catch {
+    return null;
+  }
+}
+
+function readableError(error: unknown, fallback: string): string {
+  if (typeof error === "string" && error.trim()) return error.trim();
+  if (!(error instanceof Error) || !error.message.trim()) return fallback;
+  const message = error.message.trim();
+  if (message.startsWith("{")) {
+    try {
+      const payload = JSON.parse(message) as { error?: string; message?: string };
+      return payload.error || payload.message || fallback;
+    } catch {
+      return message;
+    }
+  }
+  return message;
 }
 
 export default function TerminalPage({ onBackHome }: TerminalPageProps) {
@@ -58,7 +88,9 @@ export default function TerminalPage({ onBackHome }: TerminalPageProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const streamReadyRef = useRef(false);
+  const requestResizeRef = useRef<(() => void) | null>(null);
   const disposedRef = useRef(false);
   const [connState, setConnState] = useState<ConnState>("connecting");
   const [error, setError] = useState<string | null>(null);
@@ -68,7 +100,6 @@ export default function TerminalPage({ onBackHome }: TerminalPageProps) {
     const term = termRef.current;
     const fit = fitRef.current;
     const host = hostRef.current;
-    const ws = wsRef.current;
     if (!term || !fit || !host) return;
     const nextFont = computeFontSize(host.clientWidth);
     if (term.options.fontSize !== nextFont) {
@@ -77,15 +108,15 @@ export default function TerminalPage({ onBackHome }: TerminalPageProps) {
     try {
       fit.fit();
     } catch {
-      // ignore fit races during unmount
+      return;
     }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ t: "rs", c: term.cols, r: term.rows }));
-    }
+    requestResizeRef.current?.();
   }, []);
 
   useEffect(() => {
     disposedRef.current = false;
+    streamReadyRef.current = false;
+    setError(null);
     const host = hostRef.current;
     if (!host) return;
 
@@ -93,7 +124,8 @@ export default function TerminalPage({ onBackHome }: TerminalPageProps) {
       convertEol: true,
       cursorBlink: true,
       scrollback: 1000,
-      fontFamily: '"Source Code Pro", ui-monospace, SFMono-Regular, Menlo, monospace',
+      fontFamily:
+        '"Source Code Pro", ui-monospace, SFMono-Regular, Menlo, monospace',
       fontSize: computeFontSize(host.clientWidth),
       theme: {
         background: "#f6f8fa",
@@ -124,102 +156,137 @@ export default function TerminalPage({ onBackHome }: TerminalPageProps) {
     termRef.current = term;
     fitRef.current = fit;
 
-    const token = readWebSessionToken();
-    if (!token) {
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    let inputBuffer = "";
+    let inputTimer: number | null = null;
+    let inputSending = false;
+    let resizeTimer: number | null = null;
+
+    const failConnection = (cause: unknown) => {
+      if (disposedRef.current || controller.signal.aborted) return;
+      streamReadyRef.current = false;
       setConnState("error");
-      setError(t("terminal.authRequired"));
-      return () => {
-        disposedRef.current = true;
-        term.dispose();
-        termRef.current = null;
-        fitRef.current = null;
-      };
-    }
-
-    const ws = new WebSocket(buildWsUrl(token));
-    wsRef.current = ws;
-    setConnState("connecting");
-
-    ws.onopen = () => {
-      if (disposedRef.current) return;
-      setConnState("replaying");
-      fitAndResize();
+      setError(readableError(cause, t("terminal.connectionFailed")));
+      controller.abort();
     };
 
-    ws.onmessage = (event) => {
-      if (disposedRef.current || typeof event.data !== "string") return;
-      let message: { t?: string; d?: string; m?: string };
+    const flushInput = async () => {
+      if (inputSending || !streamReadyRef.current || !inputBuffer) return;
+      inputSending = true;
       try {
-        message = JSON.parse(event.data) as { t?: string; d?: string; m?: string };
-      } catch {
-        return;
+        while (
+          inputBuffer &&
+          streamReadyRef.current &&
+          !controller.signal.aborted
+        ) {
+          const data = inputBuffer;
+          inputBuffer = "";
+          await jsonFetch("/web-api/terminal/input", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ d: encodeBytes(data) }),
+            signal: controller.signal,
+          });
+        }
+      } catch (cause) {
+        if (!isAbortError(cause)) failConnection(cause);
+      } finally {
+        inputSending = false;
       }
+    };
+
+    const scheduleInput = (data: string) => {
+      if (!streamReadyRef.current || controller.signal.aborted) return;
+      inputBuffer += data;
+      if (inputSending || inputTimer !== null) return;
+      inputTimer = window.setTimeout(() => {
+        inputTimer = null;
+        void flushInput();
+      }, INPUT_BATCH_MS);
+    };
+
+    requestResizeRef.current = () => {
+      if (!streamReadyRef.current || controller.signal.aborted) return;
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = null;
+        void jsonFetch("/web-api/terminal/resize", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ c: term.cols, r: term.rows }),
+          signal: controller.signal,
+        }).catch((cause) => {
+          if (!isAbortError(cause)) failConnection(cause);
+        });
+      }, RESIZE_DEBOUNCE_MS);
+    };
+
+    const handleEvent = (event: ServerSentEvent) => {
+      if (disposedRef.current) return;
+      const message = parseTerminalMessage(event);
+      if (!message) return;
       switch (message.t) {
         case "rb":
           setConnState("replaying");
           break;
         case "re":
+          streamReadyRef.current = true;
           setConnState("live");
           fitAndResize();
           break;
         case "out":
-          if (message.d) {
-            term.write(decodeBase64(message.d));
-          }
-          break;
-        case "pong":
+          if (message.d) term.write(decodeBase64(message.d));
           break;
         case "exit":
+          streamReadyRef.current = false;
           setConnState("closed");
           term.writeln("");
           term.writeln(t("terminal.sessionEnded"));
           break;
         case "err":
-          setConnState("error");
-          setError(message.m || t("terminal.unknownError"));
+          failConnection(message.m || t("terminal.unknownError"));
           break;
         default:
           break;
       }
     };
 
-    ws.onerror = () => {
-      if (disposedRef.current) return;
-      setConnState("error");
-      setError(t("terminal.connectionFailed"));
-    };
+    setConnState("connecting");
+    void consumeAuthenticatedSse("/web-api/terminal/stream", {
+      signal: controller.signal,
+      onEvent: handleEvent,
+    })
+      .then(() => {
+        if (disposedRef.current || controller.signal.aborted) return;
+        streamReadyRef.current = false;
+        setConnState("closed");
+      })
+      .catch((cause) => {
+        if (!isAbortError(cause)) failConnection(cause);
+      });
 
-    ws.onclose = () => {
-      if (disposedRef.current) return;
-      setConnState((prev) => (prev === "error" ? prev : "closed"));
-      wsRef.current = null;
-    };
-
-    const dataSub = term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ t: "in", d: encodeBytes(data) }));
-      }
-    });
-
+    const dataSub = term.onData(scheduleInput);
     const ro = new ResizeObserver(() => {
       window.clearTimeout((ro as unknown as { _timer?: number })._timer);
       (ro as unknown as { _timer?: number })._timer = window.setTimeout(() => {
         fitAndResize();
-      }, 100);
+      }, RESIZE_DEBOUNCE_MS);
     });
     ro.observe(host);
     window.addEventListener("resize", fitAndResize);
 
     return () => {
       disposedRef.current = true;
+      streamReadyRef.current = false;
+      controller.abort();
       window.removeEventListener("resize", fitAndResize);
       ro.disconnect();
       dataSub.dispose();
-      // Detach only: close WS, keep server PTY alive.
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+      if (inputTimer !== null) window.clearTimeout(inputTimer);
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer);
+      requestResizeRef.current = null;
+      streamAbortRef.current = null;
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -230,12 +297,13 @@ export default function TerminalPage({ onBackHome }: TerminalPageProps) {
     setEnding(true);
     try {
       await jsonFetch("/web-api/terminal/session/end", { method: "POST" });
-      wsRef.current?.close();
+      streamReadyRef.current = false;
+      streamAbortRef.current?.abort();
       setConnState("closed");
       termRef.current?.writeln("");
       termRef.current?.writeln(t("terminal.sessionEnded"));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : t("terminal.unknownError"));
+    } catch (cause) {
+      setError(readableError(cause, t("terminal.unknownError")));
     } finally {
       setEnding(false);
     }
@@ -275,7 +343,7 @@ export default function TerminalPage({ onBackHome }: TerminalPageProps) {
           <ArrowLeft className="h-4 w-4" />
           {t("terminal.backHome")}
         </Button>
-        <div className="min-w-0 flex-1 text-sm text-muted-foreground truncate">
+        <div className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
           {t("terminal.subtitle")} · {statusLabel}
         </div>
         <Button

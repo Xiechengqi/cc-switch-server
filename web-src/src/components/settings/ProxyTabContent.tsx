@@ -11,7 +11,11 @@ import { Badge } from "@/components/ui/badge";
 import { ProxyPanel } from "@/components/proxy";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 
-export function ProxyTabContent() {
+export function ProxyTabContent({
+  defaultOpen = true,
+}: {
+  defaultOpen?: boolean;
+}) {
   const { t } = useTranslation();
   const { isRunning } = useProxyStatus();
 
@@ -21,7 +25,11 @@ export function ProxyTabContent() {
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.3 }}
     >
-      <Accordion type="single" collapsible defaultValue="proxy">
+      <Accordion
+        type="single"
+        collapsible
+        defaultValue={defaultOpen ? "proxy" : undefined}
+      >
         <AccordionItem
           value="proxy"
           className="overflow-hidden rounded-lg glass-card"

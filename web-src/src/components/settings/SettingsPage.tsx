@@ -58,7 +58,10 @@ import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySett
 import { ServerUpgradePolicySettings } from "@/components/settings/ServerUpgradePolicySettings";
 import { ServerVersionSettings } from "@/components/settings/ServerVersionSettings";
 import { ServerConfigDirSettings } from "@/components/settings/ServerConfigDirSettings";
-import { ShareSettingsTab, type ShareSettingsSaveState } from "@/components/settings/ShareSettingsTab";
+import {
+  ShareSettingsTab,
+  type ShareSettingsSaveState,
+} from "@/components/settings/ShareSettingsTab";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useTranslation } from "react-i18next";
@@ -116,14 +119,16 @@ export function SettingsPage({
   useEffect(() => {
     if (open) {
       const normalizedTab =
-        defaultTab === "router" || defaultTab === "diagnostics"
-          ? "share"
-          : defaultTab === "tunnel" || defaultTab === "backup"
-            ? "advanced"
-            : defaultTab;
+        defaultTab === "proxy" && serverMode
+          ? "advanced"
+          : defaultTab === "router" || defaultTab === "diagnostics"
+            ? "share"
+            : defaultTab === "tunnel" || defaultTab === "backup"
+              ? "advanced"
+              : defaultTab;
       setActiveTab(normalizedTab);
     }
-  }, [open, defaultTab]);
+  }, [open, defaultTab, serverMode]);
 
   useEffect(() => {
     if (requiresRestart) {
@@ -218,7 +223,12 @@ export function SettingsPage({
   const isBusy = useMemo(() => isLoading && !settings, [isLoading, settings]);
 
   return (
-    <div className={cn("flex flex-col h-full overflow-hidden", PAGE_SHELL_PADDING_X)}>
+    <div
+      className={cn(
+        "flex flex-col h-full overflow-hidden",
+        PAGE_SHELL_PADDING_X,
+      )}
+    >
       {isBusy ? (
         <div className="flex flex-1 items-center justify-center">
           <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -230,15 +240,14 @@ export function SettingsPage({
           className="flex flex-col h-full"
         >
           <TabsList
-            className={cn(
-              "grid w-full mb-6 glass rounded-lg",
-              serverMode ? "grid-cols-6" : "grid-cols-5",
-            )}
+            className={cn("grid w-full mb-6 glass rounded-lg", "grid-cols-5")}
           >
             <TabsTrigger value="general">
               {t("settings.tabGeneral")}
             </TabsTrigger>
-            <TabsTrigger value="proxy">{t("settings.tabProxy")}</TabsTrigger>
+            {!serverMode ? (
+              <TabsTrigger value="proxy">{t("settings.tabProxy")}</TabsTrigger>
+            ) : null}
             <TabsTrigger value="auth">
               {t("settings.tabAuth", { defaultValue: "认证" })}
             </TabsTrigger>
@@ -327,11 +336,11 @@ export function SettingsPage({
                 )}
               </TabsContent>
 
-              <TabsContent value="proxy" className="space-y-6 mt-0 pb-4">
-                {settings ? (
-                  <ProxyTabContent />
-                ) : null}
-              </TabsContent>
+              {!serverMode ? (
+                <TabsContent value="proxy" className="space-y-6 mt-0 pb-4">
+                  {settings ? <ProxyTabContent /> : null}
+                </TabsContent>
+              ) : null}
 
               <TabsContent value="auth" className="space-y-6 mt-0 pb-4">
                 <motion.div
@@ -364,6 +373,9 @@ export function SettingsPage({
                     transition={{ duration: 0.3 }}
                     className="space-y-4"
                   >
+                    {serverMode ? (
+                      <ProxyTabContent defaultOpen={false} />
+                    ) : null}
                     <Accordion
                       type="multiple"
                       defaultValue={[]}
@@ -390,7 +402,9 @@ export function SettingsPage({
                                       defaultValue:
                                         "持久化数据目录（监听地址由启动参数配置）",
                                     })
-                                  : t("settings.advanced.configDir.description")}
+                                  : t(
+                                      "settings.advanced.configDir.description",
+                                    )}
                               </p>
                             </div>
                           </div>
@@ -399,9 +413,7 @@ export function SettingsPage({
                           {serverMode ? (
                             <ServerConfigDirSettings
                               configDir={
-                                appConfigDir ??
-                                resolvedDirs.appConfig ??
-                                ""
+                                appConfigDir ?? resolvedDirs.appConfig ?? ""
                               }
                             />
                           ) : (
@@ -459,32 +471,32 @@ export function SettingsPage({
                       </AccordionItem>
 
                       {!serverMode ? (
-                      <AccordionItem
-                        value="cloudSync"
-                        className="rounded-xl glass-card overflow-hidden"
-                      >
-                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                          <div className="flex items-center gap-3">
-                            <Cloud className="h-5 w-5 text-blue-500" />
-                            <div className="text-left">
-                              <h3 className="text-base font-semibold">
-                                {t("settings.advanced.cloudSync.title")}
-                              </h3>
-                              <p className="text-sm text-muted-foreground font-normal">
-                                {t("settings.advanced.cloudSync.description")}
-                              </p>
+                        <AccordionItem
+                          value="cloudSync"
+                          className="rounded-xl glass-card overflow-hidden"
+                        >
+                          <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                            <div className="flex items-center gap-3">
+                              <Cloud className="h-5 w-5 text-blue-500" />
+                              <div className="text-left">
+                                <h3 className="text-base font-semibold">
+                                  {t("settings.advanced.cloudSync.title")}
+                                </h3>
+                                <p className="text-sm text-muted-foreground font-normal">
+                                  {t("settings.advanced.cloudSync.description")}
+                                </p>
+                              </div>
                             </div>
-                          </div>
-                        </AccordionTrigger>
-                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-                          <WebdavSyncSection
-                            config={settings?.webdavSync}
-                            s3Config={settings?.s3Sync}
-                            settings={settings}
-                            onAutoSave={handleAutoSave}
-                          />
-                        </AccordionContent>
-                      </AccordionItem>
+                          </AccordionTrigger>
+                          <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                            <WebdavSyncSection
+                              config={settings?.webdavSync}
+                              s3Config={settings?.s3Sync}
+                              settings={settings}
+                              onAutoSave={handleAutoSave}
+                            />
+                          </AccordionContent>
+                        </AccordionItem>
                       ) : null}
 
                       <AccordionItem
@@ -597,7 +609,9 @@ export function SettingsPage({
                 <div className="flex items-center justify-end gap-3">
                   <Button
                     onClick={() => void shareSaveState.save()}
-                    disabled={!shareSaveState.canSave || shareSaveState.isSaving}
+                    disabled={
+                      !shareSaveState.canSave || shareSaveState.isSaving
+                    }
                   >
                     {shareSaveState.isSaving ? (
                       <span className="inline-flex items-center gap-2">

@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use super::options::TerminalRuntimeOptions;
-use super::session::{next_generation, TerminalSession};
+use super::session::{next_generation, SessionCommand, TerminalSession};
 
 #[derive(Clone, Default)]
 pub struct OpsTerminalManager {
@@ -23,6 +23,13 @@ impl std::fmt::Debug for OpsTerminalManager {
 pub(crate) enum AttachError {
     Busy { owner: String },
     Spawn(String),
+}
+
+#[derive(Debug)]
+pub(crate) enum SessionAccessError {
+    NotActive,
+    Busy { owner: String },
+    Closed,
 }
 
 impl OpsTerminalManager {
@@ -53,6 +60,30 @@ impl OpsTerminalManager {
                 Some(session.owner.clone())
             }
         })
+    }
+
+    pub(crate) async fn request_for_owner(
+        &self,
+        owner: &str,
+        command: SessionCommand,
+    ) -> Result<(), SessionAccessError> {
+        let mut guard = self.session.lock().await;
+        let Some(session) = guard.as_ref() else {
+            return Err(SessionAccessError::NotActive);
+        };
+        if session.is_dead() {
+            session.kill();
+            *guard = None;
+            return Err(SessionAccessError::NotActive);
+        }
+        if session.owner != owner {
+            return Err(SessionAccessError::Busy {
+                owner: session.owner.clone(),
+            });
+        }
+        session
+            .request(command)
+            .map_err(|_| SessionAccessError::Closed)
     }
 
     pub(crate) async fn attach_or_create(

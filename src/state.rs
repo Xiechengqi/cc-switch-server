@@ -4845,6 +4845,9 @@ const ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS: u64 = 5;
 const ROUTER_HEARTBEAT_UNREGISTERED_MAX_RETRY_SECS: u64 = 5 * 60;
 const ROUTER_HEARTBEAT_WARNING_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const ROUTER_HEARTBEAT_ENDPOINT_WARNING_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const PUBLIC_IP_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const PUBLIC_IP_RETRY_INITIAL: Duration = Duration::from_secs(30);
+const PUBLIC_IP_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
 const ROUTER_HEARTBEAT_SUSTAINED_FAILURES: u32 = 3;
 const ROUTER_HEARTBEAT_STATE_ERROR_MAX_CHARS: usize = 2 * 1024;
 
@@ -4876,16 +4879,36 @@ pub fn spawn_installation_heartbeat(state: ServerState) {
 
 pub fn spawn_public_ip_discovery(state: ServerState) {
     tokio::spawn(async move {
-        let http = state.http_client().await;
-        match crate::infra::public_ip::discover_public_ipv4(&http).await {
-            Some(ip) => {
-                tracing::info!(%ip, "discovered public IPv4 for router client display");
-                state.set_reported_public_ip(Some(ip)).await;
-            }
-            None => {
-                tracing::warn!(
-                    "public IPv4 discovery failed on all endpoints; keeping previous value if any"
-                );
+        let mut retry_delay = PUBLIC_IP_RETRY_INITIAL;
+        let mut failure_warned = false;
+        loop {
+            let http = state.http_client().await;
+            match crate::infra::public_ip::discover_public_ipv4(&http).await {
+                Some(ip) => {
+                    if state.reported_public_ip().await.as_deref() != Some(ip.as_str()) {
+                        tracing::info!(%ip, "discovered public IPv4 for router client display");
+                        state.set_reported_public_ip(Some(ip)).await;
+                    }
+                    retry_delay = PUBLIC_IP_RETRY_INITIAL;
+                    failure_warned = false;
+                    sleep(PUBLIC_IP_REFRESH_INTERVAL).await;
+                }
+                None => {
+                    if failure_warned {
+                        tracing::debug!(
+                            retry_secs = retry_delay.as_secs(),
+                            "public IPv4 discovery still unavailable"
+                        );
+                    } else {
+                        tracing::warn!(
+                            retry_secs = retry_delay.as_secs(),
+                            "public IPv4 discovery failed on all endpoints; keeping the last router-observed IP until retry"
+                        );
+                        failure_warned = true;
+                    }
+                    sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(PUBLIC_IP_RETRY_MAX);
+                }
             }
         }
     });

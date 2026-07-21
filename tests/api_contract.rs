@@ -2987,7 +2987,7 @@ async fn web_terminal_routes_can_be_disabled_explicitly() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/web-api/terminal/ws")
+                .uri("/web-api/terminal/stream")
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -3008,6 +3008,96 @@ async fn web_terminal_routes_can_be_disabled_explicitly() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn web_terminal_uses_authenticated_http_stream_and_controls() {
+    let app = app_router(test_state());
+    let token = setup_and_login(&app).await;
+
+    let anonymous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/web-api/terminal/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let before_attach = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/terminal/input",
+            json!({ "d": "Cg==" }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(before_attach.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(before_attach).await["code"].as_str(),
+        Some("terminal_not_active")
+    );
+
+    let stream = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/web-api/terminal/stream")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert!(stream
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream")));
+
+    let input = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/terminal/input",
+            json!({ "d": "cHJpbnRmICd0ZXJtaW5hbC10cmFuc3BvcnQnCg==" }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(input.status(), StatusCode::OK);
+
+    let resize = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/terminal/resize",
+            json!({ "c": 120, "r": 40 }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resize.status(), StatusCode::OK);
+
+    drop(stream);
+    let ended = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/terminal/session/end",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ended.status(), StatusCode::OK);
 }
 
 #[tokio::test]

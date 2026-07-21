@@ -141,6 +141,12 @@ body {
   color: hsl(var(--foreground));
 }
 
+input::placeholder,
+textarea::placeholder {
+  color: hsl(var(--muted-foreground) / 0.55) !important;
+  opacity: 1;
+}
+
 html.dark {
   color-scheme: dark;
 }
