@@ -418,6 +418,7 @@ mod tests {
         };
         let providers = ProviderStore {
             providers: vec![provider],
+            ..Default::default()
         };
 
         let summary = summary_for_share(&share, &providers, None, Some(&usage));
@@ -445,6 +446,7 @@ mod tests {
         };
         let providers = ProviderStore {
             providers: vec![provider],
+            ..Default::default()
         };
 
         let summary = summary_for_share(&share, &providers, None, Some(&usage));
@@ -468,11 +470,14 @@ mod tests {
         let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::CodexOAuth);
         let providers = ProviderStore {
             providers: vec![provider],
+            ..Default::default()
         };
         let accounts = AccountStore {
             accounts: vec![Account {
                 id: "acct-1".to_string(),
                 provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+                token_refresh_generation: 1,
                 email: Some("owner@example.com".to_string()),
                 access_token: Some("token".to_string()),
                 refresh_token: None,
@@ -528,6 +533,7 @@ mod tests {
         };
         let providers = ProviderStore {
             providers: vec![provider],
+            ..Default::default()
         };
 
         let first = summary_for_share(&share, &providers, None, Some(&usage));
@@ -573,6 +579,7 @@ mod tests {
         };
         let providers = ProviderStore {
             providers: vec![provider],
+            ..Default::default()
         };
 
         let summary = summary_for_share(&share, &providers, None, Some(&usage));
@@ -612,6 +619,7 @@ mod tests {
         };
         let providers = ProviderStore {
             providers: vec![provider],
+            ..Default::default()
         };
 
         let summary = summary_for_share(&share, &providers, None, Some(&usage));
@@ -644,6 +652,7 @@ mod tests {
             },
             provider_type,
             provider_type_id: provider_type.as_str().to_string(),
+            resource: Default::default(),
         }
     }
 
@@ -697,6 +706,10 @@ mod tests {
             router_url: None,
             config_revision: 0,
             router_synced_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: None,
+            router_synced_descriptor_generation: 0,
+            router_synced_descriptor_fingerprint: None,
             user_grants: BTreeMap::new(),
         }
     }

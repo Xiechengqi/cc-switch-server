@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = "0.3"
 flate2 = "1"
+fs2 = "0.4"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
@@ -27,11 +28,12 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client-legacy"] }
 hex = "0.4"
 hmac = "0.12"
+hkdf = "0.12"
 jsonwebtoken = "9"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "socks", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 russh = { version = "0.46", default-features = false, features = ["flate2"] }
 serde = { version = "1", features = ["derive"] }
@@ -41,10 +43,14 @@ sha3 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots"] }
+toml = "0.8"
+url = "2"
 tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
 twox-hash = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = { version = "1", features = ["derive"] }
+portable-pty = "0.8"
 
 [dev-dependencies]
 tower = "0.5"

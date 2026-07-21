@@ -1,6 +1,5 @@
 use std::convert::Infallible;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod web;
 
@@ -22,6 +21,7 @@ pub(crate) mod session;
 pub(in crate::api) mod settings;
 pub(in crate::api) mod shares;
 pub(in crate::api) mod subscription_quota;
+pub(crate) mod terminal;
 pub(in crate::api) mod types;
 pub(in crate::api) mod usage;
 
@@ -106,7 +106,6 @@ use crate::domain::accounts::oauth::{
 use crate::domain::accounts::store::{
     Account, AccountRefreshUpdate, AccountStore, UpsertAccountInput,
 };
-use crate::domain::failover::UpdateFailoverAppInput;
 use crate::domain::providers::current_provider;
 use crate::domain::providers::model::{
     classify_provider_response, AppKind, Provider, ProviderType, ProviderTypeRequest,
@@ -114,7 +113,7 @@ use crate::domain::providers::model::{
 };
 use crate::domain::providers::store::{ProviderSortUpdate, StoredProvider};
 use crate::domain::settings::config::{
-    ServerConfig, UpdateClientTunnelInput, UpdateRouterConfigInput, UpdateUpstreamProxyInput,
+    ServerConfig, UpdateClientTunnelInput, UpdateRouterConfigInput,
 };
 use crate::domain::settings::ui_settings;
 use crate::domain::sharing::shares::{
@@ -207,19 +206,24 @@ pub fn app_router(state: ServerState) -> Router {
             "/.well-known/cc-switch/payout-profile",
             get(public_payout_profile),
         )
-        .route(
-            "/api/upstream-proxy",
-            get(upstream_proxy).put(update_upstream_proxy),
-        )
         .route("/api/providers", get(list_providers).post(create_provider))
+        .route(
+            "/api/providers/:id",
+            get(get_provider)
+                .patch(update_provider)
+                .delete(delete_provider),
+        )
         .route("/api/providers/export", get(export_providers))
         .route("/api/providers/import", post(import_providers))
-        .route("/api/providers/health", get(provider_health))
-        .route("/api/failover", get(failover_snapshot))
-        .route("/api/failover/apps/:app", put(update_failover_app))
         .route(
-            "/api/failover/providers/:provider_id/reset",
-            post(reset_failover_provider),
+            "/api/providers/account-bindings/migration",
+            get(preview_provider_account_binding_migration)
+                .post(apply_provider_account_binding_migration),
+        )
+        .route("/api/providers/health", get(provider_health))
+        .route(
+            "/api/providers/storage-migration",
+            get(provider_storage_migration),
         )
         .route("/api/providers/test", post(test_providers))
         .route("/api/providers/:id/test", post(test_provider))
@@ -228,10 +232,27 @@ pub fn app_router(state: ServerState) -> Router {
             post(fetch_provider_models),
         )
         .route(
+            "/api/providers/:id/delete-preview",
+            get(provider_delete_preview),
+        )
+        .route(
+            "/api/providers/:id/adopt-profile",
+            post(adopt_provider_profile),
+        )
+        .route(
+            "/api/providers/:id/rebind-custom",
+            post(rebind_custom_provider),
+        )
+        .route(
+            "/api/providers/:id/clone-as-custom",
+            post(clone_provider_as_custom),
+        )
+        .route(
             "/api/providers/from-preset",
             post(create_provider_from_preset),
         )
         .route("/api/provider-presets", get(provider_presets))
+        .route("/api/provider-registry", get(provider_registry))
         .route("/api/provider-coverage", get(provider_coverage))
         .route("/api/provider-matrix", get(provider_matrix))
         .route("/api/provider-type", post(provider_type))
@@ -314,6 +335,10 @@ pub fn app_router(state: ServerState) -> Router {
             post(cancel_grok_device_login),
         )
         .route("/api/accounts/:id", delete(delete_account))
+        .route(
+            "/api/accounts/:id/delete-preview",
+            get(account_delete_preview),
+        )
         .route(
             "/api/accounts/:id/claude/credentials",
             get(export_claude_credentials),
@@ -421,6 +446,14 @@ pub fn app_router(state: ServerState) -> Router {
         )
         .route("/web-api/context", get(web_runtime_context))
         .route("/web-api/invoke/*command", post(web_invoke_compat))
+        .route(
+            "/web-api/terminal/ws",
+            get(crate::api::terminal::terminal_ws),
+        )
+        .route(
+            "/web-api/terminal/session/end",
+            post(crate::api::terminal::terminal_session_end),
+        )
         .route("/web-api/events", get(events))
         .route("/web-api/debug/runtime", get(debug_runtime))
         .route("/web-api/debug/diagnostics", get(debug_diagnostics))
@@ -773,6 +806,7 @@ async fn web_runtime_context(
             "status": "setup-required",
             "permissions": ["setup"],
             "apps": ["claude", "codex", "gemini"],
+            "providerContract": provider_contract_context(),
             "auth": {
                 "authenticated": false,
                 "setupRequired": true,
@@ -805,6 +839,7 @@ async fn web_runtime_context(
         "status": "authenticated",
         "permissions": ["admin", "providers", "shares", "usage", "settings", "accounts"],
         "apps": ["claude", "codex", "gemini"],
+        "providerContract": provider_contract_context(),
         "auth": {
             "authenticated": true,
             "setupRequired": false,
@@ -820,7 +855,8 @@ async fn web_runtime_context(
         "runtime": {
             "configDir": state.config_dir.display().to_string(),
             "webDistDir": state.web_dist_dir.as_ref().map(|path| path.display().to_string()),
-            "embeddedWebAssets": web_assets::asset_count()
+            "embeddedWebAssets": web_assets::asset_count(),
+            "enableWebTerminal": config.is_web_terminal_enabled()
         },
         "features": {
             "retained": contract.retained_features,
@@ -832,6 +868,14 @@ async fn web_runtime_context(
             "allowed": contract.ui_automation_allowed
         }
     })))
+}
+
+fn provider_contract_context() -> Value {
+    json!({
+        "version": web_runtime::PROVIDER_CONTRACT_VERSION,
+        "minSupported": web_runtime::PROVIDER_CONTRACT_MIN_SUPPORTED,
+        "maxSupported": web_runtime::PROVIDER_CONTRACT_MAX_SUPPORTED,
+    })
 }
 
 async fn proxy_claude_messages(
@@ -1047,10 +1091,6 @@ fn oauth_login_api_error(error: OAuthLoginError) -> ApiError {
         | OAuthLoginError::InvalidTransition) => ApiError::conflict(error.to_string()),
         OAuthLoginError::NotFound => ApiError::not_found(error.to_string()),
     }
-}
-
-fn provider_test_timeout(timeout_ms: Option<u64>) -> Duration {
-    Duration::from_millis(timeout_ms.filter(|value| *value > 0).unwrap_or(15_000))
 }
 
 fn normalize_share_market_grant(

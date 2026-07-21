@@ -5,7 +5,6 @@ import {
   modelTestProvider,
   type StreamCheckResult,
 } from "@/lib/api/model-test";
-import { useResetCircuitBreaker } from "@/lib/query/failover";
 import type { AppId } from "@/lib/api";
 
 /**
@@ -17,7 +16,6 @@ import type { AppId } from "@/lib/api";
 export function useModelTest(appId: AppId) {
   const { t } = useTranslation();
   const [testingIds, setTestingIds] = useState<Set<string>>(new Set());
-  const resetCircuitBreaker = useResetCircuitBreaker();
 
   const testProvider = useCallback(
     async (
@@ -38,7 +36,6 @@ export function useModelTest(appId: AppId) {
             }),
             { closeButton: true },
           );
-          resetCircuitBreaker.mutate({ providerId, appType: appId });
         } else if (result.status === "degraded") {
           toast.warning(
             t("streamCheck.degraded", {
@@ -47,7 +44,6 @@ export function useModelTest(appId: AppId) {
               defaultValue: `${providerName} 模型可用但较慢 (${result.responseTimeMs}ms)`,
             }),
           );
-          resetCircuitBreaker.mutate({ providerId, appType: appId });
         } else if (result.errorCategory === "modelNotFound") {
           toast.error(
             t("streamCheck.modelNotFound", {
@@ -139,7 +135,7 @@ export function useModelTest(appId: AppId) {
         });
       }
     },
-    [appId, resetCircuitBreaker, t],
+    [appId, t],
   );
 
   const isTesting = useCallback(

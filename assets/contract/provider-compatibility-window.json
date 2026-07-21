@@ -1,0 +1,158 @@
+{
+  "schemaVersion": 1,
+  "authority": "phase-10-provider-compatibility-window",
+  "policy": {
+    "decision": "retain",
+    "minimumStableReleases": 2,
+    "minimumObservationDays": 14,
+    "observationStartedAt": null,
+    "observedStableReleases": [],
+    "removalEligible": false,
+    "reason": "No stable bridge release observation has been recorded; deleting S1 or older-Web readers would violate the Provider migration rollback contract."
+  },
+  "currentSourceEvidence": [
+    {
+      "path": "src/api/mod.rs",
+      "sha256": "b19b5d06ff57ebd30e3c02a1d05b620f1e8881b1ab70706a240c7814bdc936a2"
+    },
+    {
+      "path": "src/api/providers.rs",
+      "sha256": "404b7d46f1d49c05a0bb5447e476ffe09060668945a65793f2915e7853f25e54"
+    },
+    {
+      "path": "src/domain/providers/credentials.rs",
+      "sha256": "abf26766620d5ce9f5818cd72270911752e0f42a7b655947f2c11ce63aa99fda"
+    },
+    {
+      "path": "src/domain/providers/model.rs",
+      "sha256": "86b3199578137b06e42233ad758db01eea0176ef9d36056713610e733b1dbd1c"
+    },
+    {
+      "path": "src/domain/providers/model_routing.rs",
+      "sha256": "62ac646ebce876205c6a558e877b68cfbf5d135968a915e4a8484a977e290569"
+    },
+    {
+      "path": "src/domain/providers/runtime.rs",
+      "sha256": "ebc86a33e2c0495f9451ce80e4cc22afb1ede80a7a29dbed4c75a5dcf38baa35"
+    },
+    {
+      "path": "src/domain/providers/store.rs",
+      "sha256": "6632d367dbc3ff218f8a6bda69c978e34f26e191f12a33ad139eb9edbf992849"
+    }
+  ],
+  "entries": [
+    {
+      "id": "s1-store-decoder",
+      "kind": "reader",
+      "source": "src/domain/providers/store.rs",
+      "marker": "pub fn load_or_default",
+      "heuristicInputs": [],
+      "boundary": "Decodes only an unguarded S1 providers.json; guarded S2 uses the strict S2 decoder.",
+      "status": "retained_until_release_window",
+      "removalGate": "two_stable_releases_and_14_days"
+    },
+    {
+      "id": "legacy-provider-classifier",
+      "kind": "reader",
+      "source": "src/domain/providers/model.rs",
+      "marker": "pub fn classify_provider",
+      "heuristicInputs": [
+        "name",
+        "endpoint_url",
+        "meta.providerType",
+        "meta.apiFormat"
+      ],
+      "boundary": "Used only for S1/no-profile and legacy_compat classification; fixed and custom Profiles use canonical Registry identity.",
+      "status": "retained_until_release_window",
+      "removalGate": "two_stable_releases_and_14_days"
+    },
+    {
+      "id": "legacy-model-routing-normalizer",
+      "kind": "reader",
+      "source": "src/domain/providers/model_routing.rs",
+      "marker": "normalize_provider_model_routing",
+      "heuristicInputs": [
+        "name",
+        "endpoint_url",
+        "meta.providerType",
+        "legacy_config"
+      ],
+      "boundary": "Builds the in-memory S1 compatibility runtime view and never writes during load.",
+      "status": "retained_until_release_window",
+      "removalGate": "two_stable_releases_and_14_days"
+    },
+    {
+      "id": "legacy-runtime-driver-resolver",
+      "kind": "reader",
+      "source": "src/domain/providers/runtime.rs",
+      "marker": "fn legacy_driver_id",
+      "heuristicInputs": [
+        "name",
+        "meta.apiFormat",
+        "providerType"
+      ],
+      "boundary": "Selected only for no-profile/legacy compatibility execution; typed Profiles dispatch by driverId.",
+      "status": "retained_until_release_window",
+      "removalGate": "two_stable_releases_and_14_days"
+    },
+    {
+      "id": "legacy-profile-adoption-hint",
+      "kind": "reader",
+      "source": "src/domain/providers/credentials.rs",
+      "marker": "legacy name matching is only an adoption hint",
+      "heuristicInputs": [
+        "name"
+      ],
+      "boundary": "Suggests an explicit reviewed adoption action and never mutates Provider identity automatically.",
+      "status": "retained_until_release_window",
+      "removalGate": "two_stable_releases_and_14_days"
+    },
+    {
+      "id": "preset-name-create-fallback",
+      "kind": "request_compatibility",
+      "source": "src/api/providers.rs",
+      "marker": "profileId is required to create a Provider from a preset",
+      "heuristicInputs": [
+        "name"
+      ],
+      "boundary": "Older Web requests may omit profileId; the fallback resolves a Registry mapping before the typed command.",
+      "status": "retained_until_release_window",
+      "removalGate": "two_stable_releases_and_14_days"
+    },
+    {
+      "id": "provider-presets-endpoint",
+      "kind": "endpoint",
+      "source": "src/api/providers.rs",
+      "marker": "async fn provider_presets",
+      "heuristicInputs": [],
+      "boundary": "Deprecated shape generated from Registry identity for older Web clients; it is not a runtime authority.",
+      "status": "retained_until_release_window",
+      "removalGate": "two_stable_releases_and_14_days"
+    },
+    {
+      "id": "provider-matrix-endpoint",
+      "kind": "endpoint",
+      "source": "src/api/mod.rs",
+      "marker": "async fn provider_matrix",
+      "heuristicInputs": [],
+      "boundary": "Compatibility diagnostics only; the Registry is the authoritative list of creatable Profiles.",
+      "status": "retained_until_release_window",
+      "removalGate": "two_stable_releases_and_14_days"
+    },
+    {
+      "id": "provider-type-endpoint",
+      "kind": "endpoint",
+      "source": "src/api/mod.rs",
+      "marker": "async fn provider_type",
+      "heuristicInputs": [
+        "name",
+        "endpoint_url",
+        "meta.providerType",
+        "meta.apiFormat"
+      ],
+      "boundary": "Legacy classification diagnostics only; typed Provider writes cannot use it to choose identity.",
+      "status": "retained_until_release_window",
+      "removalGate": "two_stable_releases_and_14_days"
+    }
+  ]
+}

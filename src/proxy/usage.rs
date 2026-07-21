@@ -212,7 +212,7 @@ mod tests {
         state.replace_config(config).await.unwrap();
 
         let stored = state
-            .mutate_providers(|providers| {
+            .mutate_providers_immediate(|providers| {
                 providers.upsert(
                     AppKind::Codex,
                     Provider {
@@ -225,7 +225,8 @@ mod tests {
                     },
                 )
             })
-            .await;
+            .await
+            .unwrap();
         state
             .mutate_shares_immediate(|shares| {
                 shares

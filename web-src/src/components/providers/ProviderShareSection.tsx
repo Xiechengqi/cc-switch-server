@@ -6,6 +6,7 @@ import {
   Copy,
   ExternalLink,
   Loader2,
+  Save,
   Share2,
   X,
 } from "lucide-react";
@@ -118,11 +119,8 @@ interface ProviderShareSectionProps {
   providerId: string;
   providerName: string;
   onOpenShareSettings?: () => void;
-  onSaveHandlerChange?: (handler: ProviderShareSaveHandler | null) => void;
   onDirtyChange?: (dirty: boolean) => void;
 }
-
-export type ProviderShareSaveHandler = () => Promise<boolean>;
 
 function shareStateLabel(
   state: ProviderShareState,
@@ -161,7 +159,6 @@ export function ProviderShareSection({
   providerId,
   providerName,
   onOpenShareSettings,
-  onSaveHandlerChange,
   onDirtyChange,
 }: ProviderShareSectionProps) {
   const { t } = useTranslation();
@@ -222,23 +219,15 @@ export function ProviderShareSection({
   const tokenLimitTouchedRef = useRef(false);
   const parallelLimitTouchedRef = useRef(false);
   const expiresTouchedRef = useRef(false);
-  const providerSaveHandlerRef = useRef<ProviderShareSaveHandler>(
-    async () => true,
-  );
-
-  useEffect(() => {
-    if (!onSaveHandlerChange) return;
-    const handler: ProviderShareSaveHandler = () =>
-      providerSaveHandlerRef.current();
-    onSaveHandlerChange(handler);
-    return () => onSaveHandlerChange(null);
-  }, [onSaveHandlerChange]);
 
   const shareableApp = isShareableApp(appId) ? appId : null;
   const shareExists = Boolean(share);
   const shareRunning = share ? isShareRunning(share) : false;
   const routerSyncPending = Boolean(
-    share && share.routerSyncedRevision < share.configRevision,
+    share &&
+      (share.descriptorGeneration === 0 ||
+        share.routerSyncedDescriptorGeneration !== share.descriptorGeneration ||
+        share.routerSyncedDescriptorFingerprint !== share.descriptorFingerprint),
   );
   const marketsQueryEnabled = shareExists && isShareOpen;
   const {
@@ -720,6 +709,7 @@ export function ProviderShareSection({
     const payloadUserGrants = userGrantsForAcl(aclPayload.sharedWithEmails);
     await saveMutation.mutateAsync({
       shareId: share.id,
+      expectedConfigRevision: share.configRevision,
       subdomain: subdomainInput.trim(),
       description: descriptionInput.trim() || undefined,
       forSale: forSaleValue,
@@ -740,8 +730,6 @@ export function ProviderShareSection({
     });
     return true;
   };
-
-  providerSaveHandlerRef.current = handleSave;
 
   const handleShareToggle = async (checked: boolean) => {
     if (busy) return;
@@ -1392,6 +1380,21 @@ export function ProviderShareSection({
                       })}
                 </p>
               ) : null}
+
+              <div className="flex justify-end border-t border-border/50 pt-4">
+                <Button
+                  type="button"
+                  disabled={busy || !shareDraftDirty}
+                  onClick={() => void handleSave()}
+                >
+                  {saveMutation.isPending ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Save className="mr-2 h-4 w-4" />
+                  )}
+                  {t("common.save", { defaultValue: "保存" })}
+                </Button>
+              </div>
             </>
           )}
         </div>

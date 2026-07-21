@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "authority": "phase-0-router-channel-baseline",
+  "router": {
+    "repository": "/data/projects/cc-switch-router",
+    "commit": "43ebea0ea20f7ab8be081d929c4fdd7cf79a40b1"
+  },
+  "sources": [
+    {
+      "path": "src/models.rs",
+      "sha256": "7836311e534d8db346a4fab506c4069bfaf335077995aaab670ce44c72dd813d"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "15ed3bf843a17a24f2bee848c348215fd459361b06d85b0a6c0b78cc06a1b96a"
+    },
+    {
+      "path": "src/store.rs",
+      "sha256": "d11288a4fbeca3b148a5d4870666a095535e35ff78aafdb1a47ab0fb711e950b"
+    }
+  ],
+  "facts": {
+    "appAvailabilityDtoDeclared": true,
+    "appAvailabilityPersistedByRuntimeSnapshot": false,
+    "runtimeRefreshIntervalSeconds": 600,
+    "sameRevisionStaticOverwriteAllowed": true
+  },
+  "ownership": {
+    "staticDescriptor": [
+      "identity and owner",
+      "ACL and user grants",
+      "limits and expiry",
+      "app/provider bindings",
+      "upstream provider projection",
+      "config revision (later descriptor generation/fingerprint)"
+    ],
+    "runtimeSnapshot": [
+      "support status",
+      "app runtimes/providers",
+      "token/request counters",
+      "share status",
+      "model health",
+      "appAvailability DTO currently ignored by persistence"
+    ],
+    "requestLog": [
+      "request identity",
+      "requested/actual model",
+      "usage",
+      "status/latency",
+      "caller metadata"
+    ]
+  },
+  "followUpBoundary": "dynamic Provider health/appAvailability persistence remains outside the core Provider form plan"
+}

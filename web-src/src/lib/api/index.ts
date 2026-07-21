@@ -90,7 +90,7 @@ export {
   supportsWebPasteFlow,
   localCallbackAuthBlockedMessage,
 } from "./auth";
-export { failoverApi } from "./failover";
+export { providerHealthApi } from "./providerHealth";
 export type { ProviderHealth } from "@/types/proxy";
 export type { Provider } from "@/types";
 export type {

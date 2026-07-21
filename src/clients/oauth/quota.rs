@@ -5550,6 +5550,8 @@ mod tests {
         Account {
             id: "acct-imported".to_string(),
             provider_type,
+            auth_identity_generation: 1,
+            token_refresh_generation: 0,
             email: None,
             access_token: None,
             refresh_token: None,

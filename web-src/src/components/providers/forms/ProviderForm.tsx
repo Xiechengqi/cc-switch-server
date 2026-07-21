@@ -90,7 +90,6 @@ import {
 import {
   ProviderSharePlaceholder,
   ProviderShareSection,
-  type ProviderShareSaveHandler,
 } from "@/components/providers/ProviderShareSection";
 import { isShareableApp } from "@/hooks/useProviderShare";
 import {
@@ -142,6 +141,22 @@ import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { PROVIDER_TYPES } from "@/config/constants";
 import { detectCodingPlanProvider } from "@/config/codingPlanProviders";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
+import {
+  customProfileId,
+  isCoreProviderApp,
+  legacyPresetNameForProfile,
+  profileIdForLegacyPreset,
+} from "@/server/providerRegistry";
+import {
+  anthropicApiKeyPreset,
+  googleGeminiApiKeyPreset,
+  openAiApiKeyPreset,
+} from "@/server/directProviderPresets";
+import { ServerProviderForm } from "@/server/providers/editor/ServerProviderForm";
+import type {
+  ProviderCredentialPatches,
+  ProviderResource,
+} from "@/lib/api/providers";
 
 const isAntigravityFamilyType = (providerType?: string | null) =>
   providerType === PROVIDER_TYPES.ANTIGRAVITY_OAUTH ||
@@ -309,11 +324,14 @@ type LocalProxyRequestOverridesBuildResult = ReturnType<
 export interface ProviderFormProps {
   appId: AppId;
   providerId?: string;
+  resource?: ProviderResource;
   submitLabel: string;
   onSubmit: (values: ProviderFormValues) => Promise<void> | void;
   onCancel: () => void;
   onSubmittingChange?: (isSubmitting: boolean) => void;
   onDirtyChange?: (dirty: boolean) => void;
+  onUnsavedChange?: (dirty: boolean) => void;
+  onSubmitBlockedChange?: (blocked: boolean) => void;
   initialData?: {
     name?: string;
     websiteUrl?: string;
@@ -330,6 +348,15 @@ export interface ProviderFormProps {
 }
 
 export function ProviderForm(props: ProviderFormProps) {
+  if (isServerWebRuntime() && isCoreProviderApp(props.appId)) {
+    return (
+      <ServerProviderForm
+        {...props}
+        appId={props.appId}
+        onSubmit={props.onSubmit}
+      />
+    );
+  }
   if (props.appId === "claude-desktop") {
     return <ClaudeDesktopProviderForm {...props} />;
   }
@@ -345,6 +372,7 @@ function ProviderFormFull({
   onCancel,
   onSubmittingChange,
   onDirtyChange,
+  onUnsavedChange,
   initialData,
   showButtons = true,
   isProxyTakeover = false,
@@ -433,18 +461,18 @@ function ProviderFormFull({
   const isOmoSlimCategory = appId === "opencode" && category === "omo-slim";
   const isAnyOmoCategory = isOmoCategory || isOmoSlimCategory;
   const selectedClaudePresetProviderType = useMemo(() => {
-    if (appId !== "claude" || !selectedPresetId?.startsWith("claude-")) {
+    if (appId !== "claude" || !selectedPresetId) {
       return undefined;
     }
-    const index = Number(selectedPresetId.slice("claude-".length));
-    if (!Number.isInteger(index)) return undefined;
-    return providerPresets.filter((preset) => !preset.hidden)[index]
+    const presetName = legacyPresetNameForProfile("claude", selectedPresetId);
+    return providerPresets.find((preset) => preset.name === presetName)
       ?.providerType;
   }, [appId, selectedPresetId]);
   const allowOfficialClaudeApiKey =
     appId === "claude" &&
-    (selectedClaudePresetProviderType || initialData?.meta?.providerType) ===
-      PROVIDER_TYPES.CURSOR_APIKEY;
+    (selectedPresetId === "claude.anthropic_api_key" ||
+      (selectedClaudePresetProviderType || initialData?.meta?.providerType) ===
+        PROVIDER_TYPES.CURSOR_APIKEY);
   const apiKeyFormCategory =
     initialData?.meta?.providerType === PROVIDER_TYPES.OLLAMA_CLOUD
       ? "third_party"
@@ -520,18 +548,11 @@ function ProviderFormFull({
     mode: "onSubmit",
   });
   const { isSubmitting } = form.formState;
-  const providerShareSaveRef = useRef<ProviderShareSaveHandler | null>(null);
   const [providerShareDirty, setProviderShareDirty] = useState(false);
   const [providerDraftBaseline, setProviderDraftBaseline] = useState<{
     key: string;
     fingerprint: string;
   } | null>(null);
-  const handleProviderShareSaveChange = useCallback(
-    (handler: ProviderShareSaveHandler | null) => {
-      providerShareSaveRef.current = handler;
-    },
-    [],
-  );
   const handleProviderShareDirtyChange = useCallback((dirty: boolean) => {
     setProviderShareDirty(dirty);
   }, []);
@@ -749,13 +770,21 @@ function ProviderFormFull({
   >(() => resolveManagedAccountId(initialData?.meta, "deepseek_account"));
 
   const selectedCodexPresetProviderType =
-    appId === "codex" && selectedPresetId?.startsWith("codex-")
-      ? codexProviderPresets[Number(selectedPresetId.slice("codex-".length))]
-          ?.providerType
+    appId === "codex" && selectedPresetId
+      ? codexProviderPresets.find(
+          (preset) =>
+            preset.name ===
+            legacyPresetNameForProfile("codex", selectedPresetId),
+        )?.providerType
       : undefined;
+  const selectedCodexProfileId =
+    appId === "codex" ? selectedPresetId : undefined;
   const isCodexOfficialPreset =
     appId === "codex" &&
     category === "official" &&
+    (selectedCodexProfileId
+      ? selectedCodexProfileId === "codex.openai_oauth"
+      : initialData?.meta?.providerType === PROVIDER_TYPES.CODEX_OAUTH) &&
     (selectedCodexPresetProviderType || initialData?.meta?.providerType) !==
       PROVIDER_TYPES.CURSOR_OAUTH &&
     (selectedCodexPresetProviderType || initialData?.meta?.providerType) !==
@@ -874,15 +903,24 @@ function ProviderFormFull({
 
   const presetEntries = useMemo(() => {
     if (appId === "codex") {
-      return codexProviderPresets.map<PresetEntry>((preset, index) => ({
-        id: `codex-${index}`,
-        preset,
-      }));
+      return [
+        { id: "codex.openai_api_key", preset: openAiApiKeyPreset },
+        ...codexProviderPresets.map<PresetEntry>((preset) => ({
+          id: profileIdForLegacyPreset("codex", preset.name),
+          preset,
+        })),
+      ];
     } else if (appId === "gemini") {
-      return geminiProviderPresets.map<PresetEntry>((preset, index) => ({
-        id: `gemini-${index}`,
-        preset,
-      }));
+      return [
+        {
+          id: "gemini.google_api_key",
+          preset: googleGeminiApiKeyPreset,
+        },
+        ...geminiProviderPresets.map<PresetEntry>((preset) => ({
+          id: profileIdForLegacyPreset("gemini", preset.name),
+          preset,
+        })),
+      ];
     } else if (appId === "opencode") {
       return opencodeProviderPresets.map<PresetEntry>((preset, index) => ({
         id: `opencode-${index}`,
@@ -899,12 +937,15 @@ function ProviderFormFull({
         preset,
       }));
     }
-    return providerPresets
-      .filter((p) => !p.hidden)
-      .map<PresetEntry>((preset, index) => ({
-        id: `claude-${index}`,
-        preset,
-      }));
+    return [
+      { id: "claude.anthropic_api_key", preset: anthropicApiKeyPreset },
+      ...providerPresets
+        .filter((p) => !p.hidden)
+        .map<PresetEntry>((preset) => ({
+          id: profileIdForLegacyPreset("claude", preset.name),
+          preset,
+        })),
+    ];
   }, [appId]);
 
   const {
@@ -1677,17 +1718,20 @@ function ProviderFormFull({
     providerDraftBaseline?.key === providerDraftInitializationKey &&
     providerDraftBaseline.fingerprint !== providerDraftFingerprint,
   );
-  const effectiveFormDirty = providerDraftDirty || providerShareDirty;
+  useEffect(() => {
+    onDirtyChange?.(providerDraftDirty);
+  }, [providerDraftDirty, onDirtyChange]);
 
   useEffect(() => {
-    onDirtyChange?.(effectiveFormDirty);
-  }, [effectiveFormDirty, onDirtyChange]);
+    onUnsavedChange?.(providerDraftDirty || providerShareDirty);
+  }, [onUnsavedChange, providerDraftDirty, providerShareDirty]);
 
   useEffect(
     () => () => {
       onDirtyChange?.(false);
+      onUnsavedChange?.(false);
     },
-    [onDirtyChange],
+    [onDirtyChange, onUnsavedChange],
   );
 
   const handleSubmit = async (values: ProviderFormData) => {
@@ -2387,6 +2431,40 @@ function ProviderFormFull({
       }
     }
 
+    if (!isEditMode && isCoreProviderApp(appId)) {
+      payload.profileId = activePreset?.id ?? customProfileId(appId);
+      if (!activePreset) {
+        payload.customBinding =
+          appId === "claude"
+            ? {
+                upstreamProtocol:
+                  localApiFormat === "anthropic"
+                    ? "anthropic_messages"
+                    : localApiFormat === "openai_chat"
+                      ? "open_ai_chat"
+                      : localApiFormat === "openai_responses"
+                        ? "open_ai_responses"
+                        : "gemini_native",
+                authScheme:
+                  localApiKeyField === "ANTHROPIC_API_KEY"
+                    ? "api_key"
+                    : "bearer",
+              }
+            : appId === "codex"
+              ? {
+                  upstreamProtocol:
+                    localCodexApiFormat === "openai_chat"
+                      ? "open_ai_chat"
+                      : "open_ai_responses",
+                  authScheme: "bearer",
+                }
+              : {
+                  upstreamProtocol: "gemini_native",
+                  authScheme: "api_key",
+                };
+      }
+    }
+
     if (!isEditMode && draftCustomEndpoints.length > 0) {
       const customEndpointsToSave: Record<
         string,
@@ -2611,8 +2689,6 @@ function ProviderFormFull({
 
     payload.meta = nextMeta;
 
-    const shareSaved = await providerShareSaveRef.current?.();
-    if (shareSaved === false) return;
     await onSubmit(payload);
   };
 
@@ -3700,7 +3776,6 @@ function ProviderFormFull({
               providerId={providerId}
               providerName={form.watch("name") || providerId}
               onOpenShareSettings={onOpenShareSettings}
-              onSaveHandlerChange={handleProviderShareSaveChange}
               onDirtyChange={handleProviderShareDirtyChange}
             />
           ) : isShareableApp(appId) ? (
@@ -3714,7 +3789,11 @@ function ProviderFormFull({
               </Button>
               <Button
                 type="submit"
-                disabled={isSubmitting || isConfirmSubmitting}
+                disabled={
+                  isSubmitting ||
+                  isConfirmSubmitting ||
+                  (Boolean(initialData) && !providerDraftDirty)
+                }
               >
                 {submitLabel}
               </Button>
@@ -3786,6 +3865,9 @@ function ProviderFormFull({
 }
 
 export type ProviderFormValues = ProviderFormData & {
+  profileId?: string;
+  customBinding?: import("@/lib/api/providers").ProviderCustomBinding;
+  credentialPatches?: ProviderCredentialPatches;
   presetId?: string;
   presetCategory?: ProviderCategory;
   isPartner?: boolean;

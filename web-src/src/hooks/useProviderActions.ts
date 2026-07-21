@@ -4,6 +4,10 @@ import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { providersApi, settingsApi, openclawApi, type AppId } from "@/lib/api";
 import type {
+  ProviderCredentialPatches,
+  ProviderCustomBinding,
+} from "@/lib/api/providers";
+import type {
   Provider,
   OpenClawProviderConfig,
   OpenClawDefaultModel,
@@ -68,6 +72,9 @@ export function useProviderActions(
   const addProvider = useCallback(
     async (
       provider: Omit<Provider, "id"> & {
+        profileId?: string;
+        customBinding?: ProviderCustomBinding;
+        credentialPatches?: ProviderCredentialPatches;
         providerKey?: string;
         suggestedDefaults?: OpenClawSuggestedDefaults;
         addToLive?: boolean;
@@ -127,8 +134,20 @@ export function useProviderActions(
 
   // 更新供应商
   const updateProvider = useCallback(
-    async (provider: Provider, originalId?: string) => {
-      await updateProviderMutation.mutateAsync({ provider, originalId });
+    async (
+      provider: Provider,
+      originalId?: string,
+      options: {
+        profileId?: string;
+        customBinding?: ProviderCustomBinding;
+        credentialPatches?: ProviderCredentialPatches;
+      } = {},
+    ) => {
+      await updateProviderMutation.mutateAsync({
+        provider,
+        originalId,
+        ...options,
+      });
 
       // 更新托盘菜单（失败不影响主操作）
       try {

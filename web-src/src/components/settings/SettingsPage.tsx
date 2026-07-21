@@ -12,7 +12,6 @@ import {
   LogOut,
   Save,
   FolderSearch,
-  Database,
   Cloud,
   ScrollText,
   HardDriveDownload,
@@ -46,7 +45,6 @@ import { SkillStorageLocationSettings } from "@/components/settings/SkillStorage
 import { SkillSyncMethodSettings } from "@/components/settings/SkillSyncMethodSettings";
 import { TerminalSettings } from "@/components/settings/TerminalSettings";
 import { DirectorySettings } from "@/components/settings/DirectorySettings";
-import { ImportExportSection } from "@/components/settings/ImportExportSection";
 import { BackupListSection } from "@/components/settings/BackupListSection";
 import { WebdavSyncSection } from "@/components/settings/WebdavSyncSection";
 import { ProxyTabContent } from "@/components/settings/ProxyTabContent";
@@ -63,7 +61,6 @@ import { ServerConfigDirSettings } from "@/components/settings/ServerConfigDirSe
 import { ShareSettingsTab, type ShareSettingsSaveState } from "@/components/settings/ShareSettingsTab";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
-import { useImportExport } from "@/hooks/useImportExport";
 import { useTranslation } from "react-i18next";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import { isServerWebRuntime } from "@/lib/runtime";
@@ -74,16 +71,13 @@ export type SettingsTab =
 interface SettingsDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onImportSuccess?: () => void | Promise<void>;
-  defaultTab?:
-    SettingsTab | "router" | "diagnostics" | "tunnel" | "failover" | "backup";
+  defaultTab?: SettingsTab | "router" | "diagnostics" | "tunnel" | "backup";
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
 }
 
 export function SettingsPage({
   open,
   onOpenChange,
-  onImportSuccess,
   defaultTab = "general",
   onSignOut,
 }: SettingsDialogProps) {
@@ -110,21 +104,6 @@ export function SettingsPage({
   const [shareSaveState, setShareSaveState] =
     useState<ShareSettingsSaveState | null>(null);
 
-  const {
-    selectedFile,
-    status: importStatus,
-    errorMessage,
-    backupId,
-    isImporting,
-    selectImportFile,
-    importConfig,
-    exportConfig,
-    clearSelection,
-    resetStatus,
-    serverFileInputRef,
-    onServerFileSelected,
-  } = useImportExport({ onImportSuccess });
-
   const serverMode = isServerWebRuntime();
   const { data: installedSkills } = useInstalledSkills({
     enabled: !serverMode,
@@ -139,15 +118,12 @@ export function SettingsPage({
       const normalizedTab =
         defaultTab === "router" || defaultTab === "diagnostics"
           ? "share"
-          : defaultTab === "tunnel" ||
-              defaultTab === "failover" ||
-              defaultTab === "backup"
+          : defaultTab === "tunnel" || defaultTab === "backup"
             ? "advanced"
             : defaultTab;
       setActiveTab(normalizedTab);
-      resetStatus();
     }
-  }, [open, resetStatus, defaultTab]);
+  }, [open, defaultTab]);
 
   useEffect(() => {
     if (requiresRestart) {
@@ -164,10 +140,8 @@ export function SettingsPage({
   const closeAfterSave = useCallback(() => {
     // 保存成功后关闭：不再重置语言，避免需要“保存两次”才生效
     acknowledgeRestart();
-    clearSelection();
-    resetStatus();
     onOpenChange(false);
-  }, [acknowledgeRestart, clearSelection, onOpenChange, resetStatus]);
+  }, [acknowledgeRestart, onOpenChange]);
 
   const handleSave = useCallback(async () => {
     try {
@@ -355,11 +329,7 @@ export function SettingsPage({
 
               <TabsContent value="proxy" className="space-y-6 mt-0 pb-4">
                 {settings ? (
-                  <ProxyTabContent
-                    settings={settings}
-                    onAutoSave={handleAutoSave}
-                    serverMode={serverMode}
-                  />
+                  <ProxyTabContent />
                 ) : null}
               </TabsContent>
 
@@ -456,40 +426,6 @@ export function SettingsPage({
                       </AccordionItem>
 
                       <AccordionItem
-                        value="data"
-                        className="rounded-xl glass-card overflow-hidden"
-                      >
-                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                          <div className="flex items-center gap-3">
-                            <Database className="h-5 w-5 text-blue-500" />
-                            <div className="text-left">
-                              <h3 className="text-base font-semibold">
-                                {t("settings.advanced.data.title")}
-                              </h3>
-                              <p className="text-sm text-muted-foreground font-normal">
-                                {t("settings.advanced.data.description")}
-                              </p>
-                            </div>
-                          </div>
-                        </AccordionTrigger>
-                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-                          <ImportExportSection
-                            status={importStatus}
-                            selectedFile={selectedFile}
-                            errorMessage={errorMessage}
-                            backupId={backupId}
-                            isImporting={isImporting}
-                            onSelectFile={selectImportFile}
-                            onImport={importConfig}
-                            onExport={exportConfig}
-                            onClear={clearSelection}
-                            serverFileInputRef={serverFileInputRef}
-                            onServerFileSelected={onServerFileSelected}
-                          />
-                        </AccordionContent>
-                      </AccordionItem>
-
-                      <AccordionItem
                         value="backup"
                         className="rounded-xl glass-card overflow-hidden"
                       >
@@ -505,7 +441,7 @@ export function SettingsPage({
                               <p className="text-sm text-muted-foreground font-normal">
                                 {t("settings.advanced.backup.description", {
                                   defaultValue:
-                                    "Manage automatic backups, view and restore database snapshots",
+                                    "Manage state snapshots for this installation; migrate hosts by copying the complete stopped data directory",
                                 })}
                               </p>
                             </div>

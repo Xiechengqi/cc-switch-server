@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use futures_util::StreamExt;
+use hmac::{Hmac, Mac};
 use rand::RngCore;
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, RwLock};
@@ -43,21 +45,32 @@ use crate::domain::accounts::store::{
     Account, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
-use crate::domain::failover::FailoverStore;
-use crate::domain::providers::model::{AppKind, ProviderType};
-use crate::domain::providers::store::ProviderStore;
+use crate::domain::providers::credentials::{
+    merge_provider_credentials, CredentialPatch, ProviderAccountBindingMigrationItem,
+    ProviderAccountBindingMigrationPreview, ProviderAccountBindingMigrationStatus,
+    ProviderCommandError, ProviderIdentityAction, ProviderIdentityChangePreview,
+    ProviderImportAction, ProviderImportItemPreview, ProviderImportPreview,
+    ProviderReferencePreview, ProviderRuntimeTransitionPreview, ProviderView, ProviderWriteDraft,
+};
+use crate::domain::providers::model::{AppKind, AuthBinding, Provider, ProviderMeta, ProviderType};
+use crate::domain::providers::registry::{
+    profile_by_id, resolve_custom_binding, CreationPolicy, CredentialPolicy, CustomBindingInput,
+    DriverBinding, ProfileId, ProviderKey,
+};
+use crate::domain::providers::store::{ProviderResourceMetadata, ProviderStore, StoredProvider};
 use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
-    mask_proxy_url, PayoutProfile, PayoutProfileState, RouterIdentity, ServerConfig,
+    PayoutProfile, PayoutProfileState, RouterIdentity, ServerConfig,
     SetupCompletionNotificationStatus,
 };
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareRequestLogEntry, ShareSyncOperation,
+    descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint,
+    ShareRequestLogEntry, ShareSyncOperation,
 };
 use crate::domain::sharing::shares::{
-    Share, ShareDeleteTombstone, ShareInvocation, ShareInvocationRejection, ShareMarketGrantStatus,
-    ShareStore,
+    RouterDescriptorSyncMode, Share, ShareDeleteTombstone, ShareInvocation,
+    ShareInvocationRejection, ShareMarketGrantStatus, ShareStore,
 };
 use crate::domain::usage::pricing::ModelPricingStore;
 use crate::domain::usage::store::{UsageLog, UsageStore};
@@ -68,17 +81,50 @@ const ROUTER_INSTALLATION_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(1
 const ROUTER_SHARE_SYNC_BATCH_SIZE: usize = 100;
 const SETUP_COMPLETION_RETRY_BASE_MS: i64 = 30_000;
 const SETUP_COMPLETION_RETRY_MAX_MS: i64 = 30 * 60_000;
+const MAX_PROVIDER_IMPORT_ITEMS: usize = 256;
+
+struct PreparedProviderImport {
+    candidate: ProviderStore,
+    preview: ProviderImportPreview,
+}
+
+struct PreparedProviderIdentityChange {
+    candidate: ProviderStore,
+    preview: ProviderIdentityChangePreview,
+    stored: StoredProvider,
+}
+
+struct AdoptProviderProfileInput {
+    app: AppKind,
+    provider_id: String,
+    expected_revision: u64,
+    profile_id: ProfileId,
+    account_id: Option<String>,
+}
+
+struct RebindCustomProviderInput {
+    app: AppKind,
+    provider_id: String,
+    expected_revision: u64,
+    custom_binding: CustomBindingInput,
+    credential_patches: BTreeMap<String, CredentialPatch>,
+}
 
 #[derive(Debug)]
 pub struct ServerStateInner {
     pub bind_addr: SocketAddr,
     pub config_dir: PathBuf,
+    _data_directory_lock: crate::infra::storage::DataDirectoryLock,
     pub web_dist_dir: Option<PathBuf>,
     pub provider_coverage: ProviderCoverage,
     pub(crate) config: RwLock<ServerConfig>,
     pub(crate) providers: RwLock<ProviderStore>,
+    provider_commits: AsyncMutex<()>,
+    reference_mutations: AsyncMutex<()>,
+    provider_import_preview_key: [u8; 32],
+    #[cfg(test)]
+    provider_commit_delay_ms: std::sync::atomic::AtomicU64,
     pub(crate) accounts: RwLock<AccountStore>,
-    pub(crate) failover: RwLock<FailoverStore>,
     pub(crate) pricing: RwLock<ModelPricingStore>,
     pub(crate) usage: RwLock<UsageStore>,
     pub(crate) shares: RwLock<ShareStore>,
@@ -109,6 +155,9 @@ pub struct ServerStateInner {
     pub process_instance_id: String,
     pub upgrade: crate::self_update::upgrade::SharedUpgradeRegistry,
     pub(crate) log_capture: SharedLogCapture,
+    pub(crate) terminal: crate::api::terminal::OpsTerminalManager,
+    /// Startup-discovered public IPv4 reported to router via heartbeat.
+    reported_public_ip: RwLock<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -232,12 +281,113 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::providers::store::providers_path(config_dir),
         crate::domain::accounts::store::accounts_path(config_dir),
         crate::domain::accounts::store::accounts_key_path(config_dir),
-        crate::domain::failover::failover_path(config_dir),
         crate::domain::usage::pricing::model_pricing_path(config_dir),
         crate::domain::usage::store::usage_path(config_dir),
         crate::domain::sharing::shares::shares_path(config_dir),
         crate::clients::router::tunnel::tunnels_path(config_dir),
     ]
+}
+
+fn validate_server_backup_restore_stage(
+    config_dir: &Path,
+    stage_dir: &Path,
+    manifest: &crate::infra::backup::BackupManifest,
+) -> anyhow::Result<()> {
+    let includes = |name: &str| manifest.files.iter().any(|file| file.file_name == name);
+    if includes("providers.json") && !includes("accounts.json") {
+        let current_accounts = crate::domain::accounts::store::accounts_path(config_dir);
+        if current_accounts.exists() {
+            std::fs::copy(&current_accounts, stage_dir.join("accounts.json")).with_context(
+                || {
+                    format!(
+                        "stage current accounts dependency {}",
+                        current_accounts.display()
+                    )
+                },
+            )?;
+        }
+    }
+    if (includes("accounts.json") || includes("providers.json")) && !includes("accounts.key") {
+        let current_key = crate::domain::accounts::store::accounts_key_path(config_dir);
+        if current_key.exists() {
+            std::fs::copy(&current_key, stage_dir.join("accounts.key"))
+                .with_context(|| format!("stage current account key {}", current_key.display()))?;
+        }
+    }
+
+    let staged_accounts =
+        if includes("accounts.json") || includes("accounts.key") || includes("providers.json") {
+            Some(
+                AccountStore::load_or_default(stage_dir)
+                    .context("validate staged accounts and encryption key")?,
+            )
+        } else {
+            None
+        };
+
+    if includes("server.json") {
+        ServerConfig::load_or_default(stage_dir).context("validate staged server.json")?;
+    }
+    if includes("email-auth.json") {
+        crate::clients::router::email_auth::load_state(stage_dir)
+            .context("validate staged email-auth.json")?;
+    }
+    if includes("providers.json") {
+        let mut providers =
+            ProviderStore::load_or_default(stage_dir).context("validate staged providers.json")?;
+        if providers.storage_status().format
+            == crate::domain::providers::store::ProviderStoreFormat::S1
+        {
+            providers.prepare_legacy_runtime_view();
+        }
+        providers.validate_for_commit()?;
+        providers
+            .rebuild_runtime_index(
+                staged_accounts
+                    .as_ref()
+                    .expect("Provider restore preflight loaded staged accounts"),
+            )
+            .context("compile staged Provider runtime index")?;
+        let materialized = providers
+            .materialized_clone()
+            .context("decrypt staged Provider credentials")?;
+        for stored in &materialized.providers {
+            crate::domain::providers::credentials::reject_reserved_keep_sentinel(&stored.provider)
+                .with_context(|| {
+                    format!(
+                        "validate staged provider {}:{}",
+                        stored.app.as_str(),
+                        stored.provider.id
+                    )
+                })?;
+        }
+    }
+    if includes("accounts.json") || includes("accounts.key") {
+        if includes("accounts.key") {
+            let encoded = std::fs::read_to_string(stage_dir.join("accounts.key"))
+                .context("read staged accounts.key")?;
+            crate::infra::credentials::decode_root_key(encoded.trim())
+                .context("staged accounts.key must decode to exactly 32 bytes")?;
+        }
+        staged_accounts
+            .as_ref()
+            .expect("account restore preflight loaded staged accounts");
+    }
+    if includes("model-pricing.json") {
+        ModelPricingStore::load_or_default(stage_dir)
+            .context("validate staged model-pricing.json")?;
+    }
+    if includes("usage-logs.json") {
+        UsageStore::load_or_default(stage_dir).context("validate staged usage-logs.json")?;
+    }
+    if includes("shares.json") {
+        ShareStore::load_or_default(stage_dir).context("validate staged shares.json")?;
+    }
+    if includes("tunnels.json") {
+        crate::clients::router::tunnel::validate_tunnel_store(stage_dir)
+            .context("validate staged tunnels.json")?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -722,19 +872,1199 @@ fn schedule_debounced_save(state: ServerState, kind: DebouncedStoreKind) {
     });
 }
 
+fn apply_provider_write_drafts(
+    store: &mut ProviderStore,
+    drafts: Vec<ProviderWriteDraft>,
+    accounts: &AccountStore,
+) -> Result<(Vec<StoredProvider>, bool), ProviderCommandError> {
+    let mut stored = Vec::with_capacity(drafts.len());
+    let mut any_changed = false;
+    for draft in drafts {
+        let mut provider = draft.provider;
+        let credential_changed = draft
+            .credential_patches
+            .values()
+            .any(|patch| !matches!(patch, CredentialPatch::Keep));
+        if provider.name.trim().is_empty() {
+            return Err(ProviderCommandError::Invalid(
+                "provider name is required".to_string(),
+            ));
+        }
+        validate_provider_client_request_id(draft.client_request_id.as_deref())?;
+        let replay = draft.client_request_id.as_deref().and_then(|request_id| {
+            store
+                .providers
+                .iter()
+                .find(|item| item.resource.create_request_id.as_deref() == Some(request_id))
+                .cloned()
+        });
+        let is_idempotent_replay = replay.is_some();
+        if let Some(replay) = replay.as_ref() {
+            if replay.app != draft.app
+                || (!provider.id.trim().is_empty() && provider.id != replay.provider.id)
+            {
+                return Err(ProviderCommandError::Conflict {
+                    code: "cc_switch_provider_idempotency_conflict",
+                    message: "clientRequestId was already used for a different Provider"
+                        .to_string(),
+                });
+            }
+            provider.id = replay.provider.id.clone();
+        }
+        let existing = replay.or_else(|| {
+            (!provider.id.trim().is_empty())
+                .then(|| {
+                    store
+                        .providers
+                        .iter()
+                        .find(|item| item.app == draft.app && item.provider.id == provider.id)
+                })
+                .flatten()
+                .cloned()
+        });
+        if let Some(expected_revision) = draft.expected_revision {
+            let actual_revision = existing
+                .as_ref()
+                .map(|item| item.resource.revision)
+                .unwrap_or_default();
+            if expected_revision != actual_revision {
+                return Err(ProviderCommandError::Conflict {
+                    code: "cc_switch_provider_revision_conflict",
+                    message: format!(
+                        "Provider revision conflict: expected {expected_revision}, current {actual_revision}"
+                    ),
+                });
+            }
+        }
+        merge_provider_credentials(
+            existing.as_ref().map(|item| &item.provider),
+            &mut provider,
+            &draft.credential_patches,
+        )
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+        provider.extra.remove("sortIndex");
+        crate::domain::providers::model_routing::normalize_and_validate_provider_model_routing(
+            draft.app,
+            &mut provider,
+        )
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+        let mut resource = resolve_provider_resource_metadata(
+            draft.app,
+            draft.profile_id,
+            draft.custom_binding,
+            draft.client_request_id,
+            existing.as_ref(),
+        )?;
+        resource.credential_generation = match existing.as_ref() {
+            Some(existing) if credential_changed && !is_idempotent_replay => {
+                existing.resource.credential_generation.saturating_add(1)
+            }
+            Some(existing) => existing.resource.credential_generation,
+            None => u64::from(
+                crate::domain::providers::credentials::redact_provider(&provider)
+                    .1
+                    .configured,
+            ),
+        };
+        let mut candidate = StoredProvider {
+            app: draft.app,
+            provider: provider.clone(),
+            provider_type: crate::domain::providers::model::classify_provider(draft.app, &provider),
+            provider_type_id: crate::domain::providers::model::classify_provider(
+                draft.app, &provider,
+            )
+            .as_str()
+            .to_string(),
+            resource: resource.clone(),
+        };
+        validate_and_resolve_provider_binding(&mut candidate, existing.as_ref(), accounts)?;
+        provider = candidate.provider.clone();
+        let unchanged = existing
+            .as_ref()
+            .is_some_and(|existing| provider_resource_content_eq(existing, &candidate));
+        if is_idempotent_replay && !unchanged {
+            return Err(ProviderCommandError::Conflict {
+                code: "cc_switch_provider_idempotency_conflict",
+                message: "clientRequestId replay does not match the original Provider".to_string(),
+            });
+        }
+        if unchanged {
+            stored.push(existing.expect("unchanged Provider has an existing record"));
+            continue;
+        }
+        resource.revision = existing
+            .as_ref()
+            .map(|item| item.resource.revision)
+            .unwrap_or_default()
+            .saturating_add(1);
+        stored.push(store.upsert_with_resource(draft.app, provider, resource));
+        any_changed = true;
+    }
+    Ok((stored, any_changed))
+}
+
+fn validate_and_resolve_provider_binding(
+    candidate: &mut StoredProvider,
+    existing: Option<&StoredProvider>,
+    accounts: &AccountStore,
+) -> Result<(), ProviderCommandError> {
+    let Some(profile_id) = candidate.resource.profile_id.as_ref() else {
+        return Ok(());
+    };
+    let profile = profile_by_id(profile_id.as_str())
+        .ok_or_else(|| ProviderCommandError::Invalid(format!("unknown profileId {profile_id}")))?;
+    if let Some(expected_type) = profile.compatibility_provider_type {
+        if candidate.provider_type != expected_type {
+            return Err(ProviderCommandError::Invalid(format!(
+                "Provider profile {profile_id} requires providerType {}, got {}",
+                expected_type.as_str(),
+                candidate.provider_type.as_str()
+            )));
+        }
+    }
+    crate::domain::providers::runtime::validate_custom_extra_headers(candidate, profile)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    validate_profile_credentials(candidate, profile)?;
+    let CredentialPolicy::ManagedAccount {
+        account_provider_type,
+    } = &profile.credential_policy
+    else {
+        return Ok(());
+    };
+    let account_provider_type = *account_provider_type;
+
+    let account_id = provider_account_id(candidate)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ProviderCommandError::Invalid(format!(
+                "Provider profile {profile_id} requires an explicit accountId"
+            ))
+        })?;
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Err(ProviderCommandError::Invalid(format!(
+            "Provider profile {profile_id} requires a non-empty accountId"
+        )));
+    }
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| {
+            ProviderCommandError::Invalid(format!(
+                "accountId {account_id} does not exist for Provider profile {profile_id}"
+            ))
+        })?;
+    if account.provider_type != account_provider_type {
+        return Err(ProviderCommandError::Invalid(format!(
+            "accountId {account_id} has providerType {}, expected {} for Provider profile {profile_id}",
+            account.provider_type.as_str(),
+            account_provider_type.as_str()
+        )));
+    }
+    let binding_unchanged = existing.and_then(provider_account_id) == Some(account_id);
+    let expected_generation = if binding_unchanged {
+        provider_auth_identity_generation(candidate)
+            .or_else(|| existing.and_then(provider_auth_identity_generation))
+            .unwrap_or(account.auth_identity_generation)
+    } else {
+        account.auth_identity_generation
+    };
+    if expected_generation != account.auth_identity_generation {
+        return Err(ProviderCommandError::Conflict {
+            code: "cc_switch_provider_account_identity_stale",
+            message: format!(
+                "accountId {account_id} identity changed from generation {expected_generation} to {}; explicitly rebind the Provider account",
+                account.auth_identity_generation
+            ),
+        });
+    }
+    let meta = candidate
+        .provider
+        .meta
+        .get_or_insert_with(ProviderMeta::default);
+    meta.auth_binding = Some(AuthBinding {
+        source: Some("account".to_string()),
+        auth_provider: Some(account_provider_type.as_str().to_string()),
+        account_id: Some(account_id.to_string()),
+        auth_identity_generation: Some(expected_generation),
+    });
+    Ok(())
+}
+
+fn validate_profile_credentials(
+    candidate: &StoredProvider,
+    profile: &crate::domain::providers::registry::ProfileSpec,
+) -> Result<(), ProviderCommandError> {
+    let summary = crate::domain::providers::credentials::redact_provider(&candidate.provider).1;
+    let primary_credential_configured = summary
+        .slots
+        .iter()
+        .any(|slot| !slot.starts_with("/settingsConfig/extraHeaders/"));
+    match &profile.credential_policy {
+        CredentialPolicy::StaticSecret { .. } if !primary_credential_configured => {
+            Err(ProviderCommandError::Invalid(format!(
+                "Provider profile {} requires a credential",
+                profile.profile_id
+            )))
+        }
+        CredentialPolicy::Custom
+            if candidate
+                .resource
+                .custom_binding
+                .as_ref()
+                .is_some_and(|binding| {
+                    binding.auth_scheme != crate::domain::providers::registry::AuthScheme::None
+                })
+                && !primary_credential_configured =>
+        {
+            Err(ProviderCommandError::Invalid(format!(
+                "Provider profile {} requires a primary authentication credential",
+                profile.profile_id
+            )))
+        }
+        CredentialPolicy::Aws { .. }
+            if provider_setting(&candidate.provider, "AWS_ACCESS_KEY_ID").is_none()
+                || provider_setting(&candidate.provider, "AWS_SECRET_ACCESS_KEY").is_none() =>
+        {
+            Err(ProviderCommandError::Invalid(format!(
+                "Provider profile {} requires both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
+                profile.profile_id
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn provider_setting(provider: &Provider, key: &str) -> Option<String> {
+    provider
+        .settings_config
+        .pointer(&format!("/env/{key}"))
+        .or_else(|| provider.settings_config.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn provider_account_id(stored: &StoredProvider) -> Option<&str> {
+    stored
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.account_id.as_deref())
+}
+
+fn provider_auth_identity_generation(stored: &StoredProvider) -> Option<u64> {
+    stored
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.auth_identity_generation)
+}
+
+fn validate_provider_client_request_id(
+    client_request_id: Option<&str>,
+) -> Result<(), ProviderCommandError> {
+    let Some(client_request_id) = client_request_id else {
+        return Ok(());
+    };
+    let valid = (8..=128).contains(&client_request_id.len())
+        && client_request_id == client_request_id.trim()
+        && client_request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte));
+    if !valid {
+        return Err(ProviderCommandError::Invalid(
+            "clientRequestId must be 8-128 ASCII letters, digits, '-', '_', '.', or ':'"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_provider_resource_metadata(
+    app: AppKind,
+    requested_profile_id: Option<ProfileId>,
+    requested_custom_binding: Option<crate::domain::providers::registry::CustomBindingInput>,
+    client_request_id: Option<String>,
+    existing: Option<&StoredProvider>,
+) -> Result<ProviderResourceMetadata, ProviderCommandError> {
+    let existing_profile_id = existing.and_then(|item| item.resource.profile_id.as_ref());
+    if let (Some(existing_profile_id), Some(requested_profile_id)) =
+        (existing_profile_id, requested_profile_id.as_ref())
+    {
+        if existing_profile_id != requested_profile_id {
+            return Err(ProviderCommandError::Conflict {
+                code: "cc_switch_provider_identity_conflict",
+                message: "Provider profile identity is immutable; use an explicit rebind command"
+                    .to_string(),
+            });
+        }
+    }
+    if existing.is_some() && existing_profile_id.is_none() && requested_profile_id.is_some() {
+        return Err(ProviderCommandError::Conflict {
+            code: "cc_switch_provider_identity_conflict",
+            message: "legacy Provider adoption requires the explicit adopt-profile command"
+                .to_string(),
+        });
+    }
+
+    let profile_id = requested_profile_id.or_else(|| existing_profile_id.cloned());
+    let profile_schema_revision = if let Some(profile_id) = profile_id.as_ref() {
+        let profile = profile_by_id(profile_id.as_str()).ok_or_else(|| {
+            ProviderCommandError::Invalid(format!("unknown profileId {profile_id}"))
+        })?;
+        if profile.app != app {
+            return Err(ProviderCommandError::Invalid(format!(
+                "profileId {profile_id} does not belong to {}",
+                app.as_str()
+            )));
+        }
+        if existing.is_none() && profile.creation_policy != CreationPolicy::CreateAllowed {
+            return Err(ProviderCommandError::Invalid(format!(
+                "profileId {profile_id} cannot be used to create a Provider"
+            )));
+        }
+        Some(profile.profile_schema_revision)
+    } else {
+        if requested_custom_binding.is_some() {
+            return Err(ProviderCommandError::Invalid(
+                "customBinding requires a custom profileId".to_string(),
+            ));
+        }
+        existing.and_then(|item| item.resource.profile_schema_revision)
+    };
+
+    let custom_binding = if let Some(profile_id) = profile_id.as_ref() {
+        let profile = profile_by_id(profile_id.as_str())
+            .expect("profile was validated while resolving schema revision");
+        match &profile.driver_binding {
+            crate::domain::providers::registry::DriverBinding::Custom { .. } => {
+                if let (Some(existing), Some(requested)) = (
+                    existing.and_then(|item| item.resource.custom_binding.as_ref()),
+                    requested_custom_binding.as_ref(),
+                ) {
+                    if existing != requested {
+                        return Err(ProviderCommandError::Conflict {
+                            code: "cc_switch_provider_custom_binding_conflict",
+                            message: "custom Provider protocol/auth binding is immutable in ordinary updates; use the explicit rebind-custom command".to_string(),
+                        });
+                    }
+                }
+                let binding = requested_custom_binding
+                    .or_else(|| existing.and_then(|item| item.resource.custom_binding.clone()))
+                    .ok_or_else(|| {
+                        ProviderCommandError::Invalid(format!(
+                            "Provider profile {profile_id} requires an explicit customBinding"
+                        ))
+                    })?;
+                crate::domain::providers::registry::resolve_custom_binding(profile, &binding)
+                    .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+                Some(binding)
+            }
+            crate::domain::providers::registry::DriverBinding::Fixed { .. } => {
+                if requested_custom_binding.is_some() {
+                    return Err(ProviderCommandError::Invalid(format!(
+                        "customBinding is only valid for a custom Provider profile, not {profile_id}"
+                    )));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok(ProviderResourceMetadata {
+        profile_id,
+        profile_schema_revision,
+        revision: existing
+            .map(|item| item.resource.revision)
+            .unwrap_or_default(),
+        credential_generation: existing
+            .map(|item| item.resource.credential_generation)
+            .unwrap_or_default(),
+        custom_binding,
+        create_request_id: existing
+            .and_then(|item| item.resource.create_request_id.clone())
+            .or(client_request_id),
+    })
+}
+
+fn provider_resource_content_eq(left: &StoredProvider, right: &StoredProvider) -> bool {
+    left.app == right.app
+        && left.provider_type == right.provider_type
+        && left.provider_type_id == right.provider_type_id
+        && serde_json::to_value(&left.provider).ok() == serde_json::to_value(&right.provider).ok()
+        && left.resource.profile_id == right.resource.profile_id
+        && left.resource.profile_schema_revision == right.resource.profile_schema_revision
+        && left.resource.credential_generation == right.resource.credential_generation
+        && left.resource.custom_binding == right.resource.custom_binding
+        && left.resource.create_request_id == right.resource.create_request_id
+}
+
+fn prepare_provider_import(
+    current: &ProviderStore,
+    drafts: Vec<ProviderWriteDraft>,
+    preview_key: &[u8; 32],
+    accounts: &AccountStore,
+) -> Result<PreparedProviderImport, ProviderCommandError> {
+    if drafts.is_empty() {
+        return Err(ProviderCommandError::Invalid(
+            "Provider import requires at least one item".to_string(),
+        ));
+    }
+    if drafts.len() > MAX_PROVIDER_IMPORT_ITEMS {
+        return Err(ProviderCommandError::Invalid(format!(
+            "Provider import is limited to {MAX_PROVIDER_IMPORT_ITEMS} items"
+        )));
+    }
+    let mut keys = BTreeSet::new();
+    for draft in &drafts {
+        let provider_id = draft.provider.id.trim();
+        if provider_id.is_empty() {
+            return Err(ProviderCommandError::Invalid(
+                "Provider import requires an explicit provider id".to_string(),
+            ));
+        }
+        if provider_id != draft.provider.id {
+            return Err(ProviderCommandError::Invalid(
+                "Provider import ids cannot contain surrounding whitespace".to_string(),
+            ));
+        }
+        if !keys.insert((draft.app, provider_id.to_string())) {
+            return Err(ProviderCommandError::Invalid(format!(
+                "Provider import contains duplicate key {}:{provider_id}",
+                draft.app.as_str()
+            )));
+        }
+    }
+
+    let mut digest = Hmac::<Sha256>::new_from_slice(preview_key)
+        .expect("fixed-size Provider import preview key is valid");
+    digest.update(b"cc-switch-provider-import-preview-v1\0");
+    let current_bytes = serde_json::to_vec(current)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    digest.update(&current_bytes);
+    digest.update(&[0]);
+    let draft_bytes = serde_json::to_vec(&drafts)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    digest.update(&draft_bytes);
+    let preview_token = hex::encode(digest.finalize().into_bytes());
+
+    let mut candidate = current.clone();
+    let (written, _) = apply_provider_write_drafts(&mut candidate, drafts, accounts)?;
+    candidate
+        .validate_for_commit()
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+
+    let mut create_count = 0usize;
+    let mut update_count = 0usize;
+    let mut unchanged_count = 0usize;
+    let items = written
+        .into_iter()
+        .map(|stored| {
+            let previous = current
+                .providers
+                .iter()
+                .find(|item| item.app == stored.app && item.provider.id == stored.provider.id);
+            let action = match previous {
+                None => {
+                    create_count += 1;
+                    ProviderImportAction::Create
+                }
+                Some(previous)
+                    if serde_json::to_value(previous).ok()
+                        == serde_json::to_value(&stored).ok() =>
+                {
+                    unchanged_count += 1;
+                    ProviderImportAction::Unchanged
+                }
+                Some(_) => {
+                    update_count += 1;
+                    ProviderImportAction::Update
+                }
+            };
+            ProviderImportItemPreview {
+                app: stored.app,
+                provider_id: stored.provider.id,
+                name: stored.provider.name,
+                action,
+            }
+        })
+        .collect();
+
+    Ok(PreparedProviderImport {
+        candidate,
+        preview: ProviderImportPreview {
+            preview_token,
+            create_count,
+            update_count,
+            unchanged_count,
+            items,
+        },
+    })
+}
+
+fn provider_action_preview_token(
+    preview_key: &[u8; 32],
+    domain: &'static [u8],
+    current: &ProviderStore,
+    accounts: &AccountStore,
+    input: &impl Serialize,
+) -> Result<String, ProviderCommandError> {
+    let mut digest = Hmac::<Sha256>::new_from_slice(preview_key)
+        .expect("fixed-size Provider action preview key is valid");
+    digest.update(domain);
+    digest.update(&[0]);
+    digest.update(
+        &serde_json::to_vec(current)
+            .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?,
+    );
+    digest.update(&[0]);
+    let account_identity = accounts
+        .accounts
+        .iter()
+        .map(|account| {
+            (
+                account.id.as_str(),
+                account.provider_type,
+                account.auth_identity_generation,
+            )
+        })
+        .collect::<Vec<_>>();
+    digest.update(
+        &serde_json::to_vec(&account_identity)
+            .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?,
+    );
+    digest.update(&[0]);
+    digest.update(
+        &serde_json::to_vec(input)
+            .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?,
+    );
+    Ok(hex::encode(digest.finalize().into_bytes()))
+}
+
+fn provider_runtime_transition(
+    before: &StoredProvider,
+    after: &StoredProvider,
+    accounts: &AccountStore,
+) -> Result<(ProviderRuntimeTransitionPreview, Vec<String>), ProviderCommandError> {
+    let before_plan = crate::domain::providers::runtime::compile_runtime_plan(before, accounts)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    let after_plan = crate::domain::providers::runtime::compile_runtime_plan(after, accounts)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    let mut warnings = after_plan.warnings.clone();
+    if before_plan.driver_id != after_plan.driver_id {
+        warnings.push(format!(
+            "runtime Driver changes from {} to {}",
+            before_plan.driver_id, after_plan.driver_id
+        ));
+    }
+    if before_plan.endpoint != after_plan.endpoint {
+        warnings.push("runtime endpoint changes".to_string());
+    }
+    let transition = ProviderRuntimeTransitionPreview {
+        before_fingerprint: before_plan.runtime_fingerprint.clone(),
+        after_fingerprint: after_plan.runtime_fingerprint.clone(),
+        fingerprint_changed: before_plan.runtime_fingerprint != after_plan.runtime_fingerprint,
+        before_state: before_plan.configuration_state,
+        after_state: after_plan.configuration_state,
+    };
+    Ok((transition, warnings))
+}
+
+fn provider_runtime_projection_changes(
+    before: &ProviderStore,
+    after: &ProviderStore,
+) -> BTreeSet<(AppKind, String)> {
+    before
+        .providers
+        .iter()
+        .chain(after.providers.iter())
+        .map(|stored| (stored.app, stored.provider.id.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|(app, provider_id)| {
+            let before_fingerprint = before
+                .runtime_plan(*app, provider_id)
+                .map(|plan| plan.runtime_fingerprint.clone());
+            let after_fingerprint = after
+                .runtime_plan(*app, provider_id)
+                .map(|plan| plan.runtime_fingerprint.clone());
+            before_fingerprint != after_fingerprint
+        })
+        .collect()
+}
+
+fn prepare_adopt_provider_profile(
+    current: &ProviderStore,
+    accounts: &AccountStore,
+    preview_key: &[u8; 32],
+    input: &AdoptProviderProfileInput,
+) -> Result<PreparedProviderIdentityChange, ProviderCommandError> {
+    let app = input.app;
+    let provider_id = input.provider_id.as_str();
+    let expected_revision = input.expected_revision;
+    let profile_id = &input.profile_id;
+    let account_id = input.account_id.as_deref();
+    let source = current
+        .providers
+        .iter()
+        .find(|stored| stored.app == app && stored.provider.id == provider_id)
+        .cloned()
+        .ok_or(ProviderCommandError::NotFound)?;
+    if source.resource.revision != expected_revision {
+        return Err(provider_revision_conflict(
+            expected_revision,
+            source.resource.revision,
+        ));
+    }
+    if source.resource.profile_id.is_some() {
+        return Err(ProviderCommandError::Conflict {
+            code: "cc_switch_provider_identity_conflict",
+            message: "only a legacy Provider without profile identity can be adopted".to_string(),
+        });
+    }
+    let profile = profile_by_id(profile_id.as_str())
+        .ok_or_else(|| ProviderCommandError::Invalid(format!("unknown profileId {profile_id}")))?;
+    if profile.app != app {
+        return Err(ProviderCommandError::Invalid(format!(
+            "profileId {profile_id} does not belong to {}",
+            app.as_str()
+        )));
+    }
+    if matches!(profile.driver_binding, DriverBinding::Custom { .. })
+        || matches!(profile.credential_policy, CredentialPolicy::Legacy)
+    {
+        return Err(ProviderCommandError::Invalid(
+            "adopt-profile requires a fixed non-legacy Profile; use clone-as-custom for a custom identity"
+                .to_string(),
+        ));
+    }
+
+    let input = serde_json::json!({
+        "app": app,
+        "providerId": provider_id,
+        "expectedRevision": expected_revision,
+        "profileId": profile_id,
+        "accountId": account_id,
+    });
+    let preview_token = provider_action_preview_token(
+        preview_key,
+        b"cc-switch-provider-adopt-profile-v1",
+        current,
+        accounts,
+        &input,
+    )?;
+    let mut target = source.clone();
+    target.resource.profile_id = Some(profile.profile_id.clone());
+    target.resource.profile_schema_revision = Some(profile.profile_schema_revision);
+    target.resource.custom_binding = None;
+    target.resource.revision = source.resource.revision.saturating_add(1);
+    if let Some(account_id) = account_id {
+        let CredentialPolicy::ManagedAccount {
+            account_provider_type,
+        } = profile.credential_policy
+        else {
+            return Err(ProviderCommandError::Invalid(
+                "accountId is only valid when adopting a managed-account Profile".to_string(),
+            ));
+        };
+        let meta = target
+            .provider
+            .meta
+            .get_or_insert_with(ProviderMeta::default);
+        meta.auth_binding = Some(AuthBinding {
+            source: Some("account".to_string()),
+            auth_provider: Some(account_provider_type.as_str().to_string()),
+            account_id: Some(account_id.to_string()),
+            auth_identity_generation: None,
+        });
+    }
+    validate_and_resolve_provider_binding(&mut target, Some(&source), accounts)?;
+
+    let mut candidate = current.clone();
+    let target_index = candidate
+        .providers
+        .iter()
+        .position(|stored| stored.app == app && stored.provider.id == provider_id)
+        .expect("adoption source exists in cloned Provider store");
+    candidate.providers[target_index] = target.clone();
+    candidate
+        .validate_for_commit()
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    candidate
+        .rebuild_runtime_index(accounts)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    let (runtime, warnings) = provider_runtime_transition(&source, &target, accounts)?;
+    let preview = ProviderIdentityChangePreview {
+        preview_token,
+        action: ProviderIdentityAction::AdoptProfile,
+        source: ProviderKey::new(app, provider_id)
+            .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?,
+        source_revision: source.resource.revision,
+        target: ProviderView::from_stored(&target),
+        runtime,
+        warnings,
+    };
+    Ok(PreparedProviderIdentityChange {
+        candidate,
+        preview,
+        stored: target,
+    })
+}
+
+fn prepare_rebind_custom_provider(
+    current: &ProviderStore,
+    accounts: &AccountStore,
+    preview_key: &[u8; 32],
+    input: &RebindCustomProviderInput,
+) -> Result<PreparedProviderIdentityChange, ProviderCommandError> {
+    let app = input.app;
+    let provider_id = input.provider_id.as_str();
+    let expected_revision = input.expected_revision;
+    let custom_binding = &input.custom_binding;
+    let credential_patches = &input.credential_patches;
+    let source = current
+        .providers
+        .iter()
+        .find(|stored| stored.app == app && stored.provider.id == provider_id)
+        .cloned()
+        .ok_or(ProviderCommandError::NotFound)?;
+    if source.resource.revision != expected_revision {
+        return Err(provider_revision_conflict(
+            expected_revision,
+            source.resource.revision,
+        ));
+    }
+    let profile_id = source.resource.profile_id.as_ref().ok_or_else(|| {
+        ProviderCommandError::Invalid("legacy Provider cannot be rebound".to_string())
+    })?;
+    let profile = profile_by_id(profile_id.as_str())
+        .ok_or_else(|| ProviderCommandError::Invalid(format!("unknown profileId {profile_id}")))?;
+    if !matches!(profile.driver_binding, DriverBinding::Custom { .. }) {
+        return Err(ProviderCommandError::Invalid(
+            "rebind-custom only accepts a custom Provider Profile".to_string(),
+        ));
+    }
+    resolve_custom_binding(profile, custom_binding)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    let input = serde_json::json!({
+        "app": app,
+        "providerId": provider_id,
+        "expectedRevision": expected_revision,
+        "customBinding": custom_binding,
+        "credentialPatches": credential_patches,
+    });
+    let preview_token = provider_action_preview_token(
+        preview_key,
+        b"cc-switch-provider-rebind-custom-v1",
+        current,
+        accounts,
+        &input,
+    )?;
+
+    let mut target = source.clone();
+    merge_provider_credentials(
+        Some(&source.provider),
+        &mut target.provider,
+        credential_patches,
+    )
+    .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    let credential_changed = credential_patches
+        .values()
+        .any(|patch| !matches!(patch, CredentialPatch::Keep));
+    target.resource.custom_binding = Some(custom_binding.clone());
+    if credential_changed {
+        target.resource.credential_generation =
+            target.resource.credential_generation.saturating_add(1);
+    }
+    if provider_resource_content_eq(&source, &target) {
+        return Err(ProviderCommandError::Invalid(
+            "rebind-custom does not change the Provider binding or credentials".to_string(),
+        ));
+    }
+    target.resource.revision = source.resource.revision.saturating_add(1);
+
+    let mut candidate = current.clone();
+    let target_index = candidate
+        .providers
+        .iter()
+        .position(|stored| stored.app == app && stored.provider.id == provider_id)
+        .expect("custom rebind source exists in cloned Provider store");
+    candidate.providers[target_index] = target.clone();
+    candidate
+        .validate_for_commit()
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    candidate
+        .rebuild_runtime_index(accounts)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    let (runtime, warnings) = provider_runtime_transition(&source, &target, accounts)?;
+    let preview = ProviderIdentityChangePreview {
+        preview_token,
+        action: ProviderIdentityAction::RebindCustom,
+        source: ProviderKey::new(app, provider_id)
+            .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?,
+        source_revision: source.resource.revision,
+        target: ProviderView::from_stored(&target),
+        runtime,
+        warnings,
+    };
+    Ok(PreparedProviderIdentityChange {
+        candidate,
+        preview,
+        stored: target,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_clone_provider_as_custom(
+    current: &ProviderStore,
+    accounts: &AccountStore,
+    preview_key: &[u8; 32],
+    app: AppKind,
+    source_provider_id: &str,
+    expected_revision: u64,
+    target_provider_id: String,
+    target_name: String,
+    custom_binding: CustomBindingInput,
+    client_request_id: String,
+) -> Result<PreparedProviderIdentityChange, ProviderCommandError> {
+    let source = current
+        .providers
+        .iter()
+        .find(|stored| stored.app == app && stored.provider.id == source_provider_id)
+        .cloned()
+        .ok_or(ProviderCommandError::NotFound)?;
+    if source.resource.revision != expected_revision {
+        return Err(provider_revision_conflict(
+            expected_revision,
+            source.resource.revision,
+        ));
+    }
+    if source
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .is_some_and(|binding| {
+            binding.source.as_deref() == Some("account") || binding.account_id.is_some()
+        })
+    {
+        return Err(ProviderCommandError::Invalid(
+            "managed-account Provider credentials cannot be cloned into a custom HTTP Provider"
+                .to_string(),
+        ));
+    }
+    if let Some(profile_id) = source.resource.profile_id.as_ref() {
+        let profile = profile_by_id(profile_id.as_str()).ok_or_else(|| {
+            ProviderCommandError::Invalid(format!("unknown profileId {profile_id}"))
+        })?;
+        if matches!(
+            profile.credential_policy,
+            CredentialPolicy::ManagedAccount { .. }
+        ) {
+            return Err(ProviderCommandError::Invalid(
+                "managed-account Provider credentials cannot be cloned into a custom HTTP Provider"
+                    .to_string(),
+            ));
+        }
+    }
+    if target_provider_id.trim().is_empty() || target_provider_id != target_provider_id.trim() {
+        return Err(ProviderCommandError::Invalid(
+            "targetProviderId must be non-empty and trimmed".to_string(),
+        ));
+    }
+    if target_name.trim().is_empty() || target_name != target_name.trim() {
+        return Err(ProviderCommandError::Invalid(
+            "targetName must be non-empty and trimmed".to_string(),
+        ));
+    }
+    validate_provider_client_request_id(Some(&client_request_id))?;
+    let custom_profile_id = ProfileId::parse(format!("{}.custom_http", app.as_str()))
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    let custom_profile = profile_by_id(custom_profile_id.as_str()).ok_or_else(|| {
+        ProviderCommandError::Invalid(format!("custom Profile {custom_profile_id} is unavailable"))
+    })?;
+    resolve_custom_binding(custom_profile, &custom_binding)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    let input = serde_json::json!({
+        "app": app,
+        "sourceProviderId": source_provider_id,
+        "expectedRevision": expected_revision,
+        "targetProviderId": target_provider_id,
+        "targetName": target_name,
+        "customBinding": custom_binding,
+        "clientRequestId": client_request_id,
+    });
+    let preview_token = provider_action_preview_token(
+        preview_key,
+        b"cc-switch-provider-clone-as-custom-v1",
+        current,
+        accounts,
+        &input,
+    )?;
+
+    let mut provider = source.provider.clone();
+    provider.id = target_provider_id;
+    provider.name = target_name;
+    if let Some(meta) = provider.meta.as_mut() {
+        meta.auth_binding = None;
+    }
+    let draft = ProviderWriteDraft {
+        app,
+        provider,
+        profile_id: Some(custom_profile_id),
+        custom_binding: Some(custom_binding),
+        expected_revision: None,
+        client_request_id: Some(client_request_id),
+        credential_patches: BTreeMap::new(),
+    };
+    let mut candidate = current.clone();
+    let (mut written, _) = apply_provider_write_drafts(&mut candidate, vec![draft], accounts)?;
+    let target = written
+        .pop()
+        .expect("clone-as-custom writes exactly one Provider");
+    candidate
+        .validate_for_commit()
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    candidate
+        .rebuild_runtime_index(accounts)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+    let (runtime, warnings) = provider_runtime_transition(&source, &target, accounts)?;
+    let preview = ProviderIdentityChangePreview {
+        preview_token,
+        action: ProviderIdentityAction::CloneAsCustom,
+        source: ProviderKey::new(app, source_provider_id)
+            .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?,
+        source_revision: source.resource.revision,
+        target: ProviderView::from_stored(&target),
+        runtime,
+        warnings,
+    };
+    Ok(PreparedProviderIdentityChange {
+        candidate,
+        preview,
+        stored: target,
+    })
+}
+
+fn provider_revision_conflict(expected: u64, current: u64) -> ProviderCommandError {
+    ProviderCommandError::Conflict {
+        code: "cc_switch_provider_revision_conflict",
+        message: format!("Provider revision conflict: expected {expected}, current {current}"),
+    }
+}
+
+fn validate_provider_action_preview_token(
+    actual: &str,
+    expected: &str,
+) -> Result<(), ProviderCommandError> {
+    if expected.trim().is_empty() || actual != expected {
+        return Err(ProviderCommandError::Conflict {
+            code: "cc_switch_provider_preview_conflict",
+            message: "Provider action preview is stale; preview the same action again".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn expected_account_provider_type(stored: &StoredProvider) -> Option<ProviderType> {
+    if let Some(profile_id) = stored.resource.profile_id.as_ref() {
+        let profile = profile_by_id(profile_id.as_str())?;
+        if let CredentialPolicy::ManagedAccount {
+            account_provider_type,
+        } = profile.credential_policy
+        {
+            return Some(account_provider_type);
+        }
+        return None;
+    }
+    match stored.provider_type {
+        ProviderType::ClaudeOAuth
+        | ProviderType::CodexOAuth
+        | ProviderType::GeminiCli
+        | ProviderType::AntigravityOAuth
+        | ProviderType::AgyOAuth
+        | ProviderType::GitHubCopilot
+        | ProviderType::DeepSeekAccount
+        | ProviderType::KiroOAuth
+        | ProviderType::CursorOAuth
+        | ProviderType::GrokOAuth => Some(stored.provider_type),
+        _ => None,
+    }
+}
+
+fn prepare_account_binding_migration_preview(
+    current: &ProviderStore,
+    accounts: &AccountStore,
+    preview_key: &[u8; 32],
+) -> Result<ProviderAccountBindingMigrationPreview, ProviderCommandError> {
+    let mut items = Vec::new();
+    for stored in &current.providers {
+        let Some(expected_provider_type) = expected_account_provider_type(stored) else {
+            continue;
+        };
+        let matching_account_ids = accounts
+            .accounts
+            .iter()
+            .filter(|account| account.provider_type == expected_provider_type)
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        let (status, selected_account_id, warning) = if let Some(account_id) =
+            provider_account_id(stored)
+        {
+            match accounts
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+            {
+                Some(account) if account.provider_type != expected_provider_type => (
+                    ProviderAccountBindingMigrationStatus::InvalidAccount,
+                    Some(account_id.to_string()),
+                    Some(format!(
+                        "bound account has providerType {}, expected {}",
+                        account.provider_type.as_str(),
+                        expected_provider_type.as_str()
+                    )),
+                ),
+                Some(account)
+                    if provider_auth_identity_generation(stored).is_some_and(|generation| {
+                        generation != account.auth_identity_generation
+                    }) =>
+                {
+                    (
+                        ProviderAccountBindingMigrationStatus::StaleIdentity,
+                        Some(account_id.to_string()),
+                        Some("bound account identity changed; explicitly rebind it".to_string()),
+                    )
+                }
+                Some(_) if provider_auth_identity_generation(stored).is_none() => (
+                    ProviderAccountBindingMigrationStatus::Bindable,
+                    Some(account_id.to_string()),
+                    Some(
+                        "historical binding is missing its account identity generation".to_string(),
+                    ),
+                ),
+                Some(_) => (
+                    ProviderAccountBindingMigrationStatus::Bound,
+                    Some(account_id.to_string()),
+                    None,
+                ),
+                None => (
+                    ProviderAccountBindingMigrationStatus::InvalidAccount,
+                    Some(account_id.to_string()),
+                    Some("bound account no longer exists".to_string()),
+                ),
+            }
+        } else {
+            match matching_account_ids.as_slice() {
+                    [] => (
+                        ProviderAccountBindingMigrationStatus::MissingAccount,
+                        None,
+                        Some(format!(
+                            "no {} account is available",
+                            expected_provider_type.as_str()
+                        )),
+                    ),
+                    [account_id] => (
+                        ProviderAccountBindingMigrationStatus::Bindable,
+                        Some(account_id.clone()),
+                        None,
+                    ),
+                    [account_id, ..] => (
+                        ProviderAccountBindingMigrationStatus::Ambiguous,
+                        Some(account_id.clone()),
+                        Some("multiple accounts match; migration preserves the legacy first-account resolver selection".to_string()),
+                    ),
+                }
+        };
+        items.push(ProviderAccountBindingMigrationItem {
+            provider_key: ProviderKey::new(stored.app, &stored.provider.id)
+                .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?,
+            provider_revision: stored.resource.revision,
+            expected_provider_type,
+            status,
+            selected_account_id,
+            matching_account_ids,
+            warning,
+        });
+    }
+    let bindable_count = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status,
+                ProviderAccountBindingMigrationStatus::Bindable
+                    | ProviderAccountBindingMigrationStatus::Ambiguous
+            )
+        })
+        .count();
+    let attention_count = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status,
+                ProviderAccountBindingMigrationStatus::MissingAccount
+                    | ProviderAccountBindingMigrationStatus::InvalidAccount
+                    | ProviderAccountBindingMigrationStatus::StaleIdentity
+            )
+        })
+        .count();
+    let token_input = items
+        .iter()
+        .map(|item| {
+            (
+                &item.provider_key,
+                item.provider_revision,
+                item.status,
+                item.selected_account_id.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let preview_token = provider_action_preview_token(
+        preview_key,
+        b"cc-switch-provider-account-binding-migration-v1",
+        current,
+        accounts,
+        &token_input,
+    )?;
+    Ok(ProviderAccountBindingMigrationPreview {
+        preview_token,
+        bindable_count,
+        attention_count,
+        items,
+    })
+}
+
 impl ServerStateInner {
     pub fn load(cli: Cli, log_capture: SharedLogCapture) -> anyhow::Result<ServerState> {
         let config_dir = cli.resolved_config_dir()?;
 
         std::fs::create_dir_all(&config_dir)
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
+        let data_directory_lock = crate::infra::storage::acquire_data_directory_lock(&config_dir)?;
 
         let provider_coverage = ProviderCoverage::load_embedded()?;
         let config = ServerConfig::load_or_default(&config_dir)?;
-        crate::domain::providers::migrate::migrate_remove_universal_layer(&config_dir)?;
-        let providers = ProviderStore::load_or_default(&config_dir)?;
+        let universal_migration =
+            crate::domain::providers::migrate::inspect_remove_universal_layer(&config_dir)?;
+        if universal_migration.requires_apply() {
+            tracing::warn!(
+                orphaned_providers = universal_migration.orphaned_providers,
+                universal_file_present = universal_migration.universal_file_present,
+                "legacy universal provider data requires an explicit migration; startup left it unchanged"
+            );
+        }
+        let mut providers = ProviderStore::load_runtime_or_default(&config_dir)?;
         let accounts = AccountStore::load_or_default(&config_dir)?;
-        let failover = FailoverStore::load_or_default(&config_dir)?;
+        providers
+            .rebuild_runtime_index(&accounts)
+            .context("compile Provider runtime index")?;
         let pricing = ModelPricingStore::load_or_default(&config_dir)?;
         let usage = UsageStore::load_or_default(&config_dir)?;
         let mut shares = ShareStore::load_or_default(&config_dir)?;
@@ -768,8 +2098,10 @@ impl ServerStateInner {
             &config_dir,
         );
         let bind_addr = SocketAddr::new(cli.host, cli.port);
-        let http_client = build_http_client(&config, bind_addr)?;
+        let http_client = build_http_client()?;
         let (events, _) = broadcast::channel(256);
+        let mut provider_import_preview_key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut provider_import_preview_key);
 
         let tunnels = TunnelSupervisor::load_or_default(&config_dir)?;
         let web_auth = crate::domain::web_auth::WebAuthStore::load(config_dir.clone());
@@ -780,12 +2112,17 @@ impl ServerStateInner {
         Ok(Arc::new(Self {
             bind_addr,
             config_dir,
+            _data_directory_lock: data_directory_lock,
             web_dist_dir: cli.resolved_web_dist_dir(),
             provider_coverage,
             config: RwLock::new(config),
             providers: RwLock::new(providers),
+            provider_commits: AsyncMutex::new(()),
+            reference_mutations: AsyncMutex::new(()),
+            provider_import_preview_key,
+            #[cfg(test)]
+            provider_commit_delay_ms: std::sync::atomic::AtomicU64::new(0),
             accounts: RwLock::new(accounts),
-            failover: RwLock::new(failover),
             pricing: RwLock::new(pricing),
             usage: RwLock::new(usage),
             shares: RwLock::new(shares),
@@ -816,6 +2153,8 @@ impl ServerStateInner {
             process_instance_id: new_process_instance_id(),
             upgrade,
             log_capture,
+            terminal: crate::api::terminal::OpsTerminalManager::new(),
+            reported_public_ip: RwLock::new(None),
         }))
     }
 
@@ -853,7 +2192,7 @@ impl ServerStateInner {
         let mut current = self.config.write().await;
         preserve_router_identity_from_stale_snapshot(&current, &mut config);
         preserve_setup_completion_from_stale_snapshot(&current, &mut config);
-        let http_client = build_http_client(&config, self.bind_addr)?;
+        let http_client = build_http_client()?;
         config.save(&self.config_dir)?;
         *self.http_client.write().await = http_client;
         *current = config;
@@ -872,6 +2211,14 @@ impl ServerStateInner {
 
     pub async fn config_snapshot(&self) -> ServerConfig {
         self.config.read().await.clone()
+    }
+
+    pub async fn reported_public_ip(&self) -> Option<String> {
+        self.reported_public_ip.read().await.clone()
+    }
+
+    pub async fn set_reported_public_ip(&self, ip: Option<String>) {
+        *self.reported_public_ip.write().await = ip;
     }
 
     pub(crate) async fn lock_setup(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -1337,11 +2684,18 @@ impl ServerStateInner {
     }
 
     pub async fn reload_persistent_stores(&self) -> anyhow::Result<()> {
+        let _provider_commit = self.provider_commits.lock().await;
+        self.reload_persistent_stores_under_provider_commit().await
+    }
+
+    async fn reload_persistent_stores_under_provider_commit(&self) -> anyhow::Result<()> {
         let config = ServerConfig::load_or_default(&self.config_dir)?;
-        let http_client = build_http_client(&config, self.bind_addr)?;
-        let providers = ProviderStore::load_or_default(&self.config_dir)?;
+        let http_client = build_http_client()?;
+        let mut providers = ProviderStore::load_runtime_or_default(&self.config_dir)?;
         let accounts = AccountStore::load_or_default(&self.config_dir)?;
-        let failover = FailoverStore::load_or_default(&self.config_dir)?;
+        providers
+            .rebuild_runtime_index(&accounts)
+            .context("compile Provider runtime index")?;
         let pricing = ModelPricingStore::load_or_default(&self.config_dir)?;
         let usage = UsageStore::load_or_default(&self.config_dir)?;
         let shares = ShareStore::load_or_default(&self.config_dir)?;
@@ -1351,13 +2705,49 @@ impl ServerStateInner {
         *self.config.write().await = config;
         *self.providers.write().await = providers;
         *self.accounts.write().await = accounts;
-        *self.failover.write().await = failover;
         *self.pricing.write().await = pricing;
         *self.usage.write().await = usage;
         *self.shares.write().await = shares;
         *self.ui_settings.write().await = ui_settings;
         self.tunnels.reload_statuses().await?;
         Ok(())
+    }
+
+    pub async fn restore_backup_command(
+        self: &Arc<Self>,
+        backup_id: String,
+    ) -> anyhow::Result<crate::infra::backup::BackupRestoreResult> {
+        let state = Arc::clone(self);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = state.restore_backup_owned(backup_id).await;
+            let _ = result_tx.send(result);
+        });
+        result_rx
+            .await
+            .context("backup restore coordinator stopped before reporting a result")?
+    }
+
+    async fn restore_backup_owned(
+        &self,
+        backup_id: String,
+    ) -> anyhow::Result<crate::infra::backup::BackupRestoreResult> {
+        let _provider_commit = self.provider_commits.lock().await;
+        let config_dir = self.config_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::infra::backup::restore_backup_with_validator(
+                &config_dir,
+                &backup_id,
+                |stage_dir, manifest| {
+                    validate_server_backup_restore_stage(&config_dir, stage_dir, manifest)
+                },
+            )
+        })
+        .await
+        .context("backup restore task panicked")??;
+        self.reload_persistent_stores_under_provider_commit()
+            .await?;
+        Ok(result)
     }
 
     pub async fn http_client(&self) -> reqwest::Client {
@@ -1391,55 +2781,659 @@ impl ServerStateInner {
         self.events.subscribe()
     }
 
-    pub async fn save_providers(&self) -> anyhow::Result<()> {
-        self.providers.read().await.save(&self.config_dir)
+    pub async fn providers_snapshot(&self) -> ProviderStore {
+        self.providers.read().await.clone()
     }
 
-    pub async fn mutate_providers<R>(&self, mutate: impl FnOnce(&mut ProviderStore) -> R) -> R {
-        let mut providers = self.providers.write().await;
-        mutate(&mut providers)
+    pub async fn provider_runtime_plan(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+    ) -> Option<Arc<crate::domain::providers::runtime::ProviderRuntimePlan>> {
+        self.providers.read().await.runtime_plan(app, provider_id)
+    }
+
+    pub async fn provider_views(&self, app: Option<AppKind>) -> Vec<ProviderView> {
+        let store = self.providers.read().await;
+        store
+            .list(app)
+            .iter()
+            .map(|stored| {
+                ProviderView::from_stored_with_order(stored, store.provider_order_index(stored))
+            })
+            .collect()
+    }
+
+    pub async fn provider_reference_preview(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+    ) -> Result<ProviderReferencePreview, ProviderCommandError> {
+        let providers = self.providers.read().await;
+        let stored = providers
+            .providers
+            .iter()
+            .find(|stored| stored.app == app && stored.provider.id == provider_id)
+            .ok_or(ProviderCommandError::NotFound)?;
+        let revision = stored.resource.revision;
+        let mut share_ids = self
+            .shares
+            .read()
+            .await
+            .share_ids_for_provider(app, provider_id);
+        share_ids.sort();
+        let current_provider = crate::domain::providers::current_provider::read_current_provider_id(
+            &self.ui_settings.read().await.for_frontend(),
+            app,
+        )
+        .as_deref() == Some(provider_id);
+        Ok(ProviderReferencePreview {
+            app,
+            provider_id: provider_id.to_string(),
+            revision,
+            blocked: !share_ids.is_empty() || current_provider,
+            share_ids,
+            current_provider,
+        })
+    }
+
+    pub async fn delete_provider_command(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: String,
+        expected_revision: u64,
+    ) -> anyhow::Result<Result<bool, ProviderCommandError>> {
+        let _references = self.reference_mutations.lock().await;
+        let preview = match self.provider_reference_preview(app, &provider_id).await {
+            Ok(preview) => preview,
+            Err(error) => return Ok(Err(error)),
+        };
+        if preview.revision != expected_revision {
+            return Ok(Err(ProviderCommandError::Conflict {
+                code: "cc_switch_provider_revision_conflict",
+                message: format!(
+                    "Provider revision conflict: expected {expected_revision}, current {}",
+                    preview.revision
+                ),
+            }));
+        }
+        if preview.blocked {
+            return Ok(Err(ProviderCommandError::Conflict {
+                code: "cc_switch_provider_in_use",
+                message: format!(
+                    "Provider is still referenced by {} Share(s){}",
+                    preview.share_ids.len(),
+                    if preview.current_provider {
+                        " and is the current Provider"
+                    } else {
+                        ""
+                    }
+                ),
+            }));
+        }
+        self.try_mutate_providers_immediate_if_changed(move |providers| {
+            let Some(stored) = providers
+                .providers
+                .iter()
+                .find(|stored| stored.app == app && stored.provider.id == provider_id)
+            else {
+                return Err(ProviderCommandError::NotFound);
+            };
+            if stored.resource.revision != expected_revision {
+                return Err(ProviderCommandError::Conflict {
+                    code: "cc_switch_provider_revision_conflict",
+                    message: format!(
+                        "Provider revision conflict: expected {expected_revision}, current {}",
+                        stored.resource.revision
+                    ),
+                });
+            }
+            Ok((providers.remove(app, &provider_id).is_some(), true))
+        })
+        .await
+    }
+
+    pub async fn redacted_provider_record(&self, app: AppKind) -> BTreeMap<String, Provider> {
+        let store = self.providers.read().await;
+        store
+            .list(Some(app))
+            .iter()
+            .enumerate()
+            .map(|(index, stored)| {
+                let (mut provider, _) =
+                    crate::domain::providers::credentials::redact_provider(&stored.provider);
+                provider
+                    .extra
+                    .insert("sortIndex".to_string(), Value::from(index as u64));
+                (stored.provider.id.clone(), provider)
+            })
+            .collect()
+    }
+
+    pub async fn upsert_provider_command(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider: Provider,
+        profile_id: Option<ProfileId>,
+        expected_revision: Option<u64>,
+        client_request_id: Option<String>,
+        credential_patches: BTreeMap<String, CredentialPatch>,
+    ) -> anyhow::Result<Result<StoredProvider, ProviderCommandError>> {
+        self.upsert_provider_draft_command(ProviderWriteDraft {
+            app,
+            provider,
+            profile_id,
+            custom_binding: None,
+            expected_revision,
+            client_request_id,
+            credential_patches,
+        })
+        .await
+    }
+
+    pub async fn upsert_provider_draft_command(
+        self: &Arc<Self>,
+        draft: ProviderWriteDraft,
+    ) -> anyhow::Result<Result<StoredProvider, ProviderCommandError>> {
+        self.upsert_provider_commands(vec![draft])
+            .await
+            .map(|result| {
+                result.map(|providers| {
+                    providers
+                        .into_iter()
+                        .next()
+                        .expect("single-provider command returns one provider")
+                })
+            })
+    }
+
+    pub async fn upsert_provider_commands(
+        self: &Arc<Self>,
+        drafts: Vec<ProviderWriteDraft>,
+    ) -> anyhow::Result<Result<Vec<StoredProvider>, ProviderCommandError>> {
+        let _references = self.reference_mutations.lock().await;
+        let accounts = self.accounts.read().await.clone();
+        self.try_mutate_providers_immediate_if_changed(move |store| {
+            apply_provider_write_drafts(store, drafts, &accounts)
+        })
+        .await
+    }
+
+    pub async fn preview_provider_import_command(
+        &self,
+        drafts: Vec<ProviderWriteDraft>,
+    ) -> anyhow::Result<Result<ProviderImportPreview, ProviderCommandError>> {
+        let current = self.providers.read().await.materialized_clone()?;
+        let accounts = self.accounts.read().await.clone();
+        Ok(prepare_provider_import(
+            &current,
+            drafts,
+            &self.provider_import_preview_key,
+            &accounts,
+        )
+        .map(|prepared| prepared.preview))
+    }
+
+    pub async fn apply_provider_import_command(
+        self: &Arc<Self>,
+        drafts: Vec<ProviderWriteDraft>,
+        expected_preview_token: String,
+    ) -> anyhow::Result<Result<ProviderImportPreview, ProviderCommandError>> {
+        let _references = self.reference_mutations.lock().await;
+        let accounts = self.accounts.read().await.clone();
+        let preview_key = self.provider_import_preview_key;
+        self.commit_provider_change(move |store| {
+            let prepared = prepare_provider_import(store, drafts, &preview_key, &accounts)?;
+            if expected_preview_token.trim().is_empty()
+                || prepared.preview.preview_token != expected_preview_token
+            {
+                return Err(ProviderCommandError::Conflict {
+                    code: "cc_switch_provider_import_conflict",
+                    message: "Provider import preview is stale; preview the same import again"
+                        .to_string(),
+                });
+            }
+            let changed = prepared.preview.create_count + prepared.preview.update_count > 0;
+            *store = prepared.candidate;
+            Ok((prepared.preview, changed))
+        })
+        .await
+    }
+
+    pub async fn preview_adopt_provider_profile_command(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        expected_revision: u64,
+        profile_id: ProfileId,
+        account_id: Option<String>,
+    ) -> anyhow::Result<Result<ProviderIdentityChangePreview, ProviderCommandError>> {
+        let current = self.providers.read().await.materialized_clone()?;
+        let accounts = self.accounts.read().await.clone();
+        let input = AdoptProviderProfileInput {
+            app,
+            provider_id: provider_id.to_string(),
+            expected_revision,
+            profile_id,
+            account_id,
+        };
+        Ok(prepare_adopt_provider_profile(
+            &current,
+            &accounts,
+            &self.provider_import_preview_key,
+            &input,
+        )
+        .map(|prepared| prepared.preview))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_adopt_provider_profile_command(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: String,
+        expected_revision: u64,
+        profile_id: ProfileId,
+        account_id: Option<String>,
+        expected_preview_token: String,
+    ) -> anyhow::Result<Result<(ProviderIdentityChangePreview, StoredProvider), ProviderCommandError>>
+    {
+        let _references = self.reference_mutations.lock().await;
+        let accounts = self.accounts.read().await.clone();
+        let preview_key = self.provider_import_preview_key;
+        let input = AdoptProviderProfileInput {
+            app,
+            provider_id,
+            expected_revision,
+            profile_id,
+            account_id,
+        };
+        self.commit_provider_change(move |store| {
+            let prepared = prepare_adopt_provider_profile(store, &accounts, &preview_key, &input)?;
+            validate_provider_action_preview_token(
+                &prepared.preview.preview_token,
+                &expected_preview_token,
+            )?;
+            *store = prepared.candidate;
+            Ok(((prepared.preview, prepared.stored), true))
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn preview_rebind_custom_provider_command(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        expected_revision: u64,
+        custom_binding: CustomBindingInput,
+        credential_patches: BTreeMap<String, CredentialPatch>,
+    ) -> anyhow::Result<Result<ProviderIdentityChangePreview, ProviderCommandError>> {
+        let current = self.providers.read().await.materialized_clone()?;
+        let accounts = self.accounts.read().await.clone();
+        let input = RebindCustomProviderInput {
+            app,
+            provider_id: provider_id.to_string(),
+            expected_revision,
+            custom_binding,
+            credential_patches,
+        };
+        Ok(prepare_rebind_custom_provider(
+            &current,
+            &accounts,
+            &self.provider_import_preview_key,
+            &input,
+        )
+        .map(|prepared| prepared.preview))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_rebind_custom_provider_command(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: String,
+        expected_revision: u64,
+        custom_binding: CustomBindingInput,
+        credential_patches: BTreeMap<String, CredentialPatch>,
+        expected_preview_token: String,
+    ) -> anyhow::Result<Result<(ProviderIdentityChangePreview, StoredProvider), ProviderCommandError>>
+    {
+        let _references = self.reference_mutations.lock().await;
+        let accounts = self.accounts.read().await.clone();
+        let preview_key = self.provider_import_preview_key;
+        let input = RebindCustomProviderInput {
+            app,
+            provider_id,
+            expected_revision,
+            custom_binding,
+            credential_patches,
+        };
+        self.commit_provider_change(move |store| {
+            let prepared = prepare_rebind_custom_provider(store, &accounts, &preview_key, &input)?;
+            validate_provider_action_preview_token(
+                &prepared.preview.preview_token,
+                &expected_preview_token,
+            )?;
+            *store = prepared.candidate;
+            Ok(((prepared.preview, prepared.stored), true))
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn preview_clone_provider_as_custom_command(
+        &self,
+        app: AppKind,
+        source_provider_id: &str,
+        expected_revision: u64,
+        target_provider_id: String,
+        target_name: String,
+        custom_binding: CustomBindingInput,
+        client_request_id: String,
+    ) -> anyhow::Result<Result<ProviderIdentityChangePreview, ProviderCommandError>> {
+        let current = self.providers.read().await.materialized_clone()?;
+        let accounts = self.accounts.read().await.clone();
+        Ok(prepare_clone_provider_as_custom(
+            &current,
+            &accounts,
+            &self.provider_import_preview_key,
+            app,
+            source_provider_id,
+            expected_revision,
+            target_provider_id,
+            target_name,
+            custom_binding,
+            client_request_id,
+        )
+        .map(|prepared| prepared.preview))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_clone_provider_as_custom_command(
+        self: &Arc<Self>,
+        app: AppKind,
+        source_provider_id: String,
+        expected_revision: u64,
+        target_provider_id: String,
+        target_name: String,
+        custom_binding: CustomBindingInput,
+        client_request_id: String,
+        expected_preview_token: String,
+    ) -> anyhow::Result<Result<(ProviderIdentityChangePreview, StoredProvider), ProviderCommandError>>
+    {
+        let _references = self.reference_mutations.lock().await;
+        let accounts = self.accounts.read().await.clone();
+        let preview_key = self.provider_import_preview_key;
+        self.commit_provider_change(move |store| {
+            let prepared = prepare_clone_provider_as_custom(
+                store,
+                &accounts,
+                &preview_key,
+                app,
+                &source_provider_id,
+                expected_revision,
+                target_provider_id,
+                target_name,
+                custom_binding,
+                client_request_id,
+            )?;
+            validate_provider_action_preview_token(
+                &prepared.preview.preview_token,
+                &expected_preview_token,
+            )?;
+            *store = prepared.candidate;
+            Ok(((prepared.preview, prepared.stored), true))
+        })
+        .await
+    }
+
+    pub async fn preview_provider_account_binding_migration_command(
+        &self,
+    ) -> anyhow::Result<Result<ProviderAccountBindingMigrationPreview, ProviderCommandError>> {
+        let current = self.providers.read().await.materialized_clone()?;
+        let accounts = self.accounts.read().await.clone();
+        Ok(prepare_account_binding_migration_preview(
+            &current,
+            &accounts,
+            &self.provider_import_preview_key,
+        ))
+    }
+
+    pub async fn apply_provider_account_binding_migration_command(
+        self: &Arc<Self>,
+        expected_preview_token: String,
+    ) -> anyhow::Result<Result<(ProviderAccountBindingMigrationPreview, usize), ProviderCommandError>>
+    {
+        let _references = self.reference_mutations.lock().await;
+        let accounts = self.accounts.read().await.clone();
+        let preview_key = self.provider_import_preview_key;
+        self.commit_provider_change(move |store| {
+            let preview =
+                prepare_account_binding_migration_preview(store, &accounts, &preview_key)?;
+            validate_provider_action_preview_token(
+                &preview.preview_token,
+                &expected_preview_token,
+            )?;
+            let mut applied = 0usize;
+            for item in &preview.items {
+                if !matches!(
+                    item.status,
+                    ProviderAccountBindingMigrationStatus::Bindable
+                        | ProviderAccountBindingMigrationStatus::Ambiguous
+                ) {
+                    continue;
+                }
+                let account_id = item
+                    .selected_account_id
+                    .as_deref()
+                    .expect("bindable migration item has a selected account");
+                let account = accounts
+                    .accounts
+                    .iter()
+                    .find(|account| {
+                        account.id == account_id
+                            && account.provider_type == item.expected_provider_type
+                    })
+                    .expect("preview selected a matching account");
+                let stored = store
+                    .providers
+                    .iter_mut()
+                    .find(|stored| {
+                        stored.app == item.provider_key.app
+                            && stored.provider.id == item.provider_key.provider_id
+                    })
+                    .expect("migration preview Provider exists in candidate store");
+                let meta = stored
+                    .provider
+                    .meta
+                    .get_or_insert_with(ProviderMeta::default);
+                meta.auth_binding = Some(AuthBinding {
+                    source: Some("account".to_string()),
+                    auth_provider: Some(item.expected_provider_type.as_str().to_string()),
+                    account_id: Some(account.id.clone()),
+                    auth_identity_generation: Some(account.auth_identity_generation),
+                });
+                stored.resource.revision = stored.resource.revision.saturating_add(1);
+                applied += 1;
+            }
+            Ok(((preview, applied), applied > 0))
+        })
+        .await
+    }
+
+    pub(crate) async fn lock_reference_mutations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.reference_mutations.lock().await
     }
 
     pub async fn mutate_providers_immediate<R>(
-        &self,
-        mutate: impl FnOnce(&mut ProviderStore) -> R,
-    ) -> anyhow::Result<R> {
-        let result = self.mutate_providers(mutate).await;
-        self.save_providers().await?;
-        Ok(result)
+        self: &Arc<Self>,
+        mutate: impl FnOnce(&mut ProviderStore) -> R + Send + 'static,
+    ) -> anyhow::Result<R>
+    where
+        R: Send + 'static,
+    {
+        self.commit_provider_change(move |providers| {
+            Ok::<_, std::convert::Infallible>((mutate(providers), true))
+        })
+        .await?
+        .map_err(|never| match never {})
     }
 
     pub async fn mutate_providers_immediate_if_changed<R>(
-        &self,
-        mutate: impl FnOnce(&mut ProviderStore) -> (R, bool),
-    ) -> anyhow::Result<R> {
-        let (result, changed) = self.mutate_providers(mutate).await;
-        if changed {
-            self.save_providers().await?;
-        }
-        Ok(result)
+        self: &Arc<Self>,
+        mutate: impl FnOnce(&mut ProviderStore) -> (R, bool) + Send + 'static,
+    ) -> anyhow::Result<R>
+    where
+        R: Send + 'static,
+    {
+        self.commit_provider_change(move |providers| {
+            Ok::<_, std::convert::Infallible>(mutate(providers))
+        })
+        .await?
+        .map_err(|never| match never {})
     }
 
     pub async fn try_mutate_providers_immediate<R, E>(
-        &self,
-        mutate: impl FnOnce(&mut ProviderStore) -> Result<R, E>,
-    ) -> anyhow::Result<Result<R, E>> {
-        let result = self.mutate_providers(mutate).await;
-        if result.is_ok() {
-            self.save_providers().await?;
-        }
-        Ok(result)
+        self: &Arc<Self>,
+        mutate: impl FnOnce(&mut ProviderStore) -> Result<R, E> + Send + 'static,
+    ) -> anyhow::Result<Result<R, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.commit_provider_change(move |providers| mutate(providers).map(|result| (result, true)))
+            .await
     }
 
     pub async fn try_mutate_providers_immediate_if_changed<R, E>(
-        &self,
-        mutate: impl FnOnce(&mut ProviderStore) -> Result<(R, bool), E>,
-    ) -> anyhow::Result<Result<R, E>> {
-        let result = self.mutate_providers(mutate).await;
-        if result.as_ref().is_ok_and(|(_, changed)| *changed) {
-            self.save_providers().await?;
+        self: &Arc<Self>,
+        mutate: impl FnOnce(&mut ProviderStore) -> Result<(R, bool), E> + Send + 'static,
+    ) -> anyhow::Result<Result<R, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.commit_provider_change(mutate).await
+    }
+
+    async fn commit_provider_change<R, E>(
+        self: &Arc<Self>,
+        mutate: impl FnOnce(&mut ProviderStore) -> Result<(R, bool), E> + Send + 'static,
+    ) -> anyhow::Result<Result<R, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        let state = Arc::clone(self);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = state.commit_provider_change_owned(mutate).await;
+            let _ = result_tx.send(result);
+        });
+        result_rx
+            .await
+            .context("provider commit coordinator stopped before reporting a result")?
+    }
+
+    async fn commit_provider_change_owned<R, E>(
+        self: &Arc<Self>,
+        mutate: impl FnOnce(&mut ProviderStore) -> Result<(R, bool), E> + Send + 'static,
+    ) -> anyhow::Result<Result<R, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        let _commit = self.provider_commits.lock().await;
+        let current = self.providers.read().await.clone();
+        let mut candidate = current
+            .materialized_clone()
+            .context("materialize Provider credentials for commit")?;
+        let (result, changed) = match mutate(&mut candidate) {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !changed {
+            return Ok(Ok(result));
         }
-        Ok(result.map(|(value, _)| value))
+        candidate.validate_for_commit()?;
+        let accounts = self.accounts.read().await.clone();
+        candidate
+            .rebuild_runtime_index(&accounts)
+            .context("compile Provider runtime index before commit")?;
+        candidate
+            .seal_for_commit(&self.config_dir)
+            .context("seal Provider credentials before commit")?;
+        candidate
+            .rebuild_runtime_index(&accounts)
+            .context("compile sealed Provider runtime index before commit")?;
+
+        #[cfg(test)]
+        {
+            let delay_ms = self
+                .provider_commit_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if delay_ms > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        let config_dir = self.config_dir.clone();
+        let persisted_candidate = candidate.clone();
+        let persist_result =
+            tokio::task::spawn_blocking(move || persisted_candidate.save(&config_dir))
+                .await
+                .context("provider persistence task panicked")?;
+
+        if let Err(error) = persist_result {
+            // rename is the commit point. A directory-fsync error can be reported after the
+            // candidate is already authoritative on disk, so reconcile before deciding.
+            let on_disk = ProviderStore::load_runtime_or_default(&self.config_dir);
+            let candidate_json = serde_json::to_value(&candidate);
+            let disk_matches = on_disk
+                .as_ref()
+                .ok()
+                .and_then(|store| serde_json::to_value(store).ok())
+                .zip(candidate_json.ok())
+                .is_some_and(|(disk, expected)| disk == expected);
+            if !disk_matches {
+                return Err(error);
+            }
+            tracing::warn!(
+                error = %error,
+                "provider file reached the commit point despite a persistence error; reconciled live state"
+            );
+        }
+
+        let changed_projection_keys = provider_runtime_projection_changes(&current, &candidate);
+        *self.providers.write().await = candidate;
+        if !changed_projection_keys.is_empty() {
+            let share_ids = {
+                let shares = self.shares.read().await;
+                changed_projection_keys
+                    .iter()
+                    .flat_map(|(app, provider_id)| shares.share_ids_for_provider(*app, provider_id))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
+            if !share_ids.is_empty()
+                && self
+                    .config_snapshot()
+                    .await
+                    .has_registered_router_identity()
+            {
+                let state = Arc::clone(self);
+                tokio::spawn(async move {
+                    if let Err(error) = sync_shares_to_router(&state, &share_ids).await {
+                        tracing::warn!(
+                            share_count = share_ids.len(),
+                            %error,
+                            "Provider commit Share descriptor reconcile remains pending"
+                        );
+                    }
+                });
+            }
+        }
+        Ok(Ok(result))
     }
 
     pub async fn save_accounts(&self) -> anyhow::Result<()> {
@@ -1809,52 +3803,6 @@ impl ServerStateInner {
         let result = self.mutate_accounts(mutate).await;
         save_accounts_debounced(self);
         result
-    }
-
-    pub async fn save_failover(&self) -> anyhow::Result<()> {
-        self.failover.read().await.save(&self.config_dir)
-    }
-
-    pub async fn mutate_failover<R>(&self, mutate: impl FnOnce(&mut FailoverStore) -> R) -> R {
-        let mut failover = self.failover.write().await;
-        mutate(&mut failover)
-    }
-
-    pub async fn mutate_failover_immediate<R>(
-        &self,
-        mutate: impl FnOnce(&mut FailoverStore) -> R,
-    ) -> anyhow::Result<R> {
-        let result = self.mutate_failover(mutate).await;
-        self.save_failover().await?;
-        Ok(result)
-    }
-
-    pub async fn mutate_failover_best_effort_if_changed<R>(
-        &self,
-        persist_context: &'static str,
-        mutate: impl FnOnce(&mut FailoverStore) -> (R, bool),
-    ) -> R {
-        let (result, changed) = self.mutate_failover(mutate).await;
-        if changed {
-            if let Err(error) = self.save_failover().await {
-                tracing::warn!("failed to persist {persist_context}: {error}");
-            }
-        }
-        result
-    }
-
-    pub async fn try_mutate_failover_best_effort_if_changed<R, E>(
-        &self,
-        persist_context: &'static str,
-        mutate: impl FnOnce(&mut FailoverStore) -> Result<(R, bool), E>,
-    ) -> Result<R, E> {
-        let result = self.mutate_failover(mutate).await;
-        if result.as_ref().is_ok_and(|(_, changed)| *changed) {
-            if let Err(error) = self.save_failover().await {
-                tracing::warn!("failed to persist {persist_context}: {error}");
-            }
-        }
-        result.map(|(value, _)| value)
     }
 
     pub async fn save_pricing(&self) -> anyhow::Result<()> {
@@ -2714,85 +4662,14 @@ fn now_ms_i64() -> i64 {
     crate::infra::time::now_ms().min(i64::MAX as u128) as i64
 }
 
-pub fn build_provider_http_client(
-    proxy_url: &str,
-    bind_addr: SocketAddr,
-) -> anyhow::Result<reqwest::Client> {
-    build_http_client_from_proxy(Some(proxy_url), false, bind_addr)
-}
-
-fn build_http_client(
-    config: &ServerConfig,
-    bind_addr: SocketAddr,
-) -> anyhow::Result<reqwest::Client> {
-    build_http_client_from_proxy(
-        config.upstream_proxy.url.as_deref(),
-        config.upstream_proxy.follow_system_proxy,
-        bind_addr,
-    )
-}
-
-fn build_http_client_from_proxy(
-    proxy_url: Option<&str>,
-    follow_system_proxy: bool,
-    bind_addr: SocketAddr,
-) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
+fn build_http_client() -> anyhow::Result<reqwest::Client> {
+    crate::infra::http::direct_client_builder()
         .connect_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
         .tcp_keepalive(Duration::from_secs(60))
-        .no_gzip();
-
-    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
-        crate::domain::settings::config::validate_proxy_url(proxy_url)?;
-        let proxy = reqwest::Proxy::all(proxy_url)
-            .with_context(|| format!("configure upstream proxy {}", mask_proxy_url(proxy_url)))?;
-        builder = builder.proxy(proxy);
-    } else if !follow_system_proxy || system_proxy_points_to_self(bind_addr) {
-        builder = builder.no_proxy();
-    }
-
-    builder.build().context("build http client")
-}
-
-fn system_proxy_points_to_self(bind_addr: SocketAddr) -> bool {
-    const KEYS: [&str; 6] = [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ];
-    KEYS.iter()
-        .filter_map(|key| env::var(key).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .any(|value| proxy_points_to_addr(&value, bind_addr))
-}
-
-fn proxy_points_to_addr(value: &str, bind_addr: SocketAddr) -> bool {
-    let candidate = if value.contains("://") {
-        value.to_string()
-    } else {
-        format!("http://{value}")
-    };
-    let Ok(parsed) = reqwest::Url::parse(&candidate) else {
-        return false;
-    };
-    let Some(port) = parsed.port_or_known_default() else {
-        return false;
-    };
-    if port != bind_addr.port() {
-        return false;
-    }
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+        .no_gzip()
+        .build()
+        .context("build direct HTTP client")
 }
 
 pub async fn refresh_router_installation_registration(state: &ServerState) -> bool {
@@ -2932,7 +4809,7 @@ async fn run_auto_upgrade_tick(state: &ServerState) -> anyhow::Result<()> {
     if crate::self_update::version::ensure_binary_writable().is_err() {
         return Ok(());
     }
-    let client = reqwest::Client::builder()
+    let client = crate::infra::http::direct_client_builder()
         .user_agent("cc-switch-server/0.1 auto-upgrade")
         .build()
         .context("build auto-upgrade client")?;
@@ -2997,6 +4874,23 @@ pub fn spawn_installation_heartbeat(state: ServerState) {
     });
 }
 
+pub fn spawn_public_ip_discovery(state: ServerState) {
+    tokio::spawn(async move {
+        let http = state.http_client().await;
+        match crate::infra::public_ip::discover_public_ipv4(&http).await {
+            Some(ip) => {
+                tracing::info!(%ip, "discovered public IPv4 for router client display");
+                state.set_reported_public_ip(Some(ip)).await;
+            }
+            None => {
+                tracing::warn!(
+                    "public IPv4 discovery failed on all endpoints; keeping previous value if any"
+                );
+            }
+        }
+    });
+}
+
 async fn run_installation_heartbeat_once(
     state: &ServerState,
     consecutive_failures: &mut u32,
@@ -3037,8 +4931,14 @@ async fn run_installation_heartbeat_once(
         return false;
     }
     let http_client = state.http_client().await;
-    match client::send_installation_heartbeat(&http_client, &config, &state.process_instance_id)
-        .await
+    let public_ip = state.reported_public_ip().await;
+    match client::send_installation_heartbeat(
+        &http_client,
+        &config,
+        &state.process_instance_id,
+        public_ip.as_deref(),
+    )
+    .await
     {
         Ok(()) => {
             *consecutive_failures = 0;
@@ -3116,6 +5016,7 @@ async fn run_installation_heartbeat_once(
                             &recovered_http_client,
                             &recovered_config,
                             &state.process_instance_id,
+                            state.reported_public_ip().await.as_deref(),
                         )
                         .await
                         {
@@ -3309,18 +5210,18 @@ async fn run_periodic_share_sync_retry_once(state: &ServerState) {
         }
         return;
     }
-    let pending_ids = state
-        .shares
-        .read()
-        .await
-        .shares
-        .iter()
-        .filter(|share| {
-            share.router_synced_revision < share.config_revision
-                || share.router_last_sync_error.is_some()
-        })
-        .map(|share| share.id.clone())
-        .collect::<Vec<_>>();
+    let pending_ids = {
+        let shares = state.shares.read().await;
+        shares
+            .shares
+            .iter()
+            .filter(|share| {
+                shares.descriptor_projection_pending(share)
+                    || share.router_last_sync_error.is_some()
+            })
+            .map(|share| share.id.clone())
+            .collect::<Vec<_>>()
+    };
     for share_id in pending_ids {
         if let Err(error) = sync_one_share_to_router(state, &share_id).await {
             tracing::warn!(share_id = %share_id, error = %error, "periodic router share sync retry failed");
@@ -4197,6 +6098,73 @@ pub(crate) async fn sync_one_share_to_router(
     sync_one_share_to_router_locked(state, share_id).await
 }
 
+async fn push_router_share_operations(
+    state: &ServerState,
+    http_client: &reqwest::Client,
+    config: &ServerConfig,
+    operations: Vec<ShareSyncOperation>,
+) -> anyhow::Result<client::ShareDescriptorSyncOutcome> {
+    let strict_required =
+        state.shares.read().await.router_descriptor_sync_mode == RouterDescriptorSyncMode::Strict;
+    let outcome =
+        client::push_share_descriptor_ops(http_client, config, operations.clone(), strict_required)
+            .await?;
+    if let client::ShareDescriptorSyncOutcome::Strict(acks) = &outcome {
+        validate_router_descriptor_acks(&operations, acks)?;
+    }
+    Ok(outcome)
+}
+
+fn validate_router_descriptor_acks(
+    operations: &[ShareSyncOperation],
+    acks: &[client::ShareDescriptorSyncAck],
+) -> anyhow::Result<()> {
+    let expected = operations
+        .iter()
+        .filter_map(|operation| operation.share.as_ref())
+        .map(|share| {
+            (
+                share.share_id.as_str(),
+                (
+                    share.descriptor_generation,
+                    share.descriptor_fingerprint.as_str(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    for ack in acks {
+        let Some((generation, fingerprint)) = expected.get(ack.share_id.as_str()) else {
+            anyhow::bail!(
+                "Router strict Share descriptor sync returned an unknown ACK for {}",
+                ack.share_id
+            );
+        };
+        if !seen.insert(ack.share_id.as_str()) {
+            anyhow::bail!(
+                "Router strict Share descriptor sync returned a duplicate ACK for {}",
+                ack.share_id
+            );
+        }
+        if ack.descriptor_generation != *generation || ack.descriptor_fingerprint != *fingerprint {
+            anyhow::bail!(
+                "Router strict Share descriptor ACK does not match the sent projection for {}",
+                ack.share_id
+            );
+        }
+    }
+    if seen.len() != expected.len() {
+        let missing = expected
+            .keys()
+            .filter(|share_id| !seen.contains(**share_id))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("Router strict Share descriptor sync omitted ACKs for {missing}");
+    }
+    Ok(())
+}
+
 async fn sync_one_share_to_router_locked(
     state: &ServerState,
     share_id: &str,
@@ -4205,10 +6173,7 @@ async fn sync_one_share_to_router_locked(
     if !config.has_registered_router_identity() {
         anyhow::bail!("router installation is not registered");
     }
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
-    let share = {
+    {
         let store = state.shares.read().await;
         let blocked_by_delete = store.has_pending_router_delete_for_share(share_id);
         if blocked_by_delete {
@@ -4217,44 +6182,31 @@ async fn sync_one_share_to_router_locked(
         let Some(share) = store.shares.iter().find(|share| share.id == share_id) else {
             return Ok(());
         };
-        share.clone()
-    };
-    let descriptor = descriptor_for_share_with_accounts_and_usage(
-        &share,
-        &providers,
-        Some(&accounts),
-        Some(&usage),
-    );
-    let op = ShareSyncOperation {
-        kind: "upsert".to_string(),
-        share_id: None,
-        share: Some(descriptor),
-    };
+        let _ = share;
+    }
+    let operations =
+        build_router_share_upsert_ops(state, &BTreeSet::from([share_id.to_string()])).await?;
+    if operations.is_empty() {
+        return Ok(());
+    }
     let http_client = state.http_client().await;
-    let result = client::push_share_ops(&http_client, &config, vec![op]).await;
-    let router_base = config.router_api_base().map(str::to_string);
-    {
-        let mut store = state.shares.write().await;
-        match &result {
-            Ok(()) => {
-                store.router_registered = true;
-                store.last_router_error = None;
-                store.mark_router_sync(
-                    share_id,
-                    share.config_revision,
-                    router_base,
-                    Ok(crate::infra::time::now_ms()),
-                );
-            }
-            Err(error) => {
-                let message = error.to_string();
-                store.last_router_error = Some(message.clone());
-                store.mark_router_sync(share_id, share.config_revision, router_base, Err(message));
-            }
+    let result =
+        push_router_share_operations(state, &http_client, &config, operations.clone()).await;
+    match &result {
+        Ok(outcome) => {
+            mark_router_share_upserts_synced_with_outcome(
+                state,
+                &config,
+                &operations,
+                outcome.clone(),
+            )
+            .await;
+        }
+        Err(error) => {
+            mark_router_share_upserts_failed(state, &config, &operations, error.to_string()).await;
         }
     }
-    save_shares_debounced(state);
-    result
+    result.map(|_| ())
 }
 
 pub(crate) async fn sync_shares_to_router(
@@ -4280,7 +6232,7 @@ pub(crate) async fn sync_shares_to_router(
             })
             .collect::<BTreeSet<_>>()
     };
-    let operations = build_router_share_upsert_ops(state, &active_ids).await;
+    let operations = build_router_share_upsert_ops(state, &active_ids).await?;
     if operations.is_empty() {
         return Ok(());
     }
@@ -4288,8 +6240,10 @@ pub(crate) async fn sync_shares_to_router(
     let http_client = state.http_client().await;
     for chunk in operations.chunks(ROUTER_SHARE_SYNC_BATCH_SIZE) {
         let chunk = chunk.to_vec();
-        match client::push_share_ops(&http_client, &config, chunk.clone()).await {
-            Ok(()) => mark_router_share_upserts_synced(state, &config, &chunk).await,
+        match push_router_share_operations(state, &http_client, &config, chunk.clone()).await {
+            Ok(outcome) => {
+                mark_router_share_upserts_synced_with_outcome(state, &config, &chunk, outcome).await
+            }
             Err(error) => {
                 mark_router_share_upserts_failed(state, &config, &chunk, error.to_string()).await;
                 return Err(error);
@@ -4301,7 +6255,9 @@ pub(crate) async fn sync_shares_to_router(
 
 pub(crate) fn spawn_router_share_delete_retry(state: ServerState, tombstone: ShareDeleteTombstone) {
     tokio::spawn(async move {
-        if let Err(error) = retry_router_share_deletes(&state, &[tombstone.clone()]).await {
+        if let Err(error) =
+            retry_router_share_deletes(&state, std::slice::from_ref(&tombstone)).await
+        {
             tracing::warn!(
                 share_id = %tombstone.share_id,
                 operation_id = %tombstone.operation_id,
@@ -4434,12 +6390,17 @@ async fn retry_router_share_delete_chunk_locked(
             share: None,
         })
         .collect::<Vec<_>>();
-    ops.extend(build_router_share_upsert_ops(state, &current_ids).await);
+    ops.extend(build_router_share_upsert_ops(state, &current_ids).await?);
     let http_client = state.http_client().await;
-    if let Err(error) = client::push_share_ops(&http_client, &config, ops).await {
-        record_router_share_delete_failures(state, &active, error.to_string()).await?;
-        return Err(error);
-    }
+    let outcome =
+        match push_router_share_operations(state, &http_client, &config, ops.clone()).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                record_router_share_delete_failures(state, &active, error.to_string()).await?;
+                return Err(error);
+            }
+        };
+    mark_router_share_upserts_synced_with_outcome(state, &config, &ops, outcome).await;
 
     let compensation_ids = {
         let store = state.shares.read().await;
@@ -4449,15 +6410,25 @@ async fn retry_router_share_delete_chunk_locked(
             .map(|tombstone| tombstone.share_id.clone())
             .collect::<BTreeSet<_>>()
     };
-    let compensation_ops = build_router_share_upsert_ops(state, &compensation_ids).await;
+    let compensation_ops = build_router_share_upsert_ops(state, &compensation_ids).await?;
     if !compensation_ops.is_empty() {
-        if let Err(error) =
-            client::push_share_ops(&http_client, &config, compensation_ops.clone()).await
+        match push_router_share_operations(state, &http_client, &config, compensation_ops.clone())
+            .await
         {
-            record_router_share_delete_failures(state, &active, error.to_string()).await?;
-            return Err(error);
+            Ok(outcome) => {
+                mark_router_share_upserts_synced_with_outcome(
+                    state,
+                    &config,
+                    &compensation_ops,
+                    outcome,
+                )
+                .await;
+            }
+            Err(error) => {
+                record_router_share_delete_failures(state, &active, error.to_string()).await?;
+                return Err(error);
+            }
         }
-        mark_router_share_upserts_synced(state, &config, &compensation_ops).await;
     }
 
     let operation_ids = active
@@ -4478,13 +6449,22 @@ async fn retry_router_share_delete_chunk_locked(
 async fn build_router_share_upsert_ops(
     state: &ServerState,
     share_ids: &BTreeSet<String>,
-) -> Vec<ShareSyncOperation> {
+) -> anyhow::Result<Vec<ShareSyncOperation>> {
+    build_router_share_upsert_ops_with_policy(state, share_ids, false).await
+}
+
+async fn build_router_share_upsert_ops_with_policy(
+    state: &ServerState,
+    share_ids: &BTreeSet<String>,
+    force: bool,
+) -> anyhow::Result<Vec<ShareSyncOperation>> {
     if share_ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
     let usage = state.usage.read().await.clone();
+    let config = state.config_snapshot().await;
     let shares = state
         .shares
         .read()
@@ -4494,46 +6474,117 @@ async fn build_router_share_upsert_ops(
         .filter(|share| share_ids.contains(&share.id))
         .cloned()
         .collect::<Vec<_>>();
-    shares
+    let prepared = shares
         .iter()
-        .map(|share| ShareSyncOperation {
-            kind: "upsert".to_string(),
-            share_id: None,
-            share: Some(descriptor_for_share_with_accounts_and_usage(
+        .map(|share| {
+            let descriptor = descriptor_for_share_with_accounts_and_usage(
                 share,
                 &providers,
                 Some(&accounts),
                 Some(&usage),
-            )),
+            );
+            let descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
+            let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
+            Ok((share.id.clone(), descriptor, fingerprint))
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let needs_prepare = prepared.iter().any(|(share_id, _, fingerprint)| {
+        shares
+            .iter()
+            .find(|share| &share.id == share_id)
+            .is_some_and(|share| {
+                share.descriptor_generation == 0
+                    || share.descriptor_fingerprint.as_deref() != Some(fingerprint.as_str())
+            })
+    });
+    if needs_prepare {
+        let identities = prepared
+            .iter()
+            .map(|(share_id, _, fingerprint)| (share_id.clone(), fingerprint.clone()))
+            .collect::<Vec<_>>();
+        state
+            .mutate_shares_immediate(|store| {
+                for (share_id, fingerprint) in identities {
+                    store.prepare_descriptor_projection(&share_id, fingerprint);
+                }
+            })
+            .await?;
+    }
+
+    let projection_state = state.shares.read().await.clone();
+    Ok(prepared
+        .into_iter()
+        .filter_map(|(share_id, mut descriptor, _)| {
+            let share = projection_state.get(&share_id)?;
+            if !force && !projection_state.descriptor_projection_pending(share) {
+                return None;
+            }
+            descriptor.descriptor_generation = share.descriptor_generation;
+            descriptor.descriptor_fingerprint = share
+                .descriptor_fingerprint
+                .clone()
+                .expect("prepared Share projection has a fingerprint");
+            Some(ShareSyncOperation {
+                kind: "upsert".to_string(),
+                share_id: None,
+                share: Some(descriptor),
+            })
+        })
+        .collect())
 }
 
-async fn mark_router_share_upserts_synced(
+async fn mark_router_share_upserts_synced_with_outcome(
     state: &ServerState,
     config: &ServerConfig,
     operations: &[ShareSyncOperation],
+    outcome: client::ShareDescriptorSyncOutcome,
 ) {
-    let revisions = operations
+    let projections = operations
         .iter()
         .filter_map(|operation| {
-            operation
-                .share
-                .as_ref()
-                .map(|share| (share.share_id.clone(), share.config_revision))
+            operation.share.as_ref().map(|share| {
+                (
+                    share.share_id.clone(),
+                    share.descriptor_generation,
+                    share.descriptor_fingerprint.clone(),
+                    share.config_revision,
+                )
+            })
         })
         .collect::<Vec<_>>();
     let router_base = config.router_api_base().map(str::to_string);
     let now = crate::infra::time::now_ms();
-    state
-        .mutate_shares_debounced(|store| {
+    let strict = matches!(outcome, client::ShareDescriptorSyncOutcome::Strict(_));
+    if let Err(error) = state
+        .mutate_shares_immediate(|store| {
             store.router_registered = true;
             store.last_router_error = None;
-            for (share_id, revision) in &revisions {
-                store.mark_router_sync(share_id, *revision, router_base.clone(), Ok(now));
+            store.record_router_descriptor_sync_mode(
+                if strict {
+                    RouterDescriptorSyncMode::Strict
+                } else {
+                    RouterDescriptorSyncMode::Legacy
+                },
+                (!strict).then(|| {
+                    "Router does not expose strict Share descriptor acknowledgements".to_string()
+                }),
+            );
+            for (share_id, generation, fingerprint, revision) in &projections {
+                store.mark_router_descriptor_sync(
+                    share_id,
+                    *generation,
+                    fingerprint,
+                    *revision,
+                    router_base.clone(),
+                    Ok(now),
+                );
             }
         })
-        .await;
+        .await
+    {
+        tracing::warn!(%error, "persist Router Share descriptor ACK failed");
+    }
 }
 
 async fn mark_router_share_upserts_failed(
@@ -4542,22 +6593,28 @@ async fn mark_router_share_upserts_failed(
     operations: &[ShareSyncOperation],
     message: String,
 ) {
-    let revisions = operations
+    let projections = operations
         .iter()
         .filter_map(|operation| {
-            operation
-                .share
-                .as_ref()
-                .map(|share| (share.share_id.clone(), share.config_revision))
+            operation.share.as_ref().map(|share| {
+                (
+                    share.share_id.clone(),
+                    share.descriptor_generation,
+                    share.descriptor_fingerprint.clone(),
+                    share.config_revision,
+                )
+            })
         })
         .collect::<Vec<_>>();
     let router_base = config.router_api_base().map(str::to_string);
     state
         .mutate_shares_debounced(|store| {
             store.last_router_error = Some(message.clone());
-            for (share_id, revision) in &revisions {
-                store.mark_router_sync(
+            for (share_id, generation, fingerprint, revision) in &projections {
+                store.mark_router_descriptor_sync(
                     share_id,
+                    *generation,
+                    fingerprint,
                     *revision,
                     router_base.clone(),
                     Err(message.clone()),
@@ -4606,9 +6663,6 @@ pub async fn reconcile_all_shares_to_router(state: ServerState) -> anyhow::Resul
         .trim()
         .to_string();
 
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
     let (shares, prune_already_applied) = {
         let store = state.shares.read().await;
         (
@@ -4621,59 +6675,26 @@ pub async fn reconcile_all_shares_to_router(state: ServerState) -> anyhow::Resul
     } else {
         state.request_router_share_prune_retry();
     }
-    let ops = shares
+    let share_ids = shares
         .iter()
-        .map(|share| ShareSyncOperation {
-            kind: "upsert".to_string(),
-            share_id: None,
-            share: Some(descriptor_for_share_with_accounts_and_usage(
-                share,
-                &providers,
-                Some(&accounts),
-                Some(&usage),
-            )),
-        })
-        .collect::<Vec<_>>();
+        .map(|share| share.id.clone())
+        .collect::<BTreeSet<_>>();
+    let ops = build_router_share_upsert_ops_with_policy(&state, &share_ids, true).await?;
 
     let http_client = state.http_client().await;
-    let result: anyhow::Result<()> = async {
-        for chunk in ops.chunks(ROUTER_SHARE_SYNC_BATCH_SIZE) {
-            client::push_share_ops(&http_client, &config, chunk.to_vec()).await?;
-        }
-        Ok(())
-    }
-    .await;
-    let router_base = config.router_api_base().map(str::to_string);
-    let now = crate::infra::time::now_ms();
-    state
-        .mutate_shares_debounced(|store| match &result {
-            Ok(()) => {
-                store.router_registered = true;
-                store.last_router_error = None;
-                for share in &shares {
-                    store.mark_router_sync(
-                        &share.id,
-                        share.config_revision,
-                        router_base.clone(),
-                        Ok(now),
-                    );
-                }
+    for chunk in ops.chunks(ROUTER_SHARE_SYNC_BATCH_SIZE) {
+        let chunk = chunk.to_vec();
+        match push_router_share_operations(&state, &http_client, &config, chunk.clone()).await {
+            Ok(outcome) => {
+                mark_router_share_upserts_synced_with_outcome(&state, &config, &chunk, outcome)
+                    .await;
             }
             Err(error) => {
-                let message = error.to_string();
-                store.last_router_error = Some(message.clone());
-                for share in &shares {
-                    store.mark_router_sync(
-                        &share.id,
-                        share.config_revision,
-                        router_base.clone(),
-                        Err(message.clone()),
-                    );
-                }
+                mark_router_share_upserts_failed(&state, &config, &chunk, error.to_string()).await;
+                return Err(error);
             }
-        })
-        .await;
-    result?;
+        }
+    }
 
     if !prune_already_applied {
         match client::prune_shares(
@@ -4990,9 +7011,7 @@ async fn issue_client_tunnel_lease(
         anyhow::bail!("setup is incomplete");
     }
     if !config.has_registered_router_identity() {
-        if let Err(error) = state.register_router_installation().await {
-            return Err(error);
-        }
+        state.register_router_installation().await?;
         config = state.config_snapshot().await;
         state
             .complete_router_registration_control_plane("implicit_client_tunnel_registration")
@@ -5153,6 +7172,7 @@ fn resolve_share_label(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5161,12 +7181,14 @@ mod tests {
     use crate::clients::router::tunnel::TunnelRuntimeStatus;
     use crate::domain::accounts::store::Account;
     use crate::domain::providers::model::{AppKind, ProviderType};
+    use crate::domain::providers::store::providers_path;
     use crate::domain::sharing::shares::{Share, ShareAcl, UpsertShareInput};
     use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
     use axum::extract::State as AxumState;
     use axum::http::StatusCode;
     use axum::routing::{get, post};
     use axum::{Json, Router};
+    use base64::Engine;
     use serde_json::{json, Value};
     use tokio::sync::Mutex as TokioMutex;
 
@@ -5417,6 +7439,8 @@ mod tests {
         Account {
             id: "acct-copilot".to_string(),
             provider_type: ProviderType::GitHubCopilot,
+            auth_identity_generation: 1,
+            token_refresh_generation: 1,
             email: Some("octo@example.com".to_string()),
             access_token: Some("cached-copilot-token".to_string()),
             refresh_token: Some("github-refresh-token".to_string()),
@@ -7557,7 +9581,7 @@ mod tests {
             .unwrap();
         assert!(tombstone.has_legacy_router_target());
 
-        retry_router_share_deletes(&state, &[tombstone.clone()])
+        retry_router_share_deletes(&state, std::slice::from_ref(&tombstone))
             .await
             .expect_err("the first Router delete must remain pending");
         let persisted = ShareStore::load_or_default(&state.config_dir).unwrap();
@@ -7654,7 +9678,7 @@ mod tests {
         state.replace_config(second_config).await.unwrap();
 
         assert_eq!(
-            retry_router_share_deletes(&state, &[tombstone.clone()])
+            retry_router_share_deletes(&state, std::slice::from_ref(&tombstone))
                 .await
                 .unwrap(),
             0
@@ -7923,6 +9947,718 @@ mod tests {
         state.replace_config(config).await.unwrap();
     }
 
+    fn test_provider(id: &str, name: &str) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: name.to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: None,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn test_api_key_credential() -> BTreeMap<String, CredentialPatch> {
+        BTreeMap::from([(
+            "/settingsConfig/apiKey".to_string(),
+            CredentialPatch::Replace {
+                value: "test-api-key".to_string(),
+            },
+        )])
+    }
+
+    #[tokio::test]
+    async fn provider_command_persists_profile_revision_and_idempotent_create() {
+        let state = test_state();
+        let profile_id = ProfileId::parse("codex.openai_api_key").unwrap();
+        let request_id = "provider-create-request-1".to_string();
+        let first = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("profiled-provider", "OpenAI API Key"),
+                Some(profile_id.clone()),
+                None,
+                Some(request_id.clone()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.resource.profile_id, Some(profile_id.clone()));
+        assert_eq!(first.resource.profile_schema_revision, Some(1));
+        assert_eq!(first.resource.revision, 1);
+
+        let replay = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("profiled-provider", "OpenAI API Key"),
+                Some(profile_id),
+                None,
+                Some(request_id.clone()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.resource.revision, 1);
+        assert_eq!(state.providers_snapshot().await.providers.len(), 1);
+
+        let credential_mismatch = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("profiled-provider", "OpenAI API Key"),
+                None,
+                None,
+                Some(request_id.clone()),
+                BTreeMap::from([(
+                    "/settingsConfig/apiKey".to_string(),
+                    CredentialPatch::Replace {
+                        value: "different-test-api-key".to_string(),
+                    },
+                )]),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            credential_mismatch,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_provider_idempotency_conflict",
+                ..
+            }
+        ));
+
+        let mismatch = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("profiled-provider", "Different payload"),
+                None,
+                None,
+                Some(request_id),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_provider_idempotency_conflict",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_command_rejects_stale_revision_and_identity_changes() {
+        let state = test_state();
+        let created = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("revision-provider", "OpenAI API Key"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                Some("provider-create-request-2".to_string()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let stale = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("revision-provider", "Renamed"),
+                None,
+                Some(created.resource.revision.saturating_sub(1)),
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_provider_revision_conflict",
+                ..
+            }
+        ));
+
+        let identity_change = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("revision-provider", "Renamed"),
+                Some(ProfileId::parse("codex.openrouter").unwrap()),
+                Some(created.resource.revision),
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            identity_change,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_provider_identity_conflict",
+                ..
+            }
+        ));
+        assert_eq!(
+            state.providers_snapshot().await.providers[0].provider.name,
+            "OpenAI API Key"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_delete_checks_revision_current_provider_and_concurrent_share_gate() {
+        let state = test_state();
+        let created = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("delete-guard-provider", "Delete guard"),
+                None,
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let stale = state
+            .delete_provider_command(
+                AppKind::Codex,
+                created.provider.id.clone(),
+                created.resource.revision.saturating_sub(1),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_provider_revision_conflict",
+                ..
+            }
+        ));
+
+        state
+            .apply_ui_settings_patch_immediate(json!({
+                crate::domain::providers::current_provider::current_provider_settings_key(AppKind::Codex): created.provider.id
+            }))
+            .await
+            .unwrap();
+        let current = state
+            .delete_provider_command(
+                AppKind::Codex,
+                created.provider.id.clone(),
+                created.resource.revision,
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            current,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_provider_in_use",
+                ..
+            }
+        ));
+        state
+            .apply_ui_settings_patch_immediate(json!({
+                crate::domain::providers::current_provider::current_provider_settings_key(AppKind::Codex): ""
+            }))
+            .await
+            .unwrap();
+
+        let provider_commit = state.provider_commits.lock().await;
+        let delete_state = state.clone();
+        let provider_id = created.provider.id.clone();
+        let delete = tokio::spawn(async move {
+            delete_state
+                .delete_provider_command(AppKind::Codex, provider_id, created.resource.revision)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), state.lock_reference_mutations())
+                .await
+                .is_err()
+        );
+
+        let share_state = state.clone();
+        let share = tokio::spawn(async move {
+            let _references = share_state.lock_reference_mutations().await;
+            let exists = share_state
+                .providers
+                .read()
+                .await
+                .providers
+                .iter()
+                .any(|stored| {
+                    stored.app == AppKind::Codex && stored.provider.id == "delete-guard-provider"
+                });
+            if !exists {
+                return false;
+            }
+            share_state
+                .mutate_shares_immediate(|shares| {
+                    shares.upsert(router_sync_share_input(
+                        "concurrent-provider-share",
+                        "delete-guard-provider",
+                    ))
+                })
+                .await
+                .unwrap()
+                .is_ok()
+        });
+        drop(provider_commit);
+
+        assert!(delete.await.unwrap().unwrap());
+        assert!(!share.await.unwrap());
+        assert!(state.shares.read().await.shares.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_persist_failure_does_not_change_live_snapshot() {
+        let state = test_state();
+        state
+            .upsert_provider_command(
+                AppKind::Claude,
+                test_provider("provider-before", "Before"),
+                None,
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let before = serde_json::to_value(state.providers_snapshot().await).unwrap();
+        let config_dir = state.config_dir.clone();
+        fs::remove_dir_all(&config_dir).unwrap();
+        fs::write(&config_dir, b"not a directory").unwrap();
+
+        let result = state
+            .upsert_provider_command(
+                AppKind::Claude,
+                test_provider("provider-after", "After"),
+                None,
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            serde_json::to_value(state.providers_snapshot().await).unwrap(),
+            before
+        );
+        fs::remove_file(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_provider_commit_survives_caller_cancellation() {
+        let state = test_state();
+        state
+            .provider_commit_delay_ms
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+        let config_dir = state.config_dir.clone();
+        let worker_state = state.clone();
+        let caller = tokio::spawn(async move {
+            worker_state
+                .upsert_provider_command(
+                    AppKind::Codex,
+                    test_provider("provider-cancelled-caller", "Committed"),
+                    None,
+                    None,
+                    None,
+                    BTreeMap::new(),
+                )
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        caller.abort();
+        let _ = caller.await;
+
+        sleep(Duration::from_millis(180)).await;
+        let snapshot = state.providers_snapshot().await;
+        assert!(snapshot.providers.iter().any(|stored| {
+            stored.app == AppKind::Codex && stored.provider.id == "provider-cancelled-caller"
+        }));
+        let on_disk = ProviderStore::load_runtime_or_default(&config_dir).unwrap();
+        assert!(on_disk
+            .providers
+            .iter()
+            .any(|stored| stored.provider.id == "provider-cancelled-caller"));
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_provider_commands_clone_after_commit_lock_and_keep_both_updates() {
+        let state = test_state();
+        state
+            .provider_commit_delay_ms
+            .store(75, std::sync::atomic::Ordering::Relaxed);
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .upsert_provider_command(
+                    AppKind::Claude,
+                    test_provider("provider-concurrent-a", "Concurrent A"),
+                    None,
+                    None,
+                    None,
+                    BTreeMap::new(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        sleep(Duration::from_millis(10)).await;
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            second_state
+                .upsert_provider_command(
+                    AppKind::Codex,
+                    test_provider("provider-concurrent-b", "Concurrent B"),
+                    None,
+                    None,
+                    None,
+                    BTreeMap::new(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        first.await.unwrap();
+        second.await.unwrap();
+
+        let snapshot = state.providers_snapshot().await;
+        for provider_id in ["provider-concurrent-a", "provider-concurrent-b"] {
+            assert!(snapshot
+                .providers
+                .iter()
+                .any(|stored| stored.provider.id == provider_id));
+        }
+        let on_disk = ProviderStore::load_runtime_or_default(&state.config_dir).unwrap();
+        assert_eq!(
+            serde_json::to_value(on_disk).unwrap(),
+            serde_json::to_value(snapshot).unwrap()
+        );
+        fs::remove_dir_all(&state.config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_s2_provider_keeps_credentials_across_restart_and_display_update() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let provider = Provider {
+            id: "provider-s2-static".to_string(),
+            name: "S2 Static".to_string(),
+            settings_config: json!({
+                "auth": {"OPENAI_API_KEY": "s2-plaintext-secret"},
+                "modelMapping": {"mode": "passthrough"}
+            }),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex".to_string()),
+                ..Default::default()
+            }),
+            extra: BTreeMap::new(),
+        };
+        state
+            .upsert_provider_command(
+                AppKind::Codex,
+                provider,
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                Some("s2-create-request".to_string()),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let persisted = fs::read_to_string(providers_path(&config_dir)).unwrap();
+        assert!(persisted.contains("s2-encrypted-typed-records"));
+        assert!(!persisted.contains("s2-plaintext-secret"));
+        drop(state);
+
+        let restarted = test_state_at(config_dir.clone());
+        let snapshot = restarted.providers_snapshot().await;
+        let mut redacted = snapshot.providers[0].provider.clone();
+        assert_eq!(
+            redacted.settings_config["auth"]["OPENAI_API_KEY"],
+            crate::domain::providers::credentials::SECRET_KEEP_SENTINEL
+        );
+        redacted.name = "S2 Static Renamed".to_string();
+        let updated = restarted
+            .upsert_provider_command(
+                AppKind::Codex,
+                redacted,
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                Some(snapshot.providers[0].resource.revision),
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.provider.name, "S2 Static Renamed");
+
+        let providers = restarted.providers.read().await;
+        let stored = providers.providers[0].clone();
+        let execution =
+            crate::proxy::provider_ops::ProviderExecution::from_store(&providers, stored).unwrap();
+        let auth = execution
+            .materialize_auth(&AccountStore::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            auth.headers,
+            vec![(
+                "authorization".to_string(),
+                "Bearer s2-plaintext-secret".to_string()
+            )]
+        );
+        drop(auth);
+        drop(providers);
+
+        let persisted = fs::read_to_string(providers_path(&config_dir)).unwrap();
+        assert!(!persisted.contains("s2-plaintext-secret"));
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn server_backup_restore_validator_rejects_malformed_typed_stores() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_dir =
+            std::env::temp_dir().join(format!("cc-switch-server-restore-validation-{nanos}"));
+        let stage_dir = config_dir.join("stage");
+        fs::create_dir_all(&stage_dir).unwrap();
+
+        for (file_name, content, expected_error) in [
+            (
+                "providers.json",
+                br#"{"providers":"bad"}"#.as_slice(),
+                "validate staged providers.json",
+            ),
+            (
+                "tunnels.json",
+                br#"{"statuses":"bad"}"#.as_slice(),
+                "validate staged tunnels.json",
+            ),
+        ] {
+            fs::write(stage_dir.join(file_name), content).unwrap();
+            let manifest = crate::infra::backup::BackupManifest {
+                id: "backup-test".to_string(),
+                created_at_ms: 1,
+                reason: None,
+                files: vec![crate::infra::backup::BackupFile {
+                    file_name: file_name.to_string(),
+                    size_bytes: content.len() as u64,
+                }],
+            };
+
+            let error = validate_server_backup_restore_stage(&config_dir, &stage_dir, &manifest)
+                .unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error:#}");
+            fs::remove_file(stage_dir.join(file_name)).unwrap();
+        }
+
+        fs::write(stage_dir.join("accounts.key"), "AQI\n").unwrap();
+        let manifest = crate::infra::backup::BackupManifest {
+            id: "backup-test".to_string(),
+            created_at_ms: 1,
+            reason: None,
+            files: vec![crate::infra::backup::BackupFile {
+                file_name: "accounts.key".to_string(),
+                size_bytes: 4,
+            }],
+        };
+        let error =
+            validate_server_backup_restore_stage(&config_dir, &stage_dir, &manifest).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("staged accounts.key must decode to exactly 32 bytes"),
+            "{error:#}"
+        );
+
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn s2_backup_restore_validates_key_and_runtime_before_live_replacement() {
+        let config_dir = provider_restore_test_dir("s2-key-runtime");
+        let backed_up_provider = write_s2_static_provider(
+            &config_dir,
+            "provider-from-backup",
+            "backup-provider-secret",
+        );
+        let key_path = crate::domain::accounts::store::accounts_key_path(&config_dir);
+        let backed_up_key = fs::read(&key_path).unwrap();
+        let backup = crate::infra::backup::create_backup(
+            &config_dir,
+            &[providers_path(&config_dir), key_path.clone()],
+            Some("s2 restore validation".to_string()),
+        )
+        .unwrap();
+
+        let live_provider =
+            write_s2_static_provider(&config_dir, "live-provider", "live-provider-secret");
+        let live_key = fs::read(&key_path).unwrap();
+        let backup_dir = config_dir.join("backups").join(&backup.id);
+        let wrong_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([91_u8; 32]);
+        fs::write(backup_dir.join("accounts.key"), format!("{wrong_key}\n")).unwrap();
+
+        let error = crate::infra::backup::restore_backup_with_validator(
+            &config_dir,
+            &backup.id,
+            |stage_dir, manifest| {
+                validate_server_backup_restore_stage(&config_dir, stage_dir, manifest)
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("validate staged providers.json"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(providers_path(&config_dir)).unwrap(),
+            live_provider
+        );
+        assert_eq!(fs::read(&key_path).unwrap(), live_key);
+
+        fs::write(backup_dir.join("accounts.key"), &backed_up_key).unwrap();
+        crate::infra::backup::restore_backup_with_validator(
+            &config_dir,
+            &backup.id,
+            |stage_dir, manifest| {
+                validate_server_backup_restore_stage(&config_dir, stage_dir, manifest)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(providers_path(&config_dir)).unwrap(),
+            backed_up_provider
+        );
+        assert_eq!(fs::read(&key_path).unwrap(), backed_up_key);
+        let accounts = AccountStore::load_or_default(&config_dir).unwrap();
+        let mut restored = ProviderStore::load_or_default(&config_dir).unwrap();
+        restored.rebuild_runtime_index(&accounts).unwrap();
+        let runtime = restored
+            .runtime_plan(AppKind::Codex, "provider-from-backup")
+            .expect("restored S2 Provider must compile a RuntimePlan");
+        assert_eq!(
+            runtime.configuration_state,
+            crate::domain::providers::runtime::RuntimeConfigurationState::Ready
+        );
+
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn s2_provider_only_backup_without_matching_key_fails_before_live_replacement() {
+        let config_dir = provider_restore_test_dir("s2-missing-key");
+        write_s2_static_provider(
+            &config_dir,
+            "provider-from-backup",
+            "backup-provider-secret",
+        );
+        let backup = crate::infra::backup::create_backup(
+            &config_dir,
+            &[providers_path(&config_dir)],
+            Some("provider-only S2 restore".to_string()),
+        )
+        .unwrap();
+        let live_provider = fs::read(providers_path(&config_dir)).unwrap();
+        let key_path = crate::domain::accounts::store::accounts_key_path(&config_dir);
+        fs::remove_file(&key_path).unwrap();
+
+        let error = crate::infra::backup::restore_backup_with_validator(
+            &config_dir,
+            &backup.id,
+            |stage_dir, manifest| {
+                validate_server_backup_restore_stage(&config_dir, stage_dir, manifest)
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("validate staged providers.json"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(providers_path(&config_dir)).unwrap(),
+            live_provider
+        );
+        assert!(!key_path.exists());
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    fn provider_restore_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_dir = std::env::temp_dir().join(format!("cc-switch-server-{name}-{nanos}"));
+        fs::create_dir_all(&config_dir).unwrap();
+        config_dir
+    }
+
+    fn write_s2_static_provider(config_dir: &Path, provider_id: &str, secret: &str) -> Vec<u8> {
+        let mut store = ProviderStore::load_runtime_or_default(config_dir).unwrap();
+        store.providers.clear();
+        store.order.clear();
+        store.upsert_with_resource(
+            AppKind::Codex,
+            Provider {
+                id: provider_id.to_string(),
+                name: provider_id.to_string(),
+                settings_config: json!({
+                    "auth": {"OPENAI_API_KEY": secret},
+                    "modelMapping": {"mode": "passthrough"}
+                }),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("grok_oauth".to_string()),
+                    ..Default::default()
+                }),
+                extra: BTreeMap::new(),
+            },
+            ProviderResourceMetadata {
+                profile_id: Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                profile_schema_revision: Some(1),
+                revision: 1,
+                credential_generation: 1,
+                ..Default::default()
+            },
+        );
+        store.seal_for_commit(config_dir).unwrap();
+        store
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
+        assert_eq!(
+            store
+                .runtime_plan(AppKind::Codex, provider_id)
+                .unwrap()
+                .configuration_state,
+            crate::domain::providers::runtime::RuntimeConfigurationState::Ready
+        );
+        store.save(config_dir).unwrap();
+        fs::read(providers_path(config_dir)).unwrap()
+    }
+
     fn test_state() -> ServerState {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8116,6 +10852,10 @@ mod tests {
             router_url: None,
             config_revision: 0,
             router_synced_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: None,
+            router_synced_descriptor_generation: 0,
+            router_synced_descriptor_fingerprint: None,
             user_grants: std::collections::BTreeMap::new(),
         }
     }

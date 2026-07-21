@@ -1,220 +1,321 @@
 #!/usr/bin/env node
 /**
- * Sync selected desktop UI files from /data/projects/cc-switch into web-src.
+ * Sync selected desktop UI files from a pinned, reviewed upstream commit.
  *
  * Usage:
  *   node scripts/sync/sync-desktop-ui.mjs [--check] [path...]
- *
- * Default paths mirror the Phase U12 direct-port scope.
+ *   node scripts/sync/sync-desktop-ui.mjs --update-pinned-hashes
+ *   node scripts/sync/sync-desktop-ui.mjs --refresh-upstream
  */
+import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-const desktopRoot = process.env.CC_SWITCH_DESKTOP_ROOT || "/data/projects/cc-switch";
-const serverWebSrc = path.resolve("web-src/src");
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const manifestPath = process.env.CC_SWITCH_DESKTOP_SYNC_MANIFEST
+  ? path.resolve(process.env.CC_SWITCH_DESKTOP_SYNC_MANIFEST)
+  : path.join(repoRoot, "assets/contract/desktop-ui-sync.json");
+const serverWebSrc = path.join(repoRoot, "web-src/src");
+const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+const desktopRoot =
+  process.env.CC_SWITCH_DESKTOP_ROOT || manifest.upstream.repository;
 
-// server does not run vitest; desktop test files are intentionally not synced
-const skipSuffixes = [".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"];
+const testSuffixes = [".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"];
 
-function shouldSkipSync(file) {
-  return skipSuffixes.some((suffix) => file.endsWith(suffix));
+function git(args, options = {}) {
+  return execFileSync("git", ["-C", desktopRoot, ...args], {
+    encoding: options.buffer ? null : "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+    stdio: ["ignore", "pipe", options.quiet ? "ignore" : "pipe"],
+  });
 }
 
-export const defaultPaths = [
-  "index.css",
-  "i18n/index.ts",
-  "i18n/locales/en.json",
-  "i18n/locales/zh.json",
-  "i18n/locales/zh-TW.json",
-  "i18n/locales/ja.json",
-  "components/ui",
-  "components/providers/forms",
-  "components/providers/AddProviderDialog.tsx",
-  "components/providers/ProviderEmptyState.tsx",
-  "components/providers/ProviderList.tsx",
-  "components/providers/ProviderCard.tsx",
-  "components/providers/ProviderActions.tsx",
-  "components/providers/ProviderEmptyState.tsx",
-  "components/providers/ProviderHealthBadge.tsx",
-  "components/ConfirmDialog.tsx",
-  "components/JsonEditor.tsx",
-  "components/ProviderIcon.tsx",
-  "components/BrandIcons.tsx",
-  "components/ClaudeOauthQuotaFooter.tsx",
-  "components/CodexOauthQuotaFooter.tsx",
-  "components/GeminiOauthQuotaFooter.tsx",
-  "components/CopilotQuotaFooter.tsx",
-  "components/CursorOauthQuotaFooter.tsx",
-  "components/KiroOauthQuotaFooter.tsx",
-  "components/AntigravityOauthQuotaFooter.tsx",
-  "components/OllamaQuotaFooter.tsx",
-  "components/SubscriptionQuotaFooter.tsx",
-  "components/settings/SettingsPage.tsx",
-  "components/settings/LanguageSettings.tsx",
-  "components/settings/ThemeSettings.tsx",
-  "components/share",
-  "components/usage",
-  "lib/utils.ts",
-  "lib/query/queryClient.ts",
-];
-
-export const serverLocalOverrides = [
-  "i18n/locales/en.json",
-  "i18n/locales/zh.json",
-  "i18n/locales/zh-TW.json",
-  "i18n/locales/ja.json",
-  "components/providers/forms/AntigravityOAuthSection.tsx",
-  "components/providers/forms/CodexOAuthSection.tsx",
-  "components/providers/forms/CopilotAuthSection.tsx",
-  "components/providers/forms/CursorOAuthSection.tsx",
-  "components/providers/forms/GeminiOAuthSection.tsx",
-  "components/providers/forms/KiroOAuthSection.tsx",
-  "components/providers/forms/hooks/useManagedAuth.ts",
-  "components/providers/forms/ProviderForm.tsx",
-  "components/providers/forms/ProviderPresetSelector.tsx",
-  "components/providers/ProviderShareSection.tsx",
-  "components/ConfirmDialog.tsx",
-  "components/common/FullScreenPanel.tsx",
-  "components/settings/SettingsPage.tsx",
-  "components/settings/ShareSettingsTab.tsx",
-  "components/settings/ServerVersionSettings.tsx",
-  "components/settings/ClientTunnelSettingsPanel.tsx",
-  "components/share/EditShareDialog.tsx",
-  "components/share/ImportSharesModal.tsx",
-  "components/share/OwnerChangeModal.tsx",
-  "components/share/ShareOwnerChangeEmailDialog.tsx",
-  "components/share/ShareEmptyState.tsx",
-  "components/share/ShareExportModal.tsx",
-  "components/share/SharePage.tsx",
-  "components/usage/UsageMiniMetric.tsx",
-  "components/usage/UsageTabs.tsx",
-  "components/usage/index.ts",
-];
-
-export const serverExcludedFromSync = [
-  "components/universal",
-  "config/universalProviderPresets.ts",
-  "components/share/ShareOwnerLoginDialog.tsx",
-  "components/share/ShareRouterBar.tsx",
-  "components/settings/ShareEmailLoginCard.tsx",
-  "components/settings/ImportExportPanel.tsx",
-];
-
-const serverLocalOverrideSet = new Set(serverLocalOverrides);
-const serverExcludedFromSyncSet = new Set(serverExcludedFromSync);
-
-function copyFile(src, dest, checkOnly) {
-  if (!fs.existsSync(src)) {
-    throw new Error(`missing desktop source: ${src}`);
-  }
-  if (shouldSkipSync(src)) {
-    return;
-  }
-  const relativeDest = toWebSrcRelative(dest);
-  if (serverExcludedFromSyncSet.has(relativeDest)) {
-    return;
-  }
-  if (!checkOnly && serverLocalOverrideSet.has(relativeDest)) {
-    return;
-  }
-  if (checkOnly) {
-    if (!fs.existsSync(dest)) {
-      throw new Error(`missing server target: ${dest}`);
-    }
-    if (
-      !serverLocalOverrideSet.has(relativeDest) &&
-      !fs.readFileSync(src).equals(fs.readFileSync(dest))
-    ) {
-      throw new Error(`server copy drifted from desktop: ${dest}`);
-    }
-    return;
-  }
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.copyFileSync(src, dest);
-  console.log(`synced ${path.relative(desktopRoot, src)} -> ${path.relative(process.cwd(), dest)}`);
+function sha256(value) {
+  return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-function copyTree(src, dest, checkOnly) {
-  if (!fs.existsSync(src)) {
-    throw new Error(`missing desktop source: ${src}`);
-  }
-  const stat = fs.statSync(src);
-  if (stat.isFile()) {
-    copyFile(src, dest, checkOnly);
-    return;
-  }
-  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
-    if (entry.isFile() && shouldSkipSync(entry.name)) {
-      continue;
+export function normalizeRelative(relativePath) {
+  return relativePath.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+}
+
+function sourcePath(relativePath) {
+  return `src/${normalizeRelative(relativePath)}`;
+}
+
+function readPinnedSource(relativePath, commit = manifest.upstream.commit) {
+  try {
+    const content = git(
+      ["show", `${commit}:${sourcePath(relativePath)}`],
+      { buffer: true, quiet: true },
+    );
+    rejectConflictMarkers(relativePath, content);
+    return content;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("conflict marker")) {
+      throw error;
     }
-    copyTree(path.join(src, entry.name), path.join(dest, entry.name), checkOnly);
+    return null;
   }
 }
 
-function toWebSrcRelative(file) {
-  return path.relative(serverWebSrc, file).split(path.sep).join("/");
+export function rejectConflictMarkers(relativePath, content) {
+  const text = content.toString("utf8");
+  if (
+    text.includes("<<<<<<< ") ||
+    text.includes("\n=======\n") ||
+    text.includes("\n>>>>>>> ")
+  ) {
+    throw new Error(`pinned upstream source contains conflict marker: ${relativePath}`);
+  }
+}
+
+function listPinnedFiles(relativePath) {
+  const root = sourcePath(relativePath);
+  const output = git([
+    "ls-tree",
+    "-r",
+    "--name-only",
+    manifest.upstream.commit,
+    "--",
+    root,
+  ]).trim();
+  if (!output) {
+    throw new Error(`missing pinned upstream source: ${root}`);
+  }
+  return output
+    .split("\n")
+    .filter(Boolean)
+    .map((file) => normalizeRelative(file.replace(/^src\//, "")));
 }
 
 function walkFiles(root) {
-  if (!fs.existsSync(root)) {
-    return [];
-  }
+  if (!fs.existsSync(root)) return [];
   const stat = fs.statSync(root);
-  if (stat.isFile()) {
-    return [root];
-  }
+  if (stat.isFile()) return [root];
   return fs
     .readdirSync(root, { withFileTypes: true })
     .flatMap((entry) => walkFiles(path.join(root, entry.name)));
 }
 
-function checkUnexpectedServerFiles(relativePath) {
-  const src = path.join(desktopRoot, "src", relativePath);
-  const dest = path.join(serverWebSrc, relativePath);
-  if (!fs.existsSync(src) || !fs.existsSync(dest) || fs.statSync(dest).isFile()) {
-    return;
+function toWebRelative(file) {
+  return normalizeRelative(path.relative(serverWebSrc, file));
+}
+
+function isTestFile(relativePath) {
+  return testSuffixes.some((suffix) => relativePath.endsWith(suffix));
+}
+
+const serverOwnedByPath = new Map(
+  manifest.serverOwned.map((entry) => [normalizeRelative(entry.path), entry]),
+);
+
+function excludedRule(relativePath) {
+  return manifest.excluded.find((entry) => {
+    const rulePath = normalizeRelative(entry.path);
+    return entry.kind === "prefix"
+      ? relativePath === rulePath || relativePath.startsWith(`${rulePath}/`)
+      : relativePath === rulePath;
+  });
+}
+
+export function validateManifestShape(candidate) {
+  if (candidate?.schemaVersion !== 1) {
+    throw new Error(`unsupported desktop UI sync manifest schema: ${candidate?.schemaVersion}`);
   }
-  for (const file of walkFiles(dest)) {
-    if (shouldSkipSync(file)) {
-      continue;
+  if (
+    !candidate.upstream ||
+    typeof candidate.upstream.repository !== "string" ||
+    !candidate.upstream.repository ||
+    !/^[0-9a-f]{40}$/.test(candidate.upstream.commit ?? "")
+  ) {
+    throw new Error("desktop UI sync manifest must pin a full upstream commit");
+  }
+  if (!Array.isArray(candidate.syncRoots) || candidate.syncRoots.length === 0) {
+    throw new Error("desktop UI sync manifest requires syncRoots");
+  }
+  const roots = candidate.syncRoots.map(normalizeRelative);
+  if (roots.some((root) => !root) || new Set(roots).size !== roots.length) {
+    throw new Error("desktop UI sync roots must be non-empty and unique");
+  }
+  if (!Array.isArray(candidate.serverOwned) || !Array.isArray(candidate.excluded)) {
+    throw new Error("desktop UI sync manifest requires serverOwned and excluded arrays");
+  }
+  const seen = new Set();
+  for (const entry of candidate.serverOwned) {
+    const relativePath = normalizeRelative(entry.path);
+    if (!relativePath || seen.has(relativePath)) {
+      throw new Error(`duplicate server-owned sync entry: ${relativePath}`);
     }
-    const source = path.join(src, path.relative(dest, file));
-    const relativeDest = toWebSrcRelative(file);
-    if (!fs.existsSync(source) && !serverLocalOverrideSet.has(relativeDest)) {
-      throw new Error(`unexpected server-local file in synced tree: ${file}`);
+    seen.add(relativePath);
+    if (
+      entry.owner !== "server" ||
+      !entry.reason ||
+      !/^[0-9a-f]{40}$/.test(entry.lastReviewedUpstreamCommit ?? "") ||
+      !/^[0-9a-f]{40}$/.test(entry.lastReviewedServerCommit ?? "") ||
+      !entry.exitPhase ||
+      (entry.upstreamSourceSha256 !== null &&
+        !/^[0-9a-f]{64}$/.test(entry.upstreamSourceSha256 ?? ""))
+    ) {
+      throw new Error(`incomplete server-owned sync entry: ${relativePath}`);
+    }
+    if (entry.lastReviewedUpstreamCommit !== candidate.upstream.commit) {
+      throw new Error(`stale reviewed commit for ${relativePath}`);
+    }
+  }
+  const excluded = new Set();
+  for (const entry of candidate.excluded) {
+    const relativePath = normalizeRelative(entry.path);
+    if (
+      !relativePath ||
+      excluded.has(relativePath) ||
+      !["exact", "prefix"].includes(entry.kind) ||
+      !entry.reason
+    ) {
+      throw new Error(`invalid excluded sync entry: ${relativePath}`);
+    }
+    if (seen.has(relativePath)) {
+      throw new Error(`sync path cannot be both server-owned and excluded: ${relativePath}`);
+    }
+    excluded.add(relativePath);
+  }
+}
+
+export function validatePinnedManifest(
+  candidate,
+  { resolveCommit, readSource },
+) {
+  validateManifestShape(candidate);
+  const actualCommit = resolveCommit(candidate.upstream.commit);
+  if (actualCommit !== candidate.upstream.commit) {
+    throw new Error("pinned upstream commit does not resolve exactly");
+  }
+  for (const entry of candidate.serverOwned) {
+    const relativePath = normalizeRelative(entry.path);
+    const source = readSource(relativePath, candidate.upstream.commit);
+    if (source) rejectConflictMarkers(relativePath, source);
+    const actualHash = source ? sha256(source) : null;
+    if (entry.upstreamSourceSha256 !== actualHash) {
+      throw new Error(
+        `stale upstream hash for ${relativePath}; run --update-pinned-hashes after review`,
+      );
     }
   }
 }
 
-function main() {
-  const args = process.argv.slice(2);
-  const checkOnly = args.includes("--check");
-  const paths = args.filter((arg) => !arg.startsWith("--"));
-  const selected = paths.length ? paths : defaultPaths;
+function validateManifest() {
+  validatePinnedManifest(manifest, {
+    resolveCommit: (commit) => git(["rev-parse", commit]).trim(),
+    readSource: (relativePath, commit) => readPinnedSource(relativePath, commit),
+  });
+}
 
-  let failures = 0;
-  for (const relativePath of selected) {
-    const src = path.join(desktopRoot, "src", relativePath);
-    const dest = path.join(serverWebSrc, relativePath);
+function updatePinnedHashes({ refreshCommit }) {
+  if (refreshCommit) {
+    const status = git(["status", "--porcelain=v1"]).trim();
+    if (status) {
+      throw new Error(
+        "refusing to refresh desktop UI baseline from a dirty or conflicted upstream worktree",
+      );
+    }
+    manifest.upstream.commit = git(["rev-parse", "HEAD"]).trim();
+  }
+
+  for (const entry of manifest.serverOwned) {
+    const source = readPinnedSource(entry.path);
+    entry.upstreamSourceSha256 = source ? sha256(source) : null;
+    entry.lastReviewedUpstreamCommit = manifest.upstream.commit;
+  }
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  console.log(
+    refreshCommit
+      ? `desktop UI baseline refreshed at ${manifest.upstream.commit}`
+      : `desktop UI hashes refreshed from pinned ${manifest.upstream.commit}`,
+  );
+}
+
+function copyOrCheck(relativePath, source, checkOnly) {
+  if (isTestFile(relativePath) || excludedRule(relativePath)) return;
+  if (serverOwnedByPath.has(relativePath)) return;
+
+  const destination = path.join(serverWebSrc, relativePath);
+  if (checkOnly) {
+    if (!fs.existsSync(destination)) {
+      throw new Error(`missing server target: ${destination}`);
+    }
+    if (!source.equals(fs.readFileSync(destination))) {
+      throw new Error(`server copy drifted from pinned desktop: ${destination}`);
+    }
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.writeFileSync(destination, source);
+  console.log(`synced ${sourcePath(relativePath)} -> ${path.relative(repoRoot, destination)}`);
+}
+
+function processRoot(relativeRoot, checkOnly) {
+  const sourceFiles = listPinnedFiles(relativeRoot);
+  const sourceSet = new Set(sourceFiles);
+  const failures = [];
+  for (const relativePath of sourceFiles) {
     try {
-      copyTree(src, dest, checkOnly);
-      if (checkOnly) {
-        checkUnexpectedServerFiles(relativePath);
-      }
+      const source = readPinnedSource(relativePath);
+      if (!source) throw new Error(`missing pinned upstream blob: ${relativePath}`);
+      copyOrCheck(relativePath, source, checkOnly);
     } catch (error) {
-      failures += 1;
-      console.error(error instanceof Error ? error.message : String(error));
+      failures.push(error instanceof Error ? error.message : String(error));
     }
   }
 
-  if (failures) {
-    console.error(`sync-desktop-ui failed: ${failures} path(s)`);
-    process.exit(1);
+  const destinationRoot = path.join(serverWebSrc, normalizeRelative(relativeRoot));
+  if (!fs.existsSync(destinationRoot) || fs.statSync(destinationRoot).isFile()) return;
+  for (const file of walkFiles(destinationRoot)) {
+    const relativePath = toWebRelative(file);
+    if (isTestFile(relativePath)) continue;
+    if (sourceSet.has(relativePath)) continue;
+    if (serverOwnedByPath.has(relativePath) || excludedRule(relativePath)) continue;
+    failures.push(`unexpected server-local file in synced tree: ${file}`);
+  }
+  if (failures.length > 0) throw new Error(failures.join("\n"));
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  if (args.includes("--update-pinned-hashes")) {
+    updatePinnedHashes({ refreshCommit: false });
+    return;
+  }
+  if (args.includes("--refresh-upstream")) {
+    updatePinnedHashes({ refreshCommit: true });
+    return;
   }
 
-  console.log(checkOnly ? "sync-desktop-ui check ok" : "sync-desktop-ui complete");
+  validateManifest();
+  const checkOnly = args.includes("--check");
+  const selected = args.filter((arg) => !arg.startsWith("--"));
+  const roots = selected.length > 0 ? selected : manifest.syncRoots;
+  const failures = [];
+  for (const relativeRoot of roots) {
+    try {
+      processRoot(relativeRoot, checkOnly);
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  if (failures.length > 0) {
+    for (const failure of [...new Set(failures)]) console.error(failure);
+    console.error(`sync-desktop-ui failed: ${failures.length} root(s)`);
+    process.exit(1);
+  }
+  console.log(
+    checkOnly
+      ? `sync-desktop-ui check ok at ${manifest.upstream.commit}`
+      : `sync-desktop-ui complete from ${manifest.upstream.commit}`,
+  );
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

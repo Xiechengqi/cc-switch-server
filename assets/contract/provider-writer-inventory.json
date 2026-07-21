@@ -1,0 +1,280 @@
+{
+  "schemaVersion": 1,
+  "authority": "phase-0-provider-writer-inventory",
+  "serverBaselineCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+  "currentSourceEvidence": [
+    {
+      "path": "src/admin.rs",
+      "sha256": "212faa68f6407864757914954d2e163a54ecf8e2b3bf33ea80450becff8cfd16"
+    },
+    {
+      "path": "src/api/invoke/dispatch.rs",
+      "sha256": "8cb16c2f6993a4b917ff210d8db0097b556d8346cb630ad9dcd6b679f9df988c"
+    },
+    {
+      "path": "src/api/providers.rs",
+      "sha256": "404b7d46f1d49c05a0bb5447e476ffe09060668945a65793f2915e7853f25e54"
+    },
+    {
+      "path": "src/api/types/providers.rs",
+      "sha256": "ef8da5725e971c7d9f2b9fb18c47f6cb8b581aeba5ce1ddf4ebf6e5735a7f888"
+    },
+    {
+      "path": "src/domain/providers/credentials.rs",
+      "sha256": "abf26766620d5ce9f5818cd72270911752e0f42a7b655947f2c11ce63aa99fda"
+    },
+    {
+      "path": "src/domain/providers/migrate.rs",
+      "sha256": "46a38f2271665dd22576c746e7032625717b7023c0aa06633ead0c011e529b15"
+    },
+    {
+      "path": "src/domain/providers/storage_migration.rs",
+      "sha256": "cc0e4233accab1be53c06beb56945f4b660462a8d617acf5d9a9228aa54da92e"
+    },
+    {
+      "path": "src/domain/providers/store.rs",
+      "sha256": "6632d367dbc3ff218f8a6bda69c978e34f26e191f12a33ad139eb9edbf992849"
+    },
+    {
+      "path": "src/domain/providers/store_v2.rs",
+      "sha256": "ff094a049a0d98175f914724181c56c2953b4c39bfa754dbf8b76c9b9895dc2a"
+    },
+    {
+      "path": "src/infra/backup.rs",
+      "sha256": "1f5e5b075f573afaa8e448974770e4760d56989d5a24efaf8550c394bf3f6deb"
+    },
+    {
+      "path": "src/infra/credentials.rs",
+      "sha256": "024db12dd220ecd65c2b9e9fc386e8782f84b211883e2b945cddea43674df7e1"
+    },
+    {
+      "path": "src/state.rs",
+      "sha256": "05674f233f64d25b26970d922d856314ccc596394a54f1cfe5af0f02d20370eb"
+    }
+  ],
+  "entries": [
+    {
+      "id": "rest-create",
+      "source": "src/api/providers.rs::create_provider",
+      "currentBehavior": "requires the Provider write contract, applies a ProviderWriteDraft through upsert_provider_draft_command, commits clone/validate/persist/swap, and returns a redacted ProviderView",
+      "targetCommand": "retain provider_commands::create_provider over the shared commit coordinator",
+      "closePhase": "phase-1",
+      "closureStatus": "closed",
+      "risk": "a compatibility endpoint could bypass CredentialPatch or return the stored secret-bearing record",
+      "evidence": [
+        "src/api/providers.rs::create_provider",
+        "src/state.rs::upsert_provider_draft_command",
+        "src/domain/providers/credentials.rs::ProviderView"
+      ]
+    },
+    {
+      "id": "rest-update",
+      "source": "src/api/providers.rs::update_provider",
+      "currentBehavior": "checks path/body identity, requires the Provider write contract, and uses the same ProviderWriteDraft command and redacted response as create",
+      "targetCommand": "retain provider_commands::update_provider over the shared commit coordinator",
+      "closePhase": "phase-1",
+      "closureStatus": "closed",
+      "risk": "create and update semantics could drift or allow a resource id substitution",
+      "evidence": [
+        "src/api/providers.rs::update_provider",
+        "src/state.rs::upsert_provider_draft_command",
+        "src/domain/providers/credentials.rs::CredentialPatch"
+      ]
+    },
+    {
+      "id": "rest-import",
+      "source": "src/api/providers.rs::import_providers",
+      "currentBehavior": "requires explicit preview/apply mode; preview validates without writing, while apply binds the same typed batch and current snapshot to a token checked inside the commit coordinator",
+      "targetCommand": "retain provider_commands::preview_import|apply_import",
+      "closePhase": "phase-1",
+      "closureStatus": "closed",
+      "risk": "a compatibility import path could bypass preview binding, batch validation, or CredentialPatch handling",
+      "evidence": [
+        "src/api/providers.rs::import_providers",
+        "src/api/types/providers.rs::ImportProvidersRequest",
+        "src/state.rs::preview_provider_import_command",
+        "src/state.rs::apply_provider_import_command"
+      ]
+    },
+    {
+      "id": "rest-preset-create",
+      "source": "src/api/providers.rs::create_provider_from_preset",
+      "currentBehavior": "uses profileId as the authoritative identity and writes a typed resource through the shared command; mutable preset name remains a read-only request fallback during the compatibility window",
+      "targetCommand": "retain provider_commands::create_from_profile_id and remove only the name fallback after the compatibility gate",
+      "closePhase": "phase-10-window",
+      "closureStatus": "partial",
+      "risk": "removing the deprecated name fallback before two stable releases and 14 days would break an older Web bundle",
+      "evidence": [
+        "src/api/providers.rs::create_provider_from_preset",
+        "src/api/providers.rs::profile_for_legacy_preset",
+        "src/state.rs::upsert_provider_draft_command"
+      ]
+    },
+    {
+      "id": "invoke-add-update",
+      "source": "src/api/invoke/dispatch.rs::add_provider|update_provider",
+      "currentBehavior": "requires the same write contract and delegates both compatibility commands to upsert_provider_draft_command with CredentialPatch",
+      "targetCommand": "retain provider_commands::create_provider|update_provider",
+      "closePhase": "phase-1",
+      "closureStatus": "closed",
+      "risk": "future invoke compatibility changes could diverge from REST validation or credential semantics",
+      "evidence": [
+        "src/api/invoke/dispatch.rs::add_provider",
+        "src/api/invoke/dispatch.rs::upsert_provider_draft_command"
+      ]
+    },
+    {
+      "id": "invoke-sort",
+      "source": "src/api/invoke/dispatch.rs::update_providers_sort_order",
+      "currentBehavior": "uses the commit coordinator and stores per-app presentation order in the ProviderStore top-level order map without changing Provider revision",
+      "targetCommand": "retain provider_commands::update_provider_order over ProviderStore::update_sort_order",
+      "closePhase": "phase-3",
+      "closureStatus": "closed",
+      "risk": "a future compatibility change could reintroduce sortIndex mutation into runtime-bearing Provider records",
+      "evidence": [
+        "src/api/invoke/dispatch.rs::update_providers_sort_order",
+        "src/domain/providers/store.rs::update_sort_order"
+      ]
+    },
+    {
+      "id": "delete-cascade",
+      "source": "src/api/providers.rs::delete_provider",
+      "currentBehavior": "delegates to delete_provider_command, which holds the reference mutation gate and rejects Share/current-provider references without mutating them",
+      "targetCommand": "retain provider_commands::delete_provider with reference preview and conflict response",
+      "closePhase": "phase-3",
+      "closureStatus": "closed",
+      "risk": "a future force-delete path could bypass the reference gate or revive cross-store cascade side effects",
+      "evidence": [
+        "src/api/providers.rs::delete_provider",
+        "src/state.rs::provider_reference_preview",
+        "src/state.rs::delete_provider_command"
+      ]
+    },
+    {
+      "id": "save-on-load",
+      "source": "src/domain/providers/store.rs::ProviderStore::load_or_default",
+      "currentBehavior": "decodes S1 without writing; legacy classification and model normalization are prepared only in the in-memory runtime view",
+      "targetCommand": "retain pure S1 decoder plus LegacyRuntimeView",
+      "closePhase": "phase-1",
+      "closureStatus": "closed",
+      "risk": "a future loader normalization could silently mutate persisted Provider behavior during startup",
+      "evidence": [
+        "src/domain/providers/store.rs::load_or_default",
+        "src/domain/providers/store.rs::prepare_legacy_runtime_view"
+      ]
+    },
+    {
+      "id": "universal-startup-migration",
+      "source": "src/domain/providers/migrate.rs::migrate_remove_universal_layer",
+      "currentBehavior": "startup performs read-only inspection; mutation is available only through the explicit admin preview/apply command",
+      "targetCommand": "retain provider_migration::preview|apply",
+      "closePhase": "phase-1",
+      "closureStatus": "closed",
+      "risk": "calling the apply function from ordinary startup would restore an implicit save-on-load migration",
+      "evidence": [
+        "src/state.rs::inspect_remove_universal_layer",
+        "src/admin.rs::migrate_remove_universal_layer",
+        "src/domain/providers/migrate.rs::inspect_remove_universal_layer"
+      ]
+    },
+    {
+      "id": "model-discovery-merge",
+      "source": "src/api/providers.rs::fetch_provider_models",
+      "currentBehavior": "returns discovery observations without writing; merge=true is rejected and users must explicitly save a selected model through the typed Provider command",
+      "targetCommand": "retain read-only discovery operation",
+      "closePhase": "phase-4",
+      "closureStatus": "closed",
+      "risk": "a future convenience merge could couple untrusted network observations to Provider configuration and revision",
+      "evidence": [
+        "src/api/providers.rs::fetch_provider_models",
+        "src/api/providers.rs::automatic model discovery merge is retired"
+      ]
+    },
+    {
+      "id": "state-provider-mutation",
+      "source": "src/state.rs::mutate_providers_immediate*",
+      "currentBehavior": "a detached commit coordinator materializes a candidate, validates and compiles RuntimePlan, seals credentials, atomically persists in the store's current S1/S2 format, reconciles post-rename errors, then swaps live state; fresh stores start as S2",
+      "targetCommand": "retain provider commit coordinator clone/validate/compile/seal/persist/swap",
+      "closePhase": "phase-9",
+      "closureStatus": "closed",
+      "risk": "new Provider writers could bypass S2 sealing or weaken the disk/live commit-point reconciliation",
+      "evidence": [
+        "src/state.rs::commit_provider_change",
+        "src/state.rs::commit_provider_change_owned",
+        "src/domain/providers/store.rs::seal_for_commit",
+        "src/domain/providers/store.rs::validate_for_commit"
+      ]
+    },
+    {
+      "id": "provider-store-codec",
+      "source": "src/domain/providers/store.rs::ProviderStore::save",
+      "currentBehavior": "preserves S1 only for an existing unmigrated installation, writes encrypted guarded S2 for fresh or explicitly migrated stores, and never silently downgrades S2",
+      "targetCommand": "retain format-aware ProviderStore codec until the compatibility removal gate",
+      "closePhase": "phase-9",
+      "closureStatus": "closed",
+      "risk": "a raw serializer or format reset could disclose plaintext credentials or make an S2 file readable as S1",
+      "evidence": [
+        "src/domain/providers/store.rs::ProviderStoreFormat::S2",
+        "src/domain/providers/store.rs::encode_s2",
+        "src/domain/providers/store_v2.rs::encode_s2",
+        "src/domain/providers/store_v2.rs::old-decoder-must-reject"
+      ]
+    },
+    {
+      "id": "provider-storage-migration",
+      "source": "src/domain/providers/storage_migration.rs::apply|rollback|cleanup_snapshot",
+      "currentBehavior": "runs only as an explicit offline command under the data-directory process lock, performs read-only preflight and RuntimePlan parity, snapshots S1, atomically cuts over to S2, and permits audited snapshot rollback or cleanup",
+      "targetCommand": "retain explicit provider storage migration commands",
+      "closePhase": "phase-9",
+      "closureStatus": "closed",
+      "risk": "running migration beside a live Server or deleting the rollback snapshot implicitly could corrupt the store or remove the downgrade path",
+      "evidence": [
+        "src/domain/providers/storage_migration.rs::pub fn apply",
+        "src/domain/providers/storage_migration.rs::pub fn rollback",
+        "src/domain/providers/storage_migration.rs::pub fn cleanup_snapshot",
+        "src/domain/providers/storage_migration.rs::apply_is_rejected_while_server_holds_data_directory_lock"
+      ]
+    },
+    {
+      "id": "backup-restore",
+      "source": "src/infra/backup.rs::restore_backup_with_validator",
+      "currentBehavior": "stages all files and validates typed stores, matching Account/Provider keys, authenticated S2 credential decryption, reserved sentinels, and Provider RuntimePlan compilation before live replacement; files remain sequentially replaced by the accepted same-installation restore boundary",
+      "targetCommand": "retain same-installation staged schema/key/credential/RuntimePlan preflight",
+      "closePhase": "phase-9",
+      "closureStatus": "closed",
+      "risk": "an apply-time filesystem failure can require the generated pre-restore snapshot for rollback",
+      "evidence": [
+        "src/infra/backup.rs::restore_backup_with_validator",
+        "src/state.rs::validate_server_backup_restore_stage",
+        "src/state.rs::restore_backup_command",
+        "src/state.rs::s2_backup_restore_validates_key_and_runtime_before_live_replacement"
+      ]
+    },
+    {
+      "id": "reload-after-restore",
+      "source": "src/state.rs::reload_persistent_stores",
+      "currentBehavior": "preloads every typed store before ordered in-memory swaps under the Provider commit lock; cross-store online transactional visibility is explicitly outside the product boundary",
+      "targetCommand": "retain validated same-installation reload boundary",
+      "closePhase": "complete",
+      "closureStatus": "accepted_boundary",
+      "risk": "concurrent readers may observe an ordered reload transition, so restore remains an explicit administrative operation",
+      "evidence": [
+        "src/state.rs::reload_persistent_stores",
+        "src/state.rs::reload_persistent_stores_under_provider_commit"
+      ]
+    },
+    {
+      "id": "ordinary-export",
+      "source": "src/api/providers.rs::export_providers",
+      "currentBehavior": "returns redacted ProviderView records without reusable credentials or ciphertext",
+      "targetCommand": "retain redacted ProviderView contract",
+      "closePhase": "complete",
+      "closureStatus": "closed",
+      "risk": "a DTO regression could disclose credentials or make an ordinary export reusable as a secret bundle",
+      "evidence": [
+        "src/api/providers.rs::export_providers",
+        "src/domain/providers/credentials.rs::ProviderView"
+      ]
+    }
+  ]
+}

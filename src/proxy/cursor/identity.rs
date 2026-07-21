@@ -394,6 +394,8 @@ mod tests {
         let account = Account {
             id: "cursor_1".to_string(),
             provider_type: ProviderType::CursorOAuth,
+            auth_identity_generation: 1,
+            token_refresh_generation: 1,
             email: Some("u@example.com".to_string()),
             access_token: Some("access".to_string()),
             refresh_token: Some("refresh".to_string()),

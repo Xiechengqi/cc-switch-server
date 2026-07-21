@@ -80,11 +80,20 @@ curl -fsS -X POST \
   "$SERVER_URL/api/auth/login"
 echo
 
+echo "== create provider =="
+PROVIDER_ID="$(curl -fsS -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-CC-Switch-Provider-Contract-Version: 1" \
+  -H "Content-Type: application/json" \
+  -d '{"app":"codex","profileId":"codex.openai_api_key","clientRequestId":"smoke-provider","credentialPatches":{"/settingsConfig/apiKey":{"action":"replace","value":"smoke-provider-secret"}}}' \
+  "$SERVER_URL/api/providers/from-preset" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>process.stdout.write(JSON.parse(s).stored.provider.id))')"
+echo "provider id: $PROVIDER_ID"
+
 echo "== create share =="
 curl -fsS -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"id":"smoke-share","app":"codex","providerId":"smoke-provider","providerType":"codex","displayName":"Smoke Share"}' \
+  -d "{\"id\":\"smoke-share\",\"app\":\"codex\",\"providerId\":\"$PROVIDER_ID\",\"providerType\":\"codex\",\"displayName\":\"Smoke Share\"}" \
   "$SERVER_URL/api/shares"
 echo
 

@@ -127,11 +127,9 @@ pub fn default_ui_settings() -> Value {
         "proxyConfirmed": true,
         "usageConfirmed": true,
         "streamCheckConfirmed": true,
-        "enableFailoverToggle": false,
         "preserveCodexOfficialAuthOnSwitch": false,
         "unifyCodexSessionHistory": false,
         "unifyCodexMigrateExisting": false,
-        "failoverConfirmed": true,
         "firstRunNoticeConfirmed": true,
         "autoSyncConfirmed": true,
         "commonConfigConfirmed": false,
@@ -414,8 +412,8 @@ mod tests {
             },
             client: Default::default(),
             setup_completion_notification: None,
-            upstream_proxy: Default::default(),
             upgrade_policy: Default::default(),
+            enable_web_terminal: false,
         };
         let settings = store.settings_for_frontend(&config);
         assert_eq!(
@@ -498,7 +496,6 @@ mod tests {
         };
         let frontend = store.for_frontend();
         assert_eq!(frontend["commonConfigConfirmed"], json!(true));
-        assert_eq!(frontend["enableFailoverToggle"], json!(false));
         assert!(frontend.get("visibleApps").is_some());
     }
 

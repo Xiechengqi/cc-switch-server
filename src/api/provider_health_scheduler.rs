@@ -9,8 +9,9 @@ use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageMo
 use crate::state::ServerState;
 
 use super::{
-    map_provider_test_to_stream_check_result, provider_test_model, test_provider_inner,
-    web_stream_check_config, TestProviderQuery, TestProviderResponse,
+    map_provider_test_to_stream_check_result, provider_test_model,
+    resolve_provider_execution_by_key, test_provider_inner, web_stream_check_config,
+    TestProviderQuery, TestProviderResponse,
 };
 
 const FIRST_HEALTH_CHECK_DELAY: Duration = Duration::from_secs(120);
@@ -111,7 +112,7 @@ pub(crate) async fn check_share_binding(
 
     let model = provider_test_model(provider.app, provider, None, Some(config));
     let query = TestProviderQuery {
-        app: Some(provider.app),
+        app: provider.app,
         network: Some(true),
         timeout_ms: Some(config.timeout_secs.saturating_mul(1000)),
         model: Some(model.clone()),
@@ -135,8 +136,30 @@ async fn run_probe_with_retries(
     config: &StreamCheckConfig,
     model: &str,
 ) -> StreamCheckResult {
+    let execution =
+        match resolve_provider_execution_by_key(state, provider.app, &provider.provider.id).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                return StreamCheckResult {
+                    status: HealthStatus::Failed,
+                    success: false,
+                    provider_revision: Some(provider.resource.revision),
+                    message: error.message,
+                    response_time_ms: None,
+                    http_status: None,
+                    model_used: model.to_string(),
+                    tested_at: chrono::Utc::now().timestamp(),
+                    retry_count: 0,
+                    error_category: Some("invalidConfig".to_string()),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                };
+            }
+        };
     for attempt in 0..=config.max_retries {
-        match test_provider_inner(state, provider.clone(), query).await {
+        match test_provider_inner(state, execution.clone(), query).await {
             Ok(response) => {
                 let retry = !probe_succeeded(&response)
                     && retryable_probe(
@@ -166,6 +189,7 @@ async fn run_probe_with_retries(
                     return StreamCheckResult {
                         status: HealthStatus::Failed,
                         success: false,
+                        provider_revision: Some(provider.resource.revision),
                         message: error.message,
                         response_time_ms: None,
                         http_status: Some(error.status.as_u16()),
@@ -197,6 +221,7 @@ async fn record_quota_block(
     let result = StreamCheckResult {
         status: HealthStatus::Failed,
         success: false,
+        provider_revision: Some(provider.resource.revision),
         message: "quota blocked".to_string(),
         response_time_ms: Some(0),
         http_status: Some(429),

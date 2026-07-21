@@ -3,6 +3,15 @@ use super::*;
 use crate::domain::sharing::router_contract::descriptor_for_share_with_accounts_and_usage;
 use std::collections::BTreeMap;
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct UpsertShareCommand {
+    #[serde(default)]
+    pub(in crate::api) expected_config_revision: Option<u64>,
+    #[serde(flatten)]
+    pub(in crate::api) input: UpsertShareInput,
+}
+
 pub(in crate::api) async fn list_shares(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -39,6 +48,18 @@ pub(in crate::api) async fn import_shares(
         .email
         .clone()
         .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?;
+    let reference_guard = state.lock_reference_mutations().await;
+    {
+        let providers = state.providers.read().await;
+        for share in &input.shares {
+            validate_share_provider_reference(
+                &providers,
+                share.app,
+                &share.provider_id,
+                share.provider_type,
+            )?;
+        }
+    }
     let mut imported_store = ShareStore {
         shares: std::mem::take(&mut input.shares),
         ..ShareStore::default()
@@ -52,6 +73,7 @@ pub(in crate::api) async fn import_shares(
         .mutate_shares_immediate(|store| store.import_shares(input.shares))
         .await
         .map_err(ApiError::internal)?;
+    drop(reference_guard);
     state.emit_event(
         ServerEvent::new("share.imported", "share").message(format!("imported {imported} shares")),
     );
@@ -65,9 +87,13 @@ pub(in crate::api) async fn import_shares(
 pub(in crate::api) async fn upsert_share(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(mut input): Json<UpsertShareInput>,
+    Json(command): Json<UpsertShareCommand>,
 ) -> Result<Json<UpsertShareResponse>, ApiError> {
     require_session(&state, &headers).await?;
+    let UpsertShareCommand {
+        expected_config_revision,
+        mut input,
+    } = command;
     input.owner_email = Some(
         state
             .config
@@ -78,6 +104,16 @@ pub(in crate::api) async fn upsert_share(
             .clone()
             .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?,
     );
+    let reference_guard = state.lock_reference_mutations().await;
+    {
+        let providers = state.providers.read().await;
+        validate_share_provider_reference(
+            &providers,
+            input.app,
+            &input.provider_id,
+            input.provider_type,
+        )?;
+    }
     let previous = {
         let shares = state.shares.read().await;
         input
@@ -92,11 +128,26 @@ pub(in crate::api) async fn upsert_share(
             })
             .cloned()
     };
+    match (previous.as_ref(), expected_config_revision) {
+        (Some(previous), Some(expected)) if previous.config_revision != expected => {
+            return Err(ApiError::conflict(format!(
+                "Share changed since this editor was opened (expected revision {expected}, current revision {})",
+                previous.config_revision
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(ApiError::conflict(
+                "cannot apply expectedConfigRevision to a new Share",
+            ));
+        }
+        _ => {}
+    }
     let share = state
         .mutate_shares_immediate(|store| store.upsert(input))
         .await
         .map_err(ApiError::internal)?
         .map_err(map_share_patch_error)?;
+    drop(reference_guard);
     spawn_share_upsert_sync(state.clone(), share.clone());
     let was_running = previous
         .as_ref()
@@ -121,6 +172,27 @@ pub(in crate::api) async fn upsert_share(
     }
     emit_share_event(&state, "share.changed", &share, "upserted");
     Ok(Json(UpsertShareResponse { ok: true, share }))
+}
+
+fn validate_share_provider_reference(
+    providers: &crate::domain::providers::store::ProviderStore,
+    app: AppKind,
+    provider_id: &str,
+    provider_type: ProviderType,
+) -> Result<(), ApiError> {
+    let stored = providers
+        .providers
+        .iter()
+        .find(|stored| stored.app == app && stored.provider.id == provider_id)
+        .ok_or_else(|| ApiError::not_found("share Provider not found"))?;
+    if stored.provider_type != provider_type {
+        return Err(ApiError::bad_request(format!(
+            "share providerType {} does not match Provider {}",
+            provider_type.as_str(),
+            stored.provider_type.as_str()
+        )));
+    }
+    Ok(())
 }
 
 pub(in crate::api) async fn share_connect_info(

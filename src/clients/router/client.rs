@@ -199,6 +199,8 @@ pub struct InstallationHeartbeatPayload {
     pub boot_id: String,
     pub app_version: String,
     pub commit_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +400,31 @@ struct ShareBatchSyncRequest {
     nonce: String,
     signature: String,
     ops: Vec<ShareSyncOperation>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareDescriptorSyncAck {
+    pub share_id: String,
+    pub descriptor_generation: u64,
+    pub descriptor_fingerprint: String,
+    #[serde(default)]
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareDescriptorBatchSyncResponse {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    acks: Vec<ShareDescriptorSyncAck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareDescriptorSyncOutcome {
+    Strict(Vec<ShareDescriptorSyncAck>),
+    Legacy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -808,6 +835,7 @@ pub async fn send_installation_heartbeat(
     http: &reqwest::Client,
     config: &ServerConfig,
     boot_id: &str,
+    public_ip: Option<&str>,
 ) -> Result<(), InstallationHeartbeatError> {
     let api_base = config
         .router_api_base()
@@ -818,7 +846,7 @@ pub async fn send_installation_heartbeat(
     let identity = config.registered_router_identity().ok_or_else(|| {
         InstallationHeartbeatError::Transient("router installation is not registered".into())
     })?;
-    let request = build_installation_heartbeat_request(identity, boot_id)
+    let request = build_installation_heartbeat_request(identity, boot_id, public_ip)
         .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
     let response = http
         .post(format!("{api_base}/v1/installations/heartbeat"))
@@ -1034,6 +1062,7 @@ fn bounded_router_error_body(body: &str) -> String {
 fn build_installation_heartbeat_request(
     identity: &RouterIdentity,
     boot_id: &str,
+    public_ip: Option<&str>,
 ) -> anyhow::Result<SignedRequest<InstallationHeartbeatPayload>> {
     let build = crate::build_info::build_info();
     signed_request(
@@ -1044,6 +1073,10 @@ fn build_installation_heartbeat_request(
             boot_id: boot_id.to_string(),
             app_version: crate::build_info::router_registration_version().to_string(),
             commit_id: build.commit_id.to_string(),
+            public_ip: public_ip
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
         },
     )
 }
@@ -1796,6 +1829,26 @@ pub async fn push_share_ops(
     push_share_ops_with_timeout(http, config, ops, ROUTER_CONTROL_PLANE_SYNC_TIMEOUT).await
 }
 
+pub async fn push_share_descriptor_ops(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    ops: Vec<ShareSyncOperation>,
+    strict_required: bool,
+) -> anyhow::Result<ShareDescriptorSyncOutcome> {
+    let ops = canonicalize_share_operations(config, ops)?;
+    tokio::time::timeout(
+        ROUTER_CONTROL_PLANE_SYNC_TIMEOUT,
+        push_share_descriptor_ops_request(http, config, ops, strict_required),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "router Share descriptor sync timed out after {}s",
+            ROUTER_CONTROL_PLANE_SYNC_TIMEOUT.as_secs_f64()
+        )
+    })?
+}
+
 fn canonicalize_share_operations(
     config: &ServerConfig,
     mut ops: Vec<ShareSyncOperation>,
@@ -1997,6 +2050,83 @@ async fn push_share_ops_request(
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     bail!("router share batch sync failed: {status}: {body}");
+}
+
+async fn push_share_descriptor_ops_request(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    ops: Vec<ShareSyncOperation>,
+    strict_required: bool,
+) -> anyhow::Result<ShareDescriptorSyncOutcome> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/')
+        .to_string();
+    let identity = config
+        .registered_router_identity()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let response =
+        send_share_descriptor_ops_request(http, &api_base, identity, ops.clone()).await?;
+    if response.status().is_success() {
+        let payload = response
+            .json::<ShareDescriptorBatchSyncResponse>()
+            .await
+            .context("parse Router strict Share descriptor sync response")?;
+        if !payload.ok {
+            bail!("Router strict Share descriptor sync returned ok=false");
+        }
+        return Ok(ShareDescriptorSyncOutcome::Strict(payload.acks));
+    }
+
+    let status = response.status();
+    if !strict_required
+        && matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        )
+    {
+        let response = send_share_ops_request(http, &api_base, identity, ops).await?;
+        if response.status().is_success() {
+            return Ok(ShareDescriptorSyncOutcome::Legacy);
+        }
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("router legacy Share batch sync failed: {status}: {body}");
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    bail!("router strict Share descriptor sync failed: {status}: {body}");
+}
+
+async fn send_share_descriptor_ops_request(
+    http: &reqwest::Client,
+    api_base: &str,
+    identity: &RouterIdentity,
+    ops: Vec<ShareSyncOperation>,
+) -> anyhow::Result<reqwest::Response> {
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let signature = sign_payload(
+        identity,
+        "share_descriptor_batch_sync",
+        &ops,
+        timestamp_ms,
+        &nonce,
+    )?;
+    let request = ShareBatchSyncRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
+        installation_id: identity.installation_id.clone(),
+        timestamp_ms,
+        nonce,
+        signature,
+        ops,
+    };
+    http.post(format!("{api_base}/v1/shares/descriptor-batch-sync"))
+        .json(&request)
+        .send()
+        .await
+        .context("send Router strict Share descriptor sync")
 }
 
 async fn send_share_ops_request(
@@ -3097,7 +3227,7 @@ mod tests {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-heartbeat".into();
 
-        let request = build_installation_heartbeat_request(&identity, "boot-123").unwrap();
+        let request = build_installation_heartbeat_request(&identity, "boot-123", None).unwrap();
         let payload_json = serde_json::to_string(&request.payload).unwrap();
         let canonical = format!(
             "{PROTOCOL_EPOCH}\ninst-heartbeat\ninstallation_heartbeat_v1\n{}\n{}\n{}",
@@ -3169,6 +3299,7 @@ mod tests {
             boot_id: "fixture-boot".into(),
             app_version: "1.2.3".into(),
             commit_id: "abcdef123456".into(),
+            public_ip: None,
         };
         let signature = sign_payload(
             &identity,
@@ -3420,7 +3551,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(1),
-            send_installation_heartbeat(&reqwest::Client::new(), &config, "boot-123"),
+            send_installation_heartbeat(&reqwest::Client::new(), &config, "boot-123", None),
         )
         .await
         .expect("heartbeat failure should return promptly")
@@ -3450,6 +3581,7 @@ mod tests {
             &reqwest::Client::new(),
             &config,
             "boot-oversized-response",
+            None,
         )
         .await
         .expect_err("an oversized heartbeat error must be reported");
@@ -3496,6 +3628,7 @@ mod tests {
                     &reqwest::Client::new(),
                     &config,
                     "boot-stalled-error-tail",
+                    None,
                 ),
             )
             .await
@@ -3542,6 +3675,64 @@ mod tests {
         .expect_err("a stalled share sync must hit the operation deadline");
 
         assert!(error.to_string().contains("share batch sync timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn descriptor_sync_falls_back_only_before_strict_mode_is_sticky() {
+        async fn strict_handler() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+        async fn legacy_handler() -> Json<Value> {
+            Json(json!({"ok": true}))
+        }
+
+        let app = Router::new()
+            .route("/v1/shares/descriptor-batch-sync", post(strict_handler))
+            .route("/v1/shares/batch-sync", post(legacy_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-descriptor-fallback".into();
+        config.router.identity = Some(identity);
+
+        assert_eq!(
+            push_share_descriptor_ops(&reqwest::Client::new(), &config, Vec::new(), false)
+                .await
+                .unwrap(),
+            ShareDescriptorSyncOutcome::Legacy
+        );
+        let error = push_share_descriptor_ops(&reqwest::Client::new(), &config, Vec::new(), true)
+            .await
+            .expect_err("sticky strict mode must not downgrade after a 404");
+        assert!(error.to_string().contains("404 Not Found"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn descriptor_sync_parses_strict_ack_envelope() {
+        async fn handler() -> Json<Value> {
+            Json(json!({"ok": true, "acks": []}))
+        }
+        let app = Router::new().route("/v1/shares/descriptor-batch-sync", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{addr}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-descriptor-strict".into();
+        config.router.identity = Some(identity);
+
+        assert_eq!(
+            push_share_descriptor_ops(&reqwest::Client::new(), &config, Vec::new(), false)
+                .await
+                .unwrap(),
+            ShareDescriptorSyncOutcome::Strict(Vec::new())
+        );
         server.abort();
     }
 

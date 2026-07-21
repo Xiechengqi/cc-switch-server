@@ -9,6 +9,7 @@ import {
   sessionsApi,
   type AppId,
 } from "@/lib/api";
+import type { ProviderResource } from "@/lib/api/providers";
 import type {
   Provider,
   Settings,
@@ -17,6 +18,7 @@ import type {
 } from "@/types";
 import { isServerWebRuntime } from "@/lib/runtime";
 import { SERVER_DEFAULT_SETTINGS } from "@/lib/serverDefaultSettings";
+import { isCoreProviderApp } from "@/server/providerRegistry";
 
 const sortProviders = (
   providers: Record<string, Provider>,
@@ -43,6 +45,7 @@ const sortProviders = (
 
 export interface ProvidersQueryData {
   providers: Record<string, Provider>;
+  resources: Record<string, ProviderResource>;
   currentProviderId: string;
 }
 
@@ -67,10 +70,29 @@ export const useProvidersQuery = (
     refetchIntervalInBackground: false,
     queryFn: async () => {
       let providers: Record<string, Provider> = {};
+      let resources: Record<string, ProviderResource> = {};
       let currentProviderId = "";
 
       try {
-        providers = await providersApi.getAll(appId);
+        if (isServerWebRuntime() && isCoreProviderApp(appId)) {
+          const records = await providersApi.getResources(appId);
+          resources = Object.fromEntries(
+            records.map((resource) => [resource.provider.id, resource]),
+          );
+          providers = Object.fromEntries(
+            records.map((resource) => [
+              resource.provider.id,
+              {
+                ...resource.provider,
+                ...(resource.orderIndex === undefined
+                  ? {}
+                  : { sortIndex: resource.orderIndex }),
+              },
+            ]),
+          );
+        } else {
+          providers = await providersApi.getAll(appId);
+        }
       } catch (error) {
         if (import.meta.env.DEV) {
           console.warn("获取供应商列表失败:", error);
@@ -87,6 +109,7 @@ export const useProvidersQuery = (
 
       return {
         providers: sortProviders(providers),
+        resources,
         currentProviderId,
       };
     },

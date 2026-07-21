@@ -1453,6 +1453,17 @@ pub(in crate::api) async fn delete_account(
     Path(id): Path<String>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
     require_session(&state, &headers).await?;
+    let reference_guard = state.lock_reference_mutations().await;
+    let preview = account_delete_preview_inner(&state, &id).await?;
+    if preview.blocked {
+        return Err(ApiError::conflict_code(
+            "cc_switch_account_in_use",
+            format!(
+                "account is still referenced by {} Provider(s)",
+                preview.provider_keys.len()
+            ),
+        ));
+    }
     let (deleted, removed_account) = state
         .try_mutate_accounts_immediate(|store| {
             let provider_type = store
@@ -1477,6 +1488,7 @@ pub(in crate::api) async fn delete_account(
         })
         .await
         .map_err(ApiError::internal)??;
+    drop(reference_guard);
     if deleted {
         if let Some((provider_type, was_default)) = removed_account {
             state
@@ -1490,6 +1502,60 @@ pub(in crate::api) async fn delete_account(
         }
     }
     Ok(Json(DeleteResponse { ok: true, deleted }))
+}
+
+pub(in crate::api) async fn account_delete_preview(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<AccountDeletePreviewResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    Ok(Json(AccountDeletePreviewResponse {
+        ok: true,
+        preview: account_delete_preview_inner(&state, &id).await?,
+    }))
+}
+
+async fn account_delete_preview_inner(
+    state: &ServerState,
+    account_id: &str,
+) -> Result<AccountDeletePreview, ApiError> {
+    if !state
+        .accounts
+        .read()
+        .await
+        .accounts
+        .iter()
+        .any(|account| account.id == account_id)
+    {
+        return Err(ApiError::not_found("account not found"));
+    }
+    let mut provider_keys = state
+        .providers
+        .read()
+        .await
+        .providers
+        .iter()
+        .filter(|stored| {
+            stored
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.account_id.as_deref())
+                == Some(account_id)
+        })
+        .map(|stored| crate::domain::providers::registry::ProviderKey {
+            app: stored.app,
+            provider_id: stored.provider.id.clone(),
+        })
+        .collect::<Vec<_>>();
+    provider_keys.sort();
+    Ok(AccountDeletePreview {
+        account_id: account_id.to_string(),
+        blocked: !provider_keys.is_empty(),
+        provider_keys,
+    })
 }
 
 pub(in crate::api) async fn refresh_account(

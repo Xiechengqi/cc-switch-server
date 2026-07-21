@@ -27,7 +27,6 @@ import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
 import { ProviderInUseTag } from "@/components/providers/ProviderQuotaMetaRow";
 import { ProviderShareStatusTag } from "@/components/providers/ProviderShareStatusTag";
-import { FailoverPriorityBadge } from "@/components/providers/FailoverPriorityBadge";
 import {
   extractCodexBaseUrl,
   extractCodexExperimentalBearerToken,
@@ -38,7 +37,7 @@ import {
   getProviderQuotaSource,
   isManagedOauthProvider,
 } from "@/utils/providerMetaUtils";
-import { useProviderHealth } from "@/lib/query/failover";
+import { useProviderHealth } from "@/lib/query/providerHealth";
 import { useSettingsQuery } from "@/lib/query/queries";
 import { getOauthQuotaRefreshIntervalMinutes } from "@/lib/query/oauthQuotaRefresh";
 import { resolveManagedAccountId } from "@/lib/authBinding";
@@ -80,11 +79,6 @@ interface ProviderCardProps {
   isProxyRunning: boolean;
   isProxyTakeover?: boolean; // 代理接管模式（Live配置已被接管，切换为热切换）
   dragHandleProps?: DragHandleProps;
-  isAutoFailoverEnabled?: boolean; // 是否开启自动故障转移
-  failoverPriority?: number; // 故障转移优先级（1 = P1, 2 = P2, ...）
-  isInFailoverQueue?: boolean; // 是否在故障转移队列中
-  onToggleFailover?: (enabled: boolean) => void; // 切换故障转移队列
-  activeProviderId?: string; // 代理当前实际使用的供应商 ID（用于故障转移模式下标注绿色边框）
   // OpenClaw: default model
   isDefaultModel?: boolean;
   onSetAsDefault?: () => void;
@@ -238,11 +232,6 @@ export function ProviderCard({
   isProxyRunning,
   isProxyTakeover = false,
   dragHandleProps,
-  isAutoFailoverEnabled = false,
-  failoverPriority,
-  isInFailoverQueue = false,
-  onToggleFailover,
-  activeProviderId,
   // OpenClaw: default model
   isDefaultModel,
   onSetAsDefault,
@@ -344,23 +333,17 @@ export function ProviderCard({
   // - OMO/OMO Slim 供应商：使用 isCurrent
   // - OpenClaw：使用默认模型归属的 provider 作为当前项（蓝色边框）
   // - OpenCode（非 OMO）：不存在"当前"概念，返回 false
-  // - 故障转移模式：优先使用代理实际使用的供应商，状态未就绪时回退到当前选中项
-  // - 普通模式：isCurrent
-  const failoverActiveProviderId = activeProviderId?.trim();
+  // - 其它应用：使用明确选中的当前供应商
   const isActiveProvider = isAnyOmo
     ? isCurrent
     : appId === "openclaw"
       ? Boolean(isDefaultModel)
       : appId === "opencode"
         ? false
-        : isAutoFailoverEnabled
-          ? failoverActiveProviderId
-            ? failoverActiveProviderId === provider.id
-            : isCurrent
-          : isCurrent;
+        : isCurrent;
 
   const shouldUseGreen =
-    !isAnyOmo && (isProxyTakeover || isAutoFailoverEnabled) && isActiveProvider;
+    !isAnyOmo && isProxyTakeover && isActiveProvider;
   const shouldUseViolet = canManageShare && isSharing;
   const showInUseTag = isActiveProvider;
 
@@ -369,7 +352,7 @@ export function ProviderCard({
       className={cn(
         "relative overflow-hidden rounded-xl border border-border p-4 transition-all duration-300",
         "bg-card text-card-foreground group",
-        isAutoFailoverEnabled || isProxyTakeover
+        isProxyTakeover
           ? "hover:border-emerald-500/50"
           : "hover:border-border-active",
         shouldUseGreen &&
@@ -439,18 +422,12 @@ export function ProviderCard({
                 </span>
               )}
 
-              {isProxyRunning && isInFailoverQueue && health && (
+              {isProxyRunning && health && (
                 <ProviderHealthBadge
-                  consecutiveFailures={health.consecutive_failures}
+                  failureCount={health.consecutive_failures}
                   isHealthy={health.is_healthy}
                 />
               )}
-
-              {isAutoFailoverEnabled &&
-                isInFailoverQueue &&
-                failoverPriority && (
-                  <FailoverPriorityBadge priority={failoverPriority} />
-                )}
 
               {provider.category === "third_party" &&
                 provider.meta?.isPartner && (
@@ -616,9 +593,6 @@ export function ProviderCard({
               onOpenTerminal={
                 onOpenTerminal ? () => onOpenTerminal(provider) : undefined
               }
-              isAutoFailoverEnabled={isAutoFailoverEnabled}
-              isInFailoverQueue={isInFailoverQueue}
-              onToggleFailover={onToggleFailover}
               // OpenClaw: default model
               isDefaultModel={isDefaultModel}
               onSetAsDefault={onSetAsDefault}

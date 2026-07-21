@@ -111,6 +111,11 @@
     "noProvidersDescriptionSnippet": "除 Key 和请求地址外的数据（如插件配置）会被保存到通用配置片段，用于在不同供应商之间共享",
     "currentlyUsing": "当前使用",
     "enable": "启用",
+    "storageMigration": {
+      "title": "Provider 凭据存储仍为 S1",
+      "ready": "预检已通过。请在停止服务后运行 cc-switch-server config migrate-provider-store --apply。",
+      "blocked": "有 {{count}} 个 Provider 尚未完成身份或凭据分类，S2 切换已阻止。"
+    },
     "share": {
       "sectionTitle": "远程分享",
       "enableShare": "启用远程分享",
@@ -290,11 +295,6 @@
     "proxy": {
       "title": "启用本地路由服务",
       "message": "本地路由是一项高级功能，启用前请确保您已了解其工作原理。\n\n建议先查阅相关文档或咨询您的供应商，以获取正确的配置方式。",
-      "confirm": "我已了解，继续启用"
-    },
-    "failover": {
-      "title": "启用故障转移功能",
-      "message": "故障转移是一项高级功能，启用前请确保您已了解其工作原理。\n\n建议先在故障转移队列中配置好供应商优先级。",
       "confirm": "我已了解，继续启用"
     },
     "unifyCodexHistory": {
@@ -559,12 +559,8 @@
         "description": "管理 Claude、Codex 和 Gemini 的配置存储路径"
       },
       "proxy": {
-        "title": "本地路由",
-        "description": "控制路由服务开关、查看状态与端口信息",
-        "enableFeature": "在主页面显示本地路由开关",
-        "enableFeatureDescription": "开启后，主页面顶部将显示路由和故障转移开关",
-        "enableFailoverToggle": "在主页面显示故障转移开关",
-        "enableFailoverToggleDescription": "开启后，主页面顶部将独立显示故障转移开关",
+        "title": "API 路由",
+        "description": "查看 Server API 路由状态和当前 Provider",
         "running": "运行中",
         "stopped": "已停止"
       },
@@ -572,25 +568,13 @@
         "title": "模型测试配置",
         "description": "配置模型测试使用的默认模型和提示词"
       },
-      "failover": {
-        "title": "自动故障转移",
-        "description": "配置故障转移队列和熔断策略"
-      },
       "pricing": {
         "title": "成本定价",
         "description": "管理各模型 Token 计费规则"
       },
-      "globalProxy": {
-        "title": "全局出站代理",
-        "description": "配置 CC Switch 访问外部 API 时使用的代理"
-      },
-      "data": {
-        "title": "数据管理",
-        "description": "导入和导出本地配置数据"
-      },
       "backup": {
         "title": "备份与恢复",
-        "description": "管理自动备份，查看和恢复数据库快照"
+        "description": "管理当前安装的状态快照；跨主机迁移需停机复制完整数据目录"
       },
       "cloudSync": {
         "title": "云同步",
@@ -684,26 +668,9 @@
     "themeLight": "浅色",
     "themeDark": "深色",
     "themeSystem": "跟随系统",
-    "importExport": "SQL 导入导出",
-    "importExportHint": "导入/导出数据库 SQL 备份（仅支持导入由 CC Switch 导出的备份），便于备份或迁移。",
-    "exportConfig": "导出 SQL 备份",
-    "selectConfigFile": "选择 SQL 文件",
-    "noFileSelected": "尚未选择配置文件。",
-    "import": "导入",
-    "importing": "导入中...",
-    "importSuccess": "导入成功！",
-    "importFailed": "导入失败",
-    "syncLiveFailed": "已导入，但同步到当前供应商失败，请手动重新选择一次供应商。",
-    "importPartialSuccess": "配置已导入，但同步到当前供应商失败。",
-    "importPartialHint": "请手动重新选择一次供应商以刷新对应配置。",
-    "configExported": "配置已导出到：",
-    "exportFailed": "导出失败",
-    "selectFileFailed": "请选择有效的 SQL 备份文件",
-    "configCorrupted": "SQL 文件可能已损坏或格式不正确",
-    "backupId": "备份ID",
     "backupManager": {
-      "title": "数据库备份",
-      "description": "自动备份的数据库快照，可用于恢复到之前的状态",
+      "title": "Server 状态备份",
+      "description": "用于将当前安装恢复到之前状态，不用于跨主机迁移",
       "empty": "暂无备份",
       "restore": "恢复",
       "restoring": "恢复中...",
@@ -1086,8 +1053,6 @@
     "wslShellFlag": "标志",
     "installCommandsCopied": "安装命令已复制",
     "installCommandsCopyFailed": "复制失败，请手动复制。",
-    "importFailedError": "导入配置失败：{{message}}",
-    "exportFailedError": "导出配置失败:",
     "restartRequired": "需要重启应用",
     "restartRequiredMessage": "修改 CC Switch 配置目录后需要重启应用才能生效，是否立即重启？",
     "restartNow": "立即重启",
@@ -1095,19 +1060,8 @@
     "restartFailed": "应用重启失败，请手动关闭后重新打开。",
     "devModeRestartHint": "开发模式下不支持自动重启，请手动重新启动应用。",
     "saving": "正在保存...",
+    "saveFailedGeneric": "保存失败，请重试",
     "globalProxy": {
-      "label": "全局代理",
-      "hint": "代理所有请求（API、Skills 下载等）。开启本地路由时，应用的请求也会经过此代理。留空表示直连。",
-      "username": "用户名（可选）",
-      "password": "密码（可选）",
-      "test": "测试连接",
-      "scan": "扫描本地代理",
-      "clear": "清除",
-      "scanFailed": "扫描失败：{{error}}",
-      "saved": "代理设置已保存",
-      "saveFailed": "保存失败：{{error}}",
-      "testSuccess": "连接成功！延迟 {{latency}}ms",
-      "testFailed": "连接失败：{{error}}",
       "pricingDefaultsTitle": "计费默认配置",
       "pricingDefaultsDescription": "设置各应用的默认倍率与计费模式来源。",
       "pricingAppLabel": "应用",
@@ -1122,8 +1076,7 @@
       "pricingLoadFailed": "加载计费配置失败：{{error}}",
       "defaultCostMultiplierRequired": "默认倍率不能为空",
       "defaultCostMultiplierInvalid": "默认倍率格式不正确"
-    },
-    "saveFailedGeneric": "保存失败，请重试"
+    }
   },
   "apps": {
     "claude": "Claude",
@@ -2572,23 +2525,8 @@
     "operational": "正常",
     "degraded": "降级",
     "failed": "失败",
-    "circuitOpen": "熔断",
-    "consecutiveFailures": "连续失败 {{count}} 次"
-  },
-  "failover": {
-    "enabled": "{{app}} 故障转移已启用",
-    "disabled": "{{app}} 故障转移已关闭",
-    "toggleFailed": "操作失败: {{detail}}",
-    "inQueue": "已加入",
-    "addQueue": "加入",
-    "priority": {
-      "tooltip": "故障转移优先级 {{priority}}"
-    },
-    "tooltip": {
-      "routingRequired": "本地路由启动后才能启用 {{app}} 故障转移",
-      "enabled": "{{app}} 故障转移已启用\n按队列优先级（P1→P2→...）选择供应商",
-      "disabled": "启用 {{app}} 故障转移\n将立即切换到队列 P1，并在失败时自动切换到下一个"
-    }
+    "unavailable": "异常",
+    "failedRequests": "失败请求 {{count}} 次"
   },
   "proxy": {
     "panel": {
@@ -2704,65 +2642,6 @@
         "inactive": "路由 {{appLabel}} 的请求，让该应用请求走本地路由"
       }
     },
-    "failover": {
-      "proxyRequired": "需要先启动路由服务才能配置故障转移",
-      "autoSwitch": "自动故障转移",
-      "autoSwitchDescription": "开启后将立即切换到队列 P1，并在请求失败时自动切换到队列中的下一个供应商"
-    },
-    "failoverQueue": {
-      "title": "故障转移队列",
-      "description": "管理各应用的供应商故障转移顺序",
-      "info": "启用自动故障转移后，将按队列优先级选择供应商（P1 优先）。当请求失败时，系统会按队列顺序依次尝试下一个供应商。",
-      "selectProvider": "选择供应商添加到队列",
-      "noAvailableProviders": "没有可添加的供应商",
-      "empty": "故障转移队列为空。添加供应商以启用自动故障转移。",
-      "orderHint": "队列顺序与首页供应商列表顺序一致，可在首页拖拽调整顺序。",
-      "dragHint": "拖拽供应商可调整故障转移顺序，序号越小优先级越高。",
-      "toggleEnabled": "启用/禁用",
-      "addSuccess": "已添加到故障转移队列",
-      "addFailed": "添加失败",
-      "removeSuccess": "已从故障转移队列移除",
-      "removeFailed": "移除失败",
-      "reorderSuccess": "队列顺序已更新",
-      "reorderFailed": "更新顺序失败",
-      "toggleFailed": "状态更新失败"
-    },
-    "autoFailover": {
-      "info": "当故障转移队列中配置了多个供应商时，系统会在请求失败时按优先级顺序依次尝试。当某个供应商连续失败达到阈值时，熔断器会打开并在一段时间内跳过该供应商。",
-      "configSaved": "自动故障转移配置已保存",
-      "configSaveFailed": "保存失败",
-      "validationFailed": "以下字段超出有效范围: {{fields}}",
-      "retrySettings": "重试与超时设置",
-      "failureThreshold": "失败阈值",
-      "failureThresholdHint": "连续失败多少次后打开熔断器（建议: 3-10）",
-      "timeout": "恢复等待时间（秒）",
-      "timeoutHint": "熔断器打开后，等待多久后尝试恢复（建议: 30-120）",
-      "circuitBreakerSettings": "熔断器设置",
-      "successThreshold": "恢复成功阈值",
-      "successThresholdHint": "半开状态下成功多少次后关闭熔断器",
-      "errorRate": "错误率阈值 (%)",
-      "errorRateHint": "错误率超过此值时打开熔断器",
-      "minRequests": "最小请求数",
-      "minRequestsHint": "计算错误率前的最小请求数",
-      "explanationTitle": "工作原理",
-      "failureThresholdLabel": "失败阈值",
-      "failureThresholdExplain": "连续失败达到此次数时，熔断器打开，该供应商暂时不可用",
-      "timeoutLabel": "恢复等待时间",
-      "timeoutExplain": "熔断器打开后，等待此时间后尝试半开状态",
-      "successThresholdLabel": "恢复成功阈值",
-      "successThresholdExplain": "半开状态下，成功达到此次数时关闭熔断器，供应商恢复可用",
-      "errorRateLabel": "错误率阈值",
-      "errorRateExplain": "错误率超过此值时，即使未达到失败阈值也会打开熔断器",
-      "maxRetries": "最大重试次数",
-      "timeoutSettings": "超时配置",
-      "streamingFirstByte": "流式首字节超时",
-      "streamingIdle": "流式静默超时",
-      "nonStreaming": "非流式超时",
-      "maxRetriesHint": "请求失败时的重试次数（0-10）",
-      "streamingFirstByteHint": "等待首个数据块的最大时间，范围 1-120 秒，默认 60 秒",
-      "streamingIdleHint": "数据块之间的最大间隔，范围 60-600 秒，填 0 禁用（防止中途卡住）",
-      "nonStreamingHint": "非流式请求的总超时时间，范围 60-1200 秒，默认 600 秒（10 分钟）"
-    },
     "logging": {
       "enabled": "日志记录已启用",
       "disabled": "日志记录已关闭",
@@ -2818,45 +2697,7 @@
   "proxyConfig": {
     "proxyEnabled": "本地路由",
     "appTakeover": "应用路由",
-    "perAppConfig": "应用配置",
-    "circuitBreaker": "熔断器配置",
-    "circuitBreakerSettings": "熔断器设置",
-    "failureThreshold": "失败阈值",
-    "successThreshold": "恢复阈值",
-    "recoveryTimeout": "恢复等待时间",
-    "errorRateThreshold": "错误率阈值",
-    "minRequests": "最小请求数",
-    "timeoutConfig": "超时配置",
-    "streamingFirstByte": "流式首字节超时",
-    "streamingIdle": "流式静默超时",
-    "nonStreaming": "非流式超时"
-  },
-  "circuitBreaker": {
-    "failureThreshold": "失败阈值",
-    "successThreshold": "成功阈值",
-    "timeoutSeconds": "超时时间（秒）",
-    "errorRateThreshold": "错误率阈值 (%)",
-    "minRequests": "最小请求数",
-    "validationFailed": "以下字段超出有效范围: {{fields}}",
-    "configSaved": "熔断器配置已保存",
-    "saveFailed": "保存失败",
-    "loading": "加载中...",
-    "title": "熔断器配置",
-    "description": "调整熔断器参数以控制故障检测和恢复行为",
-    "failureThresholdHint": "连续失败多少次后打开熔断器",
-    "timeoutSecondsHint": "熔断器打开后多久尝试恢复（半开状态）",
-    "successThresholdHint": "半开状态下成功多少次后关闭熔断器",
-    "errorRateThresholdHint": "错误率超过此值时打开熔断器",
-    "minRequestsHint": "计算错误率前的最小请求数",
-    "saveConfig": "保存配置",
-    "instructionsTitle": "配置说明",
-    "instructions": {
-      "failureThreshold": "连续失败达到此次数时，熔断器打开",
-      "timeout": "熔断器打开后，等待此时间后尝试半开",
-      "successThreshold": "半开状态下，成功达到此次数时关闭熔断器",
-      "errorRate": "错误率超过此值时，熔断器打开",
-      "minRequests": "只有请求数达到此值后才计算错误率"
-    }
+    "perAppConfig": "应用配置"
   },
   "omo": {
     "editProfile": "编辑 OMO 配置",
@@ -3401,7 +3242,7 @@
     "grokSpendingLimit": "消费额度",
     "expiryUnknown": "到期时间未知",
     "expiresIn": "{{time}}后到期",
-    "expired": "已到期",
+    "expired": "会话已过期",
     "expiryNotProvided": "上游未提供订阅到期日",
     "expiryManualNotSet": "到期时间未设置",
     "expiryUnavailable": "暂时无法查询订阅到期日",
@@ -3412,9 +3253,26 @@
     "utilization": "{{value}}%",
     "resetsIn": "{{time}}后重置",
     "extraUsage": "超额用量",
-    "expired": "会话已过期",
     "expiredHint": "请运行 {{tool}} 命令刷新登录",
     "queryFailed": "查询失败",
     "refresh": "刷新"
+  },
+  "terminal": {
+    "title": "运维终端",
+    "nav": "终端",
+    "backHome": "返回首页",
+    "subtitle": "服务器运行环境",
+    "placeholderTitle": "正在连接运维终端",
+    "placeholderBody": "离开本页不会中断后台命令；再次进入可恢复最近输出。",
+    "authRequired": "需要登录后才能使用运维终端",
+    "sessionEnded": "会话已结束",
+    "unknownError": "终端错误",
+    "connectionFailed": "终端连接失败",
+    "statusConnecting": "连接中",
+    "statusReplaying": "恢复历史",
+    "statusLive": "已连接",
+    "statusClosed": "已断开",
+    "statusError": "错误",
+    "endSession": "结束会话"
   }
 }

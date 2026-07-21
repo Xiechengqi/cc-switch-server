@@ -20,6 +20,21 @@ pub(in crate::api) struct UpsertAccountResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(in crate::api) struct AccountDeletePreview {
+    pub(in crate::api) account_id: String,
+    pub(in crate::api) provider_keys: Vec<crate::domain::providers::registry::ProviderKey>,
+    pub(in crate::api) blocked: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct AccountDeletePreviewResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) preview: AccountDeletePreview,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(in crate::api) struct AccountCapabilitiesResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) capabilities:
@@ -337,6 +352,8 @@ pub(in crate::api) struct CancelAccountLoginResponse {
 pub(in crate::api) struct AccountLoginAccountSummary {
     pub(in crate::api) id: String,
     pub(in crate::api) provider_type: ProviderType,
+    pub(in crate::api) auth_identity_generation: u64,
+    pub(in crate::api) token_refresh_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -355,6 +372,8 @@ impl AccountLoginAccountSummary {
         Self {
             id: account.id.clone(),
             provider_type: account.provider_type,
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
             email: account.email.clone(),
             subscription_level: account.subscription_level.clone(),
             entitlement_status: account.entitlement_status.clone(),

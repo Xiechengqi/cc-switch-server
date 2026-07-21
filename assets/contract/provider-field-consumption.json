@@ -1,0 +1,5438 @@
+{
+  "schemaVersion": 1,
+  "authority": "phase-0-migration-ledger",
+  "serverBaselineCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+  "sourceEvidence": [
+    {
+      "path": "src/domain/providers/model.rs",
+      "sha256": "7dce7a318b48f48d9c97a1da1532c2a5c5e3894a00725d6b520b7827cf4dbc2e"
+    },
+    {
+      "path": "src/domain/providers/model_routing.rs",
+      "sha256": "62ac646ebce876205c6a558e877b68cfbf5d135968a915e4a8484a977e290569"
+    },
+    {
+      "path": "src/domain/providers/store.rs",
+      "sha256": "c1aa2af7d85282eae1cbf3c478d89315f584d8e3984079f8df4887b926ec0499"
+    },
+    {
+      "path": "src/proxy/mod.rs",
+      "sha256": "904e0c39d9ef00f81491841e6149ffd9285b0813125f7637266ba4f7fda4a37f"
+    },
+    {
+      "path": "src/proxy/adapters.rs",
+      "sha256": "e46c273dae0e9f01c9656ebe8659f0f2d7392dd9d130cc80f0048763c781cfc5"
+    },
+    {
+      "path": "web-src/src/components/providers/forms/ProviderForm.tsx",
+      "sha256": "758992d77ae894a0d59a0f6a190780f8c65fbd0a616946f517627144f6a5273e"
+    }
+  ],
+  "presetFields": [
+    {
+      "locator": "legacyPreset.claude/category",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/icon",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/iconColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Nvidia",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/isOfficial",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/name",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/providerType",
+      "sourceFormat": "json_pointer",
+      "classification": "legacy_identity",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_registry",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/requiresOAuth",
+      "sourceFormat": "json_pointer",
+      "classification": "legacy_identity",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_registry",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/modelMapping",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/modelMapping/mode",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/theme",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/theme/backgroundColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/theme/icon",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "DeepSeek Official",
+        "Grok OAuth",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/theme/textColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/websiteUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Claude Official",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/apiFormat",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_BASE_URL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/modelMapping/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)",
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek Official",
+        "DeepSeek(API Key)",
+        "GitHub Copilot",
+        "Grok OAuth",
+        "Kiro OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Kiro OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Kiro OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/modelsUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "presets": [
+        "Cursor API Key",
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/testConfig",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "presets": [
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/testConfig/enabled",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "presets": [
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/testConfig/testModel",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "presets": [
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/apiKeyUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/AWS_ACCESS_KEY_ID",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/AWS_REGION",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/AWS_SECRET_ACCESS_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/env/CLAUDE_CODE_USE_BEDROCK",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime_template",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_ACCESS_KEY_ID",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime_template",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_ACCESS_KEY_ID/editorValue",
+      "sourceFormat": "json_pointer",
+      "classification": "credential_template",
+      "secret": true,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_ACCESS_KEY_ID/label",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_ACCESS_KEY_ID/placeholder",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_REGION",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime_template",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_REGION/editorValue",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime_template",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_REGION/label",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_REGION/placeholder",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)",
+        "AWS Bedrock (API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_SECRET_ACCESS_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime_template",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_SECRET_ACCESS_KEY/editorValue",
+      "sourceFormat": "json_pointer",
+      "classification": "credential_template",
+      "secret": true,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_SECRET_ACCESS_KEY/label",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/templateValues/AWS_SECRET_ACCESS_KEY/placeholder",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "AWS Bedrock (AKSK)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.claude/settingsConfig/apiKey",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "presets": [
+        "AWS Bedrock (API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/endpointCandidates",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.claude/endpointCandidates/0",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/auth",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/category",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/config",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/icon",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/iconColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/isOfficial",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/modelMapping",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelMapping/mode",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/name",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/providerType",
+      "sourceFormat": "json_pointer",
+      "classification": "legacy_identity",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_registry",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/testConfig",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "presets": [
+        "Grok OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/testConfig/enabled",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "presets": [
+        "Grok OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/testConfig/testModel",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "presets": [
+        "Grok OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/theme",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/theme/backgroundColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/theme/icon",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/theme/textColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth",
+        "Ollama API Key",
+        "OpenAI OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/websiteUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenAI OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/config/$staticCall",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/config/baseUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/config/model",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/config/providerName",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/0",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/1",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/2",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/3",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelMapping/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Grok OAuth",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/requiresOAuth",
+      "sourceFormat": "json_pointer",
+      "classification": "legacy_identity",
+      "secret": false,
+      "presets": [
+        "Cursor OAuth",
+        "Grok OAuth",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_registry",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/apiFormat",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/apiKeyUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.codex/auth/OPENAI_API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "presets": [
+        "Cursor API Key",
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/0/contextWindow",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/0/displayName",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/0/model",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/0/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/1/contextWindow",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/1/displayName",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/1/model",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "DeepSeek(API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/1/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/2/contextWindow",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/2/displayName",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/2/model",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/2/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/3/contextWindow",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/3/displayName",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/3/model",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/3/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/4",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/4/contextWindow",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/4/displayName",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/4/model",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/4/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/5",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/5/contextWindow",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/5/displayName",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/5/model",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/5/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/6",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/6/contextWindow",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/6/displayName",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/6/model",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/6/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/7",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/7/contextWindow",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/7/displayName",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/7/model",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/7/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/8",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/8/contextWindow",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/8/displayName",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/8/model",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/modelCatalog/8/upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/codexChatReasoning",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/codexChatReasoning/effortParam",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/codexChatReasoning/outputFormat",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/codexChatReasoning/supportsEffort",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/codexChatReasoning/supportsThinking",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/codexChatReasoning/thinkingParam",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)",
+        "Nvidia",
+        "Ollama API Key"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/endpointCandidates",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)",
+        "Nvidia"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/endpointCandidates/0",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)",
+        "Nvidia"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.codex/codexChatReasoning/effortValueMode",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "DeepSeek(API Key)"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/apiKeyUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Google Official",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/category",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/description",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/icon",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/iconColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/name",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/partnerPromotionKey",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/providerType",
+      "sourceFormat": "json_pointer",
+      "classification": "legacy_identity",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_registry",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/requiresOAuth",
+      "sourceFormat": "json_pointer",
+      "classification": "legacy_identity",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_registry",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/settingsConfig",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/settingsConfig/env",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/theme",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/theme/backgroundColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/theme/icon",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/theme/textColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/websiteUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Google Official",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "profile_presentation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-2"
+    },
+    {
+      "locator": "legacyPreset.gemini/baseURL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/model",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/settingsConfig/config",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/settingsConfig/config/general",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/settingsConfig/config/general/previewFeatures",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/settingsConfig/env/GEMINI_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
+      "locator": "legacyPreset.gemini/settingsConfig/env/GOOGLE_GEMINI_BASE_URL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "presets": [
+        "Antigravity CLI (agy)",
+        "Antigravity OAuth",
+        "Grok OAuth",
+        "OpenRouter"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    }
+  ],
+  "persistedFields": [
+    {
+      "locator": "provider.id",
+      "sourceFormat": "json_pointer",
+      "classification": "resource_identity",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "provider_key",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "never",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.name",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "display",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "never",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.category",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "display",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-2",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime_container",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.auth_mode",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.apiFormat",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.api_format",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.model",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.modelMapping.mode",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.modelMapping.upstreamModel",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.model_mapping.mode",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.model_mapping.upstream_model",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.models[*]",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.modelCatalog",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "observation",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.modelCatalog.*",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "observation",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.testConfig",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.testConfig.testModel",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.testConfig.model",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.auth.OPENAI_API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.apiKey",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_DEFAULT_FABLE_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.AUTH_MODE",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.AWS_REGION",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.BASE_URL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.CLAUDE_CODE_USE_BEDROCK",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.CODEX_BASE_URL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.CODEX_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.GEMINI_BASE_URL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.GEMINI_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.GOOGLE_GEMINI_BASE_URL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.OPENAI_BASE_URL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.OPENAI_MODEL",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.ANTHROPIC_AUTH_TOKEN",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.AWS_ACCESS_KEY_ID",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.AWS_SECRET_ACCESS_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.AWS_SESSION_TOKEN",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.CODEX_API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.GEMINI_API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.GOOGLE_API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.GROK_API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.OPENAI_API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.env.XAI_API_KEY",
+      "sourceFormat": "json_pointer",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "credential_patch_slot",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta",
+      "sourceFormat": "json_pointer",
+      "classification": "legacy_container",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.providerType",
+      "sourceFormat": "json_pointer",
+      "classification": "legacy_identity",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "profile_registry",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.apiFormat",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.authBinding.source",
+      "sourceFormat": "json_pointer",
+      "classification": "account_binding",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.authBinding.authProvider",
+      "sourceFormat": "json_pointer",
+      "classification": "account_binding",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.authBinding.accountId",
+      "sourceFormat": "json_pointer",
+      "classification": "account_binding",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.githubAccountId",
+      "sourceFormat": "json_pointer",
+      "classification": "account_binding",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.apiKeyField",
+      "sourceFormat": "json_pointer",
+      "classification": "credential_locator",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.customUserAgent",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.isFullUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.promptCacheKey",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.codexFastMode",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.codexImageGenerationEnabled",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.codexImageToolStripPolicy",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.codexWebsocketEnabled",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.codexChatReasoning",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.localProxyRequestOverrides",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "block_s2_until_typed",
+      "retirePhase": "phase-10",
+      "disposition": "retire_unless_consumer_is_allowlisted"
+    },
+    {
+      "locator": "provider.meta.testConfig",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "operation_policy",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.costMultiplier",
+      "sourceFormat": "json_pointer",
+      "classification": "control_policy",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.pricingModelSource",
+      "sourceFormat": "json_pointer",
+      "classification": "control_policy",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.quotaDispatchLimitPercent",
+      "sourceFormat": "json_pointer",
+      "classification": "control_policy",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.commonConfigEnabled",
+      "sourceFormat": "json_pointer",
+      "classification": "legacy_ui",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "retire"
+    },
+    {
+      "locator": "provider.meta.custom_endpoints.*",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "observation",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "retire"
+    },
+    {
+      "locator": "provider.meta.endpointAutoSelect",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "observation",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "retire"
+    },
+    {
+      "locator": "provider.meta.claudeDesktopMode",
+      "sourceFormat": "json_pointer",
+      "classification": "non_target",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "retire"
+    },
+    {
+      "locator": "provider.meta.claudeDesktopModelRoutes.*",
+      "sourceFormat": "json_pointer",
+      "classification": "non_target",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "retire"
+    },
+    {
+      "locator": "provider.meta.usage_script",
+      "sourceFormat": "json_pointer",
+      "classification": "non_target",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "retire"
+    },
+    {
+      "locator": "provider.meta.isPartner",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "display",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.partnerPromotionKey",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "display",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.extra.sortIndex",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation_order",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "order_by_app",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-3",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.extra.websiteUrl",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "display",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.extra.notes",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "display",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.extra.icon",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "display",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.extra.iconColor",
+      "sourceFormat": "json_pointer",
+      "classification": "presentation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "display",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.extra.*",
+      "sourceFormat": "json_pointer",
+      "classification": "unknown_flatten",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "legacy_compat",
+      "migration": "block_s2_until_classified",
+      "retirePhase": "phase-10",
+      "disposition": "blocker"
+    },
+    {
+      "locator": "provider.meta.extra.*",
+      "sourceFormat": "json_pointer",
+      "classification": "unknown_flatten",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "legacy_compat",
+      "migration": "block_s2_until_classified",
+      "retirePhase": "phase-10",
+      "disposition": "blocker"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model",
+      "sourceFormat": "toml_typed_key",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model_provider",
+      "sourceFormat": "toml_typed_key",
+      "classification": "legacy_identity",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "profile_registry",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model_reasoning_effort",
+      "sourceFormat": "toml_typed_key",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:disable_response_storage",
+      "sourceFormat": "toml_typed_key",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model_providers.<id>.name",
+      "sourceFormat": "toml_typed_key",
+      "classification": "presentation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "display",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model_providers.<id>.base_url",
+      "sourceFormat": "toml_typed_key",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model_providers.<id>.wire_api",
+      "sourceFormat": "toml_typed_key",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model_providers.<id>.requires_openai_auth",
+      "sourceFormat": "toml_typed_key",
+      "classification": "credential_locator",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model_providers.<id>.env_key",
+      "sourceFormat": "toml_typed_key",
+      "classification": "credential_locator",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model_providers.<id>.http_headers.<name>",
+      "sourceFormat": "toml_typed_key",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.settingsConfig.config#toml:model_providers.<id>.query_params.<name>",
+      "sourceFormat": "toml_typed_key",
+      "classification": "credential",
+      "secret": true,
+      "reader": [
+        "src/domain/providers/model.rs::extract_codex_toml_base_url",
+        "src/domain/providers/model_routing.rs::extract_codex_toml_model",
+        "src/proxy/mod.rs::codex_provider_api_key",
+        "src/proxy/adapters.rs::codex_config_base_url"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "credentials",
+      "migration": "parse_with_smol_toml_then_extract_typed_key",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    }
+  ],
+  "dynamicPolicies": [
+    {
+      "locator": "provider.settingsConfig.env.*",
+      "keyPolicy": "known keys are enumerated above; unknown keys are not silently migrated",
+      "valuePolicy": "string only; unknown key names matching key|token|secret|password are secret",
+      "unknownDisposition": "block_s2_until_classified"
+    },
+    {
+      "locator": "provider.settingsConfig.modelCatalog.*",
+      "keyPolicy": "model id string",
+      "valuePolicy": "bounded model observation object",
+      "unknownDisposition": "preserve_as_observation_not_runtime"
+    },
+    {
+      "locator": "provider.meta.custom_endpoints.*",
+      "keyPolicy": "legacy endpoint name",
+      "valuePolicy": "legacy observation only",
+      "unknownDisposition": "retire_after_typed_endpoint_policy"
+    },
+    {
+      "locator": "provider.extra.* / provider.meta.extra.*",
+      "keyPolicy": "flattened unknown key",
+      "valuePolicy": "read-only legacy payload; may contain runtime or secret material",
+      "unknownDisposition": "block_s2_and_adoption"
+    }
+  ]
+}

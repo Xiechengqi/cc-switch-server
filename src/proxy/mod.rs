@@ -3,7 +3,6 @@
 pub mod adapters;
 mod cache_injector;
 pub(crate) mod claude_oauth;
-pub(crate) mod codex_identity;
 mod codex_instructions;
 pub(crate) mod codex_models;
 mod copilot_model_map;
@@ -13,6 +12,7 @@ mod deepseek;
 mod forwarder;
 mod grok;
 pub(crate) mod kiro;
+pub(crate) mod provider_ops;
 mod request_governance;
 mod responses_wire;
 mod router;
@@ -306,6 +306,7 @@ mod tests {
                         source: Some("managed_account".to_string()),
                         auth_provider: Some("codex_oauth".to_string()),
                         account_id: Some("a1".to_string()),
+                        auth_identity_generation: None,
                     }),
                     ..Default::default()
                 }),
@@ -313,6 +314,7 @@ mod tests {
             },
             provider_type: ProviderType::CodexOAuth,
             provider_type_id: "codex_oauth".to_string(),
+            resource: Default::default(),
         };
         let mut accounts = AccountStore::default();
         accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
@@ -379,6 +381,7 @@ mod tests {
             provider,
             provider_type: ProviderType::Claude,
             provider_type_id: "claude".to_string(),
+            resource: Default::default(),
         };
         let adapter = adapters::adapter_for(AppKind::Claude, ProviderType::Claude);
         let request = adapter

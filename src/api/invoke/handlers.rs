@@ -9,105 +9,37 @@ use crate::domain::sharing::router_contract::{
 };
 use crate::domain::usage::store::UsageLog;
 
-pub(in crate::api) fn web_provider_health_json(
+pub(in crate::api) async fn web_provider_health_json(
+    state: &ServerState,
     app: AppKind,
     provider_id: &str,
-    breaker: Option<&crate::domain::failover::ProviderBreaker>,
-) -> Value {
-    let breaker = breaker
+) -> Result<Value, ApiError> {
+    let provider = state
+        .providers
+        .read()
+        .await
+        .providers
+        .iter()
+        .find(|provider| provider.app == app && provider.provider.id == provider_id)
         .cloned()
-        .unwrap_or_else(|| crate::domain::failover::ProviderBreaker::new(app, provider_id));
-    let is_healthy = breaker.state == crate::domain::failover::BreakerState::Closed;
-    json!({
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let usage = state.usage.read().await;
+    let health = crate::domain::health::provider_health(&provider, &usage);
+    let last_request_at = health.last_request_at_ms.map(|value| value.to_string());
+    let last_was_success = health
+        .last_status_code
+        .is_some_and(|status| (200..400).contains(&status));
+    Ok(json!({
         "provider_id": provider_id,
         "app_type": app.as_str(),
-        "is_healthy": is_healthy,
-        "consecutive_failures": breaker.consecutive_failures,
-        "last_success_at": breaker.last_success_at_ms.map(|value| value.to_string()),
-        "last_failure_at": breaker.last_failure_at_ms.map(|value| value.to_string()),
-        "last_error": breaker.last_error,
-        "updated_at": breaker.last_success_at_ms
-            .or(breaker.last_failure_at_ms)
-            .map(|value| value.to_string())
+        "is_healthy": health.healthy,
+        "consecutive_failures": if health.healthy { 0 } else { health.failures },
+        "last_success_at": last_was_success.then(|| last_request_at.clone()).flatten(),
+        "last_failure_at": (!last_was_success).then(|| last_request_at.clone()).flatten(),
+        "last_error": health.reason,
+        "updated_at": last_request_at
             .unwrap_or_else(|| "0".to_string()),
-    })
-}
-
-pub(in crate::api) fn web_circuit_breaker_stats_json(
-    breaker: Option<&crate::domain::failover::ProviderBreaker>,
-) -> Value {
-    let Some(breaker) = breaker else {
-        return json!({
-            "state": "closed",
-            "consecutiveFailures": 0,
-            "consecutiveSuccesses": 0,
-            "totalRequests": 0,
-            "failedRequests": 0,
-        });
-    };
-    let state = match breaker.state {
-        crate::domain::failover::BreakerState::Closed => "closed",
-        crate::domain::failover::BreakerState::Open => "open",
-        crate::domain::failover::BreakerState::HalfOpen => "half_open",
-    };
-    json!({
-        "state": state,
-        "consecutiveFailures": breaker.consecutive_failures,
-        "consecutiveSuccesses": 0,
-        "totalRequests": breaker.consecutive_failures,
-        "failedRequests": breaker.consecutive_failures,
-    })
-}
-
-pub(in crate::api) async fn web_update_proxy_config_for_app(
-    state: &ServerState,
-    args: &Value,
-) -> Result<Value, ApiError> {
-    let config: Value = web_arg_value(args, "config")?;
-    let app = config
-        .get("appType")
-        .or_else(|| config.get("app_type"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::bad_request("config.appType is required"))?;
-    let app = parse_app_kind(app)?;
-    state
-        .mutate_ui_settings_immediate(|store| {
-            let mut proxy_app_configs = store
-                .value
-                .get("proxyAppConfigs")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            if let Some(map) = proxy_app_configs.as_object_mut() {
-                map.insert(app.as_str().to_string(), config.clone());
-            }
-            store.apply_patch(json!({ "proxyAppConfigs": proxy_app_configs }));
-        })
-        .await
-        .map_err(ApiError::internal)?;
-
-    let failure_threshold = config
-        .get("circuitFailureThreshold")
-        .and_then(Value::as_u64)
-        .map(|value| value as u32);
-    let timeout_seconds = config.get("circuitTimeoutSeconds").and_then(Value::as_u64);
-    let auto_enabled = config.get("autoFailoverEnabled").and_then(Value::as_bool);
-    let providers = state.providers.read().await.clone();
-    state
-        .mutate_failover_immediate(|failover| {
-            failover.update_app_config(
-                app,
-                UpdateFailoverAppInput {
-                    enabled: auto_enabled,
-                    failure_threshold,
-                    open_duration_ms: timeout_seconds.map(|seconds| (seconds * 1000) as u128),
-                    ..Default::default()
-                },
-                &providers,
-            );
-        })
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(json!(true))
+    }))
 }
 
 pub(in crate::api) async fn web_resolve_stored_provider(
@@ -116,7 +48,7 @@ pub(in crate::api) async fn web_resolve_stored_provider(
 ) -> Result<StoredProvider, ApiError> {
     let app = web_arg_app_type(args)?;
     let provider_id = web_arg_string_any(args, &["providerId", "provider_id"])?;
-    resolve_provider_by_id(state, &provider_id, Some(app)).await
+    resolve_provider_by_key(state, app, &provider_id).await
 }
 
 pub(in crate::api) async fn web_stream_check_config(
@@ -136,12 +68,6 @@ pub(in crate::api) async fn web_proxy_target_provider_ids(
     let ui_settings = state.ui_settings.read().await.for_frontend();
     if let Some(current) = current_provider::read_current_provider_id(&ui_settings, app) {
         ids.insert(current);
-    }
-    let failover = state.failover.read().await;
-    if let Some(config) = failover.apps.get(&app) {
-        for provider_id in &config.provider_queue {
-            ids.insert(provider_id.clone());
-        }
     }
     ids
 }
@@ -170,6 +96,7 @@ pub(in crate::api) fn map_provider_test_to_stream_check_result(
     StreamCheckResult {
         status,
         success,
+        provider_revision: Some(response.provider_revision),
         message: if success {
             "Check succeeded".to_string()
         } else {
@@ -882,6 +809,12 @@ pub(in crate::api) async fn web_save_provider_share(
 ) -> Result<Share, ApiError> {
     let value = web_payload(args, &["params", "input"]);
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
+    let expected_config_revision = web_optional_i64(
+        value,
+        &["expectedConfigRevision", "expected_config_revision"],
+    )
+    .and_then(|revision| u64::try_from(revision).ok())
+    .ok_or_else(|| ApiError::bad_request("expectedConfigRevision is required"))?;
     let subdomain = web_arg_string_any(value, &["subdomain"])?;
     let description = web_optional_string_any(value, &["description"]);
     let for_sale = web_arg_string_any(value, &["forSale", "for_sale"])?;
@@ -908,6 +841,12 @@ pub(in crate::api) async fn web_save_provider_share(
         .get(&share_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("share not found"))?;
+    if current.config_revision != expected_config_revision {
+        return Err(ApiError::conflict(format!(
+            "Share changed since this editor was opened (expected revision {}, current revision {})",
+            expected_config_revision, current.config_revision
+        )));
+    }
     let subdomain_changed = current.tunnel_subdomain.as_deref() != Some(subdomain.as_str());
     let was_running = current.enabled && current.status == "active";
 
@@ -1384,22 +1323,6 @@ pub(in crate::api) fn web_client_tunnel_input(
     })
 }
 
-pub(in crate::api) fn web_upstream_proxy_input(
-    args: &Value,
-) -> Result<UpdateUpstreamProxyInput, ApiError> {
-    let value = web_payload(args, &["config", "input", "params"]);
-    if let Ok(input) = serde_json::from_value::<UpdateUpstreamProxyInput>(value.clone()) {
-        return Ok(input);
-    }
-    Ok(UpdateUpstreamProxyInput {
-        url: web_optional_string_any(value, &["url", "proxyUrl", "proxy_url"]),
-        clear: web_optional_bool(value, &["clear"]).or_else(|| {
-            web_optional_bool(value, &["enabled", "proxyEnabled"]).map(|enabled| !enabled)
-        }),
-        follow_system_proxy: web_optional_bool(value, &["followSystemProxy"]),
-    })
-}
-
 pub(in crate::api) fn web_arg_share_id(args: &Value) -> Result<String, ApiError> {
     let value = web_payload(args, &["params", "input"]);
     web_arg_string_any(value, &["shareId", "share_id", "id"])
@@ -1472,6 +1395,11 @@ pub(in crate::api) fn web_runtime_auth_required_payload(
         "status": "auth-required",
         "permissions": ["login"],
         "apps": ["claude", "codex", "gemini"],
+        "providerContract": {
+            "version": web_runtime::PROVIDER_CONTRACT_VERSION,
+            "minSupported": web_runtime::PROVIDER_CONTRACT_MIN_SUPPORTED,
+            "maxSupported": web_runtime::PROVIDER_CONTRACT_MAX_SUPPORTED
+        },
         "auth": {
             "authenticated": false,
             "setupRequired": false,
@@ -1492,15 +1420,6 @@ pub(in crate::api) fn web_runtime_auth_required_payload(
 
 pub(in crate::api) fn web_runtime_auth_methods(config: &ServerConfig) -> Vec<&'static str> {
     crate::domain::web_auth::auth_methods(config).methods
-}
-
-pub(in crate::api) fn web_global_proxy_config_json(state: &ServerState) -> Value {
-    json!({
-        "proxyEnabled": true,
-        "listenAddress": state.bind_addr.ip().to_string(),
-        "listenPort": state.bind_addr.port(),
-        "enableLogging": true,
-    })
 }
 
 pub(in crate::api) async fn web_proxy_takeover_status_json(state: &ServerState) -> Value {
@@ -1580,188 +1499,8 @@ pub(in crate::api) async fn web_proxy_status_json(state: &ServerState) -> Value 
         "current_provider_id": active_targets.first().and_then(|target| target.get("provider_id")).cloned().unwrap_or(Value::Null),
         "last_request_at": Value::Null,
         "last_error": Value::Null,
-        "failover_count": 0,
         "active_targets": active_targets,
     })
-}
-
-pub(in crate::api) async fn web_upstream_proxy_status_json(state: &ServerState) -> Value {
-    let config = state.config.read().await;
-    let url = config.upstream_proxy.url.clone();
-    let enabled = url.as_ref().is_some_and(|value| !value.trim().is_empty());
-    json!({
-        "enabled": enabled,
-        "proxyUrl": url,
-    })
-}
-
-pub(in crate::api) async fn web_test_proxy_url(url: &str) -> Value {
-    if url.trim().is_empty() {
-        return json!({
-            "success": false,
-            "latencyMs": 0,
-            "error": "Proxy URL is empty",
-        });
-    }
-
-    let start = Instant::now();
-    let proxy = match reqwest::Proxy::all(url) {
-        Ok(proxy) => proxy,
-        Err(error) => {
-            return json!({
-                "success": false,
-                "latencyMs": 0,
-                "error": format!("Invalid proxy URL: {error}"),
-            });
-        }
-    };
-
-    let client = match reqwest::Client::builder()
-        .proxy(proxy)
-        .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            return json!({
-                "success": false,
-                "latencyMs": 0,
-                "error": format!("Failed to build client: {error}"),
-            });
-        }
-    };
-
-    let test_urls = [
-        "https://httpbin.org/get",
-        "https://www.google.com",
-        "https://api.anthropic.com",
-    ];
-    let mut last_error = None;
-    for test_url in test_urls {
-        match client.head(test_url).send().await {
-            Ok(_) => {
-                return json!({
-                    "success": true,
-                    "latencyMs": start.elapsed().as_millis() as u64,
-                    "error": Value::Null,
-                });
-            }
-            Err(error) => last_error = Some(error.to_string()),
-        }
-    }
-
-    json!({
-        "success": false,
-        "latencyMs": start.elapsed().as_millis() as u64,
-        "error": last_error.unwrap_or_else(|| "All test targets failed".to_string()),
-    })
-}
-
-pub(in crate::api) async fn web_scan_local_proxies() -> Vec<Value> {
-    const PROXY_PORTS: &[(u16, &str, bool)] = &[
-        (7890, "http", true),
-        (7891, "socks5", false),
-        (1080, "socks5", false),
-        (8080, "http", false),
-        (8888, "http", false),
-        (3128, "http", false),
-        (10808, "socks5", false),
-        (10809, "http", false),
-    ];
-
-    tokio::task::spawn_blocking(move || {
-        let mut found = Vec::new();
-        for &(port, primary_type, is_mixed) in PROXY_PORTS {
-            let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-            if TcpStream::connect_timeout(&addr.into(), Duration::from_millis(100)).is_ok() {
-                found.push(json!({
-                    "url": format!("{primary_type}://127.0.0.1:{port}"),
-                    "proxyType": primary_type,
-                    "port": port,
-                }));
-                if is_mixed {
-                    let alt_type = if primary_type == "http" {
-                        "socks5"
-                    } else {
-                        "http"
-                    };
-                    found.push(json!({
-                        "url": format!("{alt_type}://127.0.0.1:{port}"),
-                        "proxyType": alt_type,
-                        "port": port,
-                    }));
-                }
-            }
-        }
-        found
-    })
-    .await
-    .unwrap_or_default()
-}
-
-pub(in crate::api) async fn web_app_proxy_config_json(state: &ServerState, app: AppKind) -> Value {
-    let failover = state.failover.read().await;
-    let auto_failover_enabled = failover
-        .apps
-        .get(&app)
-        .map(|config| config.enabled)
-        .unwrap_or(false);
-    let app_config = state
-        .ui_settings
-        .read()
-        .await
-        .value
-        .get("proxyAppConfigs")
-        .and_then(|configs| configs.get(app.as_str()))
-        .cloned();
-    if let Some(config) = app_config {
-        return config;
-    }
-    let failure_threshold = failover
-        .apps
-        .get(&app)
-        .map(|config| config.failure_threshold)
-        .unwrap_or(4);
-    let timeout_seconds = failover
-        .apps
-        .get(&app)
-        .map(|config| (config.open_duration_ms / 1000).max(1))
-        .unwrap_or(60);
-    json!({
-        "appType": app.as_str(),
-        "enabled": true,
-        "autoFailoverEnabled": auto_failover_enabled,
-        "maxRetries": 3,
-        "streamingFirstByteTimeout": 60,
-        "streamingIdleTimeout": 120,
-        "nonStreamingTimeout": 600,
-        "circuitFailureThreshold": failure_threshold,
-        "circuitSuccessThreshold": 2,
-        "circuitTimeoutSeconds": timeout_seconds,
-        "circuitErrorRateThreshold": 0.6,
-        "circuitMinRequests": 10,
-    })
-}
-
-pub(in crate::api) async fn web_available_providers_for_failover(
-    state: &ServerState,
-    app: AppKind,
-) -> Vec<Provider> {
-    let failover = state.failover.read().await;
-    let providers = state.providers.read().await;
-    let queue_ids = failover
-        .apps
-        .get(&app)
-        .map(|config| config.provider_queue.as_slice())
-        .unwrap_or(&[]);
-    providers
-        .providers
-        .iter()
-        .filter(|stored| stored.app == app)
-        .filter(|stored| !queue_ids.iter().any(|id| id == &stored.provider.id))
-        .map(|stored| stored.provider.clone())
-        .collect()
 }
 
 pub(in crate::api) fn web_optional_string_any(args: &Value, keys: &[&str]) -> Option<String> {
@@ -2035,25 +1774,6 @@ pub(in crate::api) fn web_parse_auth_provider_type(value: &str) -> Result<Provid
 pub(in crate::api) fn web_parse_provider_type(value: &str) -> Result<ProviderType, ApiError> {
     serde_json::from_value(Value::String(value.trim().to_string()))
         .map_err(|_| ApiError::bad_request(format!("invalid providerType: {value}")))
-}
-
-pub(in crate::api) fn provider_extra_string(provider: &Provider, key: &str) -> Option<String> {
-    provider
-        .extra
-        .get(key)
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-}
-
-pub(in crate::api) fn provider_record_for_app(
-    providers: &[StoredProvider],
-    app: AppKind,
-) -> BTreeMap<String, Provider> {
-    providers
-        .iter()
-        .filter(|provider| provider.app == app)
-        .map(|provider| (provider.provider.id.clone(), provider.provider.clone()))
-        .collect()
 }
 
 pub(in crate::api) fn managed_auth_provider_label(provider_type: ProviderType) -> &'static str {

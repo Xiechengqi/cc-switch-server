@@ -79,7 +79,7 @@ async fn fetch_http(url: &str) -> Result<EncodedImage, ProxyError> {
     let mut current_url = reqwest::Url::parse(url)
         .map_err(|error| invalid_image(format!("image URL invalid: {error}")))?;
 
-    let client = reqwest::Client::builder()
+    let client = crate::infra::http::direct_client_builder()
         .timeout(FETCH_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()

@@ -111,10 +111,20 @@ pub(crate) fn router_web_role(headers: &HeaderMap) -> String {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct WebAdminPrincipal {
     user_email: String,
     role: String,
+}
+
+impl WebAdminPrincipal {
+    pub(crate) fn user_email(&self) -> &str {
+        &self.user_email
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn role(&self) -> &str {
+        &self.role
+    }
 }
 
 pub(crate) async fn require_event_session(

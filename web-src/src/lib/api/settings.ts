@@ -7,13 +7,6 @@ import type {
 } from "@/types";
 import type { AppId } from "./types";
 
-export interface ConfigTransferResult {
-  success: boolean;
-  message: string;
-  filePath?: string;
-  backupId?: string;
-}
-
 export interface WebDavTestResult {
   success: boolean;
   message?: string;
@@ -153,22 +146,6 @@ export const settingsApi = {
 
   async clearClaudeOnboardingSkip(): Promise<boolean> {
     return await invokeCommand("clear_claude_onboarding_skip");
-  },
-
-  async saveFileDialog(defaultName: string): Promise<string | null> {
-    return await invokeCommand("save_file_dialog", { defaultName });
-  },
-
-  async openFileDialog(): Promise<string | null> {
-    return await invokeCommand("open_file_dialog");
-  },
-
-  async exportConfigToFile(filePath: string): Promise<ConfigTransferResult> {
-    return await invokeCommand("export_config_to_file", { filePath });
-  },
-
-  async importConfigFromFile(filePath: string): Promise<ConfigTransferResult> {
-    return await invokeCommand("import_config_from_file", { filePath });
   },
 
   // ─── WebDAV sync ──────────────────────────────────────────

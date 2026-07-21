@@ -185,6 +185,8 @@ pub struct AuthBinding {
     pub auth_provider: Option<String>,
     #[serde(default)]
     pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_identity_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

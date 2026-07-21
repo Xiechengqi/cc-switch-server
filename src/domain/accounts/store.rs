@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
@@ -22,9 +21,7 @@ use crate::domain::accounts::subscription_expiry::{
 use crate::domain::providers::model::ProviderType;
 
 const ACCOUNTS_FILE_NAME: &str = "accounts.json";
-const ACCOUNTS_KEY_FILE_NAME: &str = "accounts.key";
 const ENCRYPTED_PREFIX: &str = "ccenc:v1:";
-const ACCOUNTS_KEY_ENV: &str = "CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY";
 const SECRET_FIELDS: &[&str] = &[
     "accessToken",
     "refreshToken",
@@ -46,6 +43,10 @@ pub struct AccountStore {
 pub struct Account {
     pub id: String,
     pub provider_type: ProviderType,
+    #[serde(default = "initial_auth_identity_generation")]
+    pub auth_identity_generation: u64,
+    #[serde(default)]
+    pub token_refresh_generation: u64,
     #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]
@@ -293,6 +294,8 @@ impl AccountStore {
         let mut account = Account {
             id: input.id.unwrap_or_else(generate_account_id),
             provider_type: input.provider_type,
+            auth_identity_generation: initial_auth_identity_generation(),
+            token_refresh_generation: 0,
             email: input.email,
             access_token: input.access_token,
             refresh_token: input.refresh_token,
@@ -320,6 +323,7 @@ impl AccountStore {
         };
 
         if let Some(existing) = self.accounts.iter_mut().find(|item| item.id == account.id) {
+            let previous = existing.clone();
             use crate::domain::accounts::subscription_expiry::{
                 subscription_expiry_capability, supports_manual_expiry,
             };
@@ -341,8 +345,10 @@ impl AccountStore {
                     preserve_codex_profile_selection(existing.profile.as_ref(), profile);
                 }
             }
+            advance_account_generations(&previous, &mut account);
             *existing = account.clone();
         } else {
+            initialize_account_generations(&mut account);
             self.accounts.push(account.clone());
         }
 
@@ -416,7 +422,10 @@ impl AccountStore {
         account_id: Option<&str>,
     ) -> Option<&Account> {
         if let Some(account_id) = account_id {
-            return self.accounts.iter().find(|item| item.id == account_id);
+            return self
+                .accounts
+                .iter()
+                .find(|item| item.id == account_id && item.provider_type == provider_type);
         }
 
         self.accounts
@@ -454,6 +463,7 @@ impl AccountStore {
                 account.id == account_id && account.provider_type == ProviderType::CodexOAuth
             })
             .ok_or_else(|| "codex account not found".to_string())?;
+        let previous = account.clone();
         let workspace_id = workspace_id.trim();
         let options = codex_workspace_options(account);
         let selected = options
@@ -505,6 +515,7 @@ impl AccountStore {
                 }
             }
         }
+        advance_account_generations(&previous, account);
         Ok(account.clone())
     }
 
@@ -519,6 +530,7 @@ impl AccountStore {
             .accounts
             .iter_mut()
             .find(|item| item.id == account_id)?;
+        let previous = account.clone();
         if account
             .expires_at
             .is_some_and(|expires_at| expires_at <= now_ms)
@@ -535,6 +547,7 @@ impl AccountStore {
                 .to_string(),
             );
         }
+        advance_account_generations(&previous, account);
         Some(account.clone())
     }
 
@@ -547,6 +560,7 @@ impl AccountStore {
             .accounts
             .iter_mut()
             .find(|item| item.id == account_id)?;
+        let previous = account.clone();
         if let Some(value) = update.email {
             account.email = Some(value);
         }
@@ -599,6 +613,7 @@ impl AccountStore {
             account.rate_limited_until = Some(value);
         }
         account.last_refresh_error = update.last_refresh_error;
+        advance_account_generations(&previous, account);
         Some(account.clone())
     }
 
@@ -725,6 +740,225 @@ impl AccountStore {
             }
         }
         Some(account.clone())
+    }
+}
+
+const fn initial_auth_identity_generation() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccountAuthIdentitySnapshot {
+    provider_type: ProviderType,
+    email: Option<String>,
+    auth_shape: u8,
+    scopes: Vec<String>,
+    principal_markers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccountTokenSnapshot {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    token_type: Option<String>,
+    api_key: Option<String>,
+    extra_headers: BTreeMap<String, String>,
+    expires_at: Option<i64>,
+    nested_secret_fingerprint: Option<[u8; 32]>,
+}
+
+impl AccountTokenSnapshot {
+    fn has_material(&self) -> bool {
+        self.access_token.is_some()
+            || self.refresh_token.is_some()
+            || self.id_token.is_some()
+            || self.api_key.is_some()
+            || !self.extra_headers.is_empty()
+            || self.nested_secret_fingerprint.is_some()
+    }
+}
+
+fn initialize_account_generations(account: &mut Account) {
+    account.auth_identity_generation = initial_auth_identity_generation();
+    account.token_refresh_generation = u64::from(account_token_snapshot(account).has_material());
+}
+
+fn advance_account_generations(previous: &Account, current: &mut Account) {
+    let previous_identity = account_auth_identity_snapshot(previous);
+    let current_identity = account_auth_identity_snapshot(current);
+    let previous_token = account_token_snapshot(previous);
+    let current_token = account_token_snapshot(current);
+
+    current.auth_identity_generation = previous.auth_identity_generation.max(1);
+    current.token_refresh_generation = previous.token_refresh_generation;
+    if previous_identity != current_identity {
+        current.auth_identity_generation = current.auth_identity_generation.saturating_add(1);
+    }
+    if previous_token != current_token {
+        current.token_refresh_generation = current.token_refresh_generation.saturating_add(1);
+    }
+}
+
+fn account_auth_identity_snapshot(account: &Account) -> AccountAuthIdentitySnapshot {
+    let mut scopes = account
+        .scopes
+        .iter()
+        .map(|scope| scope.trim())
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+
+    let mut principal_markers = BTreeMap::new();
+    collect_principal_markers("profile", account.profile.as_ref(), &mut principal_markers);
+    collect_principal_markers("raw", account.raw.as_ref(), &mut principal_markers);
+    if account.provider_type == ProviderType::CodexOAuth {
+        if let Some(workspace_id) = effective_codex_workspace_id(account) {
+            principal_markers.insert("codexWorkspaceId".to_string(), workspace_id);
+        }
+    }
+
+    let has_oauth = [
+        &account.access_token,
+        &account.refresh_token,
+        &account.id_token,
+    ]
+    .into_iter()
+    .any(|value| normalized_secret(value.as_deref()).is_some());
+    let has_api_key = normalized_secret(account.api_key.as_deref()).is_some();
+    let has_header_auth = account
+        .extra_headers
+        .values()
+        .any(|value| !value.trim().is_empty());
+    let auth_shape =
+        u8::from(has_oauth) | (u8::from(has_api_key) << 1) | (u8::from(has_header_auth) << 2);
+
+    AccountAuthIdentitySnapshot {
+        provider_type: account.provider_type,
+        email: account
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase),
+        auth_shape,
+        scopes,
+        principal_markers,
+    }
+}
+
+fn collect_principal_markers(
+    source: &str,
+    value: Option<&Value>,
+    markers: &mut BTreeMap<String, String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    for pointer in [
+        "/sub",
+        "/userId",
+        "/user_id",
+        "/accountId",
+        "/account_id",
+        "/organizationId",
+        "/organization_id",
+        "/profileArn",
+        "/login",
+        "/username",
+    ] {
+        let Some(marker) = value.pointer(pointer).and_then(identity_marker_value) else {
+            continue;
+        };
+        markers.insert(format!("{source}{pointer}"), marker);
+    }
+}
+
+fn identity_marker_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().to_string()).filter(|value| !value.is_empty()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn account_token_snapshot(account: &Account) -> AccountTokenSnapshot {
+    AccountTokenSnapshot {
+        access_token: normalized_secret(account.access_token.as_deref()),
+        refresh_token: normalized_secret(account.refresh_token.as_deref()),
+        id_token: normalized_secret(account.id_token.as_deref()),
+        token_type: account
+            .token_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase),
+        api_key: normalized_secret(account.api_key.as_deref()),
+        extra_headers: account
+            .extra_headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let value = value.trim();
+                (!value.is_empty()).then(|| (name.trim().to_ascii_lowercase(), value.to_string()))
+            })
+            .collect(),
+        expires_at: account.expires_at,
+        nested_secret_fingerprint: account.raw.as_ref().and_then(nested_secret_fingerprint),
+    }
+}
+
+fn normalized_secret(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn nested_secret_fingerprint(value: &Value) -> Option<[u8; 32]> {
+    let mut secrets = Vec::new();
+    collect_nested_secrets(value, "", &mut secrets);
+    if secrets.is_empty() {
+        return None;
+    }
+    secrets.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-account-nested-secret-v1\0");
+    for (path, secret) in secrets {
+        digest.update(path.as_bytes());
+        digest.update([0]);
+        digest.update(secret.as_bytes());
+        digest.update([0]);
+    }
+    Some(digest.finalize().into())
+}
+
+fn collect_nested_secrets(value: &Value, path: &str, secrets: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(object) => {
+            let mut fields = object.iter().collect::<Vec<_>>();
+            fields.sort_by(|left, right| left.0.cmp(right.0));
+            for (field, value) in fields {
+                let next_path = format!("{path}/{field}");
+                if SECRET_FIELDS.contains(&field.as_str()) {
+                    if let Some(secret) = value.as_str().and_then(|value| {
+                        let value = value.trim();
+                        (!value.is_empty()).then_some(value)
+                    }) {
+                        secrets.push((next_path, secret.to_string()));
+                    }
+                } else {
+                    collect_nested_secrets(value, &next_path, secrets);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                collect_nested_secrets(value, &format!("{path}/{index}"), secrets);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -975,74 +1209,22 @@ pub fn accounts_path(config_dir: &Path) -> std::path::PathBuf {
 }
 
 pub fn accounts_key_path(config_dir: &Path) -> std::path::PathBuf {
-    config_dir.join(ACCOUNTS_KEY_FILE_NAME)
+    crate::infra::credentials::root_key_path(config_dir)
 }
 
 fn load_or_create_accounts_key(config_dir: &Path) -> anyhow::Result<[u8; 32]> {
-    if let Some(key) = load_accounts_key_if_present(config_dir)? {
-        return Ok(key);
-    }
-    let path = accounts_key_path(config_dir);
-    fs::create_dir_all(config_dir)
-        .with_context(|| format!("create config dir {}", config_dir.display()))?;
-    let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
-    let encoded = URL_SAFE_NO_PAD.encode(key);
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("create {}", path.display()))?;
-    file.write_all(encoded.as_bytes())
-        .with_context(|| format!("write {}", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("write {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("sync {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 {}", path.display()))?;
-    }
-    Ok(key)
+    Ok(crate::infra::credentials::load_or_create_root_key(config_dir)?.key)
 }
 
 fn load_accounts_key(config_dir: &Path) -> anyhow::Result<[u8; 32]> {
-    load_accounts_key_if_present(config_dir)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "accounts encryption key is required to read encrypted accounts: {}",
-            accounts_key_path(config_dir).display()
-        )
-    })
-}
-
-fn load_accounts_key_if_present(config_dir: &Path) -> anyhow::Result<Option<[u8; 32]>> {
-    if let Ok(value) = std::env::var(ACCOUNTS_KEY_ENV) {
-        return decode_accounts_key(value.trim())
-            .context("decode accounts encryption env key")
-            .map(Some);
-    }
-    let path = accounts_key_path(config_dir);
-    if path.exists() {
-        let content =
-            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        return decode_accounts_key(content.trim())
-            .with_context(|| format!("decode {}", path.display()))
-            .map(Some);
-    }
-    Ok(None)
-}
-
-fn decode_accounts_key(value: &str) -> anyhow::Result<[u8; 32]> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(value)
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(value))
-        .context("base64 decode key")?;
-    let key: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("accounts encryption key must be 32 bytes"))?;
-    Ok(key)
+    crate::infra::credentials::load_root_key(config_dir)
+        .map(|resolved| resolved.key)
+        .with_context(|| {
+            format!(
+                "accounts encryption key is required to read encrypted accounts: {}",
+                accounts_key_path(config_dir).display()
+            )
+        })
 }
 
 fn account_store_has_encrypted_fields(value: &Value) -> bool {
@@ -1257,6 +1439,9 @@ mod tests {
         );
         assert_eq!(account.refresh_token.as_deref(), Some("refresh"));
         assert_eq!(account.scopes, vec!["openid"]);
+        assert!(store
+            .find_for_provider(ProviderType::CodexOAuth, Some("a1"))
+            .is_none());
     }
 
     #[test]
@@ -1348,6 +1533,65 @@ mod tests {
             None
         );
         assert_eq!(store.accounts[0].manual_subscription_expiry_rule, None);
+        assert_eq!(store.accounts[0].auth_identity_generation, 1);
+        assert_eq!(store.accounts[0].token_refresh_generation, 0);
+    }
+
+    #[test]
+    fn account_generations_separate_identity_from_token_and_observation_updates() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::CodexOAuth);
+        input.id = Some("generation-account".to_string());
+        input.email = Some("owner@example.com".to_string());
+        input.access_token = Some("access-1".to_string());
+        input.refresh_token = Some("refresh-1".to_string());
+        input.scopes = vec!["openid".to_string(), "profile".to_string()];
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+        assert_eq!(created.token_refresh_generation, 1);
+
+        let refreshed = store
+            .mark_refresh_success(
+                "generation-account",
+                AccountRefreshUpdate {
+                    access_token: Some("access-2".to_string()),
+                    refresh_token: Some("refresh-2".to_string()),
+                    expires_at: Some(2_000),
+                    quota_percent: Some(12.5),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(refreshed.auth_identity_generation, 1);
+        assert_eq!(refreshed.token_refresh_generation, 2);
+
+        let observed = store
+            .update_entitlement_snapshot(
+                "generation-account",
+                Some("plus".to_string()),
+                Some("active".to_string()),
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(observed.auth_identity_generation, 1);
+        assert_eq!(observed.token_refresh_generation, 2);
+
+        let changed_scope = store
+            .mark_refresh_success(
+                "generation-account",
+                AccountRefreshUpdate {
+                    scopes: Some(vec!["openid".to_string(), "email".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed_scope.auth_identity_generation, 2);
+        assert_eq!(changed_scope.token_refresh_generation, 2);
+
+        let persisted = serde_json::to_value(&store).unwrap();
+        let reloaded: AccountStore = serde_json::from_value(persisted).unwrap();
+        assert_eq!(reloaded.accounts[0].auth_identity_generation, 2);
+        assert_eq!(reloaded.accounts[0].token_refresh_generation, 2);
     }
 
     #[test]

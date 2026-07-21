@@ -219,6 +219,22 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
       readNumber(record, "configRevision", "config_revision") ?? 0,
     routerSyncedRevision:
       readNumber(record, "routerSyncedRevision", "router_synced_revision") ?? 0,
+    descriptorGeneration:
+      readNumber(record, "descriptorGeneration", "descriptor_generation") ?? 0,
+    descriptorFingerprint:
+      readString(record, "descriptorFingerprint", "descriptor_fingerprint") ?? null,
+    routerSyncedDescriptorGeneration:
+      readNumber(
+        record,
+        "routerSyncedDescriptorGeneration",
+        "router_synced_descriptor_generation",
+      ) ?? 0,
+    routerSyncedDescriptorFingerprint:
+      readString(
+        record,
+        "routerSyncedDescriptorFingerprint",
+        "router_synced_descriptor_fingerprint",
+      ) ?? null,
     routerLastSyncError:
       readString(record, "routerLastSyncError", "router_last_sync_error") ?? null,
     userGrants:

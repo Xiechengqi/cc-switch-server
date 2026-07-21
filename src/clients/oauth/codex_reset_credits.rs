@@ -117,11 +117,8 @@ pub(crate) fn codex_authenticated_get(
     workspace_id: Option<&str>,
     request_timeout: Duration,
 ) -> reqwest::RequestBuilder {
-    let mut identity_headers = vec![(
-        "user-agent",
-        crate::proxy::codex_identity::default_user_agent(),
-    )];
-    crate::proxy::codex_identity::finalize_headers(&mut identity_headers);
+    let mut identity_headers = vec![("user-agent", crate::codex_identity::default_user_agent())];
+    crate::codex_identity::finalize_headers(&mut identity_headers);
     let mut request = http
         .get(url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
@@ -144,11 +141,8 @@ pub(crate) fn codex_authenticated_post(
     body: Value,
     request_timeout: Duration,
 ) -> reqwest::RequestBuilder {
-    let mut identity_headers = vec![(
-        "user-agent",
-        crate::proxy::codex_identity::default_user_agent(),
-    )];
-    crate::proxy::codex_identity::finalize_headers(&mut identity_headers);
+    let mut identity_headers = vec![("user-agent", crate::codex_identity::default_user_agent())];
+    crate::codex_identity::finalize_headers(&mut identity_headers);
     let mut request = http
         .post(url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))

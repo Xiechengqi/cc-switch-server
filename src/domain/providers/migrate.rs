@@ -3,12 +3,46 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use serde::Serialize;
 
 use crate::domain::providers::model::Provider;
 use crate::domain::providers::store::ProviderStore;
 
 const MIGRATION_MARKER: &str = ".migrated-universal-layer";
 const UNIVERSAL_PROVIDERS_FILE: &str = "universal-providers.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UniversalLayerMigrationPreview {
+    pub already_applied: bool,
+    pub orphaned_providers: usize,
+    pub universal_file_present: bool,
+}
+
+impl UniversalLayerMigrationPreview {
+    pub fn requires_apply(self) -> bool {
+        !self.already_applied && (self.orphaned_providers > 0 || self.universal_file_present)
+    }
+}
+
+pub fn inspect_remove_universal_layer(
+    config_dir: &Path,
+) -> anyhow::Result<UniversalLayerMigrationPreview> {
+    if config_dir.join(MIGRATION_MARKER).exists() {
+        return Ok(UniversalLayerMigrationPreview {
+            already_applied: true,
+            orphaned_providers: 0,
+            universal_file_present: false,
+        });
+    }
+    let mut providers = ProviderStore::load_or_default(config_dir)?;
+    let orphaned_providers = orphan_universal_derivatives(&mut providers);
+    Ok(UniversalLayerMigrationPreview {
+        already_applied: false,
+        orphaned_providers,
+        universal_file_present: config_dir.join(UNIVERSAL_PROVIDERS_FILE).exists(),
+    })
+}
 
 pub fn migrate_remove_universal_layer(config_dir: &Path) -> anyhow::Result<bool> {
     let marker = config_dir.join(MIGRATION_MARKER);
@@ -146,11 +180,41 @@ mod tests {
         )
         .unwrap();
 
+        let preview = inspect_remove_universal_layer(&config_dir).unwrap();
+        assert_eq!(preview.orphaned_providers, 1);
+        assert!(preview.universal_file_present);
+        assert!(preview.requires_apply());
         assert!(migrate_remove_universal_layer(&config_dir).unwrap());
         assert!(!config_dir.join(UNIVERSAL_PROVIDERS_FILE).exists());
         assert!(config_dir.join(MIGRATION_MARKER).exists());
         assert!(!migrate_remove_universal_layer(&config_dir).unwrap());
 
         let _ = fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn inspection_never_modifies_provider_files() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "cc-switch-universal-inspect-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&config_dir).unwrap();
+        let path = providers_path(&config_dir);
+        fs::write(
+            &path,
+            r#"{"providers":[{"app":"claude","provider":{"id":"universal:u1:claude","name":"u","settingsConfig":{},"category":"universal"},"providerType":"claude","providerTypeId":"claude"}]}"#,
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let preview = inspect_remove_universal_layer(&config_dir).unwrap();
+
+        assert!(preview.requires_apply());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!config_dir.join(MIGRATION_MARKER).exists());
+        fs::remove_dir_all(config_dir).unwrap();
     }
 }

@@ -1,11 +1,8 @@
 import { invokeCommand } from "@/lib/runtime";
 import type {
-  ProxyConfig,
   ProxyStatus,
   ProxyServerInfo,
   ProxyTakeoverStatus,
-  GlobalProxyConfig,
-  AppProxyConfig,
 } from "@/types/proxy";
 
 export const proxyApi = {
@@ -57,40 +54,6 @@ export const proxyApi = {
     enabled: boolean,
   ): Promise<void> {
     return invokeCommand("set_proxy_takeover_for_app", { appType, enabled });
-  },
-
-  // ========== Legacy 代理配置 API (兼容) ==========
-
-  // 获取代理配置（旧版 v2 兼容接口）
-  async getProxyConfig(): Promise<ProxyConfig> {
-    return invokeCommand("get_proxy_config");
-  },
-
-  // 更新代理配置（旧版 v2 兼容接口）
-  async updateProxyConfig(config: ProxyConfig): Promise<void> {
-    return invokeCommand("update_proxy_config", { config });
-  },
-
-  // ========== v3+ 全局/应用级配置 API ==========
-
-  // 获取全局代理配置
-  async getGlobalProxyConfig(): Promise<GlobalProxyConfig> {
-    return invokeCommand("get_global_proxy_config");
-  },
-
-  // 更新全局代理配置
-  async updateGlobalProxyConfig(config: GlobalProxyConfig): Promise<void> {
-    return invokeCommand("update_global_proxy_config", { config });
-  },
-
-  // 获取指定应用的代理配置
-  async getProxyConfigForApp(appType: string): Promise<AppProxyConfig> {
-    return invokeCommand("get_proxy_config_for_app", { appType });
-  },
-
-  // 更新指定应用的代理配置
-  async updateProxyConfigForApp(config: AppProxyConfig): Promise<void> {
-    return invokeCommand("update_proxy_config_for_app", { config });
   },
 
   // ========== 计费默认配置 API ==========

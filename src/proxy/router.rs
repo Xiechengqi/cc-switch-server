@@ -1,12 +1,12 @@
 use axum::http::HeaderMap;
-use std::collections::BTreeSet;
 
 use crate::domain::accounts::store::AccountStore;
-use crate::domain::failover::{current_time_ms, FailoverStore};
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
+use crate::infra::time::now_ms;
 use crate::state::AccountInFlightSnapshot;
 
+use super::provider_ops::ProviderExecution;
 use super::ProxyError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,8 +44,7 @@ impl ProxyRoute {
 
 #[derive(Debug)]
 pub(super) struct ProviderRouteSelection {
-    pub provider: StoredProvider,
-    pub failover_state_changed: bool,
+    pub execution: ProviderExecution,
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +60,6 @@ struct ProviderSelectionOptions<'a> {
     provider_type_filter: Option<ProviderType>,
     provider_filter: Option<fn(&StoredProvider) -> bool>,
     account_in_flight: Option<&'a AccountInFlightSnapshot>,
-    excluded_provider_ids: Option<&'a BTreeSet<String>>,
 }
 
 const DEFAULT_CLAUDE_ACCOUNT_MAX_CONCURRENT: u32 = 8;
@@ -69,50 +67,37 @@ const DEFAULT_CLAUDE_ACCOUNT_MAX_CONCURRENT: u32 = 8;
 pub(super) fn select_provider(
     store: &ProviderStore,
     accounts: &AccountStore,
-    failover: &mut FailoverStore,
     app: AppKind,
     headers: &HeaderMap,
+    current_provider_id: Option<&str>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_inner(store, accounts, failover, app, headers, None, None)
+    select_provider_inner(
+        store,
+        accounts,
+        app,
+        headers,
+        current_provider_id,
+        None,
+        None,
+    )
 }
 
 pub(super) fn select_provider_with_account_inflight(
     store: &ProviderStore,
     accounts: &AccountStore,
-    failover: &mut FailoverStore,
     app: AppKind,
     headers: &HeaderMap,
+    current_provider_id: Option<&str>,
     account_in_flight: &AccountInFlightSnapshot,
-) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_inner(
-        store,
-        accounts,
-        failover,
-        app,
-        headers,
-        None,
-        Some(account_in_flight),
-    )
-}
-
-pub(super) fn select_provider_with_account_inflight_excluding(
-    store: &ProviderStore,
-    accounts: &AccountStore,
-    failover: &mut FailoverStore,
-    app: AppKind,
-    headers: &HeaderMap,
-    account_in_flight: &AccountInFlightSnapshot,
-    excluded_provider_ids: &BTreeSet<String>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
     select_provider_with_optional_filter(
         store,
         accounts,
-        failover,
         app,
         headers,
+        current_provider_id,
         ProviderSelectionOptions {
             account_in_flight: Some(account_in_flight),
-            excluded_provider_ids: Some(excluded_provider_ids),
             ..ProviderSelectionOptions::default()
         },
     )
@@ -121,21 +106,19 @@ pub(super) fn select_provider_with_account_inflight_excluding(
 pub(super) fn select_provider_for_claude_count_tokens(
     store: &ProviderStore,
     accounts: &AccountStore,
-    failover: &mut FailoverStore,
     headers: &HeaderMap,
+    current_provider_id: Option<&str>,
     account_in_flight: &AccountInFlightSnapshot,
-    excluded_provider_ids: &BTreeSet<String>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
     select_provider_with_optional_filter(
         store,
         accounts,
-        failover,
         AppKind::Claude,
         headers,
+        current_provider_id,
         ProviderSelectionOptions {
             provider_filter: Some(provider_supports_claude_count_tokens),
             account_in_flight: Some(account_in_flight),
-            excluded_provider_ids: Some(excluded_provider_ids),
             ..ProviderSelectionOptions::default()
         },
     )
@@ -152,17 +135,17 @@ pub(super) fn provider_supports_claude_count_tokens(provider: &StoredProvider) -
 pub(super) fn select_provider_for_type(
     store: &ProviderStore,
     accounts: &AccountStore,
-    failover: &mut FailoverStore,
     app: AppKind,
     headers: &HeaderMap,
+    current_provider_id: Option<&str>,
     provider_type: ProviderType,
 ) -> Result<ProviderRouteSelection, ProxyError> {
     select_provider_inner(
         store,
         accounts,
-        failover,
         app,
         headers,
+        current_provider_id,
         Some(provider_type),
         None,
     )
@@ -171,15 +154,15 @@ pub(super) fn select_provider_for_type(
 pub(super) fn select_provider_for_codex_image_generation(
     store: &ProviderStore,
     accounts: &AccountStore,
-    failover: &mut FailoverStore,
     headers: &HeaderMap,
+    current_provider_id: Option<&str>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
     select_provider_with_filter(
         store,
         accounts,
-        failover,
         AppKind::Codex,
         headers,
+        current_provider_id,
         codex_image_generation_provider,
         None,
     )
@@ -188,18 +171,18 @@ pub(super) fn select_provider_for_codex_image_generation(
 fn select_provider_inner(
     store: &ProviderStore,
     accounts: &AccountStore,
-    failover: &mut FailoverStore,
     app: AppKind,
     headers: &HeaderMap,
+    current_provider_id: Option<&str>,
     provider_type_filter: Option<ProviderType>,
     account_in_flight: Option<&AccountInFlightSnapshot>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
     select_provider_with_optional_filter(
         store,
         accounts,
-        failover,
         app,
         headers,
+        current_provider_id,
         ProviderSelectionOptions {
             provider_type_filter,
             account_in_flight,
@@ -211,18 +194,18 @@ fn select_provider_inner(
 fn select_provider_with_filter(
     store: &ProviderStore,
     accounts: &AccountStore,
-    failover: &mut FailoverStore,
     app: AppKind,
     headers: &HeaderMap,
+    current_provider_id: Option<&str>,
     filter: fn(&StoredProvider) -> bool,
     account_in_flight: Option<&AccountInFlightSnapshot>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
     select_provider_with_optional_filter(
         store,
         accounts,
-        failover,
         app,
         headers,
+        current_provider_id,
         ProviderSelectionOptions {
             provider_filter: Some(filter),
             account_in_flight,
@@ -234,165 +217,54 @@ fn select_provider_with_filter(
 fn select_provider_with_optional_filter(
     store: &ProviderStore,
     accounts: &AccountStore,
-    failover: &mut FailoverStore,
     app: AppKind,
     headers: &HeaderMap,
+    current_provider_id: Option<&str>,
     options: ProviderSelectionOptions<'_>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
     let ProviderSelectionOptions {
         provider_type_filter,
         provider_filter,
         account_in_flight,
-        excluded_provider_ids,
     } = options;
-    let now = current_time_ms();
-    let provider_id = headers
+    let now = now_ms();
+    let explicit_provider_id = headers
         .get("x-cc-provider-id")
         .and_then(|value| value.to_str().ok());
-
-    if let Some(provider_id) = provider_id {
-        let provider = store
-            .providers
-            .iter()
-            .find(|item| {
-                item.app == app
-                    && item.provider.id == provider_id
-                    && provider_type_filter
-                        .map(|provider_type| item.provider_type == provider_type)
-                        .unwrap_or(true)
-                    && provider_filter.map(|filter| filter(item)).unwrap_or(true)
-            })
-            .cloned()
-            .ok_or_else(|| ProxyError::not_found(format!("provider not found: {provider_id}")))?;
-        ensure_provider_account_does_not_need_relogin(&provider, accounts)?;
-        ensure_provider_not_rate_limited(&provider, accounts, now)?;
-        if account_in_flight
-            .and_then(|snapshot| account_concurrency_for_provider(&provider, accounts, snapshot))
-            .is_some_and(|selection| selection.current >= selection.max_concurrent)
-        {
-            return Err(account_concurrency_limit_error(&provider));
-        }
-        return Ok(ProviderRouteSelection {
-            provider,
-            failover_state_changed: false,
-        });
-    }
-
-    let matching_candidates = store
+    let provider_id = explicit_provider_id
+        .or(current_provider_id)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProxyError::not_found(format!(
+                "no current provider configured for {}",
+                app.as_str()
+            ))
+        })?;
+    let provider = store
         .providers
         .iter()
-        .filter(|item| item.app == app)
-        .filter(|item| {
-            provider_type_filter
-                .map(|provider_type| item.provider_type == provider_type)
-                .unwrap_or(true)
-                && provider_filter.map(|filter| filter(item)).unwrap_or(true)
-        })
-        .collect::<Vec<_>>();
-    let active_candidates = matching_candidates
-        .iter()
-        .copied()
-        .filter(|item| !provider_account_needs_relogin(item, accounts))
-        .collect::<Vec<_>>();
-    if active_candidates.is_empty() && !matching_candidates.is_empty() {
-        return Err(ProxyError {
-            status: axum::http::StatusCode::UNAUTHORIZED,
-            message: "all managed accounts require login".to_string(),
-        });
-    }
-    let rate_available_candidates = active_candidates
-        .iter()
-        .copied()
-        .filter(|item| provider_rate_limited_until(item, accounts, now).is_none())
-        .collect::<Vec<_>>();
-    let available_candidates = rate_available_candidates
-        .iter()
-        .copied()
-        .filter(|provider| {
-            account_in_flight
-                .and_then(|snapshot| account_concurrency_for_provider(provider, accounts, snapshot))
-                .is_none_or(|selection| selection.current < selection.max_concurrent)
-        })
-        .collect::<Vec<_>>();
-    let non_excluded_candidates = available_candidates
-        .iter()
-        .copied()
-        .filter(|provider| {
-            excluded_provider_ids.is_none_or(|excluded| !excluded.contains(&provider.provider.id))
-        })
-        .collect::<Vec<_>>();
-    // If every available provider has already failed in this logical request,
-    // fall back to the normal candidate set and let the retry budget stop loops.
-    let candidates = if non_excluded_candidates.is_empty() {
-        available_candidates
-    } else {
-        non_excluded_candidates
-    };
-    let has_matching_provider = !matching_candidates.is_empty();
-    if candidates.is_empty() && !rate_available_candidates.is_empty() {
-        return Err(ProxyError {
-            status: axum::http::StatusCode::TOO_MANY_REQUESTS,
-            message: "all Claude OAuth accounts are at their concurrency limit".to_string(),
-        });
-    }
-    if candidates.is_empty() && has_matching_provider {
-        let until = store
-            .providers
-            .iter()
-            .filter(|item| item.app == app)
-            .filter(|item| {
-                provider_type_filter
+        .find(|item| {
+            item.app == app
+                && item.provider.id == provider_id
+                && provider_type_filter
                     .map(|provider_type| item.provider_type == provider_type)
                     .unwrap_or(true)
-                    && provider_filter.map(|filter| filter(item)).unwrap_or(true)
-            })
-            .filter_map(|item| provider_rate_limited_until(item, accounts, now))
-            .min()
-            .unwrap_or(0);
-        if until == 0 {
-            return Err(ProxyError::not_found(format!(
-                "no provider configured for {:?}",
-                app
-            )));
-        }
-        let label = provider_type_filter
-            .map(|provider_type| provider_type.as_str().replace('_', " "))
-            .unwrap_or_else(|| {
-                if store
-                    .providers
-                    .iter()
-                    .filter(|item| item.app == app)
-                    .all(|item| item.provider_type == ProviderType::GrokOAuth)
-                {
-                    "grok oauth".to_string()
-                } else {
-                    "codex oauth".to_string()
-                }
-            });
-        return Err(ProxyError {
-            status: axum::http::StatusCode::TOO_MANY_REQUESTS,
-            message: format!("all {label} accounts are rate limited until {until}"),
-        });
-    }
-    if candidates.is_empty() {
-        return Err(ProxyError::not_found(format!(
-            "no provider configured for {:?}",
-            app
-        )));
-    }
-
-    let selection = failover
-        .select_provider_with_load(app, &candidates, now, |provider| {
-            account_in_flight
-                .and_then(|snapshot| account_concurrency_for_provider(provider, accounts, snapshot))
-                .map(account_concurrency_load_score)
-                .unwrap_or_default()
+                && provider_filter.map(|filter| filter(item)).unwrap_or(true)
         })
-        .ok_or_else(|| ProxyError::not_found(format!("no provider configured for {:?}", app)))?;
-    Ok(ProviderRouteSelection {
-        provider: selection.provider.clone(),
-        failover_state_changed: selection.state_changed,
-    })
+        .cloned()
+        .ok_or_else(|| ProxyError::not_found(format!("provider not found: {provider_id}")))?;
+    ensure_provider_account_does_not_need_relogin(&provider, accounts)?;
+    ensure_provider_not_rate_limited(&provider, accounts, now)?;
+    if account_in_flight
+        .and_then(|snapshot| account_concurrency_for_provider(&provider, accounts, snapshot))
+        .is_some_and(|selection| selection.current >= selection.max_concurrent)
+    {
+        return Err(account_concurrency_limit_error(&provider));
+    }
+    let execution = ProviderExecution::from_store(store, provider)?;
+    execution.ensure_operation_supported(super::provider_ops::ProviderOperation::Forward)?;
+    Ok(ProviderRouteSelection { execution })
 }
 
 pub(super) fn account_concurrency_for_provider(
@@ -472,13 +344,6 @@ fn json_u32(value: &serde_json::Value) -> Option<u32> {
         .as_u64()
         .and_then(|value| u32::try_from(value).ok())
         .or_else(|| value.as_str()?.trim().parse::<u32>().ok())
-}
-
-fn account_concurrency_load_score(selection: AccountConcurrencySelection) -> u64 {
-    u64::from(selection.current)
-        .saturating_mul(1_000_000)
-        .checked_div(u64::from(selection.max_concurrent))
-        .unwrap_or_default()
 }
 
 fn account_concurrency_limit_error(provider: &StoredProvider) -> ProxyError {
@@ -579,7 +444,6 @@ mod tests {
 
     use super::*;
     use crate::domain::accounts::store::UpsertAccountInput;
-    use crate::domain::failover::{FailoverStore, ProviderOutcome, UpdateFailoverAppInput};
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
     use crate::state::AccountInFlightTracker;
 
@@ -596,6 +460,7 @@ mod tests {
             },
             provider_type: ProviderType::Codex,
             provider_type_id: "codex".to_string(),
+            resource: Default::default(),
         }
     }
 
@@ -612,6 +477,7 @@ mod tests {
                         source: Some("account_store".to_string()),
                         auth_provider: Some("codex_oauth".to_string()),
                         account_id: Some(account_id.to_string()),
+                        auth_identity_generation: None,
                     }),
                     ..ProviderMeta::default()
                 }),
@@ -619,6 +485,7 @@ mod tests {
             },
             provider_type: ProviderType::CodexOAuth,
             provider_type_id: "codex_oauth".to_string(),
+            resource: Default::default(),
         }
     }
 
@@ -643,6 +510,7 @@ mod tests {
                         source: Some("account_store".to_string()),
                         auth_provider: Some("claude_oauth".to_string()),
                         account_id: Some(account_id.to_string()),
+                        auth_identity_generation: None,
                     }),
                     ..ProviderMeta::default()
                 }),
@@ -650,6 +518,7 @@ mod tests {
             },
             provider_type: ProviderType::ClaudeOAuth,
             provider_type_id: "claude_oauth".to_string(),
+            resource: Default::default(),
         }
     }
 
@@ -718,6 +587,7 @@ mod tests {
                         source: Some("account_store".to_string()),
                         auth_provider: Some("cursor_oauth".to_string()),
                         account_id: Some(account_id.to_string()),
+                        auth_identity_generation: None,
                     }),
                     ..ProviderMeta::default()
                 }),
@@ -725,6 +595,7 @@ mod tests {
             },
             provider_type: ProviderType::CursorOAuth,
             provider_type_id: "cursor_oauth".to_string(),
+            resource: Default::default(),
         }
     }
 
@@ -755,267 +626,136 @@ mod tests {
     }
 
     fn provider_store() -> ProviderStore {
-        ProviderStore {
-            providers: vec![
-                provider(AppKind::Codex, "p1"),
-                provider(AppKind::Codex, "p2"),
-            ],
-        }
+        runtime_store(vec![
+            provider(AppKind::Codex, "p1"),
+            provider(AppKind::Codex, "p2"),
+        ])
     }
 
-    fn enabled_failover(store: &ProviderStore) -> FailoverStore {
-        let mut failover = FailoverStore::default();
-        failover.update_app_config(
-            AppKind::Codex,
-            UpdateFailoverAppInput {
-                enabled: Some(true),
-                provider_queue: Some(vec!["p1".to_string(), "p2".to_string()]),
-                failure_threshold: Some(1),
-                open_duration_ms: Some(1_000),
-                half_open_max_probes: Some(1),
-            },
-            store,
-        );
-        failover
+    fn runtime_store(providers: Vec<StoredProvider>) -> ProviderStore {
+        let mut store = ProviderStore {
+            providers,
+            ..Default::default()
+        };
+        store
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
+        store
     }
 
     #[test]
-    fn explicit_provider_header_bypasses_failover_selection() {
+    fn explicit_provider_header_overrides_current_provider() {
         let store = provider_store();
-        let mut failover = enabled_failover(&store);
-        failover.record_outcome(AppKind::Codex, "p1", ProviderOutcome::NetworkFailure, 100);
         let mut headers = HeaderMap::new();
-        headers.insert("x-cc-provider-id", HeaderValue::from_static("p1"));
+        headers.insert("x-cc-provider-id", HeaderValue::from_static("p2"));
 
         let accounts = AccountStore::default();
         let selected =
-            select_provider(&store, &accounts, &mut failover, AppKind::Codex, &headers).unwrap();
+            select_provider(&store, &accounts, AppKind::Codex, &headers, Some("p1")).unwrap();
 
-        assert_eq!(selected.provider.provider.id, "p1");
-        assert!(!selected.failover_state_changed);
+        assert_eq!(selected.execution.stored.provider.id, "p2");
     }
 
     #[test]
-    fn automatic_selection_skips_open_breaker() {
+    fn current_provider_is_selected_without_automatic_fallback() {
         let store = provider_store();
-        let mut failover = enabled_failover(&store);
-        let now = current_time_ms();
-        failover.record_outcome(AppKind::Codex, "p1", ProviderOutcome::NetworkFailure, now);
-
         let selected = select_provider(
             &store,
             &AccountStore::default(),
-            &mut failover,
             AppKind::Codex,
             &HeaderMap::new(),
+            Some("p2"),
         )
         .unwrap();
 
-        assert_eq!(selected.provider.provider.id, "p2");
-        assert!(!selected.failover_state_changed);
+        assert_eq!(selected.execution.stored.provider.id, "p2");
     }
 
     #[test]
-    fn logical_retry_excludes_failed_provider_but_preserves_explicit_pin() {
+    fn missing_current_provider_is_rejected() {
         let store = provider_store();
-        let accounts = AccountStore::default();
-        let tracker = AccountInFlightTracker::default();
-        let snapshot = tracker.snapshot();
-        let mut failover = enabled_failover(&store);
-        let excluded = BTreeSet::from(["p1".to_string()]);
-
-        let selected = select_provider_with_account_inflight_excluding(
+        let error = select_provider(
             &store,
-            &accounts,
-            &mut failover,
+            &AccountStore::default(),
             AppKind::Codex,
             &HeaderMap::new(),
-            &snapshot,
-            &excluded,
+            None,
         )
-        .unwrap();
-        assert_eq!(selected.provider.provider.id, "p2");
-
-        let mut pinned = HeaderMap::new();
-        pinned.insert("x-cc-provider-id", HeaderValue::from_static("p1"));
-        let selected = select_provider_with_account_inflight_excluding(
-            &store,
-            &accounts,
-            &mut failover,
-            AppKind::Codex,
-            &pinned,
-            &snapshot,
-            &excluded,
-        )
-        .unwrap();
-        assert_eq!(selected.provider.provider.id, "p1");
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
+        assert!(error.message.contains("no current provider"));
     }
 
     #[test]
-    fn automatic_selection_skips_rate_limited_codex_oauth_account() {
-        let now = current_time_ms() as i64;
-        let store = ProviderStore {
-            providers: vec![
-                codex_oauth_provider("p1", "acct-1"),
-                codex_oauth_provider("p2", "acct-2"),
-            ],
-        };
+    fn current_rate_limited_provider_returns_429_without_fallback() {
+        let now = now_ms() as i64;
+        let store = runtime_store(vec![
+            codex_oauth_provider("p1", "acct-1"),
+            codex_oauth_provider("p2", "acct-2"),
+        ]);
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", Some(now + 60_000)));
         accounts.upsert(codex_oauth_account("acct-2", None));
-        let mut failover = enabled_failover(&store);
-
-        let selected = select_provider(
+        let error = select_provider(
             &store,
             &accounts,
-            &mut failover,
             AppKind::Codex,
             &HeaderMap::new(),
+            Some("p1"),
         )
-        .unwrap();
-
-        assert_eq!(selected.provider.provider.id, "p2");
-    }
-
-    #[test]
-    fn automatic_selection_skips_rate_limited_cursor_oauth_account() {
-        let now = current_time_ms() as i64;
-        let store = ProviderStore {
-            providers: vec![
-                cursor_oauth_provider("p1", "cursor-acct-1"),
-                cursor_oauth_provider("p2", "cursor-acct-2"),
-            ],
-        };
-        let mut accounts = AccountStore::default();
-        accounts.upsert(cursor_oauth_account("cursor-acct-1", Some(now + 60_000)));
-        accounts.upsert(cursor_oauth_account("cursor-acct-2", None));
-        let mut failover = enabled_failover(&store);
-
-        let selected = select_provider(
-            &store,
-            &accounts,
-            &mut failover,
-            AppKind::Codex,
-            &HeaderMap::new(),
-        )
-        .unwrap();
-
-        assert_eq!(selected.provider.provider.id, "p2");
-    }
-
-    #[test]
-    fn explicit_rate_limited_codex_oauth_provider_returns_429() {
-        let now = current_time_ms() as i64;
-        let store = ProviderStore {
-            providers: vec![codex_oauth_provider("p1", "acct-1")],
-        };
-        let mut accounts = AccountStore::default();
-        accounts.upsert(codex_oauth_account("acct-1", Some(now + 60_000)));
-        let mut failover = enabled_failover(&store);
-        let mut headers = HeaderMap::new();
-        headers.insert("x-cc-provider-id", HeaderValue::from_static("p1"));
-
-        let error = select_provider(&store, &accounts, &mut failover, AppKind::Codex, &headers)
-            .unwrap_err();
-
+        .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
-    fn automatic_selection_skips_account_that_requires_relogin() {
-        let store = ProviderStore {
-            providers: vec![
-                codex_oauth_provider("p1", "acct-1"),
-                codex_oauth_provider("p2", "acct-2"),
-            ],
-        };
+    fn current_cursor_provider_respects_account_cooldown() {
+        let now = now_ms() as i64;
+        let store = runtime_store(vec![
+            cursor_oauth_provider("p1", "cursor-acct-1"),
+            cursor_oauth_provider("p2", "cursor-acct-2"),
+        ]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(cursor_oauth_account("cursor-acct-1", Some(now + 60_000)));
+        accounts.upsert(cursor_oauth_account("cursor-acct-2", None));
+        let error = select_provider(
+            &store,
+            &accounts,
+            AppKind::Codex,
+            &HeaderMap::new(),
+            Some("p1"),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn current_provider_that_requires_relogin_returns_401_without_fallback() {
+        let store = runtime_store(vec![
+            codex_oauth_provider("p1", "acct-1"),
+            codex_oauth_provider("p2", "acct-2"),
+        ]);
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", None));
         accounts.upsert(codex_oauth_account("acct-2", None));
         accounts.accounts[0].needs_relogin = true;
-        let mut failover = enabled_failover(&store);
-
-        let selected = select_provider(
+        let error = select_provider(
             &store,
             &accounts,
-            &mut failover,
             AppKind::Codex,
             &HeaderMap::new(),
+            Some("p1"),
         )
-        .unwrap();
-
-        assert_eq!(selected.provider.provider.id, "p2");
-    }
-
-    #[test]
-    fn explicit_provider_returns_401_when_account_requires_relogin() {
-        let store = ProviderStore {
-            providers: vec![codex_oauth_provider("p1", "acct-1")],
-        };
-        let mut accounts = AccountStore::default();
-        accounts.upsert(codex_oauth_account("acct-1", None));
-        accounts.accounts[0].needs_relogin = true;
-        let mut failover = enabled_failover(&store);
-        let mut headers = HeaderMap::new();
-        headers.insert("x-cc-provider-id", HeaderValue::from_static("p1"));
-
-        let error = select_provider(&store, &accounts, &mut failover, AppKind::Codex, &headers)
-            .unwrap_err();
-
+        .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::UNAUTHORIZED);
         assert!(error.message.contains("requires login"));
     }
 
     #[test]
-    fn claude_oauth_selection_prefers_lower_account_load() {
-        let store = ProviderStore {
-            providers: vec![
-                claude_oauth_provider("p1", "acct-1", Some(8)),
-                claude_oauth_provider("p2", "acct-2", Some(8)),
-            ],
-        };
-        let mut accounts = AccountStore::default();
-        accounts.upsert(claude_oauth_account("acct-1"));
-        accounts.upsert(claude_oauth_account("acct-2"));
-        let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
-        let _guard = tracker
-            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 8)
-            .unwrap();
-        let snapshot = tracker.snapshot();
-        let mut failover = FailoverStore::default();
-        failover.update_app_config(
-            AppKind::Claude,
-            UpdateFailoverAppInput {
-                enabled: Some(true),
-                provider_queue: Some(vec!["p1".to_string(), "p2".to_string()]),
-                failure_threshold: None,
-                open_duration_ms: None,
-                half_open_max_probes: None,
-            },
-            &store,
-        );
-
-        let selected = select_provider_with_account_inflight(
-            &store,
-            &accounts,
-            &mut failover,
-            AppKind::Claude,
-            &HeaderMap::new(),
-            &snapshot,
-        )
-        .unwrap();
-
-        assert_eq!(selected.provider.provider.id, "p2");
-    }
-
-    #[test]
-    fn claude_oauth_selection_skips_saturated_account() {
-        let store = ProviderStore {
-            providers: vec![
-                claude_oauth_provider("p1", "acct-1", Some(1)),
-                claude_oauth_provider("p2", "acct-2", Some(1)),
-            ],
-        };
+    fn current_claude_provider_at_concurrency_limit_returns_429() {
+        let store = runtime_store(vec![
+            claude_oauth_provider("p1", "acct-1", Some(1)),
+            claude_oauth_provider("p2", "acct-2", Some(1)),
+        ]);
         let mut accounts = AccountStore::default();
         accounts.upsert(claude_oauth_account("acct-1"));
         accounts.upsert(claude_oauth_account("acct-2"));
@@ -1024,27 +764,12 @@ mod tests {
             .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
             .unwrap();
         let snapshot = tracker.snapshot();
-        let mut failover = FailoverStore::default();
-
-        let selected = select_provider_with_account_inflight(
-            &store,
-            &accounts,
-            &mut failover,
-            AppKind::Claude,
-            &HeaderMap::new(),
-            &snapshot,
-        )
-        .unwrap();
-        assert_eq!(selected.provider.provider.id, "p2");
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-cc-provider-id", HeaderValue::from_static("p1"));
         let error = select_provider_with_account_inflight(
             &store,
             &accounts,
-            &mut failover,
             AppKind::Claude,
-            &headers,
+            &HeaderMap::new(),
+            Some("p1"),
             &snapshot,
         )
         .unwrap_err();
@@ -1057,34 +782,29 @@ mod tests {
         unsupported.provider_type = ProviderType::Codex;
         unsupported.provider_type_id = "codex".to_string();
         let supported = claude_oauth_provider("claude-native", "acct-1", None);
-        let store = ProviderStore {
-            providers: vec![unsupported, supported],
-        };
+        let store = runtime_store(vec![unsupported, supported]);
         let mut accounts = AccountStore::default();
         accounts.upsert(claude_oauth_account("acct-1"));
         let tracker = AccountInFlightTracker::default();
-        let mut failover = FailoverStore::default();
 
         let selected = select_provider_for_claude_count_tokens(
             &store,
             &accounts,
-            &mut failover,
             &HeaderMap::new(),
+            Some("claude-native"),
             &tracker.snapshot(),
-            &BTreeSet::new(),
         )
         .unwrap();
-        assert_eq!(selected.provider.provider.id, "claude-native");
+        assert_eq!(selected.execution.stored.provider.id, "claude-native");
 
         let mut pinned = HeaderMap::new();
         pinned.insert("x-cc-provider-id", HeaderValue::from_static("codex-first"));
         let error = select_provider_for_claude_count_tokens(
             &store,
             &accounts,
-            &mut failover,
             &pinned,
+            Some("claude-native"),
             &tracker.snapshot(),
-            &BTreeSet::new(),
         )
         .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);

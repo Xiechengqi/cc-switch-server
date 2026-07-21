@@ -37,12 +37,10 @@ pub(in crate::api) async fn restore_backup(
     Path(id): Path<String>,
 ) -> Result<Json<BackupRestoreResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let result = crate::infra::backup::restore_backup(&state.config_dir, &id)
-        .map_err(ApiError::bad_request)?;
-    state
-        .reload_persistent_stores()
+    let result = state
+        .restore_backup_command(id)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::bad_request)?;
     state.emit_event(
         ServerEvent::new("backup.restored", "backup")
             .id(result.restored.id.clone())

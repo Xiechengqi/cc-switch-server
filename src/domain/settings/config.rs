@@ -26,9 +26,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub setup_completion_notification: Option<SetupCompletionNotificationState>,
     #[serde(default)]
-    pub upstream_proxy: UpstreamProxyConfig,
-    #[serde(default)]
     pub upgrade_policy: UpgradePolicyConfig,
+    /// Web ops terminal entry. Default on; PTY still lazy-created on first attach.
+    /// Disable via `enableWebTerminal: false` or `CC_SWITCH_ENABLE_WEB_TERMINAL=0|false|off`.
+    #[serde(default = "default_true")]
+    pub enable_web_terminal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,25 +338,7 @@ pub struct ClientConfig {
     pub last_heartbeat_ms: Option<u128>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpstreamProxyConfig {
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default = "default_follow_system_proxy")]
-    pub follow_system_proxy: bool,
-}
-
-impl Default for UpstreamProxyConfig {
-    fn default() -> Self {
-        Self {
-            url: None,
-            follow_system_proxy: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupOptions {
     #[serde(default)]
@@ -369,17 +353,6 @@ pub struct SetupOptions {
 
 fn default_true() -> bool {
     true
-}
-
-impl Default for SetupOptions {
-    fn default() -> Self {
-        Self {
-            dry_run: false,
-            allow_offline: false,
-            issue_session_token: false,
-            issue_api_token: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,9 +375,23 @@ impl ServerConfig {
             router: RouterConfig::default(),
             client: ClientConfig::default(),
             setup_completion_notification: None,
-            upstream_proxy: UpstreamProxyConfig::default(),
             upgrade_policy: UpgradePolicyConfig::default(),
+            enable_web_terminal: true,
         }
+    }
+
+    /// Effective web terminal switch: env overrides `server.json` when set.
+    pub fn is_web_terminal_enabled(&self) -> bool {
+        if let Ok(value) = std::env::var("CC_SWITCH_ENABLE_WEB_TERMINAL") {
+            let normalized = value.trim().to_ascii_lowercase();
+            if matches!(normalized.as_str(), "0" | "false" | "no" | "off") {
+                return false;
+            }
+            if matches!(normalized.as_str(), "1" | "true" | "yes" | "on") {
+                return true;
+            }
+        }
+        self.enable_web_terminal
     }
 
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
@@ -448,11 +435,11 @@ impl ServerConfig {
     }
 
     pub fn is_router_client_ready(&self) -> bool {
-        if !self
+        if self
             .router
             .url
             .as_deref()
-            .is_some_and(|value| !value.is_empty())
+            .is_none_or(|value| value.is_empty())
         {
             return true;
         }
@@ -596,8 +583,8 @@ impl ServerConfig {
                 last_heartbeat_ms: None,
             },
             setup_completion_notification: None,
-            upstream_proxy: UpstreamProxyConfig::default(),
             upgrade_policy: UpgradePolicyConfig::default(),
+            enable_web_terminal: true,
         })
     }
 
@@ -645,19 +632,6 @@ impl ServerConfig {
         }
         if let Some(status) = input.tunnel_status {
             self.client.tunnel_status = optional_trimmed(status);
-        }
-        Ok(())
-    }
-
-    pub fn update_upstream_proxy(&mut self, input: UpdateUpstreamProxyInput) -> anyhow::Result<()> {
-        if input.clear.unwrap_or(false) {
-            self.upstream_proxy.url = None;
-        }
-        if let Some(url) = input.url {
-            self.upstream_proxy.url = optional_proxy_url(url)?;
-        }
-        if let Some(follow_system_proxy) = input.follow_system_proxy {
-            self.upstream_proxy.follow_system_proxy = follow_system_proxy;
         }
         Ok(())
     }
@@ -737,17 +711,6 @@ pub struct UpdateClientTunnelInput {
     pub tunnel_status: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateUpstreamProxyInput {
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub clear: Option<bool>,
-    #[serde(default)]
-    pub follow_system_proxy: Option<bool>,
-}
-
 pub fn config_path(config_dir: &Path) -> std::path::PathBuf {
     config_dir.join(CONFIG_FILE_NAME)
 }
@@ -805,41 +768,6 @@ fn router_config_from_setup_url(router_url: &str) -> anyhow::Result<RouterConfig
 fn optional_trimmed(value: String) -> Option<String> {
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
-}
-
-fn optional_proxy_url(value: String) -> anyhow::Result<Option<String>> {
-    let Some(value) = optional_trimmed(value) else {
-        return Ok(None);
-    };
-    validate_proxy_url(&value)?;
-    Ok(Some(value))
-}
-
-pub fn validate_proxy_url(value: &str) -> anyhow::Result<()> {
-    let scheme = value
-        .split_once("://")
-        .map(|(scheme, _)| scheme.to_ascii_lowercase())
-        .ok_or_else(|| anyhow::anyhow!("proxy url must include a scheme"))?;
-    if !matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h") {
-        bail!("proxy url scheme must be one of http, https, socks5, socks5h");
-    }
-    reqwest::Proxy::all(value)
-        .with_context(|| format!("invalid proxy url {}", mask_proxy_url(value)))?;
-    Ok(())
-}
-
-pub fn mask_proxy_url(value: &str) -> String {
-    let Some((scheme, rest)) = value.split_once("://") else {
-        return value.to_string();
-    };
-    match rest.rsplit_once('@') {
-        Some((_, host)) => format!("{scheme}://{host}"),
-        None => value.to_string(),
-    }
-}
-
-fn default_follow_system_proxy() -> bool {
-    true
 }
 
 fn normalize_subdomain(subdomain: &str) -> anyhow::Result<String> {
@@ -1047,41 +975,6 @@ mod tests {
     }
 
     #[test]
-    fn upstream_proxy_update_validates_and_can_clear_url() {
-        let mut config = ServerConfig::empty();
-
-        config
-            .update_upstream_proxy(UpdateUpstreamProxyInput {
-                url: Some("socks5h://user:pass@127.0.0.1:1080".to_string()),
-                clear: None,
-                follow_system_proxy: Some(false),
-            })
-            .unwrap();
-        assert_eq!(
-            config.upstream_proxy.url.as_deref(),
-            Some("socks5h://user:pass@127.0.0.1:1080")
-        );
-        assert!(!config.upstream_proxy.follow_system_proxy);
-
-        config
-            .update_upstream_proxy(UpdateUpstreamProxyInput {
-                url: None,
-                clear: Some(true),
-                follow_system_proxy: None,
-            })
-            .unwrap();
-        assert!(config.upstream_proxy.url.is_none());
-
-        assert!(config
-            .update_upstream_proxy(UpdateUpstreamProxyInput {
-                url: Some("ftp://127.0.0.1:21".to_string()),
-                clear: None,
-                follow_system_proxy: None,
-            })
-            .is_err());
-    }
-
-    #[test]
     fn payout_profile_normalizes_address_networks_and_increments_revision() {
         let mut config = ServerConfig::empty();
         let first = config
@@ -1158,18 +1051,6 @@ mod tests {
     }
 
     #[test]
-    fn proxy_url_mask_hides_credentials() {
-        assert_eq!(
-            mask_proxy_url("http://user:pass@proxy.example.com:8080"),
-            "http://proxy.example.com:8080"
-        );
-        assert_eq!(
-            mask_proxy_url("socks5h://127.0.0.1:1080"),
-            "socks5h://127.0.0.1:1080"
-        );
-    }
-
-    #[test]
     fn debug_token_expires_and_can_be_revoked() {
         let mut config = ServerConfig::empty();
         config.set_debug_token("temporary-secret", 2_000).unwrap();
@@ -1193,5 +1074,13 @@ mod tests {
         assert!(!config.has_registered_router_identity());
         config.router.identity.as_mut().unwrap().installation_id = "inst-1".to_string();
         assert!(config.has_registered_router_identity());
+    }
+
+    #[test]
+    fn web_terminal_defaults_on_and_can_be_disabled() {
+        let mut config = ServerConfig::empty();
+        assert!(config.is_web_terminal_enabled());
+        config.enable_web_terminal = false;
+        assert!(!config.is_web_terminal_enabled());
     }
 }

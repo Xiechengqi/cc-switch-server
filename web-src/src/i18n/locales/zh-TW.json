@@ -109,6 +109,11 @@
     "noProvidersDescriptionSnippet": "除 API Key 和請求位址外的資料（如外掛程式設定）會被儲存至通用設定片段，用於在不同供應商之間共用",
     "currentlyUsing": "目前使用",
     "enable": "啟用",
+    "storageMigration": {
+      "title": "Provider 憑據儲存仍為 S1",
+      "ready": "預檢已通過。請停止服務後執行 cc-switch-server config migrate-provider-store --apply。",
+      "blocked": "有 {{count}} 個 Provider 尚未完成身分或憑據分類，因此已阻止切換至 S2。"
+    },
     "share": {
       "ownerNotConfigured": "請先設定 Client Owner",
       "ownerManagedHint": "Share Owner 與 Client Owner 保持一致。可在「設定 → 分享」透過安裝簽名的 Owner 換綁進行修改。"
@@ -280,11 +285,6 @@
       "message": "本地路由是一項進階功能，啟用前請確保您已了解其運作原理。\n\n建議先查閱相關文件或諮詢您的供應商，以取得正確的設定方式。",
       "confirm": "我已了解，繼續啟用"
     },
-    "failover": {
-      "title": "啟用故障轉移功能",
-      "message": "故障轉移是一項進階功能，啟用前請確保您已了解其運作原理。\n\n建議先在故障轉移佇列中設定好供應商優先順序。",
-      "confirm": "我已了解，繼續啟用"
-    },
     "unifyCodexHistory": {
       "title": "統一 Codex 會話歷史",
       "message": "開啟後，官方訂閱與第三方將共用同一個會話歷史清單。注意：跨供應商繼續舊會話時，可能因對方後端無法解密 encrypted_content 推理內容而失敗。\n\n可選擇同時把現有官方會話歷史遷入共享清單（遷移前自動備份到 ~/.cc-switch/backups，關閉開關時可選擇恢復）。",
@@ -448,12 +448,8 @@
         "description": "管理 Claude、Codex 和 Gemini 的設定儲存路徑"
       },
       "proxy": {
-        "title": "本地路由",
-        "description": "控制路由服務開關、查看狀態與連接埠資訊",
-        "enableFeature": "在主頁面顯示本地路由開關",
-        "enableFeatureDescription": "開啟後，主頁面頂部將顯示路由和故障轉移開關",
-        "enableFailoverToggle": "在主頁面顯示故障轉移開關",
-        "enableFailoverToggleDescription": "開啟後，主頁面頂部將獨立顯示故障轉移開關",
+        "title": "API 路由",
+        "description": "查看 Server API 路由狀態和目前 Provider",
         "running": "執行中",
         "stopped": "已停止"
       },
@@ -461,25 +457,13 @@
         "title": "模型測試設定",
         "description": "設定模型測試使用的預設模型和提示詞"
       },
-      "failover": {
-        "title": "自動故障轉移",
-        "description": "設定故障轉移佇列和斷路器策略"
-      },
       "pricing": {
         "title": "成本定價",
         "description": "管理各模型 Token 計費規則"
       },
-      "globalProxy": {
-        "title": "全域出站代理伺服器",
-        "description": "設定 CC Switch 存取外部 API 時使用的代理伺服器"
-      },
-      "data": {
-        "title": "資料管理",
-        "description": "匯入和匯出本地設定資料"
-      },
       "backup": {
         "title": "備份與還原",
-        "description": "管理自動備份，查看和還原資料庫快照"
+        "description": "管理目前安裝的狀態快照；跨主機遷移需停機複製完整資料目錄"
       },
       "cloudSync": {
         "title": "雲端同步",
@@ -573,26 +557,9 @@
     "themeLight": "淺色",
     "themeDark": "深色",
     "themeSystem": "跟隨系統",
-    "importExport": "SQL 匯入匯出",
-    "importExportHint": "匯入/匯出資料庫 SQL 備份（僅支援匯入由 CC Switch 匯出的備份），便於備份或遷移。",
-    "exportConfig": "匯出 SQL 備份",
-    "selectConfigFile": "選擇 SQL 檔案",
-    "noFileSelected": "尚未選擇設定檔。",
-    "import": "匯入",
-    "importing": "匯入中...",
-    "importSuccess": "匯入成功！",
-    "importFailed": "匯入失敗",
-    "syncLiveFailed": "已匯入，但同步至目前供應商失敗，請手動重新選擇一次供應商。",
-    "importPartialSuccess": "設定已匯入，但同步至目前供應商失敗。",
-    "importPartialHint": "請手動重新選擇一次供應商以重新整理對應設定。",
-    "configExported": "設定已匯出至：",
-    "exportFailed": "匯出失敗",
-    "selectFileFailed": "請選擇有效的 SQL 備份檔案",
-    "configCorrupted": "SQL 檔案可能已損壞或格式不正確",
-    "backupId": "備份 ID",
     "backupManager": {
-      "title": "資料庫備份",
-      "description": "自動備份的資料庫快照，可用於還原至之前的狀態",
+      "title": "Server 狀態備份",
+      "description": "用於將目前安裝還原至先前狀態，不用於跨主機遷移",
       "empty": "暫無備份",
       "restore": "還原",
       "restoring": "還原中...",
@@ -946,8 +913,6 @@
     "wslShellFlag": "標誌",
     "installCommandsCopied": "安裝命令已複製",
     "installCommandsCopyFailed": "複製失敗，請手動複製。",
-    "importFailedError": "匯入設定失敗：{{message}}",
-    "exportFailedError": "匯出設定失敗：",
     "restartRequired": "需要重新啟動應用程式",
     "restartRequiredMessage": "修改 CC Switch 設定目錄後需要重新啟動應用程式才能生效，是否立即重新啟動？",
     "restartNow": "立即重新啟動",
@@ -955,19 +920,8 @@
     "restartFailed": "應用程式重新啟動失敗，請手動關閉後重新開啟。",
     "devModeRestartHint": "開發模式下不支援自動重新啟動，請手動重新啟動應用程式。",
     "saving": "正在儲存...",
+    "saveFailedGeneric": "儲存失敗，請重試",
     "globalProxy": {
-      "label": "全域代理伺服器",
-      "hint": "代理所有請求（API、Skills 下載等）。開啟本地路由時，應用程式的請求也會經過此代理伺服器。留空表示直連。",
-      "username": "使用者名稱（選填）",
-      "password": "密碼（選填）",
-      "test": "測試連線",
-      "scan": "掃描本地代理伺服器",
-      "clear": "清除",
-      "scanFailed": "掃描失敗：{{error}}",
-      "saved": "代理伺服器設定已儲存",
-      "saveFailed": "儲存失敗：{{error}}",
-      "testSuccess": "連線成功！延遲 {{latency}}ms",
-      "testFailed": "連線失敗：{{error}}",
       "pricingDefaultsTitle": "計費預設設定",
       "pricingDefaultsDescription": "設定各應用程式的預設倍率與計費模式來源。",
       "pricingAppLabel": "應用程式",
@@ -982,8 +936,7 @@
       "pricingLoadFailed": "載入計費設定失敗：{{error}}",
       "defaultCostMultiplierRequired": "預設倍率不能為空",
       "defaultCostMultiplierInvalid": "預設倍率格式不正確"
-    },
-    "saveFailedGeneric": "儲存失敗，請重試"
+    }
   },
   "apps": {
     "claude": "Claude",
@@ -2433,23 +2386,8 @@
     "operational": "正常",
     "degraded": "降級",
     "failed": "失敗",
-    "circuitOpen": "斷路",
-    "consecutiveFailures": "連續失敗 {{count}} 次"
-  },
-  "failover": {
-    "enabled": "{{app}} 故障轉移已啟用",
-    "disabled": "{{app}} 故障轉移已關閉",
-    "toggleFailed": "操作失敗：{{detail}}",
-    "inQueue": "已加入",
-    "addQueue": "加入",
-    "priority": {
-      "tooltip": "故障轉移優先順序 {{priority}}"
-    },
-    "tooltip": {
-      "routingRequired": "本地路由啟動後才能啟用 {{app}} 故障轉移",
-      "enabled": "{{app}} 故障轉移已啟用\n按佇列優先順序（P1→P2→...）選擇供應商",
-      "disabled": "啟用 {{app}} 故障轉移\n將立即切換至佇列 P1，並在失敗時自動切換至下一個"
-    }
+    "unavailable": "異常",
+    "failedRequests": "失敗請求 {{count}} 次"
   },
   "proxy": {
     "panel": {
@@ -2563,65 +2501,6 @@
         "inactive": "路由 {{appLabel}} 的請求，讓該應用程式請求走本地路由"
       }
     },
-    "failover": {
-      "proxyRequired": "需要先啟動路由服務才能設定故障轉移",
-      "autoSwitch": "自動故障轉移",
-      "autoSwitchDescription": "開啟後將立即切換至佇列 P1，並在請求失敗時自動切換至佇列中的下一個供應商"
-    },
-    "failoverQueue": {
-      "title": "故障轉移佇列",
-      "description": "管理各應用程式的供應商故障轉移順序",
-      "info": "啟用自動故障轉移後，將按佇列優先順序選擇供應商（P1 優先）。當請求失敗時，系統會按佇列順序依次嘗試下一個供應商。",
-      "selectProvider": "選擇供應商新增至佇列",
-      "noAvailableProviders": "沒有可新增的供應商",
-      "empty": "故障轉移佇列為空。新增供應商以啟用自動故障轉移。",
-      "orderHint": "佇列順序與首頁供應商清單順序一致，可在首頁拖曳調整順序。",
-      "dragHint": "拖曳供應商可調整故障轉移順序，序號越小優先順序越高。",
-      "toggleEnabled": "啟用/停用",
-      "addSuccess": "已新增至故障轉移佇列",
-      "addFailed": "新增失敗",
-      "removeSuccess": "已從故障轉移佇列移除",
-      "removeFailed": "移除失敗",
-      "reorderSuccess": "佇列順序已更新",
-      "reorderFailed": "更新順序失敗",
-      "toggleFailed": "狀態更新失敗"
-    },
-    "autoFailover": {
-      "info": "當故障轉移佇列中設定了多個供應商時，系統會在請求失敗時按優先順序依次嘗試。當某個供應商連續失敗達到閾值時，斷路器會打開並在一段時間內跳過該供應商。",
-      "configSaved": "自動故障轉移設定已儲存",
-      "configSaveFailed": "儲存失敗",
-      "validationFailed": "以下欄位超出有效範圍：{{fields}}",
-      "retrySettings": "重試與逾時設定",
-      "failureThreshold": "失敗閾值",
-      "failureThresholdHint": "連續失敗多少次後打開斷路器（建議：3-10）",
-      "timeout": "恢復等待時間（秒）",
-      "timeoutHint": "斷路器打開後，等待多久後嘗試恢復（建議：30-120）",
-      "circuitBreakerSettings": "斷路器設定",
-      "successThreshold": "恢復成功閾值",
-      "successThresholdHint": "半開狀態下成功多少次後關閉斷路器",
-      "errorRate": "錯誤率閾值 (%)",
-      "errorRateHint": "錯誤率超過此值時打開斷路器",
-      "minRequests": "最小請求數",
-      "minRequestsHint": "計算錯誤率前的最小請求數",
-      "explanationTitle": "運作原理",
-      "failureThresholdLabel": "失敗閾值",
-      "failureThresholdExplain": "連續失敗達到此次數時，斷路器打開，該供應商暫時不可用",
-      "timeoutLabel": "恢復等待時間",
-      "timeoutExplain": "斷路器打開後，等待此時間後嘗試半開狀態",
-      "successThresholdLabel": "恢復成功閾值",
-      "successThresholdExplain": "半開狀態下，成功達到此次數時關閉斷路器，供應商恢復可用",
-      "errorRateLabel": "錯誤率閾值",
-      "errorRateExplain": "錯誤率超過此值時，即使未達到失敗閾值也會打開斷路器",
-      "maxRetries": "最大重試次數",
-      "timeoutSettings": "逾時設定",
-      "streamingFirstByte": "串流首位元組逾時",
-      "streamingIdle": "串流閒置逾時",
-      "nonStreaming": "非串流逾時",
-      "maxRetriesHint": "請求失敗時的重試次數（0-10）",
-      "streamingFirstByteHint": "等待首個資料區塊的最大時間，範圍 1-120 秒，預設 60 秒",
-      "streamingIdleHint": "資料區塊之間的最大間隔，範圍 60-600 秒，填 0 停用（防止中途卡住）",
-      "nonStreamingHint": "非串流請求的總逾時時間，範圍 60-1200 秒，預設 600 秒（10 分鐘）"
-    },
     "logging": {
       "enabled": "日誌紀錄已啟用",
       "disabled": "日誌紀錄已關閉",
@@ -2677,45 +2556,7 @@
   "proxyConfig": {
     "proxyEnabled": "本地路由",
     "appTakeover": "應用路由",
-    "perAppConfig": "應用程式設定",
-    "circuitBreaker": "斷路器設定",
-    "circuitBreakerSettings": "斷路器設定",
-    "failureThreshold": "失敗閾值",
-    "successThreshold": "恢復閾值",
-    "recoveryTimeout": "恢復等待時間",
-    "errorRateThreshold": "錯誤率閾值",
-    "minRequests": "最小請求數",
-    "timeoutConfig": "逾時設定",
-    "streamingFirstByte": "串流首位元組逾時",
-    "streamingIdle": "串流閒置逾時",
-    "nonStreaming": "非串流逾時"
-  },
-  "circuitBreaker": {
-    "failureThreshold": "失敗閾值",
-    "successThreshold": "成功閾值",
-    "timeoutSeconds": "逾時時間（秒）",
-    "errorRateThreshold": "錯誤率閾值 (%)",
-    "minRequests": "最小請求數",
-    "validationFailed": "以下欄位超出有效範圍：{{fields}}",
-    "configSaved": "斷路器設定已儲存",
-    "saveFailed": "儲存失敗",
-    "loading": "載入中...",
-    "title": "斷路器設定",
-    "description": "調整斷路器參數以控制故障檢測和恢復行為",
-    "failureThresholdHint": "連續失敗多少次後打開斷路器",
-    "timeoutSecondsHint": "斷路器打開後多久嘗試恢復（半開狀態）",
-    "successThresholdHint": "半開狀態下成功多少次後關閉斷路器",
-    "errorRateThresholdHint": "錯誤率超過此值時打開斷路器",
-    "minRequestsHint": "計算錯誤率前的最小請求數",
-    "saveConfig": "儲存設定",
-    "instructionsTitle": "設定說明",
-    "instructions": {
-      "failureThreshold": "連續失敗達到此次數時，斷路器打開",
-      "timeout": "斷路器打開後，等待此時間後嘗試半開",
-      "successThreshold": "半開狀態下，成功達到此次數時關閉斷路器",
-      "errorRate": "錯誤率超過此值時，斷路器打開",
-      "minRequests": "只有請求數達到此值後才計算錯誤率"
-    }
+    "perAppConfig": "應用程式設定"
   },
   "omo": {
     "editProfile": "編輯 OMO 設定",
@@ -2929,7 +2770,7 @@
     "grokSpendingLimit": "消費額度",
     "expiryUnknown": "到期時間未知",
     "expiresIn": "{{time}}後到期",
-    "expired": "已到期",
+    "expired": "工作階段已過期",
     "expiryNotProvided": "上游未提供訂閱到期日",
     "expiryManualNotSet": "到期時間未設定",
     "expiryUnavailable": "暫時無法查詢訂閱到期日",
@@ -2940,9 +2781,26 @@
     "utilization": "{{value}}%",
     "resetsIn": "{{time}} 後重設",
     "extraUsage": "超額用量",
-    "expired": "工作階段已過期",
     "expiredHint": "請執行 {{tool}} 命令重新整理登入",
     "queryFailed": "查詢失敗",
     "refresh": "重新整理"
+  },
+  "terminal": {
+    "title": "維運終端",
+    "nav": "終端",
+    "backHome": "返回首頁",
+    "subtitle": "伺服器執行環境",
+    "placeholderTitle": "正在連線維運終端",
+    "placeholderBody": "離開本頁不會中斷背景命令；再次進入可恢復最近輸出。",
+    "authRequired": "需要登入後才能使用維運終端",
+    "sessionEnded": "工作階段已結束",
+    "unknownError": "終端錯誤",
+    "connectionFailed": "終端連線失敗",
+    "statusConnecting": "連線中",
+    "statusReplaying": "恢復歷史",
+    "statusLive": "已連線",
+    "statusClosed": "已中斷",
+    "statusError": "錯誤",
+    "endSession": "結束工作階段"
   }
 }

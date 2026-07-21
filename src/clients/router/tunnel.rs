@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rand::{Rng, RngCore};
@@ -207,6 +208,7 @@ impl TunnelSupervisor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // Tunnel actor dependencies remain explicit at this boundary.
     pub async fn ensure_running(
         self: &Arc<Self>,
         key: impl Into<String>,
@@ -313,6 +315,7 @@ impl TunnelSupervisor {
         TunnelStartOutcome::Started { generation }
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors ensure_running for an explicit replacement.
     pub async fn force_reconnect(
         self: &Arc<Self>,
         key: impl Into<String>,
@@ -493,6 +496,7 @@ impl TunnelSupervisor {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // A complete persisted transition is kept in one call.
     async fn set_transition_status(
         &self,
         key: &str,
@@ -906,6 +910,7 @@ async fn set_status_for_generation(
     true
 }
 
+#[allow(clippy::too_many_arguments)] // Constructs one status snapshot from the lease contract.
 fn status_from_lease(
     key: &str,
     kind: &str,
@@ -944,6 +949,7 @@ fn status_from_lease(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Connection lifecycle inputs are intentionally explicit.
 async fn connect_and_forward(
     lease: &NamespaceLeaseResponse,
     local_addr: &str,
@@ -1463,6 +1469,18 @@ struct TunnelRuntimeStore {
 
 pub fn tunnels_path(config_dir: &Path) -> PathBuf {
     config_dir.join(TUNNELS_FILE_NAME)
+}
+
+pub fn validate_tunnel_store(config_dir: &Path) -> anyhow::Result<()> {
+    let path = tunnels_path(config_dir);
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("read tunnel runtime store {}", path.display()))?;
+    serde_json::from_str::<TunnelRuntimeStore>(&content)
+        .with_context(|| format!("parse tunnel runtime store {}", path.display()))?;
+    Ok(())
 }
 
 pub fn renewal_delay(expires_at: &str) -> Option<Duration> {

@@ -1,0 +1,645 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "/data/projects/cc-switch",
+    "commit": "b1dee0153da94316fb50416c679a11f74cc66f14"
+  },
+  "syncRoots": [
+    "index.css",
+    "i18n/index.ts",
+    "i18n/locales/en.json",
+    "i18n/locales/zh.json",
+    "i18n/locales/zh-TW.json",
+    "i18n/locales/ja.json",
+    "components/ui",
+    "components/providers/forms",
+    "components/providers/AddProviderDialog.tsx",
+    "components/providers/ProviderEmptyState.tsx",
+    "components/providers/ProviderList.tsx",
+    "components/providers/ProviderCard.tsx",
+    "components/providers/ProviderActions.tsx",
+    "components/providers/ProviderHealthBadge.tsx",
+    "components/ConfirmDialog.tsx",
+    "components/JsonEditor.tsx",
+    "components/ProviderIcon.tsx",
+    "components/BrandIcons.tsx",
+    "components/ClaudeOauthQuotaFooter.tsx",
+    "components/CodexOauthQuotaFooter.tsx",
+    "components/GeminiOauthQuotaFooter.tsx",
+    "components/CopilotQuotaFooter.tsx",
+    "components/CursorOauthQuotaFooter.tsx",
+    "components/KiroOauthQuotaFooter.tsx",
+    "components/AntigravityOauthQuotaFooter.tsx",
+    "components/OllamaQuotaFooter.tsx",
+    "components/SubscriptionQuotaFooter.tsx",
+    "components/settings/SettingsPage.tsx",
+    "components/settings/LanguageSettings.tsx",
+    "components/settings/ThemeSettings.tsx",
+    "components/share",
+    "components/usage",
+    "lib/utils.ts",
+    "lib/query/queryClient.ts"
+  ],
+  "serverOwned": [
+    {
+      "path": "i18n/index.ts",
+      "owner": "server",
+      "reason": "Server bootstrap does not use the Tauri locale bridge.",
+      "upstreamSourceSha256": "4d9d6e652d3fd8709caca557e8b5cb74d6894cec5cb72f2554aa903018428e92",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "i18n/locales/en.json",
+      "owner": "server",
+      "reason": "Server product copy includes router, share and headless-only messages.",
+      "upstreamSourceSha256": "47a25124b90bdcfc9e6b21621592ee5bc003caf87b423c5000554c860e36f782",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "i18n/locales/zh.json",
+      "owner": "server",
+      "reason": "Server product copy includes router, share and headless-only messages.",
+      "upstreamSourceSha256": "e7a6a6fdf319872699799e75662e08d68602620bd266b012a2503a31cc38fd8e",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "i18n/locales/zh-TW.json",
+      "owner": "server",
+      "reason": "Server product copy includes router, share and headless-only messages.",
+      "upstreamSourceSha256": "b8e6904b75f561fc753d709201c4c51a646a30894871f3b0b6d139901e2abc1a",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "i18n/locales/ja.json",
+      "owner": "server",
+      "reason": "Server product copy includes router, share and headless-only messages.",
+      "upstreamSourceSha256": "ad58e18b1f427ee6bda563f32db76a59cc5bb83df70fedc460e9ca48b0aa8ee4",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "components/providers/forms/AntigravityOAuthSection.tsx",
+      "owner": "server",
+      "reason": "Server-managed account binding replaces desktop login commands.",
+      "upstreamSourceSha256": "b02ef10f6527c0b1bf63bdd620f93305712faf3b07701d0e7857e43be86be0d5",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/CodexOAuthSection.tsx",
+      "owner": "server",
+      "reason": "Server-managed account binding replaces desktop login commands.",
+      "upstreamSourceSha256": "b3f6dcdad1b4d03c61ce81872bc76ba3eee9578db157fdb22a3b557049c22e54",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/ClaudeOAuthSection.tsx",
+      "owner": "server",
+      "reason": "Server-managed Claude account binding and subscription refresh replace desktop login commands.",
+      "upstreamSourceSha256": "f82c7430fc8d20d595bb1cd9836f8e6f2188712559577059324935bdd332dd52",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/CopilotAuthSection.tsx",
+      "owner": "server",
+      "reason": "Server-managed account binding replaces desktop login commands.",
+      "upstreamSourceSha256": "fd6d8ed79906fc12b7062f2daa685f73081ecd43bfd7811685df3a2bd68f9c90",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/CursorOAuthSection.tsx",
+      "owner": "server",
+      "reason": "Server-managed account binding replaces desktop login commands.",
+      "upstreamSourceSha256": "6f1c8e0733d5f7a6be36767f08416380f23fd7b00ce01aa00442b09048d693d2",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/GeminiOAuthSection.tsx",
+      "owner": "server",
+      "reason": "Server-managed account binding replaces desktop login commands.",
+      "upstreamSourceSha256": "deca4144b5fe3b38e85f8f382200bb8f65e649cc3f491b6e988d598e9e464407",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/KiroOAuthSection.tsx",
+      "owner": "server",
+      "reason": "Server-managed account binding replaces desktop login commands.",
+      "upstreamSourceSha256": "8d8773b837fe95a4d770bfe4034376799ca3212ef3e5befe6572feba917d5c38",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/hooks/useManagedAuth.ts",
+      "owner": "server",
+      "reason": "Server account APIs and refresh semantics differ from Tauri.",
+      "upstreamSourceSha256": "99d56298d683593a197f4c34e7a76845d3c61256d8371358f068c26be0738061",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/hooks/useAntigravityOauth.ts",
+      "owner": "server",
+      "reason": "Server Antigravity and agy Profiles share one managed-account section but bind distinct account provider types.",
+      "upstreamSourceSha256": "b4fbe8707611906250ae537552cb73d64a28e52f0440091e544a3b3d02822c7b",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/ClaudeFormFields.tsx",
+      "owner": "server",
+      "reason": "Server enforces one actual upstream model for non-native Claude profiles and adds Grok account binding.",
+      "upstreamSourceSha256": "05f781bdaf090687890d41602e968e8c77a020d4de6398dc7520b6ee10e1ffc9",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/CodexBankedResetPanel.tsx",
+      "owner": "server",
+      "reason": "Server subscription reset data is loaded through managed account APIs.",
+      "upstreamSourceSha256": "be148f99c9b8e01259ead5b365c541f1b6a2209ca9e58912bf9d378f68330f8a",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/CodexCommonConfigModal.tsx",
+      "owner": "server",
+      "reason": "Temporary S1 bridge for Server Codex configuration; replaced by typed sections in Phase 7.",
+      "upstreamSourceSha256": "ad0ddb2d2899180cd7dd1e128dd33dc4ebfce636b6b3ffb500b5cbf2f561b425",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/CodexConfigEditor.tsx",
+      "owner": "server",
+      "reason": "Temporary S1 bridge for Server Codex configuration; replaced by typed sections in Phase 7.",
+      "upstreamSourceSha256": "a1ecf7debc5e4b0899aa66fc667dc2233cc3e64992eb41a6a0dd803c6698c91b",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/CodexConfigSections.tsx",
+      "owner": "server",
+      "reason": "Temporary S1 bridge for Server Codex configuration; replaced by typed sections in Phase 7.",
+      "upstreamSourceSha256": "ee660395964504befda118f803aca513de8aad65a2deec92abc3c2b41edd9cde",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/CodexFormFields.tsx",
+      "owner": "server",
+      "reason": "Server account binding and single-model policy differ from desktop raw config.",
+      "upstreamSourceSha256": "d0c26e1f46d6ad2ed57a939dfd83e88c58df46afe54533dd6a81bd44d4fa5d45",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/GeminiConfigEditor.tsx",
+      "owner": "server",
+      "reason": "Temporary S1 bridge for Server Gemini configuration; replaced by typed sections in Phase 7.",
+      "upstreamSourceSha256": "e94f17bda92eb1492ef0828fb815322264b996d884ccfd53c42086dc39629833",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/GeminiConfigSections.tsx",
+      "owner": "server",
+      "reason": "Temporary S1 bridge for Server Gemini configuration; replaced by typed sections in Phase 7.",
+      "upstreamSourceSha256": "66dc6cfd67748270c48764d8b71eb0934ca526cf9f322f991c7d42e9110db453",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/GeminiFormFields.tsx",
+      "owner": "server",
+      "reason": "Server account binding and single-model policy differ from desktop raw config.",
+      "upstreamSourceSha256": "432bd9b0b8413028148ffb7a8e2e9516d02cd85a54ce5e0ea1468efa7fc62de6",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/ProviderAdvancedConfig.tsx",
+      "owner": "server",
+      "reason": "Temporary S1 bridge exposes only options consumed by Server runtime.",
+      "upstreamSourceSha256": "801c2555a33ad6397dcef95cca6840c09068fbe4551e119086356e357e938376",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/SingleModelMappingField.tsx",
+      "owner": "server",
+      "reason": "Server enforces explicit actual-model policy for non-native profiles.",
+      "upstreamSourceSha256": "4f333b0172753d1fb5e96436b95c8172a2fe5951e99e0c7e817835bdfb4c3130",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/hooks/useApiKeyState.ts",
+      "owner": "server",
+      "reason": "Server S1 bridge normalizes API keys before typed credential patches replace it.",
+      "upstreamSourceSha256": "312d3427e6c7014601f2bc3d9ab4163fcb4295dc6fc36b7c529cabc6c5bed29b",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/hooks/useCodexCommonConfig.ts",
+      "owner": "server",
+      "reason": "Server S1 bridge does not use the desktop filesystem/Tauri contract.",
+      "upstreamSourceSha256": "e90537fa83cfb578a104adc630983f5f325f2883e0ea8c3b9297944d83047b0f",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/hooks/useCodexConfigState.ts",
+      "owner": "server",
+      "reason": "Server S1 bridge preserves headless Codex fields pending typed RuntimeConfig.",
+      "upstreamSourceSha256": "a6955fc5f40c67a8a2a2e8e1a9fea990ee63b1a19cf828047a1ceac6bd8a8c98",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/hooks/useKiroOauth.ts",
+      "owner": "server",
+      "reason": "Server Kiro account binding and import operations differ from desktop.",
+      "upstreamSourceSha256": "dd21cbfb544a84f58a70223d3f2de4b896ac0034b5a0fcd4d2171baede34433e",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/hooks/useModelState.ts",
+      "owner": "server",
+      "reason": "Server single-model runtime policy replaces desktop role-model configuration.",
+      "upstreamSourceSha256": "01e9b2ca34be69bffea922579c0a573c1ad8046c174629e3f9d1152f1a336c68",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/GrokOAuthSection.tsx",
+      "owner": "server",
+      "reason": "Server-native Grok managed account binding has no pinned desktop counterpart.",
+      "upstreamSourceSha256": null,
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/ProviderForm.tsx",
+      "owner": "server",
+      "reason": "Server owns Provider DTO, account binding and independent Share save composition.",
+      "upstreamSourceSha256": "d9c051720f86058aa54733ede98b8b5be4cb3cbb50a1abd6ff49f4a0f27de423",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/forms/ProviderPresetSelector.tsx",
+      "owner": "server",
+      "reason": "Server registry owns stable profile identity and creation admission.",
+      "upstreamSourceSha256": "b700dd47d0c14dbb2b9f71aa1dfdbd466450ccf19b68737ceedb2cac63f8a1c3",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/AddProviderDialog.tsx",
+      "owner": "server",
+      "reason": "Server creation flow is driven by the backend profile registry.",
+      "upstreamSourceSha256": "d9f0f788459a002efa4fef9c2cf6f23c4163b66413de2d14e848dbb38ce55cd0",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/ProviderEmptyState.tsx",
+      "owner": "server",
+      "reason": "Server provider creation and navigation actions differ from desktop.",
+      "upstreamSourceSha256": "e220c0877e4ce5b88f6dd7f0e7a428c5b4852e4862c8b989a053be38a8b00400",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/ProviderList.tsx",
+      "owner": "server",
+      "reason": "Server list consumes ProviderSummary and server-side health/share state.",
+      "upstreamSourceSha256": "a69249ef6beb59e2678254f8af503d8034bc21f78e059705e974be5de2700cb3",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/ProviderCard.tsx",
+      "owner": "server",
+      "reason": "Server card projects headless quota, Share and availability state.",
+      "upstreamSourceSha256": "72e33dd10ee964bc4d3a565f89c65457114fc8c5d36bff7ea2f2e6b721c0a38a",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/ProviderActions.tsx",
+      "owner": "server",
+      "reason": "Server actions use revisioned HTTP/invoke commands and reference protection.",
+      "upstreamSourceSha256": "e0c4ecc972647ccd1cef6ee6f8d96c88582acea3698dde7a3f02cf55e2b4dd2d",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/providers/ProviderShareSection.tsx",
+      "owner": "server",
+      "reason": "Remote Share is a server-only independently persisted resource.",
+      "upstreamSourceSha256": null,
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/ConfirmDialog.tsx",
+      "owner": "server",
+      "reason": "Server confirmation supports async revisioned commands.",
+      "upstreamSourceSha256": "64349b79627b99744a015d1ee9f76d4d9dce33546d0720fb170168b807da6cfc",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/CopilotQuotaFooter.tsx",
+      "owner": "server",
+      "reason": "Quota refresh is executed by server account APIs.",
+      "upstreamSourceSha256": "70a04e251fb90de06a8fa4978af0e7ec80f9079f849eca585fc6d01e7167cae2",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/CursorOauthQuotaFooter.tsx",
+      "owner": "server",
+      "reason": "Quota refresh is executed by server account APIs.",
+      "upstreamSourceSha256": "83b0fb0c04f328198603f0e8b6dd894d6053cf596100206bd0c46541ac197307",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/KiroOauthQuotaFooter.tsx",
+      "owner": "server",
+      "reason": "Quota refresh is executed by server account APIs.",
+      "upstreamSourceSha256": "c218a2ec4d60a7f861223904f12f06a791ee071ca686c5423cbea6f68cbcc09d",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/OllamaQuotaFooter.tsx",
+      "owner": "server",
+      "reason": "Quota refresh is executed by server provider APIs.",
+      "upstreamSourceSha256": "80e6a4bd255d9f92abdd7fd361dec1b43f89e5a39620285f5a4e822bbd085f43",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/SubscriptionQuotaFooter.tsx",
+      "owner": "server",
+      "reason": "Server subscription metadata includes headless refresh evidence.",
+      "upstreamSourceSha256": "07ba66de3d8cb8bd969f8f827a91d435075fa47364965595a844e817b256ed0e",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/settings/SettingsPage.tsx",
+      "owner": "server",
+      "reason": "Server settings exclude desktop-only product surfaces.",
+      "upstreamSourceSha256": "913cb5c74a9b6ec8417d8f19a0448a0827bad37553bf8f589576a7ce8237b78c",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "components/share/ShareEmptyState.tsx",
+      "owner": "server",
+      "reason": "Server Share creation is embedded in Provider configuration.",
+      "upstreamSourceSha256": null,
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/share/ShareCard.tsx",
+      "owner": "server",
+      "reason": "Server Share cards are read-only projections; editing belongs to the Provider composition.",
+      "upstreamSourceSha256": "e226a2b5b42841c1a824aace4a2cfd922d09efbe11a210e888aac032c7c30639",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/share/ShareList.tsx",
+      "owner": "server",
+      "reason": "Server Share list is a read-only projection; edits belong to Provider composition.",
+      "upstreamSourceSha256": "e487c9f883b83ff70ce7cdfaa4599609e955e9a765bdce0d74da51cae7188d47",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    },
+    {
+      "path": "components/share/ShareOwnerChangeEmailDialog.tsx",
+      "owner": "server",
+      "reason": "Owner email authorization is server/router specific.",
+      "upstreamSourceSha256": "91c80be90c8728c2782b6c71efad73469947716d62d22804ccab6517c72a3ac9",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "components/share/SharePage.tsx",
+      "owner": "server",
+      "reason": "Server Share page consumes router-native status and request records.",
+      "upstreamSourceSha256": "9986a663ace667e53b254228e006718891df63ffe755820b3f02210091b45a11",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "components/usage/UsageMiniMetric.tsx",
+      "owner": "server",
+      "reason": "Server usage metric DTOs and ranges differ from desktop.",
+      "upstreamSourceSha256": null,
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "components/usage/UsageDashboard.tsx",
+      "owner": "server",
+      "reason": "Server usage refresh state is not backed by the desktop settings store.",
+      "upstreamSourceSha256": "2439b95095806490adb214916be5bba5d2eafcc8197bf262928f2f1f6a599dfd",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "components/usage/ModelTestConfigPanel.tsx",
+      "owner": "server",
+      "reason": "Server model testing is backed by the headless Provider operation API.",
+      "upstreamSourceSha256": null,
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-6"
+    },
+    {
+      "path": "components/usage/UsageTabs.tsx",
+      "owner": "server",
+      "reason": "Server usage navigation exposes headless-only views.",
+      "upstreamSourceSha256": null,
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "components/usage/index.ts",
+      "owner": "server",
+      "reason": "Server usage exports exclude desktop-only components.",
+      "upstreamSourceSha256": null,
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-10"
+    },
+    {
+      "path": "lib/query/queryClient.ts",
+      "owner": "server",
+      "reason": "Server query bootstrap uses HTTP/invoke shims and different retry policy.",
+      "upstreamSourceSha256": "a3fa2e815030bbd73c909cd4633417ac4262fb0b33fede41e53f38456f79343a",
+      "lastReviewedUpstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14",
+      "lastReviewedServerCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+      "exitPhase": "phase-7"
+    }
+  ],
+  "excluded": [
+    {
+      "path": "components/providers/forms/ClaudeDesktopProviderForm.tsx",
+      "kind": "exact",
+      "reason": "Claude Desktop profile mutation is outside the server product boundary."
+    },
+    {
+      "path": "components/providers/forms/OmoFormFields.tsx",
+      "kind": "exact",
+      "reason": "Omo is outside the Claude/Codex/Gemini server product boundary."
+    },
+    {
+      "path": "components/providers/forms/OpenCodeFormFields.tsx",
+      "kind": "exact",
+      "reason": "OpenCode is outside the Claude/Codex/Gemini server product boundary."
+    },
+    {
+      "path": "components/providers/forms/helpers/opencodeFormUtils.ts",
+      "kind": "exact",
+      "reason": "OpenCode is outside the Claude/Codex/Gemini server product boundary."
+    },
+    {
+      "path": "components/providers/forms/hooks/useOpencodeFormState.ts",
+      "kind": "exact",
+      "reason": "OpenCode is outside the Claude/Codex/Gemini server product boundary."
+    },
+    {
+      "path": "components/share/CreateShareDialog.tsx",
+      "kind": "exact",
+      "reason": "Server creates and edits Share through the Provider-owned composition."
+    },
+    {
+      "path": "components/share/EditShareDialog.tsx",
+      "kind": "exact",
+      "reason": "Server edits Share through the Provider-owned independently saved composition."
+    },
+    {
+      "path": "components/share/ShareStatsBar.tsx",
+      "kind": "exact",
+      "reason": "Desktop aggregate Share controls are not part of the Server read-only Share projection."
+    },
+    {
+      "path": "components/share/TunnelConfigPanel.tsx",
+      "kind": "exact",
+      "reason": "Server tunnel configuration is owned by server/router settings, not the desktop Share page."
+    },
+    {
+      "path": "components/usage/ConnectivityCheckConfigPanel.tsx",
+      "kind": "exact",
+      "reason": "Server-native connectivity diagnostics replace the desktop settings panel."
+    },
+    {
+      "path": "components/universal",
+      "kind": "prefix",
+      "reason": "Universal provider persistence is intentionally not part of server."
+    },
+    {
+      "path": "config/universalProviderPresets.ts",
+      "kind": "exact",
+      "reason": "Universal recipes are audited into app-specific custom mappings, not synced as runtime UI."
+    },
+    {
+      "path": "components/share/ShareOwnerLoginDialog.tsx",
+      "kind": "exact",
+      "reason": "Server/router email authorization has a separate flow."
+    },
+    {
+      "path": "components/share/ShareRouterBar.tsx",
+      "kind": "exact",
+      "reason": "Server router selection uses the server-native Router contract."
+    },
+    {
+      "path": "components/settings/ShareEmailLoginCard.tsx",
+      "kind": "exact",
+      "reason": "Server owner authentication is not a desktop settings card."
+    },
+    {
+      "path": "components/settings/ImportExportPanel.tsx",
+      "kind": "exact",
+      "reason": "Server backup and redacted export have separate security semantics."
+    },
+    {
+      "path": "components/settings/GlobalProxySettings.tsx",
+      "kind": "exact",
+      "reason": "Server production HTTP is always direct and does not expose outbound proxy configuration."
+    }
+  ]
+}

@@ -9,6 +9,99 @@ export interface ProviderSortUpdate {
   sortIndex: number;
 }
 
+export type ProviderUpstreamProtocol =
+  "anthropic_messages" | "open_ai_chat" | "open_ai_responses" | "gemini_native";
+
+export type ProviderAuthScheme =
+  | "none"
+  | "api_key"
+  | "bearer"
+  | "oauth"
+  | "aws_sig_v4"
+  | "custom_header"
+  | "query";
+
+export interface ProviderCustomBinding {
+  upstreamProtocol: ProviderUpstreamProtocol;
+  authScheme: ProviderAuthScheme;
+}
+
+export interface ProviderIdentityView {
+  status:
+    | "bound"
+    | "profile_upgrade_available"
+    | "adoption_available"
+    | "legacy_compat"
+    | "needs_attention";
+  suggestedProfileId?: string;
+  currentProfileSchemaRevision?: number;
+  warning?: string;
+}
+
+export interface ProviderResource {
+  app: "claude" | "codex" | "gemini";
+  provider: Provider;
+  providerType: string;
+  providerTypeId: string;
+  revision: number;
+  profileId?: string;
+  profileSchemaRevision?: number;
+  customBinding?: ProviderCustomBinding;
+  identity: ProviderIdentityView;
+  orderIndex?: number;
+  credentialConfigured: boolean;
+  credentialSlots: string[];
+}
+
+export type ProviderCredentialPatch =
+  | { action: "keep" }
+  | { action: "replace"; value: string }
+  | { action: "clear" };
+
+export type ProviderCredentialPatches = Record<string, ProviderCredentialPatch>;
+
+export interface ProviderWriteOptions {
+  profileId?: string;
+  customBinding?: ProviderCustomBinding;
+  expectedRevision?: number;
+  clientRequestId?: string;
+  credentialPatches?: ProviderCredentialPatches;
+}
+
+export interface ProviderIdentityActionPreview {
+  previewToken: string;
+  action: "adopt_profile" | "rebind_custom" | "clone_as_custom";
+  sourceRevision: number;
+  warnings: string[];
+}
+
+export interface ProviderIdentityActionResult {
+  ok: boolean;
+  mode: "preview" | "apply";
+  preview: ProviderIdentityActionPreview;
+  stored?: ProviderResource;
+}
+
+export interface ProviderStoreMigrationItem {
+  app: "claude" | "codex" | "gemini";
+  providerId: string;
+  status: "ready" | "blocked";
+  blockerCodes: string[];
+}
+
+export interface ProviderStoreMigrationReport {
+  sourceFormat: "s1" | "s2";
+  targetFormat: "s1" | "s2";
+  keySource: "environment" | "file" | "file_will_be_created" | "unavailable";
+  providerCount: number;
+  readyCount: number;
+  blockedCount: number;
+  runtimePlanParity: boolean;
+  referenceFingerprint: string;
+  canApply: boolean;
+  items: ProviderStoreMigrationItem[];
+}
+
 export interface ProviderSwitchEvent {
   appType: AppId;
   providerId: string;
@@ -48,6 +141,14 @@ export const providersApi = {
     return await invokeCommand("get_providers", { app: appId });
   },
 
+  async getResources(appId: AppId): Promise<ProviderResource[]> {
+    return await invokeCommand("get_provider_resources", { app: appId });
+  },
+
+  async getStoreMigration(): Promise<ProviderStoreMigrationReport> {
+    return await invokeCommand("get_provider_store_migration");
+  },
+
   async getCurrent(appId: AppId): Promise<string> {
     return await invokeCommand("get_current_provider", { app: appId });
   },
@@ -56,24 +157,78 @@ export const providersApi = {
     provider: Provider,
     appId: AppId,
     addToLive?: boolean,
-  ): Promise<boolean> {
-    return await invokeCommand("add_provider", { provider, app: appId, addToLive });
+    options: ProviderWriteOptions = {},
+  ): Promise<ProviderResource> {
+    return await invokeCommand("add_provider", {
+      provider,
+      app: appId,
+      addToLive,
+      ...options,
+    });
   },
 
   async update(
     provider: Provider,
     appId: AppId,
     originalId?: string,
-  ): Promise<boolean> {
+    options: ProviderWriteOptions = {},
+  ): Promise<ProviderResource> {
     return await invokeCommand("update_provider", {
       provider,
       app: appId,
       originalId,
+      ...options,
     });
   },
 
-  async delete(id: string, appId: AppId): Promise<boolean> {
-    return await invokeCommand("delete_provider", { id, app: appId });
+  async delete(
+    id: string,
+    appId: AppId,
+    expectedRevision?: number,
+  ): Promise<boolean> {
+    return await invokeCommand("delete_provider", {
+      id,
+      app: appId,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    });
+  },
+
+  async adoptProfile(options: {
+    app: AppId;
+    providerId: string;
+    expectedRevision: number;
+    profileId: string;
+    accountId?: string;
+    mode: "preview" | "apply";
+    previewToken?: string;
+  }): Promise<ProviderIdentityActionResult> {
+    return await invokeCommand("adopt_provider_profile", options);
+  },
+
+  async rebindCustom(options: {
+    app: AppId;
+    providerId: string;
+    expectedRevision: number;
+    customBinding: ProviderCustomBinding;
+    credentialPatches?: ProviderCredentialPatches;
+    mode: "preview" | "apply";
+    previewToken?: string;
+  }): Promise<ProviderIdentityActionResult> {
+    return await invokeCommand("rebind_custom_provider", options);
+  },
+
+  async cloneAsCustom(options: {
+    app: AppId;
+    providerId: string;
+    expectedRevision: number;
+    targetProviderId: string;
+    targetName: string;
+    customBinding: ProviderCustomBinding;
+    clientRequestId: string;
+    mode: "preview" | "apply";
+    previewToken?: string;
+  }): Promise<ProviderIdentityActionResult> {
+    return await invokeCommand("clone_provider_as_custom", options);
   },
 
   /**
@@ -81,7 +236,10 @@ export const providersApi = {
    * Does NOT delete from database - provider remains in the list
    */
   async removeFromLiveConfig(id: string, appId: AppId): Promise<boolean> {
-    return await invokeCommand("remove_provider_from_live_config", { id, app: appId });
+    return await invokeCommand("remove_provider_from_live_config", {
+      id,
+      app: appId,
+    });
   },
 
   async switch(id: string, appId: AppId): Promise<SwitchResult> {
@@ -112,7 +270,10 @@ export const providersApi = {
     updates: ProviderSortUpdate[],
     appId: AppId,
   ): Promise<boolean> {
-    return await invokeCommand("update_providers_sort_order", { updates, app: appId });
+    return await invokeCommand("update_providers_sort_order", {
+      updates,
+      app: appId,
+    });
   },
 
   async onSwitched(

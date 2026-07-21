@@ -1,13 +1,5 @@
-.settings-card,.auth-panel,.panel,.settings-layout,table,.usage-tabs{
+.auth-panel,.panel,table,.usage-tabs{
   color: hsl(var(--foreground));
-}.usage-result{
-  max-width: 360px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: hsl(var(--success));
-  font-size: 0.8rem;
-  font-weight: 650;
 }.usage-range-presets button.active{
   background: hsl(var(--panel));
   box-shadow: 0 1px 2px hsl(220 20% 20% / 0.08);

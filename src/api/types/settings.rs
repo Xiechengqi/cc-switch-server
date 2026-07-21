@@ -1,4 +1,4 @@
-use crate::domain::settings::config::{mask_proxy_url, RouterConfig, ServerConfig};
+use crate::domain::settings::config::{RouterConfig, ServerConfig};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -8,35 +8,6 @@ pub(in crate::api) struct ConfigSnapshotResponse {
     pub(in crate::api) owner_email: Option<String>,
     pub(in crate::api) router_url: Option<String>,
     pub(in crate::api) client_tunnel_subdomain: Option<String>,
-    pub(in crate::api) upstream_proxy: UpstreamProxyView,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UpstreamProxyResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) upstream_proxy: UpstreamProxyView,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UpstreamProxyView {
-    pub(in crate::api) enabled: bool,
-    pub(in crate::api) url: Option<String>,
-    pub(in crate::api) masked_url: Option<String>,
-    pub(in crate::api) follow_system_proxy: bool,
-}
-
-impl UpstreamProxyView {
-    pub(in crate::api) fn from_config(config: &ServerConfig) -> Self {
-        let url = config.upstream_proxy.url.clone();
-        Self {
-            enabled: url.as_deref().is_some_and(|value| !value.trim().is_empty()),
-            masked_url: url.as_deref().map(mask_proxy_url),
-            url,
-            follow_system_proxy: config.upstream_proxy.follow_system_proxy,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -99,7 +70,6 @@ impl ConfigSnapshotResponse {
             owner_email: config.owner.email.clone(),
             router_url: config.router.url.clone(),
             client_tunnel_subdomain: config.client.tunnel_subdomain.clone(),
-            upstream_proxy: UpstreamProxyView::from_config(config),
         }
     }
 }

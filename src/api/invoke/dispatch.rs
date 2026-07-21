@@ -266,43 +266,6 @@ async fn web_invoke_dispatch(
                 .map_err(ApiError::internal)?;
             Ok(json!(true))
         }
-        "get_global_proxy_config" => Ok(json!(web_global_proxy_config_json(state))),
-        "get_global_proxy_url" => {
-            let config = state.config.read().await;
-            Ok(json!(config.upstream_proxy.url))
-        }
-        "get_upstream_proxy_status" => Ok(json!(web_upstream_proxy_status_json(state).await)),
-        "set_global_proxy_url" => {
-            let url = web_optional_string_any(&args, &["url", "proxyUrl", "proxy_url"])
-                .unwrap_or_default();
-            let mut config = state.config.read().await.clone();
-            let input = if url.trim().is_empty() {
-                UpdateUpstreamProxyInput {
-                    url: None,
-                    clear: Some(true),
-                    follow_system_proxy: None,
-                }
-            } else {
-                UpdateUpstreamProxyInput {
-                    url: Some(url),
-                    clear: None,
-                    follow_system_proxy: None,
-                }
-            };
-            config
-                .update_upstream_proxy(input)
-                .map_err(ApiError::bad_request)?;
-            state
-                .replace_config(config)
-                .await
-                .map_err(ApiError::internal)?;
-            Ok(Value::Null)
-        }
-        "test_proxy_url" => {
-            let url = web_arg_string_any(&args, &["url", "proxyUrl"])?;
-            Ok(json!(web_test_proxy_url(&url).await))
-        }
-        "scan_local_proxies" => Ok(json!(web_scan_local_proxies().await)),
         "is_portable_mode" => Ok(json!(false)),
         "get_app_config_dir_override" => Ok(json!(null)),
         "get_app_config_path" => Ok(json!(state.config_dir.display().to_string())),
@@ -315,8 +278,29 @@ async fn web_invoke_dispatch(
                 Some(app) => app,
                 None => return Ok(json!({})),
             };
-            let providers = state.providers.read().await;
-            Ok(json!(provider_record_for_app(&providers.providers, app)))
+            Ok(json!(state.redacted_provider_record(app).await))
+        }
+        "get_provider_registry" => Ok(json!(
+            crate::domain::providers::registry::provider_registry()
+        )),
+        "get_provider_store_migration" => {
+            let config_dir = state.config_dir.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                crate::domain::providers::storage_migration::preflight(&config_dir)
+            })
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("Provider migration preflight panicked: {error}"))
+            })?
+            .map_err(ApiError::internal)?;
+            Ok(json!(report))
+        }
+        "get_provider_resources" => {
+            let app = match web_arg_app_for_read(&args)? {
+                Some(app) => app,
+                None => return Ok(json!([])),
+            };
+            Ok(json!(state.provider_views(Some(app)).await))
         }
         "get_current_provider" => {
             let app = match web_arg_app_for_read(&args)? {
@@ -331,43 +315,244 @@ async fn web_invoke_dispatch(
             Ok(json!(current))
         }
         "add_provider" | "update_provider" => {
+            require_provider_write_contract(state, headers)?;
             let app = web_arg_app(&args)?;
-            let mut provider: Provider = web_arg_value(&args, "provider")?;
-            if provider.name.trim().is_empty() {
-                return Err(ApiError::bad_request("provider name is required"));
+            let provider: Provider = web_arg_value(&args, "provider")?;
+            let profile_id = web_optional_deserialize(&args, "profileId")?;
+            let custom_binding = web_optional_deserialize(&args, "customBinding")?;
+            let expected_revision = web_optional_deserialize(&args, "expectedRevision")?;
+            if command == "update_provider" && expected_revision.is_none() {
+                return Err(ApiError::bad_request(
+                    "expectedRevision is required to update a Provider",
+                ));
             }
-            crate::domain::providers::model_routing::normalize_and_validate_provider_model_routing(
-                app,
-                &mut provider,
-            )
-            .map_err(ApiError::bad_request)?;
-            state
-                .mutate_providers_immediate(|providers| providers.upsert(app, provider))
+            let client_request_id: Option<String> =
+                web_optional_deserialize(&args, "clientRequestId")?;
+            let credential_patches =
+                web_optional_deserialize(&args, "credentialPatches")?.unwrap_or_default();
+            let stored = state
+                .upsert_provider_draft_command(
+                    crate::domain::providers::credentials::ProviderWriteDraft {
+                        app,
+                        provider,
+                        profile_id,
+                        custom_binding,
+                        expected_revision,
+                        client_request_id,
+                        credential_patches,
+                    },
+                )
                 .await
-                .map_err(ApiError::internal)?;
-            Ok(json!(true))
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            Ok(json!(
+                crate::domain::providers::credentials::ProviderView::from_stored(&stored)
+            ))
+        }
+        "adopt_provider_profile" => {
+            require_provider_write_contract(state, headers)?;
+            let app = web_arg_app(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "id"])?;
+            let expected_revision = web_arg_value(&args, "expectedRevision")?;
+            let profile_id = web_arg_value(&args, "profileId")?;
+            let account_id = web_optional_deserialize(&args, "accountId")?;
+            let mode: ProviderActionMode = web_arg_value(&args, "mode")?;
+            let (preview, stored) = match mode {
+                ProviderActionMode::Preview => (
+                    state
+                        .preview_adopt_provider_profile_command(
+                            app,
+                            &provider_id,
+                            expected_revision,
+                            profile_id,
+                            account_id,
+                        )
+                        .await
+                        .map_err(ApiError::internal)?
+                        .map_err(map_provider_command_error)?,
+                    None,
+                ),
+                ProviderActionMode::Apply => {
+                    let preview_token: String = web_arg_value(&args, "previewToken")?;
+                    let (preview, stored) = state
+                        .apply_adopt_provider_profile_command(
+                            app,
+                            provider_id,
+                            expected_revision,
+                            profile_id,
+                            account_id,
+                            preview_token,
+                        )
+                        .await
+                        .map_err(ApiError::internal)?
+                        .map_err(map_provider_command_error)?;
+                    (
+                        preview,
+                        Some(
+                            crate::domain::providers::credentials::ProviderView::from_stored(
+                                &stored,
+                            ),
+                        ),
+                    )
+                }
+            };
+            Ok(json!({"ok": true, "mode": mode, "preview": preview, "stored": stored}))
+        }
+        "rebind_custom_provider" => {
+            require_provider_write_contract(state, headers)?;
+            let app = web_arg_app(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "id"])?;
+            let expected_revision = web_arg_value(&args, "expectedRevision")?;
+            let custom_binding = web_arg_value(&args, "customBinding")?;
+            let credential_patches =
+                web_optional_deserialize(&args, "credentialPatches")?.unwrap_or_default();
+            let mode: ProviderActionMode = web_arg_value(&args, "mode")?;
+            let (preview, stored) = match mode {
+                ProviderActionMode::Preview => (
+                    state
+                        .preview_rebind_custom_provider_command(
+                            app,
+                            &provider_id,
+                            expected_revision,
+                            custom_binding,
+                            credential_patches,
+                        )
+                        .await
+                        .map_err(ApiError::internal)?
+                        .map_err(map_provider_command_error)?,
+                    None,
+                ),
+                ProviderActionMode::Apply => {
+                    let preview_token: String = web_arg_value(&args, "previewToken")?;
+                    let (preview, stored) = state
+                        .apply_rebind_custom_provider_command(
+                            app,
+                            provider_id,
+                            expected_revision,
+                            custom_binding,
+                            credential_patches,
+                            preview_token,
+                        )
+                        .await
+                        .map_err(ApiError::internal)?
+                        .map_err(map_provider_command_error)?;
+                    (
+                        preview,
+                        Some(
+                            crate::domain::providers::credentials::ProviderView::from_stored(
+                                &stored,
+                            ),
+                        ),
+                    )
+                }
+            };
+            Ok(json!({"ok": true, "mode": mode, "preview": preview, "stored": stored}))
+        }
+        "clone_provider_as_custom" => {
+            require_provider_write_contract(state, headers)?;
+            let app = web_arg_app(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "id"])?;
+            let expected_revision = web_arg_value(&args, "expectedRevision")?;
+            let target_provider_id = web_arg_string(&args, "targetProviderId")?;
+            let target_name = web_arg_string(&args, "targetName")?;
+            let custom_binding = web_arg_value(&args, "customBinding")?;
+            let client_request_id = web_arg_string(&args, "clientRequestId")?;
+            let mode: ProviderActionMode = web_arg_value(&args, "mode")?;
+            let (preview, stored) = match mode {
+                ProviderActionMode::Preview => (
+                    state
+                        .preview_clone_provider_as_custom_command(
+                            app,
+                            &provider_id,
+                            expected_revision,
+                            target_provider_id,
+                            target_name,
+                            custom_binding,
+                            client_request_id,
+                        )
+                        .await
+                        .map_err(ApiError::internal)?
+                        .map_err(map_provider_command_error)?,
+                    None,
+                ),
+                ProviderActionMode::Apply => {
+                    let preview_token: String = web_arg_value(&args, "previewToken")?;
+                    let (preview, stored) = state
+                        .apply_clone_provider_as_custom_command(
+                            app,
+                            provider_id,
+                            expected_revision,
+                            target_provider_id,
+                            target_name,
+                            custom_binding,
+                            client_request_id,
+                            preview_token,
+                        )
+                        .await
+                        .map_err(ApiError::internal)?
+                        .map_err(map_provider_command_error)?;
+                    (
+                        preview,
+                        Some(
+                            crate::domain::providers::credentials::ProviderView::from_stored(
+                                &stored,
+                            ),
+                        ),
+                    )
+                }
+            };
+            Ok(json!({"ok": true, "mode": mode, "preview": preview, "stored": stored}))
+        }
+        "preview_provider_account_binding_migration" => {
+            let preview = state
+                .preview_provider_account_binding_migration_command()
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            Ok(json!({"ok": true, "preview": preview, "applied": 0}))
+        }
+        "apply_provider_account_binding_migration" => {
+            require_provider_write_contract(state, headers)?;
+            let preview_token = web_arg_string(&args, "previewToken")?;
+            let (preview, applied) = state
+                .apply_provider_account_binding_migration_command(preview_token)
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            Ok(json!({"ok": true, "preview": preview, "applied": applied}))
         }
         "update_providers_sort_order" => {
+            require_provider_write_contract(state, headers)?;
             let app = web_arg_app(&args)?;
             let updates: Vec<ProviderSortUpdate> = web_arg_value(&args, "updates")?;
-            let _changed = state
-                .mutate_providers_immediate_if_changed(|providers| {
-                    let changed = providers.update_sort_order(app, updates);
-                    (changed, changed)
+            let changed = state
+                .mutate_providers_immediate_if_changed(move |providers| {
+                    match providers.update_sort_order(app, updates) {
+                        Ok(changed) => (Ok(changed), changed),
+                        Err(error) => (Err(error.to_string()), false),
+                    }
                 })
                 .await
                 .map_err(ApiError::internal)?;
+            changed.map_err(ApiError::bad_request)?;
             Ok(json!(true))
         }
         "delete_provider" => {
+            require_provider_write_contract(state, headers)?;
             let app = web_arg_app(&args)?;
             let id = web_arg_string(&args, "id")?;
-            let deleted = delete_provider_with_share_cascade(state, app, &id).await?;
+            let expected_revision: u64 = web_arg_value(&args, "expectedRevision")?;
+            let deleted = state
+                .delete_provider_command(app, id, expected_revision)
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
             Ok(json!(deleted))
         }
         "switch_provider" => {
             let app = web_arg_app(&args)?;
             let id = web_arg_string(&args, "id")?;
+            let _references = state.lock_reference_mutations().await;
             let exists = state
                 .providers
                 .read()
@@ -388,6 +573,7 @@ async fn web_invoke_dispatch(
         }
         "clear_current_provider" => {
             let app = web_arg_app(&args)?;
+            let _references = state.lock_reference_mutations().await;
             state
                 .apply_ui_settings_patch_immediate(json!({
                     current_provider::current_provider_settings_key(app): ""
@@ -399,10 +585,7 @@ async fn web_invoke_dispatch(
         "get_provider_health" => {
             let app = web_arg_app_type(&args)?;
             let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
-            let failover = state.failover.read().await;
-            let key = format!("{}:{provider_id}", app.as_str());
-            let breaker = failover.breakers.get(&key);
-            Ok(json!(web_provider_health_json(app, &provider_id, breaker)))
+            Ok(web_provider_health_json(state, app, &provider_id).await?)
         }
         "list_shares" | "export_all_shares" => {
             let config = state.config_snapshot().await;
@@ -442,9 +625,16 @@ async fn web_invoke_dispatch(
         }
         "create_share" => {
             let input = web_share_upsert_input(state, &args).await?;
-            let response = upsert_share(State(state.clone()), headers.clone(), Json(input))
-                .await?
-                .0;
+            let response = upsert_share(
+                State(state.clone()),
+                headers.clone(),
+                Json(UpsertShareCommand {
+                    expected_config_revision: None,
+                    input,
+                }),
+            )
+            .await?
+            .0;
             Ok(web_share_json(
                 &state.config_snapshot().await,
                 &response.share,
@@ -743,28 +933,10 @@ async fn web_invoke_dispatch(
             let log = usage.logs.iter().find(|log| log.request_id == id).cloned();
             Ok(json!(log))
         }
-        "get_proxy_config_for_app" => {
-            let app = web_arg_app_type(&args)?;
-            Ok(json!(web_app_proxy_config_json(state, app).await))
-        }
-        "get_available_providers_for_failover" => {
-            let app = web_arg_app_type(&args)?;
-            Ok(json!(
-                web_available_providers_for_failover(state, app).await
-            ))
-        }
         "get_proxy_status" => Ok(json!(web_proxy_status_json(state).await)),
         "get_proxy_takeover_status" => Ok(json!(web_proxy_takeover_status_json(state).await)),
         "is_proxy_running" => Ok(json!(true)),
         "is_live_takeover_active" => Ok(json!(web_is_live_takeover_active(state).await)),
-        "update_global_proxy_config" => {
-            let input = web_upstream_proxy_input(&args)?;
-            let response =
-                update_upstream_proxy(State(state.clone()), headers.clone(), Json(input))
-                    .await?
-                    .0;
-            Ok(json!(response.upstream_proxy))
-        }
         "list_db_backups" => {
             let response = list_backups(State(state.clone()), headers.clone()).await?.0;
             Ok(json!(crate::infra::backup::backup_entries_for_frontend(
@@ -784,46 +956,6 @@ async fn web_invoke_dispatch(
                 .await?
                 .0;
             Ok(json!(response.result))
-        }
-        "get_auto_failover_enabled" => {
-            let app = web_arg_app_type(&args)?;
-            let failover = state.failover.read().await;
-            let enabled = failover
-                .apps
-                .get(&app)
-                .map(|config| config.enabled)
-                .unwrap_or(false);
-            Ok(json!(enabled))
-        }
-        "get_failover_queue" => {
-            let app = web_arg_app_type(&args)?;
-            let failover = state.failover.read().await;
-            let providers = state.providers.read().await;
-            let queue = failover
-                .apps
-                .get(&app)
-                .map(|config| config.provider_queue.as_slice())
-                .unwrap_or(&[]);
-            let items = queue
-                .iter()
-                .enumerate()
-                .map(|(index, provider_id)| {
-                    let stored = providers.providers.iter().find(|provider| {
-                        provider.app == app && provider.provider.id == *provider_id
-                    });
-                    json!({
-                        "providerId": provider_id,
-                        "providerName": stored
-                            .map(|provider| provider.provider.name.clone())
-                            .unwrap_or_else(|| provider_id.clone()),
-                        "sortIndex": index,
-                        "providerNotes": stored.and_then(|provider| {
-                            provider_extra_string(&provider.provider, "notes")
-                        })
-                    })
-                })
-                .collect::<Vec<_>>();
-            Ok(json!(items))
         }
         "deepseek_account_status" => {
             let accounts = state.accounts.read().await;
@@ -1144,171 +1276,6 @@ async fn web_invoke_dispatch(
             }
             Ok(json!(true))
         }
-        "get_proxy_config" => Ok(json!(web_global_proxy_config_json(state))),
-        "update_proxy_config" => {
-            let listen_address =
-                web_optional_string_any(&args, &["listenAddress", "listen_address", "address"]);
-            let listen_port = args
-                .get("listenPort")
-                .or_else(|| args.get("listen_port"))
-                .or_else(|| args.get("port"))
-                .and_then(|value| value.as_u64().map(|port| port as u16));
-            if listen_address.is_some() || listen_port.is_some() {
-                let mut patch = serde_json::Map::new();
-                let mut proxy_patch = serde_json::Map::new();
-                if let Some(address) = listen_address {
-                    proxy_patch.insert("listenAddress".to_string(), json!(address));
-                }
-                if let Some(port) = listen_port {
-                    proxy_patch.insert("listenPort".to_string(), json!(port));
-                }
-                patch.insert("proxyRuntimeConfig".to_string(), Value::Object(proxy_patch));
-                state
-                    .apply_ui_settings_patch_immediate(Value::Object(patch))
-                    .await
-                    .map_err(ApiError::internal)?;
-            }
-            Ok(json!(true))
-        }
-        "update_proxy_config_for_app" => web_update_proxy_config_for_app(state, &args).await,
-        "add_to_failover_queue" => {
-            let app = web_arg_app_type(&args)?;
-            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
-            let providers = state.providers.read().await.clone();
-            let config = state
-                .mutate_failover_immediate(|failover| {
-                    let mut queue = failover
-                        .apps
-                        .get(&app)
-                        .map(|config| config.provider_queue.clone())
-                        .unwrap_or_default();
-                    if !queue.iter().any(|id| id == &provider_id) {
-                        queue.push(provider_id);
-                    }
-                    failover.update_app_config(
-                        app,
-                        UpdateFailoverAppInput {
-                            provider_queue: Some(queue),
-                            ..Default::default()
-                        },
-                        &providers,
-                    )
-                })
-                .await
-                .map_err(ApiError::internal)?;
-            Ok(json!(config.enabled))
-        }
-        "remove_from_failover_queue" => {
-            let app = web_arg_app_type(&args)?;
-            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
-            let providers = state.providers.read().await.clone();
-            let config = state
-                .mutate_failover_immediate(|failover| {
-                    let queue = failover
-                        .apps
-                        .get(&app)
-                        .map(|config| {
-                            config
-                                .provider_queue
-                                .iter()
-                                .filter(|id| **id != provider_id)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    failover.update_app_config(
-                        app,
-                        UpdateFailoverAppInput {
-                            provider_queue: Some(queue),
-                            ..Default::default()
-                        },
-                        &providers,
-                    )
-                })
-                .await
-                .map_err(ApiError::internal)?;
-            Ok(json!(config.enabled))
-        }
-        "set_auto_failover_enabled" => {
-            let app = web_arg_app_type(&args)?;
-            let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-            let providers = state.providers.read().await.clone();
-            let config = state
-                .mutate_failover_immediate(|failover| {
-                    failover.update_app_config(
-                        app,
-                        UpdateFailoverAppInput {
-                            enabled: Some(enabled),
-                            ..Default::default()
-                        },
-                        &providers,
-                    )
-                })
-                .await
-                .map_err(ApiError::internal)?;
-            Ok(json!(config.enabled))
-        }
-        "get_circuit_breaker_config" => {
-            let failover = state.failover.read().await;
-            let app = web_arg_app_type(&args).unwrap_or(AppKind::Claude);
-            let config = failover.apps.get(&app).cloned().unwrap_or_default();
-            Ok(json!({
-                "failureThreshold": config.failure_threshold,
-                "successThreshold": 2,
-                "timeoutSeconds": (config.open_duration_ms / 1000).max(1),
-                "errorRateThreshold": 0.5,
-                "minRequests": 10,
-            }))
-        }
-        "update_circuit_breaker_config" => {
-            let config: Value = web_arg_value(&args, "config")?;
-            let app = web_arg_app_type(&args).unwrap_or(AppKind::Claude);
-            let providers = state.providers.read().await.clone();
-            let failure_threshold = config
-                .get("failureThreshold")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32);
-            let timeout_seconds = config.get("timeoutSeconds").and_then(Value::as_u64);
-            let updated = state
-                .mutate_failover_immediate(|failover| {
-                    failover.update_app_config(
-                        app,
-                        UpdateFailoverAppInput {
-                            failure_threshold,
-                            open_duration_ms: timeout_seconds
-                                .map(|seconds| (seconds * 1000) as u128),
-                            ..Default::default()
-                        },
-                        &providers,
-                    )
-                })
-                .await
-                .map_err(ApiError::internal)?;
-            Ok(json!({
-                "failureThreshold": updated.failure_threshold,
-                "successThreshold": 2,
-                "timeoutSeconds": (updated.open_duration_ms / 1000).max(1),
-                "errorRateThreshold": 0.5,
-                "minRequests": 10,
-            }))
-        }
-        "get_circuit_breaker_stats" => {
-            let app = web_arg_app_type(&args)?;
-            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
-            let failover = state.failover.read().await;
-            let key = format!("{}:{}", app.as_str(), provider_id);
-            let breaker = failover.breakers.get(&key);
-            Ok(json!(web_circuit_breaker_stats_json(breaker)))
-        }
-        "reset_circuit_breaker" => {
-            let app = web_arg_app_type(&args)?;
-            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
-            let breaker = state
-                .mutate_failover_immediate(|failover| failover.reset_provider(app, &provider_id))
-                .await
-                .map_err(ApiError::internal)?;
-            Ok(json!(web_circuit_breaker_stats_json(Some(&breaker))))
-        }
         "delete_db_backup" => {
             let id = web_arg_string_any(&args, &["filename", "id", "backupId"])?;
             crate::infra::backup::delete_backup(&state.config_dir, &id)
@@ -1321,49 +1288,6 @@ async fn web_invoke_dispatch(
             let manifest = crate::infra::backup::rename_backup(&state.config_dir, &id, &new_name)
                 .map_err(ApiError::bad_request)?;
             Ok(json!(manifest.id))
-        }
-        "export_config_to_file" => {
-            let bundle = crate::domain::settings::transfer::export_config_bundle(
-                &state.config_dir,
-                &crate::state::backup_targets(&state.config_dir),
-            )
-            .map_err(ApiError::internal)?;
-            let encoded = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                serde_json::to_vec(&bundle).map_err(ApiError::internal)?,
-            );
-            let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-            Ok(json!({
-                "success": true,
-                "message": "config exported",
-                "fileName": format!("cc-switch-server-export-{stamp}.json"),
-                "contentBase64": encoded,
-            }))
-        }
-        "import_config_from_file" => {
-            if let Some(encoded) =
-                web_optional_string_any(&args, &["contentBase64", "content_base64", "fileContent"])
-            {
-                let backup_id =
-                    crate::domain::settings::transfer::import_config_bundle_from_base64(
-                        &state.config_dir,
-                        &crate::state::backup_targets(&state.config_dir),
-                        &encoded,
-                    )
-                    .map_err(ApiError::bad_request)?;
-                state
-                    .reload_persistent_stores()
-                    .await
-                    .map_err(ApiError::internal)?;
-                return Ok(json!({
-                    "success": true,
-                    "message": "config imported",
-                    "backupId": backup_id,
-                }));
-            }
-            Err(ApiError::bad_request(
-                "import requires contentBase64 payload on server web runtime",
-            ))
         }
         "open_file_dialog" | "save_file_dialog" | "pick_directory" => Ok(Value::Null),
         "open_external" => Ok(json!(true)),
@@ -1597,12 +1521,14 @@ async fn web_invoke_dispatch(
         }
         "model_test_provider" => {
             let stored = web_resolve_stored_provider(state, &args).await?;
+            let execution =
+                resolve_provider_execution_by_key(state, stored.app, &stored.provider.id).await?;
             let config = web_stream_check_config(state).await;
             let response = test_provider_inner(
                 state,
-                stored,
+                execution,
                 &TestProviderQuery {
-                    app: None,
+                    app: stored.app,
                     network: Some(true),
                     timeout_ms: Some(config.timeout_secs.saturating_mul(1000)),
                     model: None,
@@ -1636,11 +1562,39 @@ async fn web_invoke_dispatch(
                 {
                     continue;
                 }
+                let execution =
+                    match resolve_provider_execution_by_key(state, stored.app, &stored.provider.id)
+                        .await
+                    {
+                        Ok(execution) => execution,
+                        Err(error) => {
+                            results.push((
+                                stored.provider.id.clone(),
+                                crate::domain::stream_check::StreamCheckResult {
+                                    status: crate::domain::stream_check::HealthStatus::Failed,
+                                    success: false,
+                                    provider_revision: Some(stored.resource.revision),
+                                    message: error.message,
+                                    response_time_ms: None,
+                                    http_status: None,
+                                    tested_at: chrono::Utc::now().timestamp(),
+                                    retry_count: 0,
+                                    error_category: Some("invalidConfig".to_string()),
+                                    model_used: String::new(),
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cache_read_tokens: 0,
+                                    cache_creation_tokens: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    };
                 let response = test_provider_inner(
                     state,
-                    stored.clone(),
+                    execution,
                     &TestProviderQuery {
-                        app: None,
+                        app: stored.app,
                         network: Some(true),
                         timeout_ms: Some(config.timeout_secs.saturating_mul(1000)),
                         model: None,
@@ -1652,9 +1606,13 @@ async fn web_invoke_dispatch(
                     let message = error.message.clone();
                     TestProviderResponse {
                         ok: false,
+                        outcome: ProviderOperationOutcome::InvalidConfig,
+                        driver_id: "unknown".to_string(),
+                        runtime_fingerprint: String::new(),
                         provider_id: stored.provider.id.clone(),
                         app: stored.app,
                         provider_type: stored.provider_type,
+                        provider_revision: stored.resource.revision,
                         adapter: "unknown",
                         support: proxy::adapters::AdapterSupport::Planned,
                         endpoint: String::new(),

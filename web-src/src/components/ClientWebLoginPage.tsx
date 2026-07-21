@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { AuthLanguageSwitcher } from "@/components/AuthLanguageSwitcher";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { SecretInput } from "@/components/ui/secret-input";
+import { SecretInput } from "@/server/ui/SecretInput";
 import { useI18n } from "@/lib/i18n";
 import {
   clearRouterSessionTokens,

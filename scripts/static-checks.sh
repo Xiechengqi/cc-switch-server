@@ -14,8 +14,15 @@ echo "== json parse =="
 node - <<'NODE'
 const fs = require('fs');
 for (const file of [
+  'assets/contract/desktop-ui-sync.json',
+  'assets/contract/provider-field-consumption.json',
+  'assets/contract/provider-legacy-behavior.json',
+  'assets/contract/provider-writer-inventory.json',
   'assets/contract/provider-coverage.json',
   'assets/contract/provider-fixtures/structures.json',
+  'assets/contract/router-provider-channel-baseline.json',
+  'assets/contract/server-provider-legacy-inventory.json',
+  'assets/contract/upstream-provider-source-baseline.json',
   'assets/contract/web-runtime-contract.json',
   'docs/code-agent-regression-matrix.json',
 ]) {
@@ -37,8 +44,12 @@ for file in "${shell_scripts[@]}"; do
 done
 
 echo "== provider audits =="
+node --test scripts/audit/*.test.mjs scripts/sync/*.test.mjs
+node scripts/audit/audit-upstream-provider-baseline.mjs --check
+node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
+node scripts/audit/audit-server-product-boundary.mjs
 node scripts/audit/audit-web-i18n-literals.mjs
 node scripts/audit/audit-web-runtime-contract.mjs
 
@@ -49,11 +60,12 @@ echo "== desktop ui sync drift =="
 node scripts/sync/sync-desktop-ui.mjs --check
 
 echo "== web source typecheck =="
-if [[ -d web-src && -d web-src/node_modules ]]; then
-  npm --prefix web-src run typecheck
-else
-  echo "skip web source typecheck: web-src/node_modules not installed"
+if [[ ! -d web-src/node_modules ]]; then
+  echo "web source typecheck/tests require web-src/node_modules; run npm --prefix web-src ci"
+  exit 1
 fi
+npm --prefix web-src run typecheck
+npm --prefix web-src run test
 
 echo "== transform coverage audit =="
 node scripts/audit/audit-transform-coverage.mjs --check
@@ -91,11 +103,19 @@ git diff --check -- ':(exclude)web-dist'
 
 echo "== state write discipline =="
 state_write_paths=(src/api src/clients src/domain src/proxy src/infra tests)
-if rg -n -U 'state\s*\.\s*(config|providers|accounts|failover|pricing|usage|shares|ui_settings|sessions|oauth_logins)\s*\.\s*write\s*\(\s*\)\s*\.\s*await' "${state_write_paths[@]}"; then
+if rg -n -U 'state\s*\.\s*(config|providers|accounts|pricing|usage|shares|ui_settings|sessions|oauth_logins)\s*\.\s*write\s*\(\s*\)\s*\.\s*await' "${state_write_paths[@]}"; then
   echo 'state store writes must go through ServerStateInner domain methods'; exit 1
 fi
-if rg -n -U 'state\s*\.\s*save_(providers|accounts|failover|pricing|usage|ui_settings)\s*\(\s*\)\s*\.\s*await|save_(accounts|shares)_debounced\s*\(' "${state_write_paths[@]}"; then
+if rg -n -U 'state\s*\.\s*save_(providers|accounts|pricing|usage|ui_settings)\s*\(\s*\)\s*\.\s*await|save_(accounts|shares)_debounced\s*\(' "${state_write_paths[@]}"; then
   echo 'state store persistence must stay encapsulated in ServerStateInner domain methods'; exit 1
+fi
+
+echo "== direct outbound HTTP policy =="
+if rg -n 'reqwest::Proxy|\.proxy\s*\(' src; then
+  echo 'server outbound HTTP must remain direct; explicit proxy construction is forbidden'; exit 1
+fi
+if ! rg -U -q 'reqwest::Client::builder\(\)\s*\.no_proxy\(\)' src/infra/http.rs; then
+  echo 'central HTTP client builder must explicitly disable environment/system proxies'; exit 1
 fi
 
 echo "== dependency direction =="

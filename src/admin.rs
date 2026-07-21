@@ -28,7 +28,68 @@ pub fn run_config_command(cli: &Cli, command: ConfigCommand) -> anyhow::Result<(
             println!("{}", validation_report(&snapshot));
             Ok(())
         }
+        ConfigCommand::MigrateProviders { apply } => migrate_providers(cli, apply),
+        ConfigCommand::MigrateProviderStore {
+            apply,
+            rollback,
+            cleanup_snapshot,
+        } => migrate_provider_store(cli, apply, rollback, cleanup_snapshot),
     }
+}
+
+fn migrate_provider_store(
+    cli: &Cli,
+    apply: bool,
+    rollback: bool,
+    cleanup_snapshot: bool,
+) -> anyhow::Result<()> {
+    let config_dir = cli.resolved_config_dir()?;
+    if cleanup_snapshot {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "action": "cleanup_snapshot",
+                "changed": crate::domain::providers::storage_migration::cleanup_snapshot(&config_dir)?,
+            }))?
+        );
+        return Ok(());
+    }
+    let result = if rollback {
+        serde_json::to_value(crate::domain::providers::storage_migration::rollback(
+            &config_dir,
+        )?)?
+    } else if apply {
+        serde_json::to_value(crate::domain::providers::storage_migration::apply(
+            &config_dir,
+        )?)?
+    } else {
+        serde_json::to_value(crate::domain::providers::storage_migration::preflight(
+            &config_dir,
+        )?)?
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn migrate_providers(cli: &Cli, apply: bool) -> anyhow::Result<()> {
+    let config_dir = cli.resolved_config_dir()?;
+    let preview = crate::domain::providers::migrate::inspect_remove_universal_layer(&config_dir)?;
+    if !apply {
+        println!("{}", serde_json::to_string_pretty(&preview)?);
+        return Ok(());
+    }
+    let _data_directory_lock = crate::infra::storage::acquire_data_directory_lock(&config_dir)?;
+    let changed = crate::domain::providers::migrate::migrate_remove_universal_layer(&config_dir)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "applied": changed,
+            "preview": preview,
+        })
+    );
+    Ok(())
 }
 
 pub fn run_password_command(cli: &Cli, command: PasswordCommand) -> anyhow::Result<()> {
@@ -108,8 +169,13 @@ pub(crate) fn validate_config_stores(cli: &Cli) -> anyhow::Result<ConfigSnapshot
     let config_dir = cli.resolved_config_dir()?;
     let web_dist_dir = cli.resolved_web_dist_dir();
     let config = ServerConfig::load_or_default(&config_dir)?;
-    let providers = ProviderStore::load_or_default(&config_dir)?;
+    let mut providers = ProviderStore::load_or_default(&config_dir)?;
+    if providers.storage_status().format == crate::domain::providers::store::ProviderStoreFormat::S1
+    {
+        providers.prepare_legacy_runtime_view();
+    }
     let accounts = AccountStore::load_or_default(&config_dir)?;
+    providers.rebuild_runtime_index(&accounts)?;
     let shares = ShareStore::load_or_default(&config_dir)?;
     let usage = UsageStore::load_or_default(&config_dir)?;
     let tunnels = TunnelRuntimeStoreForCli::load_or_default(&config_dir)?;
@@ -440,17 +506,20 @@ struct ConfigPrintSummary {
     bind_addr: String,
     setup_complete: bool,
     server: RedactedServerConfigSummary,
+    provider_store: crate::domain::providers::store::ProviderStoreStatus,
     stores: Vec<StoreSummary>,
 }
 
 impl From<ConfigSnapshot> for ConfigPrintSummary {
     fn from(snapshot: ConfigSnapshot) -> Self {
+        let provider_store = snapshot.providers.storage_status();
         Self {
             config_dir: snapshot.config_dir.display().to_string(),
             web_dist_dir: snapshot.web_dist_dir.map(|path| path.display().to_string()),
             bind_addr: snapshot.bind_addr,
             setup_complete: snapshot.config.is_setup_complete(),
             server: RedactedServerConfigSummary::from(snapshot.config),
+            provider_store,
             stores: snapshot.stores,
         }
     }

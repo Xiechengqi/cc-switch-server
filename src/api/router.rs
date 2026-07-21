@@ -172,12 +172,13 @@ pub(in crate::api) async fn claim_client_tunnel(
                 .replace_config(next)
                 .await
                 .map_err(ApiError::internal)?;
+            if let Err(error) = state
+                .mutate_shares_immediate(|shares| {
+                    shares.router_registered = false;
+                    shares.last_router_error = Some(message.clone());
+                })
+                .await
             {
-                let mut shares = state.shares.write().await;
-                shares.router_registered = false;
-                shares.last_router_error = Some(message.clone());
-            }
-            if let Err(error) = state.save_shares().await {
                 tracing::warn!(error = %error, "persist router claim failure failed");
             }
             if crate::client_tunnel_provision::is_subdomain_conflict_error(&message) {

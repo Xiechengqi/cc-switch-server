@@ -24,7 +24,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { useProviderHealth } from "@/lib/query/failover";
+import { useProviderHealth } from "@/lib/query/providerHealth";
 import { useShareMarketsQuery } from "@/lib/query";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";

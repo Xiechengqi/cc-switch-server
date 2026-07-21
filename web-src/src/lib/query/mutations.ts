@@ -9,12 +9,18 @@ import { providersApi, sessionsApi, settingsApi, type AppId } from "@/lib/api";
 import { subscriptionApi } from "@/lib/api/subscription";
 import type { DeleteSessionOptions } from "@/lib/api/sessions";
 import type { SwitchResult } from "@/lib/api/providers";
+import type {
+  ProviderCredentialPatches,
+  ProviderCustomBinding,
+} from "@/lib/api/providers";
 import type { Provider, SessionMeta, Settings } from "@/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { generateUUID } from "@/utils/uuid";
 import { openclawKeys } from "@/hooks/useOpenClaw";
 import { invalidateHermesProviderCaches } from "@/hooks/useHermes";
 import { PROVIDER_TYPES } from "@/config/constants";
+import { isCoreProviderApp } from "@/server/providerRegistry";
+import type { ProvidersQueryData } from "./queries";
 const isCursorApiKeyProvider = (
   provider: Provider | undefined,
 ): provider is Provider =>
@@ -62,6 +68,9 @@ export const useAddProviderMutation = (appId: AppId) => {
   return useMutation({
     mutationFn: async (
       providerInput: Omit<Provider, "id"> & {
+        profileId?: string;
+        customBinding?: ProviderCustomBinding;
+        credentialPatches?: ProviderCredentialPatches;
         providerKey?: string;
         addToLive?: boolean;
         ensureClaudeDesktopOfficialSeed?: boolean;
@@ -69,6 +78,9 @@ export const useAddProviderMutation = (appId: AppId) => {
     ) => {
       const {
         providerKey: _providerKey,
+        profileId,
+        customBinding,
+        credentialPatches,
         addToLive,
         ensureClaudeDesktopOfficialSeed,
         ...rest
@@ -110,8 +122,13 @@ export const useAddProviderMutation = (appId: AppId) => {
       };
       delete (newProvider as any).providerKey;
 
-      await providersApi.add(newProvider, appId, addToLive);
-      return newProvider;
+      const stored = await providersApi.add(newProvider, appId, addToLive, {
+        profileId,
+        customBinding,
+        clientRequestId: crypto.randomUUID(),
+        credentialPatches,
+      });
+      return isCoreProviderApp(appId) ? stored.provider : newProvider;
     },
     onSuccess: async (provider) => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
@@ -184,10 +201,35 @@ export const useUpdateProviderMutation = (appId: AppId) => {
     mutationFn: async ({
       provider,
       originalId,
+      profileId,
+      customBinding,
+      credentialPatches,
     }: {
       provider: Provider;
       originalId?: string;
+      profileId?: string;
+      customBinding?: ProviderCustomBinding;
+      credentialPatches?: ProviderCredentialPatches;
     }) => {
+      if (isCoreProviderApp(appId)) {
+        const baseline = queryClient.getQueryData<ProvidersQueryData>([
+          "providers",
+          appId,
+        ]);
+        const expectedRevision = baseline?.resources[originalId ?? provider.id]?.revision;
+        if (expectedRevision === undefined) {
+          throw new Error(
+            "Provider revision is unavailable; refresh the Provider list before saving",
+          );
+        }
+        const stored = await providersApi.update(provider, appId, originalId, {
+          expectedRevision,
+          profileId,
+          customBinding,
+          credentialPatches,
+        });
+        return stored.provider;
+      }
       await providersApi.update(provider, appId, originalId);
       return provider;
     },
@@ -233,7 +275,11 @@ export const useDeleteProviderMutation = (appId: AppId) => {
 
   return useMutation({
     mutationFn: async (providerId: string) => {
-      await providersApi.delete(providerId, appId);
+      const resource = queryClient.getQueryData<ProvidersQueryData>([
+        "providers",
+        appId,
+      ])?.resources[providerId];
+      await providersApi.delete(providerId, appId, resource?.revision);
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });

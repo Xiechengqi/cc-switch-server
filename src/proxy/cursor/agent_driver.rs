@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::domain::accounts::store::{Account, AccountStore};
-use crate::domain::failover::ProviderOutcome;
+use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
 use crate::domain::providers::model::ProviderType;
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
@@ -1574,28 +1574,38 @@ async fn resolve_cursor_credential(
 }
 
 fn cursor_api_key(stored: &StoredProvider, accounts: &AccountStore) -> Result<String, ProxyError> {
-    setting(
-        &stored.provider,
-        &[
-            "CURSOR_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "API_KEY",
-        ],
-    )
-    .or_else(|| {
-        let account_id = stored
-            .provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.auth_binding.as_ref())
-            .and_then(|binding| binding.account_id.as_deref());
-        accounts
-            .find_for_provider(ProviderType::CursorApiKey, account_id)
-            .and_then(account_api_key)
-    })
-    .ok_or_else(|| ProxyError::bad_request("Cursor API key is required"))
+    stored
+        .provider
+        .settings_config
+        .get("apiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            setting(
+                &stored.provider,
+                &[
+                    "CURSOR_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_API_KEY",
+                    "OPENAI_API_KEY",
+                    "API_KEY",
+                ],
+            )
+        })
+        .or_else(|| {
+            let account_id = stored
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.account_id.as_deref());
+            accounts
+                .find_for_provider(ProviderType::CursorApiKey, account_id)
+                .and_then(account_api_key)
+        })
+        .ok_or_else(|| ProxyError::bad_request("Cursor API key is required"))
 }
 
 fn account_api_key(account: &Account) -> Option<String> {

@@ -60,6 +60,11 @@ export interface WebRuntimeContext {
   status?: string;
   permissions?: string[];
   apps?: string[];
+  providerContract?: {
+    version: number;
+    minSupported: number;
+    maxSupported: number;
+  };
   auth?: {
     authenticated?: boolean;
     setupRequired?: boolean;
@@ -76,6 +81,7 @@ export interface WebRuntimeContext {
     configDir?: string;
     webDistDir?: string | null;
     embeddedWebAssets?: number;
+    enableWebTerminal?: boolean;
   };
   features?: {
     retained?: WebRuntimeFeature[];
@@ -100,6 +106,8 @@ export class HttpResponseError extends Error {
 
 const TOKEN_KEY = "cc_switch_server_token";
 const PASSWORD_KEY = "cc_switch_server_password";
+export const PROVIDER_CONTRACT_VERSION = 2;
+const PROVIDER_CONTRACT_HEADER = "x-cc-switch-provider-contract-version";
 
 export function readToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
@@ -194,10 +202,13 @@ export async function apiFetch(
   init: RequestInit = {},
 ): Promise<Response> {
   assertClientTunnelCompatiblePath(input);
+  const headers = new Headers(init.headers || {});
+  headers.set(PROVIDER_CONTRACT_HEADER, String(PROVIDER_CONTRACT_VERSION));
+  const requestInit = { ...init, headers };
   if (isRemoteWebMode()) {
-    return routerAuthFetch(input, init);
+    return routerAuthFetch(input, requestInit);
   }
-  return localApiFetch(input, init);
+  return localApiFetch(input, requestInit);
 }
 
 export async function jsonFetch<T>(

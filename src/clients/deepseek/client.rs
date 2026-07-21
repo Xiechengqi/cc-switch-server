@@ -32,10 +32,13 @@ impl DeepSeekWebClient {
 
     pub fn with_api_base(api_base: impl Into<String>) -> Self {
         Self {
-            http: Client::builder()
+            http: crate::infra::http::direct_client_builder()
                 .user_agent("DeepSeek/2.0.4 Android/35")
                 .build()
-                .unwrap_or_else(|_| Client::new()),
+                .unwrap_or_else(|_| {
+                    crate::infra::http::direct_client()
+                        .expect("default direct HTTP client must build")
+                }),
             api_base: api_base.into().trim_end_matches('/').to_string(),
         }
     }

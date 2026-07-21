@@ -1,6 +1,11 @@
+pub mod credentials;
 pub mod current_provider;
 pub mod matrix;
 pub mod migrate;
 pub mod model;
 pub mod model_routing;
+pub mod registry;
+pub mod runtime;
+pub mod storage_migration;
 pub mod store;
+mod store_v2;

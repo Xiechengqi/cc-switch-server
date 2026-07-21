@@ -30,6 +30,7 @@ interface AntigravityOAuthSectionProps {
   onAccountSelect?: (accountId: string | null) => void;
   showLoggedInAccounts?: boolean;
   allowDefaultAccountOption?: boolean;
+  authProvider?: "antigravity_oauth" | "agy_oauth";
 }
 
 export const AntigravityOAuthSection: React.FC<
@@ -40,6 +41,7 @@ export const AntigravityOAuthSection: React.FC<
   onAccountSelect,
   showLoggedInAccounts = false,
   allowDefaultAccountOption = true,
+  authProvider = "antigravity_oauth",
 }) => {
   const { t } = useTranslation();
   const [copied, setCopied] = React.useState(false);
@@ -59,7 +61,7 @@ export const AntigravityOAuthSection: React.FC<
     logout,
     removeAccount,
     setDefaultAccount,
-  } = useAntigravityOauth();
+  } = useAntigravityOauth(authProvider);
 
   const handleAccountSelect = (value: string) => {
     onAccountSelect?.(value === "none" ? null : value);

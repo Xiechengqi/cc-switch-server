@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
 import { toast } from "sonner";
@@ -8,12 +15,12 @@ import {
   Settings,
   Share2,
   ShieldCheck,
+  Terminal,
 } from "lucide-react";
 import type { Provider } from "@/types";
-import type { AppId } from "@/lib/api";
-import { useProvidersQuery, useSettingsQuery } from "@/lib/query";
+import { useProvidersQuery } from "@/lib/query";
 import { useProxyStatus, useProxyTakeoverStatus } from "@/lib/query/proxy";
-import { useProviderActions } from "@/hooks/useProviderActions";
+import { useServerProviderActions } from "@/server/providers/useServerProviderActions";
 import { useOauthQuotaRefreshBridge } from "@/hooks/useOauthQuotaRefreshBridge";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -31,6 +38,11 @@ import {
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
+import type {
+  ProviderCredentialPatches,
+  ProviderCustomBinding,
+} from "@/lib/api/providers";
+import type { CoreProviderApp } from "@/server/providerRegistry";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { AppSwitcher } from "@/components/AppSwitcher";
 import {
@@ -38,20 +50,21 @@ import {
   type SettingsTab,
 } from "@/components/settings/SettingsPage";
 import { SharePage } from "@/components/share/SharePage";
-import { FailoverToggle } from "@/components/proxy/FailoverToggle";
 import { Button } from "@/components/ui/button";
 import { SERVER_MAIN_APPS } from "@/lib/serverApps";
 
-type View = "providers" | "shares" | "settings";
+const TerminalPage = lazy(() => import("@/components/terminal/TerminalPage"));
+
+type View = "providers" | "shares" | "settings" | "terminal";
 
 const VIEW_STORAGE_KEY = "cc-switch-server-view";
 const APP_STORAGE_KEY = "cc-switch-active-app";
 
-function isServerApp(value: string | null): value is AppId {
+function isServerApp(value: string | null): value is CoreProviderApp {
   return value === "claude" || value === "codex" || value === "gemini";
 }
 
-function getInitialApp(): AppId {
+function getInitialApp(): CoreProviderApp {
   const stored = localStorage.getItem(APP_STORAGE_KEY);
   if (isServerApp(stored)) {
     return stored;
@@ -59,8 +72,11 @@ function getInitialApp(): AppId {
   return "claude";
 }
 
-function getInitialView(): View {
+function getInitialView(enableWebTerminal: boolean): View {
   const stored = localStorage.getItem(VIEW_STORAGE_KEY);
+  if (stored === "terminal") {
+    return enableWebTerminal ? "terminal" : "providers";
+  }
   if (stored === "providers" || stored === "shares" || stored === "settings") {
     return stored;
   }
@@ -69,13 +85,19 @@ function getInitialView(): View {
 
 interface ServerDesktopAppProps {
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
+  enableWebTerminal?: boolean;
 }
 
-export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = {}) {
+export default function ServerDesktopApp({
+  onSignOut,
+  enableWebTerminal = true,
+}: ServerDesktopAppProps = {}) {
   const { t } = useTranslation();
   useOauthQuotaRefreshBridge();
-  const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
-  const [currentView, setCurrentView] = useState<View>(getInitialView);
+  const [activeApp, setActiveApp] = useState<CoreProviderApp>(getInitialApp);
+  const [currentView, setCurrentView] = useState<View>(() =>
+    getInitialView(enableWebTerminal),
+  );
   const [settingsDefaultTab, setSettingsDefaultTab] =
     useState<SettingsTab>("general");
   const [isAddOpen, setIsAddOpen] = useState(false);
@@ -95,6 +117,12 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
     localStorage.setItem(APP_STORAGE_KEY, activeApp);
   }, [activeApp]);
 
+  useEffect(() => {
+    if (!enableWebTerminal && currentView === "terminal") {
+      setCurrentView("providers");
+    }
+  }, [enableWebTerminal, currentView]);
+
   const needsProviderData =
     currentView === "providers" || currentView === "shares";
   const needsProxyPolling = currentView === "providers";
@@ -106,21 +134,15 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
   const isProxyRunning = proxyStatus?.running ?? false;
 
   const isCurrentAppTakeoverActive = takeoverStatus?.[activeApp] ?? false;
-  const activeProviderId = useMemo(() => {
-    const target = proxyStatus?.active_targets?.find(
-      (item) => item.app_type === activeApp,
-    );
-    return target?.provider_id;
-  }, [proxyStatus?.active_targets, activeApp]);
-
   const { data, isLoading } = useProvidersQuery(activeApp, {
     isProxyRunning,
     enabled: needsProviderData,
   });
   const providers = useMemo(() => data?.providers ?? {}, [data]);
   const currentProviderId = data?.currentProviderId ?? "";
-
-  const { data: settingsData } = useSettingsQuery();
+  const editingProviderResource = effectiveEditingProvider
+    ? data?.resources[effectiveEditingProvider.id]
+    : undefined;
 
   const {
     addProvider,
@@ -128,11 +150,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
     switchProvider,
     clearCurrentProvider,
     deleteProvider,
-  } = useProviderActions(
-    activeApp,
-    isProxyRunning,
-    isProxyRunning && isCurrentAppTakeoverActive,
-  );
+  } = useServerProviderActions(activeApp);
 
   const handleOpenWebsite = useCallback(
     async (url: string) => {
@@ -150,11 +168,10 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
 
   const handleDuplicateProvider = useCallback(
     async (provider: Provider) => {
+      const resource = data?.resources[provider.id];
       const newSortIndex =
         provider.sortIndex !== undefined ? provider.sortIndex + 1 : undefined;
-      const duplicatedProvider: Omit<Provider, "id" | "createdAt"> & {
-        providerKey?: string;
-      } = {
+      const duplicatedProvider = {
         name: `${provider.name} copy`,
         settingsConfig: deepClone(provider.settingsConfig),
         websiteUrl: provider.websiteUrl,
@@ -163,21 +180,33 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
         meta: provider.meta ? deepClone(provider.meta) : undefined,
         icon: provider.icon,
         iconColor: provider.iconColor,
+        profileId: resource?.profileId,
+        customBinding: resource?.customBinding,
       };
       await addProvider(duplicatedProvider);
     },
-    [addProvider],
+    [addProvider, data?.resources],
   );
 
   const handleEditProvider = useCallback(
     async ({
       provider,
       originalId,
+      profileId,
+      customBinding,
+      credentialPatches,
     }: {
       provider: Provider;
       originalId?: string;
+      profileId?: string;
+      customBinding?: ProviderCustomBinding;
+      credentialPatches?: ProviderCredentialPatches;
     }) => {
-      await updateProvider(provider, originalId);
+      await updateProvider(provider, originalId, {
+        profileId,
+        customBinding,
+        credentialPatches,
+      });
       setEditingProvider(null);
     },
     [updateProvider],
@@ -207,21 +236,16 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
     setConfirmAction(null);
   }, [confirmAction, deleteProvider]);
 
-  const openSettings = useCallback(
-    (tab: SettingsTab) => {
-      setSettingsDefaultTab(tab);
-      setCurrentView("settings");
-    },
-    [],
-  );
+  const openSettings = useCallback((tab: SettingsTab) => {
+    setSettingsDefaultTab(tab);
+    setCurrentView("settings");
+  }, []);
 
   const addActionButtonClass =
     "bg-orange-500 hover:bg-orange-600 dark:bg-orange-500 dark:hover:bg-orange-600 text-white shadow-lg shadow-orange-500/30 dark:shadow-orange-500/40 rounded-full w-8 h-8";
 
   const isProviderHome =
-    currentView === "providers" &&
-    editingProvider === null &&
-    !isAddOpen;
+    currentView === "providers" && editingProvider === null && !isAddOpen;
 
   const content = (() => {
     switch (currentView) {
@@ -241,7 +265,12 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
           activeApp !== "gemini"
         ) {
           return (
-            <div className={cn(PAGE_SHELL_PADDING_X, "pt-2 text-sm text-muted-foreground")}>
+            <div
+              className={cn(
+                PAGE_SHELL_PADDING_X,
+                "pt-2 text-sm text-muted-foreground",
+              )}
+            >
               {t("share.unsupportedApp", {
                 defaultValue:
                   "{{app}} 暂不支持 share；请切换到 Claude / Codex / Gemini tab 后再创建 share。",
@@ -259,9 +288,31 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
             }}
           />
         );
+      case "terminal":
+        return (
+          <Suspense
+            fallback={
+              <div
+                className={cn(
+                  PAGE_SHELL_PADDING_X,
+                  "pt-4 text-sm text-muted-foreground",
+                )}
+              >
+                {t("common.loading")}
+              </div>
+            }
+          >
+            <TerminalPage onBackHome={() => setCurrentView("providers")} />
+          </Suspense>
+        );
       default:
         return (
-          <div className={cn(PAGE_SHELL_PADDING_X, "flex flex-col flex-1 min-h-0 overflow-hidden")}>
+          <div
+            className={cn(
+              PAGE_SHELL_PADDING_X,
+              "flex flex-col flex-1 min-h-0 overflow-hidden",
+            )}
+          >
             <div className="flex-1 overflow-y-auto overflow-x-hidden pb-10 sm:pb-12">
               <AnimatePresence mode="wait">
                 <motion.div
@@ -281,7 +332,6 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                     isProxyTakeover={
                       isProxyRunning && isCurrentAppTakeoverActive
                     }
-                    activeProviderId={activeProviderId}
                     onSwitch={switchProvider}
                     onClearCurrent={clearCurrentProvider}
                     onEdit={(provider) => setEditingProvider(provider)}
@@ -324,12 +374,14 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                   size="icon"
                   onClick={() => setCurrentView("providers")}
                   className="rounded-lg"
+                  title={t("common.back")}
                 >
                   <ArrowLeft className="w-4 h-4" />
                 </Button>
                 <h1 className="text-lg font-semibold truncate">
                   {currentView === "settings" && t("settings.title")}
                   {currentView === "shares" && t("share.title")}
+                  {currentView === "terminal" && t("terminal.title")}
                 </h1>
               </div>
             ) : (
@@ -356,6 +408,17 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
                 >
                   <Settings className="w-4 h-4" />
                 </Button>
+                {enableWebTerminal && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setCurrentView("terminal")}
+                    title={t("terminal.nav")}
+                    className="hover:bg-black/5 dark:hover:bg-white/5"
+                  >
+                    <Terminal className="w-4 h-4" />
+                  </Button>
+                )}
                 {isProviderHome && (
                   <>
                     <Button
@@ -384,16 +447,13 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
 
           {isProviderHome && (
             <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
-              {settingsData?.enableFailoverToggle === true && (
-                <div className="flex shrink-0 items-center gap-1.5">
-                  <FailoverToggle activeApp={activeApp} />
-                </div>
-              )}
               <div className="flex min-w-0 flex-1 items-center">
                 <div className="ml-auto flex shrink-0 items-center gap-1.5">
                   <AppSwitcher
                     activeApp={activeApp}
-                    onSwitch={setActiveApp}
+                    onSwitch={(app) => {
+                      if (isServerApp(app)) setActiveApp(app);
+                    }}
                     apps={SERVER_MAIN_APPS}
                   />
                   <Button
@@ -438,6 +498,7 @@ export default function ServerDesktopApp({ onSignOut }: ServerDesktopAppProps = 
       <EditProviderDialog
         open={Boolean(editingProvider)}
         provider={effectiveEditingProvider}
+        resource={editingProviderResource}
         appId={activeApp}
         isProxyTakeover={isProxyRunning && isCurrentAppTakeoverActive}
         onOpenChange={(open) => {

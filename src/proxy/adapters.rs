@@ -16,6 +16,8 @@ use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialK
 use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
+use crate::domain::providers::registry::UpstreamProtocol;
+use crate::domain::providers::runtime::ProviderRuntimePlan;
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::usage::store::{
     usage_from_json_with_semantics, InputTokenSemantics, TokenUsage,
@@ -362,6 +364,66 @@ impl GenericForwardingAdapter {
             route,
             custom_tool_names,
         ))
+    }
+}
+
+pub(super) fn resolve_runtime_endpoint_for_request(
+    plan: &ProviderRuntimePlan,
+    route: ProxyRoute,
+    gemini_path: Option<String>,
+    stored: &StoredProvider,
+    request: &AdapterRequest,
+) -> Result<String, ProxyError> {
+    if let Some(endpoint) = request.upstream_endpoint.as_ref() {
+        return Ok(endpoint.clone());
+    }
+    if plan.upstream_protocol == UpstreamProtocol::Legacy {
+        return adapter_for(stored.app, stored.provider_type).resolve_endpoint_for_request(
+            route,
+            gemini_path,
+            stored,
+            request,
+        );
+    }
+    let upstream_format = runtime_upstream_format(plan).ok_or_else(|| {
+        ProxyError::bad_request(format!(
+            "driver {} must provide a specialized upstream endpoint",
+            plan.driver_id
+        ))
+    })?;
+    let path = if plan.driver_id.as_str() == "special.copilot"
+        && upstream_format == UpstreamFormat::OpenAiChat
+    {
+        "/chat/completions".to_string()
+    } else {
+        upstream_path(upstream_format, route, gemini_path, request)
+    };
+    Ok(join_upstream_url(&plan.endpoint, &path))
+}
+
+pub(super) fn runtime_model_list_url(plan: &ProviderRuntimePlan) -> Option<String> {
+    let path = match plan.upstream_protocol {
+        UpstreamProtocol::AnthropicMessages
+        | UpstreamProtocol::OpenAiChat
+        | UpstreamProtocol::OpenAiResponses => "/v1/models",
+        UpstreamProtocol::GeminiNative => "/v1beta/models",
+        _ => return None,
+    };
+    Some(join_upstream_url(&plan.endpoint, path))
+}
+
+fn runtime_upstream_format(plan: &ProviderRuntimePlan) -> Option<UpstreamFormat> {
+    match plan.upstream_protocol {
+        UpstreamProtocol::AnthropicMessages => Some(UpstreamFormat::AnthropicMessages),
+        UpstreamProtocol::OpenAiChat => Some(UpstreamFormat::OpenAiChat),
+        UpstreamProtocol::OpenAiResponses => Some(UpstreamFormat::OpenAiResponses),
+        UpstreamProtocol::GeminiNative => Some(UpstreamFormat::GeminiNative),
+        UpstreamProtocol::Special => match plan.driver_id.as_str() {
+            "special.cursor" | "special.copilot" => Some(UpstreamFormat::OpenAiChat),
+            "special.antigravity" | "special.agy" => Some(UpstreamFormat::GeminiNative),
+            _ => None,
+        },
+        UpstreamProtocol::Bedrock | UpstreamProtocol::Custom | UpstreamProtocol::Legacy => None,
     }
 }
 
@@ -1425,6 +1487,9 @@ fn upstream_path(
     request: &AdapterRequest,
 ) -> String {
     match upstream_format {
+        UpstreamFormat::AnthropicMessages if route == ProxyRoute::ClaudeCountTokens => {
+            "/v1/messages/count_tokens".to_string()
+        }
         UpstreamFormat::AnthropicMessages => "/v1/messages".to_string(),
         UpstreamFormat::OpenAiResponses if route == ProxyRoute::CodexResponsesCompact => {
             "/v1/responses/compact".to_string()
@@ -1650,11 +1715,79 @@ fn apply_bedrock_forward_contract(
     if stored.app != AppKind::Claude || stored.provider_type != ProviderType::AwsBedrock {
         return Ok(());
     }
+    if stored.resource.profile_id.is_some() {
+        return Ok(());
+    }
     let (date_yyyymmdd, amz_date) = sigv4_dates_now();
     let signed = bedrock_sigv4_signed_request_parts(stored, request, &date_yyyymmdd, &amz_date)?;
     request.body = Bytes::from(signed.body);
     request.upstream_endpoint = Some(signed.endpoint);
     request.upstream_headers = signed.headers;
+    Ok(())
+}
+
+pub(super) fn finalize_runtime_request(
+    plan: &ProviderRuntimePlan,
+    stored: &StoredProvider,
+    request: &mut AdapterRequest,
+) -> Result<(), ProxyError> {
+    match plan.driver_id.as_str() {
+        "aws.bedrock_sigv4" => {
+            let (date_yyyymmdd, amz_date) = sigv4_dates_now();
+            let signed =
+                bedrock_sigv4_signed_request_parts(stored, request, &date_yyyymmdd, &amz_date)?;
+            request.body = Bytes::from(signed.body);
+            request.upstream_endpoint = Some(signed.endpoint);
+            request.upstream_headers = signed.headers;
+        }
+        "http.bedrock_bearer" => apply_bedrock_bearer_forward_contract(plan, request)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_bedrock_bearer_forward_contract(
+    plan: &ProviderRuntimePlan,
+    request: &mut AdapterRequest,
+) -> Result<(), ProxyError> {
+    let parsed = url::Url::parse(&plan.endpoint)
+        .map_err(|error| ProxyError::bad_request(format!("invalid Bedrock endpoint: {error}")))?;
+    if parsed.host_str().is_none() {
+        return Err(ProxyError::bad_request("Bedrock endpoint has no host"));
+    }
+    let model = request
+        .actual_model
+        .as_deref()
+        .or(request.model.as_deref())
+        .ok_or_else(|| ProxyError::bad_request("Bedrock model is required"))?;
+    let operation = if request.stream_requested {
+        "converse-stream"
+    } else {
+        "converse"
+    };
+    let path = format!(
+        "/model/{}/{}",
+        percent_encode_path_segment(model),
+        operation
+    );
+    let mut endpoint = parsed;
+    endpoint.set_path(&path);
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    let value = serde_json::from_slice::<Value>(&request.body).map_err(|error| {
+        ProxyError::bad_request(format!("bedrock converse body must be valid json: {error}"))
+    })?;
+    let value = bedrock_converse_body_from_anthropic(&value)?;
+    request.body = serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::bad_request(format!("encode Bedrock body failed: {error}")))?;
+    request.upstream_endpoint = Some(endpoint.to_string());
+    request.upstream_headers.retain(|(name, _)| {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "authorization" | "x-amz-date" | "x-amz-security-token"
+        )
+    });
     Ok(())
 }
 
@@ -2134,9 +2267,9 @@ fn apply_auth_headers(
                 headers.push(("chatgpt-account-id", account_id));
                 headers.push((
                     "originator",
-                    super::codex_identity::DEFAULT_CODEX_ORIGINATOR.to_string(),
+                    crate::codex_identity::DEFAULT_CODEX_ORIGINATOR.to_string(),
                 ));
-                headers.push(("version", super::codex_identity::configured_version()));
+                headers.push(("version", crate::codex_identity::configured_version()));
             }
         }
         AppKind::Gemini => {
@@ -2216,7 +2349,7 @@ fn apply_common_provider_headers(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
-                .unwrap_or_else(super::codex_identity::default_user_agent);
+                .unwrap_or_else(crate::codex_identity::default_user_agent);
             headers.push(("user-agent", user_agent));
         }
     } else if provider_type != ProviderType::GitHubCopilot {
@@ -3275,6 +3408,7 @@ mod tests {
             },
             provider_type,
             provider_type_id: provider_type.as_str().to_string(),
+            resource: Default::default(),
         }
     }
 
@@ -3285,6 +3419,7 @@ mod tests {
                 source: Some("account".to_string()),
                 auth_provider: Some("codex_oauth".to_string()),
                 account_id: Some(account_id.to_string()),
+                auth_identity_generation: None,
             }),
             ..Default::default()
         });
@@ -3299,6 +3434,8 @@ mod tests {
         crate::domain::accounts::store::Account {
             id: account_id.to_string(),
             provider_type: ProviderType::CodexOAuth,
+            auth_identity_generation: 1,
+            token_refresh_generation: 1,
             email: Some("codex@example.test".to_string()),
             access_token: Some(access_token.to_string()),
             refresh_token: Some("refresh-token".to_string()),
@@ -3418,6 +3555,7 @@ mod tests {
             },
             provider_type: ProviderType::Gemini,
             provider_type_id: "gemini".to_string(),
+            resource: Default::default(),
         };
 
         assert_adapter_contract(AdapterContract {
@@ -4669,6 +4807,7 @@ mod tests {
             },
             provider_type: ProviderType::OpenRouter,
             provider_type_id: "openrouter".to_string(),
+            resource: Default::default(),
         };
 
         let headers = adapter
@@ -4859,6 +4998,7 @@ mod tests {
             },
             provider_type: ProviderType::ClaudeAuth,
             provider_type_id: "claude_auth".to_string(),
+            resource: Default::default(),
         };
 
         let headers = adapter
@@ -4957,6 +5097,7 @@ mod tests {
             },
             provider_type: ProviderType::Codex,
             provider_type_id: "codex".to_string(),
+            resource: Default::default(),
         };
 
         assert_adapter_contract(AdapterContract {

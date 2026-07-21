@@ -111,6 +111,11 @@
     "noProvidersDescriptionSnippet": "Settings other than API key and endpoint (e.g. plugins) will be saved to a common config snippet for sharing across providers",
     "currentlyUsing": "Currently Using",
     "enable": "Enable",
+    "storageMigration": {
+      "title": "Provider credentials still use S1 storage",
+      "ready": "Preflight passed. Stop the service, then run cc-switch-server config migrate-provider-store --apply.",
+      "blocked": "S2 cutover is blocked because {{count}} Provider(s) still need identity or credential classification."
+    },
     "share": {
       "enable": "Share",
       "sharing": "Sharing",
@@ -286,11 +291,6 @@
     "proxy": {
       "title": "Enable Local Routing",
       "message": "Local routing is an advanced feature. Please make sure you understand how it works before enabling.\n\nWe recommend consulting the relevant documentation or your provider for proper configuration.",
-      "confirm": "I understand, enable"
-    },
-    "failover": {
-      "title": "Enable Failover",
-      "message": "Failover is an advanced feature. Please make sure you understand how it works before enabling.\n\nWe recommend configuring provider priorities in the failover queue first.",
       "confirm": "I understand, enable"
     },
     "unifyCodexHistory": {
@@ -555,12 +555,8 @@
         "description": "Manage storage paths for Claude, Codex and Gemini configurations"
       },
       "proxy": {
-        "title": "Local Routing",
-        "description": "Control routing service toggle, view status and port info",
-        "enableFeature": "Show Routing Toggle on Main Page",
-        "enableFeatureDescription": "When enabled, the routing and failover toggles will appear at the top of the main page",
-        "enableFailoverToggle": "Show Failover Toggle on Main Page",
-        "enableFailoverToggleDescription": "When enabled, the failover toggle will appear independently at the top of the main page",
+        "title": "API Routing",
+        "description": "View server API routing status and selected Providers",
         "running": "Running",
         "stopped": "Stopped"
       },
@@ -568,25 +564,13 @@
         "title": "Model Test Config",
         "description": "Configure default models and prompts for model testing"
       },
-      "failover": {
-        "title": "Auto Failover",
-        "description": "Configure failover queue and circuit breaker strategy"
-      },
       "pricing": {
         "title": "Cost Pricing",
         "description": "Manage token pricing rules for each model"
       },
-      "globalProxy": {
-        "title": "Global Outbound Proxy",
-        "description": "Configure proxy for CC Switch to access external APIs"
-      },
-      "data": {
-        "title": "Data Management",
-        "description": "Import and export local configuration data"
-      },
       "backup": {
         "title": "Backup & Restore",
-        "description": "Manage automatic backups, view and restore database snapshots"
+        "description": "Manage state snapshots for this installation; migrate hosts by copying the complete stopped data directory"
       },
       "cloudSync": {
         "title": "Cloud Sync",
@@ -680,26 +664,9 @@
     "themeLight": "Light",
     "themeDark": "Dark",
     "themeSystem": "System",
-    "importExport": "SQL Import/Export",
-    "importExportHint": "Import or export database SQL backups for migration or restore (import supports only backups exported by CC Switch).",
-    "exportConfig": "Export SQL Backup",
-    "selectConfigFile": "Select SQL File",
-    "noFileSelected": "No configuration file selected.",
-    "import": "Import",
-    "importing": "Importing...",
-    "importSuccess": "Import Successful!",
-    "importFailed": "Import Failed",
-    "syncLiveFailed": "Imported, but failed to sync to the current provider. Please reselect the provider manually.",
-    "importPartialSuccess": "Config imported, but failed to sync to the current provider.",
-    "importPartialHint": "Please manually reselect the provider to refresh the live configuration.",
-    "configExported": "Config exported to:",
-    "exportFailed": "Export failed",
-    "selectFileFailed": "Please choose a valid SQL backup file",
-    "configCorrupted": "SQL file may be corrupted or invalid",
-    "backupId": "Backup ID",
     "backupManager": {
-      "title": "Database Backups",
-      "description": "Automatic database snapshots for restoring to a previous state",
+      "title": "Server State Backups",
+      "description": "Snapshots for restoring this installation to a previous state; not for migration between hosts",
       "empty": "No backups yet",
       "restore": "Restore",
       "restoring": "Restoring...",
@@ -1082,8 +1049,6 @@
     "wslShellFlag": "Flag",
     "installCommandsCopied": "Install commands copied",
     "installCommandsCopyFailed": "Copy failed, please copy manually.",
-    "importFailedError": "Import config failed: {{message}}",
-    "exportFailedError": "Export config failed:",
     "restartRequired": "Restart Required",
     "restartRequiredMessage": "Modifying the CC Switch configuration directory requires restarting the application to take effect. Restart now?",
     "restartNow": "Restart Now",
@@ -1091,19 +1056,8 @@
     "restartFailed": "Application restart failed, please manually close and reopen.",
     "devModeRestartHint": "Dev Mode: Automatic restart not supported, please manually restart the application.",
     "saving": "Saving...",
+    "saveFailedGeneric": "Save failed, please try again",
     "globalProxy": {
-      "label": "Global Proxy",
-      "hint": "Proxy all requests (API, Skills download, etc.). When local routing is enabled, app traffic is also routed through this proxy. Leave empty for direct connection.",
-      "username": "Username (optional)",
-      "password": "Password (optional)",
-      "test": "Test Connection",
-      "scan": "Scan Local Proxies",
-      "clear": "Clear",
-      "scanFailed": "Scan failed: {{error}}",
-      "saved": "Proxy settings saved",
-      "saveFailed": "Save failed: {{error}}",
-      "testSuccess": "Connected! Latency {{latency}}ms",
-      "testFailed": "Connection failed: {{error}}",
       "pricingDefaultsTitle": "Pricing Defaults",
       "pricingDefaultsDescription": "Set the default multiplier and pricing model source per app.",
       "pricingAppLabel": "App",
@@ -1118,8 +1072,7 @@
       "pricingLoadFailed": "Failed to load pricing defaults: {{error}}",
       "defaultCostMultiplierRequired": "Default multiplier is required",
       "defaultCostMultiplierInvalid": "Invalid multiplier format"
-    },
-    "saveFailedGeneric": "Save failed, please try again"
+    }
   },
   "apps": {
     "claude": "Claude",
@@ -2568,23 +2521,8 @@
     "operational": "Operational",
     "degraded": "Degraded",
     "failed": "Failed",
-    "circuitOpen": "Circuit Open",
-    "consecutiveFailures": "{{count}} consecutive failures"
-  },
-  "failover": {
-    "enabled": "{{app}} failover enabled",
-    "disabled": "{{app}} failover disabled",
-    "toggleFailed": "Operation failed: {{detail}}",
-    "inQueue": "In queue",
-    "addQueue": "Add",
-    "priority": {
-      "tooltip": "Failover priority {{priority}}"
-    },
-    "tooltip": {
-      "routingRequired": "Local routing must be running before {{app}} failover can be enabled",
-      "enabled": "{{app}} failover enabled\nRequests follow queue priority (P1→P2→...)",
-      "disabled": "Enable {{app}} failover\nSwitches to queue P1 immediately, then falls back on failures"
-    }
+    "unavailable": "Unhealthy",
+    "failedRequests": "{{count}} failed requests"
   },
   "proxy": {
     "panel": {
@@ -2700,65 +2638,6 @@
         "inactive": "Route {{appLabel}}'s requests through local routing"
       }
     },
-    "failover": {
-      "proxyRequired": "Routing service must be started to configure failover",
-      "autoSwitch": "Auto Failover",
-      "autoSwitchDescription": "When enabled, switches to queue P1 immediately and automatically tries the next provider in the queue on failures"
-    },
-    "failoverQueue": {
-      "title": "Failover Queue",
-      "description": "Manage failover order for each app's providers",
-      "info": "When auto failover is enabled, requests follow the queue priority order (P1 first). On failures, the system will try the next provider in the queue.",
-      "selectProvider": "Select a provider to add to queue",
-      "noAvailableProviders": "No providers available to add",
-      "empty": "Failover queue is empty. Add providers to enable automatic failover.",
-      "orderHint": "Queue order matches the provider list order on the Home page. Reorder providers on the Home page to change priority.",
-      "dragHint": "Drag providers to adjust failover order. Lower numbers have higher priority.",
-      "toggleEnabled": "Enable/Disable",
-      "addSuccess": "Added to failover queue",
-      "addFailed": "Failed to add",
-      "removeSuccess": "Removed from failover queue",
-      "removeFailed": "Failed to remove",
-      "reorderSuccess": "Queue order updated",
-      "reorderFailed": "Failed to update order",
-      "toggleFailed": "Failed to update status"
-    },
-    "autoFailover": {
-      "info": "When the failover queue has multiple providers, the system will try them in priority order when requests fail. When a provider reaches the consecutive failure threshold, the circuit breaker will open and skip it temporarily.",
-      "configSaved": "Auto failover config saved",
-      "configSaveFailed": "Failed to save",
-      "validationFailed": "The following fields are out of valid range: {{fields}}",
-      "retrySettings": "Retry & Timeout Settings",
-      "failureThreshold": "Failure Threshold",
-      "failureThresholdHint": "Open circuit breaker after this many consecutive failures (recommended: 3-10)",
-      "timeout": "Recovery Wait Time (seconds)",
-      "timeoutHint": "Wait this long before trying to recover after circuit opens (recommended: 30-120)",
-      "circuitBreakerSettings": "Circuit Breaker Settings",
-      "successThreshold": "Recovery Success Threshold",
-      "successThresholdHint": "Close circuit breaker after this many successes in half-open state",
-      "errorRate": "Error Rate Threshold (%)",
-      "errorRateHint": "Open circuit breaker when error rate exceeds this value",
-      "minRequests": "Minimum Requests",
-      "minRequestsHint": "Minimum requests before calculating error rate",
-      "explanationTitle": "How It Works",
-      "failureThresholdLabel": "Failure Threshold",
-      "failureThresholdExplain": "Circuit breaker opens after this many consecutive failures, making the provider temporarily unavailable",
-      "timeoutLabel": "Recovery Wait Time",
-      "timeoutExplain": "After circuit opens, wait this long before trying half-open state",
-      "successThresholdLabel": "Recovery Success Threshold",
-      "successThresholdExplain": "In half-open state, close circuit breaker after this many successes, making provider available again",
-      "errorRateLabel": "Error Rate Threshold",
-      "errorRateExplain": "Open circuit breaker when error rate exceeds this value, even if failure threshold not reached",
-      "maxRetries": "Max Retries",
-      "timeoutSettings": "Timeout Settings",
-      "streamingFirstByte": "Streaming First Byte Timeout",
-      "streamingIdle": "Streaming Idle Timeout",
-      "nonStreaming": "Non-Streaming Timeout",
-      "maxRetriesHint": "Number of retries on request failure (0-10)",
-      "streamingFirstByteHint": "Max time to wait for first data chunk, range 1-120s, default 60s",
-      "streamingIdleHint": "Max interval between data chunks, range 60-600s, 0 to disable (prevents mid-stream stalls)",
-      "nonStreamingHint": "Total timeout for non-streaming requests, range 60-1200s, default 600s (10 min)"
-    },
     "logging": {
       "enabled": "Logging enabled",
       "disabled": "Logging disabled",
@@ -2814,45 +2693,7 @@
   "proxyConfig": {
     "proxyEnabled": "Local Routing",
     "appTakeover": "App Routing",
-    "perAppConfig": "Per-App Config",
-    "circuitBreaker": "Circuit Breaker",
-    "circuitBreakerSettings": "Circuit Breaker Settings",
-    "failureThreshold": "Failure Threshold",
-    "successThreshold": "Success Threshold",
-    "recoveryTimeout": "Recovery Timeout",
-    "errorRateThreshold": "Error Rate Threshold",
-    "minRequests": "Min Requests",
-    "timeoutConfig": "Timeout Config",
-    "streamingFirstByte": "Streaming First Byte Timeout",
-    "streamingIdle": "Streaming Idle Timeout",
-    "nonStreaming": "Non-Streaming Timeout"
-  },
-  "circuitBreaker": {
-    "failureThreshold": "Failure Threshold",
-    "successThreshold": "Success Threshold",
-    "timeoutSeconds": "Timeout (seconds)",
-    "errorRateThreshold": "Error Rate Threshold (%)",
-    "minRequests": "Minimum Requests",
-    "validationFailed": "The following fields are out of valid range: {{fields}}",
-    "configSaved": "Circuit breaker configuration saved",
-    "saveFailed": "Save failed",
-    "loading": "Loading...",
-    "title": "Circuit Breaker Configuration",
-    "description": "Adjust circuit breaker parameters to control fault detection and recovery behavior",
-    "failureThresholdHint": "How many consecutive failures trigger the circuit breaker",
-    "timeoutSecondsHint": "How long to wait before attempting recovery (half-open state)",
-    "successThresholdHint": "How many successes in half-open state to close the circuit breaker",
-    "errorRateThresholdHint": "Open circuit breaker when error rate exceeds this value",
-    "minRequestsHint": "Minimum requests before calculating error rate",
-    "saveConfig": "Save Configuration",
-    "instructionsTitle": "Configuration Instructions",
-    "instructions": {
-      "failureThreshold": "Circuit breaker opens when consecutive failures reach this count",
-      "timeout": "After circuit breaker opens, wait this time before attempting half-open",
-      "successThreshold": "In half-open state, close circuit breaker when successes reach this count",
-      "errorRate": "Circuit breaker opens when error rate exceeds this value",
-      "minRequests": "Error rate is only calculated after request count reaches this value"
-    }
+    "perAppConfig": "Per-App Config"
   },
   "omo": {
     "editProfile": "Edit OMO Config",
@@ -3397,7 +3238,7 @@
     "grokSpendingLimit": "Spending Limit",
     "expiryUnknown": "Expiration unknown",
     "expiresIn": "Expires in {{time}}",
-    "expired": "Expired",
+    "expired": "Session expired",
     "expiryNotProvided": "Subscription expiry not provided upstream",
     "expiryManualNotSet": "Subscription expiry not set",
     "expiryUnavailable": "Subscription expiry is temporarily unavailable",
@@ -3408,9 +3249,26 @@
     "utilization": "{{value}}%",
     "resetsIn": "Resets in {{time}}",
     "extraUsage": "Extra Usage",
-    "expired": "Session expired",
     "expiredHint": "Run the {{tool}} command to refresh your login",
     "queryFailed": "Query failed",
     "refresh": "Refresh"
+  },
+  "terminal": {
+    "title": "Ops Terminal",
+    "nav": "Terminal",
+    "backHome": "Back to home",
+    "subtitle": "Server runtime environment",
+    "placeholderTitle": "Connecting ops terminal",
+    "placeholderBody": "Leaving this page does not stop running commands; re-enter to restore recent output.",
+    "authRequired": "Sign in to use the ops terminal",
+    "sessionEnded": "Session ended",
+    "unknownError": "Terminal error",
+    "connectionFailed": "Terminal connection failed",
+    "statusConnecting": "Connecting",
+    "statusReplaying": "Restoring history",
+    "statusLive": "Connected",
+    "statusClosed": "Disconnected",
+    "statusError": "Error",
+    "endSession": "End session"
   }
 }

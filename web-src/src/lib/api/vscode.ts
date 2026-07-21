@@ -70,25 +70,4 @@ export const vscodeApi = {
     });
   },
 
-  async exportConfigToFile(filePath: string) {
-    return await invokeCommand("export_config_to_file", {
-      filePath,
-    });
-  },
-
-  async importConfigFromFile(filePath: string) {
-    return await invokeCommand("import_config_from_file", {
-      filePath,
-    });
-  },
-
-  async saveFileDialog(defaultName: string): Promise<string | null> {
-    return await invokeCommand("save_file_dialog", {
-      defaultName,
-    });
-  },
-
-  async openFileDialog(): Promise<string | null> {
-    return await invokeCommand("open_file_dialog");
-  },
 };

@@ -7,6 +7,7 @@ export type ManagedAuthProvider =
   | "claude_oauth"
   | "google_gemini_oauth"
   | "antigravity_oauth"
+  | "agy_oauth"
   | "cursor_oauth"
   | "kiro_oauth";
 
@@ -125,6 +126,7 @@ const LOCAL_CALLBACK_AUTH_PROVIDERS = new Set<ManagedAuthProvider>([
   "grok_oauth",
   "google_gemini_oauth",
   "antigravity_oauth",
+  "agy_oauth",
 ]);
 
 function isLoopbackHostname(hostname: string): boolean {

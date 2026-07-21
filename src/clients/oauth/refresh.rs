@@ -718,6 +718,8 @@ mod tests {
         Account {
             id: "acct-1".to_string(),
             provider_type,
+            auth_identity_generation: 1,
+            token_refresh_generation: 1,
             email: Some("test@example.com".to_string()),
             access_token: access_token.map(str::to_string),
             refresh_token: refresh_token.map(str::to_string),

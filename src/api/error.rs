@@ -80,6 +80,16 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn provider_contract_mismatch(error: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: error.into(),
+            code: Some("cc_switch_provider_contract_mismatch"),
+            error_type: Some("provider_contract_mismatch"),
+            retryable: Some(false),
+        }
+    }
+
     pub(crate) fn not_implemented(error: impl std::fmt::Display) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, error.to_string())
     }

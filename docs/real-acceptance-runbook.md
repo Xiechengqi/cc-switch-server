@@ -62,6 +62,37 @@ scripts/smoke/share-market-grant-smoke.sh
 RUN_REAL=1 scripts/release-readiness.sh
 ```
 
+## Provider Store Migration Acceptance
+
+Do not run the write steps against a production data directory until the Server
+has been stopped and a complete directory backup exists.
+
+1. Run `cc-switch-server --config-dir "$CONFIG_DIR" config migrate-provider-store`
+   while the service is running. It must be read-only and report S1/S2 format,
+   blocker count, key source, and RuntimePlan parity without changing
+   `providers.json` or creating `accounts.key`.
+2. For an eligible S1 fixture, stop the Server and run the same command with
+   `--apply`. Confirm the guarded S2 file contains no known plaintext Provider
+   credential, every Provider recompiles to the same RuntimePlan, and the S1
+   snapshot remains under `provider-migrations/s1-to-s2/`.
+3. Attempt `--apply`, `--rollback`, and `--cleanup-snapshot` while another Server
+   owns the data-directory lock. Each write action must fail before changing a
+   live file.
+4. Stop the Server and run `--rollback`; confirm the exact S1 bytes are restored
+   and the previous bridge binary can parse them. Re-apply S2 before continuing
+   forward acceptance.
+5. Stage an S2 backup with a wrong/missing root key. Restore must fail before live
+   replacement. With the matching `accounts.key` or
+   `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY`, restore must decrypt credentials
+   and compile every Provider RuntimePlan before replacement.
+6. Do not run `--cleanup-snapshot` or remove compatibility readers until
+   `assets/contract/provider-compatibility-window.json` records two stable bridge
+   releases and at least 14 observation days.
+
+Record only format, counts, blocker codes, key source category, short reference
+fingerprint, and pass/fail state. Never record an envelope, root key, or plaintext
+credential.
+
 ## 必需变量
 
 ### server 基础
@@ -147,7 +178,7 @@ Claude OAuth 专项补充：
 2. 新建 Claude 授权 URL 必须包含 `prompt=login`，避免多账号浏览器会话抢占。
 3. Claude proxy 请求应携带 CLI header set、基于首条 user 文本稳定合成的 `x-claude-code-session-id`，并在无客户端 `metadata.user_id` 时注入 server 合成值。
 4. `anthropic-beta` 应按请求形状出现：基础请求只带 Claude Code/OAuth beta；含 `thinking`、streaming tools 或 computer-use tool 时才追加对应 beta；messages 与 profile/usage 请求的 Claude CLI UA 应保持同一版本，CCH `cc_entrypoint` 默认应为 `cli`。
-5. 上游 429 带 `anthropic-ratelimit-unified-reset` 时，failover breaker 的 open 窗口应按该时间生效；无 header 时回退默认 open duration。
+5. 上游 429 时应记录 Provider rate-limited outcome、保留审计过的 rate-limit 响应头，并在同一请求重试预算内始终固定当前 Provider；不得切到其它 Provider。
 6. Claude SSE 中出现 `event:error` 且类型为 `rate_limit_error`、`overloaded_error` 或 `api_error` 时，应记录 provider failure；若 error 是首个上游 chunk，应在 3 次/10s 预算内透明重试；已开始输出的流不做透明重放。
 7. 非 Claude Code 客户端请求应被改写为 billing/identity system blocks，原 system 迁移到首条 user message，并重算 CCH。
 8. 上游 400 signature/thinking 错误应触发反应式降级重试：thinking block 降为 text；工具签名错误时 tool_use/tool_result 降为 text；web_search 历史块错误时剥离历史 server_tool_use/web_search_tool_result。
@@ -164,8 +195,8 @@ Claude OAuth 专项补充：
 19. `POST /v1/messages/count_tokens` 与 `/claude/v1/messages/count_tokens` 应只选择 `claude`、`claude_auth`、`claude_oauth`；OAuth 抓包应包含 token-counting beta、无 generation 字段且 CCH 对最终 body 有效。Codex/Gemini/OpenRouter provider 必须被拒绝，成功响应的 `input_tokens` 原样返回且不产生生成 usage。
 20. Responses/Chat 上游转 Anthropic stream 时，使用两个并行工具和 packed `function_call_arguments.done` 验证每个 block 只 start/stop 一次、arguments 不丢不重；分别以 CRLF、多事件同 chunk、JSON 每个切分点和 EOF 半帧注入，已输出后的错误不得重放请求。
 21. profile refresh 后 `organization.billing_type` 应进入 `profile.billingSource`；Apple/Stripe 不应改变 plan 或生成订阅到期日，未知 billing type 应原样保留。
-22. 连续 `invalid_grant` 达到 `CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 阈值后，账号应显示 `relogin` 并退出自动选号；网络错误、限流和普通 quota 错误不得累计该计数，手工 refresh 成功后状态应清零。
-23. `GET /metrics` 应能看到账号 inflight/max、Claude retry、breaker、warm-refresh、CLI version-gate、beta decision、count_tokens outcome 与 stream protocol error 指标；labels 必须保持固定枚举。该端点默认无鉴权，公网部署必须由反向代理或网络策略限制抓取来源。
+22. 连续 `invalid_grant` 达到 `CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 阈值后，账号应显示 `relogin` 并退出其固定 Provider 内的账号调度；网络错误、限流和普通 quota 错误不得累计该计数，手工 refresh 成功后状态应清零。
+23. `GET /metrics` 应能看到账号 inflight/max、Claude retry、Provider outcome、warm-refresh、CLI version-gate、beta decision、count_tokens outcome 与 stream protocol error 指标；labels 必须保持固定枚举。该端点默认无鉴权，公网部署必须由反向代理或网络策略限制抓取来源。
 
 Cursor/Copilot/Kiro/Bedrock 的真实验收变量已经接入 `scripts/smoke/real-acceptance-env-check.sh` 的 AB7 gate 和 `scripts/smoke/oauth-readiness-check.sh` 的脱敏 evidence。变量齐备只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。
 

@@ -32,7 +32,6 @@ use cc_switch_server::cli::Cli;
 use cc_switch_server::domain::accounts::store::{
     AccountQuota, AccountRefreshUpdate, UpsertAccountInput,
 };
-use cc_switch_server::domain::failover::UpdateFailoverAppInput;
 use cc_switch_server::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
 };
@@ -44,16 +43,17 @@ use cc_switch_server::state::{ServerState, ServerStateInner};
 
 async fn upsert_test_provider(state: &ServerState, app: AppKind, provider: Provider) {
     state
-        .mutate_providers(|providers| {
+        .mutate_providers_immediate(move |providers| {
             providers.upsert(app, provider);
         })
-        .await;
+        .await
+        .unwrap();
 }
 
 async fn providers_snapshot(
     state: &ServerState,
 ) -> cc_switch_server::domain::providers::store::ProviderStore {
-    state.mutate_providers(|providers| providers.clone()).await
+    state.providers_snapshot().await
 }
 
 #[tokio::test]
@@ -515,6 +515,7 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("cursor_oauth".to_string()),
                     account_id: Some("acct-cursor".to_string()),
+                    auth_identity_generation: None,
                 }),
                 provider_type: Some("cursor_oauth".to_string()),
                 ..Default::default()
@@ -841,6 +842,24 @@ async fn oauth_login_cancel_is_authenticated_idempotent_and_terminal() {
 #[tokio::test]
 async fn share_market_grant_route_updates_snapshot_and_can_clear_status() {
     let state = test_state();
+    upsert_test_provider(
+        &state,
+        AppKind::Codex,
+        Provider {
+            id: "p1".to_string(),
+            name: "Grant Provider".to_string(),
+            settings_config: json!({
+                "env": {
+                    "OPENAI_BASE_URL": "https://api.openai.com",
+                    "OPENAI_API_KEY": "grant-test-secret"
+                }
+            }),
+            category: None,
+            meta: None,
+            extra: Default::default(),
+        },
+    )
+    .await;
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
 
@@ -999,7 +1018,7 @@ async fn provider_network_test_reports_redacted_upstream_4xx_body() {
     let response = app
         .oneshot(json_request(
             Method::POST,
-            "/api/providers/codex-network-test/test?network=true",
+            "/api/providers/codex-network-test/test?app=codex&network=true",
             json!(null),
             Some(&token),
         ))
@@ -1066,7 +1085,7 @@ async fn provider_network_test_covers_4xx_5xx_and_empty_bodies() {
     let response = app
         .oneshot(json_request(
             Method::POST,
-            "/api/providers/codex-provider-test/test?network=true",
+            "/api/providers/codex-provider-test/test?app=codex&network=true",
             json!(null),
             Some(&token),
         ))
@@ -1123,7 +1142,7 @@ async fn provider_network_test_timeout_is_configurable_and_redacted() {
     let response = app
         .oneshot(json_request(
             Method::POST,
-            "/api/providers/codex-provider-timeout/test?network=true&timeoutMs=25",
+            "/api/providers/codex-provider-timeout/test?app=codex&network=true&timeoutMs=25",
             json!(null),
             Some(&token),
         ))
@@ -1257,6 +1276,7 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("github_copilot".to_string()),
                     account_id: Some("acct-copilot".to_string()),
+                    auth_identity_generation: None,
                 }),
                 ..Default::default()
             }),
@@ -1413,6 +1433,7 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("kiro_oauth".to_string()),
                     account_id: Some("acct-kiro".to_string()),
+                    auth_identity_generation: None,
                 }),
                 ..Default::default()
             }),
@@ -1585,6 +1606,7 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("kiro_oauth".to_string()),
                     account_id: Some("acct-kiro-stream".to_string()),
+                    auth_identity_generation: None,
                 }),
                 ..Default::default()
             }),
@@ -1866,7 +1888,7 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
 }
 
 #[tokio::test]
-async fn claude_transport_failure_retries_unpinned_provider_before_response_commit() {
+async fn claude_transport_failure_does_not_switch_provider_before_response_commit() {
     let closed_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -1877,28 +1899,34 @@ async fn claude_transport_failure_retries_unpinned_provider_before_response_comm
         .await
         .unwrap();
     let upstream_addr = listener.local_addr().unwrap();
+    let live_requests = Arc::new(AtomicUsize::new(0));
+    let live_requests_for_route = Arc::clone(&live_requests);
     let upstream = Router::new().route(
         "/v1/messages",
-        post(|| async {
-            (
-                StatusCode::OK,
-                [
-                    ("content-type", "application/json"),
-                    ("x-request-id", "req-failover"),
-                    ("anthropic-ratelimit-requests-remaining", "42"),
-                    ("set-cookie", "must-not-pass=1"),
-                ],
-                json!({
-                    "id": "msg-ok",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "claude-sonnet-4",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
-                    "usage": {"input_tokens": 2, "output_tokens": 1}
-                })
-                .to_string(),
-            )
+        post(move || {
+            let live_requests = Arc::clone(&live_requests_for_route);
+            async move {
+                live_requests.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    [
+                        ("content-type", "application/json"),
+                        ("x-request-id", "req-pinned-provider"),
+                        ("anthropic-ratelimit-requests-remaining", "42"),
+                        ("set-cookie", "must-not-pass=1"),
+                    ],
+                    json!({
+                        "id": "msg-ok",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 2, "output_tokens": 1}
+                    })
+                    .to_string(),
+                )
+            }
         }),
     );
     tokio::spawn(async move {
@@ -1929,25 +1957,12 @@ async fn claude_transport_failure_retries_unpinned_provider_before_response_comm
         )
         .await;
     }
-    let providers = providers_snapshot(&state).await;
     state
-        .mutate_failover(|failover| {
-            failover.update_app_config(
-                AppKind::Claude,
-                UpdateFailoverAppInput {
-                    enabled: Some(true),
-                    provider_queue: Some(vec![
-                        "claude-dead".to_string(),
-                        "claude-live".to_string(),
-                    ]),
-                    failure_threshold: Some(2),
-                    open_duration_ms: Some(60_000),
-                    half_open_max_probes: Some(1),
-                },
-                &providers,
-            );
-        })
-        .await;
+        .apply_ui_settings_patch_immediate(json!({
+            "currentProviderClaude": "claude-dead"
+        }))
+        .await
+        .unwrap();
 
     let response = app_router(state.clone())
         .oneshot(json_request(
@@ -1964,53 +1979,41 @@ async fn claude_transport_failure_retries_unpinned_provider_before_response_comm
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get("x-request-id").unwrap(),
-        "req-failover"
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("anthropic-ratelimit-requests-remaining")
-            .unwrap(),
-        "42"
-    );
-    assert!(!response.headers().contains_key("set-cookie"));
-    let body = json_body(response).await;
-    assert_eq!(body["id"], "msg-ok");
-
-    let usage = state.usage_snapshot().await;
-    assert_eq!(usage.logs.len(), 1);
-    assert_eq!(usage.logs[0].provider_id, "claude-live");
-    assert_eq!(usage.logs[0].input_tokens, Some(2));
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(live_requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn claude_rate_limit_body_read_failure_retries_before_response_commit() {
+async fn claude_rate_limit_body_read_failure_does_not_switch_provider() {
     let broken_addr =
         spawn_broken_chunked_status_upstream("429 Too Many Requests", "application/json").await;
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let live_addr = listener.local_addr().unwrap();
+    let live_requests = Arc::new(AtomicUsize::new(0));
+    let live_requests_for_route = Arc::clone(&live_requests);
     let upstream = Router::new().route(
         "/v1/messages",
-        post(|| async {
-            (
-                StatusCode::OK,
-                [("content-type", "application/json")],
-                json!({
-                    "id": "msg-after-429-read-error",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "claude-sonnet-4",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
-                    "usage": {"input_tokens": 2, "output_tokens": 1}
-                })
-                .to_string(),
-            )
+        post(move || {
+            let live_requests = Arc::clone(&live_requests_for_route);
+            async move {
+                live_requests.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    json!({
+                        "id": "msg-after-429-read-error",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 2, "output_tokens": 1}
+                    })
+                    .to_string(),
+                )
+            }
         }),
     );
     tokio::spawn(async move {
@@ -2041,25 +2044,12 @@ async fn claude_rate_limit_body_read_failure_retries_before_response_commit() {
         )
         .await;
     }
-    let providers = providers_snapshot(&state).await;
     state
-        .mutate_failover(|failover| {
-            failover.update_app_config(
-                AppKind::Claude,
-                UpdateFailoverAppInput {
-                    enabled: Some(true),
-                    provider_queue: Some(vec![
-                        "claude-broken-429".to_string(),
-                        "claude-live-after-429".to_string(),
-                    ]),
-                    failure_threshold: Some(2),
-                    open_duration_ms: Some(60_000),
-                    half_open_max_probes: Some(1),
-                },
-                &providers,
-            );
-        })
-        .await;
+        .apply_ui_settings_patch_immediate(json!({
+            "currentProviderClaude": "claude-broken-429"
+        }))
+        .await
+        .unwrap();
 
     let response = app_router(state.clone())
         .oneshot(json_request(
@@ -2076,11 +2066,8 @@ async fn claude_rate_limit_body_read_failure_retries_before_response_commit() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json_body(response).await["id"], "msg-after-429-read-error");
-    let usage = state.usage_snapshot().await;
-    assert_eq!(usage.logs.len(), 1);
-    assert_eq!(usage.logs[0].provider_id, "claude-live-after-429");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(live_requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -2841,7 +2828,7 @@ async fn provider_share_settings_are_saved_atomically() {
 
     let mut input = test_share_input("share-provider-save", "provider-save", ProviderType::Codex);
     input.tunnel_subdomain = Some("before-save".to_string());
-    state
+    let current = state
         .mutate_shares_immediate(|store| store.upsert(input).unwrap())
         .await
         .unwrap();
@@ -2853,6 +2840,7 @@ async fn provider_share_settings_are_saved_atomically() {
             json!({
                 "params": {
                     "shareId": "share-provider-save",
+                    "expectedConfigRevision": current.config_revision,
                     "ownerEmail": "forged@example.com",
                     "subdomain": "after-save",
                     "description": "Provider-scoped share",
@@ -2982,6 +2970,44 @@ async fn web_runtime_context_reports_setup_and_authenticated_admin() {
     assert_eq!(body["status"].as_str(), Some("authenticated"));
     assert_eq!(body["apps"].as_array().unwrap().len(), 3);
     assert!(body["commands"].as_array().unwrap().len() > 10);
+    assert_eq!(body["runtime"]["enableWebTerminal"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn web_terminal_routes_can_be_disabled_explicitly() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config_snapshot().await;
+    config.enable_web_terminal = false;
+    state.replace_config(config).await.unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/web-api/terminal/ws")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await;
+    assert_eq!(body["code"].as_str(), Some("cc_switch_feature_disabled"));
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/terminal/session/end",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -3541,7 +3567,7 @@ async fn web_invoke_get_providers_returns_desktop_record_shape() {
         },
     )
     .await;
-    let app = app_router(state);
+    let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
 
     let response = app
@@ -3557,6 +3583,36 @@ async fn web_invoke_get_providers_returns_desktop_record_shape() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     assert_eq!(body["codex-web"]["name"].as_str(), Some("Codex Web"));
+    assert_eq!(
+        body["codex-web"]["settingsConfig"]["env"]["OPENAI_API_KEY"].as_str(),
+        Some("__CC_SWITCH_SECRET_KEEP__")
+    );
+    assert!(!serde_json::to_string(&body).unwrap().contains("sk-test"));
+
+    let mut edited = body["codex-web"].clone();
+    edited["name"] = json!("Codex Web Renamed");
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/update_provider",
+            json!({"app": "codex", "provider": edited, "expectedRevision": 0}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = providers_snapshot(&state).await;
+    let stored = stored
+        .providers
+        .iter()
+        .find(|stored| stored.provider.id == "codex-web")
+        .unwrap();
+    assert_eq!(stored.provider.name, "Codex Web Renamed");
+    assert_eq!(
+        stored.provider.settings_config["env"]["OPENAI_API_KEY"],
+        json!("__CC_SWITCH_SECRET_KEEP__")
+    );
 
     let response = app
         .clone()
@@ -3606,6 +3662,1037 @@ async fn web_invoke_get_providers_returns_desktop_record_shape() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await.as_str(), Some(""));
+}
+
+#[tokio::test]
+async fn provider_registry_and_resource_views_publish_stable_identity() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    let registry = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/provider-registry",
+            Value::Null,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(registry.status(), StatusCode::OK);
+    let registry = json_body(registry).await;
+    assert_eq!(
+        registry["registry"]["format"],
+        "cc-switch-provider-registry"
+    );
+    assert_eq!(
+        registry["registry"]["profiles"].as_array().unwrap().len(),
+        38
+    );
+
+    let presets = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/provider-presets?app=codex",
+            Value::Null,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(presets.status(), StatusCode::OK);
+    let presets = json_body(presets).await;
+    let presets = presets["presets"].as_array().unwrap();
+    assert_eq!(presets.len(), 10);
+    assert!(presets
+        .iter()
+        .all(|preset| preset["profileId"].as_str().is_some()));
+    assert!(presets
+        .iter()
+        .any(|preset| preset["profileId"] == "codex.openai_api_key"));
+    assert!(presets
+        .iter()
+        .any(|preset| preset["profileId"] == "codex.custom_http"));
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/from-preset",
+            json!({
+                "app": "codex",
+                "profileId": "codex.openai_api_key",
+                "clientRequestId": "api-contract-create-openai-key",
+                "credentialPatches": {
+                    "/settingsConfig/apiKey": {
+                        "action": "replace",
+                        "value": "api-contract-openai-key"
+                    }
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await;
+    assert_eq!(created["stored"]["profileId"], "codex.openai_api_key");
+    assert_eq!(created["stored"]["profileSchemaRevision"], 1);
+    assert_eq!(created["stored"]["revision"], 1);
+    assert_eq!(created["stored"]["identity"]["status"], "bound");
+
+    let resources = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/get_provider_resources",
+            json!({"app": "codex"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resources.status(), StatusCode::OK);
+    let resources = json_body(resources).await;
+    assert_eq!(resources[0]["profileId"], "codex.openai_api_key");
+    assert_eq!(resources[0]["revision"], 1);
+}
+
+#[tokio::test]
+async fn every_create_allowed_provider_profile_has_a_working_creation_bridge() {
+    use cc_switch_server::domain::providers::registry::{
+        provider_registry, CreationPolicy, CredentialPolicy,
+    };
+
+    let state = test_state();
+    let mut managed_types = provider_registry()
+        .profiles
+        .iter()
+        .filter_map(|profile| match &profile.credential_policy {
+            CredentialPolicy::ManagedAccount {
+                account_provider_type,
+            } => Some(*account_provider_type),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    managed_types.sort_by_key(|provider_type| provider_type.as_str());
+    managed_types.dedup();
+    state
+        .mutate_accounts_immediate(move |accounts| {
+            for provider_type in managed_types {
+                accounts.upsert(test_account_input(
+                    &format!("profile-account-{}", provider_type.as_str()),
+                    provider_type,
+                ));
+            }
+        })
+        .await
+        .unwrap();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    for profile in provider_registry()
+        .profiles
+        .iter()
+        .filter(|profile| profile.creation_policy == CreationPolicy::CreateAllowed)
+    {
+        let request_id = format!(
+            "profile-create-{}",
+            profile.profile_id.as_str().replace('.', "-")
+        );
+        let account_id = match &profile.credential_policy {
+            CredentialPolicy::ManagedAccount {
+                account_provider_type,
+            } => Some(format!(
+                "profile-account-{}",
+                account_provider_type.as_str()
+            )),
+            _ => None,
+        };
+        let custom_binding = match profile.app {
+            AppKind::Claude => json!({
+                "upstreamProtocol": "anthropic_messages",
+                "authScheme": "api_key"
+            }),
+            AppKind::Codex => json!({
+                "upstreamProtocol": "open_ai_responses",
+                "authScheme": "api_key"
+            }),
+            AppKind::Gemini => json!({
+                "upstreamProtocol": "gemini_native",
+                "authScheme": "api_key"
+            }),
+        };
+        let credential_patches = match &profile.credential_policy {
+            CredentialPolicy::StaticSecret { .. } | CredentialPolicy::Custom => json!({
+                "/settingsConfig/apiKey": {
+                    "action": "replace",
+                    "value": format!("fixture-secret-{}", profile.profile_id.as_str())
+                }
+            }),
+            CredentialPolicy::Aws { .. } => json!({
+                "/settingsConfig/env/AWS_ACCESS_KEY_ID": {
+                    "action": "replace",
+                    "value": "AKIAFIXTURE12345678"
+                },
+                "/settingsConfig/env/AWS_SECRET_ACCESS_KEY": {
+                    "action": "replace",
+                    "value": "fixture-secret-access-key"
+                }
+            }),
+            _ => json!({}),
+        };
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/providers/from-preset",
+                json!({
+                    "app": profile.app,
+                    "profileId": profile.profile_id,
+                    "clientRequestId": request_id,
+                    "accountId": account_id,
+                    "customBinding": matches!(
+                        profile.driver_binding,
+                        cc_switch_server::domain::providers::registry::DriverBinding::Custom { .. }
+                    ).then_some(custom_binding),
+                    "credentialPatches": credential_patches,
+                }),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Profile {} could not be created: {body}",
+            profile.profile_id
+        );
+        assert_eq!(body["stored"]["profileId"], profile.profile_id.as_str());
+        assert_eq!(body["stored"]["app"], profile.app.as_str());
+    }
+}
+
+#[tokio::test]
+async fn provider_point_operations_use_app_scoped_provider_keys() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    for (provider_app, profile_id, name) in [
+        ("claude", "claude.custom_http", "Claude duplicate"),
+        ("codex", "codex.custom_http", "Codex duplicate"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/providers",
+                json!({
+                    "app": provider_app,
+                    "profileId": profile_id,
+                    "customBinding": {
+                        "upstreamProtocol": if provider_app == "claude" {
+                            "anthropic_messages"
+                        } else {
+                            "open_ai_responses"
+                        },
+                        "authScheme": "api_key"
+                    },
+                    "clientRequestId": format!("duplicate-key-create-{provider_app}"),
+                    "provider": {
+                        "id": "duplicate-id",
+                        "name": name,
+                        "settingsConfig": {},
+                    },
+                    "credentialPatches": {
+                        "/settingsConfig/apiKey": {
+                            "action": "replace",
+                            "value": format!("duplicate-key-{provider_app}")
+                        }
+                    }
+                }),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    for (provider_app, expected_name) in
+        [("claude", "Claude duplicate"), ("codex", "Codex duplicate")]
+    {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::GET,
+                &format!("/api/providers/duplicate-id?app={provider_app}"),
+                Value::Null,
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["provider"]["name"], expected_name);
+    }
+
+    let missing_app = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/providers/duplicate-id",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_app.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn external_web_provider_writes_require_matching_contract_version() {
+    let state = test_state_with_external_web_dist();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+    let provider = json!({
+        "id": "contract-provider",
+        "name": "Contract Provider",
+        "settingsConfig": {},
+    });
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/add_provider",
+            json!({"app": "codex", "provider": provider.clone()}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["code"].as_str(),
+        Some("cc_switch_provider_contract_mismatch")
+    );
+
+    let mut request = json_request(
+        Method::POST,
+        "/web-api/invoke/add_provider",
+        json!({"app": "codex", "provider": provider}),
+        Some(&token),
+    );
+    request.headers_mut().insert(
+        "x-cc-switch-provider-contract-version",
+        axum::http::HeaderValue::from_static("2"),
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn provider_rest_resource_uses_redacted_views_and_shared_write_command() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers",
+            json!({
+                "app": "claude",
+                "profileId": "claude.custom_http",
+                "customBinding": {
+                    "upstreamProtocol": "anthropic_messages",
+                    "authScheme": "bearer"
+                },
+                "clientRequestId": "rest-provider-create-request",
+                "provider": {
+                    "id": "rest-provider",
+                    "name": "REST Provider",
+                    "settingsConfig": {
+                        "env": {
+                            "ANTHROPIC_BASE_URL": "https://example.com",
+                            "ANTHROPIC_AUTH_TOKEN": "rest-secret",
+                            "ANTHROPIC_MODEL": "claude-sonnet-4-5"
+                        }
+                    }
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert!(!serde_json::to_string(&body)
+        .unwrap()
+        .contains("rest-secret"));
+    let mut provider = body["stored"]["provider"].clone();
+    let revision = body["stored"]["revision"].as_u64().unwrap();
+    provider["name"] = json!("REST Provider Renamed");
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/providers/rest-provider?app=claude",
+            json!({"provider": provider.clone(), "expectedRevision": revision}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = providers_snapshot(&state).await;
+    let stored = stored
+        .providers
+        .iter()
+        .find(|stored| stored.provider.id == "rest-provider")
+        .unwrap();
+    let delete_revision = stored.resource.revision;
+    assert_eq!(stored.provider.name, "REST Provider Renamed");
+    assert_eq!(
+        stored.provider.settings_config["env"]["ANTHROPIC_AUTH_TOKEN"],
+        json!("__CC_SWITCH_SECRET_KEEP__")
+    );
+    assert_eq!(stored.resource.credential_generation, 1);
+
+    let stale = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/providers/rest-provider?app=claude",
+            json!({"provider": provider, "expectedRevision": revision}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(stale).await["code"],
+        "cc_switch_provider_revision_conflict"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/providers/rest-provider?app=claude",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!serde_json::to_string(&json_body(response).await)
+        .unwrap()
+        .contains("rest-secret"));
+
+    for uri in [
+        "/api/providers?app=claude",
+        "/api/providers/export?app=claude",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::GET, uri, Value::Null, Some(&token)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let serialized = serde_json::to_string(&json_body(response).await).unwrap();
+        assert!(
+            !serialized.contains("rest-secret"),
+            "secret leaked from {uri}"
+        );
+    }
+
+    let response = app
+        .oneshot(json_request(
+            Method::DELETE,
+            &format!("/api/providers/rest-provider?app=claude&expectedRevision={delete_revision}"),
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(providers_snapshot(&state).await.providers.is_empty());
+}
+
+#[tokio::test]
+async fn provider_delete_preview_blocks_referenced_provider_without_cascading_share() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let provider = Provider {
+        id: "referenced-provider".to_string(),
+        name: "Referenced Provider".to_string(),
+        settings_config: json!({
+            "env": {
+                "OPENAI_BASE_URL": "https://api.openai.com/v1",
+                "OPENAI_API_KEY": "secret"
+            },
+            "modelMapping": {"mode": "passthrough"}
+        }),
+        category: None,
+        meta: None,
+        extra: Default::default(),
+    };
+    let stored = state
+        .upsert_provider_command(
+            AppKind::Codex,
+            provider,
+            Some(
+                cc_switch_server::domain::providers::registry::ProfileId::parse(
+                    "codex.openai_api_key",
+                )
+                .unwrap(),
+            ),
+            None,
+            Some("referenced-provider-create".to_string()),
+            Default::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let share = state
+        .mutate_shares_immediate(|shares| {
+            shares
+                .upsert(test_share_input(
+                    "share-referencing-provider",
+                    "referenced-provider",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+    let preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/providers/referenced-provider/delete-preview?app=codex",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(preview["preview"]["blocked"], true);
+    assert_eq!(
+        preview["preview"]["shareIds"],
+        json!(["share-referencing-provider"])
+    );
+
+    let response = app
+        .oneshot(json_request(
+            Method::DELETE,
+            &format!(
+                "/api/providers/referenced-provider?app=codex&expectedRevision={}",
+                stored.resource.revision
+            ),
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["code"],
+        "cc_switch_provider_in_use"
+    );
+    assert!(providers_snapshot(&state)
+        .await
+        .providers
+        .iter()
+        .any(|provider| provider.provider.id == "referenced-provider"));
+    assert_eq!(
+        state
+            .mutate_shares(|shares| shares.get(&share.id).cloned())
+            .await
+            .unwrap()
+            .id,
+        share.id
+    );
+}
+
+#[tokio::test]
+async fn provider_identity_actions_and_account_binding_migration_are_previewed_and_atomic() {
+    use cc_switch_server::domain::providers::registry::{
+        AuthScheme, CustomBindingInput, ProfileId, UpstreamProtocol,
+    };
+    use cc_switch_server::domain::providers::store::ProviderResourceMetadata;
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let legacy = Provider {
+        id: "legacy-openrouter".to_string(),
+        name: "OpenRouter".to_string(),
+        settings_config: json!({
+            "env": {
+                "OPENAI_BASE_URL": "https://openrouter.ai/api/v1",
+                "OPENAI_API_KEY": "legacy-secret"
+            },
+            "modelMapping": {"mode": "single", "upstreamModel": "openai/gpt-test"}
+        }),
+        category: None,
+        meta: Some(ProviderMeta {
+            provider_type: Some("openrouter".to_string()),
+            ..Default::default()
+        }),
+        extra: Default::default(),
+    };
+    let legacy = state
+        .upsert_provider_command(AppKind::Codex, legacy, None, None, None, Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/legacy-openrouter/adopt-profile?app=codex",
+            json!({
+                "mode": "preview",
+                "expectedRevision": legacy.resource.revision,
+                "profileId": "codex.openrouter"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(preview["preview"]["action"], "adopt_profile");
+    assert_eq!(
+        preview["preview"]["target"]["profileId"],
+        "codex.openrouter"
+    );
+    assert!(preview["stored"].is_null());
+    let adopt_token = preview["preview"]["previewToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let adopted = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/legacy-openrouter/adopt-profile?app=codex",
+            json!({
+                "mode": "apply",
+                "expectedRevision": legacy.resource.revision,
+                "profileId": "codex.openrouter",
+                "previewToken": adopt_token
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(adopted.status(), StatusCode::OK);
+    let adopted = json_body(adopted).await;
+    let adopted_revision = adopted["stored"]["revision"].as_u64().unwrap();
+    assert_eq!(adopted_revision, legacy.resource.revision + 1);
+
+    let clone_preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/legacy-openrouter/clone-as-custom?app=codex",
+            json!({
+                "mode": "preview",
+                "expectedRevision": adopted_revision,
+                "targetProviderId": "custom-clone",
+                "targetName": "Custom clone",
+                "customBinding": {
+                    "upstreamProtocol": "open_ai_responses",
+                    "authScheme": "api_key"
+                },
+                "clientRequestId": "clone-as-custom-request"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(clone_preview.status(), StatusCode::OK);
+    let clone_preview = json_body(clone_preview).await;
+    let clone_token = clone_preview["preview"]["previewToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cloned = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/legacy-openrouter/clone-as-custom?app=codex",
+            json!({
+                "mode": "apply",
+                "expectedRevision": adopted_revision,
+                "targetProviderId": "custom-clone",
+                "targetName": "Custom clone",
+                "customBinding": {
+                    "upstreamProtocol": "open_ai_responses",
+                    "authScheme": "api_key"
+                },
+                "clientRequestId": "clone-as-custom-request",
+                "previewToken": clone_token
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cloned.status(), StatusCode::OK);
+    let cloned = json_body(cloned).await;
+    assert_eq!(cloned["stored"]["profileId"], "codex.custom_http");
+    let clone_revision = cloned["stored"]["revision"].as_u64().unwrap();
+
+    let rebind_preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/custom-clone/rebind-custom?app=codex",
+            json!({
+                "mode": "preview",
+                "expectedRevision": clone_revision,
+                "customBinding": {
+                    "upstreamProtocol": "open_ai_chat",
+                    "authScheme": "api_key"
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rebind_preview.status(), StatusCode::OK);
+    let rebind_preview = json_body(rebind_preview).await;
+    assert_eq!(
+        rebind_preview["preview"]["runtime"]["fingerprintChanged"],
+        true
+    );
+    let rebind_token = rebind_preview["preview"]["previewToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rebound = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/custom-clone/rebind-custom?app=codex",
+            json!({
+                "mode": "apply",
+                "expectedRevision": clone_revision,
+                "customBinding": {
+                    "upstreamProtocol": "open_ai_chat",
+                    "authScheme": "api_key"
+                },
+                "previewToken": rebind_token
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rebound.status(), StatusCode::OK);
+
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.accounts.push(
+                serde_json::from_value(json!({
+                    "id": "historical-codex-account",
+                    "providerType": "codex_oauth"
+                }))
+                .unwrap(),
+            );
+        })
+        .await
+        .unwrap();
+    state
+        .mutate_providers_immediate(|providers| {
+            providers.upsert_with_resource(
+                AppKind::Codex,
+                Provider {
+                    id: "historical-managed".to_string(),
+                    name: "OpenAI OAuth".to_string(),
+                    settings_config: json!({}),
+                    category: None,
+                    meta: Some(ProviderMeta {
+                        provider_type: Some("codex_oauth".to_string()),
+                        ..Default::default()
+                    }),
+                    extra: Default::default(),
+                },
+                ProviderResourceMetadata {
+                    profile_id: Some(ProfileId::parse("codex.openai_oauth").unwrap()),
+                    profile_schema_revision: Some(1),
+                    revision: 3,
+                    ..Default::default()
+                },
+            );
+        })
+        .await
+        .unwrap();
+
+    let migration = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/providers/account-bindings/migration",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(migration.status(), StatusCode::OK);
+    let migration = json_body(migration).await;
+    assert_eq!(migration["preview"]["bindableCount"], 1);
+    assert_eq!(migration["preview"]["items"][0]["status"], "bindable");
+    let migration_token = migration["preview"]["previewToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let migrated = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/account-bindings/migration",
+            json!({"previewToken": migration_token}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(migrated.status(), StatusCode::OK);
+    assert_eq!(json_body(migrated).await["applied"], 1);
+
+    let providers = providers_snapshot(&state).await;
+    let source = providers
+        .providers
+        .iter()
+        .find(|stored| stored.provider.id == "legacy-openrouter")
+        .unwrap();
+    assert_eq!(
+        source.resource.profile_id.as_ref().unwrap().as_str(),
+        "codex.openrouter"
+    );
+    let clone = providers
+        .providers
+        .iter()
+        .find(|stored| stored.provider.id == "custom-clone")
+        .unwrap();
+    assert_eq!(
+        clone.resource.custom_binding,
+        Some(CustomBindingInput {
+            upstream_protocol: UpstreamProtocol::OpenAiChat,
+            auth_scheme: AuthScheme::ApiKey,
+        })
+    );
+    let historical = providers
+        .providers
+        .iter()
+        .find(|stored| stored.provider.id == "historical-managed")
+        .unwrap();
+    let binding = historical
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .unwrap();
+    assert_eq!(
+        binding.account_id.as_deref(),
+        Some("historical-codex-account")
+    );
+    assert_eq!(binding.auth_identity_generation, Some(1));
+    assert_eq!(historical.resource.revision, 4);
+}
+
+#[tokio::test]
+async fn account_delete_preview_blocks_bound_account() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "bound-claude-account",
+                ProviderType::ClaudeOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/from-preset",
+            json!({
+                "app": "claude",
+                "profileId": "claude.official_oauth",
+                "clientRequestId": "bound-account-provider-create",
+                "accountId": "bound-claude-account"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/accounts/bound-claude-account/delete-preview",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(preview["preview"]["blocked"], true);
+    assert_eq!(preview["preview"]["providerKeys"][0]["app"], "claude");
+
+    let response = app
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/accounts/bound-claude-account",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["code"],
+        "cc_switch_account_in_use"
+    );
+    assert!(state
+        .accounts_snapshot()
+        .await
+        .accounts
+        .iter()
+        .any(|account| account.id == "bound-claude-account"));
+}
+
+#[tokio::test]
+async fn provider_import_requires_preview_and_applies_atomically_without_secret_echo() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let provider = json!({
+        "app": "claude",
+        "provider": {
+            "id": "import-provider",
+            "name": "Imported Provider",
+            "settingsConfig": {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://example.com",
+                    "ANTHROPIC_AUTH_TOKEN": "import-secret",
+                    "ANTHROPIC_MODEL": "claude-sonnet-4-5"
+                }
+            }
+        }
+    });
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/import",
+            json!({"mode": "preview", "providers": [provider.clone()]}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let preview = json_body(response).await;
+    assert_eq!(preview["imported"], 0);
+    assert_eq!(preview["preview"]["createCount"], 1);
+    assert_eq!(preview["preview"]["updateCount"], 0);
+    assert!(providers_snapshot(&state).await.providers.is_empty());
+    assert!(!serde_json::to_string(&preview)
+        .unwrap()
+        .contains("import-secret"));
+    let preview_token = preview["preview"]["previewToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/import",
+            json!({
+                "mode": "apply",
+                "previewToken": preview_token,
+                "providers": [provider.clone()]
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let applied = json_body(response).await;
+    assert_eq!(applied["imported"], 1);
+    assert!(!serde_json::to_string(&applied)
+        .unwrap()
+        .contains("import-secret"));
+    let stored = providers_snapshot(&state).await;
+    assert_eq!(stored.providers.len(), 1);
+    assert_eq!(
+        stored.providers[0].provider.settings_config["env"]["ANTHROPIC_AUTH_TOKEN"],
+        json!("__CC_SWITCH_SECRET_KEEP__")
+    );
+    assert_eq!(stored.providers[0].resource.credential_generation, 1);
+    assert!(stored.storage_status().committed_credentials_encrypted);
+
+    let stale = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/import",
+            json!({
+                "mode": "apply",
+                "previewToken": preview["preview"]["previewToken"],
+                "providers": [provider]
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(stale).await["code"],
+        "cc_switch_provider_import_conflict"
+    );
+
+    let duplicate = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/import",
+            json!({
+                "mode": "preview",
+                "providers": [
+                    {
+                        "app": "codex",
+                        "provider": {"id": "duplicate", "name": "First", "settingsConfig": {}}
+                    },
+                    {
+                        "app": "codex",
+                        "provider": {"id": "duplicate", "name": "Second", "settingsConfig": {}}
+                    }
+                ]
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(providers_snapshot(&state).await.providers.len(), 1);
 }
 
 #[tokio::test]
@@ -3904,6 +4991,31 @@ fn test_state() -> ServerState {
     .unwrap()
 }
 
+fn test_state_with_external_web_dist() -> ServerState {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("cc-switch-server-http-external-{nanos}"));
+    let web_dist = root.join("web-dist");
+    std::fs::create_dir_all(&web_dist).unwrap();
+    let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
+        cc_switch_server::logging::RING_BUFFER_CAPACITY,
+    ));
+    ServerStateInner::load(
+        Cli {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: Some(root.join("config")),
+            web_dist_dir: Some(web_dist),
+            log_level: "warn".to_string(),
+            command: None,
+        },
+        log_capture,
+    )
+    .unwrap()
+}
+
 async fn setup_and_login(app: &Router) -> String {
     let response = app
         .clone()
@@ -3968,6 +5080,7 @@ async fn managed_auth_manual_subscription_expiry_updates_account_and_share_metad
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("claude_oauth".to_string()),
                     account_id: Some("acct-claude-expiry".to_string()),
+                    auth_identity_generation: None,
                 }),
                 ..Default::default()
             }),
@@ -4121,6 +5234,7 @@ async fn managed_auth_recurring_subscription_expiry_rule_is_validated_and_synced
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("claude_oauth".to_string()),
                     account_id: Some("acct-claude-recurring".to_string()),
+                    auth_identity_generation: None,
                 }),
                 ..Default::default()
             }),
@@ -4284,6 +5398,7 @@ async fn managed_auth_grok_manual_subscription_expiry_is_available_as_fallback()
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("grok_oauth".to_string()),
                     account_id: Some("acct-grok-expiry".to_string()),
+                    auth_identity_generation: None,
                 }),
                 ..Default::default()
             }),
@@ -4623,6 +5738,7 @@ async fn managed_auth_default_account_change_refreshes_only_unbound_provider_sha
                         source: Some("managed_account".to_string()),
                         auth_provider: Some("claude_oauth".to_string()),
                         account_id: Some(account_id.to_string()),
+                        auth_identity_generation: None,
                     }),
                     ..Default::default()
                 }),
@@ -4676,7 +5792,7 @@ async fn managed_auth_default_account_change_refreshes_only_unbound_provider_sha
 }
 
 #[tokio::test]
-async fn managed_auth_account_removal_refreshes_explicit_and_default_bound_shares() {
+async fn managed_auth_account_removal_refreshes_unbound_legacy_provider_shares() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
@@ -4696,49 +5812,38 @@ async fn managed_auth_account_removal_refreshes_explicit_and_default_bound_share
         })
         .await
         .unwrap();
-    for (provider_id, account_id) in [
-        ("claude-remove-default", None),
-        ("claude-remove-explicit", Some("acct-claude-removed")),
-    ] {
-        upsert_test_provider(
-            &state,
-            AppKind::Claude,
-            Provider {
-                id: provider_id.to_string(),
-                name: provider_id.to_string(),
-                settings_config: json!({}),
-                category: None,
-                meta: Some(ProviderMeta {
-                    provider_type: Some("claude_oauth".to_string()),
-                    auth_binding: account_id.map(|account_id| AuthBinding {
-                        source: Some("managed_account".to_string()),
-                        auth_provider: Some("claude_oauth".to_string()),
-                        account_id: Some(account_id.to_string()),
-                    }),
-                    ..Default::default()
-                }),
-                extra: Default::default(),
-            },
-        )
-        .await;
-        let mut share_input = test_share_input(
-            &format!("share-{provider_id}"),
-            provider_id,
-            ProviderType::ClaudeOAuth,
-        );
-        share_input.app = AppKind::Claude;
-        state
-            .mutate_shares_immediate(|shares| shares.upsert(share_input).unwrap())
-            .await
-            .unwrap();
-    }
-    let revisions_before = state
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "claude-remove-default".to_string(),
+            name: "claude-remove-default".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("claude_oauth".to_string()),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+    let mut share_input = test_share_input(
+        "share-claude-remove-default",
+        "claude-remove-default",
+        ProviderType::ClaudeOAuth,
+    );
+    share_input.app = AppKind::Claude;
+    state
+        .mutate_shares_immediate(|shares| shares.upsert(share_input).unwrap())
+        .await
+        .unwrap();
+    let revision_before = state
         .mutate_shares(|shares| {
-            [
-                "share-claude-remove-default",
-                "share-claude-remove-explicit",
-            ]
-            .map(|share_id| shares.get(share_id).unwrap().config_revision)
+            shares
+                .get("share-claude-remove-default")
+                .unwrap()
+                .config_revision
         })
         .await;
 
@@ -4759,17 +5864,15 @@ async fn managed_auth_account_removal_refreshes_explicit_and_default_bound_share
         .find_account_by_id("acct-claude-removed")
         .await
         .is_none());
-    let revisions_after = state
+    let revision_after = state
         .mutate_shares(|shares| {
-            [
-                "share-claude-remove-default",
-                "share-claude-remove-explicit",
-            ]
-            .map(|share_id| shares.get(share_id).unwrap().config_revision)
+            shares
+                .get("share-claude-remove-default")
+                .unwrap()
+                .config_revision
         })
         .await;
-    assert!(revisions_after[0] > revisions_before[0]);
-    assert!(revisions_after[1] > revisions_before[1]);
+    assert!(revision_after > revision_before);
 }
 
 #[tokio::test]
@@ -4798,6 +5901,7 @@ async fn automatic_subscription_expiry_refreshes_share_only_when_effective_value
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("codex_oauth".to_string()),
                     account_id: Some("acct-codex-auto-expiry".to_string()),
+                    auth_identity_generation: None,
                 }),
                 ..Default::default()
             }),
@@ -4920,6 +6024,7 @@ async fn codex_workspace_change_clears_subscription_expiry_and_refreshes_share()
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("codex_oauth".to_string()),
                     account_id: Some("acct-codex-workspace-expiry".to_string()),
+                    auth_identity_generation: None,
                 }),
                 ..Default::default()
             }),

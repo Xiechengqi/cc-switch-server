@@ -7,6 +7,24 @@ use crate::infra::time::now_ms;
 
 const RECENT_WINDOW_MS: u128 = 10 * 60 * 1000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderRequestOutcome {
+    Success { status_code: u16 },
+    Failure { status_code: u16 },
+    RateLimited { status_code: u16 },
+    NetworkFailure,
+}
+
+impl ProviderRequestOutcome {
+    pub fn from_status(status_code: u16) -> Self {
+        if status_code == 429 || (500..=599).contains(&status_code) {
+            Self::Failure { status_code }
+        } else {
+            Self::Success { status_code }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderHealth {
@@ -115,6 +133,7 @@ mod tests {
             },
             provider_type: ProviderType::Codex,
             provider_type_id: "codex".to_string(),
+            resource: Default::default(),
         };
         let mut log = UsageLog::new(
             AppKind::Codex,
@@ -152,6 +171,7 @@ mod tests {
             },
             provider_type: ProviderType::Codex,
             provider_type_id: "codex".to_string(),
+            resource: Default::default(),
         };
         let mut log = UsageLog::new(
             AppKind::Codex,

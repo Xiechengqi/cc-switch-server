@@ -292,6 +292,21 @@ impl AccountManager for ManualTokenAccountManager {
         store: &mut AccountStore,
         mut input: UpsertAccountInput,
     ) -> Result<Account, AccountManagerError> {
+        if let Some(account_id) = input.id.as_deref() {
+            if let Some(existing) = store
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+            {
+                if existing.provider_type != input.provider_type {
+                    return Err(AccountManagerError::CredentialUnavailable(format!(
+                        "account {account_id} is already bound to providerType {}; create a new account instead of changing its type to {}",
+                        existing.provider_type.as_str(),
+                        input.provider_type.as_str()
+                    )));
+                }
+            }
+        }
         if input.provider_type == ProviderType::CodexOAuth {
             if let Some(refresh_token) = input
                 .refresh_token
@@ -940,6 +955,25 @@ mod tests {
             .unwrap();
         assert_eq!(updated.id, "acct-1");
         assert_eq!(store.accounts.len(), 1);
+    }
+
+    #[test]
+    fn account_provider_type_cannot_change_in_place() {
+        let manager = manager_for(ProviderType::CodexOAuth);
+        let mut store = AccountStore::default();
+        manager
+            .finish_login(&mut store, codex_account_input("acct-1", "refresh-1"))
+            .unwrap();
+
+        let mut replacement = codex_account_input("acct-1", "refresh-2");
+        replacement.provider_type = ProviderType::ClaudeOAuth;
+        let error = manager.finish_login(&mut store, replacement).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AccountManagerError::CredentialUnavailable(_)
+        ));
+        assert_eq!(store.accounts[0].provider_type, ProviderType::CodexOAuth);
     }
 
     #[test]

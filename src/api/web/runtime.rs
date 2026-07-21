@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 
 static CONTRACT: OnceLock<WebRuntimeContract> = OnceLock::new();
 
+pub const PROVIDER_CONTRACT_VERSION: u32 = 2;
+pub const PROVIDER_CONTRACT_MIN_SUPPORTED: u32 = 2;
+pub const PROVIDER_CONTRACT_MAX_SUPPORTED: u32 = 2;
+pub const PROVIDER_CONTRACT_HEADER: &str = "x-cc-switch-provider-contract-version";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebRuntimeContract {

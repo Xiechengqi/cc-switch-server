@@ -19,6 +19,7 @@ export interface ProviderMeta {
     source?: string | null;
     authProvider?: string | null;
     accountId?: string | null;
+    authIdentityGeneration?: number | null;
   } | null;
   [key: string]: unknown;
 }
@@ -68,6 +69,8 @@ export interface ProviderMatrix {
 
 export interface ProviderPresetSummary {
   name: string;
+  profileId?: string | null;
+  profileSchemaRevision?: number | null;
   providerType?: string | null;
   apiFormat?: string | null;
   baseUrl?: string | null;
@@ -79,41 +82,6 @@ export interface ProviderSortUpdate {
 }
 
 export type ProviderPresetsByApp = Record<AppKind, ProviderPresetSummary[]>;
-
-export interface FailoverAppConfig {
-  enabled: boolean;
-  providerQueue: string[];
-  failureThreshold: number;
-  openDurationMs: number;
-  halfOpenMaxProbes: number;
-}
-
-export interface ProviderBreaker {
-  app: AppKind;
-  providerId: string;
-  state: string;
-  consecutiveFailures: number;
-  openedAtMs?: number | null;
-  halfOpenStartedAtMs?: number | null;
-  halfOpenProbeCount: number;
-  lastStatusCode?: number | null;
-  lastError?: string | null;
-  lastFailureAtMs?: number | null;
-  lastSuccessAtMs?: number | null;
-}
-
-export interface FailoverSnapshot {
-  apps: Partial<Record<AppKind, FailoverAppConfig>>;
-  breakers: ProviderBreaker[];
-}
-
-export interface UpdateFailoverAppInput {
-  enabled?: boolean;
-  providerQueue?: string[];
-  failureThreshold?: number;
-  openDurationMs?: number;
-  halfOpenMaxProbes?: number;
-}
 
 export interface ProviderHealth {
   providerId: string;
@@ -262,6 +230,8 @@ export interface OAuthLoginFinish {
 export interface AccountLoginAccountSummary {
   id: string;
   providerType: string;
+  authIdentityGeneration: number;
+  tokenRefreshGeneration: number;
   email?: string | null;
   subscriptionLevel?: string | null;
   entitlementStatus?: string | null;
@@ -601,20 +571,6 @@ export interface ConfigSnapshot {
   ownerEmail?: string | null;
   routerUrl?: string | null;
   clientTunnelSubdomain?: string | null;
-  upstreamProxy: UpstreamProxyView;
-}
-
-export interface UpstreamProxyView {
-  enabled: boolean;
-  url?: string | null;
-  maskedUrl?: string | null;
-  followSystemProxy: boolean;
-}
-
-export interface UpdateUpstreamProxyInput {
-  url?: string;
-  clear?: boolean;
-  followSystemProxy?: boolean;
 }
 
 export interface RouterConfigView {

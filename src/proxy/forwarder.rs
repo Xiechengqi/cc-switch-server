@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -22,15 +22,16 @@ use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
 use crate::domain::accounts::store::AccountStore;
-use crate::domain::failover::{current_time_ms, ProviderOutcome};
+use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
+use crate::domain::providers::current_provider;
 use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
+use crate::infra::time::now_ms as current_time_ms;
 use crate::state::{
-    build_provider_http_client, AccountInFlightGuard, AccountInFlightSnapshot,
-    CopilotUpstreamAuthError, DeepSeekUpstreamError, ManagedAccountRefreshError, ServerState,
-    ShareInFlightGuard,
+    AccountInFlightGuard, AccountInFlightSnapshot, CopilotUpstreamAuthError, DeepSeekUpstreamError,
+    ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
 };
 
 use super::adapters::{self, ProviderAdapter};
@@ -38,6 +39,7 @@ use super::claude_oauth::ClaudeBodyRetryStage;
 use super::cursor;
 use super::deepseek;
 use super::kiro;
+use super::provider_ops::{ProviderExecution, ProviderOperation};
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy, decode_response_body_for_proxy,
     ResponseDecodeResult,
@@ -45,7 +47,7 @@ use super::request_governance::{
 use super::router::{
     account_concurrency_for_provider, provider_supports_claude_count_tokens, select_provider,
     select_provider_for_claude_count_tokens, select_provider_for_codex_image_generation,
-    select_provider_with_account_inflight_excluding, ProxyRoute,
+    select_provider_with_account_inflight, ProxyRoute,
 };
 use super::streaming::{ClaudeSseErrorDetector, StreamUsageAccumulator};
 use super::usage::{log_usage, update_stream_usage};
@@ -61,7 +63,7 @@ struct ForwardAttemptContext {
     attempt: u32,
     started_at_ms: u128,
     body_retry_stage: Option<ClaudeBodyRetryStage>,
-    excluded_provider_ids: BTreeSet<String>,
+    execution: Option<ProviderExecution>,
 }
 
 impl Default for ForwardAttemptContext {
@@ -70,7 +72,7 @@ impl Default for ForwardAttemptContext {
             attempt: 0,
             started_at_ms: current_time_ms(),
             body_retry_stage: None,
-            excluded_provider_ids: BTreeSet::new(),
+            execution: None,
         }
     }
 }
@@ -83,15 +85,13 @@ impl ForwardAttemptContext {
 
     fn next(
         &self,
-        failed_provider_id: Option<&str>,
+        execution: &ProviderExecution,
         body_retry_stage: Option<ClaudeBodyRetryStage>,
     ) -> Self {
         let mut next = self.clone();
         next.attempt = next.attempt.saturating_add(1);
         next.body_retry_stage = body_retry_stage;
-        if let Some(provider_id) = failed_provider_id {
-            next.excluded_provider_ids.insert(provider_id.to_string());
-        }
+        next.execution = Some(execution.clone());
         next
     }
 }
@@ -120,480 +120,518 @@ async fn forward_with_attempt(
     gemini_path: Option<String>,
     headers: HeaderMap,
     body: Bytes,
-    attempt_context: ForwardAttemptContext,
+    mut attempt_context: ForwardAttemptContext,
 ) -> Result<Response, ProxyError> {
-    let raw_body_for_retry = body.clone();
-    let body = decode_request_body_for_proxy(&headers, body)?;
-    let app = route.app();
-    let retry_gemini_path = gemini_path.clone();
-    let claude_body_retry_stage = attempt_context.body_retry_stage;
-    let mut request_context = request_context_from_headers(&headers);
-    request_context.session_id = session_id_from_request(route, &headers, &body);
-    let provider_failover_allowed =
-        request_context.share_id.is_none() && !headers.contains_key("x-cc-provider-id");
-    let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-        let (share_name, guard) = validate_and_acquire_share_invocation(
-            &state,
-            &share_id,
-            request_context.user_email.as_deref(),
-        )
-        .await?;
-        request_context.share_name = Some(share_name);
-        Some(guard)
-    } else {
-        None
-    };
-    let shares = state.shares.read().await.clone();
-    let accounts_for_selection = state.accounts_snapshot().await;
-    let providers = state.providers.read().await;
-    let (stored, account_in_flight_guard) = if let Some(share_id) =
-        request_context.share_id.as_deref()
-    {
-        let (stored, _share_name) = select_share_provider(&providers, &shares, app, share_id)?;
-        if route == ProxyRoute::ClaudeCountTokens && !provider_supports_claude_count_tokens(&stored)
-        {
-            return Err(ProxyError::bad_request(
-                "Claude count_tokens requires a native Anthropic provider",
-            ));
-        }
-        let snapshot = state.account_in_flight.snapshot();
-        let guard = acquire_account_in_flight(&state, &stored, &accounts_for_selection, &snapshot)?;
-        (stored, guard)
-    } else {
-        let mut attempts = 0;
-        loop {
-            let snapshot = state.account_in_flight.snapshot();
-            let stored = state
-                .try_mutate_failover_best_effort_if_changed(
-                    "failover selection state",
-                    |failover| {
-                        let selected = if route == ProxyRoute::ClaudeCountTokens {
+    let raw_body_for_retry = body;
+    let retry_gemini_path = gemini_path;
+    'attempt: loop {
+        let gemini_path = retry_gemini_path.clone();
+        let body = decode_request_body_for_proxy(&headers, raw_body_for_retry.clone())?;
+        let app = route.app();
+        let claude_body_retry_stage = attempt_context.body_retry_stage;
+        let mut request_context = request_context_from_headers(&headers);
+        request_context.session_id = session_id_from_request(route, &headers, &body);
+        let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
+            let (share_name, guard) = validate_and_acquire_share_invocation(
+                &state,
+                &share_id,
+                request_context.user_email.as_deref(),
+            )
+            .await?;
+            request_context.share_name = Some(share_name);
+            Some(guard)
+        } else {
+            None
+        };
+        let accounts_for_selection = state.accounts_snapshot().await;
+        let (execution, account_in_flight_guard) =
+            if let Some(execution) = attempt_context.execution.clone() {
+                execution.ensure_operation_supported(ProviderOperation::Forward)?;
+                let snapshot = state.account_in_flight.snapshot();
+                let guard = acquire_account_in_flight(
+                    &state,
+                    &execution.stored,
+                    &accounts_for_selection,
+                    &snapshot,
+                )?;
+                (execution, guard)
+            } else {
+                let shares = state.shares.read().await.clone();
+                let providers = state.providers.read().await;
+                let ui_settings = state.ui_settings.read().await.for_frontend();
+                let configured_provider_id =
+                    current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
+                if let Some(share_id) = request_context.share_id.as_deref() {
+                    let (execution, _share_name) =
+                        select_share_execution(&providers, &shares, app, share_id)?;
+                    if route == ProxyRoute::ClaudeCountTokens
+                        && !provider_supports_claude_count_tokens(&execution.stored)
+                    {
+                        return Err(ProxyError::bad_request(
+                            "Claude count_tokens requires a native Anthropic provider",
+                        ));
+                    }
+                    let snapshot = state.account_in_flight.snapshot();
+                    let guard = acquire_account_in_flight(
+                        &state,
+                        &execution.stored,
+                        &accounts_for_selection,
+                        &snapshot,
+                    )?;
+                    (execution, guard)
+                } else {
+                    let mut attempts = 0;
+                    loop {
+                        let snapshot = state.account_in_flight.snapshot();
+                        let execution = if route == ProxyRoute::ClaudeCountTokens {
                             select_provider_for_claude_count_tokens(
                                 &providers,
                                 &accounts_for_selection,
-                                failover,
                                 &headers,
+                                configured_provider_id.as_deref(),
                                 &snapshot,
-                                &attempt_context.excluded_provider_ids,
                             )
                         } else {
-                            select_provider_with_account_inflight_excluding(
+                            select_provider_with_account_inflight(
                                 &providers,
                                 &accounts_for_selection,
-                                failover,
                                 app,
                                 &headers,
+                                configured_provider_id.as_deref(),
                                 &snapshot,
-                                &attempt_context.excluded_provider_ids,
                             )
-                        };
-                        selected.map(|selected| {
-                            let changed = selected.failover_state_changed;
-                            (selected.provider, changed)
-                        })
-                    },
-                )
-                .await?;
-            match try_acquire_account_in_flight(&state, &stored, &accounts_for_selection, &snapshot)
-            {
-                AccountInFlightAcquire::Acquired(guard) => break (stored, Some(guard)),
-                AccountInFlightAcquire::NotManaged => break (stored, None),
-                AccountInFlightAcquire::Saturated => {
-                    attempts += 1;
-                    if attempts >= 3 {
-                        return Err(account_concurrency_proxy_error(&stored));
+                        }?
+                        .execution;
+                        match try_acquire_account_in_flight(
+                            &state,
+                            &execution.stored,
+                            &accounts_for_selection,
+                            &snapshot,
+                        ) {
+                            AccountInFlightAcquire::Acquired(guard) => {
+                                break (execution, Some(guard));
+                            }
+                            AccountInFlightAcquire::NotManaged => break (execution, None),
+                            AccountInFlightAcquire::Saturated => {
+                                attempts += 1;
+                                if attempts >= 3 {
+                                    return Err(account_concurrency_proxy_error(&execution.stored));
+                                }
+                            }
+                        }
                     }
                 }
-            }
-        }
-    };
-    drop(providers);
-    validate_codex_allowed_client(&stored, route, &headers, request_context.share_id.is_some())?;
-    let started = Instant::now();
-    if cursor::agentservice_driver_requested(&stored) {
-        let adapter_request =
-            adapters::cursor_agentservice_request(body, &stored, route, gemini_path.as_deref())?;
-        refresh_managed_account_if_needed(&state, app, &stored).await?;
-        return cursor::forward_agentservice(cursor::AgentServiceForwardOptions {
-            state,
+            };
+        let stored = execution.runtime_stored_view();
+        validate_codex_allowed_client(
+            &stored,
             route,
-            stored,
-            adapter_request,
-            request_context,
-            share_invocation_guard,
-        })
-        .await;
-    }
-    if app == AppKind::Claude && stored.provider_type == ProviderType::KiroOAuth {
-        return forward_claude_kiro(ClaudeKiroForwardOptions {
-            state,
-            stored,
-            headers,
-            body,
-            request_context,
-            share_invocation_guard,
-            started,
-        })
-        .await;
-    }
-    if app == AppKind::Claude && stored.provider_type == ProviderType::DeepSeekAccount {
-        return forward_claude_deepseek(ClaudeDeepSeekForwardOptions {
-            state,
-            stored,
-            body,
-            request_context,
-            share_invocation_guard,
-            started,
-        })
-        .await;
-    }
-    let adapter = adapters::adapter_for(app, stored.provider_type);
-    let codex_oauth_session_id = request_context
-        .session_id
-        .as_deref()
-        .and_then(codex_oauth_upstream_session_id);
-    let gemini_path_for_request = gemini_path.clone();
-    let copilot_metadata = adapters::CopilotRequestMetadata {
-        has_anthropic_beta: headers.contains_key("anthropic-beta"),
-        session_id: request_context.session_id.clone(),
-    };
-    let adapter_request = adapter.transform_request_for_route_with_metadata(
-        body,
-        &stored,
-        route,
-        gemini_path_for_request.as_deref(),
-        &copilot_metadata,
-    )?;
-    let mut adapter_request = adapter_request;
-    if stored.provider_type == ProviderType::CodexOAuth
-        && matches!(
-            route,
-            ProxyRoute::CodexResponses
-                | ProxyRoute::CodexResponsesCompact
-                | ProxyRoute::CodexChatCompletions
-        )
-    {
-        let compact_request = route == ProxyRoute::CodexResponsesCompact
-            || (route == ProxyRoute::CodexResponses
-                && codex_responses_body_has_compaction_trigger(&adapter_request.body));
-        if compact_request {
-            adapter_request.body = normalize_codex_oauth_compact_body_bytes(&adapter_request.body)?;
-            adapter_request.stream_requested = false;
-        } else {
-            adapter_request.body = normalize_codex_oauth_responses_body_bytes(
-                &adapter_request.body,
-                codex_oauth_session_id.as_deref(),
-                codex_image_tool_strip_policy(&stored),
-            )?;
-        }
-    }
-    let grok_contract = if stored.provider_type == ProviderType::GrokOAuth {
-        let cli_profile = grok_cli_profile(app, &stored);
-        let tenant_scope = grok_tenant_scope(&request_context, &stored);
-        let contract = super::grok::apply_forward_contract(
-            &mut adapter_request.body,
             &headers,
-            route,
-            request_context.session_id.as_deref(),
-            tenant_scope.as_deref(),
-            cli_profile,
+            request_context.share_id.is_some(),
         )?;
-        if request_context.session_id.is_none() {
-            request_context.session_id = contract.session_id.clone();
+        let started = Instant::now();
+        if execution.driver_is("special.cursor") && cursor::agentservice_driver_requested(&stored) {
+            let adapter_request = adapters::cursor_agentservice_request(
+                body,
+                &stored,
+                route,
+                gemini_path.as_deref(),
+            )?;
+            let mut adapter_request = adapter_request;
+            execution.enforce_model_policy(&mut adapter_request)?;
+            refresh_execution_managed_account_if_needed(&state, &execution).await?;
+            let accounts = state.accounts_snapshot().await;
+            execution.materialize_auth(&accounts)?;
+            return cursor::forward_agentservice(cursor::AgentServiceForwardOptions {
+                state,
+                route,
+                stored,
+                adapter_request,
+                request_context,
+                share_invocation_guard,
+            })
+            .await;
         }
-        if adapter_request.actual_model.as_deref() != Some(contract.actual_model.as_str()) {
-            adapter_request.actual_model_source = Some("grok_model_normalization".to_string());
+        if app == AppKind::Claude && execution.driver_is("special.kiro") {
+            return forward_claude_kiro(ClaudeKiroForwardOptions {
+                state,
+                execution,
+                stored,
+                headers,
+                body,
+                request_context,
+                share_invocation_guard,
+                started,
+            })
+            .await;
         }
-        adapter_request.model = Some(contract.actual_model.clone());
-        adapter_request.actual_model = Some(contract.actual_model.clone());
-        adapter_request.pricing_model = Some(contract.actual_model.clone());
-        Some(contract)
-    } else {
-        None
-    };
-    let mut url =
-        adapter.resolve_endpoint_for_request(route, gemini_path, &stored, &adapter_request)?;
-    if stored.provider_type == ProviderType::GrokOAuth {
-        url = super::grok::chat_upstream_url(&url, grok_cli_profile(app, &stored));
-    }
-    if stored.provider_type == ProviderType::CodexOAuth
-        && route == ProxyRoute::CodexResponses
-        && codex_responses_body_has_compaction_trigger(&adapter_request.body)
-    {
-        url = codex_compact_url(&url);
-    }
-    refresh_managed_account_if_needed(&state, app, &stored).await?;
-    let copilot_upstream_auth = if copilot_managed_account_auth_required(app, &stored) {
-        Some(
-            state
-                .prepare_copilot_upstream_auth(managed_account_id(&stored))
-                .await
-                .map_err(copilot_upstream_auth_error_to_proxy_error)?,
-        )
-    } else {
-        None
-    };
-    let accounts = state.accounts_snapshot().await;
-    let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
-    target_headers.extend(adapter_request.upstream_headers.iter().cloned());
-    if stored.provider_type == ProviderType::CodexOAuth {
-        append_codex_oauth_session_headers(&mut target_headers, codex_oauth_session_id.as_deref());
-    }
-    if let Some(contract) = grok_contract {
-        for (name, value) in contract.headers {
-            replace_or_push_header(&mut target_headers, name, value);
+        if app == AppKind::Claude && execution.driver_is("special.deepseek_account") {
+            return forward_claude_deepseek(ClaudeDeepSeekForwardOptions {
+                state,
+                execution,
+                stored,
+                body,
+                request_context,
+                share_invocation_guard,
+                started,
+            })
+            .await;
         }
-    }
-    if route == ProxyRoute::ClaudeCountTokens && stored.provider_type != ProviderType::ClaudeOAuth {
-        super::claude_oauth::normalize_count_tokens_body(&mut adapter_request.body)?;
-        adapter_request.stream_requested = false;
-        replace_or_push_header(
-            &mut target_headers,
-            "anthropic-beta",
-            "token-counting-2024-11-01".to_string(),
-        );
-    }
-    if app == AppKind::Claude && stored.provider_type == ProviderType::ClaudeOAuth {
-        let context_1m_requested = adapter_request_requests_claude_context_1m(&adapter_request);
-        let contract = if route == ProxyRoute::ClaudeCountTokens {
-            adapter_request.stream_requested = false;
-            super::claude_oauth::apply_count_tokens_forward_contract(
-                &mut url,
-                &mut adapter_request.body,
-                &headers,
-                &claude_oauth_identity_seed(&stored),
-                context_1m_requested,
-            )?
-        } else {
-            super::claude_oauth::apply_forward_contract(
-                &mut url,
-                &mut adapter_request.body,
-                &headers,
-                &claude_oauth_identity_seed(&stored),
-                context_1m_requested,
-                claude_body_retry_stage,
-            )?
+        let adapter = adapters::adapter_for(app, stored.provider_type);
+        let codex_oauth_session_id = request_context
+            .session_id
+            .as_deref()
+            .and_then(codex_oauth_upstream_session_id);
+        let gemini_path_for_request = gemini_path.clone();
+        let copilot_metadata = adapters::CopilotRequestMetadata {
+            has_anthropic_beta: headers.contains_key("anthropic-beta"),
+            session_id: request_context.session_id.clone(),
         };
-        if request_context.session_id.is_none() {
-            request_context.session_id = contract.session_id.clone();
-        }
-        for (name, value) in contract.headers {
-            replace_or_push_header(&mut target_headers, name, value);
-        }
-    }
-    if let Some(auth) = copilot_upstream_auth {
-        url = super::join_url(&auth.api_endpoint, "/chat/completions");
-        replace_or_push_header(
-            &mut target_headers,
-            "authorization",
-            format!("Bearer {}", auth.token),
-        );
-    }
-    if stored.provider_type == ProviderType::CodexOAuth {
-        super::codex_identity::finalize_headers(&mut target_headers);
-    }
-    let mut target_headers = owned_headers(target_headers);
-    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
-    if route == ProxyRoute::ClaudeCountTokens && stored.provider_type != ProviderType::ClaudeOAuth {
-        replace_or_push_owned_header(
-            &mut target_headers,
-            "anthropic-beta".to_string(),
-            "token-counting-2024-11-01".to_string(),
-        );
-    }
-
-    let http_client = forward_http_client(&state, &stored).await?;
-    let request = build_upstream_post_request(
-        &http_client,
-        &url,
-        adapter_request.body.clone(),
-        &headers,
-        &target_headers,
-        &stored,
-        adapter_request.stream_requested,
-    );
-
-    let upstream_result = if adapter_request.stream_requested {
-        match stream_first_byte_timeout(&stored) {
-            Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-                    if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
-                        crate::metrics::record_claude_retry("transport", "send_timeout");
-                        let next_attempt = attempt_context.next(
-                            provider_failover_allowed.then_some(stored.provider.id.as_str()),
-                            claude_body_retry_stage,
-                        );
-                        drop(account_in_flight_guard);
-                        drop(share_invocation_guard);
-                        return Box::pin(forward_with_attempt(
-                            state,
-                            route,
-                            retry_gemini_path,
-                            headers,
-                            raw_body_for_retry,
-                            next_attempt,
-                        ))
-                        .await;
-                    }
-                    return Err(ProxyError {
-                        status: StatusCode::GATEWAY_TIMEOUT,
-                        message: format!(
-                            "proxy upstream streaming first byte timeout after {}ms",
-                            timeout.as_millis()
-                        ),
-                    });
-                }
-            },
-            None => request.send().await,
-        }
-    } else {
-        request.send().await
-    };
-    let mut upstream = match upstream_result {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-            if route == ProxyRoute::ClaudeCountTokens {
-                crate::metrics::record_claude_count_tokens_outcome("network_error");
-            }
-            if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
-                crate::metrics::record_claude_retry("transport", "send_error");
-                let next_attempt = attempt_context.next(
-                    provider_failover_allowed.then_some(stored.provider.id.as_str()),
-                    claude_body_retry_stage,
-                );
-                drop(account_in_flight_guard);
-                drop(share_invocation_guard);
-                return Box::pin(forward_with_attempt(
-                    state,
-                    route,
-                    retry_gemini_path,
-                    headers,
-                    raw_body_for_retry,
-                    next_attempt,
-                ))
-                .await;
-            }
-            return Err(ProxyError::bad_gateway(error));
-        }
-    };
-    let mut status = upstream.status();
-    let mut status_code = status.as_u16();
-    let mut response_headers = upstream.headers().clone();
-    strip_hop_by_hop_response_headers(&mut response_headers);
-    if route == ProxyRoute::ClaudeCountTokens
-        && stored.provider_type == ProviderType::ClaudeOAuth
-        && status == StatusCode::UNAUTHORIZED
-        && attempt_context.attempt == 0
-    {
-        state
-            .refresh_managed_account_now(stored.provider_type, managed_account_id(&stored))
-            .await
-            .map_err(managed_account_refresh_error_to_proxy_error)?;
-        crate::metrics::record_claude_count_tokens_outcome("auth_refresh");
-        let next_attempt = attempt_context.next(None, None);
-        drop(upstream);
-        drop(account_in_flight_guard);
-        drop(share_invocation_guard);
-        return Box::pin(forward_with_attempt(
-            state,
+        let adapter_request = adapter.transform_request_for_route_with_metadata(
+            body,
+            &stored,
             route,
-            retry_gemini_path,
-            headers,
-            raw_body_for_retry,
-            next_attempt,
-        ))
-        .await;
-    }
-    maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
-    maybe_mark_grok_cooldown(&state, &stored, status, &response_headers).await;
-    let mut content_type = response_headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let mut content_encoding = content_encoding_value(&response_headers);
-
-    if codex_image_tool_strip_policy(&stored) == CodexImageToolStripPolicy::OnError
-        && stored.provider_type == ProviderType::CodexOAuth
-        && matches!(
-            route,
-            ProxyRoute::CodexResponses | ProxyRoute::CodexChatCompletions
-        )
-        && !status.is_success()
-    {
-        let original_bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
-        let original_decoded = decode_response_body_for_proxy(&response_headers, original_bytes);
-        if codex_image_tool_rejection_body(&original_decoded.body) {
-            if let Some(retry_body) = codex_image_tool_stripped_body_bytes(&adapter_request.body)? {
-                let retry_request = build_upstream_post_request(
-                    &http_client,
-                    &url,
-                    retry_body.clone(),
+            gemini_path_for_request.as_deref(),
+            &copilot_metadata,
+        )?;
+        let mut adapter_request = adapter_request;
+        if execution.driver_is("oauth.openai_codex")
+            && matches!(
+                route,
+                ProxyRoute::CodexResponses
+                    | ProxyRoute::CodexResponsesCompact
+                    | ProxyRoute::CodexChatCompletions
+            )
+        {
+            let compact_request = route == ProxyRoute::CodexResponsesCompact
+                || (route == ProxyRoute::CodexResponses
+                    && codex_responses_body_has_compaction_trigger(&adapter_request.body));
+            if compact_request {
+                adapter_request.body =
+                    normalize_codex_oauth_compact_body_bytes(&adapter_request.body)?;
+                adapter_request.stream_requested = false;
+            } else {
+                adapter_request.body = normalize_codex_oauth_responses_body_bytes(
+                    &adapter_request.body,
+                    codex_oauth_session_id.as_deref(),
+                    codex_image_tool_strip_policy(&stored),
+                )?;
+            }
+        }
+        execution.enforce_model_policy(&mut adapter_request)?;
+        let grok_contract = if execution.driver_is("oauth.grok_responses") {
+            let cli_profile = grok_cli_profile(app, &stored);
+            let tenant_scope = grok_tenant_scope(&request_context, &stored);
+            let contract = super::grok::apply_forward_contract(
+                &mut adapter_request.body,
+                &headers,
+                route,
+                request_context.session_id.as_deref(),
+                tenant_scope.as_deref(),
+                cli_profile,
+            )?;
+            if request_context.session_id.is_none() {
+                request_context.session_id = contract.session_id.clone();
+            }
+            if adapter_request.actual_model.as_deref() != Some(contract.actual_model.as_str()) {
+                adapter_request.actual_model_source = Some("grok_model_normalization".to_string());
+            }
+            adapter_request.model = Some(contract.actual_model.clone());
+            adapter_request.actual_model = Some(contract.actual_model.clone());
+            adapter_request.pricing_model = Some(contract.actual_model.clone());
+            Some(contract)
+        } else {
+            None
+        };
+        execution.enforce_model_policy(&mut adapter_request)?;
+        execution.finalize_request(&mut adapter_request)?;
+        let mut url = execution.resolve_endpoint(route, gemini_path, &adapter_request)?;
+        if execution.driver_is("oauth.grok_responses") {
+            url = super::grok::chat_upstream_url(&url, grok_cli_profile(app, &stored));
+        }
+        if execution.driver_is("oauth.openai_codex")
+            && route == ProxyRoute::CodexResponses
+            && codex_responses_body_has_compaction_trigger(&adapter_request.body)
+        {
+            url = codex_compact_url(&url);
+        }
+        refresh_execution_managed_account_if_needed(&state, &execution).await?;
+        let copilot_upstream_auth = if execution.driver_is("special.copilot") {
+            Some(
+                state
+                    .prepare_copilot_upstream_auth(execution.managed_account_id())
+                    .await
+                    .map_err(copilot_upstream_auth_error_to_proxy_error)?,
+            )
+        } else {
+            None
+        };
+        let accounts = state.accounts_snapshot().await;
+        let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
+        target_headers.extend(adapter_request.upstream_headers.iter().cloned());
+        if execution.driver_is("oauth.openai_codex") {
+            append_codex_oauth_session_headers(
+                &mut target_headers,
+                codex_oauth_session_id.as_deref(),
+            );
+        }
+        if let Some(contract) = grok_contract {
+            for (name, value) in contract.headers {
+                replace_or_push_header(&mut target_headers, name, value);
+            }
+        }
+        if route == ProxyRoute::ClaudeCountTokens && !execution.driver_is("oauth.claude_messages") {
+            super::claude_oauth::normalize_count_tokens_body(&mut adapter_request.body)?;
+            adapter_request.stream_requested = false;
+            replace_or_push_header(
+                &mut target_headers,
+                "anthropic-beta",
+                "token-counting-2024-11-01".to_string(),
+            );
+        }
+        if app == AppKind::Claude && execution.driver_is("oauth.claude_messages") {
+            let context_1m_requested = adapter_request_requests_claude_context_1m(&adapter_request);
+            let contract = if route == ProxyRoute::ClaudeCountTokens {
+                adapter_request.stream_requested = false;
+                super::claude_oauth::apply_count_tokens_forward_contract(
+                    &mut url,
+                    &mut adapter_request.body,
                     &headers,
-                    &target_headers,
-                    &stored,
-                    adapter_request.stream_requested,
-                );
-                match retry_request.send().await {
-                    Ok(retry_upstream) => {
-                        adapter_request.body = retry_body;
-                        upstream = retry_upstream;
-                        status = upstream.status();
-                        status_code = status.as_u16();
-                        response_headers = upstream.headers().clone();
-                        strip_hop_by_hop_response_headers(&mut response_headers);
-                        maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
-                        maybe_mark_grok_cooldown(&state, &stored, status, &response_headers).await;
-                        content_type = response_headers
-                            .get(CONTENT_TYPE)
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_string);
-                        content_encoding = content_encoding_value(&response_headers);
-                    }
+                    &claude_oauth_identity_seed(&stored),
+                    context_1m_requested,
+                )?
+            } else {
+                super::claude_oauth::apply_forward_contract(
+                    &mut url,
+                    &mut adapter_request.body,
+                    &headers,
+                    &claude_oauth_identity_seed(&stored),
+                    context_1m_requested,
+                    claude_body_retry_stage,
+                )?
+            };
+            if request_context.session_id.is_none() {
+                request_context.session_id = contract.session_id.clone();
+            }
+            for (name, value) in contract.headers {
+                replace_or_push_header(&mut target_headers, name, value);
+            }
+        }
+        if let Some(auth) = copilot_upstream_auth {
+            url = super::join_url(&auth.api_endpoint, "/chat/completions");
+            replace_or_push_header(
+                &mut target_headers,
+                "authorization",
+                format!("Bearer {}", auth.token),
+            );
+        }
+        if execution.driver_is("oauth.openai_codex") {
+            crate::codex_identity::finalize_headers(&mut target_headers);
+        }
+        let mut target_headers = owned_headers(target_headers);
+        let materialized_auth = execution.materialize_auth(&accounts)?;
+        execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
+        apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
+        if route == ProxyRoute::ClaudeCountTokens && !execution.driver_is("oauth.claude_messages") {
+            replace_or_push_owned_header(
+                &mut target_headers,
+                "anthropic-beta".to_string(),
+                "token-counting-2024-11-01".to_string(),
+            );
+        }
+
+        let http_client = forward_http_client(&state, &stored).await?;
+        let request = build_upstream_post_request(
+            &http_client,
+            &url,
+            adapter_request.body.clone(),
+            &headers,
+            &target_headers,
+            execution.request_timeout(),
+            adapter_request.stream_requested,
+        );
+
+        let upstream_result = if adapter_request.stream_requested {
+            match execution.stream_first_byte_timeout() {
+                Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
+                    Ok(result) => result,
                     Err(_) => {
-                        record_provider_outcome(
-                            &state,
-                            &stored,
-                            provider_outcome_from_status_and_headers(
-                                status_code,
-                                &response_headers,
+                        record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
+                            .await;
+                        if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
+                            crate::metrics::record_claude_retry("transport", "send_timeout");
+                            attempt_context =
+                                attempt_context.next(&execution, claude_body_retry_stage);
+                            drop(account_in_flight_guard);
+                            drop(share_invocation_guard);
+                            continue 'attempt;
+                        }
+                        return Err(ProxyError {
+                            status: StatusCode::GATEWAY_TIMEOUT,
+                            message: format!(
+                                "proxy upstream streaming first byte timeout after {}ms",
+                                timeout.as_millis()
                             ),
-                        )
-                        .await;
-                        log_usage(
-                            &state,
-                            &stored,
-                            status_code,
-                            started.elapsed().as_millis(),
-                            model_metadata(&adapter_request),
-                            TokenUsage::default(),
-                            UsageLogContext {
-                                is_streaming: adapter_request.stream_requested,
-                                stream_status: adapter_request
-                                    .stream_requested
-                                    .then(|| "image_tool_retry_failed".to_string()),
-                                ..request_context
-                            },
-                        )
-                        .await;
-                        return Ok(decoded_upstream_response(
-                            status,
-                            &response_headers,
-                            content_type,
-                            content_encoding,
-                            original_decoded,
-                        ));
+                        });
                     }
+                },
+                None => request.send().await,
+            }
+        } else {
+            request.send().await
+        };
+        let mut upstream = match upstream_result {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                if route == ProxyRoute::ClaudeCountTokens {
+                    crate::metrics::record_claude_count_tokens_outcome("network_error");
+                }
+                if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
+                    crate::metrics::record_claude_retry("transport", "send_error");
+                    attempt_context = attempt_context.next(&execution, claude_body_retry_stage);
+                    drop(account_in_flight_guard);
+                    drop(share_invocation_guard);
+                    continue 'attempt;
+                }
+                return Err(ProxyError::bad_gateway(error));
+            }
+        };
+        let mut status = upstream.status();
+        let mut status_code = status.as_u16();
+        let mut response_headers = upstream.headers().clone();
+        strip_hop_by_hop_response_headers(&mut response_headers);
+        if route == ProxyRoute::ClaudeCountTokens
+            && execution.driver_is("oauth.claude_messages")
+            && status == StatusCode::UNAUTHORIZED
+            && attempt_context.attempt == 0
+        {
+            state
+                .refresh_managed_account_now(stored.provider_type, execution.managed_account_id())
+                .await
+                .map_err(managed_account_refresh_error_to_proxy_error)?;
+            crate::metrics::record_claude_count_tokens_outcome("auth_refresh");
+            attempt_context = attempt_context.next(&execution, None);
+            drop(upstream);
+            drop(account_in_flight_guard);
+            drop(share_invocation_guard);
+            continue 'attempt;
+        }
+        maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
+        maybe_mark_grok_cooldown(&state, &stored, status, &response_headers).await;
+        let mut content_type = response_headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let mut content_encoding = content_encoding_value(&response_headers);
+
+        if codex_image_tool_strip_policy(&stored) == CodexImageToolStripPolicy::OnError
+            && execution.driver_is("oauth.openai_codex")
+            && matches!(
+                route,
+                ProxyRoute::CodexResponses | ProxyRoute::CodexChatCompletions
+            )
+            && !status.is_success()
+        {
+            let original_bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
+            let original_decoded =
+                decode_response_body_for_proxy(&response_headers, original_bytes);
+            if codex_image_tool_rejection_body(&original_decoded.body) {
+                if let Some(retry_body) =
+                    codex_image_tool_stripped_body_bytes(&adapter_request.body)?
+                {
+                    let retry_request = build_upstream_post_request(
+                        &http_client,
+                        &url,
+                        retry_body.clone(),
+                        &headers,
+                        &target_headers,
+                        execution.request_timeout(),
+                        adapter_request.stream_requested,
+                    );
+                    match retry_request.send().await {
+                        Ok(retry_upstream) => {
+                            adapter_request.body = retry_body;
+                            upstream = retry_upstream;
+                            status = upstream.status();
+                            status_code = status.as_u16();
+                            response_headers = upstream.headers().clone();
+                            strip_hop_by_hop_response_headers(&mut response_headers);
+                            maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
+                            maybe_mark_grok_cooldown(&state, &stored, status, &response_headers)
+                                .await;
+                            content_type = response_headers
+                                .get(CONTENT_TYPE)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string);
+                            content_encoding = content_encoding_value(&response_headers);
+                        }
+                        Err(_) => {
+                            record_provider_outcome(
+                                &state,
+                                &stored,
+                                provider_outcome_from_status(status_code),
+                            )
+                            .await;
+                            log_usage(
+                                &state,
+                                &stored,
+                                status_code,
+                                started.elapsed().as_millis(),
+                                model_metadata(&adapter_request),
+                                TokenUsage::default(),
+                                UsageLogContext {
+                                    is_streaming: adapter_request.stream_requested,
+                                    stream_status: adapter_request
+                                        .stream_requested
+                                        .then(|| "image_tool_retry_failed".to_string()),
+                                    ..request_context
+                                },
+                            )
+                            .await;
+                            return Ok(decoded_upstream_response(
+                                status,
+                                &response_headers,
+                                content_type,
+                                content_encoding,
+                                original_decoded,
+                            ));
+                        }
+                    }
+                } else {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        provider_outcome_from_status(status_code),
+                    )
+                    .await;
+                    log_usage(
+                        &state,
+                        &stored,
+                        status_code,
+                        started.elapsed().as_millis(),
+                        model_metadata(&adapter_request),
+                        TokenUsage::default(),
+                        UsageLogContext {
+                            is_streaming: adapter_request.stream_requested,
+                            stream_status: adapter_request
+                                .stream_requested
+                                .then(|| "upstream_error".to_string()),
+                            ..request_context
+                        },
+                    )
+                    .await;
+                    return Ok(decoded_upstream_response(
+                        status,
+                        &response_headers,
+                        content_type,
+                        content_encoding,
+                        original_decoded,
+                    ));
                 }
             } else {
-                record_provider_outcome(
-                    &state,
-                    &stored,
-                    provider_outcome_from_status_and_headers(status_code, &response_headers),
-                )
-                .await;
+                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
+                    .await;
                 log_usage(
                     &state,
                     &stored,
@@ -618,14 +656,189 @@ async fn forward_with_attempt(
                     original_decoded,
                 ));
             }
-        } else {
-            record_provider_outcome(
-                &state,
-                &stored,
-                provider_outcome_from_status_and_headers(status_code, &response_headers),
-            )
-            .await;
-            log_usage(
+        }
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let bytes = match upstream.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        provider_outcome_from_status(status_code),
+                    )
+                    .await;
+                    if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
+                        crate::metrics::record_claude_retry(
+                            "transport",
+                            "rate_limit_body_read_error",
+                        );
+                        attempt_context = attempt_context.next(&execution, claude_body_retry_stage);
+                        drop(account_in_flight_guard);
+                        drop(share_invocation_guard);
+                        continue 'attempt;
+                    }
+                    return Err(ProxyError::bad_gateway(error));
+                }
+            };
+            let decoded = decode_response_body_for_proxy(&response_headers, bytes);
+            maybe_mark_codex_rate_limited(&state, &stored, &decoded.body).await;
+            if route == ProxyRoute::ClaudeCountTokens {
+                crate::metrics::record_claude_count_tokens_outcome("rate_limited");
+            } else {
+                let usage = adapter.parse_usage(&decoded.body, &stored, route);
+                let share_id_for_record = request_context.share_id.clone();
+                let user_email_for_record = request_context.user_email.clone();
+                log_usage(
+                    &state,
+                    &stored,
+                    status_code,
+                    started.elapsed().as_millis(),
+                    model_metadata(&adapter_request),
+                    usage,
+                    UsageLogContext {
+                        is_streaming: adapter_request.stream_requested,
+                        stream_status: adapter_request
+                            .stream_requested
+                            .then(|| "rate_limited".to_string()),
+                        ..request_context
+                    },
+                )
+                .await;
+                record_share_invocation_result(
+                    &state,
+                    share_id_for_record.as_deref(),
+                    user_email_for_record.as_deref(),
+                    usage,
+                )
+                .await;
+            }
+            record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
+                .await;
+            let mut response = Response::new(Body::from(decoded.body));
+            *response.status_mut() = status;
+            if let Some(content_type) = content_type {
+                if let Ok(value) = HeaderValue::from_str(&content_type) {
+                    response.headers_mut().insert(CONTENT_TYPE, value);
+                }
+            }
+            if decoded.preserve_content_encoding {
+                if let Some(value) = content_encoding {
+                    response.headers_mut().insert(CONTENT_ENCODING, value);
+                }
+            }
+            copy_safe_upstream_response_headers(&response_headers, &mut response);
+            return Ok(response);
+        }
+
+        if adapter_request.stream_requested {
+            let timeouts = StreamTimeoutConfig {
+                first_byte: execution.stream_first_byte_timeout(),
+                idle: execution.stream_idle_timeout(),
+            };
+            let mut inner = upstream.bytes_stream().boxed();
+            let mut pending_chunk = None;
+            let mut sse_error_detector = claude_sse_error_detector_for(&stored, route);
+            let mut sse_error_outcome_recorded = false;
+            if sse_error_detector.is_some() {
+                let mut prelude = Vec::new();
+                let mut detected_error = None;
+                let first_chunk = loop {
+                    let (timeout, kind) = if prelude.is_empty() {
+                        (timeouts.first_byte, StreamTimeoutKind::FirstByte)
+                    } else {
+                        (timeouts.idle, StreamTimeoutKind::Idle)
+                    };
+                    let next = match timeout {
+                        Some(timeout) => {
+                            match tokio::time::timeout(timeout, inner.try_next()).await {
+                                Ok(result) => result.map_err(StreamReadError::Upstream),
+                                Err(_) => Err(StreamReadError::Timeout { kind, timeout }),
+                            }
+                        }
+                        None => inner.try_next().await.map_err(StreamReadError::Upstream),
+                    };
+                    match next {
+                        Ok(Some(chunk)) => {
+                            prelude.extend_from_slice(&chunk);
+                            detected_error = sse_error_detector
+                                .as_mut()
+                                .and_then(|detector| detector.push(&chunk));
+                            let ready = detected_error.is_some()
+                                || sse_error_detector
+                                    .as_ref()
+                                    .is_some_and(ClaudeSseErrorDetector::prelude_ready)
+                                || prelude.len() >= 64 * 1024;
+                            if ready {
+                                break Ok(Some(Bytes::from(prelude)));
+                            }
+                        }
+                        Ok(None) => break Ok((!prelude.is_empty()).then(|| Bytes::from(prelude))),
+                        Err(error) => break Err(error),
+                    }
+                };
+                match first_chunk {
+                    Ok(Some(chunk)) => {
+                        let sse_error = detected_error;
+                        let sse_error_outcome = sse_error
+                            .as_ref()
+                            .and_then(|error| claude_sse_error_outcome(&error.error_type));
+                        if let Some(outcome) = sse_error_outcome {
+                            record_provider_outcome(&state, &stored, outcome).await;
+                            if attempt_context.retry_allowed() {
+                                crate::metrics::record_claude_retry("transport", "sse_error");
+                                attempt_context =
+                                    attempt_context.next(&execution, claude_body_retry_stage);
+                                drop(account_in_flight_guard);
+                                drop(share_invocation_guard);
+                                continue 'attempt;
+                            }
+                            sse_error_outcome_recorded = true;
+                        } else if execution.driver_is("oauth.claude_messages") {
+                            if let Some(error) = sse_error {
+                                if let Some(next_stage) = claude_body_retry_stage_for_error_message(
+                                    error.message.as_deref().unwrap_or(&error.error_type),
+                                    claude_body_retry_stage,
+                                    &adapter_request.body,
+                                ) {
+                                    if attempt_context.retry_allowed() {
+                                        crate::metrics::record_claude_retry(
+                                            next_stage.as_header_value(),
+                                            "sse_error",
+                                        );
+                                        attempt_context =
+                                            attempt_context.next(&execution, Some(next_stage));
+                                        drop(account_in_flight_guard);
+                                        drop(share_invocation_guard);
+                                        continue 'attempt;
+                                    }
+                                }
+                            }
+                        }
+                        pending_chunk = Some(chunk);
+                        sse_error_detector = claude_sse_error_detector_for(&stored, route);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
+                            .await;
+                        if attempt_context.retry_allowed() {
+                            crate::metrics::record_claude_retry("transport", "first_event_read");
+                            attempt_context =
+                                attempt_context.next(&execution, claude_body_retry_stage);
+                            drop(account_in_flight_guard);
+                            drop(share_invocation_guard);
+                            continue 'attempt;
+                        }
+                        return Err(ProxyError {
+                            status: StatusCode::from_u16(error.status_code())
+                                .unwrap_or(StatusCode::BAD_GATEWAY),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            let request_id = log_usage(
                 &state,
                 &stored,
                 status_code,
@@ -633,384 +846,100 @@ async fn forward_with_attempt(
                 model_metadata(&adapter_request),
                 TokenUsage::default(),
                 UsageLogContext {
-                    is_streaming: adapter_request.stream_requested,
-                    stream_status: adapter_request
-                        .stream_requested
-                        .then(|| "upstream_error".to_string()),
-                    ..request_context
+                    is_streaming: true,
+                    stream_status: Some("pending".to_string()),
+                    ..request_context.clone()
                 },
             )
             .await;
-            return Ok(decoded_upstream_response(
-                status,
-                &response_headers,
-                content_type,
-                content_encoding,
-                original_decoded,
-            ));
-        }
-    }
 
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        let bytes = match upstream.bytes().await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                record_provider_outcome(
-                    &state,
-                    &stored,
-                    provider_outcome_from_status_and_headers(status_code, &response_headers),
-                )
-                .await;
-                if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
-                    crate::metrics::record_claude_retry("transport", "rate_limit_body_read_error");
-                    let next_attempt = attempt_context.next(
-                        provider_failover_allowed.then_some(stored.provider.id.as_str()),
-                        claude_body_retry_stage,
-                    );
-                    drop(account_in_flight_guard);
-                    drop(share_invocation_guard);
-                    return Box::pin(forward_with_attempt(
-                        state,
-                        route,
-                        retry_gemini_path,
-                        headers,
-                        raw_body_for_retry,
-                        next_attempt,
-                    ))
-                    .await;
-                }
-                return Err(ProxyError::bad_gateway(error));
-            }
-        };
-        let decoded = decode_response_body_for_proxy(&response_headers, bytes);
-        maybe_mark_codex_rate_limited(&state, &stored, &decoded.body).await;
-        if route == ProxyRoute::ClaudeCountTokens {
-            crate::metrics::record_claude_count_tokens_outcome("rate_limited");
-        } else {
-            let usage = adapter.parse_usage(&decoded.body, &stored, route);
-            let share_id_for_record = request_context.share_id.clone();
-            let user_email_for_record = request_context.user_email.clone();
-            log_usage(
-                &state,
-                &stored,
+            let stream_stored = stored.clone();
+            let interrupted_update_armed = Arc::new(AtomicBool::new(true));
+            let stream_state = StreamForwardState {
+                inner,
+                stored: stream_stored,
+                state: state.clone(),
+                route,
+                request_id,
                 status_code,
-                started.elapsed().as_millis(),
-                model_metadata(&adapter_request),
-                usage,
-                UsageLogContext {
-                    is_streaming: adapter_request.stream_requested,
-                    stream_status: adapter_request
-                        .stream_requested
-                        .then(|| "rate_limited".to_string()),
-                    ..request_context
-                },
-            )
-            .await;
-            record_share_invocation_result(
-                &state,
-                share_id_for_record.as_deref(),
-                user_email_for_record.as_deref(),
-                usage,
-            )
-            .await;
-        }
-        record_provider_outcome(
-            &state,
-            &stored,
-            provider_outcome_from_status_and_headers(status_code, &response_headers),
-        )
-        .await;
-        let mut response = Response::new(Body::from(decoded.body));
-        *response.status_mut() = status;
-        if let Some(content_type) = content_type {
-            if let Ok(value) = HeaderValue::from_str(&content_type) {
-                response.headers_mut().insert(CONTENT_TYPE, value);
-            }
-        }
-        if decoded.preserve_content_encoding {
-            if let Some(value) = content_encoding {
-                response.headers_mut().insert(CONTENT_ENCODING, value);
-            }
-        }
-        copy_safe_upstream_response_headers(&response_headers, &mut response);
-        return Ok(response);
-    }
-
-    if adapter_request.stream_requested {
-        let timeouts = stream_timeout_config(&stored);
-        let mut inner = upstream.bytes_stream().boxed();
-        let mut pending_chunk = None;
-        let mut sse_error_detector = claude_sse_error_detector_for(&stored, route);
-        let mut sse_error_outcome_recorded = false;
-        if sse_error_detector.is_some() {
-            let mut prelude = Vec::new();
-            let mut detected_error = None;
-            let first_chunk = loop {
-                let (timeout, kind) = if prelude.is_empty() {
-                    (timeouts.first_byte, StreamTimeoutKind::FirstByte)
-                } else {
-                    (timeouts.idle, StreamTimeoutKind::Idle)
-                };
-                let next = match timeout {
-                    Some(timeout) => match tokio::time::timeout(timeout, inner.try_next()).await {
-                        Ok(result) => result.map_err(StreamReadError::Upstream),
-                        Err(_) => Err(StreamReadError::Timeout { kind, timeout }),
-                    },
-                    None => inner.try_next().await.map_err(StreamReadError::Upstream),
-                };
-                match next {
-                    Ok(Some(chunk)) => {
-                        prelude.extend_from_slice(&chunk);
-                        detected_error = sse_error_detector
-                            .as_mut()
-                            .and_then(|detector| detector.push(&chunk));
-                        let ready = detected_error.is_some()
-                            || sse_error_detector
-                                .as_ref()
-                                .is_some_and(ClaudeSseErrorDetector::prelude_ready)
-                            || prelude.len() >= 64 * 1024;
-                        if ready {
-                            break Ok(Some(Bytes::from(prelude)));
-                        }
-                    }
-                    Ok(None) => break Ok((!prelude.is_empty()).then(|| Bytes::from(prelude))),
-                    Err(error) => break Err(error),
-                }
+                share_id: request_context.share_id.clone(),
+                user_email: request_context.user_email.clone(),
+                started,
+                first_token_ms: None,
+                received_any_chunk: false,
+                usage: StreamUsageAccumulator::new(adapters::usage_input_semantics_for(
+                    &stored, route,
+                )),
+                codex_completed_output_patcher: CodexCompletedOutputPatcher::new(&stored, route),
+                codex_pending_function_call_patcher: CodexPendingFunctionCallPatcher::new(
+                    &stored, route,
+                ),
+                codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher::default(),
+                stream_transform: super::stream_transforms::StreamEventTransformer::new(
+                    &stored,
+                    route,
+                    adapter_request.custom_tool_names.clone(),
+                ),
+                timeouts,
+                pending_chunk,
+                sse_error_detector,
+                sse_error_outcome_recorded,
+                terminal_frame_sent: false,
+                interrupted_update_armed,
+                _account_in_flight_guard: account_in_flight_guard,
+                _share_invocation_guard: share_invocation_guard,
             };
-            match first_chunk {
-                Ok(Some(chunk)) => {
-                    let sse_error = detected_error;
-                    let sse_error_outcome = sse_error.as_ref().and_then(|error| {
-                        claude_sse_error_outcome(
-                            &error.error_type,
-                            reset_header_open_until_ms(&response_headers),
-                        )
-                    });
-                    if let Some(outcome) = sse_error_outcome {
-                        record_provider_outcome(&state, &stored, outcome).await;
-                        if attempt_context.retry_allowed() {
-                            crate::metrics::record_claude_retry("transport", "sse_error");
-                            let next_attempt = attempt_context.next(
-                                provider_failover_allowed.then_some(stored.provider.id.as_str()),
-                                claude_body_retry_stage,
-                            );
-                            drop(account_in_flight_guard);
-                            drop(share_invocation_guard);
-                            return Box::pin(forward_with_attempt(
-                                state,
-                                route,
-                                retry_gemini_path,
-                                headers,
-                                raw_body_for_retry,
-                                next_attempt,
-                            ))
-                            .await;
-                        }
-                        sse_error_outcome_recorded = true;
-                    } else if stored.provider_type == ProviderType::ClaudeOAuth {
-                        if let Some(error) = sse_error {
-                            if let Some(next_stage) = claude_body_retry_stage_for_error_message(
-                                error.message.as_deref().unwrap_or(&error.error_type),
-                                claude_body_retry_stage,
-                                &adapter_request.body,
-                            ) {
-                                if attempt_context.retry_allowed() {
-                                    crate::metrics::record_claude_retry(
-                                        next_stage.as_header_value(),
-                                        "sse_error",
-                                    );
-                                    let next_attempt = attempt_context.next(None, Some(next_stage));
-                                    drop(account_in_flight_guard);
-                                    drop(share_invocation_guard);
-                                    return Box::pin(forward_with_attempt(
-                                        state,
-                                        route,
-                                        retry_gemini_path,
-                                        headers,
-                                        raw_body_for_retry,
-                                        next_attempt,
-                                    ))
-                                    .await;
-                                }
+            let stream = stream::try_unfold(stream_state, |mut stream_state| async move {
+                if stream_state.terminal_frame_sent {
+                    return Ok(None);
+                }
+
+                let next_chunk = if let Some(chunk) = stream_state.pending_chunk.take() {
+                    Ok(Some(chunk))
+                } else {
+                    let timeout_kind = stream_state.next_timeout_kind();
+                    match stream_state.next_timeout() {
+                        Some(timeout) => {
+                            match tokio::time::timeout(timeout, stream_state.inner.try_next()).await
+                            {
+                                Ok(result) => result.map_err(StreamReadError::Upstream),
+                                Err(_) => Err(StreamReadError::Timeout {
+                                    kind: timeout_kind,
+                                    timeout,
+                                }),
                             }
                         }
+                        None => stream_state
+                            .inner
+                            .try_next()
+                            .await
+                            .map_err(StreamReadError::Upstream),
                     }
-                    pending_chunk = Some(chunk);
-                    sse_error_detector = claude_sse_error_detector_for(&stored, route);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-                    if attempt_context.retry_allowed() {
-                        crate::metrics::record_claude_retry("transport", "first_event_read");
-                        let next_attempt = attempt_context.next(
-                            provider_failover_allowed.then_some(stored.provider.id.as_str()),
-                            claude_body_retry_stage,
-                        );
-                        drop(account_in_flight_guard);
-                        drop(share_invocation_guard);
-                        return Box::pin(forward_with_attempt(
-                            state,
-                            route,
-                            retry_gemini_path,
-                            headers,
-                            raw_body_for_retry,
-                            next_attempt,
-                        ))
-                        .await;
-                    }
-                    return Err(ProxyError {
-                        status: StatusCode::from_u16(error.status_code())
-                            .unwrap_or(StatusCode::BAD_GATEWAY),
-                        message: error.to_string(),
-                    });
-                }
-            }
-        }
-        let request_id = log_usage(
-            &state,
-            &stored,
-            status_code,
-            started.elapsed().as_millis(),
-            model_metadata(&adapter_request),
-            TokenUsage::default(),
-            UsageLogContext {
-                is_streaming: true,
-                stream_status: Some("pending".to_string()),
-                ..request_context.clone()
-            },
-        )
-        .await;
+                };
 
-        let stream_stored = stored.clone();
-        let interrupted_update_armed = Arc::new(AtomicBool::new(true));
-        let stream_state = StreamForwardState {
-            inner,
-            stored: stream_stored,
-            state: state.clone(),
-            route,
-            request_id,
-            status_code,
-            share_id: request_context.share_id.clone(),
-            user_email: request_context.user_email.clone(),
-            started,
-            first_token_ms: None,
-            received_any_chunk: false,
-            usage: StreamUsageAccumulator::new(adapters::usage_input_semantics_for(&stored, route)),
-            codex_completed_output_patcher: CodexCompletedOutputPatcher::new(&stored, route),
-            codex_pending_function_call_patcher: CodexPendingFunctionCallPatcher::new(
-                &stored, route,
-            ),
-            codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher::default(),
-            stream_transform: super::stream_transforms::StreamEventTransformer::new(
-                &stored,
-                route,
-                adapter_request.custom_tool_names.clone(),
-            ),
-            timeouts,
-            upstream_open_until_ms: reset_header_open_until_ms(&response_headers),
-            pending_chunk,
-            sse_error_detector,
-            sse_error_outcome_recorded,
-            terminal_frame_sent: false,
-            interrupted_update_armed,
-            _account_in_flight_guard: account_in_flight_guard,
-            _share_invocation_guard: share_invocation_guard,
-        };
-        let stream = stream::try_unfold(stream_state, |mut stream_state| async move {
-            if stream_state.terminal_frame_sent {
-                return Ok(None);
-            }
-
-            let next_chunk = if let Some(chunk) = stream_state.pending_chunk.take() {
-                Ok(Some(chunk))
-            } else {
-                let timeout_kind = stream_state.next_timeout_kind();
-                match stream_state.next_timeout() {
-                    Some(timeout) => {
-                        match tokio::time::timeout(timeout, stream_state.inner.try_next()).await {
-                            Ok(result) => result.map_err(StreamReadError::Upstream),
-                            Err(_) => Err(StreamReadError::Timeout {
-                                kind: timeout_kind,
-                                timeout,
-                            }),
-                        }
-                    }
-                    None => stream_state
-                        .inner
-                        .try_next()
-                        .await
-                        .map_err(StreamReadError::Upstream),
-                }
-            };
-
-            match next_chunk {
-                Ok(Some(chunk)) => {
-                    stream_state.received_any_chunk = true;
-                    let chunk = stream_state.codex_completed_output_patcher.push(chunk);
-                    let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
-                    stream_state.usage.push(&chunk);
-                    if !stream_state.sse_error_outcome_recorded {
-                        let sse_error_outcome = stream_state
-                            .sse_error_detector
-                            .as_mut()
-                            .and_then(|detector| detector.push(&chunk))
-                            .and_then(|error| {
-                                claude_sse_error_outcome(
-                                    &error.error_type,
-                                    stream_state.upstream_open_until_ms,
-                                )
-                            });
-                        if let Some(outcome) = sse_error_outcome {
-                            record_provider_outcome(
-                                &stream_state.state,
-                                &stream_state.stored,
-                                outcome,
-                            )
-                            .await;
-                            stream_state.sse_error_outcome_recorded = true;
-                        }
-                    }
-                    if stream_state.first_token_ms.is_none() && !chunk.is_empty() {
-                        let first_token_ms = stream_state.started.elapsed().as_millis();
-                        stream_state.first_token_ms = Some(first_token_ms);
-                        update_stream_usage(
-                            &stream_state.state,
-                            &stream_state.stored,
-                            &stream_state.request_id,
-                            stream_state.status_code,
-                            stream_state.started.elapsed().as_millis(),
-                            Some(first_token_ms),
-                            Default::default(),
-                            Some("streaming"),
-                        )
-                        .await;
-                    }
-                    let transformed = match stream_state.stream_transform.push(chunk) {
-                        Ok(transformed) => transformed,
-                        Err(error) => return stream_state.terminate_transform_error(error).await,
-                    };
-                    let transformed = stream_state
-                        .codex_custom_tool_stream_patcher
-                        .push(transformed);
-                    Ok(Some((transformed, stream_state)))
-                }
-                Ok(None) => {
-                    let chunk = stream_state.codex_completed_output_patcher.finish();
-                    let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
-                    let tail = stream_state.codex_pending_function_call_patcher.finish();
-                    let chunk = if tail.is_empty() {
-                        chunk
-                    } else if chunk.is_empty() {
-                        tail
-                    } else {
-                        let mut joined = chunk.to_vec();
-                        joined.extend_from_slice(&tail);
-                        Bytes::from(joined)
-                    };
-                    if !chunk.is_empty() {
+                match next_chunk {
+                    Ok(Some(chunk)) => {
+                        stream_state.received_any_chunk = true;
+                        let chunk = stream_state.codex_completed_output_patcher.push(chunk);
+                        let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
                         stream_state.usage.push(&chunk);
-                        if stream_state.first_token_ms.is_none() {
+                        if !stream_state.sse_error_outcome_recorded {
+                            let sse_error_outcome = stream_state
+                                .sse_error_detector
+                                .as_mut()
+                                .and_then(|detector| detector.push(&chunk))
+                                .and_then(|error| claude_sse_error_outcome(&error.error_type));
+                            if let Some(outcome) = sse_error_outcome {
+                                record_provider_outcome(
+                                    &stream_state.state,
+                                    &stream_state.stored,
+                                    outcome,
+                                )
+                                .await;
+                                stream_state.sse_error_outcome_recorded = true;
+                            }
+                        }
+                        if stream_state.first_token_ms.is_none() && !chunk.is_empty() {
                             let first_token_ms = stream_state.started.elapsed().as_millis();
                             stream_state.first_token_ms = Some(first_token_ms);
                             update_stream_usage(
@@ -1031,240 +960,258 @@ async fn forward_with_attempt(
                                 return stream_state.terminate_transform_error(error).await
                             }
                         };
-                        let tail = match stream_state.stream_transform.finish() {
+                        let transformed = stream_state
+                            .codex_custom_tool_stream_patcher
+                            .push(transformed);
+                        Ok(Some((transformed, stream_state)))
+                    }
+                    Ok(None) => {
+                        let chunk = stream_state.codex_completed_output_patcher.finish();
+                        let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
+                        let tail = stream_state.codex_pending_function_call_patcher.finish();
+                        let chunk = if tail.is_empty() {
+                            chunk
+                        } else if chunk.is_empty() {
+                            tail
+                        } else {
+                            let mut joined = chunk.to_vec();
+                            joined.extend_from_slice(&tail);
+                            Bytes::from(joined)
+                        };
+                        if !chunk.is_empty() {
+                            stream_state.usage.push(&chunk);
+                            if stream_state.first_token_ms.is_none() {
+                                let first_token_ms = stream_state.started.elapsed().as_millis();
+                                stream_state.first_token_ms = Some(first_token_ms);
+                                update_stream_usage(
+                                    &stream_state.state,
+                                    &stream_state.stored,
+                                    &stream_state.request_id,
+                                    stream_state.status_code,
+                                    stream_state.started.elapsed().as_millis(),
+                                    Some(first_token_ms),
+                                    Default::default(),
+                                    Some("streaming"),
+                                )
+                                .await;
+                            }
+                            let transformed = match stream_state.stream_transform.push(chunk) {
+                                Ok(transformed) => transformed,
+                                Err(error) => {
+                                    return stream_state.terminate_transform_error(error).await
+                                }
+                            };
+                            let tail = match stream_state.stream_transform.finish() {
+                                Ok(tail) => tail,
+                                Err(error) => {
+                                    return stream_state.terminate_transform_error(error).await
+                                }
+                            };
+                            let transformed = join_bytes(transformed, tail);
+                            let transformed = stream_state
+                                .codex_custom_tool_stream_patcher
+                                .push(transformed);
+                            return Ok(Some((transformed, stream_state)));
+                        }
+                        let transform_tail = match stream_state.stream_transform.finish() {
                             Ok(tail) => tail,
                             Err(error) => {
                                 return stream_state.terminate_transform_error(error).await
                             }
                         };
-                        let transformed = join_bytes(transformed, tail);
-                        let transformed = stream_state
+                        let transformed_tail = stream_state
                             .codex_custom_tool_stream_patcher
-                            .push(transformed);
-                        return Ok(Some((transformed, stream_state)));
+                            .push(transform_tail);
+                        let custom_tail = join_bytes(
+                            transformed_tail,
+                            stream_state.codex_custom_tool_stream_patcher.finish(),
+                        );
+                        if !custom_tail.is_empty() {
+                            return Ok(Some((custom_tail, stream_state)));
+                        }
+                        let usage = std::mem::take(&mut stream_state.usage).finish();
+                        update_stream_usage(
+                            &stream_state.state,
+                            &stream_state.stored,
+                            &stream_state.request_id,
+                            stream_state.status_code,
+                            stream_state.started.elapsed().as_millis(),
+                            stream_state.first_token_ms,
+                            usage,
+                            Some("completed"),
+                        )
+                        .await;
+                        record_share_invocation_result(
+                            &stream_state.state,
+                            stream_state.share_id.as_deref(),
+                            stream_state.user_email.as_deref(),
+                            usage,
+                        )
+                        .await;
+                        if !stream_state.sse_error_outcome_recorded {
+                            record_provider_outcome(
+                                &stream_state.state,
+                                &stream_state.stored,
+                                provider_outcome_from_status(stream_state.status_code),
+                            )
+                            .await;
+                        }
+                        stream_state
+                            .interrupted_update_armed
+                            .store(false, Ordering::Relaxed);
+                        Ok(None)
                     }
-                    let transform_tail = match stream_state.stream_transform.finish() {
-                        Ok(tail) => tail,
-                        Err(error) => return stream_state.terminate_transform_error(error).await,
-                    };
-                    let transformed_tail = stream_state
-                        .codex_custom_tool_stream_patcher
-                        .push(transform_tail);
-                    let custom_tail = join_bytes(
-                        transformed_tail,
-                        stream_state.codex_custom_tool_stream_patcher.finish(),
-                    );
-                    if !custom_tail.is_empty() {
-                        return Ok(Some((custom_tail, stream_state)));
-                    }
-                    let usage = std::mem::take(&mut stream_state.usage).finish();
-                    update_stream_usage(
-                        &stream_state.state,
-                        &stream_state.stored,
-                        &stream_state.request_id,
-                        stream_state.status_code,
-                        stream_state.started.elapsed().as_millis(),
-                        stream_state.first_token_ms,
-                        usage,
-                        Some("completed"),
-                    )
-                    .await;
-                    record_share_invocation_result(
-                        &stream_state.state,
-                        stream_state.share_id.as_deref(),
-                        stream_state.user_email.as_deref(),
-                        usage,
-                    )
-                    .await;
-                    if !stream_state.sse_error_outcome_recorded {
+                    Err(error) => {
+                        let usage = std::mem::take(&mut stream_state.usage).finish();
+                        let status = error.status_code();
+                        let stream_status = error.stream_status();
+                        update_stream_usage(
+                            &stream_state.state,
+                            &stream_state.stored,
+                            &stream_state.request_id,
+                            status,
+                            stream_state.started.elapsed().as_millis(),
+                            stream_state.first_token_ms,
+                            usage,
+                            Some(stream_status),
+                        )
+                        .await;
+                        record_share_invocation_result(
+                            &stream_state.state,
+                            stream_state.share_id.as_deref(),
+                            stream_state.user_email.as_deref(),
+                            usage,
+                        )
+                        .await;
                         record_provider_outcome(
                             &stream_state.state,
                             &stream_state.stored,
-                            provider_outcome_from_status_and_reset(
-                                stream_state.status_code,
-                                stream_state.upstream_open_until_ms,
-                            ),
+                            ProviderOutcome::NetworkFailure,
                         )
                         .await;
+                        stream_state
+                            .interrupted_update_armed
+                            .store(false, Ordering::Relaxed);
+                        stream_state.terminal_frame_sent = true;
+                        let message = error.to_string();
+                        if let Some(frame) =
+                            stream_terminal_error_frame(stream_state.route, &message, status)
+                        {
+                            Ok(Some((frame, stream_state)))
+                        } else {
+                            Err(std::io::Error::other(message))
+                        }
                     }
-                    stream_state
-                        .interrupted_update_armed
-                        .store(false, Ordering::Relaxed);
-                    Ok(None)
                 }
-                Err(error) => {
-                    let usage = std::mem::take(&mut stream_state.usage).finish();
-                    let status = error.status_code();
-                    let stream_status = error.stream_status();
-                    update_stream_usage(
-                        &stream_state.state,
-                        &stream_state.stored,
-                        &stream_state.request_id,
-                        status,
-                        stream_state.started.elapsed().as_millis(),
-                        stream_state.first_token_ms,
-                        usage,
-                        Some(stream_status),
-                    )
-                    .await;
-                    record_share_invocation_result(
-                        &stream_state.state,
-                        stream_state.share_id.as_deref(),
-                        stream_state.user_email.as_deref(),
-                        usage,
-                    )
-                    .await;
-                    record_provider_outcome(
-                        &stream_state.state,
-                        &stream_state.stored,
-                        ProviderOutcome::NetworkFailure,
-                    )
-                    .await;
-                    stream_state
-                        .interrupted_update_armed
-                        .store(false, Ordering::Relaxed);
-                    stream_state.terminal_frame_sent = true;
-                    let message = error.to_string();
-                    if let Some(frame) =
-                        stream_terminal_error_frame(stream_state.route, &message, status)
-                    {
-                        Ok(Some((frame, stream_state)))
-                    } else {
-                        Err(std::io::Error::other(message))
-                    }
+            });
+            let mut response = Response::new(Body::from_stream(stream));
+            *response.status_mut() = status;
+            if let Some(content_type) = content_type {
+                if let Ok(value) = HeaderValue::from_str(&content_type) {
+                    response.headers_mut().insert(CONTENT_TYPE, value);
                 }
             }
-        });
-        let mut response = Response::new(Body::from_stream(stream));
+            copy_safe_upstream_response_headers(&response_headers, &mut response);
+            return Ok(response);
+        }
+
+        let bytes = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                if route == ProxyRoute::ClaudeCountTokens {
+                    crate::metrics::record_claude_count_tokens_outcome("network_error");
+                }
+                if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
+                    crate::metrics::record_claude_retry("transport", "body_read_error");
+                    attempt_context = attempt_context.next(&execution, claude_body_retry_stage);
+                    drop(account_in_flight_guard);
+                    drop(share_invocation_guard);
+                    continue 'attempt;
+                }
+                return Err(ProxyError::bad_gateway(error));
+            }
+        };
+        let decoded = decode_response_body_for_proxy(&response_headers, bytes);
+        let mut preserve_content_encoding = decoded.preserve_content_encoding;
+        let mut bytes = decoded.body;
+        let next_body_retry_stage = if route == ProxyRoute::ClaudeMessages
+            && execution.driver_is("oauth.claude_messages")
+        {
+            claude_non_stream_retry_stage(
+                status,
+                &bytes,
+                claude_body_retry_stage,
+                &adapter_request.body,
+            )
+        } else {
+            None
+        };
+        if let Some(next_stage) = next_body_retry_stage {
+            if attempt_context.retry_allowed() {
+                crate::metrics::record_claude_retry(next_stage.as_header_value(), "http_error");
+                attempt_context = attempt_context.next(&execution, Some(next_stage));
+                drop(account_in_flight_guard);
+                drop(share_invocation_guard);
+                continue 'attempt;
+            }
+        }
+        let (rewritten, version_gate_rewritten) =
+            maybe_rewrite_claude_cli_version_gate_body(status, &stored, route, bytes);
+        bytes = rewritten;
+        if version_gate_rewritten {
+            preserve_content_encoding = false;
+        }
+        let usage = if route == ProxyRoute::ClaudeCountTokens {
+            TokenUsage::default()
+        } else {
+            adapter.parse_usage(&bytes, &stored, route)
+        };
+        let bytes =
+            adapter.transform_response_for_request(bytes, &stored, route, &adapter_request)?;
+        let share_id_for_record = request_context.share_id.clone();
+        if route == ProxyRoute::ClaudeCountTokens {
+            crate::metrics::record_claude_count_tokens_outcome(count_tokens_metric_outcome(status));
+        } else {
+            let user_email_for_record = request_context.user_email.clone();
+            log_usage(
+                &state,
+                &stored,
+                status_code,
+                started.elapsed().as_millis(),
+                model_metadata(&adapter_request),
+                usage,
+                UsageLogContext {
+                    is_streaming: false,
+                    ..request_context
+                },
+            )
+            .await;
+            record_share_invocation_result(
+                &state,
+                share_id_for_record.as_deref(),
+                user_email_for_record.as_deref(),
+                usage,
+            )
+            .await;
+        }
+        record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
+
+        let mut response = Response::new(Body::from(bytes));
         *response.status_mut() = status;
         if let Some(content_type) = content_type {
             if let Ok(value) = HeaderValue::from_str(&content_type) {
                 response.headers_mut().insert(CONTENT_TYPE, value);
             }
         }
+        if preserve_content_encoding {
+            if let Some(value) = content_encoding {
+                response.headers_mut().insert(CONTENT_ENCODING, value);
+            }
+        }
         copy_safe_upstream_response_headers(&response_headers, &mut response);
         return Ok(response);
     }
-
-    let bytes = match upstream.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-            if route == ProxyRoute::ClaudeCountTokens {
-                crate::metrics::record_claude_count_tokens_outcome("network_error");
-            }
-            if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
-                crate::metrics::record_claude_retry("transport", "body_read_error");
-                let next_attempt = attempt_context.next(
-                    provider_failover_allowed.then_some(stored.provider.id.as_str()),
-                    claude_body_retry_stage,
-                );
-                drop(account_in_flight_guard);
-                drop(share_invocation_guard);
-                return Box::pin(forward_with_attempt(
-                    state,
-                    route,
-                    retry_gemini_path,
-                    headers,
-                    raw_body_for_retry,
-                    next_attempt,
-                ))
-                .await;
-            }
-            return Err(ProxyError::bad_gateway(error));
-        }
-    };
-    let decoded = decode_response_body_for_proxy(&response_headers, bytes);
-    let mut preserve_content_encoding = decoded.preserve_content_encoding;
-    let mut bytes = decoded.body;
-    let next_body_retry_stage = if route == ProxyRoute::ClaudeMessages
-        && stored.provider_type == ProviderType::ClaudeOAuth
-    {
-        claude_non_stream_retry_stage(
-            status,
-            &bytes,
-            claude_body_retry_stage,
-            &adapter_request.body,
-        )
-    } else {
-        None
-    };
-    if let Some(next_stage) = next_body_retry_stage {
-        if attempt_context.retry_allowed() {
-            crate::metrics::record_claude_retry(next_stage.as_header_value(), "http_error");
-            let next_attempt = attempt_context.next(None, Some(next_stage));
-            drop(account_in_flight_guard);
-            drop(share_invocation_guard);
-            return Box::pin(forward_with_attempt(
-                state,
-                route,
-                retry_gemini_path,
-                headers,
-                raw_body_for_retry,
-                next_attempt,
-            ))
-            .await;
-        }
-    }
-    let (rewritten, version_gate_rewritten) =
-        maybe_rewrite_claude_cli_version_gate_body(status, &stored, route, bytes);
-    bytes = rewritten;
-    if version_gate_rewritten {
-        preserve_content_encoding = false;
-    }
-    let usage = if route == ProxyRoute::ClaudeCountTokens {
-        TokenUsage::default()
-    } else {
-        adapter.parse_usage(&bytes, &stored, route)
-    };
-    let bytes = adapter.transform_response_for_request(bytes, &stored, route, &adapter_request)?;
-    let share_id_for_record = request_context.share_id.clone();
-    if route == ProxyRoute::ClaudeCountTokens {
-        crate::metrics::record_claude_count_tokens_outcome(count_tokens_metric_outcome(status));
-    } else {
-        let user_email_for_record = request_context.user_email.clone();
-        log_usage(
-            &state,
-            &stored,
-            status_code,
-            started.elapsed().as_millis(),
-            model_metadata(&adapter_request),
-            usage,
-            UsageLogContext {
-                is_streaming: false,
-                ..request_context
-            },
-        )
-        .await;
-        record_share_invocation_result(
-            &state,
-            share_id_for_record.as_deref(),
-            user_email_for_record.as_deref(),
-            usage,
-        )
-        .await;
-    }
-    record_provider_outcome(
-        &state,
-        &stored,
-        provider_outcome_from_status_and_headers(status_code, &response_headers),
-    )
-    .await;
-
-    let mut response = Response::new(Body::from(bytes));
-    *response.status_mut() = status;
-    if let Some(content_type) = content_type {
-        if let Ok(value) = HeaderValue::from_str(&content_type) {
-            response.headers_mut().insert(CONTENT_TYPE, value);
-        }
-    }
-    if preserve_content_encoding {
-        if let Some(value) = content_encoding {
-            response.headers_mut().insert(CONTENT_ENCODING, value);
-        }
-    }
-    copy_safe_upstream_response_headers(&response_headers, &mut response);
-    Ok(response)
 }
 
 pub async fn forward_codex_responses_ws(
@@ -1290,26 +1237,25 @@ pub async fn forward_codex_responses_ws(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let stored = if let Some(share_id) = request_context.share_id.as_deref() {
-        let (stored, _share_name) = select_share_provider(&providers, &shares, app, share_id)?;
-        stored
+    let ui_settings = state.ui_settings.read().await.for_frontend();
+    let configured_provider_id =
+        current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
+    let execution = if let Some(share_id) = request_context.share_id.as_deref() {
+        let (execution, _share_name) = select_share_execution(&providers, &shares, app, share_id)?;
+        execution
     } else {
-        state
-            .try_mutate_failover_best_effort_if_changed("failover ws selection state", |failover| {
-                select_provider(&providers, &accounts_for_selection, failover, app, &headers).map(
-                    |selected| {
-                        let changed = selected.failover_state_changed;
-                        (selected.provider, changed)
-                    },
-                )
-            })
-            .await?
+        select_provider(
+            &providers,
+            &accounts_for_selection,
+            app,
+            &headers,
+            configured_provider_id.as_deref(),
+        )?
+        .execution
     };
     drop(providers);
-    if !matches!(
-        stored.provider_type,
-        ProviderType::CodexOAuth | ProviderType::GrokOAuth
-    ) {
+    let stored = execution.runtime_stored_view();
+    if !execution.driver_is("oauth.openai_codex") && !execution.driver_is("oauth.grok_responses") {
         return Err(ProxyError::bad_request(
             "responses websocket is only available for codex_oauth or grok_oauth providers",
         ));
@@ -1321,14 +1267,16 @@ pub async fn forward_codex_responses_ws(
         });
     }
     validate_codex_allowed_client(&stored, route, &headers, request_context.share_id.is_some())?;
-    refresh_managed_account_if_needed(&state, app, &stored).await?;
+    refresh_execution_managed_account_if_needed(&state, &execution).await?;
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(app, stored.provider_type);
     let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
     let mut session_id = codex_oauth_session_id_from_request(&headers, b"").or_else(|| {
-        (stored.provider_type == ProviderType::GrokOAuth).then(super::grok::new_session_id)
+        execution
+            .driver_is("oauth.grok_responses")
+            .then(super::grok::new_session_id)
     });
-    if stored.provider_type == ProviderType::GrokOAuth {
+    if execution.driver_is("oauth.grok_responses") {
         if let Some(raw) = session_id.as_deref() {
             let tenant_scope = grok_tenant_scope(&request_context, &stored);
             session_id = Some(super::grok::namespace_session_id(
@@ -1338,10 +1286,10 @@ pub async fn forward_codex_responses_ws(
         }
     }
     append_codex_oauth_session_headers(&mut target_headers, session_id.as_deref());
-    if stored.provider_type == ProviderType::CodexOAuth {
-        super::codex_identity::finalize_headers(&mut target_headers);
+    if execution.driver_is("oauth.openai_codex") {
+        crate::codex_identity::finalize_headers(&mut target_headers);
     }
-    if stored.provider_type == ProviderType::GrokOAuth {
+    if execution.driver_is("oauth.grok_responses") {
         if let Some(session_id) = session_id.as_deref() {
             replace_or_push_header(
                 &mut target_headers,
@@ -1351,21 +1299,27 @@ pub async fn forward_codex_responses_ws(
         }
     }
     let mut target_headers = owned_headers(target_headers);
-    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
-
-    let ws_url = if stored.provider_type == ProviderType::GrokOAuth {
+    let mut ws_url = if execution.driver_is("oauth.grok_responses") {
         super::grok::websocket_url().to_string()
     } else {
         "wss://chatgpt.com/backend-api/codex/responses".to_string()
     };
-    let ws_mode = if stored.provider_type == ProviderType::GrokOAuth {
+    let materialized_auth = execution.materialize_auth(&accounts)?;
+    execution.apply_auth(&mut target_headers, &mut ws_url, materialized_auth.as_ref())?;
+    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
+
+    let ws_mode = if execution.driver_is("oauth.grok_responses") {
         ResponsesWebsocketMode::Grok
     } else {
         ResponsesWebsocketMode::Codex
     };
-    let websocket_upstream_model = crate::domain::providers::model_routing::single_upstream_model(
-        &stored.provider.settings_config,
-    );
+    let websocket_upstream_model = match &execution.plan.model_policy {
+        crate::domain::providers::runtime::RuntimeModelPolicy::Single { upstream_model } => {
+            Some(upstream_model.clone())
+        }
+        crate::domain::providers::runtime::RuntimeModelPolicy::Passthrough => None,
+    };
+    let request_timeout = execution.request_timeout();
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let state_for_share = state.clone();
@@ -1374,7 +1328,7 @@ pub async fn forward_codex_responses_ws(
         if let Err(error) = bridge_responses_websocket(
             socket,
             target_headers,
-            provider_upstream_timeout(&stored),
+            request_timeout,
             ws_url,
             ws_mode,
             session_id,
@@ -1439,34 +1393,33 @@ pub async fn forward_grok_media(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let stored = if let Some(share_id) = request_context.share_id.as_deref() {
-        let (stored, _share_name) =
-            select_share_provider(&providers, &shares, AppKind::Codex, share_id)?;
-        stored
+    let ui_settings = state.ui_settings.read().await.for_frontend();
+    let configured_provider_id =
+        current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
+    let execution = if let Some(share_id) = request_context.share_id.as_deref() {
+        let (execution, _share_name) =
+            select_share_execution(&providers, &shares, AppKind::Codex, share_id)?;
+        execution
     } else {
-        state
-            .try_mutate_failover_best_effort_if_changed("grok media selection state", |failover| {
-                super::router::select_provider_for_type(
-                    &providers,
-                    &accounts_for_selection,
-                    failover,
-                    AppKind::Codex,
-                    &selection_headers,
-                    ProviderType::GrokOAuth,
-                )
-                .map(|selected| (selected.provider, selected.failover_state_changed))
-            })
-            .await?
+        super::router::select_provider_for_type(
+            &providers,
+            &accounts_for_selection,
+            AppKind::Codex,
+            &selection_headers,
+            configured_provider_id.as_deref(),
+            ProviderType::GrokOAuth,
+        )?
+        .execution
     };
     drop(providers);
-    if stored.provider_type != ProviderType::GrokOAuth {
+    if !execution.driver_is("oauth.grok_responses") {
         return Err(ProxyError::bad_request(
             "Grok media endpoints require a grok_oauth provider",
         ));
     }
-    forward_grok_media_with_stored(
+    forward_grok_media_with_execution(
         state,
-        stored,
+        execution,
         method,
         upstream_path,
         headers,
@@ -1500,63 +1453,58 @@ pub async fn forward_images_generations(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let stored = if let Some(share_id) = request_context.share_id.as_deref() {
-        let (stored, _share_name) =
-            select_share_provider(&providers, &shares, AppKind::Codex, share_id)?;
-        stored
+    let ui_settings = state.ui_settings.read().await.for_frontend();
+    let configured_provider_id =
+        current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
+    let execution = if let Some(share_id) = request_context.share_id.as_deref() {
+        let (execution, _share_name) =
+            select_share_execution(&providers, &shares, AppKind::Codex, share_id)?;
+        execution
     } else {
-        state
-            .try_mutate_failover_best_effort_if_changed(
-                "image generation selection state",
-                |failover| {
-                    select_provider_for_codex_image_generation(
-                        &providers,
-                        &accounts_for_selection,
-                        failover,
-                        &headers,
-                    )
-                    .map(|selected| (selected.provider, selected.failover_state_changed))
-                },
-            )
-            .await?
+        select_provider_for_codex_image_generation(
+            &providers,
+            &accounts_for_selection,
+            &headers,
+            configured_provider_id.as_deref(),
+        )?
+        .execution
     };
     drop(providers);
 
-    match stored.provider_type {
-        ProviderType::GrokOAuth => {
-            forward_grok_media_with_stored(
-                state,
-                stored,
-                Method::POST,
-                "/images/generations".to_string(),
-                headers,
-                body,
-                request_context.share_id,
-                request_context.user_email,
-                share_invocation_guard,
-            )
-            .await
-        }
-        ProviderType::CodexOAuth => {
-            forward_codex_images_generations(
-                state,
-                stored,
-                headers,
-                body,
-                request_context,
-                share_invocation_guard,
-            )
-            .await
-        }
-        _ => Err(ProxyError::bad_request(
+    if execution.driver_is("oauth.grok_responses") {
+        forward_grok_media_with_execution(
+            state,
+            execution,
+            Method::POST,
+            "/images/generations".to_string(),
+            headers,
+            body,
+            request_context.share_id,
+            request_context.user_email,
+            share_invocation_guard,
+        )
+        .await
+    } else if execution.driver_is("oauth.openai_codex") {
+        forward_codex_images_generations(
+            state,
+            execution,
+            headers,
+            body,
+            request_context,
+            share_invocation_guard,
+        )
+        .await
+    } else {
+        Err(ProxyError::bad_request(
             "image generation requires a grok_oauth provider or codex_oauth provider with image generation enabled",
-        )),
+        ))
     }
 }
 
-async fn forward_grok_media_with_stored(
+#[allow(clippy::too_many_arguments)] // Media forwarding carries the full request/accounting context.
+async fn forward_grok_media_with_execution(
     state: ServerState,
-    stored: StoredProvider,
+    execution: ProviderExecution,
     method: Method,
     upstream_path: String,
     headers: HeaderMap,
@@ -1565,7 +1513,8 @@ async fn forward_grok_media_with_stored(
     user_email: Option<String>,
     _share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
-    refresh_managed_account_if_needed(&state, AppKind::Codex, &stored).await?;
+    let stored = execution.runtime_stored_view();
+    refresh_execution_managed_account_if_needed(&state, &execution).await?;
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
     let mut target_headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
@@ -1582,7 +1531,6 @@ async fn forward_grok_media_with_stored(
         "application/json, text/event-stream".to_string(),
     );
     let mut target_headers = owned_headers(target_headers);
-    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
     let (body, content_type) = if upstream_path.contains("/images/edits") {
         (
             super::grok::image_edit_body(&headers, body)?,
@@ -1596,7 +1544,10 @@ async fn forward_grok_media_with_stored(
                 .unwrap_or_else(|| "application/json".to_string()),
         )
     };
-    let url = super::grok::upstream_media_url(&upstream_path);
+    let mut url = super::join_url(&execution.plan.endpoint, &upstream_path);
+    let materialized_auth = execution.materialize_auth(&accounts)?;
+    execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
+    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
     let http_client = forward_http_client(&state, &stored).await?;
     let mut request = http_client
         .request(method.clone(), &url)
@@ -1607,6 +1558,7 @@ async fn forward_grok_media_with_stored(
     if method != Method::GET {
         request = request.body(body);
     }
+    request = request.timeout(execution.request_timeout());
     let started = Instant::now();
     let upstream = request.send().await.map_err(|error| {
         tokio::spawn({
@@ -1637,17 +1589,12 @@ async fn forward_grok_media_with_stored(
             state.remember_grok_media_session(
                 session_key,
                 stored.provider.id.clone(),
-                managed_account_id(&stored).map(str::to_string),
+                execution.managed_account_id().map(str::to_string),
                 24 * 60 * 60 * 1000,
             );
         }
     }
-    record_provider_outcome(
-        &state,
-        &stored,
-        provider_outcome_from_status_and_headers(status_code, &response_headers),
-    )
-    .await;
+    record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
     record_share_invocation_result(
         &state,
         share_id.as_deref(),
@@ -1679,13 +1626,14 @@ async fn forward_grok_media_with_stored(
 
 async fn forward_codex_images_generations(
     state: ServerState,
-    stored: StoredProvider,
+    execution: ProviderExecution,
     headers: HeaderMap,
     body: Bytes,
     request_context: UsageLogContext,
     _share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
-    refresh_managed_account_if_needed(&state, AppKind::Codex, &stored).await?;
+    let stored = execution.runtime_stored_view();
+    refresh_execution_managed_account_if_needed(&state, &execution).await?;
     validate_codex_allowed_client(
         &stored,
         ProxyRoute::CodexResponses,
@@ -1698,10 +1646,9 @@ async fn forward_codex_images_generations(
     let mut target_headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
     let session_id = codex_oauth_session_id_from_request(&headers, &body);
     append_codex_oauth_session_headers(&mut target_headers, session_id.as_deref());
-    super::codex_identity::finalize_headers(&mut target_headers);
+    crate::codex_identity::finalize_headers(&mut target_headers);
     let mut target_headers = owned_headers(target_headers);
-    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
-    let adapter_request = adapters::AdapterRequest {
+    let mut adapter_request = adapters::AdapterRequest {
         body: prepared.body.clone(),
         upstream_endpoint: None,
         upstream_headers: Vec::new(),
@@ -1713,18 +1660,18 @@ async fn forward_codex_images_generations(
         stream_requested: true,
         custom_tool_names: Default::default(),
     };
-    let url = adapter.resolve_endpoint_for_request(
-        ProxyRoute::CodexResponses,
-        None,
-        &stored,
-        &adapter_request,
-    )?;
+    execution.enforce_model_policy(&mut adapter_request)?;
+    let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, &adapter_request)?;
+    let materialized_auth = execution.materialize_auth(&accounts)?;
+    execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
+    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
     let http_client = forward_http_client(&state, &stored).await?;
     let mut request = http_client
         .post(&url)
         .header(ACCEPT, "application/json, text/event-stream")
         .header(CONTENT_TYPE, "application/json")
-        .body(prepared.body.clone());
+        .body(adapter_request.body.clone())
+        .timeout(execution.request_timeout());
     for (name, value) in &target_headers {
         request = request.header(name.as_str(), value.as_str());
     }
@@ -1753,12 +1700,7 @@ async fn forward_codex_images_generations(
     if status == StatusCode::TOO_MANY_REQUESTS {
         maybe_mark_codex_rate_limited(&state, &stored, &decoded.body).await;
     }
-    record_provider_outcome(
-        &state,
-        &stored,
-        provider_outcome_from_status_and_headers(status_code, &response_headers),
-    )
-    .await;
+    record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
     if !status.is_success() {
         record_share_invocation_result(
             &state,
@@ -2557,6 +2499,7 @@ fn codex_rate_limit_message(body: &[u8]) -> Option<String> {
 
 struct ClaudeKiroForwardOptions {
     state: ServerState,
+    execution: ProviderExecution,
     stored: StoredProvider,
     headers: HeaderMap,
     body: Bytes,
@@ -2567,6 +2510,7 @@ struct ClaudeKiroForwardOptions {
 
 struct ClaudeDeepSeekForwardOptions {
     state: ServerState,
+    execution: ProviderExecution,
     stored: StoredProvider,
     body: Bytes,
     request_context: UsageLogContext,
@@ -2579,6 +2523,7 @@ async fn forward_claude_deepseek(
 ) -> Result<Response, ProxyError> {
     let ClaudeDeepSeekForwardOptions {
         state,
+        execution,
         stored,
         body,
         request_context,
@@ -2587,6 +2532,23 @@ async fn forward_claude_deepseek(
     } = options;
     let (body, model_selection) =
         adapters::apply_provider_model_routing(body, &stored, ProxyRoute::ClaudeMessages);
+    let mut runtime_request = adapters::AdapterRequest {
+        body,
+        upstream_endpoint: None,
+        upstream_headers: Vec::new(),
+        model: model_selection
+            .actual_model
+            .clone()
+            .or_else(|| model_selection.requested_model.clone()),
+        requested_model: model_selection.requested_model.clone(),
+        actual_model: model_selection.actual_model.clone(),
+        actual_model_source: model_selection.actual_model_source.clone(),
+        pricing_model: model_selection.pricing_model.clone(),
+        stream_requested: false,
+        custom_tool_names: Default::default(),
+    };
+    execution.enforce_model_policy(&mut runtime_request)?;
+    let body = runtime_request.body;
     let request_body: Value = serde_json::from_slice(&body)
         .map_err(|error| ProxyError::bad_request(format!("invalid Claude JSON body: {error}")))?;
     let routed_model = request_body
@@ -2596,7 +2558,7 @@ async fn forward_claude_deepseek(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ProxyError::bad_request("missing model"))?
         .to_string();
-    let response_model = model_selection
+    let response_model = runtime_request
         .requested_model
         .clone()
         .unwrap_or_else(|| routed_model.clone());
@@ -2610,13 +2572,15 @@ async fn forward_claude_deepseek(
     let model_metadata = routed_model_metadata(
         &response_model,
         &deepseek_model,
-        model_selection.actual_model_source.as_deref(),
+        runtime_request.actual_model_source.as_deref(),
         "deepseek_model_normalization",
     );
 
-    refresh_managed_account_if_needed(&state, AppKind::Claude, &stored).await?;
+    refresh_execution_managed_account_if_needed(&state, &execution).await?;
+    let accounts = state.accounts_snapshot().await;
+    execution.materialize_auth(&accounts)?;
     let upstream = state
-        .start_deepseek_chat_completion(managed_account_id(&stored), &deepseek_model, &prompt)
+        .start_deepseek_chat_completion(execution.managed_account_id(), &deepseek_model, &prompt)
         .await
         .map_err(deepseek_upstream_error_to_proxy_error)?;
     let status = upstream.status();
@@ -2793,6 +2757,7 @@ fn deepseek_upstream_error_to_proxy_error(error: DeepSeekUpstreamError) -> Proxy
 async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Response, ProxyError> {
     let ClaudeKiroForwardOptions {
         state,
+        execution,
         stored,
         headers,
         body,
@@ -2802,6 +2767,23 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     } = options;
     let (body, model_selection) =
         adapters::apply_provider_model_routing(body, &stored, ProxyRoute::ClaudeMessages);
+    let mut runtime_request = adapters::AdapterRequest {
+        body,
+        upstream_endpoint: None,
+        upstream_headers: Vec::new(),
+        model: model_selection
+            .actual_model
+            .clone()
+            .or_else(|| model_selection.requested_model.clone()),
+        requested_model: model_selection.requested_model.clone(),
+        actual_model: model_selection.actual_model.clone(),
+        actual_model_source: model_selection.actual_model_source.clone(),
+        pricing_model: model_selection.pricing_model.clone(),
+        stream_requested: false,
+        custom_tool_names: Default::default(),
+    };
+    execution.enforce_model_policy(&mut runtime_request)?;
+    let body = runtime_request.body;
     let request_body: Value = serde_json::from_slice(&body)
         .map_err(|error| ProxyError::bad_request(format!("invalid Claude JSON body: {error}")))?;
     let routed_model = request_body
@@ -2811,7 +2793,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ProxyError::bad_request("missing model"))?
         .to_string();
-    let response_model = model_selection
+    let response_model = runtime_request
         .requested_model
         .clone()
         .unwrap_or_else(|| routed_model.clone());
@@ -2821,7 +2803,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     let model_metadata = routed_model_metadata(
         &response_model,
         &actual_model,
-        model_selection.actual_model_source.as_deref(),
+        runtime_request.actual_model_source.as_deref(),
         "kiro_model_normalization",
     );
     let stream_requested = request_body
@@ -2829,9 +2811,11 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    refresh_managed_account_if_needed(&state, AppKind::Claude, &stored).await?;
+    refresh_execution_managed_account_if_needed(&state, &execution).await?;
+    let accounts = state.accounts_snapshot().await;
+    execution.materialize_auth(&accounts)?;
     let account = state
-        .find_account_for_provider(ProviderType::KiroOAuth, managed_account_id(&stored))
+        .find_account_for_provider(ProviderType::KiroOAuth, execution.managed_account_id())
         .await
         .ok_or_else(|| ProxyError::not_found("kiro_oauth managed account not found"))?;
     let mut prepared = kiro::prepare_kiro_request(&account, &request_body)?;
@@ -2848,11 +2832,11 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         request = request.header(*name, value);
     }
     if !stream_requested {
-        request = request.timeout(provider_upstream_timeout(&stored));
+        request = request.timeout(execution.request_timeout());
     }
 
     let upstream_result = if stream_requested {
-        match stream_first_byte_timeout(&stored) {
+        match execution.stream_first_byte_timeout() {
             Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
                 Ok(result) => result,
                 Err(_) => {
@@ -2928,7 +2912,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             tracing::warn!(
                 provider_id = %stored.provider.id,
                 status_code,
-                "Kiro request rejected by terminal client validation; skipping failover accounting"
+                "Kiro request rejected by terminal client validation; skipping provider outcome accounting"
             );
         } else {
             record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code))
@@ -3364,81 +3348,19 @@ pub(super) async fn record_share_invocation_result(
 }
 
 pub(super) async fn record_provider_outcome(
-    state: &ServerState,
+    _state: &ServerState,
     stored: &StoredProvider,
     outcome: ProviderOutcome,
 ) {
     crate::metrics::record_provider_outcome(stored.app.as_str(), &stored.provider.id, outcome);
-    let breaker_state = state
-        .mutate_failover_best_effort_if_changed("failover breaker state", |failover| {
-            let updated = failover.record_outcome(
-                stored.app,
-                &stored.provider.id,
-                outcome,
-                current_time_ms(),
-            );
-            let breaker_state = failover
-                .breakers
-                .values()
-                .find(|breaker| {
-                    breaker.app == stored.app && breaker.provider_id == stored.provider.id
-                })
-                .map(|breaker| breaker.state);
-            (breaker_state, updated)
-        })
-        .await;
-    if let Some(breaker_state) = breaker_state {
-        crate::metrics::record_breaker_state(
-            stored.app.as_str(),
-            &stored.provider.id,
-            breaker_state,
-        );
-    }
 }
 
-fn provider_outcome_from_status_and_headers(
-    status_code: u16,
-    headers: &HeaderMap,
-) -> ProviderOutcome {
-    provider_outcome_from_status_and_reset(status_code, reset_header_open_until_ms(headers))
-}
-
-fn provider_outcome_from_status_and_reset(
-    status_code: u16,
-    open_until_ms: Option<u128>,
-) -> ProviderOutcome {
+fn provider_outcome_from_status(status_code: u16) -> ProviderOutcome {
     if status_code == StatusCode::TOO_MANY_REQUESTS.as_u16() {
-        ProviderOutcome::RateLimited {
-            status_code,
-            open_until_ms,
-        }
+        ProviderOutcome::RateLimited { status_code }
     } else {
         ProviderOutcome::from_status(status_code)
     }
-}
-
-fn reset_header_open_until_ms(headers: &HeaderMap) -> Option<u128> {
-    let value = headers
-        .get("anthropic-ratelimit-unified-reset")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    parse_reset_timestamp_ms(value)
-}
-
-fn parse_reset_timestamp_ms(value: &str) -> Option<u128> {
-    if let Ok(number) = value.parse::<u128>() {
-        return Some(if number > 10_000_000_000 {
-            number
-        } else if number > 1_000_000_000 {
-            number.saturating_mul(1000)
-        } else {
-            current_time_ms().saturating_add(number.saturating_mul(1000))
-        });
-    }
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .and_then(|timestamp| u128::try_from(timestamp.timestamp_millis()).ok())
 }
 
 fn claude_non_stream_retry_stage(
@@ -3586,14 +3508,10 @@ fn claude_sse_error_detector_for(
     (route == ProxyRoute::ClaudeMessages).then(ClaudeSseErrorDetector::default)
 }
 
-fn claude_sse_error_outcome(
-    error_type: &str,
-    open_until_ms: Option<u128>,
-) -> Option<ProviderOutcome> {
+fn claude_sse_error_outcome(error_type: &str) -> Option<ProviderOutcome> {
     match error_type {
         "rate_limit_error" => Some(ProviderOutcome::RateLimited {
             status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-            open_until_ms,
         }),
         "overloaded_error" => Some(ProviderOutcome::Failure { status_code: 529 }),
         "api_error" => Some(ProviderOutcome::Failure { status_code: 500 }),
@@ -3637,6 +3555,24 @@ async fn refresh_managed_account_if_needed(
 
     state
         .refresh_managed_account_if_needed(stored.provider_type, managed_account_id(stored))
+        .await
+        .map_err(managed_account_refresh_error_to_proxy_error)
+}
+
+async fn refresh_execution_managed_account_if_needed(
+    state: &ServerState,
+    execution: &ProviderExecution,
+) -> Result<(), ProxyError> {
+    let crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+        account_id,
+        expected_provider_type,
+        ..
+    } = &execution.plan.auth_ref
+    else {
+        return Ok(());
+    };
+    state
+        .refresh_managed_account_if_needed(*expected_provider_type, Some(account_id))
         .await
         .map_err(managed_account_refresh_error_to_proxy_error)
 }
@@ -3966,7 +3902,7 @@ fn build_upstream_post_request(
     body: Bytes,
     client_headers: &HeaderMap,
     target_headers: &[(String, String)],
-    stored: &StoredProvider,
+    request_timeout: Duration,
     stream_requested: bool,
 ) -> reqwest::RequestBuilder {
     let mut request = http_client
@@ -3984,7 +3920,7 @@ fn build_upstream_post_request(
         request = request.header(name.as_str(), value.as_str());
     }
     if !stream_requested {
-        request = request.timeout(provider_upstream_timeout(stored));
+        request = request.timeout(request_timeout);
     }
     request
 }
@@ -4357,7 +4293,6 @@ struct StreamForwardState {
     codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher,
     stream_transform: super::stream_transforms::StreamEventTransformer,
     timeouts: StreamTimeoutConfig,
-    upstream_open_until_ms: Option<u128>,
     pending_chunk: Option<Bytes>,
     sse_error_detector: Option<ClaudeSseErrorDetector>,
     sse_error_outcome_recorded: bool,
@@ -5102,48 +5037,9 @@ fn optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
 
 async fn forward_http_client(
     state: &ServerState,
-    stored: &StoredProvider,
+    _stored: &StoredProvider,
 ) -> Result<reqwest::Client, ProxyError> {
-    if let Some(proxy_url) = provider_upstream_proxy_url(stored) {
-        return build_provider_http_client(&proxy_url, state.bind_addr)
-            .map_err(|error| ProxyError::bad_request(format!("provider proxy invalid: {error}")));
-    }
     Ok(state.http_client().await)
-}
-
-fn provider_upstream_proxy_url(stored: &StoredProvider) -> Option<String> {
-    setting(
-        &stored.provider,
-        &[
-            "UPSTREAM_PROXY_URL",
-            "PROVIDER_PROXY_URL",
-            "PROXY_URL",
-            "HTTPS_PROXY",
-            "HTTP_PROXY",
-        ],
-    )
-    .or_else(|| {
-        stored
-            .provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
-            .and_then(|value| {
-                [
-                    "/upstreamProxyUrl",
-                    "/upstream_proxy_url",
-                    "/proxyUrl",
-                    "/proxy_url",
-                    "/httpsProxy",
-                    "/httpProxy",
-                ]
-                .into_iter()
-                .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str))
-            })
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
 }
 
 fn strip_hop_by_hop_response_headers(headers: &mut HeaderMap) {
@@ -5303,6 +5199,18 @@ fn select_share_provider(
     ))
 }
 
+fn select_share_execution(
+    providers: &ProviderStore,
+    shares: &ShareStore,
+    app: AppKind,
+    share_id: &str,
+) -> Result<(ProviderExecution, Option<String>), ProxyError> {
+    let (stored, share_name) = select_share_provider(providers, shares, app, share_id)?;
+    let execution = ProviderExecution::from_store(providers, stored)?;
+    execution.ensure_operation_supported(ProviderOperation::Forward)?;
+    Ok((execution, share_name))
+}
+
 fn model_metadata(request: &adapters::AdapterRequest) -> UsageModelMetadata {
     UsageModelMetadata {
         model: request.model.clone(),
@@ -5429,6 +5337,8 @@ fn count_tokens_metric_outcome(status: StatusCode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use serde_json::{json, Value};
 
     use crate::domain::providers::model::{
@@ -5436,15 +5346,30 @@ mod tests {
     };
 
     #[test]
-    fn retry_context_is_internal_and_tracks_failed_provider_and_body_stage() {
+    fn retry_context_pins_provider_and_tracks_body_stage() {
         let context = ForwardAttemptContext::default();
         assert_eq!(context.attempt, 0);
-        assert!(context.excluded_provider_ids.is_empty());
+        assert!(context.execution.is_none());
 
-        let next = context.next(Some("provider-a"), Some(ClaudeBodyRetryStage::Thinking));
+        let stored = stored_provider(AppKind::Codex, ProviderType::Codex, json!({}), None);
+        let mut store = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        store
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
+        let execution = ProviderExecution::from_store(&store, stored).unwrap();
+
+        let next = context.next(&execution, Some(ClaudeBodyRetryStage::Thinking));
         assert_eq!(next.attempt, 1);
         assert_eq!(next.body_retry_stage, Some(ClaudeBodyRetryStage::Thinking));
-        assert!(next.excluded_provider_ids.contains("provider-a"));
+        assert_eq!(
+            next.execution
+                .as_ref()
+                .map(|execution| execution.stored.provider.id.as_str()),
+            Some("codex-fixture")
+        );
     }
 
     use super::*;
@@ -5467,6 +5392,7 @@ mod tests {
                         source: Some("account_store".to_string()),
                         auth_provider: Some(provider_type.as_str().to_string()),
                         account_id: Some(account_id.to_string()),
+                        auth_identity_generation: None,
                     }),
                     provider_type: Some(provider_type.as_str().to_string()),
                     ..ProviderMeta::default()
@@ -5475,6 +5401,7 @@ mod tests {
             },
             provider_type,
             provider_type_id: provider_type.as_str().to_string(),
+            resource: Default::default(),
         }
     }
 
@@ -5747,40 +5674,18 @@ mod tests {
     }
 
     #[test]
-    fn reset_timestamp_parses_relative_epoch_and_rfc3339_values() {
-        let before = current_time_ms();
-        let relative = parse_reset_timestamp_ms("7").unwrap();
-        assert!(relative >= before + 7_000);
-        assert!(relative <= current_time_ms() + 7_000);
-
+    fn claude_sse_errors_map_to_provider_outcomes() {
         assert_eq!(
-            parse_reset_timestamp_ms("1700000000"),
-            Some(1_700_000_000_000)
-        );
-        assert_eq!(
-            parse_reset_timestamp_ms("1700000000000"),
-            Some(1_700_000_000_000)
-        );
-        assert_eq!(
-            parse_reset_timestamp_ms("2026-07-09T00:00:00Z"),
-            Some(1_783_555_200_000)
-        );
-    }
-
-    #[test]
-    fn claude_sse_rate_limit_outcome_preserves_reset_open_until() {
-        assert_eq!(
-            claude_sse_error_outcome("rate_limit_error", Some(123_456)),
+            claude_sse_error_outcome("rate_limit_error"),
             Some(ProviderOutcome::RateLimited {
-                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                open_until_ms: Some(123_456)
+                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16()
             })
         );
         assert_eq!(
-            claude_sse_error_outcome("overloaded_error", Some(123_456)),
+            claude_sse_error_outcome("overloaded_error"),
             Some(ProviderOutcome::Failure { status_code: 529 })
         );
-        assert_eq!(claude_sse_error_outcome("not_interesting", None), None);
+        assert_eq!(claude_sse_error_outcome("not_interesting"), None);
     }
 
     #[test]

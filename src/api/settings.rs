@@ -575,39 +575,6 @@ pub(in crate::api) async fn config_snapshot(
     Ok(Json(ConfigSnapshotResponse::from_config(&config)))
 }
 
-pub(in crate::api) async fn upstream_proxy(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<UpstreamProxyResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let config = state.config.read().await;
-    Ok(Json(UpstreamProxyResponse {
-        ok: true,
-        upstream_proxy: UpstreamProxyView::from_config(&config),
-    }))
-}
-
-pub(in crate::api) async fn update_upstream_proxy(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<UpdateUpstreamProxyInput>,
-) -> Result<Json<UpstreamProxyResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let mut config = state.config.read().await.clone();
-    config
-        .update_upstream_proxy(input)
-        .map_err(ApiError::bad_request)?;
-    let upstream_proxy = UpstreamProxyView::from_config(&config);
-    state
-        .replace_config(config)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(UpstreamProxyResponse {
-        ok: true,
-        upstream_proxy,
-    }))
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct UpgradePolicyResponse {

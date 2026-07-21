@@ -339,6 +339,8 @@ mod tests {
         Account {
             id: "acct-1".to_string(),
             provider_type: ProviderType::CodexOAuth,
+            auth_identity_generation: 1,
+            token_refresh_generation: 1,
             email: Some("user@example.com".to_string()),
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),

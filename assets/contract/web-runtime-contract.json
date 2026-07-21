@@ -64,10 +64,6 @@
       "label": "Router and tunnels"
     },
     {
-      "id": "failover",
-      "label": "Failover"
-    },
-    {
       "id": "proxy",
       "label": "Proxy status"
     }
@@ -154,6 +150,21 @@
       "id": "importCurrentConfig",
       "label": "Import current CLI config",
       "reason": "Desktop onboarding only; not applicable to remote token server"
+    },
+    {
+      "id": "automaticFailover",
+      "label": "Desktop automatic provider failover",
+      "reason": "Server routes deterministically through the selected Provider; retries stay pinned to that Provider"
+    },
+    {
+      "id": "outboundProxy",
+      "label": "Global outbound proxy",
+      "reason": "Server deployments use direct outbound networking and do not inspect system proxy settings"
+    },
+    {
+      "id": "configTransfer",
+      "label": "Generic config import/export",
+      "reason": "Server migration copies the complete stopped data directory so OAuth key material and all stores remain consistent"
     }
   ],
   "commands": [
@@ -173,11 +184,44 @@
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
-      "name": "add_to_failover_queue",
-      "support": "shim",
+      "name": "adopt_provider_profile",
+      "support": "native",
       "implemented": true,
-      "feature": "proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
+      "feature": "providers",
+      "endpoint": "POST /api/providers/:id/adopt-profile",
+      "notes": "Previews or applies an explicit legacy Provider adoption into a fixed Profile with optimistic revision checks."
+    },
+    {
+      "name": "rebind_custom_provider",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /api/providers/:id/rebind-custom",
+      "notes": "Previews or applies a custom Provider protocol/auth binding change through the typed credential contract."
+    },
+    {
+      "name": "clone_provider_as_custom",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /api/providers/:id/clone-as-custom",
+      "notes": "Previews or creates a custom Provider clone without mutating the source resource."
+    },
+    {
+      "name": "preview_provider_account_binding_migration",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/providers/account-bindings/migration",
+      "notes": "Builds a token-bound preview for explicit managed-account Provider bindings."
+    },
+    {
+      "name": "apply_provider_account_binding_migration",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /api/providers/account-bindings/migration",
+      "notes": "Applies the exact managed-account binding migration accepted by the current preview token."
     },
     {
       "name": "apply_claude_onboarding_skip",
@@ -708,13 +752,6 @@
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
-      "name": "export_config_to_file",
-      "support": "shim",
-      "implemented": true,
-      "feature": "settings",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
       "name": "extract_common_config_snippet",
       "support": "shim",
       "implemented": true,
@@ -752,26 +789,11 @@
       "notes": "Returns server configDir for About/runtime display."
     },
     {
-      "name": "get_auto_failover_enabled",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "endpoint": "GET /api/failover",
-      "notes": "Reads FailoverAppConfig.enabled for the requested app."
-    },
-    {
       "name": "get_auto_launch_status",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
       "notes": "Server web runtime shim."
-    },
-    {
-      "name": "get_available_providers_for_failover",
-      "support": "shim",
-      "implemented": true,
-      "feature": "failover",
-      "notes": "Returns providers for the app that are not already in the failover queue."
     },
     {
       "name": "get_balance",
@@ -872,20 +894,6 @@
       "implemented": true,
       "feature": "accounts",
       "endpoint": "GET /api/accounts/:id/quota",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
-      "name": "get_circuit_breaker_config",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
-      "name": "get_circuit_breaker_stats",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
@@ -1005,38 +1013,6 @@
       "implemented": true,
       "feature": "settings",
       "notes": "Server web runtime shim."
-    },
-    {
-      "name": "get_failover_queue",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "endpoint": "GET /api/failover",
-      "notes": "Maps FailoverAppConfig.providerQueue into desktop FailoverQueueItem shape."
-    },
-    {
-      "name": "get_global_proxy_config",
-      "support": "native",
-      "implemented": true,
-      "feature": "settings",
-      "endpoint": "GET /api/upstream-proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
-      "name": "get_global_proxy_url",
-      "support": "native",
-      "implemented": true,
-      "feature": "proxy",
-      "endpoint": "GET /api/upstream-proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
-      "name": "get_upstream_proxy_status",
-      "support": "native",
-      "implemented": true,
-      "feature": "proxy",
-      "endpoint": "GET /api/upstream-proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
       "name": "get_installed_skills",
@@ -1161,26 +1137,36 @@
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
+      "name": "get_provider_registry",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/provider-registry",
+      "notes": "Returns the authoritative Profile/Driver registry used by Server Provider controls."
+    },
+    {
+      "name": "get_provider_resources",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/providers?app=",
+      "notes": "Returns Provider resources with stable identity and revision metadata."
+    },
+    {
+      "name": "get_provider_store_migration",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/providers/storage-migration",
+      "notes": "Returns redacted S1 to S2 preflight status and blocker codes; apply and rollback remain explicit CLI operations."
+    },
+    {
       "name": "get_providers",
       "support": "native",
       "implemented": true,
       "feature": "providers",
       "endpoint": "GET /api/providers?app=",
       "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
-      "name": "get_proxy_config",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
-      "name": "get_proxy_config_for_app",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Server uses default per-app proxy settings with failover toggle from failover.json."
     },
     {
       "name": "get_proxy_status",
@@ -1345,13 +1331,6 @@
       "implemented": true,
       "feature": "claudeDesktopProfile",
       "notes": "Server web runtime shim for desktop-synced UI."
-    },
-    {
-      "name": "import_config_from_file",
-      "support": "shim",
-      "implemented": true,
-      "feature": "settings",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
       "name": "import_default_config",
@@ -1541,13 +1520,6 @@
       "notes": "Server web runtime shim."
     },
     {
-      "name": "remove_from_failover_queue",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
       "name": "remove_provider_from_live_config",
       "support": "shim",
       "implemented": true,
@@ -1559,13 +1531,6 @@
       "support": "shim",
       "implemented": true,
       "feature": "settings",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
-      "name": "reset_circuit_breaker",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
@@ -1619,13 +1584,6 @@
       "implemented": true,
       "feature": "settings",
       "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
-      "name": "scan_local_proxies",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Scans common localhost proxy ports; matches desktop scan_local_proxies."
     },
     {
       "name": "s3_sync_download",
@@ -1700,13 +1658,6 @@
       "notes": "Server web runtime shim."
     },
     {
-      "name": "set_auto_failover_enabled",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
       "name": "save_provider_share",
       "support": "native",
       "implemented": true,
@@ -1741,14 +1692,6 @@
       "implemented": true,
       "feature": "settings",
       "notes": "Server web runtime shim."
-    },
-    {
-      "name": "set_global_proxy_url",
-      "support": "native",
-      "implemented": true,
-      "feature": "proxy",
-      "endpoint": "PUT /api/upstream-proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
       "name": "set_log_config",
@@ -1902,13 +1845,6 @@
       "notes": "Removed from token server; per-app providers are the source of truth."
     },
     {
-      "name": "test_proxy_url",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Tests outbound proxy connectivity via HEAD requests to public endpoints."
-    },
-    {
       "name": "test_api_endpoints",
       "support": "shim",
       "implemented": true,
@@ -1931,13 +1867,6 @@
       "notes": "Compatibility no-op; target must equal Client Owner. Independent Share Owner transfer is rejected."
     },
     {
-      "name": "update_circuit_breaker_config",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
       "name": "update_client_tunnel",
       "support": "native",
       "implemented": true,
@@ -1951,14 +1880,6 @@
       "implemented": true,
       "feature": "tauriShell",
       "notes": "Server web runtime shim."
-    },
-    {
-      "name": "update_global_proxy_config",
-      "support": "native",
-      "implemented": true,
-      "feature": "settings",
-      "endpoint": "PUT /api/upstream-proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
       "name": "update_model_pricing",
@@ -1982,20 +1903,6 @@
       "feature": "providers",
       "endpoint": "local provider store sortIndex mutation",
       "notes": "Server persists desktop-compatible sortIndex on provider JSON and sorts provider lists by that value."
-    },
-    {
-      "name": "update_proxy_config",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
-    },
-    {
-      "name": "update_proxy_config_for_app",
-      "support": "shim",
-      "implemented": true,
-      "feature": "proxy",
-      "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
       "name": "update_share_acl",

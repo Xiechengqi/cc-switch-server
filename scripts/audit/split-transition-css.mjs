@@ -18,7 +18,6 @@ const MODULES = {
     selectors.some(
       (s) =>
         /\.provider-/.test(s) ||
-        /\.failover-priority-badge/.test(s) ||
         /\.section-heading/.test(s) ||
         /\.section-title-row/.test(s) ||
         /\.compact-kv/.test(s) ||
@@ -104,12 +103,10 @@ function extractSelectors(ruleHead) {
     .filter(Boolean);
 }
 
-function ruleReferencesOnlyDeadSelectors(selectors, sourceText) {
+function selectorReferencesOnlyDeadClasses(selector, sourceText) {
   const classNames = [];
-  for (const selector of selectors) {
-    for (const match of selector.matchAll(/\.(-?[_a-zA-Z]+[_a-zA-Z0-9-]*)/g)) {
-      classNames.push(match[1]);
-    }
+  for (const match of selector.matchAll(/\.(-?[_a-zA-Z]+[_a-zA-Z0-9-]*)/g)) {
+    classNames.push(match[1]);
   }
   if (classNames.length === 0) {
     return false;
@@ -228,10 +225,13 @@ function pruneTokens(tokens, sourceText) {
       output.push({ ...token, body: serializeTokens(pruned) });
       continue;
     }
-    if (ruleReferencesOnlyDeadSelectors(token.selectors, sourceText)) {
+    const selectors = token.selectors.filter(
+      (selector) => !selectorReferencesOnlyDeadClasses(selector, sourceText),
+    );
+    if (selectors.length === 0) {
       continue;
     }
-    output.push(token);
+    output.push({ ...token, selectors });
   }
   return output;
 }
@@ -246,12 +246,22 @@ let tokens = tokenizeCss(css);
 tokens = pruneTokens(tokens, sourceText);
 const buckets = splitTokens(tokens);
 
+const moduleBuckets = Object.fromEntries(
+  Object.keys(MODULES).map((fileName) => {
+    const modulePath = path.join(stylesDir, fileName);
+    const existing = fs.existsSync(modulePath)
+      ? pruneTokens(tokenizeCss(fs.readFileSync(modulePath, "utf8")), sourceText)
+      : [];
+    return [fileName, [...existing, ...(buckets[fileName] ?? [])]];
+  }),
+);
+
 fs.mkdirSync(stylesDir, { recursive: true });
 const coreCss = serializeTokens(buckets.core ?? []);
 fs.writeFileSync(stylesPath, `${coreCss.trim()}\n`);
 
-for (const [fileName, moduleTokens] of Object.entries(buckets)) {
-  if (fileName === "core" || moduleTokens.length === 0) {
+for (const [fileName, moduleTokens] of Object.entries(moduleBuckets)) {
+  if (moduleTokens.length === 0) {
     continue;
   }
   const outPath = path.join(stylesDir, fileName);
@@ -261,8 +271,8 @@ for (const [fileName, moduleTokens] of Object.entries(buckets)) {
 
 const mainPath = path.join(srcRoot, "main.tsx");
 let main = fs.readFileSync(mainPath, "utf8");
-for (const fileName of Object.keys(buckets)) {
-  if (fileName === "core") {
+for (const [fileName, moduleTokens] of Object.entries(moduleBuckets)) {
+  if (moduleTokens.length === 0) {
     continue;
   }
   const importLine = `import "./styles/${fileName}";`;
@@ -278,8 +288,7 @@ fs.writeFileSync(mainPath, main);
 const report = {
   coreLines: countLines(coreCss),
   modules: Object.fromEntries(
-    Object.entries(buckets)
-      .filter(([name]) => name !== "core")
+    Object.entries(moduleBuckets)
       .map(([name, toks]) => [name, countLines(serializeTokens(toks))]),
   ),
 };

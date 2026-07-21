@@ -122,6 +122,19 @@ pub struct ShareStore {
     pub last_router_error: Option<String>,
     #[serde(default)]
     pub last_router_heartbeat_ms: Option<u128>,
+    #[serde(default)]
+    pub router_descriptor_sync_mode: RouterDescriptorSyncMode,
+    #[serde(default)]
+    pub router_descriptor_sync_diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouterDescriptorSyncMode {
+    #[default]
+    Unknown,
+    Legacy,
+    Strict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +250,14 @@ pub struct Share {
     pub config_revision: u64,
     #[serde(default)]
     pub router_synced_revision: u64,
+    #[serde(default)]
+    pub descriptor_generation: u64,
+    #[serde(default)]
+    pub descriptor_fingerprint: Option<String>,
+    #[serde(default)]
+    pub router_synced_descriptor_generation: u64,
+    #[serde(default)]
+    pub router_synced_descriptor_fingerprint: Option<String>,
     #[serde(default)]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
 }
@@ -422,6 +443,10 @@ impl ShareStore {
                     existing.last_error.clone(),
                     existing.config_revision,
                     existing.router_synced_revision,
+                    existing.descriptor_generation,
+                    existing.descriptor_fingerprint.clone(),
+                    existing.router_synced_descriptor_generation,
+                    existing.router_synced_descriptor_fingerprint.clone(),
                     existing.user_grants.clone(),
                 )
             });
@@ -438,6 +463,10 @@ impl ShareStore {
             last_error,
             config_revision,
             router_synced_revision,
+            descriptor_generation,
+            descriptor_fingerprint,
+            router_synced_descriptor_generation,
+            router_synced_descriptor_fingerprint,
             preserved_user_grants,
         ) = preserved.unwrap_or((
             0,
@@ -450,6 +479,10 @@ impl ShareStore {
             None,
             0,
             0,
+            0,
+            None,
+            0,
+            None,
             BTreeMap::new(),
         ));
         let created_at_ms = if created_at_ms > 0 {
@@ -500,6 +533,10 @@ impl ShareStore {
             router_url,
             config_revision: config_revision.saturating_add(1).max(1),
             router_synced_revision,
+            descriptor_generation,
+            descriptor_fingerprint,
+            router_synced_descriptor_generation,
+            router_synced_descriptor_fingerprint,
             user_grants: preserved_user_grants.clone(),
         };
 
@@ -1391,6 +1428,81 @@ impl ShareStore {
                 }
             }
         }
+    }
+
+    pub fn prepare_descriptor_projection(
+        &mut self,
+        share_id: &str,
+        fingerprint: String,
+    ) -> Option<(u64, String)> {
+        let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
+        let changed = share.descriptor_fingerprint.as_deref() != Some(fingerprint.as_str());
+        if changed || share.descriptor_generation == 0 {
+            share.descriptor_generation = share
+                .descriptor_generation
+                .max(share.router_synced_descriptor_generation)
+                .saturating_add(1)
+                .max(1);
+            share.descriptor_fingerprint = Some(fingerprint);
+            share.router_last_sync_error = None;
+        }
+        Some((
+            share.descriptor_generation,
+            share.descriptor_fingerprint.clone().unwrap_or_default(),
+        ))
+    }
+
+    pub fn mark_router_descriptor_sync(
+        &mut self,
+        share_id: &str,
+        generation: u64,
+        fingerprint: &str,
+        config_revision: u64,
+        router_url: Option<String>,
+        result: Result<u128, String>,
+    ) -> bool {
+        let Some(share) = self.shares.iter_mut().find(|item| item.id == share_id) else {
+            return false;
+        };
+        let is_current = share.descriptor_generation == generation
+            && share.descriptor_fingerprint.as_deref() == Some(fingerprint);
+        match result {
+            Ok(now) if is_current => {
+                share.router_synced_descriptor_generation = generation;
+                share.router_synced_descriptor_fingerprint = Some(fingerprint.to_string());
+                share.router_synced_revision = share.router_synced_revision.max(config_revision);
+                share.router_last_synced_at_ms = Some(now);
+                share.router_last_sync_error = None;
+                share.router_url = router_url;
+                true
+            }
+            Ok(_) => false,
+            Err(error) if is_current => {
+                share.router_last_sync_error = Some(error);
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn descriptor_projection_pending(&self, share: &Share) -> bool {
+        share.descriptor_generation == 0
+            || share.descriptor_fingerprint.is_none()
+            || share.router_synced_descriptor_generation != share.descriptor_generation
+            || share.router_synced_descriptor_fingerprint != share.descriptor_fingerprint
+    }
+
+    pub fn record_router_descriptor_sync_mode(
+        &mut self,
+        mode: RouterDescriptorSyncMode,
+        diagnostic: Option<String>,
+    ) {
+        if self.router_descriptor_sync_mode != RouterDescriptorSyncMode::Strict
+            || mode == RouterDescriptorSyncMode::Strict
+        {
+            self.router_descriptor_sync_mode = mode;
+        }
+        self.router_descriptor_sync_diagnostic = diagnostic;
     }
 }
 
@@ -2880,6 +2992,10 @@ mod tests {
             router_url: None,
             config_revision: 0,
             router_synced_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: None,
+            router_synced_descriptor_generation: 0,
+            router_synced_descriptor_fingerprint: None,
             user_grants: BTreeMap::new(),
         };
         assert_eq!(store.import_shares(vec![share]), 1);
@@ -3161,6 +3277,51 @@ mod tests {
             store.get("s1").unwrap().router_last_sync_error.as_deref(),
             Some("failed")
         );
+    }
+
+    #[test]
+    fn descriptor_projection_generation_and_ack_are_monotonic() {
+        let mut store = ShareStore::default();
+        store.upsert(codex_share_input("projection-order")).unwrap();
+
+        let (first_generation, first_fingerprint) = store
+            .prepare_descriptor_projection("projection-order", "a".repeat(64))
+            .unwrap();
+        assert_eq!(first_generation, 1);
+        assert!(store.mark_router_descriptor_sync(
+            "projection-order",
+            first_generation,
+            &first_fingerprint,
+            1,
+            Some("https://router.example".to_string()),
+            Ok(100),
+        ));
+
+        let (second_generation, second_fingerprint) = store
+            .prepare_descriptor_projection("projection-order", "b".repeat(64))
+            .unwrap();
+        assert_eq!(second_generation, 2);
+        assert!(!store.mark_router_descriptor_sync(
+            "projection-order",
+            first_generation,
+            &first_fingerprint,
+            1,
+            Some("https://router.example".to_string()),
+            Ok(200),
+        ));
+        let share = store.get("projection-order").unwrap();
+        assert_eq!(share.router_synced_descriptor_generation, first_generation);
+        assert!(store.descriptor_projection_pending(share));
+
+        assert!(store.mark_router_descriptor_sync(
+            "projection-order",
+            second_generation,
+            &second_fingerprint,
+            1,
+            Some("https://router.example".to_string()),
+            Ok(300),
+        ));
+        assert!(!store.descriptor_projection_pending(store.get("projection-order").unwrap()));
     }
 
     #[test]

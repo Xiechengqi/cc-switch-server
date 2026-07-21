@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 
 pub(in crate::api) async fn events(

@@ -219,6 +219,7 @@ mod tests {
             },
             provider_type: ProviderType::CursorOAuth,
             provider_type_id: "cursor_oauth".to_string(),
+            resource: Default::default(),
         }
     }
 

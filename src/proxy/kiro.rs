@@ -2940,6 +2940,8 @@ mod tests {
         Account {
             id: "kiro_server".to_string(),
             provider_type: ProviderType::KiroOAuth,
+            auth_identity_generation: 1,
+            token_refresh_generation: 1,
             email: Some("kiro@example.com".to_string()),
             access_token: Some("access-token".to_string()),
             refresh_token: Some("refresh-token".to_string()),

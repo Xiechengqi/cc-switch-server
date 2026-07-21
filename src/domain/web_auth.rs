@@ -451,8 +451,8 @@ mod tests {
                 ..ClientConfig::default()
             },
             setup_completion_notification: None,
-            upstream_proxy: Default::default(),
             upgrade_policy: Default::default(),
+            enable_web_terminal: false,
         };
         if let Some(password) = password {
             config.set_password(password).expect("hash password");

@@ -26,8 +26,6 @@ export interface Provider {
   // 图标配置
   icon?: string; // 图标名称（如 "openai", "anthropic"）
   iconColor?: string; // 图标颜色（Hex 格式，如 "#00A67E"）
-  // 是否加入故障转移队列
-  inFailoverQueue?: boolean;
 }
 
 export interface AppConfig {
@@ -71,6 +69,7 @@ export interface AuthBinding {
   source: AuthBindingSource;
   authProvider?: string;
   accountId?: string;
+  authIdentityGeneration?: number;
 }
 
 export interface ClaudeDesktopModelRoute {
@@ -325,8 +324,6 @@ export interface Settings {
   usageConfirmed?: boolean;
   // User has confirmed the stream check first-run notice
   streamCheckConfirmed?: boolean;
-  // Whether to show the failover toggle independently on the main page
-  enableFailoverToggle?: boolean;
   // Preserve Codex ChatGPT login in auth.json when switching third-party providers
   preserveCodexOfficialAuthOnSwitch?: boolean;
   // Run official Codex under the shared "custom" provider id so future
@@ -334,8 +331,6 @@ export interface Settings {
   unifyCodexSessionHistory?: boolean;
   // User opted in (enable dialog checkbox) to migrate existing official sessions
   unifyCodexMigrateExisting?: boolean;
-  // User has confirmed the failover toggle first-run notice
-  failoverConfirmed?: boolean;
   // User has confirmed the first-run welcome notice
   firstRunNoticeConfirmed?: boolean;
   // User has confirmed the auto-sync traffic warning

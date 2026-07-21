@@ -117,6 +117,24 @@ pub enum ConfigCommand {
     Print,
     /// Parse and validate local JSON stores.
     Validate,
+    /// Preview or explicitly apply legacy Provider storage migrations.
+    MigrateProviders {
+        /// Apply the migration. Without this flag the command is read-only.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Preview, apply, roll back, or clean up the guarded Provider S1 -> S2 migration.
+    MigrateProviderStore {
+        /// Apply the migration after a successful preflight.
+        #[arg(long, conflicts_with_all = ["rollback", "cleanup_snapshot"])]
+        apply: bool,
+        /// Restore the verified S1 snapshot created before cutover.
+        #[arg(long, conflicts_with_all = ["apply", "cleanup_snapshot"])]
+        rollback: bool,
+        /// Explicitly delete a completed migration snapshot.
+        #[arg(long, conflicts_with_all = ["apply", "rollback"])]
+        cleanup_snapshot: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -234,6 +252,58 @@ mod tests {
             cli.effective_command(),
             Command::Config {
                 command: ConfigCommand::Validate
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_provider_migration_preview_and_apply() {
+        let preview =
+            Cli::try_parse_from(["cc-switch-server", "config", "migrate-providers"]).unwrap();
+        assert!(matches!(
+            preview.effective_command(),
+            Command::Config {
+                command: ConfigCommand::MigrateProviders { apply: false }
+            }
+        ));
+
+        let apply =
+            Cli::try_parse_from(["cc-switch-server", "config", "migrate-providers", "--apply"])
+                .unwrap();
+        assert!(matches!(
+            apply.effective_command(),
+            Command::Config {
+                command: ConfigCommand::MigrateProviders { apply: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_provider_store_migration_actions() {
+        let preview =
+            Cli::try_parse_from(["cc-switch-server", "config", "migrate-provider-store"]).unwrap();
+        assert!(matches!(
+            preview.effective_command(),
+            Command::Config {
+                command: ConfigCommand::MigrateProviderStore {
+                    apply: false,
+                    rollback: false,
+                    cleanup_snapshot: false,
+                }
+            }
+        ));
+
+        let rollback = Cli::try_parse_from([
+            "cc-switch-server",
+            "config",
+            "migrate-provider-store",
+            "--rollback",
+        ])
+        .unwrap();
+        assert!(matches!(
+            rollback.effective_command(),
+            Command::Config {
+                command: ConfigCommand::MigrateProviderStore { rollback: true, .. }
             }
         ));
     }

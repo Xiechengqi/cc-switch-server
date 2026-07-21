@@ -35,6 +35,10 @@ pub struct PresetCoverage {
 #[serde(rename_all = "camelCase")]
 pub struct PresetSummary {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<crate::domain::providers::registry::ProfileId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_schema_revision: Option<u32>,
     pub provider_type: Option<String>,
     #[serde(default)]
     pub api_format: Option<String>,

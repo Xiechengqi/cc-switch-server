@@ -2,7 +2,6 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { proxyApi } from "@/lib/api/proxy";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
-import type { GlobalProxyConfig, AppProxyConfig } from "@/types/proxy";
 
 // ========== 代理服务器状态 Hooks ==========
 
@@ -147,119 +146,6 @@ export function useSwitchProxyProvider() {
     },
     onError: (error: Error) => {
       toast.error(t("proxy.switchFailed", { error: error.message }));
-    },
-  });
-}
-
-// ========== Legacy 代理配置 Hooks (兼容) ==========
-
-/**
- * 获取代理配置（旧版）
- */
-export function useProxyConfig() {
-  const queryClient = useQueryClient();
-  const { t } = useTranslation();
-
-  const { data: config, isLoading } = useQuery({
-    queryKey: ["proxyConfig"],
-    queryFn: () => proxyApi.getProxyConfig(),
-  });
-
-  const updateMutation = useMutation({
-    mutationFn: proxyApi.updateProxyConfig,
-    onSuccess: () => {
-      toast.success(t("proxy.settings.toast.saved"), { closeButton: true });
-      queryClient.invalidateQueries({ queryKey: ["proxyConfig"] });
-      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-    },
-    onError: (error: Error) => {
-      toast.error(
-        t("proxy.settings.toast.saveFailed", { error: error.message }),
-      );
-    },
-  });
-
-  return {
-    config,
-    isLoading,
-    updateConfig: updateMutation.mutateAsync,
-    isUpdating: updateMutation.isPending,
-  };
-}
-
-// ========== v3+ 全局/应用级配置 Hooks ==========
-
-/**
- * 获取全局代理配置
- */
-export function useGlobalProxyConfig() {
-  return useQuery({
-    queryKey: ["globalProxyConfig"],
-    queryFn: () => proxyApi.getGlobalProxyConfig(),
-  });
-}
-
-/**
- * 更新全局代理配置
- */
-export function useUpdateGlobalProxyConfig() {
-  const queryClient = useQueryClient();
-  const { t } = useTranslation();
-
-  return useMutation({
-    mutationFn: (config: GlobalProxyConfig) =>
-      proxyApi.updateGlobalProxyConfig(config),
-    onSuccess: () => {
-      toast.success(t("proxy.settings.toast.saved"), { closeButton: true });
-      queryClient.invalidateQueries({ queryKey: ["globalProxyConfig"] });
-      queryClient.invalidateQueries({ queryKey: ["proxyConfig"] });
-      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-    },
-    onError: (error: Error) => {
-      toast.error(
-        t("proxy.settings.toast.saveFailed", { error: error.message }),
-      );
-    },
-  });
-}
-
-/**
- * 获取指定应用的代理配置
- */
-export function useAppProxyConfig(appType: string) {
-  return useQuery({
-    queryKey: ["appProxyConfig", appType],
-    queryFn: () => proxyApi.getProxyConfigForApp(appType),
-    enabled: !!appType,
-  });
-}
-
-/**
- * 更新指定应用的代理配置
- */
-export function useUpdateAppProxyConfig() {
-  const queryClient = useQueryClient();
-  const { t } = useTranslation();
-
-  return useMutation({
-    mutationFn: (config: AppProxyConfig) =>
-      proxyApi.updateProxyConfigForApp(config),
-    onSuccess: (_, variables) => {
-      toast.success(t("proxy.settings.toast.saved"), { closeButton: true });
-      queryClient.invalidateQueries({
-        queryKey: ["appProxyConfig", variables.appType],
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["autoFailoverEnabled", variables.appType],
-      });
-      queryClient.invalidateQueries({ queryKey: ["proxyConfig"] });
-      queryClient.invalidateQueries({ queryKey: ["circuitBreakerConfig"] });
-      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-    },
-    onError: (error: Error) => {
-      toast.error(
-        t("proxy.settings.toast.saveFailed", { error: error.message }),
-      );
     },
   });
 }

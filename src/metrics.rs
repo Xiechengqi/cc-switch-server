@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use anyhow::Context;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
-use crate::domain::failover::{BreakerState, ProviderOutcome};
+use crate::domain::health::ProviderRequestOutcome;
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -55,12 +55,12 @@ pub fn record_claude_retry(stage: &str, source: &str) {
     .increment(1);
 }
 
-pub fn record_provider_outcome(app: &str, provider_id: &str, outcome: ProviderOutcome) {
+pub fn record_provider_outcome(app: &str, provider_id: &str, outcome: ProviderRequestOutcome) {
     let outcome = match outcome {
-        ProviderOutcome::Success { .. } => "success",
-        ProviderOutcome::Failure { .. } => "failure",
-        ProviderOutcome::RateLimited { .. } => "rate_limited",
-        ProviderOutcome::NetworkFailure => "network_failure",
+        ProviderRequestOutcome::Success { .. } => "success",
+        ProviderRequestOutcome::Failure { .. } => "failure",
+        ProviderRequestOutcome::RateLimited { .. } => "rate_limited",
+        ProviderRequestOutcome::NetworkFailure => "network_failure",
     };
     metrics::counter!(
         "cc_switch_provider_outcome_total",
@@ -69,22 +69,6 @@ pub fn record_provider_outcome(app: &str, provider_id: &str, outcome: ProviderOu
         "outcome" => outcome
     )
     .increment(1);
-}
-
-pub fn record_breaker_state(app: &str, provider_id: &str, current: BreakerState) {
-    for (state, value) in [
-        ("closed", (current == BreakerState::Closed) as u8),
-        ("open", (current == BreakerState::Open) as u8),
-        ("half_open", (current == BreakerState::HalfOpen) as u8),
-    ] {
-        metrics::gauge!(
-            "cc_switch_breaker_state",
-            "app" => app.to_string(),
-            "provider_id" => provider_id.to_string(),
-            "state" => state
-        )
-        .set(f64::from(value));
-    }
 }
 
 pub fn record_warm_refresh(provider_type: &str, result: &str) {
@@ -147,11 +131,7 @@ fn describe() {
     );
     metrics::describe_counter!(
         "cc_switch_provider_outcome_total",
-        "Provider outcomes recorded by the failover breaker"
-    );
-    metrics::describe_gauge!(
-        "cc_switch_breaker_state",
-        "Current provider breaker state as a one-hot gauge"
+        "Observed upstream outcomes for each provider"
     );
     metrics::describe_counter!(
         "cc_switch_account_warm_refresh_total",

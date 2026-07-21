@@ -111,6 +111,11 @@
     "noProvidersDescriptionSnippet": "API キーとリクエスト URL 以外のデータ（プラグインなど）は共通設定スニペットに保存され、プロバイダー間で共有できます",
     "currentlyUsing": "現在使用中",
     "enable": "有効化",
+    "storageMigration": {
+      "title": "Provider の認証情報ストレージは S1 のままです",
+      "ready": "事前検証に成功しました。サービスを停止してから cc-switch-server config migrate-provider-store --apply を実行してください。",
+      "blocked": "{{count}} 件の Provider で ID または認証情報の分類が未完了のため、S2 への切り替えは保留されています。"
+    },
     "share": {
       "ownerNotConfigured": "先に Client Owner を設定してください",
       "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。",
@@ -270,11 +275,6 @@
     "proxy": {
       "title": "ローカルルーティングの有効化",
       "message": "ローカルルーティングは上級機能です。有効にする前に、その仕組みを理解していることをご確認ください。\n\n適切な設定方法については、関連ドキュメントまたはプロバイダーにご相談ください。",
-      "confirm": "理解しました、有効にする"
-    },
-    "failover": {
-      "title": "フェイルオーバーの有効化",
-      "message": "フェイルオーバーは上級機能です。有効にする前に、その仕組みを理解していることをご確認ください。\n\nフェイルオーバーキューでプロバイダーの優先順位を先に設定することをお勧めします。",
       "confirm": "理解しました、有効にする"
     },
     "unifyCodexHistory": {
@@ -461,12 +461,8 @@
         "description": "Claude、Codex、Gemini の設定保存パスを管理"
       },
       "proxy": {
-        "title": "ローカルルーティング",
-        "description": "ルーティングサービスの切り替え、ステータスとポート情報を表示",
-        "enableFeature": "メインページにルーティング切り替えを表示",
-        "enableFeatureDescription": "有効にすると、メインページ上部にルーティングとフェイルオーバーの切り替えが表示されます",
-        "enableFailoverToggle": "メインページにフェイルオーバー切り替えを表示",
-        "enableFailoverToggleDescription": "有効にすると、メインページ上部にフェイルオーバー切り替えが独立して表示されます",
+        "title": "API ルーティング",
+        "description": "Server API のルーティング状態と現在の Provider を表示",
         "running": "実行中",
         "stopped": "停止中"
       },
@@ -474,25 +470,13 @@
         "title": "モデルテスト設定",
         "description": "モデルテストで使用するデフォルトモデルとプロンプトを設定"
       },
-      "failover": {
-        "title": "自動フェイルオーバー",
-        "description": "フェイルオーバーキューとサーキットブレーカー戦略を設定"
-      },
       "pricing": {
         "title": "コスト計算",
         "description": "各モデルのトークン料金ルールを管理"
       },
-      "globalProxy": {
-        "title": "グローバル送信プロキシ",
-        "description": "CC Switch が外部 API にアクセスする際のプロキシを設定"
-      },
-      "data": {
-        "title": "データ管理",
-        "description": "ローカル設定データのインポートとエクスポート"
-      },
       "backup": {
         "title": "バックアップと復元",
-        "description": "自動バックアップの管理、データベーススナップショットの表示と復元"
+        "description": "このインストールの状態スナップショットを管理します。ホスト移行では停止中のデータディレクトリ全体をコピーしてください"
       },
       "cloudSync": {
         "title": "クラウド同期",
@@ -586,26 +570,9 @@
     "themeLight": "ライト",
     "themeDark": "ダーク",
     "themeSystem": "システム",
-    "importExport": "SQL インポート/エクスポート",
-    "importExportHint": "移行や復元用にデータベースの SQL バックアップをインポート/エクスポートします（インポートは CC Switch がエクスポートしたバックアップのみ対応）。",
-    "exportConfig": "SQL バックアップをエクスポート",
-    "selectConfigFile": "SQL ファイルを選択",
-    "noFileSelected": "ファイルが選択されていません。",
-    "import": "インポート",
-    "importing": "インポート中...",
-    "importSuccess": "インポート成功！",
-    "importFailed": "インポート失敗",
-    "syncLiveFailed": "インポートしましたが、現在のプロバイダーへの同期に失敗しました。手動で再選択してください。",
-    "importPartialSuccess": "設定はインポートされましたが、現在のプロバイダーへの同期に失敗しました。",
-    "importPartialHint": "ライブ設定を更新するため、もう一度プロバイダーを選択してください。",
-    "configExported": "設定をエクスポートしました:",
-    "exportFailed": "エクスポートに失敗しました",
-    "selectFileFailed": "有効な SQL バックアップファイルを選択してください",
-    "configCorrupted": "SQL ファイルが壊れているか形式が無効な可能性があります",
-    "backupId": "バックアップ ID",
     "backupManager": {
-      "title": "データベースバックアップ",
-      "description": "以前の状態に復元するための自動データベーススナップショット",
+      "title": "Server 状態バックアップ",
+      "description": "このインストールを以前の状態に復元するためのスナップショットです。ホスト間移行には使用しません",
       "empty": "バックアップはまだありません",
       "restore": "復元",
       "restoring": "復元中...",
@@ -988,8 +955,6 @@
     "wslShellFlag": "フラグ",
     "installCommandsCopied": "インストールコマンドをコピーしました",
     "installCommandsCopyFailed": "コピーに失敗しました。手動でコピーしてください。",
-    "importFailedError": "設定のインポートに失敗しました: {{message}}",
-    "exportFailedError": "設定のエクスポートに失敗しました:",
     "restartRequired": "再起動が必要です",
     "restartRequiredMessage": "CC Switch の設定ディレクトリを変更すると再起動が必要です。今すぐ再起動しますか？",
     "restartNow": "今すぐ再起動",
@@ -997,19 +962,8 @@
     "restartFailed": "アプリの再起動に失敗しました。手動で閉じて再度開いてください。",
     "devModeRestartHint": "開発モードでは自動再起動をサポートしていません。手動で再起動してください。",
     "saving": "保存中...",
+    "saveFailedGeneric": "保存に失敗しました。もう一度お試しください",
     "globalProxy": {
-      "label": "グローバルプロキシ",
-      "hint": "すべてのリクエスト（API、Skills ダウンロードなど）をプロキシ経由で送信します。ローカルルーティング有効時、アプリのリクエストもこのプロキシを経由します。空欄で直接接続。",
-      "username": "ユーザー名（任意）",
-      "password": "パスワード（任意）",
-      "test": "接続テスト",
-      "scan": "ローカルプロキシをスキャン",
-      "clear": "クリア",
-      "scanFailed": "スキャンに失敗しました: {{error}}",
-      "saved": "ルーティング設定を保存しました",
-      "saveFailed": "保存に失敗しました: {{error}}",
-      "testSuccess": "接続成功！遅延 {{latency}}ms",
-      "testFailed": "接続に失敗しました: {{error}}",
       "pricingDefaultsTitle": "課金のデフォルト設定",
       "pricingDefaultsDescription": "アプリごとのデフォルト倍率と課金モードを設定します。",
       "pricingAppLabel": "アプリ",
@@ -1024,8 +978,7 @@
       "pricingLoadFailed": "課金設定の読み込みに失敗しました: {{error}}",
       "defaultCostMultiplierRequired": "デフォルト倍率は必須です",
       "defaultCostMultiplierInvalid": "デフォルト倍率の形式が正しくありません"
-    },
-    "saveFailedGeneric": "保存に失敗しました。もう一度お試しください"
+    }
   },
   "apps": {
     "claude": "Claude",
@@ -2474,23 +2427,8 @@
     "operational": "正常",
     "degraded": "低下",
     "failed": "失敗",
-    "circuitOpen": "サーキットオープン",
-    "consecutiveFailures": "{{count}} 回連続失敗"
-  },
-  "failover": {
-    "enabled": "{{app}} フェイルオーバーが有効になりました",
-    "disabled": "{{app}} フェイルオーバーが無効になりました",
-    "toggleFailed": "操作に失敗しました: {{detail}}",
-    "inQueue": "キュー内",
-    "addQueue": "追加",
-    "priority": {
-      "tooltip": "フェイルオーバー優先度 {{priority}}"
-    },
-    "tooltip": {
-      "routingRequired": "ローカルルーティングの起動後に {{app}} フェイルオーバーを有効化できます",
-      "enabled": "{{app}} フェイルオーバーが有効\nキューの優先度（P1→P2→...）で使用します",
-      "disabled": "{{app}} フェイルオーバーを有効にする\nキューの P1 に即時切替し、失敗時は次を順に試行します"
-    }
+    "unavailable": "異常",
+    "failedRequests": "失敗したリクエスト {{count}} 件"
   },
   "proxy": {
     "panel": {
@@ -2604,65 +2542,6 @@
         "inactive": "{{appLabel}} のリクエストをローカルルーティング経由でルーティング"
       }
     },
-    "failover": {
-      "proxyRequired": "フェイルオーバーを設定するには、ルーティングサービスを先に起動する必要があります",
-      "autoSwitch": "自動フェイルオーバー",
-      "autoSwitchDescription": "有効にするとキューの P1 に即時切り替え、リクエスト失敗時はキュー内の次のプロバイダーを自動で試行します"
-    },
-    "failoverQueue": {
-      "title": "フェイルオーバーキュー",
-      "description": "各アプリのプロバイダーのフェイルオーバー順序を管理します",
-      "info": "自動フェイルオーバーを有効にすると、キューの優先度順（P1 優先）でプロバイダーを使用します。失敗時はキュー内の次のプロバイダーを順に試行します。",
-      "selectProvider": "キューに追加するプロバイダーを選択",
-      "noAvailableProviders": "追加できるプロバイダーがありません",
-      "empty": "フェイルオーバーキューが空です。自動フェイルオーバーを有効にするにはプロバイダーを追加してください。",
-      "orderHint": "キューの順序はホームのプロバイダー一覧の順序と一致します。ホームでドラッグして順序を変更できます。",
-      "dragHint": "ドラッグでフェイルオーバー順序を調整します。番号が小さいほど優先度が高くなります。",
-      "toggleEnabled": "有効/無効",
-      "addSuccess": "フェイルオーバーキューに追加しました",
-      "addFailed": "追加に失敗しました",
-      "removeSuccess": "フェイルオーバーキューから削除しました",
-      "removeFailed": "削除に失敗しました",
-      "reorderSuccess": "キュー順序を更新しました",
-      "reorderFailed": "順序の更新に失敗しました",
-      "toggleFailed": "状態の更新に失敗しました"
-    },
-    "autoFailover": {
-      "info": "フェイルオーバーキューに複数のプロバイダーが設定されている場合、リクエストが失敗すると優先度順に試行します。プロバイダーが連続失敗のしきい値に達すると、サーキットブレーカーが開き、一時的にスキップされます。",
-      "configSaved": "自動フェイルオーバー設定を保存しました",
-      "configSaveFailed": "保存に失敗しました",
-      "validationFailed": "以下のフィールドが有効範囲外です: {{fields}}",
-      "retrySettings": "リトライとタイムアウト設定",
-      "failureThreshold": "失敗しきい値",
-      "failureThresholdHint": "この回数連続で失敗するとサーキットブレーカーが開きます（推奨: 3-10）",
-      "timeout": "回復待ち時間（秒）",
-      "timeoutHint": "サーキットが開いた後、回復を試みるまでの待ち時間（推奨: 30-120）",
-      "circuitBreakerSettings": "サーキットブレーカー設定",
-      "successThreshold": "回復成功しきい値",
-      "successThresholdHint": "半開状態でこの回数成功するとサーキットブレーカーが閉じます",
-      "errorRate": "エラー率しきい値 (%)",
-      "errorRateHint": "この値を超えるとサーキットブレーカーが開きます",
-      "minRequests": "最小リクエスト数",
-      "minRequestsHint": "エラー率を計算する前の最小リクエスト数",
-      "explanationTitle": "仕組み",
-      "failureThresholdLabel": "失敗しきい値",
-      "failureThresholdExplain": "この回数連続で失敗すると、サーキットブレーカーが開き、プロバイダーは一時的に利用不可になります",
-      "timeoutLabel": "回復待ち時間",
-      "timeoutExplain": "サーキットが開いた後、半開状態を試みるまでの待ち時間",
-      "successThresholdLabel": "回復成功しきい値",
-      "successThresholdExplain": "半開状態でこの回数成功するとサーキットブレーカーが閉じ、プロバイダーが再び利用可能になります",
-      "errorRateLabel": "エラー率しきい値",
-      "errorRateExplain": "失敗しきい値に達していなくても、エラー率がこの値を超えるとサーキットブレーカーが開きます",
-      "maxRetries": "最大リトライ回数",
-      "timeoutSettings": "タイムアウト設定",
-      "streamingFirstByte": "ストリーミング最初のバイトタイムアウト",
-      "streamingIdle": "ストリーミングアイドルタイムアウト",
-      "nonStreaming": "非ストリーミングタイムアウト",
-      "maxRetriesHint": "リクエスト失敗時のリトライ回数（0-10）",
-      "streamingFirstByteHint": "最初のデータチャンクを待つ最大時間、範囲 1-120 秒、デフォルト 60 秒",
-      "streamingIdleHint": "データチャンク間の最大間隔、範囲 60-600 秒、0 で無効化（途中停止を防止）",
-      "nonStreamingHint": "非ストリーミングリクエストの合計タイムアウト、範囲 60-1200 秒、デフォルト 600 秒（10 分）"
-    },
     "logging": {
       "enabled": "ログ記録が有効になりました",
       "disabled": "ログ記録が無効になりました",
@@ -2718,45 +2597,7 @@
   "proxyConfig": {
     "proxyEnabled": "ローカルルーティング",
     "appTakeover": "アプリルーティング",
-    "perAppConfig": "アプリ別設定",
-    "circuitBreaker": "サーキットブレーカー",
-    "circuitBreakerSettings": "サーキットブレーカー設定",
-    "failureThreshold": "失敗閾値",
-    "successThreshold": "回復閾値",
-    "recoveryTimeout": "回復待機時間",
-    "errorRateThreshold": "エラー率閾値",
-    "minRequests": "最小リクエスト数",
-    "timeoutConfig": "タイムアウト設定",
-    "streamingFirstByte": "ストリーミング初回バイトタイムアウト",
-    "streamingIdle": "ストリーミングアイドルタイムアウト",
-    "nonStreaming": "非ストリーミングタイムアウト"
-  },
-  "circuitBreaker": {
-    "failureThreshold": "失敗閾値",
-    "successThreshold": "成功閾値",
-    "timeoutSeconds": "タイムアウト（秒）",
-    "errorRateThreshold": "エラー率閾値 (%)",
-    "minRequests": "最小リクエスト数",
-    "validationFailed": "以下のフィールドが有効範囲外です: {{fields}}",
-    "configSaved": "サーキットブレーカー設定が保存されました",
-    "saveFailed": "保存に失敗しました",
-    "loading": "読み込み中...",
-    "title": "サーキットブレーカー設定",
-    "description": "サーキットブレーカーパラメータを調整して、障害検出と復旧動作を制御します",
-    "failureThresholdHint": "連続失敗後にサーキットブレーカーを開く回数",
-    "timeoutSecondsHint": "サーキットブレーカーを開いた後、復旧を試みるまでの時間（半開状態）",
-    "successThresholdHint": "半開状態で成功してサーキットブレーカーを閉じる回数",
-    "errorRateThresholdHint": "エラー率がこの値を超えるとサーキットブレーカーを開く",
-    "minRequestsHint": "エラー率を計算する前の最小リクエスト数",
-    "saveConfig": "設定を保存",
-    "instructionsTitle": "設定説明",
-    "instructions": {
-      "failureThreshold": "連続失敗がこの回数に達するとサーキットブレーカーが開く",
-      "timeout": "サーキットブレーカーを開いた後、この時間待機してから半開を試みる",
-      "successThreshold": "半開状態で成功がこの回数に達するとサーキットブレーカーを閉じる",
-      "errorRate": "エラー率がこの値を超えるとサーキットブレーカーが開く",
-      "minRequests": "リクエスト数がこの値に達した後にのみエラー率が計算される"
-    }
+    "perAppConfig": "アプリ別設定"
   },
   "omo": {
     "editProfile": "OMO 設定を編集",
@@ -3301,7 +3142,7 @@
     "grokSpendingLimit": "利用上限",
     "expiryUnknown": "有効期限は不明です",
     "expiresIn": "{{time}}後に期限切れ",
-    "expired": "期限切れ",
+    "expired": "セッション期限切れ",
     "expiryNotProvided": "上流からサブスクリプション期限が提供されていません",
     "expiryManualNotSet": "有効期限が未設定です",
     "expiryUnavailable": "サブスクリプション期限を一時的に取得できません",
@@ -3312,9 +3153,26 @@
     "utilization": "{{value}}%",
     "resetsIn": "{{time}}後にリセット",
     "extraUsage": "超過使用量",
-    "expired": "セッション期限切れ",
     "expiredHint": "{{tool}}コマンドを実行してログインを更新してください",
     "queryFailed": "クエリに失敗しました",
     "refresh": "更新"
+  },
+  "terminal": {
+    "title": "運用ターミナル",
+    "nav": "ターミナル",
+    "backHome": "ホームに戻る",
+    "subtitle": "サーバー実行環境",
+    "placeholderTitle": "運用ターミナルに接続中",
+    "placeholderBody": "このページを離れても実行中のコマンドは停止しません。再入場で直近の出力を復元できます。",
+    "authRequired": "運用ターミナルにはログインが必要です",
+    "sessionEnded": "セッション終了",
+    "unknownError": "ターミナルエラー",
+    "connectionFailed": "ターミナル接続に失敗しました",
+    "statusConnecting": "接続中",
+    "statusReplaying": "履歴を復元中",
+    "statusLive": "接続済み",
+    "statusClosed": "切断",
+    "statusError": "エラー",
+    "endSession": "セッション終了"
   }
 }

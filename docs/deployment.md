@@ -174,7 +174,39 @@ scripts/smoke/router-market-smoke.sh
 - `usage-logs.json`
 - `tunnels.json`
 
-这些文件使用原子写入方式保存。`accounts.json` 中的账号 token 字段会用 `accounts.key` 加密；也可以用 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 提供 32 字节 base64 密钥。备份时直接备份整个 config dir，不能只备份 `accounts.json` 而漏掉 `accounts.key`。
+这些文件使用原子写入方式保存。`accounts.json` 中的账号 token 以及 S2 `providers.json` 中的 Provider credential slot 共用一个根密钥，但通过 HKDF 派生为不同用途的密钥。根密钥默认保存在 `accounts.key`；也可以用 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 提供 32 字节 base64 密钥，环境变量优先于文件。备份时直接备份整个 config dir，不能只备份 JSON 而漏掉匹配的 `accounts.key` 或部署环境密钥。
+
+### Provider S1 → S2
+
+新安装首次提交 Provider 时直接使用 S2。已存在的未迁移 `providers.json` 保持 S1；启动时只建立内存兼容视图，不会静默改盘。先执行只读预检：
+
+```bash
+sudo -u cc-switch-server cc-switch-server \
+  --config-dir /var/lib/cc-switch-server \
+  config migrate-provider-store
+```
+
+确认 JSON 报告中 `sourceFormat=s1`、`canApply=true`、`blockedCount=0`、`runtimePlanParity=true`，然后停止服务执行写操作：
+
+```bash
+sudo systemctl stop cc-switch-server
+sudo -u cc-switch-server cc-switch-server --config-dir /var/lib/cc-switch-server \
+  config migrate-provider-store --apply
+sudo systemctl start cc-switch-server
+```
+
+写操作会获取数据目录进程锁；服务仍运行时必须失败。切换后的 S1 快照位于 `provider-migrations/s1-to-s2/`。回滚和显式清理同样必须停服：
+
+```bash
+sudo -u cc-switch-server cc-switch-server --config-dir /var/lib/cc-switch-server \
+  config migrate-provider-store --rollback
+sudo -u cc-switch-server cc-switch-server --config-dir /var/lib/cc-switch-server \
+  config migrate-provider-store --cleanup-snapshot
+```
+
+在至少两个稳定 bridge release 且不少于 14 天的观察窗口完成前，不清理降级快照，也不删除 S1/name/URL reader 或旧 Provider compatibility endpoint。当前门禁记录在 `assets/contract/provider-compatibility-window.json`。
+
+S2 只降低 `providers.json` 或不含根密钥的单个快照泄露风险。攻击者若同时取得完整数据目录、`accounts.key`、环境根密钥或 Server OS 用户权限，仍可解密 Provider 和 Account 凭据。
 
 备份恢复：
 

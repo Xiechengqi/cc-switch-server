@@ -64,7 +64,12 @@ function App() {
     return <EmptyState title={t("common.error", { defaultValue: "Error" })} value={error} />;
   }
 
-  return <ServerDesktopApp onSignOut={refreshContext} />;
+  return (
+    <ServerDesktopApp
+      onSignOut={refreshContext}
+      enableWebTerminal={context.runtime?.enableWebTerminal !== false}
+    />
+  );
 }
 
 function EmptyState({ title, value }: { title: string; value: string }) {

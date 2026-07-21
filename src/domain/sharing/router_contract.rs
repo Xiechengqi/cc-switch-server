@@ -3,11 +3,12 @@ use std::collections::BTreeMap;
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::{Account, AccountQuotaTier, AccountStore};
 use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
-use crate::domain::providers::model::{classify_provider, AppKind, ProviderType};
+use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::{share_router_for_sale_label, Share, ShareMarketGrantStatus};
@@ -179,6 +180,10 @@ pub struct ShareDescriptor {
     pub auto_start: bool,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
+    #[serde(default, skip_serializing_if = "is_zero_revision")]
+    pub descriptor_generation: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub descriptor_fingerprint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
 }
@@ -649,7 +654,106 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         model_health,
         auto_start: share.auto_start,
         config_revision: share.config_revision,
+        descriptor_generation: share.descriptor_generation,
+        descriptor_fingerprint: share.descriptor_fingerprint.clone().unwrap_or_default(),
         user_grants: share.user_grants.clone(),
+    }
+}
+
+/// Hashes only facts owned by the Server's static Share projection. Router-owned
+/// request counters and health observations are deliberately excluded, as are
+/// Provider display names and volatile subscription remaining-time values.
+pub fn static_descriptor_fingerprint(
+    descriptor: &ShareDescriptor,
+    providers: &ProviderStore,
+) -> anyhow::Result<String> {
+    let projection = static_descriptor_projection(descriptor, providers)?;
+    let bytes = serde_json::to_vec(&projection)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn static_descriptor_projection(
+    descriptor: &ShareDescriptor,
+    providers: &ProviderStore,
+) -> anyhow::Result<Value> {
+    let mut projection = serde_json::to_value(descriptor)?;
+    let object = projection
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Share descriptor must serialize as an object"))?;
+    for field in [
+        "tokensUsed",
+        "requestsCount",
+        "appAvailability",
+        "modelHealth",
+        "createdAt",
+        "configRevision",
+        "descriptorGeneration",
+        "descriptorFingerprint",
+    ] {
+        object.remove(field);
+    }
+    if let Some(provider) = object.get_mut("upstreamProvider") {
+        strip_dynamic_provider_projection(provider, false);
+    }
+    if let Some(runtimes) = object.get_mut("appRuntimes").and_then(Value::as_object_mut) {
+        for provider in runtimes.values_mut() {
+            strip_dynamic_provider_projection(provider, false);
+        }
+    }
+    if let Some(apps) = object
+        .get_mut("appProviders")
+        .and_then(Value::as_object_mut)
+    {
+        for providers in apps.values_mut().filter_map(Value::as_array_mut) {
+            for provider in providers {
+                strip_dynamic_provider_projection(provider, true);
+            }
+        }
+    }
+
+    let runtime_fingerprints = descriptor
+        .bindings
+        .iter()
+        .map(|(app, provider_id)| {
+            let app_kind = match app.as_str() {
+                "claude" => AppKind::Claude,
+                "codex" => AppKind::Codex,
+                "gemini" => AppKind::Gemini,
+                other => anyhow::bail!("unsupported Share binding app {other}"),
+            };
+            let fingerprint = providers
+                .runtime_plan(app_kind, provider_id)
+                .map(|plan| plan.runtime_fingerprint.clone())
+                .unwrap_or_else(|| "missing-runtime-plan".to_string());
+            Ok((app.clone(), fingerprint))
+        })
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    object.insert(
+        "runtimeFingerprints".to_string(),
+        serde_json::to_value(runtime_fingerprints)?,
+    );
+    object.insert("fingerprintSchema".to_string(), Value::from(1));
+
+    Ok(projection)
+}
+
+fn strip_dynamic_provider_projection(value: &mut Value, app_provider: bool) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for field in [
+        "providerName",
+        "subscriptionRemainingMs",
+        "quotaPercent",
+        "quotaBlocked",
+        "quota",
+        "health",
+        "available",
+    ] {
+        object.remove(field);
+    }
+    if app_provider {
+        object.remove("name");
     }
 }
 
@@ -675,7 +779,7 @@ fn upstream_provider(
     let available = health
         .as_ref()
         .map(|health| health.healthy && quota_blocked != Some(true));
-    let resolved_provider_type = classify_provider(provider.app, &provider.provider);
+    let resolved_provider_type = provider.provider_type;
     let provider_type_id = resolved_provider_type.as_str().to_string();
     ShareUpstreamProvider {
         kind: provider_type_id.clone(),
@@ -711,7 +815,7 @@ fn app_provider(
     let available = health
         .as_ref()
         .map(|health| health.healthy && quota_blocked != Some(true));
-    let resolved_provider_type = classify_provider(provider.app, &provider.provider);
+    let resolved_provider_type = provider.provider_type;
     let provider_type_id = resolved_provider_type.as_str().to_string();
     ShareAppProvider {
         id: provider.provider.id.clone(),
@@ -1208,6 +1312,7 @@ mod tests {
         share.for_sale = false;
         let providers = ProviderStore {
             providers: vec![test_provider(ProviderType::OllamaCloud)],
+            ..Default::default()
         };
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
         assert_eq!(descriptor.for_sale, "Free");
@@ -1217,10 +1322,59 @@ mod tests {
     }
 
     #[test]
+    fn static_descriptor_fingerprint_tracks_execution_but_not_display_or_usage() {
+        let provider_type = ProviderType::Codex;
+        let base_provider = test_provider(provider_type);
+        let providers = ProviderStore {
+            providers: vec![base_provider.clone()],
+            ..ProviderStore::default()
+        };
+        let share = test_share(provider_type, Some(25.0));
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+        let baseline = static_descriptor_fingerprint(&descriptor, &providers).unwrap();
+
+        let mut display_provider = base_provider.clone();
+        display_provider.provider.name = "renamed for display only".to_string();
+        let display_providers = ProviderStore {
+            providers: vec![display_provider],
+            ..ProviderStore::default()
+        };
+        let mut usage_only_share = share.clone();
+        usage_only_share.tokens_used = 987_654;
+        usage_only_share.requests_count = 321;
+        usage_only_share.quota_percent = Some(99.0);
+        let display_descriptor =
+            descriptor_for_share_with_usage(&usage_only_share, &display_providers, None);
+        assert_eq!(
+            static_descriptor_projection(&descriptor, &providers).unwrap(),
+            static_descriptor_projection(&display_descriptor, &display_providers).unwrap()
+        );
+        assert_eq!(
+            baseline,
+            static_descriptor_fingerprint(&display_descriptor, &display_providers).unwrap()
+        );
+
+        let mut endpoint_provider = base_provider;
+        endpoint_provider.provider.settings_config["env"]["OPENAI_BASE_URL"] =
+            Value::String("https://other-upstream.example/v1".to_string());
+        let endpoint_providers = ProviderStore {
+            providers: vec![endpoint_provider],
+            ..ProviderStore::default()
+        };
+        let endpoint_descriptor =
+            descriptor_for_share_with_usage(&share, &endpoint_providers, None);
+        assert_ne!(
+            baseline,
+            static_descriptor_fingerprint(&endpoint_descriptor, &endpoint_providers).unwrap()
+        );
+    }
+
+    #[test]
     fn descriptor_maps_unlimited_expiry_to_shared_permanent_constant() {
         let share = test_share(ProviderType::OllamaCloud, None);
         let providers = ProviderStore {
             providers: vec![test_provider(ProviderType::OllamaCloud)],
+            ..Default::default()
         };
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
         assert_eq!(descriptor.expires_at, UNLIMITED_SHARE_EXPIRES_AT);
@@ -1231,6 +1385,7 @@ mod tests {
         let share = test_share(ProviderType::OllamaCloud, None);
         let providers = ProviderStore {
             providers: vec![test_provider(ProviderType::OllamaCloud)],
+            ..Default::default()
         };
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
 
@@ -1245,6 +1400,7 @@ mod tests {
         let share = test_share(ProviderType::OllamaCloud, None);
         let providers = ProviderStore {
             providers: vec![test_provider(ProviderType::OllamaCloud)],
+            ..Default::default()
         };
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
         let value = serde_json::to_value(&descriptor).unwrap();
@@ -1263,6 +1419,7 @@ mod tests {
         share.subscription_level = Some("manual".to_string());
         let providers = ProviderStore {
             providers: vec![test_provider(ProviderType::CodexOAuth)],
+            ..Default::default()
         };
         let accounts = AccountStore {
             accounts: vec![test_account(ProviderType::CodexOAuth)],
@@ -1293,6 +1450,7 @@ mod tests {
         let share = test_share(ProviderType::ClaudeOAuth, Some(5.0));
         let providers = ProviderStore {
             providers: vec![test_provider(ProviderType::ClaudeOAuth)],
+            ..Default::default()
         };
         let mut account = test_account(ProviderType::ClaudeOAuth);
         account.quota = None;
@@ -1331,6 +1489,7 @@ mod tests {
         let share = test_share(ProviderType::ClaudeOAuth, Some(5.0));
         let providers = ProviderStore {
             providers: vec![test_provider(ProviderType::ClaudeOAuth)],
+            ..Default::default()
         };
         let mut account = test_account(ProviderType::ClaudeOAuth);
         account.quota = None;
@@ -1380,6 +1539,7 @@ mod tests {
         let share = test_share(ProviderType::CodexOAuth, Some(1.0));
         let providers = ProviderStore {
             providers: vec![test_provider(ProviderType::CodexOAuth)],
+            ..Default::default()
         };
         let mut account = test_account(ProviderType::CodexOAuth);
         account.quota = Some(AccountQuota {
@@ -1417,6 +1577,7 @@ mod tests {
         });
         let providers = ProviderStore {
             providers: vec![test_provider(ProviderType::Codex)],
+            ..Default::default()
         };
 
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
@@ -1447,6 +1608,7 @@ mod tests {
         };
         let providers = ProviderStore {
             providers: vec![provider],
+            ..Default::default()
         };
 
         let descriptor = descriptor_for_share_with_usage(&share, &providers, Some(&usage));
@@ -1493,6 +1655,7 @@ mod tests {
         };
         let providers = ProviderStore {
             providers: vec![provider],
+            ..Default::default()
         };
 
         let descriptor = descriptor_for_share_with_usage(&share, &providers, Some(&usage));
@@ -1510,6 +1673,7 @@ mod tests {
         let provider = test_provider(ProviderType::Codex);
         let providers = ProviderStore {
             providers: vec![provider],
+            ..Default::default()
         };
         let usage = UsageStore::default();
 
@@ -1545,7 +1709,9 @@ mod tests {
                 },
                 provider_type: ProviderType::Nvidia,
                 provider_type_id: ProviderType::Nvidia.as_str().to_string(),
+                resource: Default::default(),
             }],
+            ..Default::default()
         };
 
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
@@ -1588,6 +1754,7 @@ mod tests {
             },
             provider_type,
             provider_type_id: provider_type.as_str().to_string(),
+            resource: Default::default(),
         }
     }
 
@@ -1635,6 +1802,10 @@ mod tests {
             router_url: None,
             config_revision: 0,
             router_synced_revision: 0,
+            descriptor_generation: 0,
+            descriptor_fingerprint: None,
+            router_synced_descriptor_generation: 0,
+            router_synced_descriptor_fingerprint: None,
             user_grants: BTreeMap::new(),
         }
     }
@@ -1643,6 +1814,8 @@ mod tests {
         Account {
             id: "acct-1".to_string(),
             provider_type,
+            auth_identity_generation: 1,
+            token_refresh_generation: 1,
             email: Some("account@example.com".to_string()),
             access_token: Some("access".to_string()),
             refresh_token: None,

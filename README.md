@@ -36,8 +36,8 @@ market or direct share URL
 
 - 提供 setup、password/API token 登录和 router 邮箱验证码登录；Web UI 覆盖 provider、account、share、usage、router、pricing、backup 和 diagnostics 常用操作。
 - 支持 Claude、Codex、Gemini 三类入口：`/v1/messages`、`/v1/chat/completions`、`/v1/responses`、Gemini `/v1beta/*` 和 OpenAI-compatible `/v1/models`/`/models`。
-- 保留 cc-switch provider metadata、AuthBinding、未知扩展字段和 Universal Provider 模型配置，导入/同步时尽量不丢 desktop 配置。
-- 支持 provider / Universal Provider JSON 导入导出；导入时按 server 当前分类逻辑重新 upsert，不信任旧导出里的分类结果。
+- 通过显式 legacy reader 保留旧 cc-switch Provider metadata、AuthBinding 和未知扩展字段；Universal 派生项只作为迁移输入，不再是 Server runtime 真值。
+- Provider API 导出仅返回脱敏视图；受控导入按 server 当前分类和凭据补丁契约执行，不提供跨 store 的通用配置导入导出。
 - 已实现 Codex Chat Completions 与 Responses 的直接互转，保留 max/reasoning/response_format/tool/usage 等 Codex bridge 关键字段。
 - 已接入 Claude/Codex/Gemini/OpenAI-compatible/Gemini-native/Anthropic-native 之间的主要跨协议 adapter contract，并把 OpenRouter、Ollama、Nvidia、DeepSeek、SubRouter、OpenCode Go 等 preset 纳入 coverage。
 - Cursor 三入口保持 AgentService planned；已移植协议、请求、事件、tool、h2、session、identity、image 前置层，并在显式 opt-in 下接入 Claude/Codex/Gemini AgentService driver。
@@ -282,8 +282,8 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | OAuth client | Gemini 浏览器登录需要 `CC_SWITCH_SERVER_GEMINI_CLIENT_ID` / `CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET`；Antigravity/Agy 浏览器登录需要 `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID` / `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET` |
 | Claude OAuth 并发 | 每账号默认最多 8 个 in-flight 请求；provider 可设置 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS`，全局可用 `CC_SWITCH_ACCOUNT_MAX_CONCURRENT` 覆盖，设为 `0` 关闭 |
 | Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
-| OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出自动选号；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
-| Prometheus | `GET /metrics` 暴露账号并发、Claude retry、breaker、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
+| OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出其固定 Provider 内的账号调度；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
+| Prometheus | `GET /metrics` 暴露账号并发、Claude 同 Provider retry、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
 | 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_MARKET_GRANT_TOKEN` |
 | stream 验收 | `STREAM_PROBE`、`REQUIRE_STREAM_USAGE` |
 | release readiness | `RUN_REAL`、`RUN_DEPLOYMENT_TESTS` |
@@ -293,12 +293,32 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 - `server.json`：owner、公开收款资料及同步状态、password hash、router、client tunnel subdomain 和 installation identity。
 - `providers.json`：Claude / Codex / Gemini 供应商配置（按应用维度管理）。
 - `accounts.json`：账号 token、profile、quota、raw snapshot；token 字段用 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 做 XChaCha20Poly1305 加密。
-- `accounts.key`：本机生成的账号 token 加密密钥；备份/迁移时必须和 `accounts.json` 一起保留。
+- `accounts.key`：本机生成的根密钥；同时派生 Account token 与 S2 Provider credential 的独立密钥。备份/迁移时必须和 `accounts.json`、`providers.json` 一起保留。
 - `shares.json` / `tunnels.json`：share、binding、ACL、market grant 和 tunnel runtime。
 - `usage-logs.jsonl` / `usage-rollups.json`：请求明细和统计 rollup。
-- `model-pricing.json`、`failover.json`、`email-auth.json`。
+- `model-pricing.json`、`email-auth.json` 及运行时生成的日志/备份目录。
 
 这些文件可能包含 token、secret 或账号信息，不能提交到 git。
+
+跨环境迁移必须先停止旧、新实例，再完整复制实际配置目录；不能只复制部分 JSON。具体步骤和 OAuth 加密密钥要求见 [Server Data Directory Migration](docs/server-data-migration.md)。
+
+### Provider 存储格式
+
+全新数据目录在首次保存 Provider 时写入带格式 guard 的 S2 `providers.json`，静态 API Key、Bearer、AWS secret 和受控自定义 header 值以 XChaCha20-Poly1305 credential slot 保存。已有 S1 安装会继续读取 S1，普通启动不会改写文件；管理员必须停服后显式切换：
+
+```bash
+# 可在服务运行时只读预检
+cc-switch-server config migrate-provider-store
+
+# 以下写操作必须先停止 cc-switch-server
+cc-switch-server config migrate-provider-store --apply
+cc-switch-server config migrate-provider-store --rollback
+cc-switch-server config migrate-provider-store --cleanup-snapshot
+```
+
+`--apply` 只有在身份/凭据分类及 S1/S2 RuntimePlan parity 全部通过时才会创建 S1 快照并切换；`--rollback` 恢复该快照；快照只通过显式 `--cleanup-snapshot` 删除。服务持有数据目录锁时，三个写操作均会失败。
+
+如果配置了 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY`，恢复和迁移时必须提供完全相同的 32 字节 base64 根密钥；否则必须保留匹配的 `accounts.key`。S2 能防止单独泄露 `providers.json` 或不含密钥的 Provider 快照，但完整数据目录、环境根密钥或 Server OS 用户权限一并泄露时仍可解密，不能把它视为硬件密钥边界。
 
 ## API 入口
 

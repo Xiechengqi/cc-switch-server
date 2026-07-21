@@ -1,46 +1,60 @@
 {
   "generatedFrom": {
-    "providerTypes": "/data/projects/cc-switch",
-    "presets": "/data/projects/cc-switch"
+    "baseline": "assets/contract/upstream-provider-source-baseline.json",
+    "serverLegacyInventory": "assets/contract/server-provider-legacy-inventory.json",
+    "serverProviderTypes": {
+      "path": "src/domain/providers/model.rs",
+      "sha256": "86b3199578137b06e42233ad758db01eea0176ef9d36056713610e733b1dbd1c"
+    },
+    "upstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14"
   },
   "providerTypes": [
     {
+      "variant": "Claude",
       "id": "claude",
       "label": "Anthropic official / API key",
       "apps": [
         "claude"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "ClaudeAuth",
       "id": "claude_auth",
       "label": "Claude bearer-only relay",
       "apps": [
         "claude"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "ClaudeOAuth",
       "id": "claude_oauth",
       "label": "Claude Official OAuth",
       "apps": [
         "claude"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "Codex",
       "id": "codex",
       "label": "OpenAI/Codex compatible",
       "apps": [
         "codex"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "CodexOAuth",
       "id": "codex_oauth",
       "label": "OpenAI ChatGPT OAuth",
       "apps": [
@@ -48,18 +62,22 @@
         "codex"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "Gemini",
       "id": "gemini",
       "label": "Google Gemini API key",
       "apps": [
         "gemini"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "GeminiCli",
       "id": "gemini_cli",
       "label": "Google Gemini OAuth / CLI",
       "apps": [
@@ -67,9 +85,11 @@
         "claude"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "OpenRouter",
       "id": "openrouter",
       "label": "OpenRouter",
       "apps": [
@@ -78,36 +98,44 @@
         "gemini"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "GitHubCopilot",
       "id": "github_copilot",
       "label": "GitHub Copilot",
       "apps": [
         "claude"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "DeepSeekAccount",
       "id": "deepseek_account",
       "label": "DeepSeek account",
       "apps": [
         "claude"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "KiroOAuth",
       "id": "kiro_oauth",
       "label": "Kiro OAuth",
       "apps": [
         "claude"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "CursorOAuth",
       "id": "cursor_oauth",
       "label": "Cursor OAuth",
       "apps": [
@@ -115,9 +143,11 @@
         "codex"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "CursorApiKey",
       "id": "cursor_apikey",
       "label": "Cursor API key",
       "apps": [
@@ -125,9 +155,11 @@
         "codex"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "AntigravityOAuth",
       "id": "antigravity_oauth",
       "label": "Antigravity OAuth",
       "apps": [
@@ -135,9 +167,11 @@
         "gemini"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "AgyOAuth",
       "id": "agy_oauth",
       "label": "Antigravity CLI / agy",
       "apps": [
@@ -145,9 +179,11 @@
         "gemini"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "OllamaCloud",
       "id": "ollama_cloud",
       "label": "Ollama API key",
       "apps": [
@@ -155,18 +191,22 @@
         "codex"
       ],
       "required": true,
-      "presentInSource": true
+      "presentInSource": true,
+      "presentInServer": true
     },
     {
+      "variant": "AwsBedrock",
       "id": "aws_bedrock",
       "label": "AWS Bedrock compatibility schema",
       "apps": [
         "claude"
       ],
       "required": false,
-      "presentInSource": false
+      "presentInSource": false,
+      "presentInServer": true
     },
     {
+      "variant": "Nvidia",
       "id": "nvidia",
       "label": "Nvidia OpenAI-compatible API",
       "apps": [
@@ -174,9 +214,11 @@
         "codex"
       ],
       "required": false,
-      "presentInSource": false
+      "presentInSource": false,
+      "presentInServer": true
     },
     {
+      "variant": "DeepSeekApi",
       "id": "deepseek_api",
       "label": "DeepSeek API key",
       "apps": [
@@ -184,9 +226,11 @@
         "codex"
       ],
       "required": false,
-      "presentInSource": false
+      "presentInSource": false,
+      "presentInServer": true
     },
     {
+      "variant": "GrokOAuth",
       "id": "grok_oauth",
       "label": "Grok/xAI OAuth reverse proxy",
       "apps": [
@@ -195,100 +239,1170 @@
         "gemini"
       ],
       "required": false,
-      "presentInSource": false
+      "presentInSource": false,
+      "presentInServer": true
     }
   ],
+  "upstreamPresets": {
+    "claude": [
+      {
+        "sourceIndex": 0,
+        "name": "Claude Official",
+        "providerType": "claude_oauth",
+        "apiFormat": null,
+        "category": "official",
+        "official": true,
+        "requiresOAuth": true,
+        "websiteUrl": "https://www.anthropic.com/claude-code",
+        "baseUrl": null,
+        "defaultModel": null,
+        "declaredPointers": [
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/isOfficial",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 1,
+        "name": "OpenAI OAuth",
+        "providerType": "codex_oauth",
+        "apiFormat": "openai_responses",
+        "category": "official",
+        "official": true,
+        "requiresOAuth": true,
+        "websiteUrl": "https://chatgpt.com/codex",
+        "baseUrl": "https://chatgpt.com/backend-api/codex",
+        "defaultModel": "gpt-5.5",
+        "declaredPointers": [
+          "/apiFormat",
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/isOfficial",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 2,
+        "name": "Kiro OAuth",
+        "providerType": "kiro_oauth",
+        "apiFormat": null,
+        "category": "official",
+        "official": true,
+        "requiresOAuth": true,
+        "websiteUrl": "https://kiro.dev",
+        "baseUrl": "https://q.us-east-1.amazonaws.com",
+        "defaultModel": "claude-sonnet-4-8",
+        "declaredPointers": [
+          "/category",
+          "/icon",
+          "/isOfficial",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 3,
+        "name": "Ollama API Key",
+        "providerType": "ollama_cloud",
+        "apiFormat": "openai_chat",
+        "category": "third_party",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://ollama.com",
+        "baseUrl": "https://ollama.com",
+        "defaultModel": "kimi-k2.7-code",
+        "declaredPointers": [
+          "/apiFormat",
+          "/category",
+          "/icon",
+          "/isOfficial",
+          "/modelsUrl",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/settingsConfig/modelMapping",
+          "/settingsConfig/modelMapping/mode",
+          "/settingsConfig/modelMapping/upstreamModel",
+          "/testConfig",
+          "/testConfig/enabled",
+          "/testConfig/testModel",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 4,
+        "name": "Cursor OAuth",
+        "providerType": "cursor_oauth",
+        "apiFormat": null,
+        "category": "official",
+        "official": true,
+        "requiresOAuth": true,
+        "websiteUrl": "https://cursor.com",
+        "baseUrl": "https://api2.cursor.sh",
+        "defaultModel": "composer-2.5",
+        "declaredPointers": [
+          "/category",
+          "/icon",
+          "/isOfficial",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/settingsConfig/modelMapping",
+          "/settingsConfig/modelMapping/mode",
+          "/settingsConfig/modelMapping/upstreamModel",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 5,
+        "name": "Cursor API Key",
+        "providerType": "cursor_apikey",
+        "apiFormat": null,
+        "category": "official",
+        "official": true,
+        "requiresOAuth": false,
+        "websiteUrl": "https://cursor.com/dashboard/cloud-agents",
+        "baseUrl": "https://api.cursor.com",
+        "defaultModel": "composer-2.5",
+        "declaredPointers": [
+          "/apiKeyUrl",
+          "/category",
+          "/icon",
+          "/isOfficial",
+          "/name",
+          "/providerType",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/settingsConfig/modelMapping",
+          "/settingsConfig/modelMapping/mode",
+          "/settingsConfig/modelMapping/upstreamModel",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 6,
+        "name": "Antigravity OAuth",
+        "providerType": "antigravity_oauth",
+        "apiFormat": "gemini_native",
+        "category": "official",
+        "official": true,
+        "requiresOAuth": true,
+        "websiteUrl": "https://antigravity.google",
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+        "defaultModel": "claude-sonnet-4-6",
+        "declaredPointers": [
+          "/apiFormat",
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/isOfficial",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 7,
+        "name": "Antigravity CLI (agy)",
+        "providerType": "agy_oauth",
+        "apiFormat": "gemini_native",
+        "category": "official",
+        "official": true,
+        "requiresOAuth": true,
+        "websiteUrl": "https://antigravity.google",
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+        "defaultModel": "claude-sonnet-4-6",
+        "declaredPointers": [
+          "/apiFormat",
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/isOfficial",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 8,
+        "name": "GitHub Copilot",
+        "providerType": "github_copilot",
+        "apiFormat": "openai_chat",
+        "category": "third_party",
+        "official": false,
+        "requiresOAuth": true,
+        "websiteUrl": "https://github.com/features/copilot",
+        "baseUrl": "https://api.githubcopilot.com",
+        "defaultModel": "claude-sonnet-5",
+        "declaredPointers": [
+          "/apiFormat",
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 9,
+        "name": "DeepSeek Official",
+        "providerType": "deepseek_account",
+        "apiFormat": null,
+        "category": "cn_official",
+        "official": false,
+        "requiresOAuth": true,
+        "websiteUrl": "https://chat.deepseek.com",
+        "baseUrl": "https://chat.deepseek.com",
+        "defaultModel": "deepseek-v4-flash",
+        "declaredPointers": [
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 10,
+        "name": "AWS Bedrock (AKSK)",
+        "providerType": null,
+        "apiFormat": null,
+        "category": "cloud_provider",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://aws.amazon.com/bedrock/",
+        "baseUrl": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com",
+        "defaultModel": "global.anthropic.claude-opus-4-8",
+        "declaredPointers": [
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/name",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/settingsConfig/env/AWS_ACCESS_KEY_ID",
+          "/settingsConfig/env/AWS_REGION",
+          "/settingsConfig/env/AWS_SECRET_ACCESS_KEY",
+          "/settingsConfig/env/CLAUDE_CODE_USE_BEDROCK",
+          "/templateValues",
+          "/templateValues/AWS_ACCESS_KEY_ID",
+          "/templateValues/AWS_ACCESS_KEY_ID/editorValue",
+          "/templateValues/AWS_ACCESS_KEY_ID/label",
+          "/templateValues/AWS_ACCESS_KEY_ID/placeholder",
+          "/templateValues/AWS_REGION",
+          "/templateValues/AWS_REGION/editorValue",
+          "/templateValues/AWS_REGION/label",
+          "/templateValues/AWS_REGION/placeholder",
+          "/templateValues/AWS_SECRET_ACCESS_KEY",
+          "/templateValues/AWS_SECRET_ACCESS_KEY/editorValue",
+          "/templateValues/AWS_SECRET_ACCESS_KEY/label",
+          "/templateValues/AWS_SECRET_ACCESS_KEY/placeholder",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 11,
+        "name": "AWS Bedrock (API Key)",
+        "providerType": null,
+        "apiFormat": null,
+        "category": "cloud_provider",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://aws.amazon.com/bedrock/",
+        "baseUrl": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com",
+        "defaultModel": "global.anthropic.claude-opus-4-8",
+        "declaredPointers": [
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/name",
+          "/settingsConfig",
+          "/settingsConfig/apiKey",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/settingsConfig/env/AWS_REGION",
+          "/settingsConfig/env/CLAUDE_CODE_USE_BEDROCK",
+          "/templateValues",
+          "/templateValues/AWS_REGION",
+          "/templateValues/AWS_REGION/editorValue",
+          "/templateValues/AWS_REGION/label",
+          "/templateValues/AWS_REGION/placeholder",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 12,
+        "name": "OpenRouter",
+        "providerType": null,
+        "apiFormat": null,
+        "category": "aggregator",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://openrouter.ai",
+        "baseUrl": "https://openrouter.ai/api",
+        "defaultModel": "anthropic/claude-sonnet-4.6",
+        "declaredPointers": [
+          "/apiKeyUrl",
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/name",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 13,
+        "name": "Nvidia",
+        "providerType": null,
+        "apiFormat": "openai_chat",
+        "category": "aggregator",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://build.nvidia.com",
+        "baseUrl": "https://integrate.api.nvidia.com",
+        "defaultModel": "moonshotai/kimi-k2.5",
+        "declaredPointers": [
+          "/apiFormat",
+          "/apiKeyUrl",
+          "/category",
+          "/icon",
+          "/iconColor",
+          "/name",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      },
+      {
+        "sourceIndex": 14,
+        "name": "DeepSeek(API Key)",
+        "providerType": null,
+        "apiFormat": null,
+        "category": "cn_official",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://platform.deepseek.com",
+        "baseUrl": "https://api.deepseek.com/anthropic",
+        "defaultModel": "deepseek-v4-flash",
+        "declaredPointers": [
+          "/apiKeyUrl",
+          "/category",
+          "/endpointCandidates",
+          "/endpointCandidates/0",
+          "/icon",
+          "/iconColor",
+          "/name",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
+          "/settingsConfig/env/ANTHROPIC_BASE_URL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+          "/settingsConfig/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "/settingsConfig/env/ANTHROPIC_MODEL",
+          "/websiteUrl"
+        ],
+        "sourceApp": "claude"
+      }
+    ],
+    "codex": [
+      {
+        "sourceIndex": 0,
+        "name": "OpenAI OAuth",
+        "providerType": "codex_oauth",
+        "apiFormat": null,
+        "category": "official",
+        "official": true,
+        "requiresOAuth": false,
+        "websiteUrl": "https://chatgpt.com/codex",
+        "baseUrl": null,
+        "defaultModel": null,
+        "declaredPointers": [
+          "/auth",
+          "/category",
+          "/config",
+          "/icon",
+          "/iconColor",
+          "/isOfficial",
+          "/name",
+          "/providerType",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "codex"
+      },
+      {
+        "sourceIndex": 1,
+        "name": "Cursor API Key",
+        "providerType": "cursor_apikey",
+        "apiFormat": "openai_chat",
+        "category": "official",
+        "official": true,
+        "requiresOAuth": false,
+        "websiteUrl": "https://cursor.com/dashboard/cloud-agents",
+        "baseUrl": "https://api.cursor.com",
+        "defaultModel": "gpt-5.5",
+        "declaredPointers": [
+          "/apiFormat",
+          "/apiKeyUrl",
+          "/auth",
+          "/auth/OPENAI_API_KEY",
+          "/category",
+          "/config",
+          "/config/$staticCall",
+          "/config/baseUrl",
+          "/config/model",
+          "/config/providerName",
+          "/icon",
+          "/isOfficial",
+          "/modelCatalog",
+          "/modelCatalog/0",
+          "/modelCatalog/0/contextWindow",
+          "/modelCatalog/0/displayName",
+          "/modelCatalog/0/model",
+          "/modelCatalog/0/upstreamModel",
+          "/modelCatalog/1",
+          "/modelCatalog/1/contextWindow",
+          "/modelCatalog/1/displayName",
+          "/modelCatalog/1/model",
+          "/modelCatalog/1/upstreamModel",
+          "/modelCatalog/2",
+          "/modelCatalog/2/contextWindow",
+          "/modelCatalog/2/displayName",
+          "/modelCatalog/2/model",
+          "/modelCatalog/2/upstreamModel",
+          "/modelCatalog/3",
+          "/modelCatalog/3/contextWindow",
+          "/modelCatalog/3/displayName",
+          "/modelCatalog/3/model",
+          "/modelCatalog/3/upstreamModel",
+          "/modelCatalog/4",
+          "/modelCatalog/4/contextWindow",
+          "/modelCatalog/4/displayName",
+          "/modelCatalog/4/model",
+          "/modelCatalog/4/upstreamModel",
+          "/modelCatalog/5",
+          "/modelCatalog/5/contextWindow",
+          "/modelCatalog/5/displayName",
+          "/modelCatalog/5/model",
+          "/modelCatalog/5/upstreamModel",
+          "/modelCatalog/6",
+          "/modelCatalog/6/contextWindow",
+          "/modelCatalog/6/displayName",
+          "/modelCatalog/6/model",
+          "/modelCatalog/6/upstreamModel",
+          "/modelCatalog/7",
+          "/modelCatalog/7/contextWindow",
+          "/modelCatalog/7/displayName",
+          "/modelCatalog/7/model",
+          "/modelCatalog/7/upstreamModel",
+          "/modelCatalog/8",
+          "/modelCatalog/8/contextWindow",
+          "/modelCatalog/8/displayName",
+          "/modelCatalog/8/model",
+          "/modelCatalog/8/upstreamModel",
+          "/modelMapping",
+          "/modelMapping/mode",
+          "/modelMapping/upstreamModel",
+          "/name",
+          "/providerType",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "codex"
+      },
+      {
+        "sourceIndex": 2,
+        "name": "Cursor OAuth",
+        "providerType": "cursor_oauth",
+        "apiFormat": "openai_chat",
+        "category": "official",
+        "official": true,
+        "requiresOAuth": true,
+        "websiteUrl": "https://cursor.com",
+        "baseUrl": "https://api2.cursor.sh",
+        "defaultModel": "gpt-5.5",
+        "declaredPointers": [
+          "/apiFormat",
+          "/auth",
+          "/category",
+          "/config",
+          "/config/$staticCall",
+          "/config/baseUrl",
+          "/config/model",
+          "/config/providerName",
+          "/icon",
+          "/isOfficial",
+          "/modelCatalog",
+          "/modelCatalog/0",
+          "/modelCatalog/0/contextWindow",
+          "/modelCatalog/0/displayName",
+          "/modelCatalog/0/model",
+          "/modelCatalog/0/upstreamModel",
+          "/modelCatalog/1",
+          "/modelCatalog/1/contextWindow",
+          "/modelCatalog/1/displayName",
+          "/modelCatalog/1/model",
+          "/modelCatalog/1/upstreamModel",
+          "/modelCatalog/2",
+          "/modelCatalog/2/contextWindow",
+          "/modelCatalog/2/displayName",
+          "/modelCatalog/2/model",
+          "/modelCatalog/2/upstreamModel",
+          "/modelCatalog/3",
+          "/modelCatalog/3/contextWindow",
+          "/modelCatalog/3/displayName",
+          "/modelCatalog/3/model",
+          "/modelCatalog/3/upstreamModel",
+          "/modelCatalog/4",
+          "/modelCatalog/4/contextWindow",
+          "/modelCatalog/4/displayName",
+          "/modelCatalog/4/model",
+          "/modelCatalog/4/upstreamModel",
+          "/modelCatalog/5",
+          "/modelCatalog/5/contextWindow",
+          "/modelCatalog/5/displayName",
+          "/modelCatalog/5/model",
+          "/modelCatalog/5/upstreamModel",
+          "/modelCatalog/6",
+          "/modelCatalog/6/contextWindow",
+          "/modelCatalog/6/displayName",
+          "/modelCatalog/6/model",
+          "/modelCatalog/6/upstreamModel",
+          "/modelCatalog/7",
+          "/modelCatalog/7/contextWindow",
+          "/modelCatalog/7/displayName",
+          "/modelCatalog/7/model",
+          "/modelCatalog/7/upstreamModel",
+          "/modelCatalog/8",
+          "/modelCatalog/8/contextWindow",
+          "/modelCatalog/8/displayName",
+          "/modelCatalog/8/model",
+          "/modelCatalog/8/upstreamModel",
+          "/modelMapping",
+          "/modelMapping/mode",
+          "/modelMapping/upstreamModel",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "codex"
+      },
+      {
+        "sourceIndex": 3,
+        "name": "Ollama API Key",
+        "providerType": "ollama_cloud",
+        "apiFormat": "openai_chat",
+        "category": "third_party",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://ollama.com",
+        "baseUrl": "https://ollama.com",
+        "defaultModel": "kimi-k2.7-code",
+        "declaredPointers": [
+          "/apiFormat",
+          "/auth",
+          "/auth/OPENAI_API_KEY",
+          "/category",
+          "/codexChatReasoning",
+          "/codexChatReasoning/effortParam",
+          "/codexChatReasoning/outputFormat",
+          "/codexChatReasoning/supportsEffort",
+          "/codexChatReasoning/supportsThinking",
+          "/codexChatReasoning/thinkingParam",
+          "/config",
+          "/config/$staticCall",
+          "/config/baseUrl",
+          "/config/model",
+          "/config/providerName",
+          "/icon",
+          "/isOfficial",
+          "/modelCatalog",
+          "/modelCatalog/0",
+          "/modelCatalog/0/contextWindow",
+          "/modelCatalog/0/displayName",
+          "/modelCatalog/0/model",
+          "/modelMapping",
+          "/modelMapping/mode",
+          "/modelMapping/upstreamModel",
+          "/name",
+          "/providerType",
+          "/requiresOAuth",
+          "/testConfig",
+          "/testConfig/enabled",
+          "/testConfig/testModel",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "codex"
+      },
+      {
+        "sourceIndex": 4,
+        "name": "OpenRouter",
+        "providerType": null,
+        "apiFormat": null,
+        "category": "aggregator",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://openrouter.ai",
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "defaultModel": "gpt-5.4",
+        "declaredPointers": [
+          "/apiKeyUrl",
+          "/auth",
+          "/auth/OPENAI_API_KEY",
+          "/category",
+          "/config",
+          "/config/$staticCall",
+          "/config/baseUrl",
+          "/config/model",
+          "/config/providerName",
+          "/icon",
+          "/iconColor",
+          "/name",
+          "/websiteUrl"
+        ],
+        "sourceApp": "codex"
+      },
+      {
+        "sourceIndex": 5,
+        "name": "Nvidia",
+        "providerType": null,
+        "apiFormat": "openai_chat",
+        "category": "aggregator",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://build.nvidia.com",
+        "baseUrl": "https://integrate.api.nvidia.com/v1",
+        "defaultModel": "moonshotai/kimi-k2.5",
+        "declaredPointers": [
+          "/apiFormat",
+          "/apiKeyUrl",
+          "/auth",
+          "/auth/OPENAI_API_KEY",
+          "/category",
+          "/codexChatReasoning",
+          "/codexChatReasoning/effortParam",
+          "/codexChatReasoning/outputFormat",
+          "/codexChatReasoning/supportsEffort",
+          "/codexChatReasoning/supportsThinking",
+          "/codexChatReasoning/thinkingParam",
+          "/config",
+          "/config/$staticCall",
+          "/config/baseUrl",
+          "/config/model",
+          "/config/providerName",
+          "/endpointCandidates",
+          "/endpointCandidates/0",
+          "/icon",
+          "/iconColor",
+          "/modelCatalog",
+          "/modelCatalog/0",
+          "/modelCatalog/0/contextWindow",
+          "/modelCatalog/0/displayName",
+          "/modelCatalog/0/model",
+          "/name",
+          "/websiteUrl"
+        ],
+        "sourceApp": "codex"
+      },
+      {
+        "sourceIndex": 6,
+        "name": "DeepSeek(API Key)",
+        "providerType": null,
+        "apiFormat": "openai_chat",
+        "category": "cn_official",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://platform.deepseek.com",
+        "baseUrl": "https://api.deepseek.com",
+        "defaultModel": "deepseek-v4-flash",
+        "declaredPointers": [
+          "/apiFormat",
+          "/apiKeyUrl",
+          "/auth",
+          "/auth/OPENAI_API_KEY",
+          "/category",
+          "/codexChatReasoning",
+          "/codexChatReasoning/effortParam",
+          "/codexChatReasoning/effortValueMode",
+          "/codexChatReasoning/outputFormat",
+          "/codexChatReasoning/supportsEffort",
+          "/codexChatReasoning/supportsThinking",
+          "/codexChatReasoning/thinkingParam",
+          "/config",
+          "/config/$staticCall",
+          "/config/baseUrl",
+          "/config/model",
+          "/config/providerName",
+          "/endpointCandidates",
+          "/endpointCandidates/0",
+          "/icon",
+          "/iconColor",
+          "/modelCatalog",
+          "/modelCatalog/0",
+          "/modelCatalog/0/contextWindow",
+          "/modelCatalog/0/displayName",
+          "/modelCatalog/0/model",
+          "/modelCatalog/1",
+          "/modelCatalog/1/contextWindow",
+          "/modelCatalog/1/displayName",
+          "/modelCatalog/1/model",
+          "/name",
+          "/websiteUrl"
+        ],
+        "sourceApp": "codex"
+      }
+    ],
+    "gemini": [
+      {
+        "sourceIndex": 0,
+        "name": "Google Official",
+        "providerType": "google_gemini_oauth",
+        "apiFormat": null,
+        "category": "official",
+        "official": false,
+        "requiresOAuth": true,
+        "websiteUrl": "https://ai.google.dev/",
+        "baseUrl": null,
+        "defaultModel": null,
+        "declaredPointers": [
+          "/apiKeyUrl",
+          "/category",
+          "/description",
+          "/icon",
+          "/iconColor",
+          "/name",
+          "/partnerPromotionKey",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "gemini"
+      },
+      {
+        "sourceIndex": 1,
+        "name": "Antigravity OAuth",
+        "providerType": "antigravity_oauth",
+        "apiFormat": null,
+        "category": "official",
+        "official": false,
+        "requiresOAuth": true,
+        "websiteUrl": "https://antigravity.google",
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+        "defaultModel": "gemini-3.5-flash-medium",
+        "declaredPointers": [
+          "/baseURL",
+          "/category",
+          "/description",
+          "/icon",
+          "/iconColor",
+          "/model",
+          "/name",
+          "/partnerPromotionKey",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/config",
+          "/settingsConfig/config/general",
+          "/settingsConfig/config/general/previewFeatures",
+          "/settingsConfig/env",
+          "/settingsConfig/env/GEMINI_MODEL",
+          "/settingsConfig/env/GOOGLE_GEMINI_BASE_URL",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "gemini"
+      },
+      {
+        "sourceIndex": 2,
+        "name": "Antigravity CLI (agy)",
+        "providerType": "agy_oauth",
+        "apiFormat": null,
+        "category": "official",
+        "official": false,
+        "requiresOAuth": true,
+        "websiteUrl": "https://antigravity.google",
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+        "defaultModel": "gemini-3.5-flash-medium",
+        "declaredPointers": [
+          "/baseURL",
+          "/category",
+          "/description",
+          "/icon",
+          "/iconColor",
+          "/model",
+          "/name",
+          "/partnerPromotionKey",
+          "/providerType",
+          "/requiresOAuth",
+          "/settingsConfig",
+          "/settingsConfig/config",
+          "/settingsConfig/config/general",
+          "/settingsConfig/config/general/previewFeatures",
+          "/settingsConfig/env",
+          "/settingsConfig/env/GEMINI_MODEL",
+          "/settingsConfig/env/GOOGLE_GEMINI_BASE_URL",
+          "/theme",
+          "/theme/backgroundColor",
+          "/theme/icon",
+          "/theme/textColor",
+          "/websiteUrl"
+        ],
+        "sourceApp": "gemini"
+      },
+      {
+        "sourceIndex": 3,
+        "name": "OpenRouter",
+        "providerType": null,
+        "apiFormat": null,
+        "category": "aggregator",
+        "official": false,
+        "requiresOAuth": false,
+        "websiteUrl": "https://openrouter.ai",
+        "baseUrl": "https://openrouter.ai/api",
+        "defaultModel": "gemini-3.5-flash",
+        "declaredPointers": [
+          "/apiKeyUrl",
+          "/baseURL",
+          "/category",
+          "/description",
+          "/icon",
+          "/iconColor",
+          "/model",
+          "/name",
+          "/settingsConfig",
+          "/settingsConfig/env",
+          "/settingsConfig/env/GEMINI_MODEL",
+          "/settingsConfig/env/GOOGLE_GEMINI_BASE_URL",
+          "/websiteUrl"
+        ],
+        "sourceApp": "gemini"
+      }
+    ]
+  },
   "presets": {
     "claude": [
       {
         "name": "Claude Official",
         "providerType": "claude_oauth",
         "apiFormat": null,
-        "baseUrl": null
+        "baseUrl": null,
+        "defaultModel": null,
+        "sourceIndex": 0
       },
       {
         "name": "OpenAI OAuth",
         "providerType": "codex_oauth",
         "apiFormat": "openai_responses",
-        "baseUrl": "https://chatgpt.com/backend-api/codex"
+        "baseUrl": "https://chatgpt.com/backend-api/codex",
+        "defaultModel": "gpt-5.6-sol",
+        "sourceIndex": 1
+      },
+      {
+        "name": "Grok OAuth",
+        "providerType": "grok_oauth",
+        "apiFormat": "openai_responses",
+        "baseUrl": "https://api.x.ai/v1",
+        "defaultModel": "grok-4.5",
+        "sourceIndex": 2
       },
       {
         "name": "Kiro OAuth",
         "providerType": "kiro_oauth",
         "apiFormat": null,
-        "baseUrl": "https://q.us-east-1.amazonaws.com"
+        "baseUrl": "https://q.us-east-1.amazonaws.com",
+        "defaultModel": "claude-sonnet-4-8",
+        "sourceIndex": 3
       },
       {
         "name": "Ollama API Key",
         "providerType": "ollama_cloud",
         "apiFormat": "openai_chat",
-        "baseUrl": "https://ollama.com"
+        "baseUrl": "https://ollama.com",
+        "defaultModel": "kimi-k2.7-code",
+        "sourceIndex": 4
       },
       {
         "name": "Cursor OAuth",
         "providerType": "cursor_oauth",
         "apiFormat": null,
-        "baseUrl": "https://api2.cursor.sh"
+        "baseUrl": "https://api2.cursor.sh",
+        "defaultModel": "composer-2.5",
+        "sourceIndex": 5
       },
       {
         "name": "Cursor API Key",
         "providerType": "cursor_apikey",
         "apiFormat": null,
-        "baseUrl": "https://api.cursor.com"
+        "baseUrl": "https://api.cursor.com",
+        "defaultModel": "composer-2.5",
+        "sourceIndex": 6
       },
       {
         "name": "Antigravity OAuth",
         "providerType": "antigravity_oauth",
         "apiFormat": "gemini_native",
-        "baseUrl": "https://daily-cloudcode-pa.googleapis.com"
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+        "defaultModel": "claude-sonnet-4-6",
+        "sourceIndex": 7
       },
       {
         "name": "Antigravity CLI (agy)",
         "providerType": "agy_oauth",
         "apiFormat": "gemini_native",
-        "baseUrl": "https://daily-cloudcode-pa.googleapis.com"
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+        "defaultModel": "claude-sonnet-4-6",
+        "sourceIndex": 8
       },
       {
         "name": "GitHub Copilot",
         "providerType": "github_copilot",
         "apiFormat": "openai_chat",
-        "baseUrl": "https://api.githubcopilot.com"
+        "baseUrl": "https://api.githubcopilot.com",
+        "defaultModel": "claude-sonnet-5",
+        "sourceIndex": 9
       },
       {
         "name": "DeepSeek Official",
         "providerType": "deepseek_account",
         "apiFormat": null,
-        "baseUrl": "https://chat.deepseek.com"
+        "baseUrl": "https://chat.deepseek.com",
+        "defaultModel": "deepseek-v4-flash",
+        "sourceIndex": 10
       },
       {
         "name": "AWS Bedrock (AKSK)",
         "providerType": null,
         "apiFormat": null,
-        "baseUrl": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com"
+        "baseUrl": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com",
+        "defaultModel": "global.anthropic.claude-opus-4-8",
+        "sourceIndex": 11
       },
       {
         "name": "AWS Bedrock (API Key)",
         "providerType": null,
         "apiFormat": null,
-        "baseUrl": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com"
+        "baseUrl": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com",
+        "defaultModel": "global.anthropic.claude-opus-4-8",
+        "sourceIndex": 12
       },
       {
         "name": "OpenRouter",
         "providerType": null,
         "apiFormat": null,
-        "baseUrl": "https://openrouter.ai/api"
+        "baseUrl": "https://openrouter.ai/api",
+        "defaultModel": "anthropic/claude-sonnet-4.6",
+        "sourceIndex": 13
       },
       {
         "name": "Nvidia",
         "providerType": null,
         "apiFormat": "openai_chat",
-        "baseUrl": "https://integrate.api.nvidia.com"
+        "baseUrl": "https://integrate.api.nvidia.com",
+        "defaultModel": "moonshotai/kimi-k2.5",
+        "sourceIndex": 14
       },
       {
         "name": "DeepSeek(API Key)",
         "providerType": null,
         "apiFormat": null,
-        "baseUrl": "https://api.deepseek.com/anthropic"
+        "baseUrl": "https://api.deepseek.com/anthropic",
+        "defaultModel": "deepseek-v4-flash",
+        "sourceIndex": 15
       }
     ],
     "codex": [
@@ -296,43 +1410,65 @@
         "name": "OpenAI OAuth",
         "providerType": "codex_oauth",
         "apiFormat": null,
-        "baseUrl": null
+        "baseUrl": null,
+        "defaultModel": null,
+        "sourceIndex": 0
+      },
+      {
+        "name": "Grok OAuth",
+        "providerType": "grok_oauth",
+        "apiFormat": null,
+        "baseUrl": "https://api.x.ai/v1",
+        "defaultModel": "grok-4.5",
+        "sourceIndex": 1
       },
       {
         "name": "Cursor API Key",
         "providerType": "cursor_apikey",
         "apiFormat": "openai_chat",
-        "baseUrl": "https://api.cursor.com"
+        "baseUrl": "https://api.cursor.com",
+        "defaultModel": "gpt-5.5",
+        "sourceIndex": 2
       },
       {
         "name": "Cursor OAuth",
         "providerType": "cursor_oauth",
         "apiFormat": "openai_chat",
-        "baseUrl": "https://api2.cursor.sh"
+        "baseUrl": "https://api2.cursor.sh",
+        "defaultModel": "gpt-5.5",
+        "sourceIndex": 3
       },
       {
         "name": "Ollama API Key",
         "providerType": "ollama_cloud",
         "apiFormat": "openai_chat",
-        "baseUrl": "https://ollama.com"
+        "baseUrl": "https://ollama.com",
+        "defaultModel": "kimi-k2.7-code",
+        "sourceIndex": 4
       },
       {
         "name": "OpenRouter",
         "providerType": null,
         "apiFormat": null,
-        "baseUrl": "https://openrouter.ai/api/v1"
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "defaultModel": "gpt-5.4",
+        "sourceIndex": 5
       },
       {
         "name": "Nvidia",
         "providerType": null,
         "apiFormat": "openai_chat",
-        "baseUrl": "https://integrate.api.nvidia.com/v1"
+        "baseUrl": "https://integrate.api.nvidia.com/v1",
+        "defaultModel": "moonshotai/kimi-k2.5",
+        "sourceIndex": 6
       },
       {
         "name": "DeepSeek(API Key)",
         "providerType": null,
         "apiFormat": "openai_chat",
-        "baseUrl": "https://api.deepseek.com"
+        "baseUrl": "https://api.deepseek.com",
+        "defaultModel": "deepseek-v4-flash",
+        "sourceIndex": 7
       }
     ],
     "gemini": [
@@ -340,28 +1476,146 @@
         "name": "Google Official",
         "providerType": "google_gemini_oauth",
         "apiFormat": null,
-        "baseUrl": null
+        "baseUrl": null,
+        "defaultModel": null,
+        "sourceIndex": 0
       },
       {
         "name": "Antigravity OAuth",
         "providerType": "antigravity_oauth",
         "apiFormat": null,
-        "baseUrl": "https://daily-cloudcode-pa.googleapis.com"
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+        "defaultModel": "gemini-3.5-flash-medium",
+        "sourceIndex": 1
       },
       {
         "name": "Antigravity CLI (agy)",
         "providerType": "agy_oauth",
         "apiFormat": null,
-        "baseUrl": "https://daily-cloudcode-pa.googleapis.com"
+        "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+        "defaultModel": "gemini-3.5-flash-medium",
+        "sourceIndex": 2
+      },
+      {
+        "name": "Grok OAuth",
+        "providerType": "grok_oauth",
+        "apiFormat": null,
+        "baseUrl": "https://api.x.ai/v1",
+        "defaultModel": "grok-4.5",
+        "sourceIndex": 3
       },
       {
         "name": "OpenRouter",
         "providerType": null,
         "apiFormat": null,
-        "baseUrl": "https://openrouter.ai/api"
+        "baseUrl": "https://openrouter.ai/api",
+        "defaultModel": "gemini-3.5-flash",
+        "sourceIndex": 4
       }
     ]
   },
+  "universalRecipes": [
+    {
+      "sourceIndex": 0,
+      "name": "NewAPI",
+      "providerType": "newapi",
+      "defaultApps": {
+        "claude": true,
+        "codex": true,
+        "gemini": true
+      },
+      "defaultModels": {
+        "claude": {
+          "model": "claude-sonnet-5",
+          "haikuModel": "claude-haiku-4-5-20251001",
+          "sonnetModel": "claude-sonnet-5",
+          "opusModel": "claude-opus-4-8"
+        },
+        "codex": {
+          "model": "gpt-5.5",
+          "reasoningEffort": "high"
+        },
+        "gemini": {
+          "model": "gemini-3.5-flash"
+        }
+      },
+      "customTemplate": false,
+      "websiteUrl": "https://www.newapi.pro",
+      "declaredPointers": [
+        "/defaultApps",
+        "/defaultApps/claude",
+        "/defaultApps/codex",
+        "/defaultApps/gemini",
+        "/defaultModels",
+        "/defaultModels/claude",
+        "/defaultModels/claude/haikuModel",
+        "/defaultModels/claude/model",
+        "/defaultModels/claude/opusModel",
+        "/defaultModels/claude/sonnetModel",
+        "/defaultModels/codex",
+        "/defaultModels/codex/model",
+        "/defaultModels/codex/reasoningEffort",
+        "/defaultModels/gemini",
+        "/defaultModels/gemini/model",
+        "/description",
+        "/icon",
+        "/iconColor",
+        "/name",
+        "/providerType",
+        "/websiteUrl"
+      ]
+    },
+    {
+      "sourceIndex": 1,
+      "name": "自定义网关",
+      "providerType": "custom_gateway",
+      "defaultApps": {
+        "claude": true,
+        "codex": true,
+        "gemini": true
+      },
+      "defaultModels": {
+        "claude": {
+          "model": "claude-sonnet-5",
+          "haikuModel": "claude-haiku-4-5-20251001",
+          "sonnetModel": "claude-sonnet-5",
+          "opusModel": "claude-opus-4-8"
+        },
+        "codex": {
+          "model": "gpt-5.5",
+          "reasoningEffort": "high"
+        },
+        "gemini": {
+          "model": "gemini-3.5-flash"
+        }
+      },
+      "customTemplate": true,
+      "websiteUrl": null,
+      "declaredPointers": [
+        "/defaultApps",
+        "/defaultApps/claude",
+        "/defaultApps/codex",
+        "/defaultApps/gemini",
+        "/defaultModels",
+        "/defaultModels/claude",
+        "/defaultModels/claude/haikuModel",
+        "/defaultModels/claude/model",
+        "/defaultModels/claude/opusModel",
+        "/defaultModels/claude/sonnetModel",
+        "/defaultModels/codex",
+        "/defaultModels/codex/model",
+        "/defaultModels/codex/reasoningEffort",
+        "/defaultModels/gemini",
+        "/defaultModels/gemini/model",
+        "/description",
+        "/icon",
+        "/iconColor",
+        "/isCustomTemplate",
+        "/name",
+        "/providerType"
+      ]
+    }
+  ],
   "fixtures": {
     "claude": [
       {
@@ -391,6 +1645,24 @@
           },
           "meta": {
             "providerType": "codex_oauth",
+            "apiFormat": "openai_responses"
+          }
+        }
+      },
+      {
+        "app": "claude",
+        "name": "Grok OAuth",
+        "expectedProviderType": "grok_oauth",
+        "provider": {
+          "id": "claude:Grok OAuth",
+          "name": "Grok OAuth",
+          "settingsConfig": {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://api.x.ai/v1"
+            }
+          },
+          "meta": {
+            "providerType": "grok_oauth",
             "apiFormat": "openai_responses"
           }
         }
@@ -629,6 +1901,23 @@
       },
       {
         "app": "codex",
+        "name": "Grok OAuth",
+        "expectedProviderType": "grok_oauth",
+        "provider": {
+          "id": "codex:Grok OAuth",
+          "name": "Grok OAuth",
+          "settingsConfig": {
+            "env": {
+              "OPENAI_BASE_URL": "https://api.x.ai/v1"
+            }
+          },
+          "meta": {
+            "providerType": "grok_oauth"
+          }
+        }
+      },
+      {
+        "app": "codex",
         "name": "Cursor API Key",
         "expectedProviderType": "cursor_apikey",
         "provider": {
@@ -776,6 +2065,23 @@
           },
           "meta": {
             "providerType": "agy_oauth"
+          }
+        }
+      },
+      {
+        "app": "gemini",
+        "name": "Grok OAuth",
+        "expectedProviderType": "grok_oauth",
+        "provider": {
+          "id": "gemini:Grok OAuth",
+          "name": "Grok OAuth",
+          "settingsConfig": {
+            "env": {
+              "GOOGLE_GEMINI_BASE_URL": "https://api.x.ai/v1"
+            }
+          },
+          "meta": {
+            "providerType": "grok_oauth"
           }
         }
       },

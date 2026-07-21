@@ -93,6 +93,10 @@ export interface ShareRecord {
   lastUsedAt?: string | null;
   configRevision: number;
   routerSyncedRevision: number;
+  descriptorGeneration: number;
+  descriptorFingerprint?: string | null;
+  routerSyncedDescriptorGeneration: number;
+  routerSyncedDescriptorFingerprint?: string | null;
   routerLastSyncError?: string | null;
   userGrants: ShareUserGrantMap;
 }
@@ -206,6 +210,7 @@ export interface UpdateShareAclParams {
 /** Complete settings payload saved atomically from a Provider edit page. */
 export interface SaveProviderShareParams {
   shareId: string;
+  expectedConfigRevision: number;
   subdomain: string;
   description?: string;
   forSale: "Yes" | "No" | "Free";

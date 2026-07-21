@@ -81,6 +81,8 @@ pub enum HealthStatus {
 pub struct StreamCheckResult {
     pub status: HealthStatus,
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_revision: Option<u64>,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_time_ms: Option<u64>,
@@ -248,6 +250,7 @@ fn build_reachability_result(
         Ok(status) => StreamCheckResult {
             status: determine_status(response_time, degraded_threshold_ms),
             success: true,
+            provider_revision: None,
             message: "Reachable".to_string(),
             response_time_ms: Some(response_time),
             http_status: Some(status),
@@ -263,6 +266,7 @@ fn build_reachability_result(
         Err(message) => StreamCheckResult {
             status: HealthStatus::Failed,
             success: false,
+            provider_revision: None,
             message,
             response_time_ms: Some(response_time),
             http_status: None,
@@ -305,6 +309,7 @@ fn failed_result(message: impl Into<String>, retry_count: u32) -> StreamCheckRes
     StreamCheckResult {
         status: HealthStatus::Failed,
         success: false,
+        provider_revision: None,
         message: message.into(),
         response_time_ms: None,
         http_status: None,

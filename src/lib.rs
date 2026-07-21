@@ -4,6 +4,7 @@ pub mod build_info;
 pub mod cli;
 pub mod client_tunnel_provision;
 pub mod clients;
+pub(crate) mod codex_identity;
 pub mod domain;
 pub mod infra;
 pub mod logging;

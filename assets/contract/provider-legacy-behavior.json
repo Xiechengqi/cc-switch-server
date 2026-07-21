@@ -1,0 +1,1574 @@
+{
+  "schemaVersion": 1,
+  "authority": "phase-0-legacy-regression-baseline",
+  "serverBaselineCommit": "90329f4a4681552ca85e48a107c7e1fc67466dd0",
+  "sourceEvidence": [
+    {
+      "path": "src/domain/providers/model.rs",
+      "sha256": "7dce7a318b48f48d9c97a1da1532c2a5c5e3894a00725d6b520b7827cf4dbc2e"
+    },
+    {
+      "path": "src/domain/providers/model_routing.rs",
+      "sha256": "62ac646ebce876205c6a558e877b68cfbf5d135968a915e4a8484a977e290569"
+    },
+    {
+      "path": "src/proxy/adapters.rs",
+      "sha256": "e46c273dae0e9f01c9656ebe8659f0f2d7392dd9d130cc80f0048763c781cfc5"
+    },
+    {
+      "path": "src/proxy/forwarder.rs",
+      "sha256": "dbdd8f1767d7635f4cf204e91182eda1e0c4bb71a0c68b51a0c45b5da4349aa3"
+    },
+    {
+      "path": "src/proxy/grok.rs",
+      "sha256": "19134fe7287154eb10590867f986d37b158a82036de7c9cde56ed385ff4026c1"
+    },
+    {
+      "path": "src/proxy/kiro.rs",
+      "sha256": "c3dfa0b7b26cc79eda9f72a6d8dccca28f573dc232c3afc85e1cc2b80bf6fded"
+    },
+    {
+      "path": "src/proxy/deepseek.rs",
+      "sha256": "51ee32e271da16b5999ff4c638faabfd68b132600689ddeae770097092ef9b8c"
+    },
+    {
+      "path": "src/proxy/cursor/agent_driver.rs",
+      "sha256": "d499c5a4a6d3bfb1cb332d1f8d5e2b695da425f3b6f42d02c141a49942b05b5a"
+    }
+  ],
+  "entries": [
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 0,
+        "presetName": "Claude Official"
+      },
+      "targetProfileId": "claude.official_oauth",
+      "classification": {
+        "providerType": "claude_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_oauth_bearer_compatible",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "provider type default",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1/messages"
+      },
+      "upstreamProtocol": "anthropic_messages",
+      "auth": {
+        "headers": [
+          "authorization",
+          "anthropic-version"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore access token"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "downstream request model",
+        "strategy": "passthrough"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 1,
+        "presetName": "OpenAI OAuth"
+      },
+      "targetProfileId": "claude.openai_oauth",
+      "classification": {
+        "providerType": "codex_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_to_codex_oauth_responses",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://chatgpt.com/backend-api/codex",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1/responses"
+      },
+      "upstreamProtocol": "openai_responses",
+      "auth": {
+        "headers": [
+          "authorization",
+          "chatgpt-account-id",
+          "originator",
+          "version"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore access token/workspace"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "gpt-5.6-sol",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "generation_route_and_request_content"
+      },
+      "specialSideEffects": [
+        "OAuth refresh",
+        "Codex identity headers",
+        "compact request normalization"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 2,
+        "presetName": "Grok OAuth"
+      },
+      "targetProfileId": "claude.grok_oauth",
+      "classification": {
+        "providerType": "grok_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_to_grok_responses",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://api.x.ai/v1",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1/responses"
+      },
+      "upstreamProtocol": "openai_responses",
+      "auth": {
+        "headers": [
+          "authorization",
+          "x-grok-client-identifier",
+          "x-grok-client-version",
+          "x-grok-conv-id",
+          "openai-beta"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore access token"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "grok-4.5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "generation_route_and_request_content"
+      },
+      "specialSideEffects": [
+        "OAuth refresh",
+        "session identity",
+        "model normalization",
+        "media routing"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 3,
+        "presetName": "Kiro OAuth"
+      },
+      "targetProfileId": "claude.kiro_oauth",
+      "classification": {
+        "providerType": "kiro_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "special_forwarder",
+        "adapter": "claude_kiro_codewhisperer_planned",
+        "adapterSupport": "planned"
+      },
+      "endpoint": {
+        "origin": "https://q.us-east-1.amazonaws.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "Amazon Q/CodeWhisperer generateAssistantResponse"
+      },
+      "upstreamProtocol": "kiro_codewhisperer",
+      "auth": {
+        "headers": [
+          "authorization",
+          "x-amz-user-agent",
+          "x-amz-target",
+          "x-amzn-kiro-agent-mode"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore access token"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "claude-sonnet-4-8",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "special_tool_bridge",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [
+        "Kiro token refresh",
+        "tool name bridge"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": false,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "production has a special forward branch while manual test/discovery still use the generic adapter"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 4,
+        "presetName": "Ollama API Key"
+      },
+      "targetProfileId": "claude.ollama_cloud",
+      "classification": {
+        "providerType": "ollama_cloud",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_ollama_openai_chat",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://ollama.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1/chat/completions"
+      },
+      "upstreamProtocol": "openai_chat",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.env.ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|API_KEY"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "kimi-k2.7-code",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 5,
+        "presetName": "Cursor OAuth"
+      },
+      "targetProfileId": "claude.cursor_oauth",
+      "classification": {
+        "providerType": "cursor_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "special_forwarder",
+        "adapter": "claude_cursor_agentservice",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://api2.cursor.sh",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "Cursor AgentService ConnectRPC endpoint"
+      },
+      "upstreamProtocol": "cursor_agentservice",
+      "auth": {
+        "headers": [
+          "authorization",
+          "x-cursor-checksum",
+          "x-cursor-client-version",
+          "x-request-id"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore access token"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "composer-2.5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "special_stream_translation",
+        "tools": "special_tool_bridge",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [
+        "Cursor session/tool bridge"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": false,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "production uses Cursor AgentService while manual test/discovery do not execute the same operation path"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 6,
+        "presetName": "Cursor API Key"
+      },
+      "targetProfileId": "claude.cursor_api_key",
+      "classification": {
+        "providerType": "cursor_apikey",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "special_forwarder",
+        "adapter": "claude_cursor_apikey_agentservice",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://api.cursor.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "Cursor AgentService ConnectRPC endpoint"
+      },
+      "upstreamProtocol": "cursor_agentservice",
+      "auth": {
+        "headers": [
+          "authorization",
+          "x-cursor-checksum",
+          "x-cursor-client-version",
+          "x-request-id"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig auth/API key"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "composer-2.5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "special_stream_translation",
+        "tools": "special_tool_bridge",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [
+        "Cursor session/tool bridge"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": false,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "production uses Cursor AgentService while manual test/discovery do not execute the same operation path"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 7,
+        "presetName": "Antigravity OAuth"
+      },
+      "targetProfileId": "claude.antigravity_oauth",
+      "classification": {
+        "providerType": "antigravity_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_antigravity_gemini_native",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://daily-cloudcode-pa.googleapis.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1beta/models/{actualModel}:{method}"
+      },
+      "upstreamProtocol": "gemini_native",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore managed credential"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "claude-sonnet-4-6",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 8,
+        "presetName": "Antigravity CLI (agy)"
+      },
+      "targetProfileId": "claude.antigravity_cli",
+      "classification": {
+        "providerType": "agy_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_antigravity_gemini_native",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://daily-cloudcode-pa.googleapis.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1beta/models/{actualModel}:{method}"
+      },
+      "upstreamProtocol": "gemini_native",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore managed credential"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "claude-sonnet-4-6",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 9,
+        "presetName": "GitHub Copilot"
+      },
+      "targetProfileId": "claude.github_copilot",
+      "classification": {
+        "providerType": "github_copilot",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_copilot_skeleton",
+        "adapterSupport": "generic_fallback"
+      },
+      "endpoint": {
+        "origin": "https://api.githubcopilot.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1/chat/completions"
+      },
+      "upstreamProtocol": "openai_chat",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore managed credential"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "claude-sonnet-5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [
+        "Copilot token exchange",
+        "request optimizer"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": false,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "production adds managed Copilot auth but capability remains generic_fallback"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 10,
+        "presetName": "DeepSeek Official"
+      },
+      "targetProfileId": "claude.deepseek_account",
+      "classification": {
+        "providerType": "deepseek_account",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "special_forwarder",
+        "adapter": "claude_deepseek_account_planned",
+        "adapterSupport": "planned"
+      },
+      "endpoint": {
+        "origin": "https://chat.deepseek.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "DeepSeek account chat completion endpoint"
+      },
+      "upstreamProtocol": "deepseek_chat",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore managed credential"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "deepseek-v4-flash",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "special_tool_bridge",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [
+        "DeepSeek account token refresh"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": false,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "production has a special forward branch while manual test/discovery still use the generic adapter"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 11,
+        "presetName": "AWS Bedrock (AKSK)"
+      },
+      "targetProfileId": "claude.aws_bedrock_aksk",
+      "classification": {
+        "providerType": "aws_bedrock",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_bedrock_signature_planned",
+        "adapterSupport": "planned"
+      },
+      "endpoint": {
+        "origin": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/model/{actualModel}/converse-stream"
+      },
+      "upstreamProtocol": "aws_bedrock_converse",
+      "auth": {
+        "headers": [
+          "authorization",
+          "x-amz-content-sha256",
+          "x-amz-date",
+          "x-amz-security-token?"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.env.AWS_ACCESS_KEY_ID",
+          "provider.settingsConfig.env.AWS_SECRET_ACCESS_KEY",
+          "provider.settingsConfig.env.AWS_SESSION_TOKEN?"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "global.anthropic.claude-opus-4-8",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "known_broken",
+        "reason": "SigV4 request planner exists but adapter capability intentionally remains planned"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 12,
+        "presetName": "AWS Bedrock (API Key)"
+      },
+      "targetProfileId": "claude.aws_bedrock_api_key",
+      "classification": {
+        "providerType": "aws_bedrock",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_bedrock_signature_planned",
+        "adapterSupport": "planned"
+      },
+      "endpoint": {
+        "origin": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/model/{actualModel}/converse-stream"
+      },
+      "upstreamProtocol": "aws_bedrock_converse",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.env.ANTHROPIC_AUTH_TOKEN"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "global.anthropic.claude-opus-4-8",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "known_broken",
+        "reason": "legacy classification collapses Bearer API key and AKSK into planned SigV4 AwsBedrock"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 13,
+        "presetName": "OpenRouter"
+      },
+      "targetProfileId": "claude.openrouter",
+      "classification": {
+        "providerType": "openrouter",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_openrouter_compatible",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://openrouter.ai/api",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1/messages"
+      },
+      "upstreamProtocol": "anthropic_messages",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.env.ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|API_KEY"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "anthropic/claude-sonnet-4.6",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 14,
+        "presetName": "Nvidia"
+      },
+      "targetProfileId": "claude.nvidia",
+      "classification": {
+        "providerType": "nvidia",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_nvidia_openai_chat",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://integrate.api.nvidia.com",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1/chat/completions"
+      },
+      "upstreamProtocol": "openai_chat",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.env.ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|API_KEY"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "moonshotai/kimi-k2.5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "claude",
+        "sourceIndex": 15,
+        "presetName": "DeepSeek(API Key)"
+      },
+      "targetProfileId": "claude.deepseek_api",
+      "classification": {
+        "providerType": "deepseek_api",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "claude_deepseek_anthropic_api",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://api.deepseek.com/anthropic",
+        "sourceLocator": "provider.settingsConfig.env.ANTHROPIC_BASE_URL",
+        "path": "/v1/messages"
+      },
+      "upstreamProtocol": "anthropic_messages",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.env.ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|API_KEY"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "deepseek-v4-flash",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "codex",
+        "sourceIndex": 0,
+        "presetName": "OpenAI OAuth"
+      },
+      "targetProfileId": "codex.openai_oauth",
+      "classification": {
+        "providerType": "codex_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "codex_oauth_responses",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "provider type default",
+        "sourceLocator": "provider.settingsConfig config.toml/base_url or env.OPENAI_BASE_URL",
+        "path": "/v1/responses"
+      },
+      "upstreamProtocol": "openai_responses",
+      "auth": {
+        "headers": [
+          "authorization",
+          "chatgpt-account-id",
+          "originator",
+          "version"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore access token/workspace"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "downstream request model",
+        "strategy": "passthrough"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "generation_route_and_request_content"
+      },
+      "specialSideEffects": [
+        "OAuth refresh",
+        "Codex identity headers",
+        "compact request normalization"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "codex",
+        "sourceIndex": 1,
+        "presetName": "Grok OAuth"
+      },
+      "targetProfileId": "codex.grok_oauth",
+      "classification": {
+        "providerType": "grok_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "codex_grok_responses",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://api.x.ai/v1",
+        "sourceLocator": "provider.settingsConfig config.toml/base_url or env.OPENAI_BASE_URL",
+        "path": "/v1/responses"
+      },
+      "upstreamProtocol": "openai_responses",
+      "auth": {
+        "headers": [
+          "authorization",
+          "x-grok-client-identifier",
+          "x-grok-client-version",
+          "x-grok-conv-id",
+          "openai-beta"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore access token"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "grok-4.5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "generation_route_and_request_content"
+      },
+      "specialSideEffects": [
+        "OAuth refresh",
+        "session identity",
+        "model normalization",
+        "media routing"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "codex",
+        "sourceIndex": 2,
+        "presetName": "Cursor API Key"
+      },
+      "targetProfileId": "codex.cursor_api_key",
+      "classification": {
+        "providerType": "cursor_apikey",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "special_forwarder",
+        "adapter": "codex_cursor_apikey_agentservice",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://api.cursor.com",
+        "sourceLocator": "provider.settingsConfig config.toml/base_url or env.OPENAI_BASE_URL",
+        "path": "Cursor AgentService ConnectRPC endpoint"
+      },
+      "upstreamProtocol": "cursor_agentservice",
+      "auth": {
+        "headers": [
+          "authorization",
+          "x-cursor-checksum",
+          "x-cursor-client-version",
+          "x-request-id"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig auth/API key"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "gpt-5.5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "special_stream_translation",
+        "tools": "special_tool_bridge",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [
+        "Cursor session/tool bridge"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": false,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "production uses Cursor AgentService while manual test/discovery do not execute the same operation path"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "codex",
+        "sourceIndex": 3,
+        "presetName": "Cursor OAuth"
+      },
+      "targetProfileId": "codex.cursor_oauth",
+      "classification": {
+        "providerType": "cursor_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "special_forwarder",
+        "adapter": "codex_cursor_agentservice",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://api2.cursor.sh",
+        "sourceLocator": "provider.settingsConfig config.toml/base_url or env.OPENAI_BASE_URL",
+        "path": "Cursor AgentService ConnectRPC endpoint"
+      },
+      "upstreamProtocol": "cursor_agentservice",
+      "auth": {
+        "headers": [
+          "authorization",
+          "x-cursor-checksum",
+          "x-cursor-client-version",
+          "x-request-id"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore access token"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "gpt-5.5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "special_stream_translation",
+        "tools": "special_tool_bridge",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [
+        "Cursor session/tool bridge"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": false,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "production uses Cursor AgentService while manual test/discovery do not execute the same operation path"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "codex",
+        "sourceIndex": 4,
+        "presetName": "Ollama API Key"
+      },
+      "targetProfileId": "codex.ollama_cloud",
+      "classification": {
+        "providerType": "ollama_cloud",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "codex_ollama_openai_compatible",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://ollama.com",
+        "sourceLocator": "provider.settingsConfig config.toml/base_url or env.OPENAI_BASE_URL",
+        "path": "/v1/chat/completions"
+      },
+      "upstreamProtocol": "openai_chat",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.auth.OPENAI_API_KEY|env.OPENAI_API_KEY|API_KEY|TOML env_key"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "kimi-k2.7-code",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "codex",
+        "sourceIndex": 5,
+        "presetName": "OpenRouter"
+      },
+      "targetProfileId": "codex.openrouter",
+      "classification": {
+        "providerType": "openrouter",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "codex_openrouter_compatible",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://openrouter.ai/api/v1",
+        "sourceLocator": "provider.settingsConfig config.toml/base_url or env.OPENAI_BASE_URL",
+        "path": "/v1/responses"
+      },
+      "upstreamProtocol": "openai_responses",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.auth.OPENAI_API_KEY|env.OPENAI_API_KEY|API_KEY|TOML env_key"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "gpt-5.4",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "codex",
+        "sourceIndex": 6,
+        "presetName": "Nvidia"
+      },
+      "targetProfileId": "codex.nvidia",
+      "classification": {
+        "providerType": "nvidia",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "codex_openai_chat_compatible",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://integrate.api.nvidia.com/v1",
+        "sourceLocator": "provider.settingsConfig config.toml/base_url or env.OPENAI_BASE_URL",
+        "path": "/v1/chat/completions"
+      },
+      "upstreamProtocol": "openai_chat",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.auth.OPENAI_API_KEY|env.OPENAI_API_KEY|API_KEY|TOML env_key"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "moonshotai/kimi-k2.5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "codex",
+        "sourceIndex": 7,
+        "presetName": "DeepSeek(API Key)"
+      },
+      "targetProfileId": "codex.deepseek_api",
+      "classification": {
+        "providerType": "deepseek_api",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "codex_openai_chat_compatible",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://api.deepseek.com",
+        "sourceLocator": "provider.settingsConfig config.toml/base_url or env.OPENAI_BASE_URL",
+        "path": "/v1/chat/completions"
+      },
+      "upstreamProtocol": "openai_chat",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.auth.OPENAI_API_KEY|env.OPENAI_API_KEY|API_KEY|TOML env_key"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "deepseek-v4-flash",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "gemini",
+        "sourceIndex": 0,
+        "presetName": "Google Official"
+      },
+      "targetProfileId": "gemini.google_oauth",
+      "classification": {
+        "providerType": "gemini_cli",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "gemini_cli_oauth_native",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "provider type default",
+        "sourceLocator": "provider.settingsConfig.env.GOOGLE_GEMINI_BASE_URL",
+        "path": "/v1beta/models/{actualModel}:{method}"
+      },
+      "upstreamProtocol": "gemini_native",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.env.GEMINI_API_KEY|GOOGLE_API_KEY|API_KEY"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "downstream request model",
+        "strategy": "passthrough"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "gemini",
+        "sourceIndex": 1,
+        "presetName": "Antigravity OAuth"
+      },
+      "targetProfileId": "gemini.antigravity_oauth",
+      "classification": {
+        "providerType": "antigravity_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "gemini_antigravity_native",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://daily-cloudcode-pa.googleapis.com",
+        "sourceLocator": "provider.settingsConfig.env.GOOGLE_GEMINI_BASE_URL",
+        "path": "/v1beta/models/{actualModel}:{method}"
+      },
+      "upstreamProtocol": "gemini_native",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore managed credential"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "downstream request model",
+        "strategy": "legacy_requested_model"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "legacy Gemini path does not enforce the target single-model policy"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "gemini",
+        "sourceIndex": 2,
+        "presetName": "Antigravity CLI (agy)"
+      },
+      "targetProfileId": "gemini.antigravity_cli",
+      "classification": {
+        "providerType": "agy_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "gemini_antigravity_native",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://daily-cloudcode-pa.googleapis.com",
+        "sourceLocator": "provider.settingsConfig.env.GOOGLE_GEMINI_BASE_URL",
+        "path": "/v1beta/models/{actualModel}:{method}"
+      },
+      "upstreamProtocol": "gemini_native",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore managed credential"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "downstream request model",
+        "strategy": "legacy_requested_model"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "legacy Gemini path does not enforce the target single-model policy"
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "gemini",
+        "sourceIndex": 3,
+        "presetName": "Grok OAuth"
+      },
+      "targetProfileId": "gemini.grok_oauth",
+      "classification": {
+        "providerType": "grok_oauth",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "gemini_to_grok_responses",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://api.x.ai/v1",
+        "sourceLocator": "provider.settingsConfig.env.GOOGLE_GEMINI_BASE_URL",
+        "path": "/v1/responses"
+      },
+      "upstreamProtocol": "openai_responses",
+      "auth": {
+        "headers": [
+          "authorization",
+          "x-grok-client-identifier",
+          "x-grok-client-version",
+          "x-grok-conv-id",
+          "openai-beta"
+        ],
+        "credentialSource": [
+          "accountBinding.accountId -> AccountStore access token"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "grok-4.5",
+        "strategy": "single"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "generation_route_and_request_content"
+      },
+      "specialSideEffects": [
+        "OAuth refresh",
+        "session identity",
+        "model normalization",
+        "media routing"
+      ],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "supported",
+        "reason": null
+      }
+    },
+    {
+      "legacyIdentity": {
+        "app": "gemini",
+        "sourceIndex": 4,
+        "presetName": "OpenRouter"
+      },
+      "targetProfileId": "gemini.openrouter",
+      "classification": {
+        "providerType": "openrouter",
+        "evidence": "assets/contract/provider-coverage.json fixture"
+      },
+      "production": {
+        "branch": "generic_adapter_with_provider_contract",
+        "adapter": "gemini_openrouter_openai_chat",
+        "adapterSupport": "native"
+      },
+      "endpoint": {
+        "origin": "https://openrouter.ai/api",
+        "sourceLocator": "provider.settingsConfig.env.GOOGLE_GEMINI_BASE_URL",
+        "path": "/v1/chat/completions"
+      },
+      "upstreamProtocol": "openai_chat",
+      "auth": {
+        "headers": [
+          "authorization"
+        ],
+        "credentialSource": [
+          "provider.settingsConfig.env.GEMINI_API_KEY|GOOGLE_API_KEY|API_KEY"
+        ]
+      },
+      "model": {
+        "requested": "downstream request model",
+        "actual": "downstream request model",
+        "strategy": "legacy_requested_model"
+      },
+      "capabilities": {
+        "stream": "native_or_translated_stream",
+        "tools": "native_or_protocol_transform",
+        "images": "request_content_only_when_protocol_supports_it"
+      },
+      "specialSideEffects": [],
+      "operationParity": {
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": false
+      },
+      "knownStatus": {
+        "status": "partial",
+        "reason": "legacy Gemini path does not enforce the target single-model policy"
+      }
+    }
+  ],
+  "counts": {
+    "claude": 16,
+    "codex": 8,
+    "gemini": 5
+  }
+}
