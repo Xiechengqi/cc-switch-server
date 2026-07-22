@@ -221,7 +221,7 @@ pub(crate) async fn start_upgrade_for_actor(
     force: bool,
 ) -> Result<String, ApiError> {
     map_self_update_error(ensure_binary_writable())?;
-    let client = crate::infra::http::direct_client_builder()
+    let client = crate::infra::http::self_update_client_builder()
         .user_agent("cc-switch-server/0.1 upgrade")
         .build()
         .map_err(|err| ApiError::internal(format!("upgrade client failed: {err}")))?;
