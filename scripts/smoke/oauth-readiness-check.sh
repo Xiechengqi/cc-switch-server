@@ -63,27 +63,6 @@ check_any_var() {
   warn "$label blocked; set at least one of $(join_missing "$@")"
 }
 
-echo "== upstream source presence =="
-sources=(
-  "/data/projects/cc-switch/src-tauri/src/proxy/providers/codex_oauth_auth.rs"
-  "/data/projects/cc-switch/src-tauri/src/proxy/providers/codex.rs"
-  "/data/projects/cc-switch/src-tauri/src/proxy/codex_responses_ws.rs"
-  "/data/projects/cc-switch/src-tauri/src/proxy/providers/claude_oauth_auth.rs"
-  "/data/projects/cc-switch/src-tauri/src/proxy/providers/gemini_oauth_auth.rs"
-  "/data/projects/cc-switch/src-tauri/src/proxy/providers/gemini.rs"
-  "/data/projects/cc-switch/src-tauri/src/proxy/providers/cursor_oauth_auth.rs"
-  "/data/projects/cc-switch/src-tauri/src/proxy/providers/copilot_auth.rs"
-  "/data/projects/cc-switch/src-tauri/src/proxy/providers/kiro_oauth_auth.rs"
-  "/data/projects/cc-switch/src-tauri/src/proxy/providers/antigravity_oauth_auth.rs"
-)
-for source in "${sources[@]}"; do
-  if [[ -f "$source" ]]; then
-    pass "source exists: ${source#/data/projects/cc-switch/}"
-  else
-    warn "source missing: ${source#/data/projects/cc-switch/}"
-  fi
-done
-
 echo "== local fixtures =="
 if [[ "$RUN_LOCAL_TESTS" == "1" ]]; then
   cargo test core::account_managers:: --quiet

@@ -10,10 +10,5 @@ node_modules/
 *.bak
 dist/
 
-# Local refactor planning notes. Keep them on disk, but do not include them in
-# formal repository commits once they are removed from the index.
-UI_PARITY_PLAN.md
-DESKTOP_ALIGNMENT_TASKS.md
-SERVER_IMPLEMENTATION_PLAN.md
-MIGRATION_LEDGER.md
+# Local work index. Keep it on disk, but do not include it in repository commits.
 docs/remaining-work-index.md

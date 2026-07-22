@@ -18,18 +18,12 @@ export interface RequestLog {
   requestedModel: string;
   actualModel: string;
   actualModelSource: string;
-  /** 写入时实际用于计价的模型名；路由接管 + request 计价模式下可能与 model 不同 */
-  pricingModel?: string;
-  costMultiplier: string;
+  rawInputTokens?: number | null;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
-  inputCostUsd: string;
-  outputCostUsd: string;
-  cacheReadCostUsd: string;
-  cacheCreationCostUsd: string;
-  totalCostUsd: string;
+  totalTokens?: number | null;
   isStreaming: boolean;
   latencyMs: number;
   firstTokenMs?: number;
@@ -53,7 +47,7 @@ export interface SessionSyncResult {
 export interface DataSourceSummary {
   dataSource: string;
   requestCount: number;
-  totalCostUsd: string;
+  totalTokens: number;
 }
 
 export interface PaginatedLogs {
@@ -63,18 +57,8 @@ export interface PaginatedLogs {
   pageSize: number;
 }
 
-export interface ModelPricing {
-  modelId: string;
-  displayName: string;
-  inputCostPerMillion: string;
-  outputCostPerMillion: string;
-  cacheReadCostPerMillion: string;
-  cacheCreationCostPerMillion: string;
-}
-
 export interface UsageSummary {
   totalRequests: number;
-  totalCost: string;
   totalInputTokens: number;
   totalOutputTokens: number;
   totalCacheCreationTokens: number;
@@ -92,9 +76,8 @@ export interface UsageSummaryByApp {
 }
 
 export interface DailyStats {
-  date: string;
+  date: number;
   requestCount: number;
-  totalCost: string;
   totalTokens: number;
   totalInputTokens: number;
   totalOutputTokens: number;
@@ -107,7 +90,6 @@ export interface ProviderStats {
   providerName: string;
   requestCount: number;
   totalTokens: number;
-  totalCost: string;
   successRate: number;
   avgLatencyMs: number;
 }
@@ -116,8 +98,8 @@ export interface ModelStats {
   model: string;
   requestCount: number;
   totalTokens: number;
-  totalCost: string;
-  avgCostPerRequest: string;
+  successRate: number;
+  avgLatencyMs: number;
 }
 
 export interface LogFilters {
@@ -135,23 +117,13 @@ export interface LogFilters {
  *
  * - `providerName` 按展示名精确匹配（与 Provider 统计列表同口径，含
  *   "Claude (Session)" 等会话占位名）；
- * - `model` 按「有效计价模型」匹配（pricing_model 优先、回落 model，
- *   与模型统计的分组口径一致）。
+ * - `model` 按实际模型优先、请求模型回落的有效模型匹配，与模型统计
+ *   的分组口径一致。
  */
 export interface UsageScopeFilters {
   appType?: string;
   providerName?: string;
   model?: string;
-}
-
-export interface ProviderLimitStatus {
-  providerId: string;
-  dailyUsage: string;
-  dailyLimit?: string;
-  dailyExceeded: boolean;
-  monthlyUsage: string;
-  monthlyLimit?: string;
-  monthlyExceeded: boolean;
 }
 
 export type UsageRangePreset = "today" | "1d" | "7d" | "14d" | "30d" | "custom";
@@ -168,16 +140,11 @@ export interface UsageRangeSelection {
 /**
  * App types surfaced as dashboard filter buttons.
  *
- * `claude-desktop` is intentionally NOT listed: the Desktop gateway's proxy
- * traffic is still recorded under its own `app_type` (preserving route-takeover
- * billing audit — the request detail panel shows the real value), but the
- * dashboard folds it into `claude` for display. It is the embedded Claude Code
- * runtime running inside the Desktop shell, and Desktop *chat* usage never
- * passes through this app at all, so a separate "Claude Desktop" bucket would
- * only ever show a partial number and mislead users into reading it as the
- * Desktop's full usage. The backend collapses `claude-desktop → claude` in
- * every dashboard query (see `folded_app_type_sql`).
- * `opencode` / `openclaw` / `hermes` have no proxy handler at all — they
+ * `claude-desktop` is a retained legacy app identifier, not a Server dashboard
+ * category. Requests carrying that identifier remain visible in request detail,
+ * while aggregate queries fold them into `claude` to avoid a partial duplicate
+ * category.
+ * `opencode` / `openclaw` / `hermes` have no proxy handler at all - they
  * appear only as managed apps elsewhere.
  */
 export type AppType = "claude" | "codex" | "gemini" | "opencode";
@@ -192,12 +159,8 @@ export const KNOWN_APP_TYPES: ReadonlyArray<AppType> = [
 ];
 
 /**
- * App types whose proxy uses an OpenAI-style protocol. Two consequences:
- *
- * 1. `inputTokens` already includes the cached portion (must subtract
- *    `cacheReadTokens` to get fresh-input semantics — see
- *    [getFreshInputTokens]).
- * 2. The protocol does not report cache _creation_ separately, only cache
+ * App types whose proxy uses an OpenAI-style protocol. The protocol does not
+ * report cache _creation_ separately, only cache
  *    _reads_. So `cacheCreationTokens` is always 0 for these app types and
  *    the UI should label it as N/A rather than 0.
  *
@@ -210,67 +173,30 @@ export const CACHE_INCLUSIVE_APP_TYPES: ReadonlySet<string> = new Set([
 
 /** Subset of request-log fields needed to derive cache-normalized input. */
 export interface CacheNormalizableLog {
-  appType: string;
   inputTokens: number;
-  cacheReadTokens: number;
 }
 
 /**
- * For a single request log, return the input token count with cache reads
- * removed. Anthropic-style providers already report `inputTokens` without
- * cache, so they pass through unchanged.
+ * Request logs from the Server API already expose normalized fresh input.
  */
 export function getFreshInputTokens(log: CacheNormalizableLog): number {
-  if (
-    CACHE_INCLUSIVE_APP_TYPES.has(log.appType) &&
-    log.inputTokens >= log.cacheReadTokens
-  ) {
-    return log.inputTokens - log.cacheReadTokens;
-  }
   return log.inputTokens;
 }
 
-export const NON_NEGATIVE_DECIMAL_REGEX = /^\d+(?:\.\d+)?$/;
-
-export function isNonNegativeDecimalString(value: string): boolean {
-  const trimmed = value.trim();
-  if (!NON_NEGATIVE_DECIMAL_REGEX.test(trimmed)) return false;
-  return Number.isFinite(Number(trimmed));
-}
-
-type UsageCostLog = Pick<
-  RequestLog,
-  | "inputTokens"
-  | "outputTokens"
-  | "cacheReadTokens"
-  | "cacheCreationTokens"
-  | "totalCostUsd"
-  | "statusCode"
-> &
-  Partial<Pick<RequestLog, "costMultiplier">>;
-
-export function hasUsageTokens(log: UsageCostLog): boolean {
+export function getTotalTokens(
+  log: CacheNormalizableLog & {
+    rawInputTokens?: number | null;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    totalTokens?: number | null;
+  },
+): number {
   return (
-    log.inputTokens > 0 ||
-    log.outputTokens > 0 ||
-    log.cacheReadTokens > 0 ||
-    log.cacheCreationTokens > 0
-  );
-}
-
-export function isUnpricedUsage(log: UsageCostLog): boolean {
-  const totalCost = Number.parseFloat(log.totalCostUsd);
-  const multiplier =
-    log.costMultiplier == null
-      ? undefined
-      : Number.parseFloat(log.costMultiplier);
-  return (
-    log.statusCode >= 200 &&
-    log.statusCode < 300 &&
-    hasUsageTokens(log) &&
-    Number.isFinite(totalCost) &&
-    (!Number.isFinite(multiplier) || multiplier !== 0) &&
-    totalCost === 0
+    log.totalTokens ??
+    (log.rawInputTokens ??
+      log.inputTokens + log.cacheReadTokens + log.cacheCreationTokens) +
+      log.outputTokens
   );
 }
 

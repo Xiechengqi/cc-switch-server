@@ -73,7 +73,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
-use chrono::Datelike;
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -120,7 +119,6 @@ use crate::domain::sharing::shares::{
     Share, ShareAcl, ShareBinding, ShareDeleteTombstone, ShareMarketGrantStatus, ShareStore,
     UpsertShareInput,
 };
-use crate::domain::usage::pricing::UpdateModelPricingInput;
 use crate::domain::usage::store::{UsageStatsFilter, UsageStore};
 use crate::proxy::adapters::ProviderAdapter;
 use crate::proxy::{self, ProxyRoute};
@@ -352,15 +350,6 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/usage/logs/:id", get(usage_log_detail))
         .route("/api/usage/logs", get(usage_logs))
         .route("/api/usage/summary", get(usage_summary))
-        .route("/api/usage/backfill-costs", post(backfill_usage_costs))
-        .route(
-            "/api/pricing/models",
-            get(list_model_pricing).post(upsert_model_pricing),
-        )
-        .route(
-            "/api/pricing/models/*model_id",
-            put(update_model_pricing).delete(delete_model_pricing),
-        )
         .route("/api/provider-limits", get(provider_limits))
         .route(
             "/api/providers/:id/limits",

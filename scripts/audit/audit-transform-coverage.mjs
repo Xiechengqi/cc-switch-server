@@ -2,14 +2,6 @@
 import fs from "node:fs";
 import process from "node:process";
 
-const desktopBaseline = {
-  transform_codex_chat: 55,
-  transform_responses: 61,
-  transform: 59,
-  transform_gemini: 26,
-  streaming: 52,
-};
-
 const serverFiles = [
   "src/proxy/transforms.rs",
   "src/proxy/streaming.rs",
@@ -17,26 +9,23 @@ const serverFiles = [
   "src/proxy/stream_transforms.rs",
 ];
 
-const targetRatio = Number(process.env.CC_SWITCH_TRANSFORM_COVERAGE_TARGET || 0.85);
-const desktopTotal = Object.values(desktopBaseline).reduce((sum, value) => sum + value, 0);
-const target = Math.ceil(desktopTotal * targetRatio);
+const minimumTests = Number(process.env.CC_SWITCH_TRANSFORM_MIN_TESTS || 216);
 const serverTotal = serverFiles
   .map((file) => [file, countRustTests(file)])
   .reduce((sum, [, count]) => sum + count, 0);
 
 const report = {
-  desktopBaseline,
-  desktopTotal,
-  targetRatio,
-  target,
+  minimumTests,
   serverFiles: Object.fromEntries(serverFiles.map((file) => [file, countRustTests(file)])),
   serverTotal,
-  remainingToTarget: Math.max(0, target - serverTotal),
+  remainingToMinimum: Math.max(0, minimumTests - serverTotal),
 };
 
 console.log(JSON.stringify(report, null, 2));
-if (process.argv.includes("--check") && serverTotal < target) {
-  console.error(`transform/streaming fixture coverage ${serverTotal}/${target} is below target`);
+if (process.argv.includes("--check") && serverTotal < minimumTests) {
+  console.error(
+    `transform/streaming fixture coverage ${serverTotal}/${minimumTests} is below the Server baseline`,
+  );
   process.exit(1);
 }
 

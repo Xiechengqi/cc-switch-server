@@ -8,7 +8,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useModelStats } from "@/lib/query/usage";
-import { fmtUsd } from "./format";
 import type { UsageRangeSelection } from "@/types/usage";
 
 interface ModelStatsTableProps {
@@ -52,10 +51,10 @@ export function ModelStatsTable({
               {t("usage.tokens", "Tokens")}
             </TableHead>
             <TableHead className="text-right">
-              {t("usage.totalCost", "总成本")}
+              {t("usage.successRate", "成功率")}
             </TableHead>
             <TableHead className="text-right">
-              {t("usage.avgCost", "平均成本")}
+              {t("usage.avgLatency", "平均延迟")}
             </TableHead>
           </TableRow>
         </TableHeader>
@@ -82,10 +81,10 @@ export function ModelStatsTable({
                   {stat.totalTokens.toLocaleString()}
                 </TableCell>
                 <TableCell className="text-right">
-                  {fmtUsd(stat.totalCost, 4)}
+                  {stat.successRate.toFixed(1)}%
                 </TableCell>
                 <TableCell className="text-right">
-                  {fmtUsd(stat.avgCostPerRequest, 6)}
+                  {stat.avgLatencyMs}ms
                 </TableCell>
               </TableRow>
             ))

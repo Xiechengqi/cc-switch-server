@@ -8,7 +8,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useProviderStats } from "@/lib/query/usage";
-import { fmtUsd } from "./format";
 import type { UsageRangeSelection } from "@/types/usage";
 
 interface ProviderStatsTableProps {
@@ -52,9 +51,6 @@ export function ProviderStatsTable({
               {t("usage.tokens", "Tokens")}
             </TableHead>
             <TableHead className="text-right">
-              {t("usage.cost", "成本")}
-            </TableHead>
-            <TableHead className="text-right">
               {t("usage.successRate", "成功率")}
             </TableHead>
             <TableHead className="text-right">
@@ -66,7 +62,7 @@ export function ProviderStatsTable({
           {stats?.length === 0 ? (
             <TableRow>
               <TableCell
-                colSpan={6}
+                colSpan={5}
                 className="text-center text-muted-foreground"
               >
                 {t("usage.noData", "暂无数据")}
@@ -83,9 +79,6 @@ export function ProviderStatsTable({
                 </TableCell>
                 <TableCell className="text-right">
                   {stat.totalTokens.toLocaleString()}
-                </TableCell>
-                <TableCell className="text-right">
-                  {fmtUsd(stat.totalCost, 4)}
                 </TableCell>
                 <TableCell className="text-right">
                   {stat.successRate.toFixed(1)}%

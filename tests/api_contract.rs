@@ -4422,7 +4422,7 @@ async fn web_invoke_registry_returns_stable_errors() {
     let response = app
         .oneshot(json_request(
             Method::POST,
-            "/web-api/invoke/not_a_desktop_command",
+            "/web-api/invoke/not_a_legacy_command",
             json!({}),
             Some(&token),
         ))
@@ -4435,7 +4435,7 @@ async fn web_invoke_registry_returns_stable_errors() {
 }
 
 #[tokio::test]
-async fn web_invoke_request_logs_matches_desktop_filter_and_pagination_contract() {
+async fn web_invoke_request_logs_matches_legacy_filter_and_pagination_contract() {
     const START_SECONDS: u128 = 1_700_000_000;
 
     let state = test_state();
@@ -4455,26 +4455,19 @@ async fn web_invoke_request_logs_matches_desktop_filter_and_pagination_contract(
                 requested_model: Some("request-alias".to_string()),
                 actual_model: Some("gpt-5.5".to_string()),
                 actual_model_source: Some("response".to_string()),
-                pricing_model: Some("gpt-5.5-priced".to_string()),
             },
             TokenUsage {
+                raw_input_tokens: Some(16),
                 input_tokens: Some(11),
                 output_tokens: Some(7),
                 cache_read_tokens: Some(3),
                 cache_creation_tokens: Some(2),
                 total_tokens: Some(23),
-                ..Default::default()
             },
         );
         log.request_id = request_id.to_string();
         log.request_agent = Some("codex-cli".to_string());
         log.first_token_ms = Some(42);
-        log.cost_multiplier = Some(1.25);
-        log.input_cost_usd = Some(0.1);
-        log.output_cost_usd = Some(0.2);
-        log.cache_read_cost_usd = Some(0.03);
-        log.cache_creation_cost_usd = Some(0.04);
-        log.total_cost_usd = Some(0.37);
         log.created_at_ms = created_at_ms;
         log.apply_context(UsageLogContext {
             share_id: Some("share-1".to_string()),
@@ -4496,7 +4489,7 @@ async fn web_invoke_request_logs_matches_desktop_filter_and_pagination_contract(
     let mut wrong_provider = make_log("req-wrong-provider", START_SECONDS * 1_000 + 300);
     wrong_provider.provider_name = "Provider Two".to_string();
     let mut wrong_model = make_log("req-wrong-model", START_SECONDS * 1_000 + 400);
-    wrong_model.pricing_model = Some("gpt-other-priced".to_string());
+    wrong_model.actual_model = Some("gpt-other".to_string());
     let mut wrong_status = make_log("req-wrong-status", START_SECONDS * 1_000 + 500);
     wrong_status.status_code = 429;
     let too_early = make_log("req-too-early", (START_SECONDS - 1) * 1_000 + 999);
@@ -4518,7 +4511,7 @@ async fn web_invoke_request_logs_matches_desktop_filter_and_pagination_contract(
         "shareId": "share-1",
         "appType": "codex",
         "providerName": "Provider One",
-        "model": "gpt-5.5-priced",
+        "model": "gpt-5.5",
         "statusCode": 200,
         "startDate": START_SECONDS as u64,
         "endDate": (START_SECONDS + 1) as u64
@@ -4547,8 +4540,10 @@ async fn web_invoke_request_logs_matches_desktop_filter_and_pagination_contract(
     assert_eq!(newest["firstTokenMs"], 42);
     assert_eq!(newest["createdAt"], (START_SECONDS + 1) as u64);
     assert_eq!(newest["inputTokens"], 11);
-    assert_eq!(newest["totalCostUsd"], "0.370000");
-    assert_eq!(newest["costMultiplier"], "1.25");
+    assert_eq!(newest["rawInputTokens"], 16);
+    assert_eq!(newest["totalTokens"], 23);
+    assert!(newest.get("totalCostUsd").is_none());
+    assert!(newest.get("costMultiplier").is_none());
     assert_eq!(newest["shareId"], "share-1");
     assert_eq!(newest["userEmail"], "reader@example.com");
 
@@ -4568,7 +4563,7 @@ async fn web_invoke_request_logs_matches_desktop_filter_and_pagination_contract(
 }
 
 #[tokio::test]
-async fn web_invoke_get_providers_returns_desktop_record_shape() {
+async fn web_invoke_get_providers_returns_legacy_record_shape() {
     let state = test_state();
     upsert_test_provider(
         &state,
@@ -6974,7 +6969,7 @@ async fn managed_auth_account_removal_refreshes_unbound_legacy_provider_shares()
 }
 
 #[tokio::test]
-async fn automatic_subscription_expiry_refreshes_share_only_when_effective_value_changes() {
+async fn account_runtime_metadata_refreshes_share_only_when_effective_value_changes() {
     let state = test_state();
     state
         .mutate_accounts_immediate(|accounts| {
@@ -7048,7 +7043,7 @@ async fn automatic_subscription_expiry_refreshes_share_only_when_effective_value
         .unwrap();
 
     assert!(state
-        .refresh_automatic_subscription_metadata_if_changed(&before, &after)
+        .refresh_account_runtime_metadata_if_changed(&before, &after)
         .await
         .unwrap());
     let changed_revision = state
@@ -7062,7 +7057,7 @@ async fn automatic_subscription_expiry_refreshes_share_only_when_effective_value
     assert!(changed_revision > share.config_revision);
 
     assert!(!state
-        .refresh_automatic_subscription_metadata_if_changed(&after, &after)
+        .refresh_account_runtime_metadata_if_changed(&after, &after)
         .await
         .unwrap());
     let unchanged_revision = state
@@ -7074,6 +7069,95 @@ async fn automatic_subscription_expiry_refreshes_share_only_when_effective_value
         })
         .await;
     assert_eq!(unchanged_revision, changed_revision);
+}
+
+#[tokio::test]
+async fn account_rate_limit_refreshes_share_once_per_block_transition() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-codex-rate-limit",
+                ProviderType::CodexOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    upsert_test_provider(
+        &state,
+        AppKind::Codex,
+        Provider {
+            id: "codex-rate-limit-provider".to_string(),
+            name: "Codex Rate Limit Provider".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("codex_oauth".to_string()),
+                    account_id: Some("acct-codex-rate-limit".to_string()),
+                    auth_identity_generation: None,
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
+    let share = state
+        .mutate_shares_immediate(|shares| {
+            shares
+                .upsert(test_share_input(
+                    "share-codex-rate-limit",
+                    "codex-rate-limit-provider",
+                    ProviderType::CodexOAuth,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+
+    state
+        .mark_account_rate_limited_until(
+            "acct-codex-rate-limit",
+            now_ms + 60_000,
+            Some("first 429".to_string()),
+        )
+        .await
+        .unwrap();
+    let blocked_revision = state
+        .mutate_shares(|shares| {
+            shares
+                .get("share-codex-rate-limit")
+                .unwrap()
+                .config_revision
+        })
+        .await;
+    assert!(blocked_revision > share.config_revision);
+
+    state
+        .mark_account_rate_limited_until(
+            "acct-codex-rate-limit",
+            now_ms + 120_000,
+            Some("concurrent 429".to_string()),
+        )
+        .await
+        .unwrap();
+    let repeated_revision = state
+        .mutate_shares(|shares| {
+            shares
+                .get("share-codex-rate-limit")
+                .unwrap()
+                .config_revision
+        })
+        .await;
+    assert_eq!(repeated_revision, blocked_revision);
 }
 
 #[tokio::test]

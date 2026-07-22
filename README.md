@@ -9,7 +9,7 @@
   <img alt="Storage" src="https://img.shields.io/badge/storage-JSON-0f766e?style=flat-square">
 </p>
 
-`cc-switch-server` 是独立 server 产品，不是 upstream desktop `cc-switch` 的整仓 fork。它选择性吸收 desktop 中服务于 Claude、Codex、Gemini 反代主线的 provider、OAuth、usage、pricing、share 和 router 能力，并把桌面依赖替换为单机 Web/API 服务。
+`cc-switch-server` 是独立 server 产品，不是 `cc-switch` 的派生 UI 或整仓 fork。Server 的产品需求、API、运行时契约和 Web UI 均在本仓库独立设计与维护；外部项目只用于审计 Claude、Codex、Gemini Provider 类型和协议行为，不作为代码或界面同步源。
 
 当前仓库只维护 server 运行路径：HTTP API、静态 Web UI、本地 JSON store、反代转发、router/share tunnel 和真实验收脚本。不迁移 Tauri window/tray/updater/deeplink、Claude Desktop profile 写入、MCP、skills、session manager 和桌面安装资产。
 
@@ -34,7 +34,7 @@ market or direct share URL
 
 ## 特性
 
-- 提供 setup、password/API token 登录和 router 邮箱验证码登录；Web UI 覆盖 provider、account、share、usage、router、pricing、backup 和 diagnostics 常用操作。
+- 提供 setup、password/API token 登录和 router 邮箱验证码登录；Web UI 覆盖 provider、account、share、usage、router、backup 和 diagnostics 常用操作。
 - 支持 Claude、Codex、Gemini 三类入口：`/v1/messages`、`/v1/chat/completions`、`/v1/responses`、Gemini `/v1beta/*` 和 OpenAI-compatible `/v1/models`/`/models`。
 - 通过显式 legacy reader 保留旧 cc-switch Provider metadata、AuthBinding 和未知扩展字段；Universal 派生项只作为迁移输入，不再是 Server runtime 真值。
 - Provider API 导出仅返回脱敏视图；受控导入按 server 当前分类和凭据补丁契约执行，不提供跨 store 的通用配置导入导出。
@@ -46,14 +46,14 @@ market or direct share URL
 - 支持 router installation register、client tunnel、share tunnel、share batch sync、installation 级公开收款资料同步、direct share request log sync、pending share edit pull/ack/event 监听。
 - 支持 share-market grant add/revoke 通过 router pending edit 应用到 server share，并同步 per-app 授权展示状态。
 - usage log 记录 requestId、sessionId、source、provider、model、stream status、cache/usage detail，并提供 summary/trends/provider/model stats。
-- 内置全局模型定价和 limits 运维面：模型定价 CRUD、成本回填、provider 日/月成本、账号 quota 和 share 限额展示。
+- usage 仅统计 Token、请求状态和延迟，不计算模型成本或 USD 金额；账号 quota 调度阈值、Share Token 限额及 Token Market 售价仍按各自业务边界管理。
 - JSON 写入使用 temp file fsync、atomic rename 和父目录 fsync；`/api/backup` 支持创建、列出、恢复主要 store，恢复前自动 pre-restore 快照。
 - `/api/events` 通过 SSE 推送 usage/share/tunnel 事件，Web 当前页会 debounce 刷新。
 - `cc-switch-server version --json` 和 `/version` 会输出版本、commit id、commit message、build time、target、profile、rustc 和 dirty 状态。
 
 ## Code Agent 反代支持
 
-`cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini CLI** 三类官方 CLI 客户端入口，并选择性吸收 desktop `cc-switch` 的 provider 桥接能力。下表评分口径与同生态中 9router、CLIProxyAPI、OmniRoute、sub2api、cockpit-tools、cc-switch、composer-api 的静态分析一致（0–10 分，侧重协议覆盖、格式互译、认证多账号、健壮性与可运维性；对比来源见本地 `proxy/proxy.md`）。
+`cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini CLI** 三类官方 CLI 客户端入口。Provider 桥接能力按 Server 自身的协议契约实现；外部仓库仅提供覆盖审计和行为验证证据。下表评分口径与同生态中 9router、CLIProxyAPI、OmniRoute、sub2api、cockpit-tools、cc-switch、composer-api 的静态分析一致（0–10 分，侧重协议覆盖、格式互译、认证多账号、健壮性与可运维性；对比来源见本地 `proxy/proxy.md`）。
 
 ### 支持的客户端入口
 
@@ -93,7 +93,7 @@ market or direct share URL
 | **核心 4（Claude/Codex/Gemini/Antigravity）均分** | 7.50 | **9.58** | 8.63 | 8.50 | 6.75 | 8.05 | **7.70** | 0 |
 | **IDE 体验类 4（Cursor/Copilot/Kiro/Qoder）均分** | 8.25 | 0 | 8.50 | 0.63 | 4.88 | 6.50 | **5.88** | 2.30 |
 
-> **cc-switch-server 与 desktop cc-switch 的主要差异**：不依赖 Tauri 桌面运行时，**不提供 Claude Code 热切换**（需重启 CLI 使 provider 变更生效）；OAuth 浏览器登录部分能力仍待 server-native 接线；**额外提供** share/router 隧道、Web 管理面、remote usage 同步与多租户 share binding。Cursor/Kiro/Copilot/DeepSeek 等跨厂商后端桥与 desktop 共用 Rust 反代实现，但 capability 升级仍以真实验收为 gate。
+> **cc-switch-server 的产品边界**：不依赖 Tauri 桌面运行时，**不提供 Claude Code 热切换**（需重启 CLI 使 provider 变更生效）；OAuth 浏览器登录部分能力仍待 Server-native 接线；提供 share/router 隧道、Web 管理面、remote usage 同步与多租户 share binding。Cursor/Kiro/Copilot/DeepSeek 等跨厂商后端桥由本仓库独立维护，capability 升级以 Server 契约和真实验收为 gate。
 >
 > 其他项目分数摘自本地 `proxy` 目录静态分析（2026-07）；`cockpit-tools` 反代能力继承自内嵌 CLIProxyAPI sidecar，自身侧重账号管理 GUI。
 
@@ -296,7 +296,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 - `accounts.key`：本机生成的根密钥；同时派生 Account token 与 S2 Provider credential 的独立密钥。备份/迁移时必须和 `accounts.json`、`providers.json` 一起保留。
 - `shares.json` / `tunnels.json`：share、binding、ACL、market grant 和 tunnel runtime。
 - `usage-logs.jsonl` / `usage-rollups.json`：请求明细和统计 rollup。
-- `model-pricing.json`、`email-auth.json` 及运行时生成的日志/备份目录。
+- `email-auth.json` 及运行时生成的日志/备份目录。
 
 这些文件可能包含 token、secret 或账号信息，不能提交到 git。
 
@@ -353,8 +353,7 @@ cc-switch-server config migrate-provider-store --cleanup-snapshot
 
 ## 文档
 
-- [上游吸收台账](UPSTREAM_IMPORT.md)
-- [UI 对齐实施计划](docs/server-desktop-ui-parity-plan.md)
+- [外部 Provider 审计台账](UPSTREAM_IMPORT.md)
 - [UI 人工验收清单](docs/manual-ui-checklist.md)
 - [部署](docs/deployment.md)
 - [真实验收 runbook](docs/real-acceptance-runbook.md)

@@ -109,7 +109,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
             message: format!(
-                "desktop invoke command '{command}' is not registered in cc-switch-server"
+                "legacy invoke command '{command}' is not registered in cc-switch-server"
             ),
             code: Some("cc_switch_web_invoke_unknown"),
             error_type: Some("web_invoke_unknown"),

@@ -127,9 +127,6 @@
       }
     }
   },
-  "usage": {
-    "unpriced": "価格未設定"
-  },
   "notifications": {
     "clearCurrentSuccess": "Provider を無効にしました",
     "clearCurrentFailedTitle": "Provider を無効にできませんでした",

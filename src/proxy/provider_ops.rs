@@ -463,9 +463,6 @@ impl ProviderExecution {
                 if request.actual_model.is_none() {
                     request.actual_model = requested.clone();
                 }
-                if request.pricing_model.is_none() {
-                    request.pricing_model = request.actual_model.clone();
-                }
                 request.model = request.actual_model.clone().or(requested);
             }
             RuntimeModelPolicy::Single { upstream_model } => {
@@ -482,7 +479,6 @@ impl ProviderExecution {
                 request.model = Some(upstream_model.to_string());
                 request.actual_model = Some(upstream_model.to_string());
                 request.actual_model_source = Some("runtime_plan_single_model".to_string());
-                request.pricing_model = Some(upstream_model.to_string());
             }
         }
         Ok(())
@@ -556,7 +552,6 @@ impl ProviderExecution {
             request.model = Some(contract.actual_model.clone());
             request.actual_model = Some(contract.actual_model.clone());
             request.actual_model_source = Some("grok_model_normalization".to_string());
-            request.pricing_model = Some(contract.actual_model);
             for (name, value) in contract.headers {
                 replace_header(headers, name, &value);
             }
@@ -849,7 +844,6 @@ fn normalize_native_claude_context_1m_model(
     }
     normalize_request_model_field(&mut request.model);
     normalize_request_model_field(&mut request.actual_model);
-    normalize_request_model_field(&mut request.pricing_model);
     if request.actual_model_source.as_deref() == Some("request") {
         request.actual_model_source = Some("claude_context_1m_suffix".to_string());
     }
@@ -1123,7 +1117,6 @@ mod tests {
             requested_model: Some("requested-model".to_string()),
             actual_model: None,
             actual_model_source: None,
-            pricing_model: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
         };
@@ -1274,7 +1267,6 @@ mod tests {
             requested_model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
             actual_model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
             actual_model_source: Some("request".to_string()),
-            pricing_model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
             stream_requested: false,
             custom_tool_names: Default::default(),
         };
@@ -1288,7 +1280,6 @@ mod tests {
         );
         assert_eq!(request.model.as_deref(), Some("Claude-Opus-4-6"));
         assert_eq!(request.actual_model.as_deref(), Some("Claude-Opus-4-6"));
-        assert_eq!(request.pricing_model.as_deref(), Some("Claude-Opus-4-6"));
         assert_eq!(
             request.actual_model_source.as_deref(),
             Some("claude_context_1m_suffix")
@@ -1302,7 +1293,6 @@ mod tests {
             requested_model: Some("claude-sonnet-4-6-1m".to_string()),
             actual_model: Some("claude-sonnet-4-6-1m".to_string()),
             actual_model_source: Some("request".to_string()),
-            pricing_model: Some("claude-sonnet-4-6-1m".to_string()),
             stream_requested: false,
             custom_tool_names: Default::default(),
         };

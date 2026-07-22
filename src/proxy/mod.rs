@@ -30,6 +30,15 @@ pub use forwarder::forward_grok_media;
 pub use forwarder::forward_images_generations;
 pub use router::ProxyRoute;
 
+pub(super) const MAX_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 8 * 24 * 60 * 60 * 1000;
+
+pub(super) fn bounded_upstream_rate_limit_until(now_ms: i64, until_ms: i64) -> i64 {
+    until_ms.clamp(
+        now_ms.saturating_add(1_000),
+        now_ms.saturating_add(MAX_UPSTREAM_RATE_LIMIT_COOLDOWN_MS),
+    )
+}
+
 pub fn capabilities() -> Vec<adapters::AdapterCapability> {
     adapters::all_capabilities()
 }

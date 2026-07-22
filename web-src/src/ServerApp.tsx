@@ -83,15 +83,15 @@ function getInitialView(enableWebTerminal: boolean): View {
   return "providers";
 }
 
-interface ServerDesktopAppProps {
+interface ServerAppProps {
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
   enableWebTerminal?: boolean;
 }
 
-export default function ServerDesktopApp({
+export default function ServerApp({
   onSignOut,
   enableWebTerminal = true,
-}: ServerDesktopAppProps = {}) {
+}: ServerAppProps = {}) {
   const { t } = useTranslation();
   useOauthQuotaRefreshBridge();
   const [activeApp, setActiveApp] = useState<CoreProviderApp>(getInitialApp);

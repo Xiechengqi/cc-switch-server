@@ -9,7 +9,7 @@
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "fa038e3833a0cc750d3cdae62c55a3c5f20e6f1c9bca529995c87934162fb81e"
+      "sha256": "5172f5db494df43330af0c764fbd6897a7cd4164a502988a8b70e7b819acceb1"
     },
     {
       "path": "src/api/providers.rs",
@@ -21,7 +21,7 @@
     },
     {
       "path": "src/domain/providers/credentials.rs",
-      "sha256": "c684df94d39dee1f818a020b6bb35428d590cf9f1096cc311283914d0e1f1b02"
+      "sha256": "71f03359c9db370ae1a6242363cf3843788c526a028aa8e7218be0d22b5fa6c3"
     },
     {
       "path": "src/domain/providers/migrate.rs",
@@ -33,7 +33,7 @@
     },
     {
       "path": "src/domain/providers/store.rs",
-      "sha256": "6632d367dbc3ff218f8a6bda69c978e34f26e191f12a33ad139eb9edbf992849"
+      "sha256": "1f5fee57d1839fa3e8a507d3afdfd3474b93ab146ffde3229c40a167c1010277"
     },
     {
       "path": "src/domain/providers/store_v2.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "3dda99dbdb0929747c24842eabac0791964e8eb86f1acbedf59db48e4b165aa0"
+      "sha256": "9416242a78ad38ed166a5da466ef877edf6608e5a7ee50a191399010b1b58cac"
     }
   ],
   "entries": [

@@ -27,7 +27,12 @@ impl UiSettingsStore {
             .with_context(|| format!("read ui settings {}", path.display()))?;
         let value = serde_json::from_str(&content)
             .with_context(|| format!("parse ui settings {}", path.display()))?;
-        Ok(Self { value })
+        let mut store = Self { value };
+        if store.remove_obsolete_cost_settings() > 0 {
+            store.save(config_dir)?;
+            tracing::info!("removed obsolete UI cost settings");
+        }
+        Ok(store)
     }
 
     pub fn save(&self, config_dir: &Path) -> anyhow::Result<()> {
@@ -67,6 +72,22 @@ impl UiSettingsStore {
 
     pub fn apply_patch(&mut self, patch: Value) {
         self.value = merge_json_values(self.value.clone(), patch);
+        self.remove_obsolete_cost_settings();
+    }
+
+    fn remove_obsolete_cost_settings(&mut self) -> usize {
+        let Some(settings) = self.value.as_object_mut() else {
+            return 0;
+        };
+        [
+            "defaultCostMultiplier",
+            "default_cost_multiplier",
+            "pricingModelSource",
+            "pricing_model_source",
+        ]
+        .into_iter()
+        .map(|key| usize::from(settings.remove(key).is_some()))
+        .sum()
     }
 }
 

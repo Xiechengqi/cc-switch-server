@@ -27,16 +27,16 @@
 - MCP、skills、session manager。
 - release notes、桌面安装资产、截图资产。
 
-## 上游吸收
+## 外部 Provider 审计
 
-上游改动只做选择性吸收。每次吸收前必须更新或核对：
+外部仓库改动只作为 Provider 类型和协议行为证据，不作为实现同步源。根据证据调整 Server 前，必须更新或核对：
 
 - `UPSTREAM_IMPORT.md`
 - `docs/provider-coverage.md`
 
 ## 状态写入
 
-新代码禁止在 `state.rs` 之外直接对 `ServerStateInner` 的存储字段 `.write().await` 后修改数据；必须通过 `ServerStateInner` 的域方法封装读改写和持久化策略。跨存储写操作按字段声明顺序获取锁：config → providers → accounts → pricing → usage → shares → ui_settings → sessions → oauth_logins。
+新代码禁止在 `state.rs` 之外直接对 `ServerStateInner` 的存储字段 `.write().await` 后修改数据；必须通过 `ServerStateInner` 的域方法封装读改写和持久化策略。跨存储写操作按字段声明顺序获取锁：config → providers → accounts → usage → shares → ui_settings → sessions → oauth_logins。
 
 shares 写路径已收敛到 `mutate_shares_immediate` / `try_mutate_shares_immediate` / `mutate_shares_debounced` / `mutate_share` / `replace_shares` / `validate_share_invocation`，调用方不得再直接感知 shares 的立即保存或 debounce 落盘细节。
 
@@ -44,17 +44,13 @@ shares 写路径已收敛到 `mutate_shares_immediate` / `try_mutate_shares_imme
 
 `domain` 不能依赖 `api`、`clients`、`proxy`；`proxy` 不能依赖 `api/http` 或 `clients`。转发热路径需要触发出站 OAuth/router 客户端时，必须通过 `state.rs` 或控制面编排方法封装状态读写、锁和持久化策略。
 
-## UI 对齐
+## UI 独立性
 
-Server Web UI 必须以 desktop 组件同源移植为准。正式实施计划见 `docs/server-desktop-ui-parity-plan.md`；人工验收见 `docs/manual-ui-checklist.md`。功能边界以 `assets/contract/web-runtime-contract.json` 为准。
+Server Web UI 以本仓库的产品需求、Server API 和 `assets/contract/web-runtime-contract.json` 为唯一实现依据，人工验收见 `docs/manual-ui-checklist.md`。
 
-本地-only 重构笔记（已 gitignore，不提交）：`UI_PARITY_PLAN.md`、`DESKTOP_ALIGNMENT_TASKS.md`、`SERVER_IMPLEMENTATION_PLAN.md`、`MIGRATION_LEDGER.md`、`docs/remaining-work-index.md`。
+禁止从 cc-switch 或其他外部项目批量复制、同步或覆盖 React 组件、样式、locale、运行时命令和页面结构。外部项目只能作为 Provider 类型、协议行为或缺陷修复的审计证据；吸收时必须按 Server 边界重新设计、逐项实现并独立 review。
 
-同步 desktop 组件：
-
-```bash
-node scripts/sync/sync-desktop-ui.mjs
-```
+本地-only 工作索引（已 gitignore，不提交）：`docs/remaining-work-index.md`。
 
 ## 验证
 

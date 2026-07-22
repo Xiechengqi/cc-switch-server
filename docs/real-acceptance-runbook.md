@@ -168,7 +168,7 @@ Codex OAuth 专项补充：
 7. SSE 与 WebSocket 分别模拟空 `response.completed.response.output`，确认按 `output_index` 重建；已有非空 output 不覆盖，第二个 response 不得串入前一轮状态。
 8. provider 的 `codexWebsocketEnabled=false` 应使 GET WS 返回 503，并保持 POST Responses SSE 可用；恢复开关后再跑 text/binary WS 与 Windows reset 场景。
 9. GPT-5.6 Sol/Terra 接受 `ultra`，Luna 将 `ultra` 降为 `max`，旧 GPT 将 `max/ultra` 降为 `xhigh`；`/v1/models` 应返回 Sol/Terra/Luna。
-10. usage fixture 同时覆盖 nested `cache_write_tokens`、cache read、cache creation 显式零值和 Anthropic exclusive input，核对 fresh/read/write/output 四桶与费用。
+10. usage fixture 同时覆盖 nested `cache_write_tokens`、cache read、cache creation 显式零值和 Anthropic exclusive input，核对 fresh/read/write/output 四桶与总 Token。
 11. `/v1/images/generations` 使用短图片 prompt 验证既有 Codex bridge、身份头和账号冷却；不要把已有 Images 路由误报为未实现。
 12. server 不应自动读取或写入运行主机用户的 `~/.codex/auth.json`；只测试显式登录/导入。TLS/JA3 只有在 rustls 请求出现可重复的上游拒绝证据时才开启专项评估。
 

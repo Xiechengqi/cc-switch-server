@@ -14,7 +14,6 @@ echo "== json parse =="
 node - <<'NODE'
 const fs = require('fs');
 for (const file of [
-  'assets/contract/desktop-ui-sync.json',
   'assets/contract/provider-field-consumption.json',
   'assets/contract/provider-legacy-behavior.json',
   'assets/contract/provider-writer-inventory.json',
@@ -44,7 +43,7 @@ for file in "${shell_scripts[@]}"; do
 done
 
 echo "== provider audits =="
-node --test scripts/audit/*.test.mjs scripts/sync/*.test.mjs
+node --test scripts/audit/*.test.mjs
 node scripts/audit/audit-upstream-provider-baseline.mjs --check
 node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node scripts/audit/audit-provider-coverage.mjs --check
@@ -55,9 +54,6 @@ node scripts/audit/audit-web-runtime-contract.mjs
 
 echo "== web dist size =="
 node scripts/audit/audit-web-dist-size.mjs
-
-echo "== desktop ui sync drift =="
-node scripts/sync/sync-desktop-ui.mjs --check
 
 echo "== web source typecheck =="
 if [[ ! -d web-src/node_modules ]]; then
@@ -72,9 +68,6 @@ node scripts/audit/audit-transform-coverage.mjs --check
 
 echo "== css transition layer audit =="
 node scripts/audit/audit-css-transition-layer.mjs --check
-
-echo "== upstream scan =="
-node scripts/sync/scan-upstream-changes.mjs --fail-on-must-review
 
 echo "== web dist asset references =="
 node - <<'NODE'
@@ -103,10 +96,10 @@ git diff --check -- ':(exclude)web-dist'
 
 echo "== state write discipline =="
 state_write_paths=(src/api src/clients src/domain src/proxy src/infra tests)
-if rg -n -U 'state\s*\.\s*(config|providers|accounts|pricing|usage|shares|ui_settings|sessions|oauth_logins)\s*\.\s*write\s*\(\s*\)\s*\.\s*await' "${state_write_paths[@]}"; then
+if rg -n -U 'state\s*\.\s*(config|providers|accounts|usage|shares|ui_settings|sessions|oauth_logins)\s*\.\s*write\s*\(\s*\)\s*\.\s*await' "${state_write_paths[@]}"; then
   echo 'state store writes must go through ServerStateInner domain methods'; exit 1
 fi
-if rg -n -U 'state\s*\.\s*save_(providers|accounts|pricing|usage|ui_settings)\s*\(\s*\)\s*\.\s*await|save_(accounts|shares)_debounced\s*\(' "${state_write_paths[@]}"; then
+if rg -n -U 'state\s*\.\s*save_(providers|accounts|usage|ui_settings)\s*\(\s*\)\s*\.\s*await|save_(accounts|shares)_debounced\s*\(' "${state_write_paths[@]}"; then
   echo 'state store persistence must stay encapsulated in ServerStateInner domain methods'; exit 1
 fi
 

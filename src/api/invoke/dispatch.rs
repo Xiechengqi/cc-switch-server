@@ -18,7 +18,7 @@ pub(in crate::api) async fn web_invoke_compat(
         .ok_or_else(|| ApiError::web_invoke_unknown(command.clone()))?;
     if command_def.support == WebRuntimeCommandSupport::Excluded {
         return Err(ApiError::feature_disabled(format!(
-            "desktop invoke command '{command}' is excluded from cc-switch-server ({})",
+            "legacy invoke command '{command}' is excluded from cc-switch-server ({})",
             command_def.feature
         )));
     }
@@ -28,7 +28,7 @@ pub(in crate::api) async fn web_invoke_compat(
     }
     if !command_def.implemented {
         return Err(ApiError::web_invoke_not_wired(format!(
-            "desktop invoke command '{command}' is registered as {} but is not bridged yet",
+            "legacy invoke command '{command}' is registered as {} but is not bridged yet",
             web_runtime_support_label(command_def.support)
         )));
     }
@@ -911,9 +911,8 @@ async fn web_invoke_dispatch(
             Ok(json!(response))
         }
         "get_usage_summary" => {
-            let filter = web_usage_stats_filter_from_args(&args);
             let usage = state.usage.read().await;
-            Ok(json!(usage.rollup_filtered(&filter)))
+            Ok(web_usage_summary_json(&usage, &args))
         }
         "get_usage_summary_by_app" => {
             let filter = web_usage_stats_filter_from_args(&args);
@@ -923,19 +922,15 @@ async fn web_invoke_dispatch(
         "get_installed_skills" => Ok(json!([])),
         "get_usage_trends" => {
             let usage = state.usage.read().await;
-            let filter = UsageStatsFilter {
-                window_ms: Some(24 * 60 * 60 * 1000),
-                ..UsageStatsFilter::default()
-            };
-            Ok(json!(usage.trends(&filter)))
+            Ok(web_usage_trends_json(&usage, &args))
         }
         "get_provider_stats" => {
             let usage = state.usage.read().await;
-            Ok(json!(usage.provider_stats(&UsageStatsFilter::default())))
+            Ok(web_provider_stats_json(&usage, &args))
         }
         "get_model_stats" => {
             let usage = state.usage.read().await;
-            Ok(json!(usage.model_stats(&UsageStatsFilter::default())))
+            Ok(web_model_stats_json(&usage, &args))
         }
         "get_request_logs" => {
             let usage = state.usage.read().await;
@@ -944,8 +939,12 @@ async fn web_invoke_dispatch(
         "get_request_detail" => {
             let id = web_arg_string(&args, "id").or_else(|_| web_arg_string(&args, "requestId"))?;
             let usage = state.usage.read().await;
-            let log = usage.logs.iter().find(|log| log.request_id == id).cloned();
-            Ok(json!(log))
+            Ok(usage
+                .logs
+                .iter()
+                .find(|log| log.request_id == id)
+                .map(web_request_log_json)
+                .unwrap_or(Value::Null))
         }
         "get_proxy_status" => Ok(json!(web_proxy_status_json(state).await)),
         "get_proxy_takeover_status" => Ok(json!(web_proxy_takeover_status_json(state).await)),
@@ -1315,62 +1314,6 @@ async fn web_invoke_dispatch(
             "restoredStateRows": 0,
             "skippedReason": "not_supported_on_server",
         })),
-        "get_model_pricing" => {
-            let response = list_model_pricing(State(state.clone()), headers.clone())
-                .await?
-                .0;
-            Ok(json!(response.models))
-        }
-        "update_model_pricing" => {
-            let model_id = web_arg_string_any(&args, &["modelId", "model_id"])?;
-            let input = UpdateModelPricingInput {
-                model_id: Some(model_id.clone()),
-                display_name: web_arg_string_any(&args, &["displayName", "display_name"])?,
-                input_cost_per_million: web_arg_string_any(&args, &["inputCost", "input_cost"])?,
-                output_cost_per_million: web_arg_string_any(&args, &["outputCost", "output_cost"])?,
-                cache_read_cost_per_million: web_arg_string_any(
-                    &args,
-                    &["cacheReadCost", "cache_read_cost"],
-                )?,
-                cache_creation_cost_per_million: web_arg_string_any(
-                    &args,
-                    &["cacheCreationCost", "cache_creation_cost"],
-                )?,
-            };
-            let response = upsert_model_pricing(State(state.clone()), headers.clone(), Json(input))
-                .await?
-                .0;
-            Ok(json!(response.model))
-        }
-        "delete_model_pricing" => {
-            let model_id = web_arg_string_any(&args, &["modelId", "model_id"])?;
-            let _ =
-                delete_model_pricing(State(state.clone()), headers.clone(), Path(model_id)).await?;
-            Ok(Value::Null)
-        }
-        "get_pricing_model_source" => {
-            let store = state.ui_settings.read().await;
-            let source = store
-                .value
-                .get("pricingModelSource")
-                .cloned()
-                .unwrap_or_else(|| {
-                    json!({
-                        "claude": "response",
-                        "codex": "response",
-                        "gemini": "response",
-                    })
-                });
-            Ok(source)
-        }
-        "set_pricing_model_source" => {
-            let source: Value = web_arg_value(&args, "source")?;
-            state
-                .apply_ui_settings_patch_immediate(json!({ "pricingModelSource": source }))
-                .await
-                .map_err(ApiError::internal)?;
-            Ok(json!(true))
-        }
         "webdav_sync_save_settings" => {
             let settings: Value = web_arg_value(&args, "settings")?;
             state
@@ -1834,14 +1777,11 @@ async fn web_invoke_dispatch(
         "sync_current_providers_live" => Ok(json!({ "imported": 0, "warnings": [] })),
         "sync_session_usage" => Ok(Value::Null),
         "get_usage_data_sources" => Ok(json!(["server"])),
-        "check_provider_limits" => Ok(json!({ "ok": true, "withinLimits": true })),
         "get_subscription_quota" => {
             let tool = web_arg_string_any(&args, &["tool"])?;
             let force = web_optional_bool(&args, &["force"]).unwrap_or(false);
             Ok(web_subscription_quota(state, headers, &tool, force).await?)
         }
-        "get_default_cost_multiplier" => Ok(json!(1.0)),
-        "set_default_cost_multiplier" => Ok(Value::Null),
         "read_live_provider_settings" => Ok(json!({})),
         "test_api_endpoints" => {
             let urls: Vec<String> = web_arg_value(&args, "urls")?;
@@ -1955,7 +1895,7 @@ async fn web_invoke_dispatch(
             "open_provider_terminal is not available in server web runtime",
         )),
         _ => Err(ApiError::web_invoke_not_wired(format!(
-            "desktop invoke command '{command}' is registered but has no dispatcher"
+            "legacy invoke command '{command}' is registered but has no dispatcher"
         ))),
     }
 }

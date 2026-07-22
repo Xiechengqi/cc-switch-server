@@ -1,5 +1,4 @@
 use crate::domain::providers::store::StoredProvider;
-use crate::domain::usage::pricing::{calculate_cost, pricing_for_model_with_store};
 use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
 use crate::state::{ServerEvent, ServerState};
 
@@ -12,7 +11,6 @@ pub(super) async fn log_usage(
     usage: TokenUsage,
     context: UsageLogContext,
 ) -> String {
-    let usage_for_cost = usage;
     let mut log = UsageLog::new(
         stored.app,
         stored.provider.id.clone(),
@@ -24,14 +22,6 @@ pub(super) async fn log_usage(
         usage,
     );
     log.apply_context(context);
-    let pricing_store = state.pricing.read().await.clone();
-    if let Some(pricing) = pricing_for_model_with_store(
-        &stored.provider,
-        Some(&pricing_store),
-        effective_pricing_model(&log),
-    ) {
-        log.apply_cost(calculate_cost(usage_for_cost, pricing));
-    }
     let request_id = log.request_id.clone();
     if let Err(error) = state.push_usage_log(log).await {
         tracing::warn!("failed to persist usage log: {error}");
@@ -56,7 +46,6 @@ pub(super) async fn update_stream_usage(
     usage: TokenUsage,
     stream_status: Option<&str>,
 ) {
-    let pricing_store = state.pricing.read().await.clone();
     let persisted = state
         .update_usage_log(request_id, |log| {
             let router_visible_changed = apply_stream_usage_fields(
@@ -67,13 +56,6 @@ pub(super) async fn update_stream_usage(
                 usage,
                 stream_status,
             );
-            if let Some(pricing) = pricing_for_model_with_store(
-                &stored.provider,
-                Some(&pricing_store),
-                effective_pricing_model(log),
-            ) {
-                log.apply_cost(calculate_cost(log.token_usage(), pricing));
-            }
             if router_visible_changed {
                 log.router_last_synced_at_ms = None;
                 log.router_last_sync_error = None;
@@ -119,9 +101,6 @@ fn apply_stream_usage_fields(
     if let Some(raw_input_tokens) = usage.raw_input_tokens {
         log.raw_input_tokens = Some(raw_input_tokens);
     }
-    if let Some(billed_input_tokens) = usage.billed_input_tokens {
-        log.billed_input_tokens = Some(billed_input_tokens);
-    }
     if let Some(output_tokens) = usage.output_tokens {
         router_visible_changed |= log.output_tokens != Some(output_tokens);
         log.output_tokens = Some(output_tokens);
@@ -141,14 +120,6 @@ fn apply_stream_usage_fields(
         log.stream_status = Some(stream_status.to_string());
     }
     router_visible_changed
-}
-
-fn effective_pricing_model(log: &UsageLog) -> Option<&str> {
-    log.pricing_model
-        .as_deref()
-        .or(log.actual_model.as_deref())
-        .or(log.requested_model.as_deref())
-        .or(log.model.as_deref())
 }
 
 #[cfg(test)]
@@ -280,7 +251,6 @@ mod tests {
                 requested_model: Some("gpt-5.5".to_string()),
                 actual_model: Some("gpt-5.5".to_string()),
                 actual_model_source: Some("response".to_string()),
-                pricing_model: Some("gpt-5.5".to_string()),
             },
             TokenUsage::default(),
             UsageLogContext {

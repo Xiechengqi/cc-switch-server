@@ -109,7 +109,5 @@ export type {
   ModelUsageStats,
   ProviderUsageStats,
   ProviderLimitStatus,
-  ModelPricingEntry,
-  UpdateModelPricingInput,
   UsageStatsFilter,
 } from "@/lib/server-legacy-api";

@@ -1329,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_id_matches_desktop_prefix_input() {
+    fn machine_id_matches_kiro_prefix_input() {
         assert_eq!(
             machine_id_from_refresh_token("rt"),
             sha256_hex("KotlinNativeAPI/rt")

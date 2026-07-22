@@ -37,7 +37,7 @@ AD3 已将本页矩阵固化为 `docs/code-agent-regression-matrix.json`。`scri
 - [ ] reasoning/thinking。
 - [ ] cache read/write usage；断言 fresh input、cache read、cache creation、output 四桶不重叠，且总量为四桶之和。
 - [ ] final usage 统计。
-- [ ] request log：requestId、shareId、source、requestedModel、actualModel、pricingModel、status、latency、tokens。
+- [ ] request log：requestId、shareId、source、requestedModel、actualModel、status、latency、tokens。
 
 ## Direct / Market 维度
 

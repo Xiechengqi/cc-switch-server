@@ -1,8 +1,11 @@
 use std::time::Duration;
 
 use crate::domain::accounts::store::AccountStore;
+use crate::domain::accounts::store::AccountUsageBlock;
 use crate::domain::providers::store::StoredProvider;
-use crate::domain::sharing::model_health::{quota_blocked_for_provider, share_bindings};
+use crate::domain::sharing::model_health::{
+    quota_block_for_provider, quota_block_message, share_bindings,
+};
 use crate::domain::sharing::shares::Share;
 use crate::domain::stream_check::{HealthStatus, StreamCheckConfig, StreamCheckResult};
 use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
@@ -106,8 +109,8 @@ pub(crate) async fn check_share_binding(
     config: &StreamCheckConfig,
     source: &str,
 ) -> anyhow::Result<ShareBindingHealthCheck> {
-    if quota_blocked_for_provider(share, provider, Some(accounts)) {
-        return record_quota_block(state, share, provider, config).await;
+    if let Some(block) = quota_block_for_provider(provider, Some(accounts)) {
+        return record_quota_block(state, share, provider, config, &block).await;
     }
 
     let model = provider_test_model(provider.app, provider, None, Some(config));
@@ -216,13 +219,14 @@ async fn record_quota_block(
     share: &Share,
     provider: &StoredProvider,
     config: &StreamCheckConfig,
+    block: &AccountUsageBlock,
 ) -> anyhow::Result<ShareBindingHealthCheck> {
     let model = provider_test_model(provider.app, provider, None, Some(config));
     let result = StreamCheckResult {
         status: HealthStatus::Failed,
         success: false,
         provider_revision: Some(provider.resource.revision),
-        message: "quota blocked".to_string(),
+        message: quota_block_message(block),
         response_time_ms: Some(0),
         http_status: Some(429),
         model_used: model,
@@ -240,9 +244,7 @@ async fn record_quota_block(
         .await?;
     let mut result = result;
     result.tested_at = seconds_from_ms(persisted.created_at_ms);
-    result.message = persisted
-        .error_message
-        .unwrap_or_else(|| "quota blocked".to_string());
+    result.message = quota_block_message(block);
     result.model_used = persisted
         .requested_model
         .or(persisted.model)
@@ -398,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn health_check_intervals_match_desktop_contract() {
+    fn health_check_intervals_match_server_contract() {
         assert_eq!(FIRST_HEALTH_CHECK_DELAY, Duration::from_secs(120));
         assert_eq!(HEALTH_CHECK_INTERVAL, Duration::from_secs(30 * 60));
         assert_eq!(QUOTA_BLOCK_REPEAT_INTERVAL_MS, 6 * 60 * 60 * 1000);

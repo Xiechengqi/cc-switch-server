@@ -350,12 +350,12 @@ export async function invokeCommand<T>(
   });
 }
 
-/** Server web UI always runs outside Tauri; desktop components gate on this flag. */
+/** Server Web always runs outside Tauri; compatibility code gates on this flag. */
 export function isTauriRuntime(): boolean {
   return false;
 }
 
-/** True when running in cc-switch-server embedded/admin web UI (not desktop Tauri). */
+/** True when running in the embedded cc-switch-server administration UI. */
 export function isServerWebRuntime(): boolean {
   return !isTauriRuntime();
 }

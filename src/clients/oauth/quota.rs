@@ -2171,7 +2171,7 @@ fn codex_window_role(limit_window_seconds: Option<i64>) -> CodexWindowRole {
     }
 }
 
-/// Align with desktop `CodexRateWindowNormalizer`: session (5h) first, weekly (7d) second.
+/// Codex rate windows are normalized with session (5h) first and weekly (7d) second.
 fn normalize_codex_rate_windows(
     primary: Option<CodexRateLimitWindow>,
     secondary: Option<CodexRateLimitWindow>,
@@ -2209,8 +2209,8 @@ fn sort_codex_quota_tiers(tiers: &mut [AccountQuotaTier]) {
     });
 }
 
-/// `/wham/usage` reports consumed quota on a 0..100 percent scale (desktop keeps the
-/// raw value). Do not treat `(0, 1]` as a 0..1 fraction or `1.0` becomes 100%.
+/// `/wham/usage` reports consumed quota on a 0..100 percent scale. Keep the raw
+/// value; treating `(0, 1]` as a 0..1 fraction would turn `1.0` into 100%.
 fn codex_window_used_fraction(window: &CodexRateLimitWindow) -> Option<f64> {
     let used_percent = window.used_percent?;
     if !used_percent.is_finite() {

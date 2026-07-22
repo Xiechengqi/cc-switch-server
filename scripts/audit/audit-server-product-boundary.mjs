@@ -13,10 +13,30 @@ const requiredExcludedFeatures = Object.freeze([
   "automaticFailover",
   "outboundProxy",
   "configTransfer",
+  "usageCostAccounting",
+]);
+
+const forbiddenRuntimeCommands = Object.freeze([
+  "check_provider_limits",
+  "delete_model_pricing",
+  "get_default_cost_multiplier",
+  "get_model_pricing",
+  "get_pricing_model_source",
+  "set_default_cost_multiplier",
+  "set_pricing_model_source",
+  "update_model_pricing",
 ]);
 
 const forbiddenPaths = Object.freeze([
+  "assets/contract/desktop-ui-sync.json",
+  "docs/server-desktop-ui-parity-plan.md",
+  "scripts/sync/convert-legacy-export.mjs",
+  "scripts/sync/export-current-cc-switch-fixtures.mjs",
+  "scripts/sync/import-desktop-export.mjs",
+  "scripts/sync/sync-desktop-ui.mjs",
+  "scripts/sync/sync-desktop-ui.test.mjs",
   "src/domain/failover.rs",
+  "src/domain/usage/pricing.rs",
   "src/domain/settings/transfer.rs",
   "web-src/src/components/providers/FailoverPriorityBadge.tsx",
   "web-src/src/components/proxy/AutoFailoverConfigPanel.tsx",
@@ -25,6 +45,11 @@ const forbiddenPaths = Object.freeze([
   "web-src/src/components/proxy/FailoverToggle.tsx",
   "web-src/src/components/settings/GlobalProxySettings.tsx",
   "web-src/src/components/settings/ImportExportSection.tsx",
+  "web-src/src/components/usage/ModelsDevPickerDialog.tsx",
+  "web-src/src/components/usage/PricingConfigPanel.tsx",
+  "web-src/src/components/usage/PricingEditModal.tsx",
+  "web-src/src/desktop-theme.css",
+  "web-src/src/ServerDesktopApp.tsx",
   "web-src/src/hooks/useGlobalProxy.ts",
   "web-src/src/hooks/useImportExport.ts",
   "web-src/src/hooks/useProxyConfig.ts",
@@ -187,7 +212,7 @@ export function sourceBoundaryViolations(relativePath, source) {
   return violations;
 }
 
-export function contractBoundaryViolations(runtimeContract, syncManifest) {
+export function contractBoundaryViolations(runtimeContract) {
   const violations = [];
   const excluded = new Set(
     (runtimeContract.excludedFeatures ?? []).map((feature) => feature.id),
@@ -206,19 +231,11 @@ export function contractBoundaryViolations(runtimeContract, syncManifest) {
         `removed feature command remains implemented: ${command.name}`,
       );
     }
-  }
-
-  const syncExcluded = new Set(
-    (syncManifest.excluded ?? []).map((entry) => entry.path),
-  );
-  for (const requiredPath of [
-    "components/settings/GlobalProxySettings.tsx",
-    "components/settings/ImportExportPanel.tsx",
-  ]) {
-    if (!syncExcluded.has(requiredPath)) {
-      violations.push(`desktop sync manifest must exclude ${requiredPath}`);
+    if (forbiddenRuntimeCommands.includes(command.name)) {
+      violations.push(`removed usage cost command remains registered: ${command.name}`);
     }
   }
+
   return violations;
 }
 
@@ -236,20 +253,20 @@ export function providerEditorBoundaryViolations(sources) {
     }
     if (source.includes("@/components/providers/forms/ProviderForm")) {
       violations.push(
-        `${pathName}: core dialog imports the desktop ProviderForm dispatcher`,
+        `${pathName}: core dialog imports the non-Server ProviderForm dispatcher`,
       );
     }
   }
 
-  const app = sources["web-src/src/ServerDesktopApp.tsx"] ?? "";
+  const app = sources["web-src/src/ServerApp.tsx"] ?? "";
   if (!app.includes("@/server/providers/useServerProviderActions")) {
     violations.push(
-      "web-src/src/ServerDesktopApp.tsx: missing Server-only Provider action boundary",
+      "web-src/src/ServerApp.tsx: missing Server-only Provider action boundary",
     );
   }
   if (app.includes("@/hooks/useProviderActions")) {
     violations.push(
-      "web-src/src/ServerDesktopApp.tsx: imports desktop Provider action dispatcher",
+      "web-src/src/ServerApp.tsx: imports non-Server Provider action dispatcher",
     );
   }
 
@@ -311,17 +328,26 @@ export function auditServerProductBoundary(root = repoRoot) {
       "utf8",
     ),
   );
-  const syncManifest = JSON.parse(
-    fs.readFileSync(
-      path.join(root, "assets/contract/desktop-ui-sync.json"),
-      "utf8",
-    ),
-  );
-  violations.push(...contractBoundaryViolations(runtimeContract, syncManifest));
+  const runtimeDescriptions = [
+    runtimeContract.product,
+    ...[
+      ...(runtimeContract.retainedFeatures ?? []),
+      ...(runtimeContract.hiddenFeatures ?? []),
+      ...(runtimeContract.excludedFeatures ?? []),
+    ].flatMap((feature) => [feature.label, feature.reason]),
+    ...(runtimeContract.commands ?? []).map((command) => command.notes),
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+  if (runtimeDescriptions.includes("desktop")) {
+    violations.push("web runtime contract may describe only Server-native commands");
+  }
+  violations.push(...contractBoundaryViolations(runtimeContract));
   const providerEditorPaths = [
     "web-src/src/components/providers/AddProviderDialog.tsx",
     "web-src/src/components/providers/EditProviderDialog.tsx",
-    "web-src/src/ServerDesktopApp.tsx",
+    "web-src/src/ServerApp.tsx",
     "web-src/src/server/providers/useServerProviderActions.ts",
   ];
   violations.push(
@@ -345,7 +371,7 @@ function main() {
     );
   }
   console.log(
-    "server product boundary ok: deterministic routing, direct HTTP, scoped data transfer",
+    "server product boundary ok: server-native UI, deterministic routing, direct HTTP, scoped data transfer",
   );
 }
 

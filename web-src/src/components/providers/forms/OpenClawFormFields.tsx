@@ -183,25 +183,6 @@ export function OpenClawFormFields({
     onModelsChange(newModels);
   };
 
-  // Update model cost
-  const handleCostChange = (
-    index: number,
-    costField: "input" | "output" | "cacheRead" | "cacheWrite",
-    value: string,
-  ) => {
-    const newModels = [...models];
-    const numValue = parseFloat(value);
-    const currentCost = newModels[index].cost || { input: 0, output: 0 };
-    newModels[index] = {
-      ...newModels[index],
-      cost: {
-        ...currentCost,
-        [costField]: isNaN(numValue) ? undefined : numValue,
-      },
-    };
-    onModelsChange(newModels);
-  };
-
   return (
     <>
       {/* API Protocol Selector */}
@@ -570,89 +551,6 @@ export function OpenClawFormFields({
                       <div className="flex-1" />
                     </div>
 
-                    {/* Cost row */}
-                    <div className="flex items-center gap-2">
-                      <div className="flex-1 space-y-1">
-                        <label className="text-xs text-muted-foreground">
-                          {t("openclaw.inputCost", {
-                            defaultValue: "输入价格 ($/M tokens)",
-                          })}
-                        </label>
-                        <Input
-                          type="number"
-                          step="0.001"
-                          value={model.cost?.input ?? ""}
-                          onChange={(e) =>
-                            handleCostChange(index, "input", e.target.value)
-                          }
-                          placeholder="3"
-                        />
-                      </div>
-                      <div className="flex-1 space-y-1">
-                        <label className="text-xs text-muted-foreground">
-                          {t("openclaw.outputCost", {
-                            defaultValue: "输出价格 ($/M tokens)",
-                          })}
-                        </label>
-                        <Input
-                          type="number"
-                          step="0.001"
-                          value={model.cost?.output ?? ""}
-                          onChange={(e) =>
-                            handleCostChange(index, "output", e.target.value)
-                          }
-                          placeholder="15"
-                        />
-                      </div>
-                      <div className="flex-1" />
-                    </div>
-
-                    {/* Cache Cost row */}
-                    <div className="flex items-center gap-2">
-                      <div className="flex-1 space-y-1">
-                        <label className="text-xs text-muted-foreground">
-                          {t("openclaw.cacheReadCost", {
-                            defaultValue: "缓存读取价格 ($/M tokens)",
-                          })}
-                        </label>
-                        <Input
-                          type="number"
-                          step="0.001"
-                          value={model.cost?.cacheRead ?? ""}
-                          onChange={(e) =>
-                            handleCostChange(index, "cacheRead", e.target.value)
-                          }
-                          placeholder="0.3"
-                        />
-                      </div>
-                      <div className="flex-1 space-y-1">
-                        <label className="text-xs text-muted-foreground">
-                          {t("openclaw.cacheWriteCost", {
-                            defaultValue: "缓存写入价格 ($/M tokens)",
-                          })}
-                        </label>
-                        <Input
-                          type="number"
-                          step="0.001"
-                          value={model.cost?.cacheWrite ?? ""}
-                          onChange={(e) =>
-                            handleCostChange(
-                              index,
-                              "cacheWrite",
-                              e.target.value,
-                            )
-                          }
-                          placeholder="3.75"
-                        />
-                      </div>
-                      <div className="flex-1" />
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      {t("openclaw.cacheCostHint", {
-                        defaultValue:
-                          "缓存价格用于计算 Prompt Caching 的成本。如不使用缓存可留空。",
-                      })}
-                    </p>
                   </CollapsibleContent>
                 </Collapsible>
               </div>

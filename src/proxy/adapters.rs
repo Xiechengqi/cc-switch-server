@@ -102,7 +102,6 @@ pub struct AdapterRequest {
     pub requested_model: Option<String>,
     pub actual_model: Option<String>,
     pub actual_model_source: Option<String>,
-    pub pricing_model: Option<String>,
     pub stream_requested: bool,
     pub custom_tool_names: BTreeSet<String>,
 }
@@ -237,7 +236,6 @@ impl GenericForwardingAdapter {
                 if let Some(actual_model) = model_from_body(&body) {
                     model.actual_model = Some(actual_model.clone());
                     model.actual_model_source = Some(source.to_string());
-                    model.pricing_model = Some(actual_model);
                 }
             }
             (
@@ -264,7 +262,6 @@ impl GenericForwardingAdapter {
             requested_model: model.requested_model,
             actual_model: model.actual_model.clone(),
             actual_model_source: model.actual_model_source,
-            pricing_model: model.pricing_model.or(model.actual_model),
             stream_requested,
             upstream_headers,
             custom_tool_names,
@@ -452,7 +449,6 @@ pub(super) fn cursor_agentservice_request(
         requested_model: model.requested_model,
         actual_model: model.actual_model.clone(),
         actual_model_source: model.actual_model_source,
-        pricing_model: model.pricing_model.or(model.actual_model),
         stream_requested,
         custom_tool_names,
     })
@@ -1556,7 +1552,7 @@ fn base_url_for_upstream(
     value.ok_or_else(|| ProxyError::bad_request("provider base url is not configured"))
 }
 
-/// Aligns with desktop `CodexAdapter::build_url` for OpenAI Responses/Chat paths.
+/// Applies the OpenAI Responses/Chat endpoint contract to origin-only URLs.
 fn is_origin_only_url(value: &str) -> bool {
     let trimmed = value.trim_end_matches('/');
     match trimmed.split_once("://") {
@@ -2412,7 +2408,6 @@ pub(super) struct ModelSelection {
     pub requested_model: Option<String>,
     pub actual_model: Option<String>,
     pub actual_model_source: Option<String>,
-    pub pricing_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2426,7 +2421,6 @@ struct ModelMappingContext {
 struct ModelMappingDecision {
     actual_model: String,
     source: &'static str,
-    pricing_model: Option<String>,
 }
 
 fn cache_injection_config(stored: &StoredProvider) -> CacheInjectionConfig {
@@ -2902,7 +2896,6 @@ fn apply_model_mapping(
                     requested_model,
                     actual_model: Some(decision.actual_model.clone()),
                     actual_model_source: Some(decision.source.to_string()),
-                    pricing_model: decision.pricing_model.or(Some(decision.actual_model)),
                 },
             );
         }
@@ -2914,7 +2907,6 @@ fn apply_model_mapping(
             requested_model: requested_model.clone(),
             actual_model: requested_model.clone(),
             actual_model_source: requested_model.as_ref().map(|_| "request".to_string()),
-            pricing_model: requested_model,
         },
     )
 }
@@ -2934,7 +2926,6 @@ fn resolve_model_mapping(
                     return Some(ModelMappingDecision {
                         actual_model,
                         source: "model_mapping_single",
-                        pricing_model: None,
                     });
                 }
             }
@@ -2942,7 +2933,6 @@ fn resolve_model_mapping(
                 return requested_model.map(|requested_model| ModelMappingDecision {
                     actual_model: requested_model.to_string(),
                     source: "model_mapping_passthrough",
-                    pricing_model: None,
                 });
             }
         }
@@ -2973,7 +2963,6 @@ fn legacy_upstream_model_mapping(mapping: &Value) -> Option<ModelMappingDecision
     Some(ModelMappingDecision {
         actual_model,
         source: "model_mapping",
-        pricing_model: None,
     })
 }
 
@@ -2984,21 +2973,20 @@ fn direct_model_mapping(mapping: &Value, requested_model: &str) -> Option<ModelM
                 .get("mappings")
                 .and_then(|mappings| direct_model_mapping_value(mappings.get(requested_model)))
         })
-        .map(|(actual_model, pricing_model)| ModelMappingDecision {
+        .map(|actual_model| ModelMappingDecision {
             actual_model,
             source: "model_mapping_direct",
-            pricing_model,
         })
 }
 
-fn direct_model_mapping_value(value: Option<&Value>) -> Option<(String, Option<String>)> {
+fn direct_model_mapping_value(value: Option<&Value>) -> Option<String> {
     let value = value?;
     if let Some(actual_model) = value
         .as_str()
         .map(str::trim)
         .filter(|model| !model.is_empty())
     {
-        return Some((actual_model.to_string(), None));
+        return Some(actual_model.to_string());
     }
     let actual_model = string_field(
         value,
@@ -3013,8 +3001,7 @@ fn direct_model_mapping_value(value: Option<&Value>) -> Option<(String, Option<S
             "to",
         ],
     )?;
-    let pricing_model = string_field(value, &["pricingModel", "pricing_model"]);
-    Some((actual_model, pricing_model))
+    Some(actual_model)
 }
 
 fn catalog_model_mapping(
@@ -3039,7 +3026,6 @@ fn catalog_model_mapping(
         Some(ModelMappingDecision {
             actual_model,
             source: "model_catalog",
-            pricing_model: string_field(model, &["pricingModel", "pricing_model"]),
         })
     })
 }
@@ -3077,7 +3063,6 @@ fn rule_model_mapping(
         Some(ModelMappingDecision {
             actual_model,
             source: "model_mapping_rule",
-            pricing_model: string_field(rule, &["pricingModel", "pricing_model"]),
         })
     })
 }
@@ -3111,7 +3096,6 @@ fn env_model_mapping(settings: &Value, requested_model: &str) -> Option<ModelMap
     Some(ModelMappingDecision {
         actual_model,
         source: "model_mapping_env",
-        pricing_model: None,
     })
 }
 
@@ -4180,7 +4164,6 @@ mod tests {
             request.actual_model_source.as_deref(),
             Some("model_mapping")
         );
-        assert_eq!(request.pricing_model.as_deref(), Some("glm-5.2"));
         assert!(request.stream_requested);
         assert_eq!(value.get("model").and_then(Value::as_str), Some("glm-5.2"));
         assert_eq!(
@@ -4238,7 +4221,6 @@ mod tests {
             request.actual_model_source.as_deref(),
             Some("model_mapping_single")
         );
-        assert_eq!(request.pricing_model.as_deref(), Some("single-model"));
     }
 
     #[test]
@@ -4302,7 +4284,7 @@ mod tests {
     }
 
     #[test]
-    fn model_mapping_direct_exact_rule_preserves_pricing_model() {
+    fn model_mapping_direct_exact_rule_preserves_actual_model() {
         let adapter = adapter_for(AppKind::Claude, ProviderType::Claude);
         let stored = stored_provider(
             AppKind::Claude,
@@ -4315,7 +4297,6 @@ mod tests {
                 "modelMapping": {
                     "claude-sonnet-4": {
                         "upstreamModel": "anthropic/sonnet-4",
-                        "pricingModel": "sonnet-priced"
                     },
                     "upstreamModel": "fallback-model"
                 }
@@ -4340,7 +4321,7 @@ mod tests {
             request.actual_model_source.as_deref(),
             Some("model_mapping_direct")
         );
-        assert_eq!(request.pricing_model.as_deref(), Some("sonnet-priced"));
+        assert_eq!(request.actual_model.as_deref(), Some("anthropic/sonnet-4"));
     }
 
     #[test]
@@ -4358,7 +4339,6 @@ mod tests {
                     "models": [{
                         "model": "gemini-2.5-pro",
                         "upstreamModel": "models/gemini-2.5-pro-preview",
-                        "pricingModel": "gemini-pro-priced"
                     }]
                 }
             }),
@@ -4384,7 +4364,10 @@ mod tests {
             request.actual_model_source.as_deref(),
             Some("model_catalog")
         );
-        assert_eq!(request.pricing_model.as_deref(), Some("gemini-pro-priced"));
+        assert_eq!(
+            request.actual_model.as_deref(),
+            Some("models/gemini-2.5-pro-preview")
+        );
     }
 
     #[test]
@@ -5158,7 +5141,6 @@ mod tests {
             ProxyRoute::CodexChatCompletions,
         );
         assert_eq!(usage.raw_input_tokens, Some(100));
-        assert_eq!(usage.billed_input_tokens, Some(30));
         assert_eq!(usage.cache_read_tokens, Some(70));
     }
 
@@ -5766,7 +5748,6 @@ mod tests {
             requested_model: Some("global.anthropic.claude-opus-4-8:0".to_string()),
             actual_model: None,
             actual_model_source: None,
-            pricing_model: None,
             stream_requested: true,
             custom_tool_names: Default::default(),
         };
@@ -5835,7 +5816,6 @@ mod tests {
             requested_model: Some("global.anthropic.claude-opus-4-8:0".to_string()),
             actual_model: None,
             actual_model_source: None,
-            pricing_model: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
         };
@@ -5920,7 +5900,6 @@ mod tests {
             requested_model: Some("anthropic.claude-sonnet-4-6:0".to_string()),
             actual_model: None,
             actual_model_source: None,
-            pricing_model: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
         };
@@ -6028,7 +6007,6 @@ mod tests {
             requested_model: Some("anthropic.claude-sonnet-4-6:0".to_string()),
             actual_model: None,
             actual_model_source: None,
-            pricing_model: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
         };

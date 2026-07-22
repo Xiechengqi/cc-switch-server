@@ -42,7 +42,8 @@ use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::AccountRefreshLocks;
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{
-    Account, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
+    active_account_usage_block, Account, AccountRefreshUpdate, AccountStore,
+    ManualSubscriptionExpiryError,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::credentials::{
@@ -73,7 +74,6 @@ use crate::domain::sharing::shares::{
     RouterDescriptorSyncMode, Share, ShareDeleteTombstone, ShareInvocation,
     ShareInvocationRejection, ShareMarketGrantStatus, ShareStore,
 };
-use crate::domain::usage::pricing::ModelPricingStore;
 use crate::domain::usage::store::{UsageLog, UsageStore};
 use crate::logging::{LogTailAccessError, LogTailResponse, SharedLogCapture};
 use crate::proxy::cursor::session::CursorSessionManager;
@@ -126,7 +126,6 @@ pub struct ServerStateInner {
     #[cfg(test)]
     provider_commit_delay_ms: std::sync::atomic::AtomicU64,
     pub(crate) accounts: RwLock<AccountStore>,
-    pub(crate) pricing: RwLock<ModelPricingStore>,
     pub(crate) usage: RwLock<UsageStore>,
     pub(crate) shares: RwLock<ShareStore>,
     pub(crate) ui_settings: RwLock<UiSettingsStore>,
@@ -282,11 +281,22 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::providers::store::providers_path(config_dir),
         crate::domain::accounts::store::accounts_path(config_dir),
         crate::domain::accounts::store::accounts_key_path(config_dir),
-        crate::domain::usage::pricing::model_pricing_path(config_dir),
         crate::domain::usage::store::usage_path(config_dir),
         crate::domain::sharing::shares::shares_path(config_dir),
         crate::clients::router::tunnel::tunnels_path(config_dir),
     ]
+}
+
+fn remove_obsolete_model_pricing_file(config_dir: &Path) -> anyhow::Result<()> {
+    let path = config_dir.join("model-pricing.json");
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "removed obsolete model pricing store");
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 fn validate_server_backup_restore_stage(
@@ -373,10 +383,6 @@ fn validate_server_backup_restore_stage(
         staged_accounts
             .as_ref()
             .expect("account restore preflight loaded staged accounts");
-    }
-    if includes("model-pricing.json") {
-        ModelPricingStore::load_or_default(stage_dir)
-            .context("validate staged model-pricing.json")?;
     }
     if includes("usage-logs.json") {
         UsageStore::load_or_default(stage_dir).context("validate staged usage-logs.json")?;
@@ -2066,8 +2072,8 @@ impl ServerStateInner {
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
-        let pricing = ModelPricingStore::load_or_default(&config_dir)?;
         let usage = UsageStore::load_or_default(&config_dir)?;
+        remove_obsolete_model_pricing_file(&config_dir)?;
         let mut shares = ShareStore::load_or_default(&config_dir)?;
         let mut shares_changed = false;
         if let Some(owner_email) = config.owner.email.as_deref() {
@@ -2124,7 +2130,6 @@ impl ServerStateInner {
             #[cfg(test)]
             provider_commit_delay_ms: std::sync::atomic::AtomicU64::new(0),
             accounts: RwLock::new(accounts),
-            pricing: RwLock::new(pricing),
             usage: RwLock::new(usage),
             shares: RwLock::new(shares),
             ui_settings: RwLock::new(ui_settings),
@@ -2697,8 +2702,8 @@ impl ServerStateInner {
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
-        let pricing = ModelPricingStore::load_or_default(&self.config_dir)?;
         let usage = UsageStore::load_or_default(&self.config_dir)?;
+        remove_obsolete_model_pricing_file(&self.config_dir)?;
         let shares = ShareStore::load_or_default(&self.config_dir)?;
         let ui_settings = UiSettingsStore::load_or_default(&self.config_dir)?;
 
@@ -2706,7 +2711,6 @@ impl ServerStateInner {
         *self.config.write().await = config;
         *self.providers.write().await = providers;
         *self.accounts.write().await = accounts;
-        *self.pricing.write().await = pricing;
         *self.usage.write().await = usage;
         *self.shares.write().await = shares;
         *self.ui_settings.write().await = ui_settings;
@@ -3767,10 +3771,13 @@ impl ServerStateInner {
             return Ok(share_ids);
         }
 
-        self.emit_event(
-            ServerEvent::new("share.changed", "share")
-                .message("account_subscription_expiry_updated"),
-        );
+        self.emit_event(ServerEvent::new("share.changed", "share").message(
+            if only_if_expiry_changed {
+                "account_subscription_expiry_updated"
+            } else {
+                "account_runtime_metadata_updated"
+            },
+        ));
         if self
             .config_snapshot()
             .await
@@ -3783,7 +3790,7 @@ impl ServerStateInner {
                     tracing::warn!(
                         share_count = pending_ids.len(),
                         %error,
-                        "router share subscription metadata sync remains pending"
+                        "router Share runtime metadata sync remains pending"
                     );
                 }
             });
@@ -3791,7 +3798,7 @@ impl ServerStateInner {
         Ok(share_ids)
     }
 
-    pub async fn refresh_automatic_subscription_metadata_if_changed(
+    pub async fn refresh_account_runtime_metadata_if_changed(
         self: &Arc<Self>,
         before: &Account,
         after: &Account,
@@ -3800,12 +3807,18 @@ impl ServerStateInner {
             resolved_subscription_expiry, subscription_expiry_capability, supports_automatic_expiry,
         };
 
-        if before.id != after.id
-            || before.provider_type != after.provider_type
-            || !supports_automatic_expiry(subscription_expiry_capability(after.provider_type))
-            || resolved_subscription_expiry(before).expires_at_ms
-                == resolved_subscription_expiry(after).expires_at_ms
-        {
+        if before.id != after.id || before.provider_type != after.provider_type {
+            return Ok(false);
+        }
+
+        let expiry_changed =
+            supports_automatic_expiry(subscription_expiry_capability(after.provider_type))
+                && resolved_subscription_expiry(before).expires_at_ms
+                    != resolved_subscription_expiry(after).expires_at_ms;
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let usage_block_changed =
+            active_account_usage_block(before, now_ms) != active_account_usage_block(after, now_ms);
+        if !expiry_changed && !usage_block_changed {
             return Ok(false);
         }
 
@@ -3822,35 +3835,6 @@ impl ServerStateInner {
         let result = self.mutate_accounts(mutate).await;
         save_accounts_debounced(self);
         result
-    }
-
-    pub async fn save_pricing(&self) -> anyhow::Result<()> {
-        self.pricing.read().await.save(&self.config_dir)
-    }
-
-    pub async fn mutate_pricing<R>(&self, mutate: impl FnOnce(&mut ModelPricingStore) -> R) -> R {
-        let mut pricing = self.pricing.write().await;
-        mutate(&mut pricing)
-    }
-
-    pub async fn mutate_pricing_immediate<R>(
-        &self,
-        mutate: impl FnOnce(&mut ModelPricingStore) -> R,
-    ) -> anyhow::Result<R> {
-        let result = self.mutate_pricing(mutate).await;
-        self.save_pricing().await?;
-        Ok(result)
-    }
-
-    pub async fn try_mutate_pricing_immediate<R, E>(
-        &self,
-        mutate: impl FnOnce(&mut ModelPricingStore) -> Result<R, E>,
-    ) -> anyhow::Result<Result<R, E>> {
-        let result = self.mutate_pricing(mutate).await;
-        if result.is_ok() {
-            self.save_pricing().await?;
-        }
-        Ok(result)
     }
 
     pub async fn save_usage(&self) -> anyhow::Result<()> {
@@ -3906,36 +3890,6 @@ impl ServerStateInner {
             .write()
             .await
             .update_log_and_persist(&self.config_dir, request_id, update)
-    }
-
-    pub async fn backfill_usage_costs(
-        &self,
-        providers: &ProviderStore,
-        pricing: &ModelPricingStore,
-    ) -> anyhow::Result<usize> {
-        let updated = { self.usage.write().await.backfill_costs(providers, pricing) };
-        if updated > 0 {
-            self.save_usage().await?;
-        }
-        Ok(updated)
-    }
-
-    pub async fn backfill_usage_costs_for_model(
-        &self,
-        providers: &ProviderStore,
-        pricing: &ModelPricingStore,
-        model_id: &str,
-    ) -> anyhow::Result<usize> {
-        let updated = {
-            self.usage
-                .write()
-                .await
-                .backfill_costs_for_model(providers, pricing, model_id)
-        };
-        if updated > 0 {
-            self.save_usage().await?;
-        }
-        Ok(updated)
     }
 
     pub async fn save_shares(&self) -> anyhow::Result<()> {
@@ -4002,33 +3956,56 @@ impl ServerStateInner {
 
         let http_client = self.http_client().await;
         let interval_ms = self.oauth_quota_refresh_interval_ms().await;
-        let update =
-            match execute_native_account_refresh(&http_client, &account, now, interval_ms).await {
-                Ok(update) => update,
-                Err(error) => {
+        let update = match execute_native_account_refresh(&http_client, &account, now, interval_ms)
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                let updated = {
+                    let mut accounts = self.accounts.write().await;
+                    accounts.mark_native_refresh_failure(
+                        &account.id,
+                        error.message.clone(),
+                        error.kind,
+                    )
+                };
+                save_accounts_debounced(self);
+                if let Some(updated) = updated {
+                    if let Err(sync_error) = self
+                        .refresh_account_runtime_metadata_if_changed(&account, &updated)
+                        .await
                     {
-                        let mut accounts = self.accounts.write().await;
-                        accounts.mark_native_refresh_failure(
-                            &account.id,
-                            error.message.clone(),
-                            error.kind,
+                        tracing::warn!(
+                            account_id = %account.id,
+                            error = %sync_error,
+                            "managed account refresh failure Share descriptor sync remains pending"
                         );
                     }
-                    save_accounts_debounced(self);
-                    return Err(ManagedAccountRefreshError::Refresh {
-                        status_code: error.status_code,
-                        message: error.message,
-                    });
                 }
-            };
+                return Err(ManagedAccountRefreshError::Refresh {
+                    status_code: error.status_code,
+                    message: error.message,
+                });
+            }
+        };
 
-        {
+        let updated = {
             let mut accounts = self.accounts.write().await;
             accounts
                 .mark_native_refresh_success(&account.id, update)
-                .ok_or(ManagedAccountRefreshError::NotFound)?;
-        }
+                .ok_or(ManagedAccountRefreshError::NotFound)?
+        };
         save_accounts_debounced(self);
+        if let Err(error) = self
+            .refresh_account_runtime_metadata_if_changed(&account, &updated)
+            .await
+        {
+            tracing::warn!(
+                account_id = %account.id,
+                %error,
+                "managed account refresh Share descriptor sync remains pending"
+            );
+        }
         Ok(())
     }
 
@@ -4038,12 +4015,50 @@ impl ServerStateInner {
         rate_limited_until: i64,
         message: Option<String>,
     ) -> Option<Account> {
-        let account = {
+        let (before, account) = {
             let mut accounts = self.accounts.write().await;
-            accounts.mark_rate_limited_until(account_id, rate_limited_until, message)
+            let before = accounts
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned();
+            let account = accounts.mark_rate_limited_until(account_id, rate_limited_until);
+            (before, account)
         };
-        if account.is_some() {
+        if let Some(account) = account.as_ref() {
+            if before
+                .as_ref()
+                .and_then(|account| account.rate_limited_until)
+                != account.rate_limited_until
+            {
+                tracing::debug!(
+                    account_id,
+                    rate_limited_until,
+                    message = message.as_deref().unwrap_or("upstream rate limit"),
+                    "updated account rate-limit cooldown"
+                );
+            }
             save_accounts_debounced(self);
+            let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            let before_kind = before
+                .as_ref()
+                .and_then(|account| active_account_usage_block(account, now_ms))
+                .map(|block| block.kind);
+            let after_kind = active_account_usage_block(account, now_ms).map(|block| block.kind);
+            if before_kind != after_kind {
+                if let Some(before) = before.as_ref() {
+                    if let Err(error) = self
+                        .refresh_account_runtime_metadata_if_changed(before, account)
+                        .await
+                    {
+                        tracing::warn!(
+                            account_id,
+                            %error,
+                            "account rate-limit Share descriptor sync remains pending"
+                        );
+                    }
+                }
+            }
         }
         account
     }
@@ -5339,11 +5354,23 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
     match execute_native_account_refresh(&http_client, &account, now, interval_ms).await {
         Ok(update) => {
             crate::metrics::record_warm_refresh(account.provider_type.as_str(), "success");
-            {
+            let updated = {
                 let mut store = state.accounts.write().await;
-                store.mark_native_refresh_success(&account.id, update);
-            }
+                store.mark_native_refresh_success(&account.id, update)
+            };
             save_accounts_debounced(state);
+            if let Some(updated) = updated {
+                if let Err(error) = state
+                    .refresh_account_runtime_metadata_if_changed(&account, &updated)
+                    .await
+                {
+                    tracing::warn!(
+                        account_id = %account.id,
+                        %error,
+                        "background OAuth refresh Share descriptor sync remains pending"
+                    );
+                }
+            }
         }
         Err(error) => {
             let metric_result =
@@ -5363,7 +5390,10 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                 let mut store = state.accounts.write().await;
                 store.mark_native_refresh_failure(&account.id, error.message, error.kind)
             };
-            if updated.is_some_and(|account| account.needs_relogin) {
+            if updated
+                .as_ref()
+                .is_some_and(|account| account.needs_relogin)
+            {
                 tracing::error!(
                     account_id = %account.id,
                     provider_type = %account.provider_type.as_str(),
@@ -5371,6 +5401,18 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                 );
             }
             save_accounts_debounced(state);
+            if let Some(updated) = updated {
+                if let Err(error) = state
+                    .refresh_account_runtime_metadata_if_changed(&account, &updated)
+                    .await
+                {
+                    tracing::warn!(
+                        account_id = %account.id,
+                        %error,
+                        "background OAuth refresh failure Share descriptor sync remains pending"
+                    );
+                }
+            }
         }
     }
 }
@@ -5453,6 +5495,7 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
         return;
     }
     let success_cooldown_ms = state.oauth_quota_refresh_interval_ms().await;
+    let account_before_refresh = account.clone();
     let mut active_account = account;
     let mut account_mutated = false;
     if account_needs_native_refresh(&active_account, now) {
@@ -5495,7 +5538,6 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
     .await
     {
         Ok(QuotaRefreshResult::Updated { update, .. }) => {
-            let account_before_quota_refresh = active_account.clone();
             let account = {
                 let mut store = state.accounts.write().await;
                 store
@@ -5504,16 +5546,13 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
             };
             save_accounts_debounced(state);
             if let Err(error) = state
-                .refresh_automatic_subscription_metadata_if_changed(
-                    &account_before_quota_refresh,
-                    &account,
-                )
+                .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &account)
                 .await
             {
                 tracing::warn!(
                     account_id = %account.id,
                     %error,
-                    "background quota refresh could not persist subscription metadata change"
+                    "background quota refresh could not persist account runtime metadata change"
                 );
             }
             emit_oauth_quota_updated(state, &account, true);
@@ -5521,6 +5560,19 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
         Ok(QuotaRefreshResult::SkippedCooldown { .. }) => {
             if account_mutated {
                 save_accounts_debounced(state);
+                if let Err(error) = state
+                    .refresh_account_runtime_metadata_if_changed(
+                        &account_before_refresh,
+                        &active_account,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        account_id = %active_account.id,
+                        %error,
+                        "background OAuth refresh Share descriptor sync remains pending"
+                    );
+                }
             }
         }
         Err(error) => {
@@ -5534,11 +5586,23 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
                     now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS),
                 );
             }
-            {
+            let account = {
                 let mut store = state.accounts.write().await;
-                store.mark_refresh_success(&active_account.id, update);
-            }
+                store.mark_refresh_success(&active_account.id, update)
+            };
             save_accounts_debounced(state);
+            if let Some(account) = account {
+                if let Err(error) = state
+                    .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &account)
+                    .await
+                {
+                    tracing::warn!(
+                        account_id = %account.id,
+                        %error,
+                        "background quota refresh failure Share descriptor sync remains pending"
+                    );
+                }
+            }
         }
     }
 }
@@ -5549,9 +5613,14 @@ async fn mark_account_quota_refresh_error(
     message: String,
     now: i64,
 ) {
-    {
+    let (before, after) = {
         let mut store = state.accounts.write().await;
-        store.mark_refresh_success(
+        let before = store
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned();
+        let after = store.mark_refresh_success(
             account_id,
             AccountRefreshUpdate {
                 quota_next_refresh_at: Some(
@@ -5561,8 +5630,21 @@ async fn mark_account_quota_refresh_error(
                 ..Default::default()
             },
         );
-    }
+        (before, after)
+    };
     save_accounts_debounced(state);
+    if let (Some(before), Some(after)) = (before, after) {
+        if let Err(error) = state
+            .refresh_account_runtime_metadata_if_changed(&before, &after)
+            .await
+        {
+            tracing::warn!(
+                account_id,
+                %error,
+                "quota refresh error Share descriptor sync remains pending"
+            );
+        }
+    }
 }
 
 fn account_quota_refresh_due(account: &Account, now: i64) -> bool {
@@ -7669,11 +7751,9 @@ mod tests {
                 requested_model: Some("gpt-5.5".to_string()),
                 actual_model: Some("glm-5.2".to_string()),
                 actual_model_source: Some("model_mapping".to_string()),
-                pricing_model: Some("glm-5.2".to_string()),
             },
             TokenUsage {
                 raw_input_tokens: Some(100),
-                billed_input_tokens: Some(70),
                 input_tokens: Some(100),
                 output_tokens: Some(10),
                 cache_read_tokens: Some(30),

@@ -1582,12 +1582,18 @@ pub(in crate::api) async fn refresh_account(
         {
             Ok(update) => update,
             Err(error) => {
-                state
+                let updated = state
                     .mutate_accounts_immediate(|store| {
-                        store.mark_native_refresh_failure(&id, error.message.clone(), error.kind);
+                        store.mark_native_refresh_failure(&id, error.message.clone(), error.kind)
                     })
                     .await
                     .map_err(ApiError::internal)?;
+                if let Some(updated) = updated {
+                    state
+                        .refresh_account_runtime_metadata_if_changed(&existing, &updated)
+                        .await
+                        .map_err(ApiError::internal)?;
+                }
                 return Err(account_refresh_api_error(error));
             }
         };
@@ -1599,6 +1605,10 @@ pub(in crate::api) async fn refresh_account(
             })
             .await
             .map_err(ApiError::internal)??;
+        state
+            .refresh_account_runtime_metadata_if_changed(&existing, &account)
+            .await
+            .map_err(ApiError::internal)?;
         return Ok(Json(UpsertAccountResponse { ok: true, account }));
     }
 
@@ -1610,6 +1620,10 @@ pub(in crate::api) async fn refresh_account(
         })
         .await
         .map_err(ApiError::internal)??;
+    state
+        .refresh_account_runtime_metadata_if_changed(&existing, &account)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(UpsertAccountResponse { ok: true, account }))
 }
 
@@ -1769,6 +1783,7 @@ pub(in crate::api) async fn account_quota(
         }
     }
 
+    let account_before_refresh = active_account.clone();
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
     if account_needs_native_refresh(&active_account, now) {
         let http_client = state.http_client().await;
@@ -1778,16 +1793,25 @@ pub(in crate::api) async fn account_quota(
             {
                 Ok(update) => update,
                 Err(error) => {
-                    state
+                    let updated = state
                         .mutate_accounts_immediate(|store| {
                             store.mark_native_refresh_failure(
                                 &id,
                                 error.message.clone(),
                                 error.kind,
-                            );
+                            )
                         })
                         .await
                         .map_err(ApiError::internal)?;
+                    if let Some(updated) = updated {
+                        state
+                            .refresh_account_runtime_metadata_if_changed(
+                                &account_before_refresh,
+                                &updated,
+                            )
+                            .await
+                            .map_err(ApiError::internal)?;
+                    }
                     return Err(account_refresh_api_error(error));
                 }
             };
@@ -1814,7 +1838,6 @@ pub(in crate::api) async fn account_quota(
     .await
     {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
-            let account_before_quota_refresh = active_account.clone();
             let account = state
                 .try_mutate_accounts_immediate(|store| {
                     store
@@ -1824,10 +1847,7 @@ pub(in crate::api) async fn account_quota(
                 .await
                 .map_err(ApiError::internal)??;
             state
-                .refresh_automatic_subscription_metadata_if_changed(
-                    &account_before_quota_refresh,
-                    &account,
-                )
+                .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &account)
                 .await
                 .map_err(ApiError::internal)?;
             state.emit_oauth_quota_updated_event(&account, true);
@@ -1843,19 +1863,28 @@ pub(in crate::api) async fn account_quota(
         Ok(QuotaRefreshResult::SkippedCooldown {
             next_refresh_at,
             message,
-        }) => Ok(Json(AccountQuotaResponse {
-            ok: true,
-            quota: active_account.quota.clone(),
-            account: Some(active_account),
-            refreshed: false,
-            message: Some(message),
-            next_refresh_at: Some(next_refresh_at),
-        })),
+        }) => {
+            state
+                .refresh_account_runtime_metadata_if_changed(
+                    &account_before_refresh,
+                    &active_account,
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            Ok(Json(AccountQuotaResponse {
+                ok: true,
+                quota: active_account.quota.clone(),
+                account: Some(active_account),
+                refreshed: false,
+                message: Some(message),
+                next_refresh_at: Some(next_refresh_at),
+            }))
+        }
         Err(error) => {
             let next_refresh_at = Some(error.next_refresh_at.unwrap_or_else(|| {
                 now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS)
             }));
-            state
+            let updated = state
                 .mutate_accounts_immediate(|store| {
                     store.mark_refresh_success(
                         &id,
@@ -1864,10 +1893,16 @@ pub(in crate::api) async fn account_quota(
                             last_refresh_error: Some(error.message.clone()),
                             ..Default::default()
                         },
-                    );
+                    )
                 })
                 .await
                 .map_err(ApiError::internal)?;
+            if let Some(updated) = updated {
+                state
+                    .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &updated)
+                    .await
+                    .map_err(ApiError::internal)?;
+            }
             Err(ApiError::new(
                 StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
                 error.message,

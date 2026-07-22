@@ -32,7 +32,7 @@ export function useBaseUrlState({
   const [geminiBaseUrl, setGeminiBaseUrl] = useState("");
   const isUpdatingRef = useRef(false);
 
-  // 从配置同步到 state（Claude / Claude Desktop）
+  // 从配置同步到 state（Claude 及本地 Profile 模式）
   useEffect(() => {
     if (appType !== "claude" && appType !== "claude-desktop") return;
     // 只有 official 类别不显示 Base URL 输入框，其他类别都需要回填

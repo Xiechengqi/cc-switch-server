@@ -55,29 +55,4 @@ export const proxyApi = {
   ): Promise<void> {
     return invokeCommand("set_proxy_takeover_for_app", { appType, enabled });
   },
-
-  // ========== 计费默认配置 API ==========
-
-  // 获取默认成本倍率
-  async getDefaultCostMultiplier(appType: string): Promise<string> {
-    return invokeCommand("get_default_cost_multiplier", { appType });
-  },
-
-  // 设置默认成本倍率
-  async setDefaultCostMultiplier(
-    appType: string,
-    value: string,
-  ): Promise<void> {
-    return invokeCommand("set_default_cost_multiplier", { appType, value });
-  },
-
-  // 获取计费模式来源
-  async getPricingModelSource(appType: string): Promise<string> {
-    return invokeCommand("get_pricing_model_source", { appType });
-  },
-
-  // 设置计费模式来源
-  async setPricingModelSource(appType: string, value: string): Promise<void> {
-    return invokeCommand("set_pricing_model_source", { appType, value });
-  },
 };

@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -9,11 +8,6 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::providers::model::{AppKind, ProviderType};
-use crate::domain::providers::store::ProviderStore;
-use crate::domain::usage::pricing::{
-    calculate_cost, pricing_for_model_with_store, pricing_scope_matches, CostBreakdown,
-    ModelPricingStore,
-};
 use crate::infra::time::now_ms;
 
 const USAGE_FILE_NAME: &str = "usage-logs.json";
@@ -23,13 +17,20 @@ const MAX_USAGE_LOGS: usize = 2_000;
 const USAGE_ROLLUP_BUCKET_MS: u128 = 60 * 1000;
 const USAGE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 const USAGE_COMPACT_EVERY_EVENTS: u64 = 500;
-const USAGE_JOURNAL_VERSION: u8 = 1;
+const USAGE_SCHEMA_VERSION: u8 = 2;
+const USAGE_JOURNAL_VERSION: u8 = 2;
 const DEFAULT_USAGE_STATS_WINDOW_MS: u128 = 60 * 60 * 1000;
 const DEFAULT_USAGE_STATS_LIMIT: usize = 50;
+
+const fn legacy_usage_schema_version() -> u8 {
+    1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageStore {
+    #[serde(default = "legacy_usage_schema_version")]
+    pub schema_version: u8,
     #[serde(default)]
     pub logs: Vec<UsageLog>,
     #[serde(default, skip)]
@@ -69,8 +70,10 @@ impl Default for UsageStore {
     fn default() -> Self {
         let checkpoint = UsageJournalCheckpoint::new();
         Self {
+            schema_version: USAGE_SCHEMA_VERSION,
             logs: Vec::new(),
             rollups: UsageRollupStore {
+                schema_version: USAGE_SCHEMA_VERSION,
                 buckets: BTreeMap::new(),
                 journal_checkpoint: Some(checkpoint.clone()),
             },
@@ -100,10 +103,6 @@ pub struct UsageLog {
     pub actual_model: Option<String>,
     #[serde(default)]
     pub actual_model_source: Option<String>,
-    #[serde(default)]
-    pub pricing_model: Option<String>,
-    #[serde(default)]
-    pub cost_multiplier: Option<f64>,
     pub status_code: u16,
     #[serde(default)]
     pub error_message: Option<String>,
@@ -112,8 +111,6 @@ pub struct UsageLog {
     pub first_token_ms: Option<u128>,
     #[serde(default)]
     pub raw_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub billed_input_tokens: Option<u64>,
     #[serde(default)]
     pub input_tokens: Option<u64>,
     #[serde(default)]
@@ -124,16 +121,6 @@ pub struct UsageLog {
     pub cache_creation_tokens: Option<u64>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
-    #[serde(default)]
-    pub input_cost_usd: Option<f64>,
-    #[serde(default)]
-    pub output_cost_usd: Option<f64>,
-    #[serde(default)]
-    pub cache_read_cost_usd: Option<f64>,
-    #[serde(default)]
-    pub cache_creation_cost_usd: Option<f64>,
-    #[serde(default)]
-    pub total_cost_usd: Option<f64>,
     #[serde(default)]
     pub share_id: Option<String>,
     #[serde(default)]
@@ -189,10 +176,19 @@ impl UsageStore {
         } else {
             Self::default()
         };
+        let snapshot_needs_migration = store.schema_version < USAGE_SCHEMA_VERSION;
         let journal = load_usage_journal(&jsonl_path)?;
-        let loaded_rollups = load_usage_rollups(config_dir)?;
+        let journal_needs_migration = journal.needs_migration();
+        let mut loaded_rollups = load_usage_rollups(config_dir)?;
+        let rollups_need_migration = loaded_rollups
+            .as_ref()
+            .is_some_and(|rollups| rollups.schema_version < USAGE_SCHEMA_VERSION);
+        let normalized_rollups = loaded_rollups
+            .as_mut()
+            .is_some_and(UsageRollupStore::normalize_keys);
 
         if !snapshot_exists {
+            store.schema_version = USAGE_SCHEMA_VERSION;
             for entry in &journal.entries {
                 store.push_log_only(entry.log().clone());
             }
@@ -203,20 +199,26 @@ impl UsageStore {
             store.writes_since_compact = 0;
             store.save_rollups(config_dir)?;
             store.save_recent_snapshot(config_dir)?;
+            if !journal.entries.is_empty() {
+                truncate_usage_journal(config_dir)?;
+            }
             return Ok(store);
         }
 
         let Some(snapshot_checkpoint) = store.journal_checkpoint.clone() else {
             let recovered = recover_unambiguous_legacy_journal_tail(&mut store, &journal);
             store.trim_recent_window();
+            store.schema_version = USAGE_SCHEMA_VERSION;
             let checkpoint = UsageJournalCheckpoint::new();
             store.journal_checkpoint = Some(checkpoint.clone());
             store.rollups = loaded_rollups
                 .unwrap_or_else(|| rebuild_usage_rollups(&store.logs, checkpoint.clone()));
+            store.rollups.schema_version = USAGE_SCHEMA_VERSION;
             store.rollups.journal_checkpoint = Some(checkpoint);
             store.writes_since_compact = 0;
             store.save_rollups(config_dir)?;
             store.save_recent_snapshot(config_dir)?;
+            truncate_usage_journal(config_dir)?;
             if !journal.entries.is_empty() {
                 tracing::warn!(
                     recovered,
@@ -232,6 +234,21 @@ impl UsageStore {
             compatible_usage_rollups(&store.logs, &snapshot_checkpoint, loaded_rollups, &journal);
         let replayed = replay_versioned_usage_journal(&mut store, &journal, &snapshot_checkpoint);
         store.writes_since_compact = replayed as u64;
+        let normalized_active_rollups = store.rollups.normalize_keys();
+        let needs_migration = snapshot_needs_migration
+            || journal_needs_migration
+            || rollups_need_migration
+            || normalized_rollups
+            || normalized_active_rollups;
+        store.schema_version = USAGE_SCHEMA_VERSION;
+        store.rollups.schema_version = USAGE_SCHEMA_VERSION;
+        if needs_migration {
+            store.save_rollups(config_dir)?;
+            store.save_recent_snapshot(config_dir)?;
+            truncate_usage_journal(config_dir)?;
+            store.writes_since_compact = 0;
+            tracing::info!("migrated usage storage to token-only schema");
+        }
         Ok(store)
     }
 
@@ -408,7 +425,6 @@ impl UsageStore {
             rollup.cache_read_tokens += log.cache_read_tokens.unwrap_or(0);
             rollup.cache_creation_tokens += log.cache_creation_tokens.unwrap_or(0);
             rollup.total_tokens += log.total_tokens.unwrap_or(0);
-            rollup.total_cost_usd += log.total_cost_usd.unwrap_or(0.0);
         }
         rollup
     }
@@ -429,6 +445,9 @@ impl UsageStore {
     }
 
     pub fn summary_by_app(&self, query: &UsageStatsFilter) -> Vec<serde_json::Value> {
+        if self.rollups.has_data() {
+            return self.rollups.summary_by_app(query);
+        }
         let mut by_app = BTreeMap::<String, UsageRollup>::new();
         for log in self
             .logs
@@ -437,29 +456,7 @@ impl UsageStore {
         {
             add_log_to_rollup(by_app.entry(log.app.as_str().to_string()).or_default(), log);
         }
-        let mut items = by_app
-            .into_iter()
-            .map(|(app_type, rollup)| {
-                let summary = usage_summary_view(&rollup);
-                (app_type, summary)
-            })
-            .filter(|(_, summary)| {
-                summary["totalRequests"].as_u64().unwrap_or(0) > 0
-                    || summary["realTotalTokens"].as_u64().unwrap_or(0) > 0
-            })
-            .map(|(app_type, summary)| {
-                serde_json::json!({
-                    "appType": app_type,
-                    "summary": summary,
-                })
-            })
-            .collect::<Vec<_>>();
-        items.sort_by(|left, right| {
-            let left_tokens = left["summary"]["realTotalTokens"].as_u64().unwrap_or(0);
-            let right_tokens = right["summary"]["realTotalTokens"].as_u64().unwrap_or(0);
-            right_tokens.cmp(&left_tokens)
-        });
-        items
+        usage_summary_by_app_items(by_app)
     }
 
     pub fn trends(&self, query: &UsageStatsFilter) -> Vec<UsageTrendPoint> {
@@ -534,8 +531,7 @@ impl UsageStore {
             .filter(|log| matches_stats_filter(log, query))
         {
             let model = usage_model_key(log);
-            let pricing_model = log.pricing_model.clone().unwrap_or_default();
-            let key = format!("{}:{model}:{pricing_model}", log.app.as_str());
+            let key = format!("{}:{model}", log.app.as_str());
             groups
                 .entry(key)
                 .or_insert_with(|| ModelUsageAccumulator::new(log, model))
@@ -556,68 +552,6 @@ impl UsageStore {
             .rev()
             .find(|log| log.request_id == request_id)
             .cloned()
-    }
-
-    pub fn backfill_costs(
-        &mut self,
-        providers: &ProviderStore,
-        pricing_store: &ModelPricingStore,
-    ) -> usize {
-        let mut updated = 0;
-        for log in &mut self.logs {
-            if !needs_cost_backfill(log) {
-                continue;
-            }
-            let previous = log.clone();
-            if backfill_log_cost(log, providers, pricing_store) {
-                self.rollups.replace_log(&previous, log);
-                updated += 1;
-            }
-        }
-        updated
-    }
-
-    pub fn backfill_costs_for_model(
-        &mut self,
-        providers: &ProviderStore,
-        pricing_store: &ModelPricingStore,
-        model_id: &str,
-    ) -> usize {
-        let mut updated = 0;
-        for log in &mut self.logs {
-            if !needs_cost_backfill(log) {
-                continue;
-            }
-            if !pricing_scope_matches(
-                [
-                    log.pricing_model.as_deref(),
-                    log.actual_model.as_deref(),
-                    log.requested_model.as_deref(),
-                    log.model.as_deref(),
-                ],
-                model_id,
-            ) {
-                continue;
-            }
-            let previous = log.clone();
-            if backfill_log_cost(log, providers, pricing_store) {
-                self.rollups.replace_log(&previous, log);
-                updated += 1;
-            }
-        }
-        updated
-    }
-
-    pub fn provider_cost_since(&self, app: AppKind, provider_id: &str, start_ms: u128) -> f64 {
-        if self.rollups.has_data() {
-            return self.rollups.provider_cost_since(app, provider_id, start_ms);
-        }
-        self.logs
-            .iter()
-            .filter(|log| log.app == app && log.provider_id == provider_id)
-            .filter(|log| log.created_at_ms >= start_ms)
-            .filter_map(|log| log.total_cost_usd)
-            .sum()
     }
 }
 
@@ -644,6 +578,8 @@ pub struct UsageStatsFilter {
     pub window_ms: Option<u128>,
     pub app: Option<AppKind>,
     pub provider_id: Option<String>,
+    pub provider_name: Option<String>,
+    pub model: Option<String>,
     pub share_id: Option<String>,
     pub user_email: Option<String>,
     pub session_id: Option<String>,
@@ -676,24 +612,16 @@ impl UsageLog {
             requested_model: model.requested_model,
             actual_model: model.actual_model,
             actual_model_source: model.actual_model_source,
-            pricing_model: model.pricing_model,
-            cost_multiplier: None,
             status_code,
             error_message: None,
             duration_ms,
             first_token_ms: None,
             raw_input_tokens: usage.raw_input_tokens,
-            billed_input_tokens: usage.billed_input_tokens,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             total_tokens: usage.total_tokens,
-            input_cost_usd: None,
-            output_cost_usd: None,
-            cache_read_cost_usd: None,
-            cache_creation_cost_usd: None,
-            total_cost_usd: None,
             share_id: None,
             user_email: None,
             data_source: None,
@@ -725,27 +653,6 @@ impl UsageLog {
         self.is_streaming = context.is_streaming;
         self.stream_status = context.stream_status;
     }
-
-    pub fn apply_cost(&mut self, cost: CostBreakdown) {
-        self.cost_multiplier = cost.cost_multiplier;
-        self.input_cost_usd = cost.input_cost_usd;
-        self.output_cost_usd = cost.output_cost_usd;
-        self.cache_read_cost_usd = cost.cache_read_cost_usd;
-        self.cache_creation_cost_usd = cost.cache_creation_cost_usd;
-        self.total_cost_usd = cost.total_cost_usd;
-    }
-
-    pub(crate) fn token_usage(&self) -> TokenUsage {
-        TokenUsage {
-            input_tokens: self.input_tokens,
-            raw_input_tokens: self.raw_input_tokens,
-            billed_input_tokens: self.billed_input_tokens,
-            output_tokens: self.output_tokens,
-            cache_read_tokens: self.cache_read_tokens,
-            cache_creation_tokens: self.cache_creation_tokens,
-            total_tokens: self.total_tokens,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -759,7 +666,6 @@ pub struct UsageRollup {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub total_tokens: u64,
-    pub total_cost_usd: f64,
 }
 
 impl UsageRollup {
@@ -776,22 +682,49 @@ impl UsageRollup {
             .cache_creation_tokens
             .saturating_add(other.cache_creation_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
-        self.total_cost_usd += other.total_cost_usd;
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRollupStore {
+    #[serde(default = "legacy_usage_schema_version")]
+    schema_version: u8,
     #[serde(default)]
     buckets: BTreeMap<String, UsageRollupBucket>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     journal_checkpoint: Option<UsageJournalCheckpoint>,
 }
 
+impl Default for UsageRollupStore {
+    fn default() -> Self {
+        Self {
+            schema_version: USAGE_SCHEMA_VERSION,
+            buckets: BTreeMap::new(),
+            journal_checkpoint: None,
+        }
+    }
+}
+
 impl UsageRollupStore {
     fn has_data(&self) -> bool {
         !self.buckets.is_empty()
+    }
+
+    fn normalize_keys(&mut self) -> bool {
+        let previous = std::mem::take(&mut self.buckets);
+        let mut changed = false;
+        for (previous_key, bucket) in previous {
+            let key = usage_rollup_bucket_key(&bucket);
+            changed |= key != previous_key;
+            if let Some(existing) = self.buckets.get_mut(&key) {
+                existing.merge(bucket);
+                changed = true;
+            } else {
+                self.buckets.insert(key, bucket);
+            }
+        }
+        changed
     }
 
     fn add_log(&mut self, log: &UsageLog) {
@@ -826,6 +759,17 @@ impl UsageRollupStore {
             accumulator.merge(&bucket.stats);
         }
         accumulator.rollup
+    }
+
+    fn summary_by_app(&self, query: &UsageStatsFilter) -> Vec<serde_json::Value> {
+        let mut by_app = BTreeMap::<String, UsageRollup>::new();
+        for bucket in self.buckets.values().filter(|bucket| bucket.matches(query)) {
+            by_app
+                .entry(bucket.app.as_str().to_string())
+                .or_default()
+                .add_assign(&bucket.stats.rollup);
+        }
+        usage_summary_by_app_items(by_app)
     }
 
     fn trends(&self, query: &UsageStatsFilter) -> Vec<UsageTrendPoint> {
@@ -885,12 +829,7 @@ impl UsageRollupStore {
     fn model_stats(&self, query: &UsageStatsFilter) -> Vec<ModelUsageStats> {
         let mut groups = BTreeMap::<String, ModelUsageAccumulator>::new();
         for bucket in self.buckets.values().filter(|bucket| bucket.matches(query)) {
-            let key = format!(
-                "{}:{}:{}",
-                bucket.app.as_str(),
-                bucket.model,
-                bucket.pricing_model.clone().unwrap_or_default()
-            );
+            let key = format!("{}:{}", bucket.app.as_str(), bucket.model);
             groups
                 .entry(key)
                 .or_insert_with(|| {
@@ -900,7 +839,6 @@ impl UsageRollupStore {
                         bucket.requested_model.clone(),
                         bucket.actual_model.clone(),
                         bucket.actual_model_source.clone(),
-                        bucket.pricing_model.clone(),
                     )
                 })
                 .merge(&bucket.stats);
@@ -912,18 +850,6 @@ impl UsageRollupStore {
         sort_model_stats(&mut stats);
         stats.truncate(query.limit.unwrap_or(DEFAULT_USAGE_STATS_LIMIT));
         stats
-    }
-
-    fn provider_cost_since(&self, app: AppKind, provider_id: &str, start_ms: u128) -> f64 {
-        self.buckets
-            .values()
-            .filter(|bucket| {
-                bucket.app == app
-                    && bucket.provider_id == provider_id
-                    && bucket.bucket_start_ms >= start_ms
-            })
-            .map(|bucket| bucket.stats.rollup.total_cost_usd)
-            .sum()
     }
 }
 
@@ -941,7 +867,6 @@ struct UsageRollupBucket {
     requested_model: Option<String>,
     actual_model: Option<String>,
     actual_model_source: Option<String>,
-    pricing_model: Option<String>,
     share_id: Option<String>,
     user_email: Option<String>,
     session_id: Option<String>,
@@ -967,7 +892,6 @@ impl UsageRollupBucket {
             requested_model: log.requested_model.clone(),
             actual_model: log.actual_model.clone(),
             actual_model_source: log.actual_model_source.clone(),
-            pricing_model: log.pricing_model.clone(),
             share_id: log.share_id.clone(),
             user_email: log.user_email.clone(),
             session_id: log.session_id.clone(),
@@ -989,6 +913,23 @@ impl UsageRollupBucket {
         self.stats.remove(log);
     }
 
+    fn merge(&mut self, other: Self) {
+        self.bucket_end_ms = self.bucket_end_ms.max(other.bucket_end_ms);
+        if self.provider_name.is_empty() {
+            self.provider_name = other.provider_name;
+        }
+        if self.requested_model.is_none() {
+            self.requested_model = other.requested_model;
+        }
+        if self.actual_model.is_none() {
+            self.actual_model = other.actual_model;
+        }
+        if self.actual_model_source.is_none() {
+            self.actual_model_source = other.actual_model_source;
+        }
+        self.stats.merge(&other.stats);
+    }
+
     fn matches(&self, query: &UsageStatsFilter) -> bool {
         query.from_ms.is_none_or(|from| self.bucket_end_ms > from)
             && query.to_ms.is_none_or(|to| self.bucket_start_ms <= to)
@@ -997,6 +938,14 @@ impl UsageRollupBucket {
                 .provider_id
                 .as_deref()
                 .is_none_or(|provider_id| self.provider_id == provider_id)
+            && query
+                .provider_name
+                .as_deref()
+                .is_none_or(|provider_name| self.provider_name == provider_name)
+            && query
+                .model
+                .as_deref()
+                .is_none_or(|model| self.model == model)
             && query
                 .share_id
                 .as_deref()
@@ -1055,7 +1004,6 @@ pub struct ModelUsageStats {
     pub requested_model: Option<String>,
     pub actual_model: Option<String>,
     pub actual_model_source: Option<String>,
-    pub pricing_model: Option<String>,
     pub rollup: UsageRollup,
     pub avg_duration_ms: Option<f64>,
     pub avg_first_token_ms: Option<f64>,
@@ -1068,13 +1016,11 @@ pub struct UsageModelMetadata {
     pub requested_model: Option<String>,
     pub actual_model: Option<String>,
     pub actual_model_source: Option<String>,
-    pub pricing_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenUsage {
     pub raw_input_tokens: Option<u64>,
-    pub billed_input_tokens: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
@@ -1200,14 +1146,14 @@ pub fn usage_from_json_with_semantics(
     let cache_total = cache_read_tokens
         .unwrap_or(0)
         .saturating_add(cache_creation_tokens.unwrap_or(0));
-    let (input_tokens, raw_input_tokens, billed_input_tokens) = match semantics {
+    let (input_tokens, raw_input_tokens) = match semantics {
         InputTokenSemantics::Inclusive => {
             let fresh = input_tokens.map(|input| input.saturating_sub(cache_total));
-            (fresh, input_tokens, fresh)
+            (fresh, input_tokens)
         }
         InputTokenSemantics::Exclusive | InputTokenSemantics::Auto => {
             let raw = input_tokens.map(|input| input.saturating_add(cache_total));
-            (input_tokens, raw, input_tokens)
+            (input_tokens, raw)
         }
     };
     let total_tokens = first_u64(usage, &["total_tokens", "totalTokens", "totalTokenCount"])
@@ -1224,7 +1170,6 @@ pub fn usage_from_json_with_semantics(
     TokenUsage {
         input_tokens,
         raw_input_tokens,
-        billed_input_tokens,
         output_tokens,
         cache_read_tokens,
         cache_creation_tokens,
@@ -1294,6 +1239,14 @@ fn matches_stats_filter(log: &UsageLog, query: &UsageStatsFilter) -> bool {
             .as_deref()
             .is_none_or(|provider_id| log.provider_id == provider_id)
         && query
+            .provider_name
+            .as_deref()
+            .is_none_or(|provider_name| log.provider_name == provider_name)
+        && query
+            .model
+            .as_deref()
+            .is_none_or(|model| usage_model_key(log) == model)
+        && query
             .share_id
             .as_deref()
             .is_none_or(|share_id| log.share_id.as_deref() == Some(share_id))
@@ -1337,7 +1290,6 @@ fn usage_summary_view(rollup: &UsageRollup) -> serde_json::Value {
         + rollup.cache_read_tokens;
     serde_json::json!({
         "totalRequests": rollup.requests,
-        "totalCost": format!("{:.6}", rollup.total_cost_usd),
         "totalInputTokens": rollup.input_tokens,
         "totalOutputTokens": rollup.output_tokens,
         "totalCacheCreationTokens": rollup.cache_creation_tokens,
@@ -1346,6 +1298,32 @@ fn usage_summary_view(rollup: &UsageRollup) -> serde_json::Value {
         "realTotalTokens": real_total_tokens,
         "cacheHitRate": cache_hit_rate,
     })
+}
+
+fn usage_summary_by_app_items(by_app: BTreeMap<String, UsageRollup>) -> Vec<serde_json::Value> {
+    let mut items = by_app
+        .into_iter()
+        .map(|(app_type, rollup)| {
+            let summary = usage_summary_view(&rollup);
+            (app_type, summary)
+        })
+        .filter(|(_, summary)| {
+            summary["totalRequests"].as_u64().unwrap_or(0) > 0
+                || summary["realTotalTokens"].as_u64().unwrap_or(0) > 0
+        })
+        .map(|(app_type, summary)| {
+            serde_json::json!({
+                "appType": app_type,
+                "summary": summary,
+            })
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        let left_tokens = left["summary"]["realTotalTokens"].as_u64().unwrap_or(0);
+        let right_tokens = right["summary"]["realTotalTokens"].as_u64().unwrap_or(0);
+        right_tokens.cmp(&left_tokens)
+    });
+    items
 }
 
 fn add_log_to_rollup(rollup: &mut UsageRollup, log: &UsageLog) {
@@ -1360,7 +1338,6 @@ fn add_log_to_rollup(rollup: &mut UsageRollup, log: &UsageLog) {
     rollup.cache_read_tokens += log.cache_read_tokens.unwrap_or(0);
     rollup.cache_creation_tokens += log.cache_creation_tokens.unwrap_or(0);
     rollup.total_tokens += log.total_tokens.unwrap_or(0);
-    rollup.total_cost_usd += log.total_cost_usd.unwrap_or(0.0);
 }
 
 fn subtract_log_from_rollup(rollup: &mut UsageRollup, log: &UsageLog) {
@@ -1385,7 +1362,6 @@ fn subtract_log_from_rollup(rollup: &mut UsageRollup, log: &UsageLog) {
     rollup.total_tokens = rollup
         .total_tokens
         .saturating_sub(log.total_tokens.unwrap_or(0));
-    rollup.total_cost_usd = (rollup.total_cost_usd - log.total_cost_usd.unwrap_or(0.0)).max(0.0);
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1521,7 +1497,6 @@ struct ModelUsageAccumulator {
     requested_model: Option<String>,
     actual_model: Option<String>,
     actual_model_source: Option<String>,
-    pricing_model: Option<String>,
     stats: UsageStatsAccumulator,
 }
 
@@ -1532,7 +1507,6 @@ impl ModelUsageAccumulator {
         requested_model: Option<String>,
         actual_model: Option<String>,
         actual_model_source: Option<String>,
-        pricing_model: Option<String>,
     ) -> Self {
         Self {
             app,
@@ -1540,7 +1514,6 @@ impl ModelUsageAccumulator {
             requested_model,
             actual_model,
             actual_model_source,
-            pricing_model,
             stats: UsageStatsAccumulator::default(),
         }
     }
@@ -1552,7 +1525,6 @@ impl ModelUsageAccumulator {
             log.requested_model.clone(),
             log.actual_model.clone(),
             log.actual_model_source.clone(),
-            log.pricing_model.clone(),
         )
     }
 
@@ -1570,10 +1542,6 @@ impl ModelUsageAccumulator {
             .actual_model_source
             .clone()
             .or_else(|| log.actual_model_source.clone());
-        self.pricing_model = self
-            .pricing_model
-            .clone()
-            .or_else(|| log.pricing_model.clone());
     }
 
     fn merge(&mut self, stats: &UsageStatsAccumulator) {
@@ -1589,7 +1557,6 @@ impl ModelUsageAccumulator {
             requested_model: self.requested_model,
             actual_model: self.actual_model,
             actual_model_source: self.actual_model_source,
-            pricing_model: self.pricing_model,
             rollup: self.stats.rollup,
             avg_duration_ms,
             avg_first_token_ms,
@@ -1603,7 +1570,6 @@ fn usage_model_key(log: &UsageLog) -> String {
         .as_deref()
         .or(log.requested_model.as_deref())
         .or(log.model.as_deref())
-        .or(log.pricing_model.as_deref())
         .unwrap_or("unknown")
         .to_string()
 }
@@ -1616,7 +1582,6 @@ fn usage_rollup_key(log: &UsageLog) -> String {
         log.provider_id.clone(),
         log.provider_type.as_str().to_string(),
         usage_model_key(log),
-        log.pricing_model.clone().unwrap_or_default(),
         log.share_id.clone().unwrap_or_default(),
         log.user_email.clone().unwrap_or_default(),
         log.session_id.clone().unwrap_or_default(),
@@ -1627,50 +1592,29 @@ fn usage_rollup_key(log: &UsageLog) -> String {
     .join("\u{1f}")
 }
 
-fn effective_pricing_model(log: &UsageLog) -> Option<&str> {
-    log.pricing_model
-        .as_deref()
-        .or(log.actual_model.as_deref())
-        .or(log.requested_model.as_deref())
-        .or(log.model.as_deref())
-}
-
-fn needs_cost_backfill(log: &UsageLog) -> bool {
-    let has_usage = log.input_tokens.unwrap_or(0)
-        + log.output_tokens.unwrap_or(0)
-        + log.cache_read_tokens.unwrap_or(0)
-        + log.cache_creation_tokens.unwrap_or(0)
-        > 0;
-    has_usage && log.total_cost_usd.unwrap_or(0.0) == 0.0
-}
-
-fn backfill_log_cost(
-    log: &mut UsageLog,
-    providers: &ProviderStore,
-    pricing_store: &ModelPricingStore,
-) -> bool {
-    let Some(provider) = providers
-        .providers
-        .iter()
-        .find(|provider| provider.app == log.app && provider.provider.id == log.provider_id)
-    else {
-        return false;
-    };
-    let Some(pricing) = pricing_for_model_with_store(
-        &provider.provider,
-        Some(pricing_store),
-        effective_pricing_model(log),
-    ) else {
-        return false;
-    };
-    let previous = log.total_cost_usd;
-    log.apply_cost(calculate_cost(log.token_usage(), pricing));
-    log.total_cost_usd != previous
+fn usage_rollup_bucket_key(bucket: &UsageRollupBucket) -> String {
+    [
+        bucket.bucket_start_ms.to_string(),
+        bucket.app.as_str().to_string(),
+        bucket.provider_id.clone(),
+        bucket.provider_type.as_str().to_string(),
+        bucket.model.clone(),
+        bucket.share_id.clone().unwrap_or_default(),
+        bucket.user_email.clone().unwrap_or_default(),
+        bucket.session_id.clone().unwrap_or_default(),
+        bucket.data_source.clone().unwrap_or_default(),
+        bucket.is_health_check.to_string(),
+        bucket.stream_status.clone().unwrap_or_default(),
+    ]
+    .join("\u{1f}")
 }
 
 fn sort_provider_stats(stats: &mut [ProviderUsageStats]) {
     stats.sort_by(|left, right| {
-        compare_cost_desc(left.rollup.total_cost_usd, right.rollup.total_cost_usd)
+        right
+            .rollup
+            .total_tokens
+            .cmp(&left.rollup.total_tokens)
             .then(right.rollup.requests.cmp(&left.rollup.requests))
             .then(left.app.as_str().cmp(right.app.as_str()))
             .then(left.provider_id.cmp(&right.provider_id))
@@ -1679,15 +1623,14 @@ fn sort_provider_stats(stats: &mut [ProviderUsageStats]) {
 
 fn sort_model_stats(stats: &mut [ModelUsageStats]) {
     stats.sort_by(|left, right| {
-        compare_cost_desc(left.rollup.total_cost_usd, right.rollup.total_cost_usd)
+        right
+            .rollup
+            .total_tokens
+            .cmp(&left.rollup.total_tokens)
             .then(right.rollup.requests.cmp(&left.rollup.requests))
             .then(left.app.as_str().cmp(right.app.as_str()))
             .then(left.model.cmp(&right.model))
     });
-}
-
-fn compare_cost_desc(left: f64, right: f64) -> Ordering {
-    right.partial_cmp(&left).unwrap_or(Ordering::Equal)
 }
 
 fn limit_latest_points(points: &mut Vec<UsageTrendPoint>, limit: Option<usize>) {
@@ -1728,6 +1671,15 @@ struct LoadedUsageJournal {
     entries: Vec<LoadedUsageJournalEntry>,
 }
 
+impl LoadedUsageJournal {
+    fn needs_migration(&self) -> bool {
+        self.entries.iter().any(|entry| match entry {
+            LoadedUsageJournalEntry::Legacy(_) => true,
+            LoadedUsageJournalEntry::Versioned(record) => record.version < USAGE_JOURNAL_VERSION,
+        })
+    }
+}
+
 #[derive(Debug)]
 enum LoadedUsageJournalEntry {
     Legacy(UsageLog),
@@ -1758,7 +1710,7 @@ fn load_usage_journal(path: &Path) -> anyhow::Result<LoadedUsageJournal> {
             continue;
         }
         if let Ok(record) = serde_json::from_str::<UsageJournalRecord>(line) {
-            if record.version == USAGE_JOURNAL_VERSION {
+            if (1..=USAGE_JOURNAL_VERSION).contains(&record.version) {
                 journal
                     .entries
                     .push(LoadedUsageJournalEntry::Versioned(record));
@@ -1820,6 +1772,7 @@ fn rebuild_usage_rollups(
     checkpoint: UsageJournalCheckpoint,
 ) -> UsageRollupStore {
     let mut rollups = UsageRollupStore {
+        schema_version: USAGE_SCHEMA_VERSION,
         buckets: BTreeMap::new(),
         journal_checkpoint: Some(checkpoint),
     };
@@ -1990,7 +1943,6 @@ mod tests {
         }));
         assert_eq!(anthropic.input_tokens, Some(7));
         assert_eq!(anthropic.raw_input_tokens, Some(7));
-        assert_eq!(anthropic.billed_input_tokens, Some(7));
         assert_eq!(anthropic.output_tokens, Some(3));
         assert_eq!(anthropic.total_tokens, Some(10));
     }
@@ -2009,7 +1961,6 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, Some(50));
         assert_eq!(usage.cache_creation_tokens, Some(5));
         assert_eq!(usage.raw_input_tokens, Some(155));
-        assert_eq!(usage.billed_input_tokens, Some(100));
         assert_eq!(usage.input_tokens, Some(100));
         assert_eq!(usage.total_tokens, Some(175));
     }
@@ -2072,7 +2023,6 @@ mod tests {
         for usage in [inclusive, exclusive] {
             assert_eq!(usage.input_tokens, Some(20));
             assert_eq!(usage.raw_input_tokens, Some(100));
-            assert_eq!(usage.billed_input_tokens, Some(20));
             assert_eq!(usage.cache_read_tokens, Some(60));
             assert_eq!(usage.cache_creation_tokens, Some(20));
             assert_eq!(usage.total_tokens, Some(108));
@@ -2092,7 +2042,6 @@ mod tests {
         }));
         assert_eq!(claude.input_tokens, Some(100));
         assert_eq!(claude.raw_input_tokens, Some(160));
-        assert_eq!(claude.billed_input_tokens, Some(100));
         assert_eq!(claude.output_tokens, Some(20));
 
         let codex = usage_from_json(&json!({
@@ -2109,7 +2058,6 @@ mod tests {
         }));
         assert_eq!(codex.input_tokens, Some(50));
         assert_eq!(codex.cache_read_tokens, Some(30));
-        assert_eq!(codex.billed_input_tokens, Some(50));
     }
 
     #[test]
@@ -2145,7 +2093,6 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(9));
         assert_eq!(usage.cache_read_tokens, Some(70));
         assert_eq!(usage.cache_creation_tokens, Some(3));
-        assert_eq!(usage.billed_input_tokens, Some(120));
         assert_eq!(usage.raw_input_tokens, Some(193));
     }
 
@@ -2165,7 +2112,6 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(15));
         assert_eq!(usage.output_tokens, Some(6));
         assert_eq!(usage.cache_read_tokens, Some(25));
-        assert_eq!(usage.billed_input_tokens, Some(15));
         assert_eq!(usage.total_tokens, Some(46));
     }
 
@@ -2335,11 +2281,9 @@ mod tests {
                 requested_model: Some("gpt-5.5".to_string()),
                 actual_model: Some("glm-5.2".to_string()),
                 actual_model_source: Some("model_mapping".to_string()),
-                pricing_model: Some("glm-5.2".to_string()),
             },
             TokenUsage {
                 raw_input_tokens: Some(175_000),
-                billed_input_tokens: Some(175_000),
                 input_tokens: Some(175_000),
                 output_tokens: Some(18),
                 cache_read_tokens: Some(0),
@@ -2378,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn token_total_uses_raw_input_plus_output_and_preserves_billed_input() {
+    fn token_total_uses_raw_input_plus_output() {
         let usage = usage_from_json(&json!({
             "usage": {
                 "input_tokens": 156_605,
@@ -2392,7 +2336,6 @@ mod tests {
         assert_eq!(usage.raw_input_tokens, Some(156_605));
         assert_eq!(usage.input_tokens, Some(6_605));
         assert_eq!(usage.cache_read_tokens, Some(150_000));
-        assert_eq!(usage.billed_input_tokens, Some(6_605));
         assert_eq!(usage.output_tokens, Some(18));
         assert_eq!(usage.total_tokens, Some(156_623));
     }
@@ -2411,11 +2354,9 @@ mod tests {
                 requested_model: Some("gpt-5.5".to_string()),
                 actual_model: Some("glm-5.2".to_string()),
                 actual_model_source: Some("model_mapping".to_string()),
-                pricing_model: Some("glm-5.2".to_string()),
             },
             TokenUsage {
                 raw_input_tokens: Some(100),
-                billed_input_tokens: Some(40),
                 input_tokens: Some(100),
                 output_tokens: Some(10),
                 cache_read_tokens: Some(60),
@@ -2449,7 +2390,6 @@ mod tests {
 
         assert_eq!(health_checks.len(), 1);
         assert_eq!(health_checks[0].actual_model.as_deref(), Some("glm-5.2"));
-        assert_eq!(health_checks[0].billed_input_tokens, Some(40));
         assert_eq!(health_checks[0].cache_read_tokens, Some(60));
     }
 
@@ -2467,7 +2407,6 @@ mod tests {
                 requested_model: Some("gpt-5.5".to_string()),
                 actual_model: Some("glm-5.2".to_string()),
                 actual_model_source: Some("model_mapping".to_string()),
-                pricing_model: Some("glm-5.2-priced".to_string()),
             },
             TokenUsage {
                 input_tokens: Some(10),
@@ -2478,7 +2417,6 @@ mod tests {
         );
         codex.request_id = "req_codex".to_string();
         codex.created_at_ms = 10_000;
-        codex.total_cost_usd = Some(0.02);
         codex.first_token_ms = Some(25);
         codex.data_source = Some("direct".to_string());
 
@@ -2494,7 +2432,6 @@ mod tests {
                 requested_model: Some("claude-sonnet".to_string()),
                 actual_model: None,
                 actual_model_source: None,
-                pricing_model: Some("sonnet-priced".to_string()),
             },
             TokenUsage {
                 input_tokens: Some(20),
@@ -2505,7 +2442,6 @@ mod tests {
         );
         claude.request_id = "req_claude".to_string();
         claude.created_at_ms = 20_000;
-        claude.total_cost_usd = Some(0.03);
         claude.data_source = Some("market".to_string());
 
         let store = UsageStore {
@@ -2528,7 +2464,7 @@ mod tests {
         let trends = store.trends(&filter);
         assert_eq!(trends.len(), 1);
         assert_eq!(trends[0].start_ms, 10_000);
-        assert_eq!(trends[0].rollup.total_cost_usd, 0.02);
+        assert_eq!(trends[0].rollup.total_tokens, 15);
 
         let providers = store.provider_stats(&filter);
         assert_eq!(providers.len(), 1);
@@ -2538,14 +2474,14 @@ mod tests {
         let models = store.model_stats(&filter);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model, "glm-5.2");
-        assert_eq!(models[0].pricing_model.as_deref(), Some("glm-5.2-priced"));
+        assert_eq!(models[0].rollup.total_tokens, 15);
 
         let detail = store.request_detail("req_codex").unwrap();
         assert_eq!(detail.actual_model.as_deref(), Some("glm-5.2"));
     }
 
     #[test]
-    fn rollups_keep_monthly_cost_after_recent_window_trims() {
+    fn rollups_keep_token_totals_after_recent_window_trims() {
         let mut store = UsageStore::default();
         for index in 0..3_000 {
             let mut log = UsageLog::new(
@@ -2560,7 +2496,6 @@ mod tests {
                     requested_model: Some("gpt-5.5".to_string()),
                     actual_model: Some("gpt-5.5".to_string()),
                     actual_model_source: Some("test".to_string()),
-                    pricing_model: Some("gpt-5.5".to_string()),
                 },
                 TokenUsage {
                     input_tokens: Some(1),
@@ -2571,7 +2506,6 @@ mod tests {
             );
             log.request_id = format!("req_{index}");
             log.created_at_ms = 1_000_000 + index;
-            log.total_cost_usd = Some(0.01);
             store.push(log);
         }
 
@@ -2584,8 +2518,10 @@ mod tests {
         };
         let summary = store.rollup_filtered(&filter);
         assert_eq!(summary.requests, 3_000);
-        assert!((summary.total_cost_usd - 30.0).abs() < 0.000_001);
-        assert!((store.provider_cost_since(AppKind::Codex, "p1", 0) - 30.0).abs() < 0.000_001);
+        assert_eq!(summary.total_tokens, 6_000);
+        let by_app = store.summary_by_app(&filter);
+        assert_eq!(by_app[0]["summary"]["totalRequests"], 3_000);
+        assert_eq!(by_app[0]["summary"]["realTotalTokens"], 6_000);
     }
 
     #[test]
@@ -2710,7 +2646,7 @@ mod tests {
         let disk_snapshot = fs::read_to_string(usage_path(&dir)).unwrap();
         assert!(!disk_snapshot.contains("req_replay_first"));
         let journal = fs::read_to_string(usage_jsonl_path(&dir)).unwrap();
-        assert!(journal.contains("\"version\":1"));
+        assert!(journal.contains("\"version\":2"));
         assert!(journal.contains("\"sequence\":3"));
 
         let loaded = UsageStore::load_or_default(&dir).unwrap();
@@ -2809,6 +2745,126 @@ mod tests {
             .logs
             .iter()
             .any(|log| log.request_id == "req_post_migration"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn token_only_migration_strips_cost_fields_and_merges_pricing_buckets() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-usage-token-only-migration-test-{}",
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let legacy_log = json!({
+            "requestId": "req_legacy_cost",
+            "app": "codex",
+            "providerId": "p1",
+            "providerName": "provider 1",
+            "providerType": "codex",
+            "model": "gpt-5.5",
+            "requestedModel": "gpt-5.5",
+            "actualModel": "gpt-5.5",
+            "actualModelSource": "response",
+            "pricingModel": "priced-a",
+            "costMultiplier": 1.5,
+            "statusCode": 200,
+            "durationMs": 10,
+            "rawInputTokens": 7,
+            "billedInputTokens": 7,
+            "inputTokens": 7,
+            "outputTokens": 3,
+            "cacheReadTokens": 0,
+            "cacheCreationTokens": 0,
+            "totalTokens": 10,
+            "inputCostUsd": 0.01,
+            "outputCostUsd": 0.02,
+            "totalCostUsd": 0.03,
+            "isHealthCheck": false,
+            "isStreaming": false,
+            "routerSyncAttemptCount": 0,
+            "createdAtMs": 1_000
+        });
+        fs::write(
+            usage_path(&dir),
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 1,
+                "logs": [legacy_log]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let bucket = |pricing_model: &str, requests: u64, total_tokens: u64| {
+            json!({
+                "bucketStartMs": 0,
+                "bucketEndMs": 60_000,
+                "dayStartMs": 0,
+                "app": "codex",
+                "providerId": "p1",
+                "providerName": "provider 1",
+                "providerType": "codex",
+                "model": "gpt-5.5",
+                "requestedModel": "gpt-5.5",
+                "actualModel": "gpt-5.5",
+                "actualModelSource": "response",
+                "pricingModel": pricing_model,
+                "isHealthCheck": false,
+                "stats": {
+                    "rollup": {
+                        "requests": requests,
+                        "successes": requests,
+                        "failures": 0,
+                        "inputTokens": total_tokens,
+                        "outputTokens": 0,
+                        "cacheReadTokens": 0,
+                        "cacheCreationTokens": 0,
+                        "totalTokens": total_tokens,
+                        "totalCostUsd": 99.0
+                    },
+                    "duration_sum_ms": requests * 10,
+                    "duration_count": requests,
+                    "first_token_sum_ms": 0,
+                    "first_token_count": 0,
+                    "last_request_at_ms": 1_000
+                }
+            })
+        };
+        fs::write(
+            usage_rollups_path(&dir),
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 1,
+                "buckets": {
+                    "legacy-priced-a": bucket("priced-a", 2, 20),
+                    "legacy-priced-b": bucket("priced-b", 3, 30)
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = UsageStore::load_or_default(&dir).unwrap();
+        assert_eq!(loaded.schema_version, USAGE_SCHEMA_VERSION);
+        assert_eq!(loaded.rollups.schema_version, USAGE_SCHEMA_VERSION);
+        assert_eq!(loaded.rollups.buckets.len(), 1);
+        let rollup = loaded.rollup();
+        assert_eq!(rollup.requests, 5);
+        assert_eq!(rollup.total_tokens, 50);
+
+        let snapshot = fs::read_to_string(usage_path(&dir)).unwrap();
+        let rollups = fs::read_to_string(usage_rollups_path(&dir)).unwrap();
+        for obsolete in [
+            "pricingModel",
+            "costMultiplier",
+            "billedInputTokens",
+            "inputCostUsd",
+            "outputCostUsd",
+            "totalCostUsd",
+        ] {
+            assert!(!snapshot.contains(obsolete), "snapshot kept {obsolete}");
+            assert!(!rollups.contains(obsolete), "rollups kept {obsolete}");
+        }
 
         fs::remove_dir_all(&dir).unwrap();
     }

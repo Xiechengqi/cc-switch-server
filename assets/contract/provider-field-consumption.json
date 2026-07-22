@@ -4836,63 +4836,6 @@
       "disposition": "migrate"
     },
     {
-      "locator": "provider.meta.costMultiplier",
-      "sourceFormat": "json_pointer",
-      "classification": "control_policy",
-      "secret": false,
-      "reader": [
-        "src/domain/providers/model.rs",
-        "src/proxy/adapters.rs"
-      ],
-      "writer": [
-        "src/api/providers.rs",
-        "src/api/invoke/dispatch.rs",
-        "web-src/src/components/providers/forms/ProviderForm.tsx"
-      ],
-      "targetOwner": "runtime_config",
-      "migration": "typed_s1_extractor",
-      "retirePhase": "phase-10",
-      "disposition": "migrate"
-    },
-    {
-      "locator": "provider.meta.pricingModelSource",
-      "sourceFormat": "json_pointer",
-      "classification": "control_policy",
-      "secret": false,
-      "reader": [
-        "src/domain/providers/model.rs",
-        "src/proxy/adapters.rs"
-      ],
-      "writer": [
-        "src/api/providers.rs",
-        "src/api/invoke/dispatch.rs",
-        "web-src/src/components/providers/forms/ProviderForm.tsx"
-      ],
-      "targetOwner": "runtime_config",
-      "migration": "typed_s1_extractor",
-      "retirePhase": "phase-10",
-      "disposition": "migrate"
-    },
-    {
-      "locator": "provider.meta.quotaDispatchLimitPercent",
-      "sourceFormat": "json_pointer",
-      "classification": "control_policy",
-      "secret": false,
-      "reader": [
-        "src/domain/providers/model.rs",
-        "src/proxy/adapters.rs"
-      ],
-      "writer": [
-        "src/api/providers.rs",
-        "src/api/invoke/dispatch.rs",
-        "web-src/src/components/providers/forms/ProviderForm.tsx"
-      ],
-      "targetOwner": "runtime_config",
-      "migration": "typed_s1_extractor",
-      "retirePhase": "phase-10",
-      "disposition": "migrate"
-    },
-    {
       "locator": "provider.meta.commonConfigEnabled",
       "sourceFormat": "json_pointer",
       "classification": "legacy_ui",

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use axum::http::HeaderMap;
 
-use crate::domain::accounts::store::AccountStore;
+use crate::domain::accounts::store::{active_account_usage_block, AccountStore, AccountUsageBlock};
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::infra::time::now_ms;
@@ -140,7 +140,7 @@ pub(super) fn select_failover_provider(
             || (route == ProxyRoute::ClaudeCountTokens
                 && !provider_supports_claude_count_tokens(&provider))
             || ensure_provider_account_does_not_need_relogin(&provider, accounts).is_err()
-            || ensure_provider_not_rate_limited(&provider, accounts, now).is_err()
+            || ensure_provider_account_usage_available(&provider, accounts, now).is_err()
             || account_concurrency_for_provider(&provider, accounts, account_in_flight)
                 .is_some_and(|selection| selection.current >= selection.max_concurrent)
         {
@@ -298,7 +298,7 @@ fn select_provider_with_optional_filter(
         .cloned()
         .ok_or_else(|| ProxyError::not_found(format!("provider not found: {provider_id}")))?;
     ensure_provider_account_does_not_need_relogin(&provider, accounts)?;
-    ensure_provider_not_rate_limited(&provider, accounts, now)?;
+    ensure_provider_account_usage_available(&provider, accounts, now)?;
     if account_in_flight
         .and_then(|snapshot| account_concurrency_for_provider(&provider, accounts, snapshot))
         .is_some_and(|selection| selection.current >= selection.max_concurrent)
@@ -412,24 +412,27 @@ fn codex_image_generation_provider(provider: &StoredProvider) -> bool {
     }
 }
 
-fn ensure_provider_not_rate_limited(
+pub(super) fn ensure_provider_account_usage_available(
     provider: &StoredProvider,
     accounts: &AccountStore,
     now_ms: u128,
 ) -> Result<(), ProxyError> {
-    if let Some(until) = provider_rate_limited_until(provider, accounts, now_ms) {
+    if let Some(block) = provider_account_usage_block(provider, accounts, now_ms) {
         return Err(ProxyError {
             status: axum::http::StatusCode::TOO_MANY_REQUESTS,
             message: format!(
-                "provider {} account is rate limited until {until}",
-                provider.provider.id
+                "provider {} account is {}: {} until {}",
+                provider.provider.id,
+                block.kind.availability(),
+                block.reason,
+                block.until_ms,
             ),
         });
     }
     Ok(())
 }
 
-fn ensure_provider_account_does_not_need_relogin(
+pub(super) fn ensure_provider_account_does_not_need_relogin(
     provider: &StoredProvider,
     accounts: &AccountStore,
 ) -> Result<(), ProxyError> {
@@ -454,21 +457,12 @@ fn provider_account_needs_relogin(provider: &StoredProvider, accounts: &AccountS
         .is_some_and(|account| account.needs_relogin)
 }
 
-fn provider_rate_limited_until(
+fn provider_account_usage_block(
     provider: &StoredProvider,
     accounts: &AccountStore,
     now_ms: u128,
-) -> Option<i64> {
-    if !matches!(
-        provider.provider_type,
-        ProviderType::ClaudeOAuth
-            | ProviderType::CodexOAuth
-            | ProviderType::GrokOAuth
-            | ProviderType::CursorOAuth
-            | ProviderType::CursorApiKey
-    ) {
-        return None;
-    }
+) -> Option<AccountUsageBlock> {
+    let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
     let account_id = provider
         .provider
         .meta
@@ -477,8 +471,7 @@ fn provider_rate_limited_until(
         .and_then(|binding| binding.account_id.as_deref());
     accounts
         .find_for_provider(provider.provider_type, account_id)
-        .and_then(|account| account.rate_limited_until)
-        .filter(|until| (*until as u128) > now_ms)
+        .and_then(|account| active_account_usage_block(account, now_ms))
 }
 
 #[cfg(test)]
@@ -487,7 +480,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::domain::accounts::store::UpsertAccountInput;
+    use crate::domain::accounts::store::{AccountQuota, AccountQuotaTier, UpsertAccountInput};
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
     use crate::state::AccountInFlightTracker;
 
@@ -616,6 +609,30 @@ mod tests {
             rate_limited_until,
             last_refresh_error: None,
         }
+    }
+
+    fn exhausted_codex_oauth_account(id: &str, now_ms: i64) -> UpsertAccountInput {
+        let mut input = codex_oauth_account(id, None);
+        input.quota_percent = Some(100.0);
+        input.quota = Some(AccountQuota {
+            success: true,
+            credential_message: Some("ChatGPT Plus".to_string()),
+            tiers: vec![AccountQuotaTier {
+                name: "seven_day".to_string(),
+                utilization: Some(1.0),
+                resets_at: Some(now_ms + 7 * 24 * 60 * 60 * 1000),
+                ..Default::default()
+            }],
+            extra_usage: Some(json!({
+                "subscriptionEvidence": {
+                    "usageAllowed": false,
+                    "usageLimitReached": true
+                }
+            })),
+        });
+        input.quota_refreshed_at = Some(now_ms - 5 * 60 * 1000);
+        input.quota_next_refresh_at = Some(now_ms + 25 * 60 * 1000);
+        input
     }
 
     fn cursor_oauth_provider(id: &str, account_id: &str) -> StoredProvider {
@@ -752,6 +769,25 @@ mod tests {
     }
 
     #[test]
+    fn current_quota_exhausted_provider_returns_429_without_fallback() {
+        let now = now_ms() as i64;
+        let store = runtime_store(vec![codex_oauth_provider("p1", "acct-1")]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(exhausted_codex_oauth_account("acct-1", now));
+
+        let error = select_provider(
+            &store,
+            &accounts,
+            AppKind::Codex,
+            &HeaderMap::new(),
+            Some("p1"),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.message.contains("quota_exhausted"));
+    }
+
+    #[test]
     fn current_cursor_provider_respects_account_cooldown() {
         let now = now_ms() as i64;
         let store = runtime_store(vec![
@@ -769,6 +805,23 @@ mod tests {
             Some("p1"),
         )
         .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn account_bound_kiro_provider_respects_account_cooldown() {
+        let now = now_ms() as i64;
+        let mut provider = claude_oauth_provider("kiro", "kiro-acct", None);
+        provider.provider_type = ProviderType::KiroOAuth;
+        provider.provider_type_id = ProviderType::KiroOAuth.as_str().to_string();
+        let mut account = claude_oauth_account("kiro-acct");
+        account.provider_type = ProviderType::KiroOAuth;
+        account.rate_limited_until = Some(now + 60_000);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(account);
+
+        let error = ensure_provider_account_usage_available(&provider, &accounts, now as u128)
+            .expect_err("Kiro account cooldown must be enforced");
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 

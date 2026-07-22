@@ -1112,6 +1112,7 @@ async fn maybe_mark_cursor_rate_limited(
     let until = super::super::grok::retry_after_until_ms(headers, now)
         .or_else(|| cursor_rate_limit_until_from_body(body, now))
         .unwrap_or_else(|| now.saturating_add(60_000));
+    let until = super::super::bounded_upstream_rate_limit_until(now, until);
     let detail = cursor_error_message_from_body(body)
         .map(|message| format!("; {message}"))
         .unwrap_or_default();
@@ -1702,7 +1703,6 @@ fn usage_model_metadata(request: &AdapterRequest) -> UsageModelMetadata {
         requested_model: request.requested_model.clone(),
         actual_model: request.actual_model.clone(),
         actual_model_source: request.actual_model_source.clone(),
-        pricing_model: request.pricing_model.clone(),
     }
 }
 

@@ -32,7 +32,7 @@
 | 状态 | `ServerState.terminal: OpsTerminalManager` |
 | 开关 | `ServerConfig.enable_web_terminal` + `CC_SWITCH_ENABLE_WEB_TERMINAL` |
 | 上下文 | `runtime.enableWebTerminal` |
-| 前端入口 | `ServerDesktopApp.tsx`（Settings 与认证之间） |
+| 前端入口 | `ServerApp.tsx`（Settings 与认证之间） |
 | 前端页 | `web-src/src/components/terminal/TerminalPage.tsx`（lazy + xterm） |
 
 ---

@@ -127,9 +127,6 @@
       }
     }
   },
-  "usage": {
-    "unpriced": "Unpriced"
-  },
   "notifications": {
     "clearCurrentSuccess": "Provider disabled",
     "clearCurrentFailedTitle": "Failed to disable Provider",

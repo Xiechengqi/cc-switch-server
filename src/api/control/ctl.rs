@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::accounts::store::Account;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -328,6 +329,7 @@ pub(crate) async fn refresh_share_usage_item(
         };
     };
     active_account = latest_account;
+    let account_before_refresh = active_account.clone();
     let now = now_ms() as i64;
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
 
@@ -346,15 +348,30 @@ pub(crate) async fn refresh_share_usage_item(
                 }
             }
             Err(error) => {
-                state
+                let updated = state
                     .mutate_accounts_debounced(|accounts| {
                         accounts.mark_native_refresh_failure(
                             &active_account.id,
                             error.message.clone(),
                             error.kind,
-                        );
+                        )
                     })
                     .await;
+                if let Some(updated) = updated {
+                    if let Err(sync_error) = state
+                        .refresh_account_runtime_metadata_if_changed(
+                            &account_before_refresh,
+                            &updated,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            account_id = %active_account.id,
+                            error = %sync_error,
+                            "control OAuth refresh failure Share descriptor sync remains pending"
+                        );
+                    }
+                }
                 return ControlRefreshShareUsageItem {
                     app: app.as_str().to_string(),
                     provider_id: Some(provider_id),
@@ -382,7 +399,6 @@ pub(crate) async fn refresh_share_usage_item(
     .await
     {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
-            let account_before_quota_refresh = active_account.clone();
             let updated = state
                 .mutate_accounts_debounced(|accounts| {
                     accounts.mark_refresh_success(&active_account.id, update)
@@ -390,16 +406,13 @@ pub(crate) async fn refresh_share_usage_item(
                 .await;
             if let Some(ref account) = updated {
                 if let Err(error) = state
-                    .refresh_automatic_subscription_metadata_if_changed(
-                        &account_before_quota_refresh,
-                        account,
-                    )
+                    .refresh_account_runtime_metadata_if_changed(&account_before_refresh, account)
                     .await
                 {
                     tracing::warn!(
                         account_id = %account.id,
                         %error,
-                        "control quota refresh could not persist subscription metadata change"
+                        "control quota refresh could not persist account runtime metadata change"
                     );
                 }
                 state.emit_oauth_quota_updated_event(account, true);
@@ -420,18 +433,45 @@ pub(crate) async fn refresh_share_usage_item(
                 message: updated.map(|_| message),
             }
         }
-        Ok(QuotaRefreshResult::SkippedCooldown { message, .. }) => ControlRefreshShareUsageItem {
-            app: app.as_str().to_string(),
-            provider_id: Some(provider_id),
-            provider_name,
-            auth_provider,
-            account_id: Some(account_id),
-            refreshed: false,
-            error: Some(message),
-            message: None,
-        },
+        Ok(QuotaRefreshResult::SkippedCooldown { message, .. }) => {
+            if let Err(error) = state
+                .refresh_account_runtime_metadata_if_changed(
+                    &account_before_refresh,
+                    &active_account,
+                )
+                .await
+            {
+                tracing::warn!(
+                    account_id = %active_account.id,
+                    %error,
+                    "control OAuth refresh Share descriptor sync remains pending"
+                );
+            }
+            ControlRefreshShareUsageItem {
+                app: app.as_str().to_string(),
+                provider_id: Some(provider_id),
+                provider_name,
+                auth_provider,
+                account_id: Some(account_id),
+                refreshed: false,
+                error: Some(message),
+                message: None,
+            }
+        }
         Err(error) => {
-            mark_quota_refresh_error(state, &active_account.id, &error).await;
+            let updated = mark_quota_refresh_error(state, &active_account.id, &error).await;
+            if let Some(updated) = updated {
+                if let Err(sync_error) = state
+                    .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &updated)
+                    .await
+                {
+                    tracing::warn!(
+                        account_id = %active_account.id,
+                        error = %sync_error,
+                        "control quota refresh failure Share descriptor sync remains pending"
+                    );
+                }
+            }
             ControlRefreshShareUsageItem {
                 app: app.as_str().to_string(),
                 provider_id: Some(provider_id),
@@ -450,7 +490,7 @@ pub(crate) async fn mark_quota_refresh_error(
     state: &ServerState,
     account_id: &str,
     error: &QuotaRefreshFailure,
-) {
+) -> Option<Account> {
     let next_refresh_at = Some(error.next_refresh_at.unwrap_or_else(|| {
         (now_ms() as i64).saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS)
     }));
@@ -463,9 +503,9 @@ pub(crate) async fn mark_quota_refresh_error(
                     last_refresh_error: Some(error.message.clone()),
                     ..Default::default()
                 },
-            );
+            )
         })
-        .await;
+        .await
 }
 
 #[derive(Debug, Deserialize)]

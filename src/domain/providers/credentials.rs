@@ -424,8 +424,6 @@ pub fn zeroize_materialized_provider(provider: &mut Provider) {
     for value in [
         meta.claude_desktop_mode.as_mut(),
         meta.partner_promotion_key.as_mut(),
-        meta.cost_multiplier.as_mut(),
-        meta.pricing_model_source.as_mut(),
         meta.api_format.as_mut(),
         meta.provider_type.as_mut(),
         meta.github_account_id.as_mut(),

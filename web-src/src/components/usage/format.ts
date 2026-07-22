@@ -21,16 +21,6 @@ export function fmtInt(
   return new Intl.NumberFormat(locale).format(Math.trunc(num));
 }
 
-export function fmtUsd(
-  value: unknown,
-  digits: number,
-  fallback: string = "--",
-): string {
-  const num = parseFiniteNumber(value);
-  if (num == null) return fallback;
-  return `$${num.toFixed(digits)}`;
-}
-
 function normalizeLanguageTag(language: string): string {
   return language.toLowerCase().replace(/_/g, "-");
 }

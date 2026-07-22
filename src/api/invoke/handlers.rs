@@ -7,7 +7,7 @@ use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch, ShareUserGrant,
 };
-use crate::domain::usage::store::UsageLog;
+use crate::domain::usage::store::{UsageLog, UsageRollup};
 
 pub(in crate::api) async fn web_provider_health_json(
     state: &ServerState,
@@ -1513,27 +1513,136 @@ pub(in crate::api) fn web_optional_string_any(args: &Value, keys: &[&str]) -> Op
     })
 }
 
-pub(in crate::api) fn web_optional_u128(args: &Value, keys: &[&str]) -> Option<u128> {
-    keys.iter().find_map(|key| {
-        args.get(*key).and_then(|value| {
-            value
-                .as_u64()
-                .map(|number| number as u128)
-                .or_else(|| value.as_i64().map(|number| number.max(0) as u128))
-        })
-    })
-}
-
 pub(in crate::api) fn web_usage_stats_filter_from_args(args: &Value) -> UsageStatsFilter {
     let app = web_optional_string_any(args, &["appType", "app", "app_type"])
         .as_deref()
         .and_then(|value| parse_app_kind(value).ok());
+    let from_ms = web_request_log_date_bound_ms(args, true);
+    let to_ms = web_request_log_date_bound_ms(args, false);
+    let window_ms = web_optional_u64(args, &["windowMs", "window_ms"])
+        .map(u128::from)
+        .or_else(|| {
+            from_ms.zip(to_ms).map(|(from, to)| {
+                if to.saturating_sub(from) <= 24 * 60 * 60 * 1_000 {
+                    60 * 60 * 1_000
+                } else {
+                    24 * 60 * 60 * 1_000
+                }
+            })
+        });
     UsageStatsFilter {
-        from_ms: web_optional_u128(args, &["startDate", "fromMs", "from_ms"]),
-        to_ms: web_optional_u128(args, &["endDate", "toMs", "to_ms"]),
+        from_ms,
+        to_ms,
+        window_ms,
         app,
-        provider_id: web_optional_string_any(args, &["providerName", "providerId", "provider_id"]),
+        provider_id: web_optional_string_any(args, &["providerId", "provider_id"]),
+        provider_name: web_optional_string_any(args, &["providerName", "provider_name"]),
+        model: web_optional_string_any(args, &["model"]),
         ..UsageStatsFilter::default()
+    }
+}
+
+pub(in crate::api) fn web_usage_summary_json(usage: &UsageStore, args: &Value) -> Value {
+    let filter = web_usage_stats_filter_from_args(args);
+    web_usage_rollup_json(&usage.rollup_filtered(&filter))
+}
+
+pub(in crate::api) fn web_usage_trends_json(usage: &UsageStore, args: &Value) -> Value {
+    let filter = web_usage_stats_filter_from_args(args);
+    Value::Array(
+        usage
+            .trends(&filter)
+            .into_iter()
+            .map(|point| {
+                let rollup = &point.rollup;
+                json!({
+                    "date": web_request_log_u128_to_u64(point.start_ms),
+                    "requestCount": rollup.requests,
+                    "totalTokens": web_usage_real_total_tokens(rollup),
+                    "totalInputTokens": rollup.input_tokens,
+                    "totalOutputTokens": rollup.output_tokens,
+                    "totalCacheCreationTokens": rollup.cache_creation_tokens,
+                    "totalCacheReadTokens": rollup.cache_read_tokens,
+                })
+            })
+            .collect(),
+    )
+}
+
+pub(in crate::api) fn web_provider_stats_json(usage: &UsageStore, args: &Value) -> Value {
+    let filter = web_usage_stats_filter_from_args(args);
+    Value::Array(
+        usage
+            .provider_stats(&filter)
+            .into_iter()
+            .map(|stat| {
+                json!({
+                    "providerId": stat.provider_id,
+                    "providerName": stat.provider_name,
+                    "requestCount": stat.rollup.requests,
+                    "totalTokens": web_usage_real_total_tokens(&stat.rollup),
+                    "successRate": web_usage_success_rate(&stat.rollup),
+                    "avgLatencyMs": stat.avg_duration_ms.unwrap_or(0.0).round(),
+                })
+            })
+            .collect(),
+    )
+}
+
+pub(in crate::api) fn web_model_stats_json(usage: &UsageStore, args: &Value) -> Value {
+    let filter = web_usage_stats_filter_from_args(args);
+    Value::Array(
+        usage
+            .model_stats(&filter)
+            .into_iter()
+            .map(|stat| {
+                json!({
+                    "model": stat.model,
+                    "requestCount": stat.rollup.requests,
+                    "totalTokens": web_usage_real_total_tokens(&stat.rollup),
+                    "successRate": web_usage_success_rate(&stat.rollup),
+                    "avgLatencyMs": stat.avg_duration_ms.unwrap_or(0.0).round(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn web_usage_rollup_json(rollup: &UsageRollup) -> Value {
+    let cacheable_input = rollup
+        .input_tokens
+        .saturating_add(rollup.cache_creation_tokens)
+        .saturating_add(rollup.cache_read_tokens);
+    let cache_hit_rate = if cacheable_input > 0 {
+        rollup.cache_read_tokens as f64 / cacheable_input as f64
+    } else {
+        0.0
+    };
+    json!({
+        "totalRequests": rollup.requests,
+        "totalInputTokens": rollup.input_tokens,
+        "totalOutputTokens": rollup.output_tokens,
+        "totalCacheCreationTokens": rollup.cache_creation_tokens,
+        "totalCacheReadTokens": rollup.cache_read_tokens,
+        "successRate": web_usage_success_rate(rollup),
+        "realTotalTokens": web_usage_real_total_tokens(rollup),
+        "cacheHitRate": cache_hit_rate,
+    })
+}
+
+fn web_usage_real_total_tokens(rollup: &UsageRollup) -> u64 {
+    rollup
+        .input_tokens
+        .saturating_add(rollup.output_tokens)
+        .saturating_add(rollup.cache_creation_tokens)
+        .saturating_add(rollup.cache_read_tokens)
+}
+
+fn web_usage_success_rate(rollup: &UsageRollup) -> f64 {
+    if rollup.requests > 0 {
+        rollup.successes as f64 / rollup.requests as f64 * 100.0
+    } else {
+        0.0
     }
 }
 
@@ -1617,14 +1726,15 @@ fn web_request_log_date_bound_ms(filters: &Value, is_start: bool) -> Option<u128
 }
 
 fn web_request_log_effective_model(log: &UsageLog) -> &str {
-    log.pricing_model
+    log.actual_model
         .as_deref()
         .filter(|value| !value.is_empty())
+        .or(log.requested_model.as_deref())
         .or(log.model.as_deref())
         .unwrap_or_default()
 }
 
-fn web_request_log_json(log: &UsageLog) -> Value {
+pub(in crate::api) fn web_request_log_json(log: &UsageLog) -> Value {
     let model = log
         .model
         .as_deref()
@@ -1645,23 +1755,18 @@ fn web_request_log_json(log: &UsageLog) -> Value {
         "requestedModel": requested_model,
         "actualModel": actual_model,
         "actualModelSource": log.actual_model_source.as_deref().unwrap_or("server"),
-        "pricingModel": log.pricing_model,
-        "costMultiplier": web_request_log_multiplier(log.cost_multiplier),
+        "rawInputTokens": log.raw_input_tokens,
         "inputTokens": web_request_log_token_count(log.input_tokens),
         "outputTokens": web_request_log_token_count(log.output_tokens),
         "cacheReadTokens": web_request_log_token_count(log.cache_read_tokens),
         "cacheCreationTokens": web_request_log_token_count(log.cache_creation_tokens),
-        "inputCostUsd": web_request_log_cost(log.input_cost_usd),
-        "outputCostUsd": web_request_log_cost(log.output_cost_usd),
-        "cacheReadCostUsd": web_request_log_cost(log.cache_read_cost_usd),
-        "cacheCreationCostUsd": web_request_log_cost(log.cache_creation_cost_usd),
-        "totalCostUsd": web_request_log_cost(log.total_cost_usd),
+        "totalTokens": log.total_tokens,
         "isStreaming": log.is_streaming,
         "latencyMs": web_request_log_u128_to_u64(log.duration_ms),
         "firstTokenMs": log.first_token_ms.map(web_request_log_u128_to_u64),
         "durationMs": web_request_log_u128_to_u64(log.duration_ms),
         "statusCode": log.status_code,
-        "errorMessage": Value::Null,
+        "errorMessage": log.error_message,
         "createdAt": web_request_log_u128_to_i64(log.created_at_ms / 1_000),
         "shareId": log.share_id,
         "shareName": log.share_name,
@@ -1670,8 +1775,8 @@ fn web_request_log_json(log: &UsageLog) -> Value {
     })
 }
 
-fn web_request_log_token_count(value: Option<u64>) -> u32 {
-    value.unwrap_or(0).min(u64::from(u32::MAX)) as u32
+fn web_request_log_token_count(value: Option<u64>) -> u64 {
+    value.unwrap_or(0)
 }
 
 fn web_request_log_u128_to_u64(value: u128) -> u64 {
@@ -1680,16 +1785,6 @@ fn web_request_log_u128_to_u64(value: u128) -> u64 {
 
 fn web_request_log_u128_to_i64(value: u128) -> i64 {
     value.min(i64::MAX as u128) as i64
-}
-
-fn web_request_log_cost(value: Option<f64>) -> String {
-    let value = value.filter(|value| value.is_finite()).unwrap_or(0.0);
-    format!("{value:.6}")
-}
-
-fn web_request_log_multiplier(value: Option<f64>) -> String {
-    let value = value.filter(|value| value.is_finite()).unwrap_or(1.0);
-    value.to_string()
 }
 
 pub(in crate::api) fn web_optional_bool(args: &Value, keys: &[&str]) -> Option<bool> {
@@ -2497,10 +2592,7 @@ pub(in crate::api) async fn web_managed_auth_set_workspace(
         .map_err(ApiError::internal)?
         .map_err(ApiError::bad_request)?;
     state
-        .refresh_automatic_subscription_metadata_if_changed(
-            &account_before_workspace_change,
-            &account,
-        )
+        .refresh_account_runtime_metadata_if_changed(&account_before_workspace_change, &account)
         .await
         .map_err(ApiError::internal)?;
     Ok(map_managed_auth_account(

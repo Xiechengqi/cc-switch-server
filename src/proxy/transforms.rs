@@ -3398,7 +3398,6 @@ mod tests {
             }
         }));
         assert_eq!(usage.raw_input_tokens, Some(100));
-        assert_eq!(usage.billed_input_tokens, Some(40));
         assert_eq!(usage.cache_read_tokens, Some(60));
         assert_eq!(usage.total_tokens, Some(104));
     }

@@ -68,7 +68,6 @@ import {
   setCodexWireApi,
   setCodexModelName as setCodexModelNameInConfig,
 } from "@/utils/providerConfigUtils";
-import { isNonNegativeDecimalString } from "@/types/usage";
 import { getCodexCustomTemplate } from "@/config/codexTemplates";
 import CodexConfigEditor from "./CodexConfigEditor";
 import { CommonConfigEditor } from "./CommonConfigEditor";
@@ -83,10 +82,7 @@ import { CodexFormFields } from "./CodexFormFields";
 import { GeminiFormFields } from "./GeminiFormFields";
 import { OmoFormFields } from "./OmoFormFields";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
-import {
-  ProviderAdvancedConfig,
-  type PricingModelSourceOption,
-} from "./ProviderAdvancedConfig";
+import { ProviderAdvancedConfig } from "./ProviderAdvancedConfig";
 import {
   ProviderSharePlaceholder,
   ProviderShareSection,
@@ -129,8 +125,6 @@ import {
   GEMINI_DEFAULT_CONFIG,
   OPENCODE_DEFAULT_CONFIG,
   OPENCLAW_DEFAULT_CONFIG,
-  hasPricingConfigOverride,
-  normalizePricingSource,
   normalizeProviderTestConfig,
   presetProviderTestConfig,
 } from "./helpers/opencodeFormUtils";
@@ -437,20 +431,6 @@ function ProviderFormFull({
   const [testConfig, setTestConfig] = useState<ProviderTestConfig>(() =>
     normalizeProviderTestConfig(initialData?.meta?.testConfig),
   );
-  const [pricingConfig, setPricingConfig] = useState<{
-    enabled: boolean;
-    costMultiplier?: string;
-    pricingModelSource: PricingModelSourceOption;
-    quotaDispatchLimitPercent?: number;
-  }>(() => ({
-    enabled: hasPricingConfigOverride(initialData?.meta),
-    costMultiplier: initialData?.meta?.costMultiplier ?? undefined,
-    quotaDispatchLimitPercent: initialData?.meta?.quotaDispatchLimitPercent,
-    pricingModelSource: normalizePricingSource(
-      initialData?.meta?.pricingModelSource,
-    ),
-  }));
-
   const { category } = useProviderCategory({
     appId,
     selectedPresetId,
@@ -490,14 +470,6 @@ function ProviderFormFull({
       supportsFullUrl ? (initialData?.meta?.isFullUrl ?? false) : false,
     );
     setTestConfig(normalizeProviderTestConfig(initialData?.meta?.testConfig));
-    setPricingConfig({
-      enabled: hasPricingConfigOverride(initialData?.meta),
-      costMultiplier: initialData?.meta?.costMultiplier ?? undefined,
-      quotaDispatchLimitPercent: initialData?.meta?.quotaDispatchLimitPercent,
-      pricingModelSource: normalizePricingSource(
-        initialData?.meta?.pricingModelSource,
-      ),
-    });
     setCodexImageGenerationEnabled(
       initialData?.meta?.codexImageGenerationEnabled ?? false,
     );
@@ -1149,17 +1121,6 @@ function ProviderFormFull({
       currentProviderType === PROVIDER_TYPES.KIRO_OAUTH ||
       isGrokOauthProviderType(currentProviderType) ||
       currentProviderType === PROVIDER_TYPES.DEEPSEEK_ACCOUNT);
-  const excludesQuotaDispatchLimit =
-    currentProviderType === PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH ||
-    isAntigravityFamilyType(currentProviderType);
-  const supportsQuotaDispatchLimit =
-    !excludesQuotaDispatchLimit &&
-    (currentProviderType === PROVIDER_TYPES.GITHUB_COPILOT ||
-      isOpenAIOAuthProviderType(currentProviderType) ||
-      currentProviderType === PROVIDER_TYPES.CLAUDE_OAUTH ||
-      currentProviderType === PROVIDER_TYPES.CURSOR_OAUTH ||
-      currentProviderType === PROVIDER_TYPES.KIRO_OAUTH ||
-      detectCodingPlanProvider(baseUrl) !== null);
   const isManagedOauthNameReadOnly =
     currentProviderType === PROVIDER_TYPES.GITHUB_COPILOT ||
     isOpenAIOAuthProviderType(currentProviderType) ||
@@ -1629,16 +1590,6 @@ function ProviderFormFull({
     isFullUrl:
       supportsFullUrl && category !== "official" ? localIsFullUrl : undefined,
     testConfig: testConfig.enabled ? testConfig : undefined,
-    pricingConfig: pricingConfig.enabled
-      ? {
-          enabled: true,
-          costMultiplier: pricingConfig.costMultiplier,
-          pricingModelSource: pricingConfig.pricingModelSource,
-          quotaDispatchLimitPercent: supportsQuotaDispatchLimit
-            ? pricingConfig.quotaDispatchLimitPercent
-            : undefined,
-        }
-      : { enabled: false },
     apiFormat:
       appId === "claude"
         ? localApiFormat
@@ -1774,20 +1725,6 @@ function ProviderFormFull({
           defaultValue: "请填写供应商名称",
         }),
       );
-    }
-
-    const costMultiplier = pricingConfig.costMultiplier?.trim();
-    if (
-      pricingConfig.enabled &&
-      costMultiplier &&
-      !isNonNegativeDecimalString(costMultiplier)
-    ) {
-      toast.error(
-        t("settings.globalProxy.defaultCostMultiplierInvalid", {
-          defaultValue: "成本倍率必须为非负数",
-        }),
-      );
-      return;
     }
 
     // opencode / openclaw / hermes: providerKey 相关
@@ -2510,20 +2447,9 @@ function ProviderFormFull({
     const baseMeta: ProviderMeta | undefined =
       payload.meta ?? (initialData?.meta ? { ...initialData.meta } : undefined);
     const {
-      costMultiplier: _ignoredCostMultiplier,
-      pricingModelSource: _ignoredPricingModelSource,
-      quotaDispatchLimitPercent: _ignoredQuotaDispatchLimitPercent,
       testConfig: _ignoredTestConfig,
-      ...baseMetaWithoutPricing
+      ...baseMetaWithoutManagedFields
     } = baseMeta ?? {};
-    const quotaDispatchLimitPercent = pricingConfig.quotaDispatchLimitPercent;
-    const validQuotaDispatchLimitPercent =
-      supportsQuotaDispatchLimit &&
-      pricingConfig.enabled &&
-      Number.isInteger(quotaDispatchLimitPercent) &&
-      quotaDispatchLimitPercent !== undefined &&
-      quotaDispatchLimitPercent >= 1 &&
-      quotaDispatchLimitPercent <= 100;
 
     // 确定 providerType（新建时从预设获取，编辑时从现有数据获取）
     const providerType =
@@ -2532,7 +2458,7 @@ function ProviderFormFull({
       initialData?.meta?.providerType;
 
     const nextMeta: ProviderMeta = {
-      ...baseMetaWithoutPricing,
+      ...baseMetaWithoutManagedFields,
       commonConfigEnabled:
         appId === "claude"
           ? useCommonConfig
@@ -2637,16 +2563,6 @@ function ProviderFormFull({
         ? overridesResult.overrides
         : undefined,
       testConfig: testConfig.enabled ? testConfig : undefined,
-      costMultiplier: pricingConfig.enabled
-        ? pricingConfig.costMultiplier
-        : undefined,
-      pricingModelSource:
-        pricingConfig.enabled && pricingConfig.pricingModelSource !== "inherit"
-          ? pricingConfig.pricingModelSource
-          : undefined,
-      quotaDispatchLimitPercent: validQuotaDispatchLimitPercent
-        ? quotaDispatchLimitPercent
-        : undefined,
       apiFormat:
         appId === "claude" && saveCategory !== "official"
           ? localApiFormat
@@ -3763,10 +3679,7 @@ function ProviderFormFull({
             appId !== "hermes" && (
               <ProviderAdvancedConfig
                 testConfig={testConfig}
-                pricingConfig={pricingConfig}
                 onTestConfigChange={setTestConfig}
-                onPricingConfigChange={setPricingConfig}
-                showQuotaDispatchLimit={supportsQuotaDispatchLimit}
               />
             )}
 

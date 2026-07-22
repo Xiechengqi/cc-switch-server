@@ -1,8 +1,8 @@
-//! Cursor AgentService migration boundary.
+//! Cursor AgentService driver boundary.
 //!
-//! The desktop implementation is a provider-specific h2/protobuf driver, not a
-//! normal HTTP POST adapter. This module keeps the ported Cursor protocol
-//! pieces isolated while the server forwarder grows a native driver path.
+//! Cursor uses a provider-specific h2/protobuf driver rather than a normal HTTP
+//! POST adapter. This module keeps the protocol pieces isolated from the Server
+//! forwarder.
 
 pub mod agent_driver;
 pub mod agent_proto;

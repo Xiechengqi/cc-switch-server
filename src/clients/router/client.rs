@@ -3694,15 +3694,17 @@ mod tests {
 
     #[tokio::test]
     async fn descriptor_sync_falls_back_only_before_strict_mode_is_sticky() {
+        type RecordedRequests = Arc<Mutex<Vec<(String, Value)>>>;
+
         async fn strict_handler(
-            State(requests): State<Arc<Mutex<Vec<(String, Value)>>>>,
+            State(requests): State<RecordedRequests>,
             Json(request): Json<Value>,
         ) -> StatusCode {
             requests.lock().await.push(("strict".into(), request));
             StatusCode::NOT_FOUND
         }
         async fn legacy_handler(
-            State(requests): State<Arc<Mutex<Vec<(String, Value)>>>>,
+            State(requests): State<RecordedRequests>,
             Json(request): Json<Value>,
         ) -> Json<Value> {
             requests.lock().await.push(("legacy".into(), request));

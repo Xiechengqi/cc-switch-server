@@ -3,14 +3,13 @@
 `cc-switch-server` 将 usage 统一成互不重叠的 fresh input、cache read、cache creation、output 四桶，再保留兼容字段供 router/market 使用。
 
 - `rawInputTokens`：总输入量，即 fresh + cache read + cache creation；OpenAI/Gemini 的 inclusive input 原样进入这里，Anthropic 的 exclusive input 会补回 cache 两桶。
-- `billedInputTokens`：fresh input，供普通 input price 计费。
 - `inputTokens`：归一后的 fresh input；router/market 字段名不变。
 - `cacheReadTokens`：命中缓存的输入 token。
 - `cacheCreationTokens`：写入缓存的输入 token。
 - `outputTokens`：输出 token。
 - `totalTokens`：优先使用上游 `total_tokens/totalTokenCount`；缺失时按 `rawInputTokens + outputTokens` 推导。
 
-Cost 计算使用 `billedInputTokens` 计算 input cost，使用 `cacheReadTokens/cacheCreationTokens` 分别计算缓存读写成本。
+Server 只记录上述 Token 桶，不按模型价格计算或保存成本金额。
 
 解析来源：
 

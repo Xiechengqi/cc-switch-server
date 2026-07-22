@@ -4,7 +4,6 @@ import type {
   ProviderMeta,
   ProviderTestConfig,
 } from "@/types";
-import type { PricingModelSourceOption } from "../ProviderAdvancedConfig";
 
 // ── Default configs ──────────────────────────────────────────────────
 
@@ -159,11 +158,6 @@ export function toOpencodeExtraOptions(
 
 export { buildOmoProfilePreview } from "@/types/omo";
 
-export const normalizePricingSource = (
-  value?: string | null,
-): PricingModelSourceOption =>
-  value === "request" || value === "response" ? value : "inherit";
-
 /** Normalize persisted test config: only explicit `enabled: true` turns the switch on. */
 export function normalizeProviderTestConfig(
   config?: ProviderTestConfig | null,
@@ -179,23 +173,4 @@ export function presetProviderTestConfig(
   if (!config) return { enabled: false };
   const { enabled: _ignored, ...fields } = config;
   return { ...fields, enabled: false };
-}
-
-/** True when meta carries an explicit pricing override (not absent/null/inherit). */
-export function hasPricingConfigOverride(meta?: ProviderMeta | null): boolean {
-  if (!meta) return false;
-  const costMultiplier = meta.costMultiplier;
-  if (costMultiplier != null && costMultiplier !== "") {
-    return true;
-  }
-  const pricingModelSource = meta.pricingModelSource;
-  if (
-    pricingModelSource != null &&
-    pricingModelSource !== "" &&
-    pricingModelSource !== "inherit"
-  ) {
-    return true;
-  }
-  const quotaDispatchLimitPercent = meta.quotaDispatchLimitPercent;
-  return quotaDispatchLimitPercent != null && quotaDispatchLimitPercent >= 1;
 }

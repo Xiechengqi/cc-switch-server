@@ -11,12 +11,7 @@ import {
 } from "recharts";
 import { useUsageTrends } from "@/lib/query/usage";
 import { Loader2 } from "lucide-react";
-import {
-  fmtInt,
-  fmtUsd,
-  getLocaleFromLanguage,
-  parseFiniteNumber,
-} from "./format";
+import { fmtInt, getLocaleFromLanguage } from "./format";
 import { resolveUsageRange } from "@/lib/usageRange";
 import type { UsageRangeSelection } from "@/types/usage";
 
@@ -62,7 +57,6 @@ export function UsageTrendChart({
   const chartData =
     trends?.map((stat) => {
       const pointDate = new Date(stat.date);
-      const cost = parseFiniteNumber(stat.totalCost);
       return {
         rawDate: stat.date,
         label: isHourly
@@ -81,7 +75,6 @@ export function UsageTrendChart({
         outputTokens: stat.totalOutputTokens,
         cacheCreationTokens: stat.totalCacheCreationTokens,
         cacheReadTokens: stat.totalCacheReadTokens,
-        cost: cost ?? null,
       };
     }) || [];
 
@@ -104,9 +97,7 @@ export function UsageTrendChart({
               />
               <span className="font-medium">{entry.name}:</span>
               <span>
-                {entry.dataKey === "cost"
-                  ? fmtUsd(entry.value, 6)
-                  : fmtInt(entry.value, dateLocale)}
+                {fmtInt(entry.value, dateLocale)}
               </span>
             </div>
           ))}
@@ -175,14 +166,6 @@ export function UsageTrendChart({
               tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }}
               tickFormatter={(value) => `${(value / 1000).toFixed(0)}k`}
             />
-            <YAxis
-              yAxisId="cost"
-              orientation="right"
-              axisLine={false}
-              tickLine={false}
-              tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }}
-              tickFormatter={(value) => `$${value}`}
-            />
             <Tooltip content={<CustomTooltip />} />
             <Legend />
             <Area
@@ -224,16 +207,6 @@ export function UsageTrendChart({
               fillOpacity={1}
               fill="url(#colorCacheRead)"
               strokeWidth={2}
-            />
-            <Area
-              yAxisId="cost"
-              type="monotone"
-              dataKey="cost"
-              name={t("usage.cost", "成本")}
-              stroke="#f43f5e"
-              fill="none"
-              strokeWidth={2}
-              strokeDasharray="4 4"
             />
           </AreaChart>
         </ResponsiveContainer>

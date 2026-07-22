@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::domain::accounts::store::{Account, AccountQuotaTier, AccountStore};
+use crate::domain::accounts::store::{
+    active_account_usage_block, Account, AccountQuotaTier, AccountStore, AccountUsageBlock,
+};
 use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
 use crate::domain::providers::model::{AppKind, ProviderType};
@@ -287,8 +289,6 @@ pub struct ShareUpstreamQuota {
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_scope: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatch_limit_percent: Option<f64>,
     #[serde(default)]
     pub tiers: Vec<ShareUpstreamQuotaTier>,
 }
@@ -581,7 +581,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
             .find(|item| app_key(item.app) == app && item.provider.id == *provider_id)
         {
             let upstream = upstream_provider(app, provider, share, accounts, usage);
-            let availability = provider_availability(app, provider, share, accounts, usage);
+            let availability = provider_availability(app, provider, accounts, usage);
             if app.as_str() == app_key(share.app) {
                 primary_upstream = Some(upstream.clone());
             }
@@ -775,7 +775,8 @@ fn upstream_provider(
     let health = usage.map(|usage| provider_health(provider, usage));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let account_context = account_context_for_share(provider, share, accounts);
-    let quota_blocked = quota_blocked_percent(account_context.quota_percent);
+    let usage_block = account.and_then(current_account_usage_block);
+    let quota_blocked = account.map(|_| usage_block.is_some());
     let available = health
         .as_ref()
         .map(|health| health.healthy && quota_blocked != Some(true));
@@ -811,7 +812,8 @@ fn app_provider(
     let health = usage.map(|usage| provider_health(provider, usage));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let account_context = account_context_for_share(provider, share, accounts);
-    let quota_blocked = quota_blocked_percent(account_context.quota_percent);
+    let usage_block = account.and_then(current_account_usage_block);
+    let quota_blocked = account.map(|_| usage_block.is_some());
     let available = health
         .as_ref()
         .map(|health| health.healthy && quota_blocked != Some(true));
@@ -848,20 +850,18 @@ fn app_provider(
 fn provider_availability(
     app: &str,
     provider: &StoredProvider,
-    share: &Share,
     accounts: Option<&AccountStore>,
     usage: Option<&UsageStore>,
 ) -> ShareProviderAvailability {
     let health = usage.map(|usage| health::provider_health(provider, usage));
-    let account_context = account_context_for_share(provider, share, accounts);
-    let quota_blocked = quota_blocked_percent(account_context.quota_percent);
+    let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
+    let usage_block = account.and_then(current_account_usage_block);
+    let quota_blocked = account.map(|_| usage_block.is_some());
     let available =
         health.as_ref().map(|health| health.healthy).unwrap_or(true) && quota_blocked != Some(true);
-    let reason = if quota_blocked == Some(true) {
-        Some("quota blocked".to_string())
-    } else {
-        health.as_ref().and_then(|health| health.reason.clone())
-    };
+    let reason = usage_block
+        .map(|block| block.reason.to_string())
+        .or_else(|| health.as_ref().and_then(|health| health.reason.clone()));
     ShareProviderAvailability {
         app: app.to_string(),
         provider_id: provider.provider.id.clone(),
@@ -889,8 +889,11 @@ fn provider_health(provider: &StoredProvider, usage: &UsageStore) -> ShareProvid
     }
 }
 
-fn quota_blocked_percent(quota_percent: Option<f64>) -> Option<bool> {
-    quota_percent.map(|quota_percent| quota_percent >= 100.0)
+fn current_account_usage_block(account: &Account) -> Option<AccountUsageBlock> {
+    active_account_usage_block(
+        account,
+        crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -955,21 +958,38 @@ fn account_subscription_remaining_ms(account: &Account) -> Option<i64> {
 
 fn upstream_quota_from_account(account: &Account) -> Option<ShareUpstreamQuota> {
     let subscription_period_end = account_subscription_expires_at(account);
+    let block = current_account_usage_block(account);
+    let availability = block
+        .as_ref()
+        .map(|block| block.kind.availability())
+        .unwrap_or("available")
+        .to_string();
+    let blocked_until = block
+        .as_ref()
+        .and_then(|block| unix_ms_to_rfc3339(block.until_ms));
+    let blocked_reason = block.as_ref().map(|block| block.reason.to_string());
+    let blocked_scope = block.as_ref().map(|block| block.scope.to_string());
     let Some(quota) = account.quota.as_ref() else {
-        return subscription_period_end.map(|subscription_period_end| ShareUpstreamQuota {
+        if subscription_period_end.is_none() && block.is_none() {
+            return None;
+        }
+        return Some(ShareUpstreamQuota {
             status: "ok".to_string(),
             plan: account.subscription_level.clone(),
             queried_at: None,
-            subscription_period_end: Some(subscription_period_end),
-            availability: Some("available".to_string()),
-            blocked_until: None,
-            blocked_reason: None,
-            blocked_scope: None,
-            dispatch_limit_percent: None,
+            subscription_period_end,
+            availability: Some(availability),
+            blocked_until,
+            blocked_reason,
+            blocked_scope,
             tiers: Vec::new(),
         });
     };
-    if quota.tiers.is_empty() && !quota.success && subscription_period_end.is_none() {
+    if quota.tiers.is_empty()
+        && !quota.success
+        && subscription_period_end.is_none()
+        && block.is_none()
+    {
         return None;
     }
     let plan = quota
@@ -985,11 +1005,10 @@ fn upstream_quota_from_account(account: &Account) -> Option<ShareUpstreamQuota> 
         plan,
         queried_at: account.quota_refreshed_at,
         subscription_period_end,
-        availability: Some("available".to_string()),
-        blocked_until: None,
-        blocked_reason: None,
-        blocked_scope: None,
-        dispatch_limit_percent: None,
+        availability: Some(availability),
+        blocked_until,
+        blocked_reason,
+        blocked_scope,
         tiers: quota
             .tiers
             .iter()
@@ -1637,7 +1656,6 @@ mod tests {
                 requested_model: Some("gpt-5.5".to_string()),
                 actual_model: None,
                 actual_model_source: None,
-                pricing_model: None,
             },
             Default::default(),
         );
@@ -1668,16 +1686,35 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_marks_quota_blocked_without_confusing_missing_percent() {
-        let share = test_share(ProviderType::Codex, Some(100.0));
-        let provider = test_provider(ProviderType::Codex);
+    fn descriptor_marks_fresh_explicit_account_limit_as_blocked() {
+        let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let share = test_share(ProviderType::CodexOAuth, Some(100.0));
+        let provider = test_provider(ProviderType::CodexOAuth);
         let providers = ProviderStore {
             providers: vec![provider],
             ..Default::default()
         };
+        let mut account = test_account(ProviderType::CodexOAuth);
+        account.quota_percent = Some(100.0);
+        account.quota_refreshed_at = Some(now);
+        account.quota_next_refresh_at = Some(now + 30 * 60 * 1000);
+        account.quota.as_mut().unwrap().extra_usage = Some(json!({
+            "subscriptionEvidence": {
+                "usageAllowed": false,
+                "usageLimitReached": true
+            }
+        }));
+        let accounts = AccountStore {
+            accounts: vec![account],
+        };
         let usage = UsageStore::default();
 
-        let descriptor = descriptor_for_share_with_usage(&share, &providers, Some(&usage));
+        let descriptor = descriptor_for_share_with_accounts_and_usage(
+            &share,
+            &providers,
+            Some(&accounts),
+            Some(&usage),
+        );
         let availability = descriptor.app_availability.codex.unwrap();
         let provider = descriptor.app_providers.codex.first().unwrap();
 
@@ -1685,6 +1722,36 @@ mod tests {
         assert_eq!(availability.quota_blocked, Some(true));
         assert_eq!(provider.quota_percent, Some(100.0));
         assert_eq!(provider.quota_blocked, Some(true));
+        assert_eq!(
+            provider
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.availability.as_deref()),
+            Some("quota_exhausted")
+        );
+        assert!(provider
+            .quota
+            .as_ref()
+            .and_then(|quota| quota.blocked_until.as_deref())
+            .is_some());
+    }
+
+    #[test]
+    fn descriptor_keeps_share_percent_as_display_only_data() {
+        let share = test_share(ProviderType::Codex, Some(100.0));
+        let providers = ProviderStore {
+            providers: vec![test_provider(ProviderType::Codex)],
+            ..Default::default()
+        };
+
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+        let availability = descriptor.app_availability.codex.unwrap();
+        let provider = descriptor.app_providers.codex.first().unwrap();
+
+        assert!(availability.available);
+        assert_eq!(availability.quota_blocked, None);
+        assert_eq!(provider.quota_percent, Some(100.0));
+        assert_eq!(provider.quota_blocked, None);
     }
 
     #[test]

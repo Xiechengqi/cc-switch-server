@@ -143,7 +143,6 @@ function pick(value) {
       dataSource: log.dataSource,
       requestedModel: log.requestedModel,
       actualModel: log.actualModel,
-      pricingModel: log.pricingModel,
       statusCode: log.statusCode,
       inputTokens: log.inputTokens,
       outputTokens: log.outputTokens,

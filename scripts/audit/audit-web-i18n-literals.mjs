@@ -217,7 +217,7 @@ function loadLocaleKeys() {
   const inlineServerKeys = loadInlineServerResourceKeys();
   return Object.fromEntries(
     LANGUAGES.map((language) => {
-      const desktop = JSON.parse(
+      const base = JSON.parse(
         fs.readFileSync(
           path.join(WEB_SRC, "i18n", "locales", `${language}.json`),
           "utf8",
@@ -229,7 +229,7 @@ function loadLocaleKeys() {
           "utf8",
         ),
       );
-      const keys = flattenKeys(mergeTrees(desktop, server));
+      const keys = flattenKeys(mergeTrees(base, server));
       for (const key of inlineServerKeys[language]) {
         keys.add(key);
       }

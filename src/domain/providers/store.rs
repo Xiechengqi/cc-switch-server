@@ -175,6 +175,21 @@ impl ProviderStore {
             store.format = ProviderStoreFormat::S2;
             return Ok(store);
         }
+        let removed_obsolete_fields = store.remove_obsolete_provider_configuration();
+        if removed_obsolete_fields > 0 {
+            if store.format == ProviderStoreFormat::S2 {
+                store.save(config_dir)?;
+                tracing::info!(
+                    removed_fields = removed_obsolete_fields,
+                    "removed obsolete Provider configuration"
+                );
+            } else {
+                tracing::info!(
+                    removed_fields = removed_obsolete_fields,
+                    "ignored obsolete Provider configuration in legacy runtime view"
+                );
+            }
+        }
         if store.format == ProviderStoreFormat::S1 {
             store.prepare_legacy_runtime_view();
             if !store.providers.is_empty() {
@@ -367,6 +382,7 @@ impl ProviderStore {
         mut provider: Provider,
         resource: ProviderResourceMetadata,
     ) -> StoredProvider {
+        remove_provider_obsolete_configuration(&mut provider);
         if provider.id.trim().is_empty() {
             provider.id = generate_provider_id(app);
         }
@@ -405,6 +421,13 @@ impl ProviderStore {
         }
 
         stored
+    }
+
+    fn remove_obsolete_provider_configuration(&mut self) -> usize {
+        self.providers
+            .iter_mut()
+            .map(|stored| remove_provider_obsolete_configuration(&mut stored.provider))
+            .sum()
     }
 
     pub fn list(&self, app: Option<AppKind>) -> Vec<StoredProvider> {
@@ -496,6 +519,94 @@ impl ProviderStore {
                     .position(|provider_id| provider_id == &provider.provider.id)
             })
             .or_else(|| provider_sort_index(provider))
+    }
+}
+
+const OBSOLETE_PROVIDER_KEYS: &[&str] = &[
+    "costMultiplier",
+    "cost_multiplier",
+    "pricingModelSource",
+    "pricing_model_source",
+    "pricingModel",
+    "pricing_model",
+    "limitDailyUsd",
+    "limit_daily_usd",
+    "dailyLimitUsd",
+    "daily_limit_usd",
+    "limitMonthlyUsd",
+    "limit_monthly_usd",
+    "monthlyLimitUsd",
+    "monthly_limit_usd",
+    "inputUsdPerMillion",
+    "input_usd_per_million",
+    "outputUsdPerMillion",
+    "output_usd_per_million",
+    "cacheReadUsdPerMillion",
+    "cache_read_usd_per_million",
+    "cacheCreationUsdPerMillion",
+    "cache_creation_usd_per_million",
+    "quotaDispatchLimitPercent",
+    "quota_dispatch_limit_percent",
+];
+
+const OBSOLETE_PROVIDER_CONTAINERS: &[&str] = &["pricing", "modelPricing"];
+
+fn remove_provider_obsolete_configuration(provider: &mut Provider) -> usize {
+    let mut removed = remove_obsolete_keys_from_btree(&mut provider.extra);
+    if let Some(meta) = provider.meta.as_mut() {
+        removed += remove_obsolete_keys_from_btree(&mut meta.extra);
+    }
+    removed + remove_obsolete_configuration_from_value(&mut provider.settings_config)
+}
+
+fn remove_obsolete_keys_from_btree(values: &mut BTreeMap<String, Value>) -> usize {
+    let mut removed = 0;
+    for key in OBSOLETE_PROVIDER_KEYS
+        .iter()
+        .chain(OBSOLETE_PROVIDER_CONTAINERS.iter())
+    {
+        removed += usize::from(values.remove(*key).is_some());
+    }
+    for value in values.values_mut() {
+        removed += remove_nested_obsolete_keys(value);
+    }
+    removed
+}
+
+fn remove_obsolete_configuration_from_value(value: &mut Value) -> usize {
+    match value {
+        Value::Object(values) => {
+            let mut removed = 0;
+            for key in OBSOLETE_PROVIDER_KEYS
+                .iter()
+                .chain(OBSOLETE_PROVIDER_CONTAINERS.iter())
+            {
+                removed += usize::from(values.remove(*key).is_some());
+            }
+            for value in values.values_mut() {
+                removed += remove_nested_obsolete_keys(value);
+            }
+            removed
+        }
+        Value::Array(values) => values.iter_mut().map(remove_nested_obsolete_keys).sum(),
+        _ => 0,
+    }
+}
+
+fn remove_nested_obsolete_keys(value: &mut Value) -> usize {
+    match value {
+        Value::Object(values) => {
+            let mut removed = 0;
+            for key in OBSOLETE_PROVIDER_KEYS {
+                removed += usize::from(values.remove(*key).is_some());
+            }
+            for value in values.values_mut() {
+                removed += remove_nested_obsolete_keys(value);
+            }
+            removed
+        }
+        Value::Array(values) => values.iter_mut().map(remove_nested_obsolete_keys).sum(),
+        _ => 0,
     }
 }
 
@@ -792,6 +903,170 @@ mod tests {
         );
 
         assert_eq!(fs::read(providers_path(&config_dir)).unwrap(), before);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_load_ignores_legacy_cost_fields_without_rewriting_s1() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-provider-cost-s1-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            providers_path(&config_dir),
+            serde_json::to_vec_pretty(&json!({
+                "providers": [{
+                    "app": "codex",
+                    "provider": {
+                        "id": "cost-s1",
+                        "name": "OpenAI Official",
+                        "settingsConfig": {
+                            "costMultiplier": 1.5,
+                            "pricing": {"inputUsdPerMillion": 1},
+                            "custom": {
+                                "pricing": {"upstreamOwned": true},
+                                "pricingModel": "obsolete"
+                            }
+                        },
+                        "meta": {
+                            "providerType": "codex",
+                            "pricingModelSource": "response",
+                            "quotaDispatchLimitPercent": 90
+                        }
+                    },
+                    "providerType": "codex",
+                    "providerTypeId": "codex"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let before = fs::read(providers_path(&config_dir)).unwrap();
+        let loaded = ProviderStore::load_runtime_or_default(&config_dir).unwrap();
+        let provider = &loaded.providers[0].provider;
+        assert!(provider.settings_config.get("costMultiplier").is_none());
+        assert!(provider.settings_config.get("pricing").is_none());
+        assert!(provider
+            .settings_config
+            .pointer("/custom/pricingModel")
+            .is_none());
+        assert_eq!(
+            provider
+                .settings_config
+                .pointer("/custom/pricing/upstreamOwned"),
+            Some(&json!(true))
+        );
+        assert!(provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.extra.get("pricingModelSource"))
+            .is_none());
+        assert!(provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.extra.get("quotaDispatchLimitPercent"))
+            .is_none());
+        assert_eq!(fs::read(providers_path(&config_dir)).unwrap(), before);
+
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_load_persists_obsolete_provider_cleanup_for_s2() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-provider-cost-s2-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = ProviderStore::default();
+        store.upsert(
+            AppKind::Codex,
+            Provider {
+                id: "cost-s2".to_string(),
+                name: "OpenAI Official".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(crate::domain::providers::model::ProviderMeta {
+                    provider_type: Some("codex".to_string()),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+        );
+        store.providers[0].provider.settings_config = json!({
+            "pricing": {"inputUsdPerMillion": 1},
+            "quotaDispatchLimitPercent": 90,
+            "modelMapping": {
+                "mappings": {
+                    "requested": {
+                        "upstreamModel": "actual",
+                        "pricingModel": "obsolete"
+                    }
+                }
+            }
+        });
+        store.providers[0]
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert("quota_dispatch_limit_percent".to_string(), json!(90));
+        store.promote_to_s2(&config_dir).unwrap();
+        store.save(&config_dir).unwrap();
+
+        let loaded = ProviderStore::load_runtime_or_default(&config_dir).unwrap();
+        assert!(loaded.providers[0]
+            .provider
+            .settings_config
+            .get("pricing")
+            .is_none());
+        assert!(loaded.providers[0]
+            .provider
+            .settings_config
+            .get("quotaDispatchLimitPercent")
+            .is_none());
+        assert!(loaded.providers[0]
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.extra.get("quota_dispatch_limit_percent"))
+            .is_none());
+        assert!(loaded.providers[0]
+            .provider
+            .settings_config
+            .pointer("/modelMapping/mappings/requested/pricingModel")
+            .is_none());
+        let persisted = ProviderStore::load_or_default(&config_dir).unwrap();
+        assert!(persisted.providers[0]
+            .provider
+            .settings_config
+            .get("pricing")
+            .is_none());
+        assert!(persisted.providers[0]
+            .provider
+            .settings_config
+            .get("quotaDispatchLimitPercent")
+            .is_none());
+        assert!(persisted.providers[0]
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.extra.get("quota_dispatch_limit_percent"))
+            .is_none());
+        assert!(persisted.providers[0]
+            .provider
+            .settings_config
+            .pointer("/modelMapping/mappings/requested/pricingModel")
+            .is_none());
+
         fs::remove_dir_all(config_dir).unwrap();
     }
 

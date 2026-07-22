@@ -6,7 +6,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useRequestDetail } from "@/lib/query/usage";
-import { getFreshInputTokens, isUnpricedUsage } from "@/types/usage";
+import { getFreshInputTokens, getTotalTokens } from "@/types/usage";
 
 interface RequestDetailPanelProps {
   requestId: string;
@@ -54,8 +54,11 @@ export function RequestDetailPanel({
   }
 
   const freshInput = getFreshInputTokens(request);
-  const isCacheInclusive = request.inputTokens !== freshInput;
-  const unpriced = isUnpricedUsage(request);
+  const rawInput =
+    request.rawInputTokens ??
+    freshInput + request.cacheReadTokens + request.cacheCreationTokens;
+  const hasSeparateCachedInput = rawInput !== freshInput;
+  const totalTokens = getTotalTokens(request);
 
   return (
     <Dialog open onOpenChange={onClose}>
@@ -108,31 +111,24 @@ export function RequestDetailPanel({
               </div>
               <div>
                 <dt className="text-muted-foreground">
-                  {t("usage.model", "模型")}
+                  {t("usage.requestModel", "请求模型")}
                 </dt>
-                <dd className="font-mono">{request.model}</dd>
-                {request.requestModel &&
-                  request.requestModel !== request.model && (
-                    <>
-                      <dt className="mt-1 text-muted-foreground">
-                        {t("usage.requestModel", "请求模型")}
-                      </dt>
-                      <dd className="font-mono text-xs">
-                        {request.requestModel}
-                      </dd>
-                    </>
-                  )}
-                {request.pricingModel &&
-                  request.pricingModel !== request.model && (
-                    <>
-                      <dt className="mt-1 text-muted-foreground">
-                        {t("usage.pricingModel", "计价模型")}
-                      </dt>
-                      <dd className="font-mono text-xs">
-                        {request.pricingModel}
-                      </dd>
-                    </>
-                  )}
+                <dd className="font-mono">
+                  {request.requestedModel || request.requestModel || request.model}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-muted-foreground">
+                  {t("usage.actualModel", "实际模型")}
+                </dt>
+                <dd className="font-mono">
+                  {request.actualModel || request.model}
+                </dd>
+                {request.actualModelSource && (
+                  <dd className="mt-1 text-xs text-muted-foreground">
+                    {request.actualModelSource}
+                  </dd>
+                )}
               </div>
               <div>
                 <dt className="text-muted-foreground">
@@ -165,10 +161,10 @@ export function RequestDetailPanel({
                 </dt>
                 <dd className="font-mono">
                   {freshInput.toLocaleString()}
-                  {isCacheInclusive && (
+                  {hasSeparateCachedInput && (
                     <span className="ml-2 text-xs text-muted-foreground/70 font-normal">
                       ({t("usage.rawInputLabel", "原始")}:{" "}
-                      {request.inputTokens.toLocaleString()})
+                      {rawInput.toLocaleString()})
                     </span>
                   )}
                 </dd>
@@ -202,92 +198,7 @@ export function RequestDetailPanel({
                   {t("usage.totalTokens", "总计")}
                 </dt>
                 <dd className="text-lg font-semibold">
-                  {(freshInput + request.outputTokens).toLocaleString()}
-                </dd>
-              </div>
-            </dl>
-          </div>
-
-          {/* 成本明细 */}
-          <div className="rounded-lg border p-4">
-            <h3 className="mb-3 font-semibold">
-              {t("usage.costBreakdown", "成本明细")}
-            </h3>
-            <dl className="grid grid-cols-2 gap-3 text-sm">
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.inputCost", "输入成本")}
-                  <span className="ml-1 text-xs">
-                    ({t("usage.baseCost", "基础")})
-                  </span>
-                </dt>
-                <dd className="font-mono">
-                  ${parseFloat(request.inputCostUsd).toFixed(6)}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.outputCost", "输出成本")}
-                  <span className="ml-1 text-xs">
-                    ({t("usage.baseCost", "基础")})
-                  </span>
-                </dt>
-                <dd className="font-mono">
-                  ${parseFloat(request.outputCostUsd).toFixed(6)}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.cacheReadCost", "缓存读取成本")}
-                  <span className="ml-1 text-xs">
-                    ({t("usage.baseCost", "基础")})
-                  </span>
-                </dt>
-                <dd className="font-mono">
-                  ${parseFloat(request.cacheReadCostUsd).toFixed(6)}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.cacheCreationCost", "缓存写入成本")}
-                  <span className="ml-1 text-xs">
-                    ({t("usage.baseCost", "基础")})
-                  </span>
-                </dt>
-                <dd className="font-mono">
-                  ${parseFloat(request.cacheCreationCostUsd).toFixed(6)}
-                </dd>
-              </div>
-              {/* 显示成本倍率（如果不等于1） */}
-              {request.costMultiplier &&
-                parseFloat(request.costMultiplier) !== 1 && (
-                  <div className="col-span-2 border-t pt-3">
-                    <dt className="text-muted-foreground">
-                      {t("usage.costMultiplier", "成本倍率")}
-                    </dt>
-                    <dd className="font-mono">×{request.costMultiplier}</dd>
-                  </div>
-                )}
-              <div
-                className={`col-span-2 ${request.costMultiplier && parseFloat(request.costMultiplier) !== 1 ? "" : "border-t"} pt-3`}
-              >
-                <dt className="text-muted-foreground">
-                  {t("usage.totalCost", "总成本")}
-                  {request.costMultiplier &&
-                    parseFloat(request.costMultiplier) !== 1 && (
-                      <span className="ml-1 text-xs">
-                        ({t("usage.withMultiplier", "含倍率")})
-                      </span>
-                    )}
-                </dt>
-                <dd
-                  className={`text-lg font-semibold ${
-                    unpriced ? "text-muted-foreground" : "text-primary"
-                  }`}
-                >
-                  {unpriced
-                    ? t("usage.unpriced", "未定价")
-                    : `$${parseFloat(request.totalCostUsd).toFixed(6)}`}
+                  {totalTokens.toLocaleString()}
                 </dd>
               </div>
             </dl>
@@ -305,6 +216,14 @@ export function RequestDetailPanel({
                 </dt>
                 <dd className="font-mono">{request.latencyMs}ms</dd>
               </div>
+              {request.firstTokenMs != null && (
+                <div>
+                  <dt className="text-muted-foreground">
+                    {t("usage.firstToken", "首 Token")}
+                  </dt>
+                  <dd className="font-mono">{request.firstTokenMs}ms</dd>
+                </div>
+              )}
             </dl>
           </div>
 

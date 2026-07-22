@@ -137,12 +137,6 @@ export interface ProviderMeta {
   partnerPromotionKey?: string;
   // 供应商单独的模型测试配置
   testConfig?: ProviderTestConfig;
-  // 供应商成本倍率
-  costMultiplier?: string;
-  // 供应商计费模式来源
-  pricingModelSource?: string;
-  // Market 调度时的周期用量上限百分比；0/undefined 表示无上限
-  quotaDispatchLimitPercent?: number;
   // API 格式（Claude / Codex 供应商使用）
   // - "anthropic": 原生 Anthropic Messages API 格式，直接透传
   // - "openai_chat": OpenAI Chat Completions 格式，需要格式转换

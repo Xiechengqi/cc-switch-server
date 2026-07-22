@@ -1,6 +1,9 @@
+use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::accounts::store::{Account, AccountStore};
+use crate::domain::accounts::store::{
+    active_account_usage_block, Account, AccountStore, AccountUsageBlock,
+};
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::Share;
@@ -59,11 +62,12 @@ pub fn summary_for_share(
             continue;
         };
 
-        let result = if quota_blocked_for_provider(share, provider, accounts) {
+        let result = if let Some(block) = quota_block_for_provider(provider, accounts) {
             Some(quota_blocked_result(
                 app,
                 provider,
                 usage.and_then(|usage| latest_quota_health_log(share, app, provider, usage)),
+                &block,
             ))
         } else {
             usage.and_then(|usage| latest_health_result(share, app, provider, usage))
@@ -174,6 +178,7 @@ fn quota_blocked_result(
     app: AppKind,
     provider: &StoredProvider,
     log: Option<&UsageLog>,
+    block: &AccountUsageBlock,
 ) -> ShareModelHealthResult {
     let requested_model = log
         .and_then(|log| log.requested_model.as_deref().or(log.model.as_deref()))
@@ -198,9 +203,7 @@ fn quota_blocked_result(
         latency_ms: log
             .map(|log| saturating_u128_to_u64(log.duration_ms))
             .unwrap_or(0),
-        error_message: log
-            .and_then(|log| log.error_message.clone())
-            .or_else(|| Some("quota blocked".to_string())),
+        error_message: Some(quota_block_message(block)),
         checked_at: log
             .map(|log| ms_to_seconds(log.created_at_ms))
             .unwrap_or_else(|| ms_to_seconds(now_ms())),
@@ -322,22 +325,22 @@ fn default_model_for_provider(provider: &StoredProvider) -> Option<String> {
     })
 }
 
-pub(crate) fn quota_blocked_for_provider(
-    share: &Share,
+pub(crate) fn quota_block_for_provider(
     provider: &StoredProvider,
     accounts: Option<&AccountStore>,
-) -> bool {
-    quota_percent_for_provider(share, provider, accounts).is_some_and(|value| value >= 100.0)
+) -> Option<AccountUsageBlock> {
+    let now = now_ms().min(i64::MAX as u128) as i64;
+    account_for_provider(accounts, provider)
+        .and_then(|account| active_account_usage_block(account, now))
 }
 
-fn quota_percent_for_provider(
-    share: &Share,
-    provider: &StoredProvider,
-    accounts: Option<&AccountStore>,
-) -> Option<f64> {
-    account_for_provider(accounts, provider)
-        .and_then(|account| account.quota_percent)
-        .or(share.quota_percent)
+pub(crate) fn quota_block_message(block: &AccountUsageBlock) -> String {
+    let until = Utc
+        .timestamp_millis_opt(block.until_ms)
+        .single()
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| block.until_ms.to_string());
+    format!("quota blocked: {} until {until}", block.reason)
 }
 
 fn account_for_provider<'a>(
@@ -459,7 +462,8 @@ mod tests {
     }
 
     #[test]
-    fn quota_block_uses_account_quota_without_health_log() {
+    fn quota_block_uses_fresh_explicit_account_evidence_without_health_log() {
+        let now = now_ms().min(i64::MAX as u128) as i64;
         let share = test_share(
             "share-1",
             AppKind::Codex,
@@ -472,38 +476,7 @@ mod tests {
             providers: vec![provider],
             ..Default::default()
         };
-        let accounts = AccountStore {
-            accounts: vec![Account {
-                id: "acct-1".to_string(),
-                provider_type: ProviderType::CodexOAuth,
-                auth_identity_generation: 1,
-                token_refresh_generation: 1,
-                email: Some("owner@example.com".to_string()),
-                access_token: Some("token".to_string()),
-                refresh_token: None,
-                id_token: None,
-                token_type: Some("Bearer".to_string()),
-                api_key: None,
-                extra_headers: Default::default(),
-                scopes: Vec::new(),
-                profile: None,
-                raw: None,
-                subscription_level: Some("pro".to_string()),
-                entitlement_status: None,
-                quota_percent: Some(100.0),
-                quota: Some(AccountQuota::default()),
-                quota_refreshed_at: None,
-                quota_next_refresh_at: None,
-                expires_at: None,
-                manual_subscription_expires_at_ms: None,
-                manual_subscription_expiry_updated_at_ms: None,
-                manual_subscription_expiry_rule: None,
-                rate_limited_until: None,
-                last_refresh_error: None,
-                refresh_consecutive_failures: 0,
-                needs_relogin: false,
-            }],
-        };
+        let accounts = blocked_codex_accounts(now);
 
         let summary = summary_for_share(&share, &providers, Some(&accounts), None);
         let result = summary.codex.first().unwrap();
@@ -511,18 +484,23 @@ mod tests {
         assert_eq!(result.status, "quota_blocked");
         assert_eq!(result.source, "cc-switch-quota");
         assert_eq!(result.recent_results, vec!["quota_blocked"]);
+        assert!(result
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("until ")));
     }
 
     #[test]
-    fn quota_block_reuses_persisted_health_log_metadata() {
+    fn quota_block_reuses_persisted_timestamp_but_refreshes_bounded_message() {
+        let now = now_ms().min(i64::MAX as u128) as i64;
         let share = test_share(
             "share-1",
             AppKind::Codex,
             "p-codex",
-            ProviderType::Codex,
-            Some(100.0),
+            ProviderType::CodexOAuth,
+            None,
         );
-        let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::Codex);
+        let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::CodexOAuth);
         let mut log = health_log(&share, &provider, 429, false, None, Some("gpt-5.5"), None);
         log.created_at_ms = 2_000;
         log.data_source = Some("cc-switch-quota".to_string());
@@ -536,8 +514,9 @@ mod tests {
             ..Default::default()
         };
 
-        let first = summary_for_share(&share, &providers, None, Some(&usage));
-        let second = summary_for_share(&share, &providers, None, Some(&usage));
+        let accounts = blocked_codex_accounts(now);
+        let first = summary_for_share(&share, &providers, Some(&accounts), Some(&usage));
+        let second = summary_for_share(&share, &providers, Some(&accounts), Some(&usage));
         let first = first.codex.first().unwrap();
         let second = second.codex.first().unwrap();
 
@@ -545,10 +524,33 @@ mod tests {
         assert_eq!(first.checked_at, 2);
         assert_eq!(second.checked_at, first.checked_at);
         assert_eq!(first.source, "cc-switch-quota");
-        assert_eq!(
+        assert!(first
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("until ")));
+        assert_ne!(
             first.error_message.as_deref(),
             Some("quota blocked until reset")
         );
+    }
+
+    #[test]
+    fn share_quota_percent_alone_does_not_block_health() {
+        let share = test_share(
+            "share-1",
+            AppKind::Codex,
+            "p-codex",
+            ProviderType::Codex,
+            Some(100.0),
+        );
+        let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::Codex);
+        let providers = ProviderStore {
+            providers: vec![provider],
+            ..Default::default()
+        };
+
+        let summary = summary_for_share(&share, &providers, None, None);
+        assert!(summary.codex.is_empty());
     }
 
     #[test]
@@ -714,6 +716,51 @@ mod tests {
         }
     }
 
+    fn blocked_codex_accounts(now_ms: i64) -> AccountStore {
+        AccountStore {
+            accounts: vec![Account {
+                id: "acct-1".to_string(),
+                provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+                token_refresh_generation: 1,
+                email: Some("owner@example.com".to_string()),
+                access_token: Some("token".to_string()),
+                refresh_token: None,
+                id_token: None,
+                token_type: Some("Bearer".to_string()),
+                api_key: None,
+                extra_headers: Default::default(),
+                scopes: Vec::new(),
+                profile: None,
+                raw: None,
+                subscription_level: Some("pro".to_string()),
+                entitlement_status: None,
+                quota_percent: Some(100.0),
+                quota: Some(AccountQuota {
+                    success: true,
+                    credential_message: None,
+                    tiers: Vec::new(),
+                    extra_usage: Some(json!({
+                        "subscriptionEvidence": {
+                            "usageAllowed": false,
+                            "usageLimitReached": true
+                        }
+                    })),
+                }),
+                quota_refreshed_at: Some(now_ms),
+                quota_next_refresh_at: Some(now_ms + 30 * 60 * 1000),
+                expires_at: None,
+                manual_subscription_expires_at_ms: None,
+                manual_subscription_expiry_updated_at_ms: None,
+                manual_subscription_expiry_rule: None,
+                rate_limited_until: None,
+                last_refresh_error: None,
+                refresh_consecutive_failures: 0,
+                needs_relogin: false,
+            }],
+        }
+    }
+
     fn health_log(
         share: &Share,
         provider: &StoredProvider,
@@ -735,7 +782,6 @@ mod tests {
                 requested_model: requested_model.map(str::to_string),
                 actual_model: actual_model.map(str::to_string),
                 actual_model_source: None,
-                pricing_model: None,
             },
             Default::default(),
         );

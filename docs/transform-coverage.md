@@ -2,14 +2,13 @@
 
 Date: 2026-07-19
 
-This tracker follows Phase X / X7. It records server-side test coverage against the desktop transform and streaming suites without importing desktop-only behavior.
+This tracker follows Phase X / X7. It records the Server-owned transform and streaming regression surface.
 
 ## Current Gate
 
 | Item | Value |
 | --- | --- |
-| Desktop baseline | 253 tests (`transform_codex_chat` 55, `transform_responses` 61, `transform` 59, `transform_gemini` 26, `streaming` 52) |
-| Server target | 85% / 216 tests |
+| Server minimum | 216 tests across the owned transform, streaming, adapter, and stream-transform modules |
 | Gate | `node scripts/audit/audit-transform-coverage.mjs --check` from `scripts/static-checks.sh` |
 
 ## First Batch Covered
@@ -80,4 +79,4 @@ This tracker follows Phase X / X7. It records server-side test coverage against 
 | SSE frame boundary slicing (half frame, multi-frame, CRLF) | Covered | `StreamEventTransformer` buffers every transformed protocol; `SseLineBuffer` remains for native DeepSeek parsing. |
 | Full stop/finish reason matrix across OpenAI Responses, Chat, Anthropic, Gemini streams | Partial | Non-streaming matrix plus key stream finish_reason paths covered; remaining provider-specific finish reasons can be added as fixtures. |
 | Image and file block matrix across all request directions | Partial | Responses->Chat and existing Anthropic/Gemini paths covered; expand to edge cases. |
-| Desktop-only semantics | Not applicable | MCP, Skills, desktop profile/session UI behavior remain excluded by server product boundary. |
+| Client-only semantics | Not applicable | MCP, Skills, profile/session UI behavior remain excluded by Server product boundary. |

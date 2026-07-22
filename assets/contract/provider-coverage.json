@@ -4,7 +4,7 @@
     "serverLegacyInventory": "assets/contract/server-provider-legacy-inventory.json",
     "serverProviderTypes": {
       "path": "src/domain/providers/model.rs",
-      "sha256": "86b3199578137b06e42233ad758db01eea0176ef9d36056713610e733b1dbd1c"
+      "sha256": "f5aa26234ade1cfaa32503407067b734cac33408b7572a40248b4761ef60ba66"
     },
     "upstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14"
   },

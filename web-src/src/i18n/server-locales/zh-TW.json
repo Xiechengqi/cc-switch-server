@@ -127,9 +127,6 @@
       }
     }
   },
-  "usage": {
-    "unpriced": "未定價"
-  },
   "notifications": {
     "clearCurrentSuccess": "已停用",
     "clearCurrentFailedTitle": "停用失敗",

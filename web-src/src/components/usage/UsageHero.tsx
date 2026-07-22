@@ -16,12 +16,7 @@ import {
   Sparkles,
   Zap,
 } from "lucide-react";
-import {
-  fmtUsd,
-  formatTokensShort,
-  getResolvedLang,
-  parseFiniteNumber,
-} from "./format";
+import { formatTokensShort, getResolvedLang } from "./format";
 import {
   CACHE_INCLUSIVE_APP_TYPES,
   type AppType,
@@ -71,14 +66,13 @@ const TITLE_THEMES: Record<AppType | "all", TitleTheme> = {
  * Combine per-app summaries into a single rolled-up summary.
  *
  * The backend's per-app rows already use fresh-input semantics (cache-inclusive
- * providers have been normalized in SQL), so plain addition is correct here.
+ * providers are normalized before persistence), so plain addition is correct here.
  * `cacheHitRate` and `successRate` must be re-derived from the summed counts
  * rather than averaged across rows.
  */
 function aggregateSummaries(items: UsageSummary[]): UsageSummary {
   let totalRequests = 0;
   let successCount = 0;
-  let totalCostNum = 0;
   let input = 0;
   let output = 0;
   let cacheCreation = 0;
@@ -87,7 +81,6 @@ function aggregateSummaries(items: UsageSummary[]): UsageSummary {
   for (const s of items) {
     totalRequests += s.totalRequests;
     successCount += Math.round((s.totalRequests * s.successRate) / 100);
-    totalCostNum += parseFiniteNumber(s.totalCost) ?? 0;
     input += s.totalInputTokens;
     output += s.totalOutputTokens;
     cacheCreation += s.totalCacheCreationTokens;
@@ -97,7 +90,6 @@ function aggregateSummaries(items: UsageSummary[]): UsageSummary {
   const cacheableInput = input + cacheCreation + cacheRead;
   return {
     totalRequests,
-    totalCost: totalCostNum.toFixed(6),
     totalInputTokens: input,
     totalOutputTokens: output,
     totalCacheCreationTokens: cacheCreation,
@@ -199,8 +191,8 @@ export function UsageHero({
   const cacheRead = summary?.totalCacheReadTokens ?? 0;
   const realTotal = summary?.realTotalTokens ?? 0;
   const hitRate = summary?.cacheHitRate ?? 0;
-  const totalCost = parseFiniteNumber(summary?.totalCost);
   const requests = summary?.totalRequests ?? 0;
+  const successRate = summary?.successRate ?? 0;
 
   const cacheWriteDisplay = {
     value:
@@ -242,7 +234,7 @@ export function UsageHero({
       <Card className="relative overflow-hidden border border-border/50 bg-card/60 backdrop-blur-xl shadow-sm">
         <CardContent className="p-4 md:p-5">
           <div className="flex flex-col gap-4">
-            {/* Top row: Main Token Count, Requests, Cost */}
+            {/* Top row: Main Token Count, Requests, Success Rate */}
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
               <div className="flex items-center gap-3">
                 <div
@@ -294,10 +286,10 @@ export function UsageHero({
                 <div className="w-px h-8 bg-border/60" />
                 <div className="flex flex-col">
                   <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-medium">
-                    {t("usage.totalCost")}
+                    {t("usage.successRate", "成功率")}
                   </span>
-                  <span className="font-semibold text-green-500 text-sm tabular-nums">
-                    {totalCost == null ? "--" : fmtUsd(totalCost, 4)}
+                  <span className="font-semibold text-emerald-500 text-sm tabular-nums">
+                    {successRate.toFixed(1)}%
                   </span>
                 </div>
               </div>

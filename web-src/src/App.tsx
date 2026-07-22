@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Network } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 
-import ServerDesktopApp from "@/ServerDesktopApp";
+import ServerApp from "@/ServerApp";
 import { ClientWebLoginPage } from "@/components/ClientWebLoginPage";
 import { LoginPanel } from "@/components/LoginPanel";
 import { isRemoteWebMode } from "@/lib/api/auth";
@@ -65,7 +65,7 @@ function App() {
   }
 
   return (
-    <ServerDesktopApp
+    <ServerApp
       onSignOut={refreshContext}
       enableWebTerminal={context.runtime?.enableWebTerminal !== false}
     />

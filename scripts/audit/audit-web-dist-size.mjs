@@ -4,7 +4,7 @@ import process from "node:process";
 
 const root = "web-dist";
 const indexFile = `${root}/index.html`;
-// Phase U12: full desktop UI parity (4 locales + CodeMirror + recharts) ships ~4.2MB raw.
+// Reviewed ceiling for the Server-owned UI, including four locales and chart/editor chunks.
 const maxBytes = Number(process.env.CC_SWITCH_WEB_DIST_MAX_BYTES || 4503592);
 
 function fileSize(path) {

@@ -52,36 +52,44 @@ test("removed Provider routing and settings capabilities fail closed", () => {
   );
 });
 
-test("runtime and desktop sync contracts must preserve removed-feature exclusions", () => {
+test("runtime contract must preserve removed-feature exclusions", () => {
   const runtime = {
     excludedFeatures: [
       { id: "automaticFailover" },
       { id: "outboundProxy" },
       { id: "configTransfer" },
+      { id: "usageCostAccounting" },
     ],
     commands: [],
   };
-  const sync = {
-    excluded: [
-      { path: "components/settings/GlobalProxySettings.tsx" },
-      { path: "components/settings/ImportExportPanel.tsx" },
-    ],
-  };
-  assert.deepEqual(contractBoundaryViolations(runtime, sync), []);
-  runtime.excludedFeatures.pop();
+  assert.deepEqual(contractBoundaryViolations(runtime), []);
+  runtime.excludedFeatures = runtime.excludedFeatures.filter(
+    (feature) => feature.id !== "configTransfer",
+  );
   assert.match(
-    contractBoundaryViolations(runtime, sync).join("\n"),
+    contractBoundaryViolations(runtime).join("\n"),
     /configTransfer/,
+  );
+
+  runtime.excludedFeatures.push({ id: "configTransfer" });
+  runtime.commands.push({
+    name: "get_model_pricing",
+    feature: "usage",
+    implemented: true,
+  });
+  assert.match(
+    contractBoundaryViolations(runtime).join("\n"),
+    /removed usage cost command remains registered/,
   );
 });
 
-test("Server Provider dialogs cannot re-import the desktop dispatcher", () => {
+test("Server Provider dialogs cannot re-import the non-Server dispatcher", () => {
   const valid = {
     "web-src/src/components/providers/AddProviderDialog.tsx":
       'import { ServerProviderForm } from "@/server/providers/editor/ServerProviderForm";',
     "web-src/src/components/providers/EditProviderDialog.tsx":
       'import { ServerProviderForm } from "@/server/providers/editor/ServerProviderForm";',
-    "web-src/src/ServerDesktopApp.tsx":
+    "web-src/src/ServerApp.tsx":
       'import { useServerProviderActions } from "@/server/providers/useServerProviderActions";',
     "web-src/src/server/providers/useServerProviderActions.ts":
       "export function useServerProviderActions() {}",
@@ -92,7 +100,7 @@ test("Server Provider dialogs cannot re-import the desktop dispatcher", () => {
     'import { ProviderForm } from "@/components/providers/forms/ProviderForm";';
   assert.match(
     providerEditorBoundaryViolations(valid).join("\n"),
-    /desktop ProviderForm dispatcher/,
+    /non-Server ProviderForm dispatcher/,
   );
 });
 

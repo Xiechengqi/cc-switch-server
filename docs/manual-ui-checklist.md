@@ -1,20 +1,20 @@
 # Manual UI Checklist
 
-This checklist is the UI parity gate for the cc-switch desktop Server version.
+This checklist is the manual UI acceptance gate for cc-switch-server.
 Do not replace it with Playwright, Cypress, Puppeteer, Selenium, browser screenshot
 scripts, or automated click flows.
 
 ## Scope
 
-- Compare the server Web UI against `/data/projects/cc-switch` desktop UI for the token server main path only.
-- Retained pages: Providers, Shares, Usage/Pricing, Settings/Auth/Router/Backup, Accounts/OAuth/quota.
+- Validate the Web UI against Server product requirements, Server APIs, and `assets/contract/web-runtime-contract.json`.
+- Retained pages: Providers, Shares, Usage, Settings/Auth/Router/Backup, Accounts/OAuth/quota.
 - Excluded from server (must not appear): Universal Providers, import-current-CLI-config, skills, MCP, OpenClaw workspace/tools/agents, Hermes, OMO, Tauri shell, updater, deeplink, Claude Desktop profile writing, WebDAV/S3 sync, speedtest, local CLI session parsing, `codex_responses_ws`.
 
 ## Viewports
 
 Run the checks manually at:
 
-- Desktop width: 1366x768 or wider.
+- Wide viewport: 1366x768 or wider.
 - Narrow width: around 390px wide.
 
 ## Global
@@ -48,16 +48,17 @@ Run the checks manually at:
 - Share status, owner, tunnel/subdomain, provider binding, ACL, limits, market/grant, pending edits, and connect info are visible.
 - Share Owner is read-only and always displays Client Owner; Provider Share create/save requests do not submit an independent owner. Changing Client Owner through verified email ownership updates every Share and preserves a valid previous owner as shared access.
 - Pause/resume/binding/tunnel actions are disabled or gated consistently with server state.
-- Share connect info can be inspected without exposing hidden desktop-only features.
+- Share connect info can be inspected without exposing excluded client-only features.
 - The full Shares page scrolls vertically to the bottom at both target viewports; expanding settings or request logs does not leave content clipped below the shell.
 - Request logs show the selected Share's recent seven-day history with correct token, status, latency, range, and pagination values; the table remains horizontally scrollable on narrow screens.
 - After a server restart, requests written since the last usage snapshot still appear, and a completed streaming request keeps its final token and latency values.
 
-## Usage And Pricing
+## Usage
 
-- Summary, trends, logs, detail, provider stats, model stats, cache/billed tokens, and cost fields match server API names.
+- Summary, trends, logs, detail, provider stats, model stats, and fresh/cache/output/total Token fields match server API names.
 - Filters for app, provider, share, user, source, session, health, stream, and time window remain usable.
-- Pricing model CRUD and provider limits warnings are visible only where supported.
+- No model-cost CRUD, USD totals, cost columns, or provider cost-limit warnings are present.
+- OAuth quota remains display-only unless the upstream reports an explicit, unexpired rate-limit or exhaustion state; Share Token limits and Token Market sale pricing remain available in their owning screens.
 
 ## Settings, Auth, Router, Backup
 
@@ -66,7 +67,7 @@ Run the checks manually at:
 - Client Tunnel Owner is read-only; saving tunnel settings changes only tunnel fields and cannot bypass verified Client Owner change.
 - Settings → Share → Payout Information persists one EVM address, explicit USDC/USDT selection, and one or more BSC/Base/Arbitrum One networks; warnings prohibit secrets and identify the address as public/self-declared.
 - Payout clear requires confirmation; Router outage leaves the local save active and visibly reports pending/failed sync.
-- Desktop-only settings are absent.
+- Client-only settings are absent.
 - Destructive actions have clear confirmation or disabled states.
 - Settings → General → Current Version can start an upgrade from both localhost and a Router Client Tunnel URL; progress logs stream without 404/401 responses before process replacement, request URLs never contain access tokens, and the UI recovers the persisted task after the expected tunnel interruption.
 - Current Version shows the active server PID and a live process uptime counter; Upgrade and Restart are adjacent actions, and Restart always requires a confirmation dialog. After restart, PID and runtime instance id must change and uptime must reset, including when the server was started through `nohup`.
@@ -102,5 +103,5 @@ Record manual findings in the relevant implementation note or PR/commit summary:
 - 2026-07-03 static-only pass: not run in a browser.
 - Reason: current implementation pass prohibits deployment/startup and UI automation.
 - Static gate used: `scripts/static-checks.sh`; native invoke registry audit currently reports no registered-not-implemented command and checks implemented commands against `web_invoke_dispatch`.
-- Phase M/M1+N2 i18n static pass is implemented: language switch is in Settings, the desktop zh/zh-TW/en/ja locale files are copied as the migration baseline, page-level and Dashboard body copy use the lightweight runtime dictionary/`tx()` layer, and `scripts/audit/audit-web-i18n-literals.mjs` currently reports zero JSX English literals. Human reviewers still need to check translated text fit in real viewports.
-- Manual desktop and narrow viewport checks remain pending for a human reviewer.
+- Phase M/M1+N2 i18n static pass is implemented: language switch is in Settings, Server-owned zh/zh-TW/en/ja locale files and the lightweight runtime dictionary/`tx()` layer cover page-level and Dashboard body copy, and `scripts/audit/audit-web-i18n-literals.mjs` currently reports zero JSX English literals. Human reviewers still need to check translated text fit in real viewports.
+- Manual wide and narrow viewport checks remain pending for a human reviewer.

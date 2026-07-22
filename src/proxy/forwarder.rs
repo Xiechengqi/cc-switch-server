@@ -45,7 +45,8 @@ use super::request_governance::{
     ResponseDecodeResult,
 };
 use super::router::{
-    account_concurrency_for_provider, provider_supports_claude_count_tokens,
+    account_concurrency_for_provider, ensure_provider_account_does_not_need_relogin,
+    ensure_provider_account_usage_available, provider_supports_claude_count_tokens,
     select_failover_provider, select_provider, select_provider_for_claude_count_tokens,
     select_provider_for_codex_image_generation, select_provider_with_account_inflight, ProxyRoute,
 };
@@ -57,6 +58,7 @@ const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const CODEX_IMAGES_DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
 const MAX_CLAUDE_RETRY_ATTEMPTS: u32 = 3;
 const MAX_CLAUDE_RETRY_ELAPSED_MS: u128 = 10_000;
+const DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 60_000;
 
 #[derive(Debug, Clone)]
 struct ForwardAttemptContext {
@@ -184,8 +186,13 @@ async fn forward_with_attempt(
                 let configured_provider_id =
                     current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
                 if let Some(share_id) = request_context.share_id.as_deref() {
-                    let (execution, _share_name) =
-                        select_share_execution(&providers, &shares, app, share_id)?;
+                    let (execution, _share_name) = select_share_execution(
+                        &providers,
+                        &shares,
+                        &accounts_for_selection,
+                        app,
+                        share_id,
+                    )?;
                     if route == ProxyRoute::ClaudeCountTokens
                         && !provider_supports_claude_count_tokens(&execution.stored)
                     {
@@ -360,7 +367,6 @@ async fn forward_with_attempt(
             }
             adapter_request.model = Some(contract.actual_model.clone());
             adapter_request.actual_model = Some(contract.actual_model.clone());
-            adapter_request.pricing_model = Some(contract.actual_model.clone());
             Some(contract)
         } else {
             None
@@ -623,6 +629,7 @@ async fn forward_with_attempt(
                 ProxyRoute::CodexResponses | ProxyRoute::CodexChatCompletions
             )
             && !status.is_success()
+            && status != StatusCode::TOO_MANY_REQUESTS
         {
             let original_bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
             let original_decoded =
@@ -779,7 +786,14 @@ async fn forward_with_attempt(
                 }
             };
             let decoded = decode_response_body_for_proxy(&response_headers, bytes);
-            maybe_mark_codex_rate_limited(&state, &stored, &decoded.body).await;
+            maybe_mark_upstream_rate_limited(
+                &state,
+                &execution,
+                status,
+                &response_headers,
+                &decoded.body,
+            )
+            .await;
             if matches!(
                 route,
                 ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
@@ -1389,7 +1403,8 @@ pub async fn forward_codex_responses_ws(
     let configured_provider_id =
         current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
     let execution = if let Some(share_id) = request_context.share_id.as_deref() {
-        let (execution, _share_name) = select_share_execution(&providers, &shares, app, share_id)?;
+        let (execution, _share_name) =
+            select_share_execution(&providers, &shares, &accounts_for_selection, app, share_id)?;
         execution
     } else {
         select_provider(
@@ -1475,12 +1490,16 @@ pub async fn forward_codex_responses_ws(
         let _share_invocation_guard = share_invocation_guard;
         if let Err(error) = bridge_responses_websocket(
             socket,
-            target_headers,
-            request_timeout,
-            ws_url,
-            ws_mode,
-            session_id,
-            websocket_upstream_model,
+            ResponsesWebsocketBridgeOptions {
+                headers: target_headers,
+                connect_timeout: request_timeout,
+                ws_url,
+                mode: ws_mode,
+                grok_session_id: session_id,
+                single_upstream_model: websocket_upstream_model,
+                state: &state_for_share,
+                execution: &execution,
+            },
         )
         .await
         {
@@ -1545,8 +1564,13 @@ pub async fn forward_grok_media(
     let configured_provider_id =
         current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
     let execution = if let Some(share_id) = request_context.share_id.as_deref() {
-        let (execution, _share_name) =
-            select_share_execution(&providers, &shares, AppKind::Codex, share_id)?;
+        let (execution, _share_name) = select_share_execution(
+            &providers,
+            &shares,
+            &accounts_for_selection,
+            AppKind::Codex,
+            share_id,
+        )?;
         execution
     } else {
         super::router::select_provider_for_type(
@@ -1605,8 +1629,13 @@ pub async fn forward_images_generations(
     let configured_provider_id =
         current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
     let execution = if let Some(share_id) = request_context.share_id.as_deref() {
-        let (execution, _share_name) =
-            select_share_execution(&providers, &shares, AppKind::Codex, share_id)?;
+        let (execution, _share_name) = select_share_execution(
+            &providers,
+            &shares,
+            &accounts_for_selection,
+            AppKind::Codex,
+            share_id,
+        )?;
         execution
     } else {
         select_provider_for_codex_image_generation(
@@ -1732,6 +1761,14 @@ async fn forward_grok_media_with_execution(
     let bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
     let decoded = decode_response_body_for_proxy(&response_headers, bytes);
     let response_body = decoded.body;
+    maybe_mark_upstream_rate_limited(
+        &state,
+        &execution,
+        status,
+        &response_headers,
+        &response_body,
+    )
+    .await;
     if status.is_success() && upstream_path.contains("/videos/generations") {
         if let Some(session_key) = super::grok::video_session_key_from_response(&response_body) {
             state.remember_grok_media_session(
@@ -1804,7 +1841,6 @@ async fn forward_codex_images_generations(
         requested_model: Some(prepared.tool_model.clone()),
         actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
         actual_model_source: Some("codex_image_generation_bridge".to_string()),
-        pricing_model: Some(prepared.tool_model.clone()),
         stream_requested: true,
         custom_tool_names: Default::default(),
     };
@@ -1846,7 +1882,14 @@ async fn forward_codex_images_generations(
     let bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
     let decoded = decode_response_body_for_proxy(&response_headers, bytes);
     if status == StatusCode::TOO_MANY_REQUESTS {
-        maybe_mark_codex_rate_limited(&state, &stored, &decoded.body).await;
+        maybe_mark_upstream_rate_limited(
+            &state,
+            &execution,
+            status,
+            &response_headers,
+            &decoded.body,
+        )
+        .await;
     }
     record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
     if !status.is_success() {
@@ -1887,7 +1930,6 @@ async fn forward_codex_images_generations(
             requested_model: Some(prepared.tool_model),
             actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
             actual_model_source: Some("codex_image_generation_bridge".to_string()),
-            pricing_model: None,
         },
         TokenUsage::default(),
         UsageLogContext {
@@ -2230,15 +2272,31 @@ enum ResponsesWebsocketMode {
     Grok,
 }
 
-async fn bridge_responses_websocket(
-    downstream: WebSocket,
+struct ResponsesWebsocketBridgeOptions<'a> {
     headers: Vec<(String, String)>,
     connect_timeout: Duration,
     ws_url: String,
     mode: ResponsesWebsocketMode,
     grok_session_id: Option<String>,
     single_upstream_model: Option<String>,
+    state: &'a ServerState,
+    execution: &'a ProviderExecution,
+}
+
+async fn bridge_responses_websocket(
+    downstream: WebSocket,
+    options: ResponsesWebsocketBridgeOptions<'_>,
 ) -> Result<(), ProxyError> {
+    let ResponsesWebsocketBridgeOptions {
+        headers,
+        connect_timeout,
+        ws_url,
+        mode,
+        grok_session_id,
+        single_upstream_model,
+        state,
+        execution,
+    } = options;
     let mut request = ws_url.into_client_request().map_err(|error| {
         ProxyError::bad_gateway(format!("build responses websocket request: {error}"))
     })?;
@@ -2259,13 +2317,16 @@ async fn bridge_responses_websocket(
     }
 
     let connect = tokio_tungstenite::connect_async(request);
-    let (upstream, _) = tokio::time::timeout(connect_timeout, connect)
+    let connect_result = tokio::time::timeout(connect_timeout, connect)
         .await
         .map_err(|_| ProxyError {
             status: StatusCode::GATEWAY_TIMEOUT,
             message: "codex websocket connect timeout".to_string(),
-        })?
-        .map_err(|error| ProxyError::bad_gateway(format!("codex websocket connect: {error}")))?;
+        })?;
+    let (upstream, _) = match connect_result {
+        Ok(upstream) => upstream,
+        Err(error) => return Err(responses_websocket_connect_error(state, execution, error).await),
+    };
     let (mut upstream_write, mut upstream_read) = upstream.split();
     let (mut downstream_write, mut downstream_read) = downstream.split();
 
@@ -2324,6 +2385,36 @@ async fn bridge_responses_websocket(
         result = client_to_upstream => result,
         result = upstream_to_client => result,
     }
+}
+
+async fn responses_websocket_connect_error(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    error: TungsteniteError,
+) -> ProxyError {
+    let Some((status, headers, body)) = responses_websocket_http_error(&error) else {
+        return ProxyError::bad_gateway(format!("codex websocket connect: {error}"));
+    };
+    maybe_mark_upstream_rate_limited(state, execution, status, &headers, &body).await;
+    ProxyError {
+        status,
+        message: format!(
+            "responses websocket upstream returned HTTP {}",
+            status.as_u16()
+        ),
+    }
+}
+
+fn responses_websocket_http_error(
+    error: &TungsteniteError,
+) -> Option<(StatusCode, HeaderMap, Vec<u8>)> {
+    let TungsteniteError::Http(response) = error else {
+        return None;
+    };
+    let status = StatusCode::from_u16(response.status().as_u16()).ok()?;
+    let headers = response.headers().clone();
+    let body = response.body().clone().unwrap_or_default();
+    Some((status, headers, body))
 }
 
 #[derive(Debug, Default)]
@@ -2540,22 +2631,57 @@ fn websocket_message_too_big_error_body() -> String {
     .to_string()
 }
 
-async fn maybe_mark_codex_rate_limited(state: &ServerState, stored: &StoredProvider, body: &[u8]) {
-    if stored.provider_type != ProviderType::CodexOAuth {
+async fn maybe_mark_upstream_rate_limited(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+) {
+    if status != StatusCode::TOO_MANY_REQUESTS {
         return;
     }
-    let Some(account_id) = managed_account_id(stored).map(str::to_string) else {
+    let Some((provider_type, requested_account_id)) = execution.managed_account_target() else {
         return;
     };
-    let Some(until) = codex_rate_limit_reset_at_ms(body, crate::infra::time::now_ms() as i64)
+    let Some(account_id) = state
+        .find_account_for_provider(provider_type, requested_account_id)
+        .await
+        .map(|account| account.id)
     else {
         return;
     };
-    let message = codex_rate_limit_message(body)
-        .unwrap_or_else(|| format!("codex oauth account is rate limited until {until}"));
+    let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let Some(until) = upstream_rate_limit_until(provider_type, status, headers, body, now) else {
+        return;
+    };
+    let message = format!("upstream returned 429; account is rate limited until {until}");
     state
         .mark_account_rate_limited_until(&account_id, until, Some(message))
         .await;
+}
+
+fn upstream_rate_limit_until(
+    provider_type: ProviderType,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+    now: i64,
+) -> Option<i64> {
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let specialized_until = match provider_type {
+        ProviderType::CodexOAuth => codex_rate_limit_reset_at_ms(body, now),
+        ProviderType::GrokOAuth => {
+            super::grok::parse_cooldown_until_ms(status, headers, now).map(|(until, _)| until)
+        }
+        _ => None,
+    };
+    let until = specialized_until
+        .or_else(|| super::grok::retry_after_until_ms(headers, now))
+        .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
+    Some(super::bounded_upstream_rate_limit_until(now, until))
 }
 
 async fn maybe_mark_grok_cooldown(
@@ -2564,7 +2690,7 @@ async fn maybe_mark_grok_cooldown(
     status: StatusCode,
     headers: &HeaderMap,
 ) {
-    if stored.provider_type != ProviderType::GrokOAuth {
+    if stored.provider_type != ProviderType::GrokOAuth || status == StatusCode::TOO_MANY_REQUESTS {
         return;
     }
     let Some(account_id) = managed_account_id(stored).map(str::to_string) else {
@@ -2630,21 +2756,6 @@ fn codex_rate_limit_reset_at_ms(body: &[u8], now_ms: i64) -> Option<i64> {
         .filter(|until| *until > now_ms)
 }
 
-fn codex_rate_limit_message(body: &[u8]) -> Option<String> {
-    let value = serde_json::from_slice::<Value>(body).ok()?;
-    [
-        "/error/message",
-        "/body/error/message",
-        "/response/error/message",
-        "/message",
-    ]
-    .into_iter()
-    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-    .map(str::trim)
-    .filter(|value| !value.is_empty())
-    .map(str::to_string)
-}
-
 struct ClaudeKiroForwardOptions {
     state: ServerState,
     execution: ProviderExecution,
@@ -2691,7 +2802,6 @@ async fn forward_claude_deepseek(
         requested_model: model_selection.requested_model.clone(),
         actual_model: model_selection.actual_model.clone(),
         actual_model_source: model_selection.actual_model_source.clone(),
-        pricing_model: model_selection.pricing_model.clone(),
         stream_requested: false,
         custom_tool_names: Default::default(),
     };
@@ -2735,7 +2845,16 @@ async fn forward_claude_deepseek(
     let status_code = status.as_u16();
 
     if !status.is_success() {
+        let response_headers = upstream.headers().clone();
         let body = upstream.text().await.unwrap_or_default();
+        maybe_mark_upstream_rate_limited(
+            &state,
+            &execution,
+            status,
+            &response_headers,
+            body.as_bytes(),
+        )
+        .await;
         record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
         return Err(ProxyError {
             status: StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -2926,7 +3045,6 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         requested_model: model_selection.requested_model.clone(),
         actual_model: model_selection.actual_model.clone(),
         actual_model_source: model_selection.actual_model_source.clone(),
-        pricing_model: model_selection.pricing_model.clone(),
         stream_requested: false,
         custom_tool_names: Default::default(),
     };
@@ -3043,6 +3161,8 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     let decoded = decode_response_body_for_proxy(&response_headers, bytes);
     let bytes = decoded.body;
     if !status.is_success() {
+        maybe_mark_upstream_rate_limited(&state, &execution, status, &response_headers, &bytes)
+            .await;
         log_usage(
             &state,
             &stored,
@@ -3352,7 +3472,6 @@ fn routed_model_metadata(
         requested_model: Some(requested_model.to_string()),
         actual_model: Some(actual_model.to_string()),
         actual_model_source: Some(policy_source.unwrap_or(fallback_source).to_string()),
-        pricing_model: Some(actual_model.to_string()),
     }
 }
 
@@ -5383,10 +5502,13 @@ fn select_share_provider(
 fn select_share_execution(
     providers: &ProviderStore,
     shares: &ShareStore,
+    accounts: &AccountStore,
     app: AppKind,
     share_id: &str,
 ) -> Result<(ProviderExecution, Option<String>), ProxyError> {
     let (stored, share_name) = select_share_provider(providers, shares, app, share_id)?;
+    ensure_provider_account_does_not_need_relogin(&stored, accounts)?;
+    ensure_provider_account_usage_available(&stored, accounts, current_time_ms())?;
     let execution = ProviderExecution::from_store(providers, stored)?;
     execution.ensure_operation_supported(ProviderOperation::Forward)?;
     Ok((execution, share_name))
@@ -5398,7 +5520,6 @@ fn model_metadata(request: &adapters::AdapterRequest) -> UsageModelMetadata {
         requested_model: request.requested_model.clone(),
         actual_model: request.actual_model.clone(),
         actual_model_source: request.actual_model_source.clone(),
-        pricing_model: request.pricing_model.clone(),
     }
 }
 
@@ -6309,6 +6430,55 @@ mod tests {
     }
 
     #[test]
+    fn share_execution_rejects_explicit_account_usage_block() {
+        let provider = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({}),
+            Some("share-account"),
+        );
+        let provider_id = provider.provider.id.clone();
+        let providers = ProviderStore {
+            providers: vec![provider],
+            ..ProviderStore::default()
+        };
+        let share = serde_json::from_value(json!({
+            "id": "blocked-share",
+            "app": "codex",
+            "providerId": provider_id,
+            "providerType": "codex_oauth",
+            "enabled": true,
+            "status": "active"
+        }))
+        .unwrap();
+        let shares = ShareStore {
+            shares: vec![share],
+            ..ShareStore::default()
+        };
+        let mut accounts = AccountStore::default();
+        accounts.upsert(
+            serde_json::from_value(json!({
+                "id": "share-account",
+                "providerType": "codex_oauth",
+                "rateLimitedUntil": current_time_ms() + 60_000
+            }))
+            .unwrap(),
+        );
+
+        let error = select_share_execution(
+            &providers,
+            &shares,
+            &accounts,
+            AppKind::Codex,
+            "blocked-share",
+        )
+        .expect_err("share execution must enforce the bound account block");
+
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.message.contains("rate_limited"));
+    }
+
+    #[test]
     fn deepseek_upstream_errors_map_to_proxy_status_codes() {
         assert_eq!(
             deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::NotFound).status,
@@ -6509,7 +6679,7 @@ mod tests {
     }
 
     #[test]
-    fn share_rejections_use_desktop_reason_suffix_and_status_mapping() {
+    fn share_rejections_use_legacy_reason_suffix_and_status_mapping() {
         let expired = share_rejection_to_proxy_error(ShareInvocationRejection {
             reason: ShareRejectReason::Expired,
             message: "Share has expired.".to_string(),
@@ -7017,9 +7187,55 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             codex_rate_limit_reset_at_ms(br#"{"error":{"resets_at":1}}"#, 1_000),
             None
         );
+    }
+
+    #[test]
+    fn upstream_rate_limit_cooldown_is_generic_and_bounded() {
+        let now = 1_700_000_000_000;
+        let headers = HeaderMap::new();
         assert_eq!(
-            codex_rate_limit_message(br#"{"error":{"message":"slow down"}}"#).as_deref(),
-            Some("slow down")
+            upstream_rate_limit_until(
+                ProviderType::KiroOAuth,
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                b"{}",
+                now,
+            ),
+            Some(now + DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)
+        );
+        assert_eq!(
+            upstream_rate_limit_until(
+                ProviderType::KiroOAuth,
+                StatusCode::OK,
+                &headers,
+                b"{}",
+                now,
+            ),
+            None
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("999999999"));
+        assert_eq!(
+            upstream_rate_limit_until(
+                ProviderType::GeminiCli,
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                b"{}",
+                now,
+            ),
+            Some(now + super::super::MAX_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)
+        );
+
+        assert_eq!(
+            upstream_rate_limit_until(
+                ProviderType::CodexOAuth,
+                StatusCode::TOO_MANY_REQUESTS,
+                &HeaderMap::new(),
+                br#"{"error":{"resets_in_seconds":12}}"#,
+                now,
+            ),
+            Some(now + 12_000)
         );
     }
 
@@ -7256,6 +7472,23 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             }
             other => panic!("unexpected websocket message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn websocket_handshake_http_error_preserves_rate_limit_evidence() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(429)
+            .header("retry-after", "30")
+            .body(Some(br#"{"error":"rate_limited"}"#.to_vec()))
+            .unwrap();
+        let error = TungsteniteError::Http(response);
+
+        let (status, headers, body) =
+            responses_websocket_http_error(&error).expect("HTTP handshake error");
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers.get("retry-after").unwrap(), "30");
+        assert_eq!(body, br#"{"error":"rate_limited"}"#);
     }
 
     #[test]

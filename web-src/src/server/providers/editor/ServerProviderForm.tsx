@@ -124,9 +124,6 @@ interface EditorState {
   customBinding?: ProviderCustomBinding;
   credentials: Record<string, CredentialEdit>;
   extraHeaders: ExtraHeaderEdit[];
-  costMultiplier: string;
-  pricingModelSource: "inherit" | "request" | "response";
-  quotaDispatchLimitPercent: string;
   customUserAgent: string;
   codexFastMode: boolean;
   codexImageGenerationEnabled: boolean;
@@ -458,16 +455,6 @@ function buildEditorState(
     customBinding,
     credentials: buildCredentialEdits(profile, resource, isEditMode),
     extraHeaders: buildExtraHeaderEdits(draft.settingsConfig, resource),
-    costMultiplier: draft.meta.costMultiplier ?? "",
-    pricingModelSource:
-      draft.meta.pricingModelSource === "request" ||
-      draft.meta.pricingModelSource === "response"
-        ? draft.meta.pricingModelSource
-        : "inherit",
-    quotaDispatchLimitPercent:
-      draft.meta.quotaDispatchLimitPercent == null
-        ? ""
-        : String(draft.meta.quotaDispatchLimitPercent),
     customUserAgent: draft.meta.customUserAgent ?? "",
     codexFastMode: draft.meta.codexFastMode ?? false,
     codexImageGenerationEnabled:
@@ -500,14 +487,6 @@ function providerMetaForSubmit(
   const meta = clone(state.draft.meta);
   if (profile.formComposition === "legacy") return meta;
   meta.providerType = profile.compatibilityProviderType;
-  meta.costMultiplier = state.costMultiplier.trim() || undefined;
-  meta.pricingModelSource =
-    state.pricingModelSource === "inherit"
-      ? undefined
-      : state.pricingModelSource;
-  const quota = Number.parseInt(state.quotaDispatchLimitPercent, 10);
-  meta.quotaDispatchLimitPercent =
-    Number.isInteger(quota) && quota >= 1 && quota <= 100 ? quota : undefined;
   meta.customUserAgent = state.customUserAgent.trim() || undefined;
 
   if (profile.credentialPolicy.mode === "managed_account") {
@@ -719,18 +698,6 @@ function validateState(
           name: header.name,
         });
       }
-    }
-  }
-  if (state.costMultiplier.trim()) {
-    const value = Number(state.costMultiplier);
-    if (!Number.isFinite(value) || value < 0) {
-      return t("serverProviderForm.validation.costMultiplierInvalid");
-    }
-  }
-  if (state.quotaDispatchLimitPercent.trim()) {
-    const value = Number(state.quotaDispatchLimitPercent);
-    if (!Number.isInteger(value) || value < 1 || value > 100) {
-      return t("serverProviderForm.validation.quotaLimitInvalid");
     }
   }
   return null;
@@ -2297,64 +2264,6 @@ export function ServerProviderForm({
 
       {profile.formComposition !== "legacy" ? (
         <Section title={t("serverProviderForm.usage.title")}>
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="space-y-2">
-              <Label>{t("serverProviderForm.usage.costMultiplier")}</Label>
-              <Input
-                inputMode="decimal"
-                value={state.costMultiplier}
-                onChange={(event) =>
-                  setState((current) => ({
-                    ...current,
-                    costMultiplier: event.target.value,
-                  }))
-                }
-                placeholder="1"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>{t("serverProviderForm.usage.pricingModel")}</Label>
-              <Select
-                value={state.pricingModelSource}
-                onValueChange={(value) =>
-                  setState((current) => ({
-                    ...current,
-                    pricingModelSource:
-                      value as EditorState["pricingModelSource"],
-                  }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="inherit">
-                    {t("serverProviderForm.usage.inherit")}
-                  </SelectItem>
-                  <SelectItem value="request">
-                    {t("serverProviderForm.usage.request")}
-                  </SelectItem>
-                  <SelectItem value="response">
-                    {t("serverProviderForm.usage.response")}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label>{t("serverProviderForm.usage.quotaLimit")}</Label>
-              <Input
-                inputMode="numeric"
-                value={state.quotaDispatchLimitPercent}
-                onChange={(event) =>
-                  setState((current) => ({
-                    ...current,
-                    quotaDispatchLimitPercent: event.target.value,
-                  }))
-                }
-                placeholder={t("serverProviderForm.usage.unlimited")}
-              />
-            </div>
-          </div>
           <div className="space-y-2">
             <Label>{t("serverProviderForm.usage.customUserAgent")}</Label>
             <Input

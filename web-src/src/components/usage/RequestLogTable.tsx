@@ -20,18 +20,13 @@ import {
 import { useRequestLogs } from "@/lib/query/usage";
 import {
   getFreshInputTokens,
-  isUnpricedUsage,
+  getTotalTokens,
   type LogFilters,
   type UsageRangeSelection,
 } from "@/types/usage";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { UsageDateRangePicker } from "./UsageDateRangePicker";
-import {
-  fmtInt,
-  fmtUsd,
-  getLocaleFromLanguage,
-  parseFiniteNumber,
-} from "./format";
+import { fmtInt, getLocaleFromLanguage } from "./format";
 
 interface RequestLogTableProps {
   range: UsageRangeSelection;
@@ -161,7 +156,7 @@ export function RequestLogTable({
                     {t("usage.provider")}
                   </TableHead>
                   <TableHead className="text-center whitespace-nowrap">
-                    {t("usage.billingModel")}
+                    {t("usage.modelPath", "模型路径")}
                   </TableHead>
                   <TableHead className="text-center whitespace-nowrap">
                     {t("usage.inputTokens")}
@@ -170,7 +165,7 @@ export function RequestLogTable({
                     {t("usage.outputTokens")}
                   </TableHead>
                   <TableHead className="text-center whitespace-nowrap">
-                    {t("usage.totalCost")}
+                    {t("usage.totalTokens", "总 Tokens")}
                   </TableHead>
                   <TableHead className="text-center whitespace-nowrap">
                     {t("usage.timingInfo")}
@@ -195,7 +190,13 @@ export function RequestLogTable({
                   </TableRow>
                 ) : (
                   logs.map((log) => {
-                    const unpriced = isUnpricedUsage(log);
+                    const freshInput = getFreshInputTokens(log);
+                    const rawInput =
+                      log.rawInputTokens ??
+                      freshInput +
+                        log.cacheReadTokens +
+                        log.cacheCreationTokens;
+                    const totalTokens = getTotalTokens(log);
                     return (
                       <TableRow key={log.requestId}>
                         <TableCell className="text-center whitespace-nowrap text-xs px-1.5">
@@ -230,23 +231,16 @@ export function RequestLogTable({
                           </div>
                         </TableCell>
                         <TableCell className="text-center px-1.5">
-                          {(() => {
-                            const freshInput = getFreshInputTokens(log);
-                            const isCacheInclusive =
-                              log.inputTokens !== freshInput;
-                            return (
-                              <div
-                                className="tabular-nums"
-                                title={
-                                  isCacheInclusive
-                                    ? `Raw: ${log.inputTokens.toLocaleString()}`
-                                    : undefined
-                                }
-                              >
-                                {fmtInt(freshInput, locale)}
-                              </div>
-                            );
-                          })()}
+                          <div
+                            className="tabular-nums"
+                            title={
+                              rawInput !== freshInput
+                                ? `Raw: ${rawInput.toLocaleString()}`
+                                : undefined
+                            }
+                          >
+                            {fmtInt(freshInput, locale)}
+                          </div>
                           {(log.cacheReadTokens > 0 ||
                             log.cacheCreationTokens > 0) && (
                             <div className="text-[10px] text-muted-foreground whitespace-nowrap">
@@ -265,24 +259,9 @@ export function RequestLogTable({
                           {fmtInt(log.outputTokens, locale)}
                         </TableCell>
                         <TableCell className="text-center px-1.5">
-                          <div
-                            className={`font-medium tabular-nums ${
-                              unpriced ? "text-muted-foreground" : ""
-                            }`}
-                          >
-                            {unpriced
-                              ? t("usage.unpriced", "未定价")
-                              : fmtUsd(log.totalCostUsd, 4)}
+                          <div className="font-medium tabular-nums">
+                            {fmtInt(totalTokens, locale)}
                           </div>
-                          {parseFiniteNumber(log.costMultiplier) != null &&
-                            parseFiniteNumber(log.costMultiplier) !== 1 && (
-                              <div className="text-[11px] text-muted-foreground">
-                                ×
-                                {parseFiniteNumber(log.costMultiplier)?.toFixed(
-                                  2,
-                                )}
-                              </div>
-                            )}
                         </TableCell>
                         <TableCell className="text-center whitespace-nowrap text-xs tabular-nums">
                           {(log.latencyMs / 1000).toFixed(1)}s

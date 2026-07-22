@@ -128,6 +128,116 @@ pub struct AccountQuotaTier {
     pub resets_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountUsageBlockKind {
+    RateLimited,
+    QuotaExhausted,
+}
+
+impl AccountUsageBlockKind {
+    pub fn availability(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExhausted => "quota_exhausted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountUsageBlock {
+    pub kind: AccountUsageBlockKind,
+    pub reason: &'static str,
+    pub scope: &'static str,
+    pub until_ms: i64,
+}
+
+const DEFAULT_QUOTA_EVIDENCE_TTL_MS: i64 = 60 * 60 * 1000;
+const MIN_QUOTA_REFRESH_INTERVAL_MS: i64 = 5 * 60 * 1000;
+const MAX_QUOTA_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
+
+pub fn active_account_usage_block(account: &Account, now_ms: i64) -> Option<AccountUsageBlock> {
+    if let Some(until_ms) = account.rate_limited_until.filter(|until| *until > now_ms) {
+        return Some(AccountUsageBlock {
+            kind: AccountUsageBlockKind::RateLimited,
+            reason: "upstream rate limit is active",
+            scope: "account_rate_limit",
+            until_ms,
+        });
+    }
+
+    let quota = account.quota.as_ref()?;
+    if !quota.success || account.last_refresh_error.is_some() {
+        return None;
+    }
+    let evidence_deadline = quota_evidence_deadline(account, now_ms)?;
+    let extra = quota.extra_usage.as_ref()?;
+    let (reason, scope) = match account.provider_type {
+        ProviderType::CodexOAuth
+            if extra
+                .pointer("/subscriptionEvidence/usageLimitReached")
+                .and_then(Value::as_bool)
+                == Some(true)
+                || extra
+                    .pointer("/subscriptionEvidence/usageAllowed")
+                    .and_then(Value::as_bool)
+                    == Some(false) =>
+        {
+            ("upstream reported the Codex usage limit", "codex_account")
+        }
+        ProviderType::GrokOAuth
+            if extra
+                .pointer("/spendingLimitReached")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            ("upstream reported the Grok spending limit", "grok_account")
+        }
+        ProviderType::KiroOAuth
+            if extra.pointer("/overageEnabled").and_then(Value::as_bool) == Some(false)
+                && quota.tiers.iter().any(quota_tier_is_exhausted) =>
+        {
+            ("upstream reported the Kiro usage limit", "kiro_account")
+        }
+        _ => return None,
+    };
+    let until_ms = quota
+        .tiers
+        .iter()
+        .filter(|tier| quota_tier_is_exhausted(tier))
+        .filter_map(|tier| tier.resets_at)
+        .filter(|reset| *reset > now_ms)
+        .min()
+        .map(|reset| reset.min(evidence_deadline))
+        .unwrap_or(evidence_deadline);
+    Some(AccountUsageBlock {
+        kind: AccountUsageBlockKind::QuotaExhausted,
+        reason,
+        scope,
+        until_ms,
+    })
+}
+
+fn quota_evidence_deadline(account: &Account, now_ms: i64) -> Option<i64> {
+    let refreshed_at = account.quota_refreshed_at?;
+    let deadline = account
+        .quota_next_refresh_at
+        .filter(|next| *next > refreshed_at)
+        .map(|next| {
+            let interval = next
+                .saturating_sub(refreshed_at)
+                .clamp(MIN_QUOTA_REFRESH_INTERVAL_MS, MAX_QUOTA_REFRESH_INTERVAL_MS);
+            next.saturating_add(interval)
+        })
+        .unwrap_or_else(|| refreshed_at.saturating_add(DEFAULT_QUOTA_EVIDENCE_TTL_MS));
+    (deadline > now_ms).then_some(deadline)
+}
+
+fn quota_tier_is_exhausted(tier: &AccountQuotaTier) -> bool {
+    tier.utilization
+        .filter(|value| value.is_finite())
+        .is_some_and(|value| value >= 1.0)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpsertAccountInput {
@@ -621,15 +731,16 @@ impl AccountStore {
         &mut self,
         account_id: &str,
         rate_limited_until: i64,
-        message: Option<String>,
     ) -> Option<Account> {
         let account = self
             .accounts
             .iter_mut()
             .find(|item| item.id == account_id)?;
-        account.rate_limited_until = Some(rate_limited_until);
-        if let Some(message) = message {
-            account.last_refresh_error = Some(message);
+        let extends_cooldown = account
+            .rate_limited_until
+            .is_none_or(|current| rate_limited_until >= current);
+        if extends_cooldown {
+            account.rate_limited_until = Some(rate_limited_until);
         }
         Some(account.clone())
     }
@@ -1435,6 +1546,175 @@ mod tests {
             rate_limited_until: None,
             last_refresh_error: None,
         }
+    }
+
+    fn quota_account(
+        provider_type: ProviderType,
+        now_ms: i64,
+        extra_usage: Value,
+        tiers: Vec<AccountQuotaTier>,
+    ) -> Account {
+        let mut input = fixture_input(provider_type);
+        input.id = Some("quota-account".to_string());
+        input.quota = Some(AccountQuota {
+            success: true,
+            credential_message: None,
+            tiers,
+            extra_usage: Some(extra_usage),
+        });
+        input.quota_percent = Some(100.0);
+        input.quota_refreshed_at = Some(now_ms - 5 * 60 * 1000);
+        input.quota_next_refresh_at = Some(now_ms + 25 * 60 * 1000);
+        AccountStore::default().upsert(input)
+    }
+
+    #[test]
+    fn aggregate_quota_percent_does_not_create_a_usage_block() {
+        let now_ms = 1_000_000_000;
+        let account = quota_account(
+            ProviderType::ClaudeOAuth,
+            now_ms,
+            json!({"raw": {}}),
+            vec![AccountQuotaTier {
+                name: "five_hour".to_string(),
+                utilization: Some(1.0),
+                resets_at: Some(now_ms + 60 * 60 * 1000),
+                ..Default::default()
+            }],
+        );
+
+        assert!(active_account_usage_block(&account, now_ms).is_none());
+    }
+
+    #[test]
+    fn fresh_explicit_codex_limit_creates_a_bounded_usage_block() {
+        let now_ms = 1_000_000_000;
+        let account = quota_account(
+            ProviderType::CodexOAuth,
+            now_ms,
+            json!({
+                "subscriptionEvidence": {
+                    "usageAllowed": false,
+                    "usageLimitReached": true
+                }
+            }),
+            vec![AccountQuotaTier {
+                name: "seven_day".to_string(),
+                utilization: Some(1.0),
+                resets_at: Some(now_ms + 7 * 24 * 60 * 60 * 1000),
+                ..Default::default()
+            }],
+        );
+
+        let block = active_account_usage_block(&account, now_ms).expect("active block");
+        assert_eq!(block.kind, AccountUsageBlockKind::QuotaExhausted);
+        assert_eq!(block.scope, "codex_account");
+        assert_eq!(block.until_ms, now_ms + 55 * 60 * 1000);
+    }
+
+    #[test]
+    fn stale_or_failed_quota_evidence_does_not_block() {
+        let now_ms = 1_000_000_000;
+        let mut account = quota_account(
+            ProviderType::GrokOAuth,
+            now_ms,
+            json!({"spendingLimitReached": true}),
+            Vec::new(),
+        );
+        let stale_at = now_ms + 56 * 60 * 1000;
+        assert!(active_account_usage_block(&account, stale_at).is_none());
+
+        account.last_refresh_error = Some("quota refresh failed".to_string());
+        assert!(active_account_usage_block(&account, now_ms).is_none());
+    }
+
+    #[test]
+    fn active_rate_limit_uses_its_authoritative_expiry() {
+        let now_ms = 1_000_000_000;
+        let mut input = fixture_input(ProviderType::CursorApiKey);
+        input.rate_limited_until = Some(now_ms + 90_000);
+        let account = AccountStore::default().upsert(input);
+
+        let block = active_account_usage_block(&account, now_ms).expect("active block");
+        assert_eq!(block.kind, AccountUsageBlockKind::RateLimited);
+        assert_eq!(block.until_ms, now_ms + 90_000);
+        assert!(active_account_usage_block(&account, now_ms + 90_000).is_none());
+    }
+
+    #[test]
+    fn repeated_rate_limit_markers_never_shorten_an_active_cooldown() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::KiroOAuth);
+        input.id = Some("rate-limited-account".to_string());
+        store.upsert(input);
+
+        store.mark_rate_limited_until("rate-limited-account", 1_000_000);
+        let account = store
+            .mark_rate_limited_until("rate-limited-account", 100_000)
+            .expect("account");
+
+        assert_eq!(account.rate_limited_until, Some(1_000_000));
+        assert!(account.last_refresh_error.is_none());
+    }
+
+    #[test]
+    fn expired_rate_limit_does_not_hide_fresh_explicit_quota_exhaustion() {
+        let now_ms = 1_000_000_000;
+        let account = quota_account(
+            ProviderType::CodexOAuth,
+            now_ms,
+            json!({
+                "subscriptionEvidence": {
+                    "usageAllowed": false,
+                    "usageLimitReached": true
+                }
+            }),
+            vec![AccountQuotaTier {
+                name: "seven_day".to_string(),
+                utilization: Some(1.0),
+                resets_at: Some(now_ms + 7 * 24 * 60 * 60 * 1000),
+                ..Default::default()
+            }],
+        );
+        let mut store = AccountStore {
+            accounts: vec![account],
+        };
+        store.mark_rate_limited_until("quota-account", now_ms + 60_000);
+
+        let account = store
+            .accounts
+            .iter()
+            .find(|account| account.id == "quota-account")
+            .expect("account");
+        let block = active_account_usage_block(account, now_ms + 90_000).expect("quota block");
+        assert_eq!(block.kind, AccountUsageBlockKind::QuotaExhausted);
+        assert!(account.last_refresh_error.is_none());
+    }
+
+    #[test]
+    fn kiro_exhaustion_only_blocks_when_overage_is_disabled() {
+        let now_ms = 1_000_000_000;
+        let tier = AccountQuotaTier {
+            name: "kiro_agentic_requests".to_string(),
+            utilization: Some(1.0),
+            resets_at: Some(now_ms + 20 * 60 * 1000),
+            ..Default::default()
+        };
+        let overage = quota_account(
+            ProviderType::KiroOAuth,
+            now_ms,
+            json!({"overageEnabled": true}),
+            vec![tier.clone()],
+        );
+        let capped = quota_account(
+            ProviderType::KiroOAuth,
+            now_ms,
+            json!({"overageEnabled": false}),
+            vec![tier],
+        );
+
+        assert!(active_account_usage_block(&overage, now_ms).is_none());
+        assert!(active_account_usage_block(&capped, now_ms).is_some());
     }
 
     #[test]

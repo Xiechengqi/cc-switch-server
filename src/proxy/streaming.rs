@@ -178,9 +178,6 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
     if next.raw_input_tokens.is_some() {
         target.raw_input_tokens = next.raw_input_tokens;
     }
-    if next.billed_input_tokens.is_some() {
-        target.billed_input_tokens = next.billed_input_tokens;
-    }
     if next.input_tokens.is_some() {
         target.input_tokens = next.input_tokens;
     }
@@ -321,7 +318,6 @@ data: {"type":"message_delta","delta":{"text":"hi"}}
 
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.raw_input_tokens, Some(10));
-        assert_eq!(usage.billed_input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(4));
         assert_eq!(usage.total_tokens, Some(14));
     }
@@ -338,7 +334,6 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
 
         assert_eq!(usage.input_tokens, Some(11));
         assert_eq!(usage.raw_input_tokens, Some(16));
-        assert_eq!(usage.billed_input_tokens, Some(11));
         assert_eq!(usage.cache_read_tokens, Some(5));
         assert_eq!(usage.total_tokens, Some(16));
     }
@@ -353,7 +348,6 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         let usage = parser.finish();
 
         assert_eq!(usage.input_tokens, Some(12));
-        assert_eq!(usage.billed_input_tokens, Some(12));
         assert_eq!(usage.output_tokens, Some(6));
         assert_eq!(usage.cache_read_tokens, Some(9));
     }
@@ -404,7 +398,6 @@ data: {"type":"message_delta","usage":{"input_tokens":140,"output_tokens":8,"cac
         assert_eq!(usage.output_tokens, Some(8));
         assert_eq!(usage.cache_read_tokens, Some(90));
         assert_eq!(usage.cache_creation_tokens, Some(4));
-        assert_eq!(usage.billed_input_tokens, Some(140));
         assert_eq!(usage.raw_input_tokens, Some(234));
         assert_eq!(usage.total_tokens, Some(242));
     }
@@ -536,103 +529,103 @@ data: {"type":"message_delta","usage":{"output_tokens":8}}
         };
     }
 
-    openai_usage_case!(desktop_openai_include_usage_001, 1, 2, 0);
-    openai_usage_case!(desktop_openai_include_usage_002, 3, 5, 1);
-    openai_usage_case!(desktop_openai_include_usage_003, 8, 13, 2);
-    openai_usage_case!(desktop_openai_include_usage_004, 21, 34, 3);
-    openai_usage_case!(desktop_openai_include_usage_005, 55, 89, 5);
-    openai_usage_case!(desktop_openai_include_usage_006, 144, 233, 8);
-    openai_usage_case!(desktop_openai_include_usage_007, 377, 610, 13);
-    openai_usage_case!(desktop_openai_include_usage_008, 987, 1597, 21);
-    openai_usage_case!(desktop_openai_include_usage_009, 10, 1, 9);
-    openai_usage_case!(desktop_openai_include_usage_010, 20, 2, 10);
-    openai_usage_case!(desktop_openai_include_usage_011, 30, 3, 11);
-    openai_usage_case!(desktop_openai_include_usage_012, 40, 4, 12);
-    openai_usage_case!(desktop_openai_include_usage_013, 50, 5, 13);
-    openai_usage_case!(desktop_openai_include_usage_014, 60, 6, 14);
-    openai_usage_case!(desktop_openai_include_usage_015, 70, 7, 15);
-    openai_usage_case!(desktop_openai_include_usage_016, 80, 8, 16);
-    openai_usage_case!(desktop_openai_include_usage_017, 90, 9, 17);
-    openai_usage_case!(desktop_openai_include_usage_018, 100, 10, 18);
-    openai_usage_case!(desktop_openai_include_usage_019, 128, 16, 32);
-    openai_usage_case!(desktop_openai_include_usage_020, 256, 32, 64);
-    openai_usage_case!(desktop_openai_include_usage_021, 512, 64, 128);
-    openai_usage_case!(desktop_openai_include_usage_022, 1024, 128, 256);
-    openai_usage_case!(desktop_openai_include_usage_023, 2048, 256, 512);
-    openai_usage_case!(desktop_openai_include_usage_024, 4096, 512, 1024);
+    openai_usage_case!(server_openai_include_usage_001, 1, 2, 0);
+    openai_usage_case!(server_openai_include_usage_002, 3, 5, 1);
+    openai_usage_case!(server_openai_include_usage_003, 8, 13, 2);
+    openai_usage_case!(server_openai_include_usage_004, 21, 34, 3);
+    openai_usage_case!(server_openai_include_usage_005, 55, 89, 5);
+    openai_usage_case!(server_openai_include_usage_006, 144, 233, 8);
+    openai_usage_case!(server_openai_include_usage_007, 377, 610, 13);
+    openai_usage_case!(server_openai_include_usage_008, 987, 1597, 21);
+    openai_usage_case!(server_openai_include_usage_009, 10, 1, 9);
+    openai_usage_case!(server_openai_include_usage_010, 20, 2, 10);
+    openai_usage_case!(server_openai_include_usage_011, 30, 3, 11);
+    openai_usage_case!(server_openai_include_usage_012, 40, 4, 12);
+    openai_usage_case!(server_openai_include_usage_013, 50, 5, 13);
+    openai_usage_case!(server_openai_include_usage_014, 60, 6, 14);
+    openai_usage_case!(server_openai_include_usage_015, 70, 7, 15);
+    openai_usage_case!(server_openai_include_usage_016, 80, 8, 16);
+    openai_usage_case!(server_openai_include_usage_017, 90, 9, 17);
+    openai_usage_case!(server_openai_include_usage_018, 100, 10, 18);
+    openai_usage_case!(server_openai_include_usage_019, 128, 16, 32);
+    openai_usage_case!(server_openai_include_usage_020, 256, 32, 64);
+    openai_usage_case!(server_openai_include_usage_021, 512, 64, 128);
+    openai_usage_case!(server_openai_include_usage_022, 1024, 128, 256);
+    openai_usage_case!(server_openai_include_usage_023, 2048, 256, 512);
+    openai_usage_case!(server_openai_include_usage_024, 4096, 512, 1024);
 
-    claude_usage_case!(desktop_claude_delta_usage_001, 1, 2, 0, 0);
-    claude_usage_case!(desktop_claude_delta_usage_002, 3, 5, 1, 0);
-    claude_usage_case!(desktop_claude_delta_usage_003, 8, 13, 2, 1);
-    claude_usage_case!(desktop_claude_delta_usage_004, 21, 34, 3, 1);
-    claude_usage_case!(desktop_claude_delta_usage_005, 55, 89, 5, 2);
-    claude_usage_case!(desktop_claude_delta_usage_006, 144, 233, 8, 3);
-    claude_usage_case!(desktop_claude_delta_usage_007, 377, 610, 13, 5);
-    claude_usage_case!(desktop_claude_delta_usage_008, 987, 1597, 21, 8);
-    claude_usage_case!(desktop_claude_delta_usage_009, 10, 1, 9, 1);
-    claude_usage_case!(desktop_claude_delta_usage_010, 20, 2, 10, 2);
-    claude_usage_case!(desktop_claude_delta_usage_011, 30, 3, 11, 3);
-    claude_usage_case!(desktop_claude_delta_usage_012, 40, 4, 12, 4);
-    claude_usage_case!(desktop_claude_delta_usage_013, 50, 5, 13, 5);
-    claude_usage_case!(desktop_claude_delta_usage_014, 60, 6, 14, 6);
-    claude_usage_case!(desktop_claude_delta_usage_015, 70, 7, 15, 7);
-    claude_usage_case!(desktop_claude_delta_usage_016, 80, 8, 16, 8);
-    claude_usage_case!(desktop_claude_delta_usage_017, 90, 9, 17, 9);
-    claude_usage_case!(desktop_claude_delta_usage_018, 100, 10, 18, 10);
-    claude_usage_case!(desktop_claude_delta_usage_019, 128, 16, 32, 4);
-    claude_usage_case!(desktop_claude_delta_usage_020, 256, 32, 64, 8);
-    claude_usage_case!(desktop_claude_delta_usage_021, 512, 64, 128, 16);
-    claude_usage_case!(desktop_claude_delta_usage_022, 1024, 128, 256, 32);
-    claude_usage_case!(desktop_claude_delta_usage_023, 2048, 256, 512, 64);
-    claude_usage_case!(desktop_claude_delta_usage_024, 4096, 512, 1024, 128);
+    claude_usage_case!(server_claude_delta_usage_001, 1, 2, 0, 0);
+    claude_usage_case!(server_claude_delta_usage_002, 3, 5, 1, 0);
+    claude_usage_case!(server_claude_delta_usage_003, 8, 13, 2, 1);
+    claude_usage_case!(server_claude_delta_usage_004, 21, 34, 3, 1);
+    claude_usage_case!(server_claude_delta_usage_005, 55, 89, 5, 2);
+    claude_usage_case!(server_claude_delta_usage_006, 144, 233, 8, 3);
+    claude_usage_case!(server_claude_delta_usage_007, 377, 610, 13, 5);
+    claude_usage_case!(server_claude_delta_usage_008, 987, 1597, 21, 8);
+    claude_usage_case!(server_claude_delta_usage_009, 10, 1, 9, 1);
+    claude_usage_case!(server_claude_delta_usage_010, 20, 2, 10, 2);
+    claude_usage_case!(server_claude_delta_usage_011, 30, 3, 11, 3);
+    claude_usage_case!(server_claude_delta_usage_012, 40, 4, 12, 4);
+    claude_usage_case!(server_claude_delta_usage_013, 50, 5, 13, 5);
+    claude_usage_case!(server_claude_delta_usage_014, 60, 6, 14, 6);
+    claude_usage_case!(server_claude_delta_usage_015, 70, 7, 15, 7);
+    claude_usage_case!(server_claude_delta_usage_016, 80, 8, 16, 8);
+    claude_usage_case!(server_claude_delta_usage_017, 90, 9, 17, 9);
+    claude_usage_case!(server_claude_delta_usage_018, 100, 10, 18, 10);
+    claude_usage_case!(server_claude_delta_usage_019, 128, 16, 32, 4);
+    claude_usage_case!(server_claude_delta_usage_020, 256, 32, 64, 8);
+    claude_usage_case!(server_claude_delta_usage_021, 512, 64, 128, 16);
+    claude_usage_case!(server_claude_delta_usage_022, 1024, 128, 256, 32);
+    claude_usage_case!(server_claude_delta_usage_023, 2048, 256, 512, 64);
+    claude_usage_case!(server_claude_delta_usage_024, 4096, 512, 1024, 128);
 
-    codex_usage_case!(desktop_codex_response_completed_001, 1, 2, 0);
-    codex_usage_case!(desktop_codex_response_completed_002, 3, 5, 1);
-    codex_usage_case!(desktop_codex_response_completed_003, 8, 13, 2);
-    codex_usage_case!(desktop_codex_response_completed_004, 21, 34, 3);
-    codex_usage_case!(desktop_codex_response_completed_005, 55, 89, 5);
-    codex_usage_case!(desktop_codex_response_completed_006, 144, 233, 8);
-    codex_usage_case!(desktop_codex_response_completed_007, 377, 610, 13);
-    codex_usage_case!(desktop_codex_response_completed_008, 987, 1597, 21);
-    codex_usage_case!(desktop_codex_response_completed_009, 10, 1, 9);
-    codex_usage_case!(desktop_codex_response_completed_010, 20, 2, 10);
-    codex_usage_case!(desktop_codex_response_completed_011, 30, 3, 11);
-    codex_usage_case!(desktop_codex_response_completed_012, 40, 4, 12);
-    codex_usage_case!(desktop_codex_response_completed_013, 50, 5, 13);
-    codex_usage_case!(desktop_codex_response_completed_014, 60, 6, 14);
-    codex_usage_case!(desktop_codex_response_completed_015, 70, 7, 15);
-    codex_usage_case!(desktop_codex_response_completed_016, 80, 8, 16);
-    codex_usage_case!(desktop_codex_response_completed_017, 90, 9, 17);
-    codex_usage_case!(desktop_codex_response_completed_018, 100, 10, 18);
-    codex_usage_case!(desktop_codex_response_completed_019, 128, 16, 32);
-    codex_usage_case!(desktop_codex_response_completed_020, 256, 32, 64);
-    codex_usage_case!(desktop_codex_response_completed_021, 512, 64, 128);
-    codex_usage_case!(desktop_codex_response_completed_022, 1024, 128, 256);
-    codex_usage_case!(desktop_codex_response_completed_023, 2048, 256, 512);
-    codex_usage_case!(desktop_codex_response_completed_024, 4096, 512, 1024);
+    codex_usage_case!(server_codex_response_completed_001, 1, 2, 0);
+    codex_usage_case!(server_codex_response_completed_002, 3, 5, 1);
+    codex_usage_case!(server_codex_response_completed_003, 8, 13, 2);
+    codex_usage_case!(server_codex_response_completed_004, 21, 34, 3);
+    codex_usage_case!(server_codex_response_completed_005, 55, 89, 5);
+    codex_usage_case!(server_codex_response_completed_006, 144, 233, 8);
+    codex_usage_case!(server_codex_response_completed_007, 377, 610, 13);
+    codex_usage_case!(server_codex_response_completed_008, 987, 1597, 21);
+    codex_usage_case!(server_codex_response_completed_009, 10, 1, 9);
+    codex_usage_case!(server_codex_response_completed_010, 20, 2, 10);
+    codex_usage_case!(server_codex_response_completed_011, 30, 3, 11);
+    codex_usage_case!(server_codex_response_completed_012, 40, 4, 12);
+    codex_usage_case!(server_codex_response_completed_013, 50, 5, 13);
+    codex_usage_case!(server_codex_response_completed_014, 60, 6, 14);
+    codex_usage_case!(server_codex_response_completed_015, 70, 7, 15);
+    codex_usage_case!(server_codex_response_completed_016, 80, 8, 16);
+    codex_usage_case!(server_codex_response_completed_017, 90, 9, 17);
+    codex_usage_case!(server_codex_response_completed_018, 100, 10, 18);
+    codex_usage_case!(server_codex_response_completed_019, 128, 16, 32);
+    codex_usage_case!(server_codex_response_completed_020, 256, 32, 64);
+    codex_usage_case!(server_codex_response_completed_021, 512, 64, 128);
+    codex_usage_case!(server_codex_response_completed_022, 1024, 128, 256);
+    codex_usage_case!(server_codex_response_completed_023, 2048, 256, 512);
+    codex_usage_case!(server_codex_response_completed_024, 4096, 512, 1024);
 
-    gemini_usage_case!(desktop_gemini_usage_metadata_001, 1, 2, 0);
-    gemini_usage_case!(desktop_gemini_usage_metadata_002, 3, 5, 1);
-    gemini_usage_case!(desktop_gemini_usage_metadata_003, 8, 13, 2);
-    gemini_usage_case!(desktop_gemini_usage_metadata_004, 21, 34, 3);
-    gemini_usage_case!(desktop_gemini_usage_metadata_005, 55, 89, 5);
-    gemini_usage_case!(desktop_gemini_usage_metadata_006, 144, 233, 8);
-    gemini_usage_case!(desktop_gemini_usage_metadata_007, 377, 610, 13);
-    gemini_usage_case!(desktop_gemini_usage_metadata_008, 987, 1597, 21);
-    gemini_usage_case!(desktop_gemini_usage_metadata_009, 10, 1, 9);
-    gemini_usage_case!(desktop_gemini_usage_metadata_010, 20, 2, 10);
-    gemini_usage_case!(desktop_gemini_usage_metadata_011, 30, 3, 11);
-    gemini_usage_case!(desktop_gemini_usage_metadata_012, 40, 4, 12);
-    gemini_usage_case!(desktop_gemini_usage_metadata_013, 50, 5, 13);
-    gemini_usage_case!(desktop_gemini_usage_metadata_014, 60, 6, 14);
-    gemini_usage_case!(desktop_gemini_usage_metadata_015, 70, 7, 15);
-    gemini_usage_case!(desktop_gemini_usage_metadata_016, 80, 8, 16);
-    gemini_usage_case!(desktop_gemini_usage_metadata_017, 90, 9, 17);
-    gemini_usage_case!(desktop_gemini_usage_metadata_018, 100, 10, 18);
-    gemini_usage_case!(desktop_gemini_usage_metadata_019, 128, 16, 32);
-    gemini_usage_case!(desktop_gemini_usage_metadata_020, 256, 32, 64);
-    gemini_usage_case!(desktop_gemini_usage_metadata_021, 512, 64, 128);
-    gemini_usage_case!(desktop_gemini_usage_metadata_022, 1024, 128, 256);
-    gemini_usage_case!(desktop_gemini_usage_metadata_023, 2048, 256, 512);
-    gemini_usage_case!(desktop_gemini_usage_metadata_024, 4096, 512, 1024);
+    gemini_usage_case!(server_gemini_usage_metadata_001, 1, 2, 0);
+    gemini_usage_case!(server_gemini_usage_metadata_002, 3, 5, 1);
+    gemini_usage_case!(server_gemini_usage_metadata_003, 8, 13, 2);
+    gemini_usage_case!(server_gemini_usage_metadata_004, 21, 34, 3);
+    gemini_usage_case!(server_gemini_usage_metadata_005, 55, 89, 5);
+    gemini_usage_case!(server_gemini_usage_metadata_006, 144, 233, 8);
+    gemini_usage_case!(server_gemini_usage_metadata_007, 377, 610, 13);
+    gemini_usage_case!(server_gemini_usage_metadata_008, 987, 1597, 21);
+    gemini_usage_case!(server_gemini_usage_metadata_009, 10, 1, 9);
+    gemini_usage_case!(server_gemini_usage_metadata_010, 20, 2, 10);
+    gemini_usage_case!(server_gemini_usage_metadata_011, 30, 3, 11);
+    gemini_usage_case!(server_gemini_usage_metadata_012, 40, 4, 12);
+    gemini_usage_case!(server_gemini_usage_metadata_013, 50, 5, 13);
+    gemini_usage_case!(server_gemini_usage_metadata_014, 60, 6, 14);
+    gemini_usage_case!(server_gemini_usage_metadata_015, 70, 7, 15);
+    gemini_usage_case!(server_gemini_usage_metadata_016, 80, 8, 16);
+    gemini_usage_case!(server_gemini_usage_metadata_017, 90, 9, 17);
+    gemini_usage_case!(server_gemini_usage_metadata_018, 100, 10, 18);
+    gemini_usage_case!(server_gemini_usage_metadata_019, 128, 16, 32);
+    gemini_usage_case!(server_gemini_usage_metadata_020, 256, 32, 64);
+    gemini_usage_case!(server_gemini_usage_metadata_021, 512, 64, 128);
+    gemini_usage_case!(server_gemini_usage_metadata_022, 1024, 128, 256);
+    gemini_usage_case!(server_gemini_usage_metadata_023, 2048, 256, 512);
+    gemini_usage_case!(server_gemini_usage_metadata_024, 4096, 512, 1024);
 }

@@ -416,7 +416,6 @@ export interface UsageRollup {
   cacheReadTokens: number;
   cacheCreationTokens: number;
   totalTokens: number;
-  totalCostUsd: number;
 }
 
 export interface UsageTrendPoint {
@@ -440,23 +439,15 @@ export interface UsageLog {
   requestedModel?: string | null;
   actualModel?: string | null;
   actualModelSource?: string | null;
-  pricingModel?: string | null;
-  costMultiplier?: number | null;
   statusCode: number;
   durationMs: number;
   firstTokenMs?: number | null;
   rawInputTokens?: number | null;
-  billedInputTokens?: number | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
   cacheReadTokens?: number | null;
   cacheCreationTokens?: number | null;
   totalTokens?: number | null;
-  inputCostUsd?: number | null;
-  outputCostUsd?: number | null;
-  cacheReadCostUsd?: number | null;
-  cacheCreationCostUsd?: number | null;
-  totalCostUsd?: number | null;
   shareId?: string | null;
   shareName?: string | null;
   userEmail?: string | null;
@@ -504,29 +495,10 @@ export interface ModelUsageStats {
   requestedModel?: string | null;
   actualModel?: string | null;
   actualModelSource?: string | null;
-  pricingModel?: string | null;
   rollup: UsageRollup;
   avgDurationMs?: number | null;
   avgFirstTokenMs?: number | null;
   lastRequestAtMs?: number | null;
-}
-
-export interface ModelPricingEntry {
-  modelId: string;
-  displayName: string;
-  inputCostPerMillion: string;
-  outputCostPerMillion: string;
-  cacheReadCostPerMillion: string;
-  cacheCreationCostPerMillion: string;
-}
-
-export interface UpdateModelPricingInput {
-  modelId?: string;
-  displayName: string;
-  inputCostPerMillion: string;
-  outputCostPerMillion: string;
-  cacheReadCostPerMillion: string;
-  cacheCreationCostPerMillion: string;
 }
 
 export interface ProviderLimitShareStatus {
@@ -549,19 +521,11 @@ export interface ProviderLimitStatus {
   providerId: string;
   providerName: string;
   providerType: string;
-  dailyUsageUsd: number;
-  dailyLimitUsd?: number | null;
-  dailyExceeded: boolean;
-  monthlyUsageUsd: number;
-  monthlyLimitUsd?: number | null;
-  monthlyExceeded: boolean;
   accountId?: string | null;
   accountEmail?: string | null;
   accountQuotaPercent?: number | null;
   accountQuotaRefreshedAt?: number | null;
   accountLastRefreshError?: string | null;
-  quotaDispatchLimitPercent?: number | null;
-  quotaDispatchExceeded: boolean;
   shares: ProviderLimitShareStatus[];
   warnings: string[];
   blocked: boolean;

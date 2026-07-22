@@ -7,8 +7,6 @@ import type {
   ModelStats,
   RequestLog,
   LogFilters,
-  ModelPricing,
-  ProviderLimitStatus,
   PaginatedLogs,
   SessionSyncResult,
   DataSourceSummary,
@@ -109,39 +107,6 @@ export const usageApi = {
 
   getRequestDetail: async (requestId: string): Promise<RequestLog | null> => {
     return invokeCommand("get_request_detail", { requestId });
-  },
-
-  getModelPricing: async (): Promise<ModelPricing[]> => {
-    return invokeCommand("get_model_pricing");
-  },
-
-  updateModelPricing: async (
-    modelId: string,
-    displayName: string,
-    inputCost: string,
-    outputCost: string,
-    cacheReadCost: string,
-    cacheCreationCost: string,
-  ): Promise<void> => {
-    return invokeCommand("update_model_pricing", {
-      modelId,
-      displayName,
-      inputCost,
-      outputCost,
-      cacheReadCost,
-      cacheCreationCost,
-    });
-  },
-
-  deleteModelPricing: async (modelId: string): Promise<void> => {
-    return invokeCommand("delete_model_pricing", { modelId });
-  },
-
-  checkProviderLimits: async (
-    providerId: string,
-    appType: string,
-  ): Promise<ProviderLimitStatus> => {
-    return invokeCommand("check_provider_limits", { providerId, appType });
   },
 
   // Session usage sync

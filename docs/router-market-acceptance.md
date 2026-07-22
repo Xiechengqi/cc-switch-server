@@ -80,7 +80,6 @@ Ollama Cloud 等无百分比 quota 的 provider 不应显示伪造 `0%`，也不
 - `requestedModel`
 - `actualModel`
 - `actualModelSource`
-- `pricingModel`
 - `statusCode`
 - `inputTokens`
 - `outputTokens`

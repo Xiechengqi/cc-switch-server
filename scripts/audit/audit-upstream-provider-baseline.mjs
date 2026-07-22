@@ -10,21 +10,20 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const requireFromWeb = createRequire(path.join(repoRoot, "web-src/package.json"));
 const ts = requireFromWeb("typescript");
-const syncManifest = JSON.parse(
-  fs.readFileSync(path.join(repoRoot, "assets/contract/desktop-ui-sync.json"), "utf8"),
-);
-const upstreamRoot =
-  process.env.CC_SWITCH_DESKTOP_ROOT || syncManifest.upstream.repository;
-const upstreamCommit = syncManifest.upstream.commit;
 const outputPath = path.join(
   repoRoot,
   "assets/contract/upstream-provider-source-baseline.json",
 );
+const pinnedBaseline = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+const upstreamRoot =
+  process.env.CC_SWITCH_PROVIDER_AUDIT_ROOT || pinnedBaseline.upstream.repository;
+let upstreamCommit = pinnedBaseline.upstream.commit;
 const serverInventoryPath = path.join(
   repoRoot,
   "assets/contract/server-provider-legacy-inventory.json",
 );
 const checkMode = process.argv.includes("--check");
+const refreshSource = process.argv.includes("--refresh-source");
 
 const expectedCounts = Object.freeze({
   upstreamProviderTypes: 16,
@@ -402,7 +401,7 @@ function buildBaseline() {
   return {
     schemaVersion: 1,
     upstream: {
-      repository: syncManifest.upstream.repository,
+      repository: pinnedBaseline.upstream.repository,
       commit: upstreamCommit,
     },
     sources,
@@ -686,6 +685,15 @@ export function validateBaselineContracts(baseline, serverInventory) {
 }
 
 function main() {
+  if (checkMode && refreshSource) {
+    throw new Error("--check and --refresh-source cannot be used together");
+  }
+  if (refreshSource) {
+    if (git(["status", "--porcelain=v1"]).trim()) {
+      throw new Error("refusing to refresh Provider audit baseline from a dirty source tree");
+    }
+    upstreamCommit = git(["rev-parse", "HEAD"]).trim();
+  }
   const baseline = buildBaseline();
   const serverInventory = buildServerLegacyInventory();
   serverInventory.coverageMappings = buildCoverageMappings(baseline, serverInventory);
@@ -709,7 +717,11 @@ function main() {
   }
   fs.writeFileSync(outputPath, serialized);
   fs.writeFileSync(serverInventoryPath, serializedServerInventory);
-  console.log(`provider source baselines written: ${outputPath}, ${serverInventoryPath}`);
+  console.log(
+    refreshSource
+      ? `Provider audit baseline refreshed at ${upstreamCommit}`
+      : `provider source baselines written: ${outputPath}, ${serverInventoryPath}`,
+  );
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -8,8 +8,8 @@ use crate::domain::accounts::subscription_expiry::{
 };
 use crate::domain::providers::model::ProviderType;
 
-/// Convert stored account quota (0–1 utilization fractions) into the desktop
-/// `SubscriptionQuota` shape expected by provider card footers (0–100).
+/// Convert stored account quota (0–1 utilization fractions) into the legacy
+/// `SubscriptionQuota` shape expected by Provider card footers (0–100).
 #[allow(dead_code)]
 pub(in crate::api) fn subscription_quota_from_account(account: &Account, tool: &str) -> Value {
     let credential_status = account_credential_status(account);

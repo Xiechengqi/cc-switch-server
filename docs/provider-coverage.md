@@ -91,14 +91,14 @@ Note: server compatibility provider types are explicit cc-switch-server classifi
 | NewAPI | `newapi` | claude, codex, gemini |
 | 自定义网关 | `custom_gateway` | claude, codex, gemini |
 
-## Server parity notes
+## Server implementation notes
 
 ### Claude/Codex model routing contract
 
 - Typed Provider ownership is derived from immutable `profileId`; fixed Profiles ignore conflicting name, URL, category, and raw `meta.providerType` hints. Only S1/`legacy_compat` records retain endpoint/name heuristics. Native Claude and Codex Profiles persist `modelMapping.mode=passthrough` and retain the requested text model.
 - Every non-native Claude/Codex Provider persists `modelMapping.mode=single` with one non-empty `upstreamModel`. The policy overrides catalogs, direct mappings, rules, role-model environment variables, Copilot preflight normalization, and vendor-specific Kiro/DeepSeek/Grok transforms.
 - Provider load performs only an in-memory compatibility normalization and never rewrites `providers.json`. Explicit existing actual models are preserved, model values are inferred from legacy app configuration when possible, and legacy Grok providers without an explicit mapping default to `grok-4.5`. S1-to-S2 cutover is an explicit offline CLI action; unresolvable historical records block cutover rather than being guessed.
-- HTTP usage records preserve the requested model, record the final upstream model and source, and price by the final model. Direct requests use the selected current Provider and Share requests use their binding. Non-Claude retries and pinned Claude requests remain on that Provider; unpinned Claude Messages/count_tokens requests may use the bounded failover policy documented below. Grok image/video routes are intentionally excluded.
+- HTTP usage records preserve the requested model, record the final upstream model and source, and attribute token usage to the final model. Direct requests use the selected current Provider and Share requests use their binding. Non-Claude retries and pinned Claude requests remain on that Provider; unpinned Claude Messages/count_tokens requests may use the bounded failover policy documented below. Grok image/video routes are intentionally excluded.
 
 ### Provider control plane and storage
 
@@ -121,7 +121,7 @@ Server-native Kiro pass from `/data/projects/proxy/Kiro/Kiro.md` P0-P2 plus kiro
 
 ### `claude_oauth` (Claude Official)
 
-Server-native Claude OAuth proxy parity pass from `/data/projects/proxy/Claude/Claude.md` through 2026-07-22:
+Claude OAuth protocol evidence review from `/data/projects/proxy/Claude/Claude.md` through 2026-07-22, implemented independently in Server:
 
 - Proxy hot path: legacy-compatible and typed Claude OAuth Providers share one prepared-request contract for network tests and real forwarding: managed-account refresh, `?beta=true`, request-shape-driven `anthropic-beta` assembly (`claude-code-20250219`, `oauth-2025-04-20`, thinking/tools/computer/context/effort/1h-cache/explicit-1m only when allowed), Claude CLI headers, per-account stable stainless OS/arch profile, session metadata, billing/identity injection, thinking sampling normalization, preserve-order JSON, and one final `cch=` signature over the cleaned body. Repeated client beta headers are merged through a fail-closed allowlist, unknown values are dropped without logging their raw token, repeated case-insensitive `[1m]` suffixes are removed before final signing, OAuth omits browser-only headers, and account extra headers cannot override the signed contract.
 - Retry/failover hardening: Claude/Claude Auth/Claude OAuth streams buffer until the first complete non-error SSE data event (bounded at 64 KiB), so a split first `event:error` can record the Provider outcome before downstream commit. Unpinned direct Claude requests switch in Provider Store order after send timeout/error, first-event read failure, non-stream or 429 body-read failure, HTTP 429/529, or one forced OAuth refresh that remains 401. Candidates exclude prior failures and filter runtime readiness, relogin, account cooldown, count_tokens capability, and account concurrency under one budget of at most three retries within 10s. Share and explicit `x-cc-provider-id` requests stay pinned; OAuth signature/thinking/web-search body fallbacks also stay on the original Provider. Once any response data is committed, transport failure records the Provider outcome and emits the protocol terminal error without replaying the request.
@@ -134,20 +134,20 @@ Server-native Claude OAuth proxy parity pass from `/data/projects/proxy/Claude/C
 
 ### `codex_oauth` (OpenAI OAuth)
 
-Server-native Codex/OpenAI OAuth proxy parity pass from `/data/projects/proxy/Codex/Codex.md` v2 P0-P2 plus TokenRouter account-candidate filtering through 2026-07-20:
+Codex/OpenAI OAuth protocol evidence review from `/data/projects/proxy/Codex/Codex.md` v2 P0-P2 plus TokenRouter account-candidate filtering through 2026-07-20, implemented independently in Server:
 
 - OAuth/account storage: CLI callback route `/web-api/oauth/openai-cli/callback`, serialized and cancellable/idempotent device polling, per-refresh-token singleflight/backoff, duplicate refresh-token rejection, immediate isolation on `refresh_token_reused`, and exclusive server token authority. Token fields are encrypted in `accounts.json`; OpenAI RS256 `id_token` values are verified against cached JWKS with issuer/audience/expiry checks before import or refresh. The Web UI can select only workspace/account IDs present in verified token organizations. The headless server does not live-read or write the host user's `~/.codex/auth.json`.
 - Proxy headers/body: managed account requests finalize a paired official Codex identity (`originator`, configurable `version` defaulting to `0.144.1`, and User-Agent), inject the validated `chatgpt-account-id`, session/window headers, `reasoning.encrypted_content`, `prompt_cache_key`, and versioned instructions; invalid continuation `message` IDs are stripped without touching call IDs. GPT-5.6 Sol/Terra/Luna capabilities and reasoning gates are server-side registry data.
 - Protocol/usage: Responses Lite `additional_tools`, custom/freeform history and response restoration, namespace flattening, `tool_search` downgrade/collision rejection, custom-tool stream completion, and strict wire zero fields are covered. OpenAI/Anthropic cache usage is normalized into fresh/read/write/output buckets, including nested `cache_write_tokens` and explicit zero values.
 - Streaming/WS/images: Responses POST SSE keeps protocol conversion; Responses GET upgrades through WebSocket with a per-provider incident rollback toggle. SSE and WS `response.completed` events with empty output are rebuilt from prior `output_item.done`; Windows/Unix reset classification and big-frame `message_too_big` mapping are covered. `/v1/images/generations` dispatches to Grok OAuth media or the Codex image-generation bridge when enabled.
 - Quota/subscription evidence: `/wham/usage.plan_type` is authoritative for the displayed plan. `/accounts/check` rejects expired or inactive candidates and uses exact matching for a verified workspace; `/subscriptions` is queried only for that verified workspace. Conflicting plans, untrusted workspace expiry, and past expiry contradicted by an available paid usage response are discarded, while sanitized resolution evidence is persisted for diagnostics. A discarded expiry is absent from both the auth summary and Share descriptor instead of being reported as expired.
-- Rate limits/account dispatch: 429 bodies parse `error.resets_in_seconds` and `error.resets_at`, write account `rateLimitedUntil`, and account selection inside the fixed Codex OAuth Provider skips cooling-down accounts; an explicitly bound account returns 429 while cooling down.
+- Rate limits/account dispatch: Codex 429 bodies parse `error.resets_in_seconds` and `error.resets_at`; generic managed-account handling also honors `Retry-After`, bounds cooldowns, and writes only account `rateLimitedUntil`. Provider selection and Share execution reject active cooldowns and fresh explicit upstream exhaustion states, while ordinary quota percentages remain display and ranking signals rather than hard dispatch thresholds.
 - Client gate: inbound requests reject generic tool signatures while the final outbound header pass pairs official originator/User-Agent families and raises obsolete versions before every HTTP, WebSocket, and image request.
 - TLS fingerprint: no Chrome/TLS impersonation is implemented in server; current stance is rustls direct TLS plus header/client gating. Real ChatGPT upstream smoke should revisit this only if upstream starts rejecting rustls traffic.
 
 ### `cursor_oauth` / `cursor_apikey` (Cursor AgentService)
 
-Server-native Cursor OAuth/API key proxy parity pass from `/data/projects/proxy/Cursor/Cursor.md` P0-P2 (2026-07-09):
+Cursor OAuth/API key protocol evidence review from `/data/projects/proxy/Cursor/Cursor.md` P0-P2 (2026-07-09), implemented independently in Server:
 
 - OAuth/account storage: DeepControl PKCE + poll remains the browser login path; server now also imports Cursor IDE `state.vscdb` from the cc-switch-server host and falls back to cursor-agent `auth.json` across Linux/macOS/Windows (`CURSOR_AGENT_AUTH_PATH` can override). Imported IDE tokens preserve `cursorServiceMachineId`; agent auth imports are accepted without machine id. `CURSOR_STATE_DB_PATH` can override the IDE DB path; vscdb reads use an immutable SQLite URI to avoid live Cursor WAL locks; OAuth, local import, and profile enrichment derive account ids from the same WorkOS subject hash when available. Account token fields are covered by the shared encrypted `accounts.json` store.
 - Profile enrichment: Cursor `/api/auth/me` uses the dashboard WorkOS session cookie shape (`WorkosCursorSessionToken=<workos_user_id>::<access_token>`) derived from the access-token JWT, not the generic `Authorization: Bearer` profile request. Token exchange/refresh, poll, and profile requests now share the Cursor browser-login User-Agent. Enrichment failure is non-fatal so access-token-only imports can still be used; when profile includes `sub`/`user_id`/`id`, it is used as the stable account id seed if tokens lack a subject.
@@ -158,7 +158,7 @@ Server-native Cursor OAuth/API key proxy parity pass from `/data/projects/proxy/
 
 ### `grok_oauth` (Grok/xAI OAuth)
 
-Server-only capability from `/data/projects/proxy/Grok/Grok.md` P0-P2 (2026-07-09); not a desktop upstream provider coverage debt:
+Server-owned capability based on protocol evidence from `/data/projects/proxy/Grok/Grok.md` P0-P2 (2026-07-09); it is not part of the external Provider baseline:
 
 - OAuth/account storage: xAI public client id, PKCE, `plan=generic`, `referrer=cc-switch-server`, endpoint allowlist for `x.ai`/`*.x.ai`, JWT-derived profile fields, native refresh, and explicit `~/.grok/auth.json` import.
 - Proxy headers/body: OpenAI Responses upstream contract, `Authorization: Bearer`, `x-grok-conv-id`, authoritative single-model routing with editable `grok-4.5` default, Responses field cleanup, reasoning effort model allowlist, tool allowlist, and `encrypted_content` shape guard.

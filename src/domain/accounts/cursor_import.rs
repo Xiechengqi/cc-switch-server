@@ -763,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_auth_paths_cover_desktop_platforms() {
+    fn agent_auth_paths_cover_supported_platforms() {
         let macos = candidate_agent_auth_paths_for("macos", Path::new("/Users/a"), None, None);
         assert!(macos.iter().any(|path| path
             .display()

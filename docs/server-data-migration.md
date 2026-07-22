@@ -69,7 +69,7 @@ After startup, verify all of the following before deleting the source copy:
 - The existing Client URL reconnects in Router without creating a second Client.
 - Every Share URL reconnects with the same binding, owner, ShareTo ACL, limits,
   and market state.
-- Recent usage/request history and model pricing are present.
+- Recent usage/request history is present with its Token totals and dimensions.
 
 For rollback, stop the target before restarting the untouched source instance.
 Do not allow both instances to reconnect to Router at the same time.

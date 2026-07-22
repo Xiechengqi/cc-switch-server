@@ -33,7 +33,7 @@ function normalizeLanguage(lang?: string | null): Language | null {
  *
  * 这导致老用户每次重启都先看到英文，必须进一次设置页才会切到中文。
  *
- * 本 hook 在 DesktopApp 根部调用：后端 settings 一拉到就同步到 i18n + 写回
+ * 本 hook 在应用根部调用：后端 settings 一拉到就同步到 i18n + 写回
  * localStorage，覆盖「老用户从未访问过设置页」的兜底场景。
  * `useSettingsForm.syncLanguage` 也已经在改语言时 setItem localStorage，
  * 所以新用户首次设置后立刻就被 i18n 启动路径直接命中，无需依赖本 hook。
