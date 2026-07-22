@@ -1,0 +1,138 @@
+{
+  "common": {
+    "copied": "Copied"
+  },
+  "providers": {
+    "addProvider": "Add provider"
+  },
+  "provider": {
+    "share": {
+      "sectionTitle": "Remote Share",
+      "addPageBadge": "Available after saving",
+      "enableShare": "Enable remote sharing",
+      "addPagePlaceholder": "Save the Provider first, then reopen the editor to configure remote sharing.",
+      "stateActive": "Share enabled",
+      "statePaused": "Share paused",
+      "stateError": "Share error",
+      "stateNone": "Share disabled",
+      "invalidNumber": "Enter a valid number",
+      "invalidConfiguration": "Fix the remote share configuration before saving",
+      "sectionHint": "Each Provider maps to one Share. Configure sharing here; use Router Console for advanced operations.",
+      "openRouterConsole": "Open Router Console",
+      "disabledHint": "Enable this to configure remote sharing and create a Share.",
+      "routerSyncFailed": "Router sync failed: {{error}}",
+      "routerSyncPending": "Syncing to Router",
+      "ownerRequired": "Configure the Client Tunnel Owner email on the Share settings page first"
+    },
+    "form": {
+      "gemini": {
+        "antigravityOauthTitle": "Antigravity OAuth authentication",
+        "antigravityOauthHint": "Antigravity OAuth uses a managed Antigravity account and does not require an API Key."
+      }
+    }
+  },
+  "share": {
+    "unsupportedApp": "{{app}} does not support sharing. Switch to the Claude, Codex, or Gemini tab to create a Share.",
+    "validation": {
+      "invalidEmail": "Invalid email address"
+    },
+    "saleMarketKind": {
+      "title": "Market type",
+      "token": "Token Market",
+      "share": "Share Market"
+    },
+    "market": {
+      "allSelected": "All Markets selected"
+    },
+    "accountMarket": {
+      "title": "Share Market",
+      "select": "Select Share Market",
+      "required": "Select a Share Market"
+    },
+    "permanent": "Permanent",
+    "expiration": "Expires",
+    "userLimit": {
+      "periodLifetime": "Lifetime",
+      "periodDay": "Daily",
+      "periodWeek": "Weekly",
+      "periodMonth": "Calendar month",
+      "title": "User limits",
+      "hint": "The overall Share limits always apply; each user is also constrained by their own limits.",
+      "add": "Add user",
+      "edit": "Edit user limits",
+      "period": "Token period"
+    },
+    "boundProviderHint": "Requests for this app always use the bound Provider and do not participate in failover.",
+    "manageInProviderHint": "Open the bound Provider editor to change sharing settings.",
+    "sharedWithEmails": "Share To",
+    "emptyReadOnlyHint": "Shares are created and managed in the Remote Share section of the Provider editor.",
+    "readOnlyOverviewHint": "This is a read-only overview. Open the bound Provider editor to change sharing settings.",
+    "routerOwner": {
+      "signedInOwner": "Signed in as owner {{email}}; configuration is editable",
+      "signedInReadOnly": "Signed in as {{email}}; only owner {{owner}} can edit configuration",
+      "signInPrompt": "Sign in with the Share owner email to edit configuration",
+      "sendCode": "Send code",
+      "codePlaceholder": "Verification code",
+      "verify": "Verify",
+      "changeEmail": "Change email",
+      "codeSent": "Verification code sent to {{target}}"
+    }
+  },
+  "codexConfig": {
+    "noCommonConfigToApply": "The common configuration is empty or has no writable values"
+  },
+  "claudeDesktop": {
+    "route": {
+      "stopBlockedByTakeover": "Another app is using proxy takeover. Disable its takeover in Settings before stopping the local route."
+    }
+  },
+  "proxy": {
+    "routing": {
+      "ready": "Routed",
+      "needsProvider": "Needs provider"
+    },
+    "server": {
+      "stopped": "Proxy server stopped",
+      "stopFailed": "Failed to stop proxy server"
+    }
+  },
+  "settings": {
+    "loadFailed": "Unable to load settings. Refresh the page and try again.",
+    "selectFileFailed": "Failed to select directory",
+    "authCenter": {
+      "serverDescription": "Manage official OAuth accounts used by the upstream proxy. Usage refresh applies only to the active Provider.",
+      "claudeOauthDescription": "Manage Claude official subscription accounts",
+      "grokOauthDescription": "Manage Grok/xAI subscription accounts",
+      "kiroOauthDescription": "Manage Kiro AWS Builder ID accounts",
+      "cursorOauthDescription": "Manage Cursor subscription accounts",
+      "geminiOauthDescription": "Manage Google Gemini accounts",
+      "antigravityOauthDescription": "Manage Antigravity subscription accounts",
+      "deepseekAccountDescription": "Manage DeepSeek accounts"
+    },
+    "serverConfigDir": {
+      "title": "Server configuration directory",
+      "description": "Directory containing providers, shares, UI settings, and other persistent files. The listen address and port come from process arguments."
+    },
+    "serverSecurity": {
+      "currentPasswordRequired": "Enter the current password"
+    },
+    "share": {
+      "health": {
+        "clientTunnel": {
+          "conflict": "Subdomain conflict; not registered with Router",
+          "claimFailed": "Router registration failed",
+          "unclaimed": "Configured but not registered with Router",
+          "connecting": "Registered; tunnel is connecting"
+        }
+      }
+    }
+  },
+  "usage": {
+    "unpriced": "Unpriced"
+  },
+  "notifications": {
+    "clearCurrentSuccess": "Provider disabled",
+    "clearCurrentFailedTitle": "Failed to disable Provider",
+    "clearCurrentFailed": "Failed to disable Provider: {{error}}"
+  }
+}

@@ -28,8 +28,15 @@
     "formatSuccess": "格式化成功",
     "formatError": "格式化失敗：{{error}}",
     "copy": "複製",
+    "copied": "已複製",
+    "undo": "復原",
     "view": "檢視",
+    "show": "顯示",
+    "hide": "隱藏",
     "back": "返回",
+    "continue": "繼續",
+    "retry": "重試",
+    "logout": "登出",
     "refresh": "重新整理",
     "refreshing": "重新整理中...",
     "import": "匯入",
@@ -98,6 +105,9 @@
     "windowClose": "關閉視窗"
   },
   "provider": {
+    "testLinkUnavailable": "目前供應商沒有可測試的自訂介面位址；請使用模型測試驗證帳號和模型是否可用。",
+    "configJsonPreview": "設定 JSON 預覽",
+    "advancedConfigJson": "進階設定 JSON",
     "connectivityCheck": "檢測連通",
     "refreshProviderInfo": "供應商資訊刷新",
     "quotaNeverUpdated": "從未更新",
@@ -116,7 +126,18 @@
     },
     "share": {
       "ownerNotConfigured": "請先設定 Client Owner",
-      "ownerManagedHint": "Share Owner 與 Client Owner 保持一致。可在「設定 → 分享」透過安裝簽名的 Owner 換綁進行修改。"
+      "ownerManagedHint": "Share Owner 與 Client Owner 保持一致。可在「設定 → 分享」透過安裝簽名的 Owner 換綁進行修改。",
+      "deleteShort": "刪除 Share",
+      "deleteConfirmTitle": "刪除 Share",
+      "deleteConfirmMessage": "刪除後該 Share 將從 Share 頁面移除，且無法復原。",
+      "deleteRemember": "記住選擇，之後不再詢問"
+    },
+    "unsavedChanges": {
+      "title": "放棄未儲存的變更？",
+      "addMessage": "目前供應商設定尚未儲存。關閉後，這些變更將會遺失。",
+      "editMessage": "目前供應商或遠端分享設定尚未儲存。關閉後，這些變更將會遺失。",
+      "discard": "放棄變更",
+      "keepEditing": "繼續編輯"
     },
     "inUse": "使用中",
     "blockedByProxyHint": "代理接管模式下無法切換至官方供應商",
@@ -434,6 +455,21 @@
       "restartAfterUpgrade": "升級後立即重啟",
       "restartConfirmTitle": "確認重啟",
       "restartConfirmMessage": "確定要重啟 cc-switch-server 嗎？重啟期間管理頁面和代理服務將暫時無法使用。",
+      "currentVersionOnly": "目前 {{current}}",
+      "versionCardUpdateAvailable": "目前版本 {{current}} -> 最新版本 {{latest}}",
+      "versionCardUpToDate": "已是最新版本 {{current}}",
+      "upgradeStep": "步驟 {{step}} / {{total}}",
+      "upgradeRestarting": "升級完成，服務重新啟動中…",
+      "upgradeRunning": "升級進行中…",
+      "upgradeSucceeded": "升級完成",
+      "rollbackScheduled": "已安排回復版本，正在等待服務恢復…",
+      "checkUpdateFailed": "檢查更新失敗：{{error}}",
+      "checkUpdateUpToDate": "目前已是最新版本（{{current}}）",
+      "checkUpdateReachableButUnavailable": "偵測到新版本（目前 {{current}}，最新 {{latest}}），但此環境無法就地升級（常見於開發模式）",
+      "checkUpdateAvailable": "目前版本是 {{current}}，最新版本是 {{latest}}，可點擊「升級」安裝（{{size}}）",
+      "rollback": "回復版本",
+      "rollbackConfirmTitle": "確認回復版本",
+      "rollbackConfirmMessage": "將使用升級前備份的二進位檔（/tmp/cc-switch-server.bak）取代目前安裝並重新啟動服務。",
       "upgradeLogTitle": "升級過程",
       "waitingLogs": "等待升級日誌…",
       "streamDisconnected": "升級日誌串流已斷開",
@@ -1051,6 +1087,12 @@
     "openReleaseNotesFailed": "開啟更新日誌失敗："
   },
   "providerForm": {
+    "providerKeyStatusLoading": "正在載入供應商識別狀態，請稍後再試",
+    "singleUpstreamModelRequired": "請填寫實際上游模型",
+    "generatedConfigPreviewHint": "此設定由上方結構化欄位生成；請透過模型對應、Endpoint 和認證欄位修改。",
+    "singleModelMappingSummary": "無論用戶端請求什麼模型，都會統一轉送至下方的實際上游模型。",
+    "singleUpstreamModelLabel": "實際上游模型",
+    "singleUpstreamModelPlaceholder": "例如：composer-2.5",
     "supplierName": "供應商名稱",
     "supplierNameRequired": "供應商名稱 *",
     "supplierNamePlaceholder": "例如：Anthropic 官方",
@@ -1274,6 +1316,23 @@
     "logoutAll": "登出所有帳號",
     "retry": "重試",
     "copyCode": "複製程式碼",
+    "cliUnavailableInRemoteWeb": "遠端 Web 模式無法連線 localhost 回呼，請使用 Device Code",
+    "imageGeneration": "生成圖片",
+    "imageGenerationDescription": "透過 ChatGPT Codex 後端啟用 OpenAI 相容的 /v1/images/generations 介面。",
+    "imageToolStripPolicy": "圖片工具策略",
+    "imageToolStripPolicyDescription": "控制 Codex Responses 請求是否可以宣告 image_generation 工具。",
+    "imageToolStripNever": "永不移除",
+    "imageToolStripOnError": "發生錯誤時移除",
+    "imageToolStripAlways": "一律移除",
+    "websocket": "Responses WebSocket",
+    "websocketDescription": "通常應保持啟用。上游 WebSocket 發生故障時可停用，強制用戶端使用 POST /v1/responses SSE。",
+    "workspace": "ChatGPT 工作區",
+    "workspaceDescription": "只能選擇已透過 OpenAI Token 聲明驗證的工作區。",
+    "loginWithCli": "CLI OAuth",
+    "loginWithDevice": "Device Code",
+    "addCliAccount": "新增 CLI OAuth",
+    "addDeviceAccount": "新增 Device Code",
+    "selectAccountRequired": "OpenAI OAuth 必須綁定一個 ChatGPT 帳號",
     "fastMode": "FAST 模式",
     "fastModeDescription": "發送 service_tier=\"priority\" 換取更低延遲。預設關閉——開啟後會以更高速率消耗 ChatGPT 配額。"
   },
@@ -1350,6 +1409,8 @@
     "quotaDispatchLimitPercentHint": "設定為非 0 後，router 會在任一重置週期達到該百分比時停止將此供應商調度給 Market。"
   },
   "codexConfig": {
+    "generatedConfigPreviewHint": "此設定由上方 auth.json、config.toml、模型目錄和模型對應生成；請透過結構化欄位修改。",
+    "localRoutingToggle": "需要本機路由對應",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n    \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex auth.json 設定內容",
@@ -2747,6 +2808,241 @@
     "suggestedDefaults": "套用建議預設設定",
     "suggestedDefaultsHint": "使用此預設推薦的預設模型設定"
   },
+  "share": {
+    "title": "Share",
+    "confirmDeleteTitle": "刪除 Share",
+    "confirmDeleteMessage": "確認刪除 Share「{{name}}」嗎？若有執行中的 tunnel，會先停止再刪除。",
+    "freeConfirm": "確認將出售方式設為免費嗎？",
+    "forSaleOptions": {
+      "free": "免費"
+    }
+  },
+  "antigravityOauth": {
+    "authStatus": "Antigravity 認證",
+    "loginWithGoogle": "使用 Google 登入 Antigravity",
+    "loginRequired": "請先登入 Antigravity 帳號",
+    "selectAccountRequired": "Antigravity OAuth 必須綁定一個 Antigravity 帳號"
+  },
+  "claudeOauth": {
+    "localCallbackLogin": "本機回呼登入",
+    "officialCallbackLogin": "官方連結登入",
+    "callbackModeHint": "本機回呼會使用 127.0.0.1 自動完成授權；官方連結會在 platform.claude.com 顯示授權碼，複製後貼回此處完成登入。",
+    "remoteCallbackModeHint": "目前透過 Web 介面存取，本機回呼無法連線，請使用官方連結並貼上授權碼完成登入。",
+    "authStatus": "Claude 訂閱認證",
+    "loginWithClaude": "使用 Claude.ai 登入",
+    "webPasteHint": "1. 點擊下方連結，在瀏覽器中完成 claude.ai 授權。\n2. 授權後 platform.claude.com 會顯示一段授權碼。\n3. 複製授權碼並貼到下方輸入框，點擊「提交」完成新增帳號。",
+    "pasteCodeLabel": "從 platform.claude.com 複製的授權碼",
+    "pasteCodePlaceholder": "貼上授權碼...",
+    "submitPasteCode": "提交",
+    "loginRequired": "請先登入 Claude 帳號"
+  },
+  "cursorOauth": {
+    "authStatus": "Cursor OAuth 認證",
+    "loginWithCursor": "使用 Cursor 登入",
+    "importLocalServerTitle": "從執行 cc-switch-server 的這台機器讀取 Cursor IDE 或 cursor-agent 登入狀態",
+    "importLocalServer": "從本機 Cursor 匯入",
+    "loginRequired": "請先登入 Cursor 帳號",
+    "selectAccountRequired": "Cursor OAuth 必須綁定一個 Cursor 帳號"
+  },
+  "deepseekAccount": {
+    "authStatus": "DeepSeek 帳號",
+    "identifier": "電子郵件或手機號碼",
+    "identifierPlaceholder": "請輸入電子郵件或手機號碼",
+    "password": "密碼",
+    "addAccount": "新增帳號",
+    "loginRequired": "請先新增 DeepSeek 帳號",
+    "selectAccountRequired": "DeepSeek Account 必須綁定一個 DeepSeek 帳號"
+  },
+  "geminiOauth": {
+    "authStatus": "Google Gemini 認證",
+    "loginWithGoogle": "使用 Google 登入",
+    "loginRequired": "請先登入 Google Gemini 帳號",
+    "selectAccountRequired": "Google Official 必須綁定一個 Google Gemini 帳號"
+  },
+  "grokOauth": {
+    "callbackRequired": "請貼上 Grok 回呼 URL、query string 或 code",
+    "loginSuccess": "Grok 帳號已登入",
+    "authJsonRequired": "請貼上 ~/.grok/auth.json 內容",
+    "authJsonInvalid": "auth.json 不是有效的 JSON",
+    "importSuccess": "Grok auth.json 已匯入",
+    "authStatus": "Grok OAuth 認證",
+    "loginWithGrok": "使用 Grok 登入",
+    "importAuthJson": "匯入 auth.json",
+    "import": "匯入",
+    "callbackPlaceholder": "http://127.0.0.1:56121/callback?code=...&state=... 或只貼上 code",
+    "finishLogin": "完成登入",
+    "loginRequired": "請先登入 Grok 帳號",
+    "selectAccountRequired": "Grok OAuth 必須綁定一個 Grok 帳號"
+  },
+  "kiroOauth": {
+    "importSuccess": "Kiro 憑據已匯入",
+    "credentialsInvalid": "credentials.json 不是有效的 JSON",
+    "apiKeyInvalid": "Kiro API Key 必須以 ksk_ 開頭",
+    "authStatus": "Kiro OAuth 認證",
+    "loginWithKiro": "使用 AWS Builder ID 登入",
+    "loginWithGoogle": "使用 Google 登入",
+    "loginWithGithub": "使用 GitHub 登入",
+    "addGoogleAccount": "新增 Google 帳號",
+    "addGithubAccount": "新增 GitHub 帳號",
+    "importJson": "匯入 JSON",
+    "importApiKey": "API Key",
+    "importLocal": "本機 Kiro",
+    "userCodeHint": "AWS Builder ID 裝置驗證碼：",
+    "copyUserCode": "複製驗證碼",
+    "loginRequired": "請先登入 AWS Builder ID 帳號",
+    "selectAccountRequired": "Kiro OAuth 必須綁定一個 AWS Builder ID 帳號"
+  },
+  "accountAuth": {
+    "accountCount": "{{count}} 個帳號",
+    "notAuthenticated": "未認證",
+    "loggedInAccounts": "已登入帳號",
+    "defaultAccount": "預設",
+    "selected": "已選取",
+    "setAsDefault": "設為預設",
+    "removeAccount": "移除帳號",
+    "selectAccount": "選擇帳號",
+    "selectAccountPlaceholder": "選擇一個帳號",
+    "useDefaultAccount": "使用預設帳號",
+    "addAnotherAccount": "新增其他帳號",
+    "waitingForBrowser": "請開啟下方授權連結並完成登入...",
+    "openLinkHint": "授權連結不會自動開啟，請點擊或複製到瀏覽器中：",
+    "copyLink": "複製連結",
+    "openManually": "開啟連結",
+    "logoutAll": "登出所有帳號",
+    "retry": "重試"
+  },
+  "serverProviderForm": {
+    "categories": {
+      "official": "官方",
+      "cnOfficial": "中國官方",
+      "aggregator": "聚合服務",
+      "thirdParty": "第三方",
+      "custom": "自訂"
+    },
+    "validation": {
+      "nameRequired": "供應商名稱不能為空",
+      "accountRequired": "請選擇一個已認證帳號",
+      "endpointInvalid": "請輸入有效的 HTTP 或 HTTPS Endpoint",
+      "modelRequired": "實際請求模型不能為空",
+      "awsRegionRequired": "AWS Region 不能為空",
+      "replacementRequired": "請填寫要替換的憑據",
+      "requiredCredentialCannotClear": "必要憑據不能清除；請選擇替換",
+      "customBindingMissing": "Custom Provider 通訊協定設定缺失",
+      "unsupportedBinding": "目前的通訊協定與認證組合不受支援",
+      "authCredentialRequired": "請填寫認證憑據",
+      "authRequired": "目前的認證方式需要憑據",
+      "invalidHeader": "Header 名稱無效：{{name}}",
+      "managedHeader": "Header 由驅動程式管理：{{name}}",
+      "duplicateHeader": "Header 名稱重複：{{name}}",
+      "headerValueRequired": "請填寫 Header {{name}} 的值",
+      "costMultiplierInvalid": "成本倍率必須是非負數",
+      "quotaLimitInvalid": "調度用量上限必須是 1 到 100 的整數"
+    },
+    "credentials": {
+      "title": "認證憑據",
+      "apiToken": "API Key / Bearer Token",
+      "keep": "保留",
+      "replace": "替換",
+      "clear": "清除",
+      "newPlaceholder": "輸入新憑據",
+      "placeholder": "輸入憑據",
+      "loading": "正在讀取已設定憑據...",
+      "loadFailed": "無法讀取已設定憑據，可重試或直接輸入新憑據取代。",
+      "loadFailedPlaceholder": "輸入新憑據進行取代",
+      "willClear": "儲存後將清除此選用憑據",
+      "willReplace": "儲存後將取代目前憑據",
+      "configured": "已設定",
+      "optionalMissing": "未設定（選填）",
+      "missing": "未設定"
+    },
+    "unsupportedAccountType": "不支援的帳號類型：{{type}}",
+    "toasts": {
+      "applyBindingFirst": "請先預覽並套用通訊協定綁定，再儲存其他設定",
+      "customUnavailable": "Custom Provider 設定無法使用",
+      "cloneIdInvalid": "請輸入與原 Provider 不同的新 ID",
+      "cloneNameRequired": "請輸入新 Provider 名稱",
+      "customCreated": "Custom Provider 已建立",
+      "identityUpdated": "供應商身分設定已更新"
+    },
+    "identity": {
+      "stable": "穩定",
+      "experimental": "實驗性",
+      "adoptTitle": "採用供應商設定",
+      "adoptMessage": "將 {{provider}} 綁定至 {{profile}}。",
+      "cloneTitle": "複製為 Custom Provider",
+      "cloneMessage": "建立 {{name}}（{{id}}）。",
+      "upstreamProtocolLine": "上游通訊協定：{{protocol}}",
+      "authSchemeLine": "認證方式：{{scheme}}",
+      "rebindTitle": "變更 Custom 綁定",
+      "adoptSection": "採用標準設定",
+      "adoptPreview": "預覽並採用",
+      "cloneSection": "複製為 Custom Provider",
+      "cloneDescription": "保留目前的 Provider，並建立一份具有明確通訊協定身分的新設定。套用前會先預覽執行階段差異。",
+      "newProviderId": "新 Provider ID",
+      "newName": "新名稱",
+      "clonePreview": "預覽並建立",
+      "confirmTitle": "確認身分變更",
+      "apply": "套用"
+    },
+    "basic": {
+      "title": "基本資訊",
+      "name": "名稱",
+      "website": "網站",
+      "notes": "備註"
+    },
+    "account": {
+      "title": "認證帳號"
+    },
+    "aws": {
+      "title": "AWS 憑據"
+    },
+    "binding": {
+      "title": "通訊協定與認證",
+      "upstreamProtocol": "上游通訊協定",
+      "authScheme": "認證方式",
+      "credential": "認證憑據",
+      "queryParameter": "Query 參數名稱",
+      "headerName": "Header 名稱",
+      "cancelChanges": "取消變更",
+      "previewApply": "預覽並套用綁定",
+      "change": "變更通訊協定綁定",
+      "pendingHint": "通訊協定身分尚未套用。請先預覽並套用綁定，再儲存 Endpoint、模型或請求設定。"
+    },
+    "endpoint": {
+      "title": "API 請求位址"
+    },
+    "model": {
+      "title": "模型策略",
+      "upstreamModel": "實際上游模型",
+      "passthrough": "透傳",
+      "passthroughHint": "使用請求中的模型"
+    },
+    "headers": {
+      "title": "額外請求 Header",
+      "value": "Header 值",
+      "remove": "刪除 Header",
+      "add": "新增 Header"
+    },
+    "codex": {
+      "title": "Codex 執行選項",
+      "imageGeneration": "圖片生成"
+    },
+    "usage": {
+      "title": "用量與請求",
+      "costMultiplier": "成本倍率",
+      "pricingModel": "計費模型",
+      "inherit": "繼承全域設定",
+      "request": "請求模型",
+      "response": "回應模型",
+      "quotaLimit": "調度用量上限（%）",
+      "unlimited": "不限制",
+      "customUserAgent": "自訂 User-Agent"
+    },
+    "legacy": {
+      "title": "相容狀態",
+      "hint": "舊版 Provider 僅允許修改顯示資訊；執行設定維持凍結。"
+    }
+  },
   "subscription": {
     "title": "訂閱額度",
     "fiveHour": "5 小時",
@@ -2760,6 +3056,7 @@
     "weeklyLimit": "每週",
     "monthly": "每月",
     "copilotPremium": "進階請求",
+    "cursorCredits": "用量",
     "grokCredits": "Grok Credits",
     "grokWeekly": "每週額度",
     "grokMonthly": "月度包含額度",
@@ -2788,8 +3085,6 @@
   "terminal": {
     "title": "維運終端",
     "nav": "終端",
-    "backHome": "返回首頁",
-    "subtitle": "伺服器執行環境",
     "placeholderTitle": "正在連線維運終端",
     "placeholderBody": "離開本頁不會中斷背景命令；再次進入可恢復最近輸出。",
     "authRequired": "需要登入後才能使用維運終端",

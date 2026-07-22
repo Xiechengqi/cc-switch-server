@@ -178,8 +178,8 @@ Claude OAuth 专项补充：
 2. 新建 Claude 授权 URL 必须包含 `prompt=login`，避免多账号浏览器会话抢占。
 3. Claude proxy 请求应携带 CLI header set、基于首条 user 文本稳定合成的 `x-claude-code-session-id`，并在无客户端 `metadata.user_id` 时注入 server 合成值。
 4. `anthropic-beta` 应按请求形状出现：基础请求只带 Claude Code/OAuth beta；含 `thinking`、streaming tools 或 computer-use tool 时才追加对应 beta；messages 与 profile/usage 请求的 Claude CLI UA 应保持同一版本，CCH `cc_entrypoint` 默认应为 `cli`。
-5. 上游 429 时应记录 Provider rate-limited outcome、保留审计过的 rate-limit 响应头，并在同一请求重试预算内始终固定当前 Provider；不得切到其它 Provider。
-6. Claude SSE 中出现 `event:error` 且类型为 `rate_limit_error`、`overloaded_error` 或 `api_error` 时，应记录 provider failure；若 error 是首个上游 chunk，应在 3 次/10s 预算内透明重试；已开始输出的流不做透明重放。
+5. 上游 429 时应记录失败 Provider 的 rate-limited outcome。未固定的直接 Claude Messages/count_tokens 请求应在 3 次/10s 预算内按 Provider Store 顺序切到下一合格 Provider；Share 或显式 `x-cc-provider-id` 请求不得切换，并应保留审计过的 rate-limit 响应头。没有合格备用 Provider 时返回原 429。
+6. Claude SSE 中出现 `event:error` 且类型为 `rate_limit_error`、`overloaded_error` 或 `api_error` 时，应记录 provider failure；若 error 位于下游 commit 前，未固定请求可切到下一合格 Provider，固定请求只可在原 Provider 内有界重试；已开始输出的流不做透明重放。
 7. 非 Claude Code 客户端请求应被改写为 billing/identity system blocks，原 system 迁移到首条 user message，并重算 CCH。
 8. 上游 400 signature/thinking 错误应触发反应式降级重试：thinking block 降为 text；工具签名错误时 tool_use/tool_result 降为 text；web_search 历史块错误时剥离历史 server_tool_use/web_search_tool_result。
 9. `CC_SWITCH_CCH_SALT_HEX`、`CC_SWITCH_CLI_STAINLESS_OS`、`CC_SWITCH_CLI_STAINLESS_ARCH`、`CC_SWITCH_CLI_STAINLESS_RUNTIME_VERSION` 覆盖应只用于灰度/抓包追热；默认路径应按账号 seed 稳定选择 stainless OS/arch，stream 请求 `x-stainless-timeout=600`，非 stream 请求为 `60`。

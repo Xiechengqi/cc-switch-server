@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -45,9 +45,9 @@ use super::request_governance::{
     ResponseDecodeResult,
 };
 use super::router::{
-    account_concurrency_for_provider, provider_supports_claude_count_tokens, select_provider,
-    select_provider_for_claude_count_tokens, select_provider_for_codex_image_generation,
-    select_provider_with_account_inflight, ProxyRoute,
+    account_concurrency_for_provider, provider_supports_claude_count_tokens,
+    select_failover_provider, select_provider, select_provider_for_claude_count_tokens,
+    select_provider_for_codex_image_generation, select_provider_with_account_inflight, ProxyRoute,
 };
 use super::streaming::{ClaudeSseErrorDetector, StreamUsageAccumulator};
 use super::usage::{log_usage, update_stream_usage};
@@ -64,6 +64,8 @@ struct ForwardAttemptContext {
     started_at_ms: u128,
     body_retry_stage: Option<ClaudeBodyRetryStage>,
     execution: Option<ProviderExecution>,
+    auth_refresh_attempted: bool,
+    excluded_provider_ids: BTreeSet<String>,
 }
 
 impl Default for ForwardAttemptContext {
@@ -73,6 +75,8 @@ impl Default for ForwardAttemptContext {
             started_at_ms: current_time_ms(),
             body_retry_stage: None,
             execution: None,
+            auth_refresh_attempted: false,
+            excluded_provider_ids: BTreeSet::new(),
         }
     }
 }
@@ -92,6 +96,24 @@ impl ForwardAttemptContext {
         next.attempt = next.attempt.saturating_add(1);
         next.body_retry_stage = body_retry_stage;
         next.execution = Some(execution.clone());
+        next
+    }
+
+    fn after_auth_refresh(&self, execution: &ProviderExecution) -> Self {
+        let mut next = self.next(execution, self.body_retry_stage);
+        next.auth_refresh_attempted = true;
+        next
+    }
+
+    fn after_provider_failover(
+        &self,
+        failed: &ProviderExecution,
+        next_execution: &ProviderExecution,
+    ) -> Self {
+        let mut next = self.next(next_execution, self.body_retry_stage);
+        next.excluded_provider_ids
+            .insert(failed.stored.provider.id.clone());
+        next.auth_refresh_attempted = false;
         next
     }
 }
@@ -343,102 +365,96 @@ async fn forward_with_attempt(
         } else {
             None
         };
-        execution.enforce_model_policy(&mut adapter_request)?;
-        execution.finalize_request(&mut adapter_request)?;
-        let mut url = execution.resolve_endpoint(route, gemini_path, &adapter_request)?;
-        if execution.driver_is("oauth.grok_responses") {
-            url = super::grok::chat_upstream_url(&url, grok_cli_profile(app, &stored));
-        }
-        if execution.driver_is("oauth.openai_codex")
-            && route == ProxyRoute::CodexResponses
-            && codex_responses_body_has_compaction_trigger(&adapter_request.body)
-        {
-            url = codex_compact_url(&url);
-        }
-        refresh_execution_managed_account_if_needed(&state, &execution).await?;
-        let copilot_upstream_auth = if execution.driver_is("special.copilot") {
-            Some(
-                state
-                    .prepare_copilot_upstream_auth(execution.managed_account_id())
-                    .await
-                    .map_err(copilot_upstream_auth_error_to_proxy_error)?,
-            )
-        } else {
-            None
-        };
-        let accounts = state.accounts_snapshot().await;
-        let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
-        target_headers.extend(adapter_request.upstream_headers.iter().cloned());
-        if execution.driver_is("oauth.openai_codex") {
-            append_codex_oauth_session_headers(
-                &mut target_headers,
-                codex_oauth_session_id.as_deref(),
-            );
-        }
-        if let Some(contract) = grok_contract {
-            for (name, value) in contract.headers {
-                replace_or_push_header(&mut target_headers, name, value);
-            }
-        }
-        if route == ProxyRoute::ClaudeCountTokens && !execution.driver_is("oauth.claude_messages") {
-            super::claude_oauth::normalize_count_tokens_body(&mut adapter_request.body)?;
-            adapter_request.stream_requested = false;
-            replace_or_push_header(
-                &mut target_headers,
-                "anthropic-beta",
-                "token-counting-2024-11-01".to_string(),
-            );
-        }
-        if app == AppKind::Claude && execution.driver_is("oauth.claude_messages") {
-            let context_1m_requested = adapter_request_requests_claude_context_1m(&adapter_request);
-            let contract = if route == ProxyRoute::ClaudeCountTokens {
-                adapter_request.stream_requested = false;
-                super::claude_oauth::apply_count_tokens_forward_contract(
-                    &mut url,
-                    &mut adapter_request.body,
+        let (mut adapter_request, url, target_headers) =
+            if execution.driver_is("oauth.claude_messages") {
+                refresh_execution_managed_account_if_needed(&state, &execution).await?;
+                let accounts = state.accounts_snapshot().await;
+                let prepared = execution.finalize_claude_request(
+                    adapter_request,
+                    route,
                     &headers,
-                    &claude_oauth_identity_seed(&stored),
-                    context_1m_requested,
-                )?
-            } else {
-                super::claude_oauth::apply_forward_contract(
-                    &mut url,
-                    &mut adapter_request.body,
-                    &headers,
-                    &claude_oauth_identity_seed(&stored),
-                    context_1m_requested,
+                    &accounts,
                     claude_body_retry_stage,
-                )?
+                )?;
+                if request_context.session_id.is_none() {
+                    request_context.session_id = prepared.session_id.clone();
+                }
+                (
+                    prepared.adapter_request,
+                    prepared.endpoint,
+                    prepared.headers,
+                )
+            } else {
+                execution.enforce_model_policy(&mut adapter_request)?;
+                execution.finalize_request(&mut adapter_request)?;
+                let mut url = execution.resolve_endpoint(route, gemini_path, &adapter_request)?;
+                if execution.driver_is("oauth.grok_responses") {
+                    url = super::grok::chat_upstream_url(&url, grok_cli_profile(app, &stored));
+                }
+                if execution.driver_is("oauth.openai_codex")
+                    && route == ProxyRoute::CodexResponses
+                    && codex_responses_body_has_compaction_trigger(&adapter_request.body)
+                {
+                    url = codex_compact_url(&url);
+                }
+                refresh_execution_managed_account_if_needed(&state, &execution).await?;
+                let copilot_upstream_auth = if execution.driver_is("special.copilot") {
+                    Some(
+                        state
+                            .prepare_copilot_upstream_auth(execution.managed_account_id())
+                            .await
+                            .map_err(copilot_upstream_auth_error_to_proxy_error)?,
+                    )
+                } else {
+                    None
+                };
+                let accounts = state.accounts_snapshot().await;
+                let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
+                target_headers.extend(adapter_request.upstream_headers.iter().cloned());
+                if execution.driver_is("oauth.openai_codex") {
+                    append_codex_oauth_session_headers(
+                        &mut target_headers,
+                        codex_oauth_session_id.as_deref(),
+                    );
+                }
+                if let Some(contract) = grok_contract {
+                    for (name, value) in contract.headers {
+                        replace_or_push_header(&mut target_headers, name, value);
+                    }
+                }
+                if route == ProxyRoute::ClaudeCountTokens {
+                    super::claude_oauth::normalize_count_tokens_body(&mut adapter_request.body)?;
+                    adapter_request.stream_requested = false;
+                    replace_or_push_header(
+                        &mut target_headers,
+                        "anthropic-beta",
+                        "token-counting-2024-11-01".to_string(),
+                    );
+                }
+                if let Some(auth) = copilot_upstream_auth {
+                    url = super::join_url(&auth.api_endpoint, "/chat/completions");
+                    replace_or_push_header(
+                        &mut target_headers,
+                        "authorization",
+                        format!("Bearer {}", auth.token),
+                    );
+                }
+                if execution.driver_is("oauth.openai_codex") {
+                    crate::codex_identity::finalize_headers(&mut target_headers);
+                }
+                let mut target_headers = owned_headers(target_headers);
+                let materialized_auth = execution.materialize_auth(&accounts)?;
+                execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
+                apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
+                if route == ProxyRoute::ClaudeCountTokens {
+                    replace_or_push_owned_header(
+                        &mut target_headers,
+                        "anthropic-beta".to_string(),
+                        "token-counting-2024-11-01".to_string(),
+                    );
+                }
+                (adapter_request, url, target_headers)
             };
-            if request_context.session_id.is_none() {
-                request_context.session_id = contract.session_id.clone();
-            }
-            for (name, value) in contract.headers {
-                replace_or_push_header(&mut target_headers, name, value);
-            }
-        }
-        if let Some(auth) = copilot_upstream_auth {
-            url = super::join_url(&auth.api_endpoint, "/chat/completions");
-            replace_or_push_header(
-                &mut target_headers,
-                "authorization",
-                format!("Bearer {}", auth.token),
-            );
-        }
-        if execution.driver_is("oauth.openai_codex") {
-            crate::codex_identity::finalize_headers(&mut target_headers);
-        }
-        let mut target_headers = owned_headers(target_headers);
-        let materialized_auth = execution.materialize_auth(&accounts)?;
-        execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
-        apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
-        if route == ProxyRoute::ClaudeCountTokens && !execution.driver_is("oauth.claude_messages") {
-            replace_or_push_owned_header(
-                &mut target_headers,
-                "anthropic-beta".to_string(),
-                "token-counting-2024-11-01".to_string(),
-            );
-        }
 
         let http_client = forward_http_client(&state, &stored).await?;
         let request = build_upstream_post_request(
@@ -458,10 +474,18 @@ async fn forward_with_attempt(
                     Err(_) => {
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
                             .await;
-                        if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
-                            crate::metrics::record_claude_retry("transport", "send_timeout");
-                            attempt_context =
-                                attempt_context.next(&execution, claude_body_retry_stage);
+                        if let Some(next_attempt) = next_claude_transport_attempt(
+                            &state,
+                            route,
+                            &headers,
+                            &request_context,
+                            &attempt_context,
+                            &execution,
+                            "send_timeout",
+                        )
+                        .await
+                        {
+                            attempt_context = next_attempt;
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
                             continue 'attempt;
@@ -487,9 +511,18 @@ async fn forward_with_attempt(
                 if route == ProxyRoute::ClaudeCountTokens {
                     crate::metrics::record_claude_count_tokens_outcome("network_error");
                 }
-                if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
-                    crate::metrics::record_claude_retry("transport", "send_error");
-                    attempt_context = attempt_context.next(&execution, claude_body_retry_stage);
+                if let Some(next_attempt) = next_claude_transport_attempt(
+                    &state,
+                    route,
+                    &headers,
+                    &request_context,
+                    &attempt_context,
+                    &execution,
+                    "send_error",
+                )
+                .await
+                {
+                    attempt_context = next_attempt;
                     drop(account_in_flight_guard);
                     drop(share_invocation_guard);
                     continue 'attempt;
@@ -501,21 +534,79 @@ async fn forward_with_attempt(
         let mut status_code = status.as_u16();
         let mut response_headers = upstream.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
-        if route == ProxyRoute::ClaudeCountTokens
-            && execution.driver_is("oauth.claude_messages")
+        if matches!(
+            route,
+            ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
+        ) && execution.driver_is("oauth.claude_messages")
             && status == StatusCode::UNAUTHORIZED
-            && attempt_context.attempt == 0
+            && !attempt_context.auth_refresh_attempted
+            && attempt_context.retry_allowed()
         {
-            state
-                .refresh_managed_account_now(stored.provider_type, execution.managed_account_id())
-                .await
-                .map_err(managed_account_refresh_error_to_proxy_error)?;
-            crate::metrics::record_claude_count_tokens_outcome("auth_refresh");
-            attempt_context = attempt_context.next(&execution, None);
-            drop(upstream);
-            drop(account_in_flight_guard);
-            drop(share_invocation_guard);
-            continue 'attempt;
+            if let Some((provider_type, account_id)) = execution.managed_account_target() {
+                state
+                    .refresh_managed_account_now(provider_type, account_id)
+                    .await
+                    .map_err(managed_account_refresh_error_to_proxy_error)?;
+                if route == ProxyRoute::ClaudeCountTokens {
+                    crate::metrics::record_claude_count_tokens_outcome("auth_refresh");
+                }
+                crate::metrics::record_claude_retry("auth", "unauthorized");
+                attempt_context = attempt_context.after_auth_refresh(&execution);
+                drop(upstream);
+                drop(account_in_flight_guard);
+                drop(share_invocation_guard);
+                continue 'attempt;
+            }
+        }
+        if matches!(
+            route,
+            ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
+        ) && execution.driver_is("oauth.claude_messages")
+            && status == StatusCode::UNAUTHORIZED
+            && attempt_context.auth_refresh_attempted
+            && !claude_request_is_provider_pinned(&headers, &request_context)
+        {
+            if let Some(next_attempt) = next_claude_provider_failover(
+                &state,
+                route,
+                &attempt_context,
+                &execution,
+                "unauthorized_after_refresh",
+            )
+            .await
+            {
+                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
+                    .await;
+                attempt_context = next_attempt;
+                drop(upstream);
+                drop(account_in_flight_guard);
+                drop(share_invocation_guard);
+                continue 'attempt;
+            }
+        }
+        if matches!(
+            route,
+            ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
+        ) && status.as_u16() == 529
+            && !claude_request_is_provider_pinned(&headers, &request_context)
+        {
+            if let Some(next_attempt) = next_claude_provider_failover(
+                &state,
+                route,
+                &attempt_context,
+                &execution,
+                "http_529",
+            )
+            .await
+            {
+                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
+                    .await;
+                attempt_context = next_attempt;
+                drop(upstream);
+                drop(account_in_flight_guard);
+                drop(share_invocation_guard);
+                continue 'attempt;
+            }
         }
         maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
         maybe_mark_grok_cooldown(&state, &stored, status, &response_headers).await;
@@ -668,12 +759,18 @@ async fn forward_with_attempt(
                         provider_outcome_from_status(status_code),
                     )
                     .await;
-                    if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
-                        crate::metrics::record_claude_retry(
-                            "transport",
-                            "rate_limit_body_read_error",
-                        );
-                        attempt_context = attempt_context.next(&execution, claude_body_retry_stage);
+                    if let Some(next_attempt) = next_claude_transport_attempt(
+                        &state,
+                        route,
+                        &headers,
+                        &request_context,
+                        &attempt_context,
+                        &execution,
+                        "rate_limit_body_read_error",
+                    )
+                    .await
+                    {
+                        attempt_context = next_attempt;
                         drop(account_in_flight_guard);
                         drop(share_invocation_guard);
                         continue 'attempt;
@@ -683,6 +780,32 @@ async fn forward_with_attempt(
             };
             let decoded = decode_response_body_for_proxy(&response_headers, bytes);
             maybe_mark_codex_rate_limited(&state, &stored, &decoded.body).await;
+            if matches!(
+                route,
+                ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
+            ) && !claude_request_is_provider_pinned(&headers, &request_context)
+            {
+                if let Some(next_attempt) = next_claude_provider_failover(
+                    &state,
+                    route,
+                    &attempt_context,
+                    &execution,
+                    "http_429",
+                )
+                .await
+                {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        provider_outcome_from_status(status_code),
+                    )
+                    .await;
+                    attempt_context = next_attempt;
+                    drop(account_in_flight_guard);
+                    drop(share_invocation_guard);
+                    continue 'attempt;
+                }
+            }
             if route == ProxyRoute::ClaudeCountTokens {
                 crate::metrics::record_claude_count_tokens_outcome("rate_limited");
             } else {
@@ -785,10 +908,18 @@ async fn forward_with_attempt(
                             .and_then(|error| claude_sse_error_outcome(&error.error_type));
                         if let Some(outcome) = sse_error_outcome {
                             record_provider_outcome(&state, &stored, outcome).await;
-                            if attempt_context.retry_allowed() {
-                                crate::metrics::record_claude_retry("transport", "sse_error");
-                                attempt_context =
-                                    attempt_context.next(&execution, claude_body_retry_stage);
+                            if let Some(next_attempt) = next_claude_transport_attempt(
+                                &state,
+                                route,
+                                &headers,
+                                &request_context,
+                                &attempt_context,
+                                &execution,
+                                "sse_error",
+                            )
+                            .await
+                            {
+                                attempt_context = next_attempt;
                                 drop(account_in_flight_guard);
                                 drop(share_invocation_guard);
                                 continue 'attempt;
@@ -822,10 +953,18 @@ async fn forward_with_attempt(
                     Err(error) => {
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
                             .await;
-                        if attempt_context.retry_allowed() {
-                            crate::metrics::record_claude_retry("transport", "first_event_read");
-                            attempt_context =
-                                attempt_context.next(&execution, claude_body_retry_stage);
+                        if let Some(next_attempt) = next_claude_transport_attempt(
+                            &state,
+                            route,
+                            &headers,
+                            &request_context,
+                            &attempt_context,
+                            &execution,
+                            "first_event_read",
+                        )
+                        .await
+                        {
+                            attempt_context = next_attempt;
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
                             continue 'attempt;
@@ -1122,9 +1261,18 @@ async fn forward_with_attempt(
                 if route == ProxyRoute::ClaudeCountTokens {
                     crate::metrics::record_claude_count_tokens_outcome("network_error");
                 }
-                if route == ProxyRoute::ClaudeMessages && attempt_context.retry_allowed() {
-                    crate::metrics::record_claude_retry("transport", "body_read_error");
-                    attempt_context = attempt_context.next(&execution, claude_body_retry_stage);
+                if let Some(next_attempt) = next_claude_transport_attempt(
+                    &state,
+                    route,
+                    &headers,
+                    &request_context,
+                    &attempt_context,
+                    &execution,
+                    "body_read_error",
+                )
+                .await
+                {
+                    attempt_context = next_attempt;
                     drop(account_in_flight_guard);
                     drop(share_invocation_guard);
                     continue 'attempt;
@@ -3563,18 +3711,74 @@ async fn refresh_execution_managed_account_if_needed(
     state: &ServerState,
     execution: &ProviderExecution,
 ) -> Result<(), ProxyError> {
-    let crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
-        account_id,
-        expected_provider_type,
-        ..
-    } = &execution.plan.auth_ref
-    else {
+    let Some((provider_type, account_id)) = execution.managed_account_target() else {
         return Ok(());
     };
     state
-        .refresh_managed_account_if_needed(*expected_provider_type, Some(account_id))
+        .refresh_managed_account_if_needed(provider_type, account_id)
         .await
         .map_err(managed_account_refresh_error_to_proxy_error)
+}
+
+async fn next_claude_transport_attempt(
+    state: &ServerState,
+    route: ProxyRoute,
+    headers: &HeaderMap,
+    request_context: &UsageLogContext,
+    attempt_context: &ForwardAttemptContext,
+    failed: &ProviderExecution,
+    reason: &'static str,
+) -> Option<ForwardAttemptContext> {
+    if !matches!(
+        route,
+        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
+    ) || !attempt_context.retry_allowed()
+    {
+        return None;
+    }
+    if claude_request_is_provider_pinned(headers, request_context) {
+        crate::metrics::record_claude_retry("transport", reason);
+        return Some(attempt_context.next(failed, attempt_context.body_retry_stage));
+    }
+    next_claude_provider_failover(state, route, attempt_context, failed, reason).await
+}
+
+async fn next_claude_provider_failover(
+    state: &ServerState,
+    route: ProxyRoute,
+    attempt_context: &ForwardAttemptContext,
+    failed: &ProviderExecution,
+    reason: &'static str,
+) -> Option<ForwardAttemptContext> {
+    if !attempt_context.retry_allowed() {
+        return None;
+    }
+    let mut excluded = attempt_context.excluded_provider_ids.clone();
+    excluded.insert(failed.stored.provider.id.clone());
+    let accounts = state.accounts_snapshot().await;
+    let in_flight = state.account_in_flight.snapshot();
+    let providers = state.providers.read().await;
+    let next =
+        select_failover_provider(&providers, &accounts, route, &in_flight, &excluded)?.execution;
+    tracing::debug!(
+        reason,
+        from_provider_id = %failed.stored.provider.id,
+        to_provider_id = %next.stored.provider.id,
+        "switching Claude request to failover Provider"
+    );
+    crate::metrics::record_claude_retry("provider", reason);
+    Some(attempt_context.after_provider_failover(failed, &next))
+}
+
+fn claude_request_is_provider_pinned(
+    headers: &HeaderMap,
+    request_context: &UsageLogContext,
+) -> bool {
+    request_context.share_id.is_some()
+        || headers
+            .get("x-cc-provider-id")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn managed_account_id(stored: &StoredProvider) -> Option<&str> {
@@ -3601,12 +3805,6 @@ fn grok_tenant_scope(context: &UsageLogContext, stored: &StoredProvider) -> Opti
         stored.provider.id,
         managed_account_id(stored).unwrap_or("provider-secret")
     ))
-}
-
-fn claude_oauth_identity_seed(stored: &StoredProvider) -> String {
-    managed_account_id(stored)
-        .unwrap_or(&stored.provider.id)
-        .to_string()
 }
 
 fn provider_secret_configured(app: AppKind, stored: &StoredProvider) -> bool {
@@ -3992,23 +4190,6 @@ fn codex_oauth_upstream_session_id(session_id: &str) -> Option<String> {
         .unwrap_or(session_id)
         .trim();
     (!session_id.is_empty()).then(|| session_id.to_string())
-}
-
-fn adapter_request_requests_claude_context_1m(request: &adapters::AdapterRequest) -> bool {
-    let explicitly_requested = request
-        .requested_model
-        .as_deref()
-        .is_some_and(model_requests_claude_context_1m);
-    let provider_declared = request
-        .actual_model_source
-        .as_deref()
-        .is_some_and(|source| source != "request");
-    explicitly_requested && provider_declared
-}
-
-fn model_requests_claude_context_1m(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
-    model.ends_with("[1m]") || model.ends_with("-1m")
 }
 
 fn append_codex_oauth_session_headers(
@@ -5337,8 +5518,6 @@ fn count_tokens_metric_outcome(status: StatusCode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use serde_json::{json, Value};
 
     use crate::domain::providers::model::{
@@ -5352,24 +5531,748 @@ mod tests {
         assert!(context.execution.is_none());
 
         let stored = stored_provider(AppKind::Codex, ProviderType::Codex, json!({}), None);
+        let mut failover_stored = stored.clone();
+        failover_stored.provider.id = "codex-failover".to_string();
         let mut store = ProviderStore {
-            providers: vec![stored.clone()],
+            providers: vec![stored.clone(), failover_stored.clone()],
             ..ProviderStore::default()
         };
         store
             .rebuild_runtime_index(&AccountStore::default())
             .unwrap();
         let execution = ProviderExecution::from_store(&store, stored).unwrap();
+        let failover_execution = ProviderExecution::from_store(&store, failover_stored).unwrap();
 
         let next = context.next(&execution, Some(ClaudeBodyRetryStage::Thinking));
         assert_eq!(next.attempt, 1);
         assert_eq!(next.body_retry_stage, Some(ClaudeBodyRetryStage::Thinking));
+        assert!(!next.auth_refresh_attempted);
         assert_eq!(
             next.execution
                 .as_ref()
                 .map(|execution| execution.stored.provider.id.as_str()),
             Some("codex-fixture")
         );
+
+        let refreshed = next.after_auth_refresh(&execution);
+        assert!(refreshed.auth_refresh_attempted);
+        assert_eq!(refreshed.attempt, 2);
+        assert_eq!(
+            refreshed.body_retry_stage,
+            Some(ClaudeBodyRetryStage::Thinking)
+        );
+
+        let failed_over = refreshed.after_provider_failover(&execution, &failover_execution);
+        assert_eq!(failed_over.attempt, 3);
+        assert!(!failed_over.auth_refresh_attempted);
+        assert!(failed_over.excluded_provider_ids.contains("codex-fixture"));
+        assert_eq!(
+            failed_over
+                .execution
+                .as_ref()
+                .map(|execution| execution.stored.provider.id.as_str()),
+            Some("codex-failover")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_legacy_claude_forwards_refresh_once_and_use_rotated_token() {
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let token_bodies_for_route = std::sync::Arc::clone(&token_bodies);
+        let token_upstream = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let token_requests = std::sync::Arc::clone(&token_requests_for_route);
+                let token_bodies = std::sync::Arc::clone(&token_bodies_for_route);
+                async move {
+                    token_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    token_bodies.lock().unwrap().push(body);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    axum::Json(json!({
+                        "access_token": "rotated-forward-access-token",
+                        "refresh_token": "rotated-forward-refresh-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "account": {"uuid": "legacy-principal"}
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(token_listener, token_upstream).await.unwrap();
+        });
+
+        let anthropic_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let anthropic_address = anthropic_listener.local_addr().unwrap();
+        let upstream_authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let upstream_authorizations_for_route = std::sync::Arc::clone(&upstream_authorizations);
+        let anthropic_upstream = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                let authorizations = std::sync::Arc::clone(&upstream_authorizations_for_route);
+                async move {
+                    authorizations.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    axum::Json(json!({
+                        "id": "msg-refreshed",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-6",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 2, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(anthropic_listener, anthropic_upstream)
+                .await
+                .unwrap();
+        });
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(std::env::temp_dir().join(format!(
+                    "cc-switch-server-legacy-refresh-forward-test-{nanos}"
+                ))),
+                web_dist_dir: None,
+                log_level: "warn".to_string(),
+                command: None,
+            },
+            std::sync::Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap();
+        let token_url = format!("http://{token_address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                    id: Some("legacy-refresh-account".to_string()),
+                    provider_type: ProviderType::ClaudeOAuth,
+                    email: Some("legacy-refresh@example.com".to_string()),
+                    access_token: Some("expired-forward-access-token".to_string()),
+                    refresh_token: Some("original-forward-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: Some("Bearer".to_string()),
+                    api_key: None,
+                    extra_headers: None,
+                    scopes: Vec::new(),
+                    profile: None,
+                    raw: Some(json!({"testOAuthTokenUrl": token_url})),
+                    subscription_level: None,
+                    entitlement_status: None,
+                    quota_percent: None,
+                    quota: None,
+                    quota_refreshed_at: None,
+                    quota_next_refresh_at: None,
+                    expires_at: Some(1),
+                    rate_limited_until: None,
+                    last_refresh_error: None,
+                });
+            })
+            .await
+            .unwrap();
+        let base_url = format!("http://{anthropic_address}");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Claude,
+                    Provider {
+                        id: "legacy-refresh-provider".to_string(),
+                        name: "Legacy Refresh Provider".to_string(),
+                        settings_config: json!({
+                            "env": {"ANTHROPIC_BASE_URL": base_url}
+                        }),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("claude_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("claude_oauth".to_string()),
+                                account_id: Some("legacy-refresh-account".to_string()),
+                                auth_identity_generation: None,
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-provider-id",
+            HeaderValue::from_static("legacy-refresh-provider"),
+        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+        );
+        let (first, second) = tokio::join!(
+            forward(
+                state.clone(),
+                ProxyRoute::ClaudeMessages,
+                None,
+                headers.clone(),
+                body.clone(),
+            ),
+            forward(
+                state.clone(),
+                ProxyRoute::ClaudeMessages,
+                None,
+                headers,
+                body,
+            )
+        );
+
+        assert_eq!(first.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.unwrap().status(), StatusCode::OK);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            token_bodies.lock().unwrap()[0]["refresh_token"],
+            json!("original-forward-refresh-token")
+        );
+        assert_eq!(
+            upstream_authorizations.lock().unwrap().as_slice(),
+            [
+                "Bearer rotated-forward-access-token",
+                "Bearer rotated-forward-access-token"
+            ]
+        );
+        let account = state
+            .find_account_by_id("legacy-refresh-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            account.access_token.as_deref(),
+            Some("rotated-forward-access-token")
+        );
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("rotated-forward-refresh-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_messages_and_count_tokens_recover_once_from_unauthorized() {
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_upstream = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let token_requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    token_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let kind = body["refresh_token"]
+                        .as_str()
+                        .and_then(|value| value.strip_prefix("refresh-"))
+                        .unwrap();
+                    axum::Json(json!({
+                        "access_token": format!("new-{kind}-access"),
+                        "refresh_token": format!("rotated-{kind}-refresh"),
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "account": {"uuid": format!("principal-{kind}")}
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(token_listener, token_upstream).await.unwrap();
+        });
+
+        let anthropic_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let anthropic_address = anthropic_listener.local_addr().unwrap();
+        let upstream_attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let message_attempts = std::sync::Arc::clone(&upstream_attempts);
+        let count_attempts = std::sync::Arc::clone(&upstream_attempts);
+        let anthropic_upstream = axum::Router::new()
+            .route(
+                "/v1/messages",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let attempts = std::sync::Arc::clone(&message_attempts);
+                    async move {
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        attempts
+                            .lock()
+                            .unwrap()
+                            .push(("messages".to_string(), authorization.clone()));
+                        if authorization == "Bearer old-messages-access" {
+                            Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    json!({
+                                        "type": "error",
+                                        "error": {"type": "authentication_error"}
+                                    })
+                                    .to_string(),
+                                ))
+                                .unwrap()
+                        } else {
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    json!({
+                                        "id": "msg-after-refresh",
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "model": "claude-sonnet-4-6",
+                                        "content": [{"type": "text", "text": "ok"}],
+                                        "stop_reason": "end_turn",
+                                        "usage": {"input_tokens": 2, "output_tokens": 1}
+                                    })
+                                    .to_string(),
+                                ))
+                                .unwrap()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/messages/count_tokens",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let attempts = std::sync::Arc::clone(&count_attempts);
+                    async move {
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        attempts
+                            .lock()
+                            .unwrap()
+                            .push(("count_tokens".to_string(), authorization.clone()));
+                        if authorization == "Bearer old-count-access" {
+                            Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    json!({
+                                        "type": "error",
+                                        "error": {"type": "authentication_error"}
+                                    })
+                                    .to_string(),
+                                ))
+                                .unwrap()
+                        } else {
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(json!({"input_tokens": 9}).to_string()))
+                                .unwrap()
+                        }
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(anthropic_listener, anthropic_upstream)
+                .await
+                .unwrap();
+        });
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(std::env::temp_dir().join(format!(
+                    "cc-switch-server-unauthorized-refresh-test-{nanos}"
+                ))),
+                web_dist_dir: None,
+                log_level: "warn".to_string(),
+                command: None,
+            },
+            std::sync::Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap();
+        let token_url = format!("http://{token_address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                for (kind, access_token) in [
+                    ("messages", "old-messages-access"),
+                    ("count", "old-count-access"),
+                ] {
+                    accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                        id: Some(format!("unauthorized-{kind}-account")),
+                        provider_type: ProviderType::ClaudeOAuth,
+                        email: Some(format!("{kind}@example.com")),
+                        access_token: Some(access_token.to_string()),
+                        refresh_token: Some(format!("refresh-{kind}")),
+                        id_token: None,
+                        token_type: Some("Bearer".to_string()),
+                        api_key: None,
+                        extra_headers: None,
+                        scopes: Vec::new(),
+                        profile: None,
+                        raw: Some(json!({"testOAuthTokenUrl": token_url})),
+                        subscription_level: None,
+                        entitlement_status: None,
+                        quota_percent: None,
+                        quota: None,
+                        quota_refreshed_at: None,
+                        quota_next_refresh_at: None,
+                        expires_at: Some(i64::MAX / 2),
+                        rate_limited_until: None,
+                        last_refresh_error: None,
+                    });
+                }
+            })
+            .await
+            .unwrap();
+        let base_url = format!("http://{anthropic_address}");
+        state
+            .mutate_providers_immediate(move |providers| {
+                for kind in ["messages", "count"] {
+                    providers.upsert(
+                        AppKind::Claude,
+                        Provider {
+                            id: format!("unauthorized-{kind}-provider"),
+                            name: format!("Unauthorized {kind} Provider"),
+                            settings_config: json!({
+                                "env": {"ANTHROPIC_BASE_URL": base_url}
+                            }),
+                            category: None,
+                            meta: Some(ProviderMeta {
+                                provider_type: Some("claude_oauth".to_string()),
+                                auth_binding: Some(AuthBinding {
+                                    source: Some("account_store".to_string()),
+                                    auth_provider: Some("claude_oauth".to_string()),
+                                    account_id: Some(format!("unauthorized-{kind}-account")),
+                                    auth_identity_generation: None,
+                                }),
+                                ..Default::default()
+                            }),
+                            extra: Default::default(),
+                        },
+                    );
+                }
+            })
+            .await
+            .unwrap();
+
+        for (kind, route) in [
+            ("messages", ProxyRoute::ClaudeMessages),
+            ("count", ProxyRoute::ClaudeCountTokens),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-cc-provider-id",
+                HeaderValue::from_str(&format!("unauthorized-{kind}-provider")).unwrap(),
+            );
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            let response = forward(
+                state.clone(),
+                route,
+                None,
+                headers,
+                Bytes::from_static(
+                    br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            upstream_attempts.lock().unwrap().as_slice(),
+            [
+                (
+                    "messages".to_string(),
+                    "Bearer old-messages-access".to_string()
+                ),
+                (
+                    "messages".to_string(),
+                    "Bearer new-messages-access".to_string()
+                ),
+                (
+                    "count_tokens".to_string(),
+                    "Bearer old-count-access".to_string()
+                ),
+                (
+                    "count_tokens".to_string(),
+                    "Bearer new-count-access".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_unauthorized_after_refresh_fails_over_to_next_provider() {
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_upstream = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let token_requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    token_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "access_token": "still-rejected-access",
+                        "refresh_token": "rotated-rejected-refresh",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "account": {"uuid": "rejected-principal"}
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(token_listener, token_upstream).await.unwrap();
+        });
+
+        let rejected_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let rejected_address = rejected_listener.local_addr().unwrap();
+        let rejected_authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rejected_authorizations_for_route = std::sync::Arc::clone(&rejected_authorizations);
+        let rejected_upstream = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap| {
+                let authorizations = std::sync::Arc::clone(&rejected_authorizations_for_route);
+                async move {
+                    authorizations.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({
+                                "type": "error",
+                                "error": {"type": "authentication_error"}
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(rejected_listener, rejected_upstream)
+                .await
+                .unwrap();
+        });
+
+        let fallback_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let fallback_address = fallback_listener.local_addr().unwrap();
+        let fallback_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback_requests_for_route = std::sync::Arc::clone(&fallback_requests);
+        let fallback_upstream = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let fallback_requests = std::sync::Arc::clone(&fallback_requests_for_route);
+                async move {
+                    fallback_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "id": "msg-after-auth-failover",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-6",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 2, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(fallback_listener, fallback_upstream)
+                .await
+                .unwrap();
+        });
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(
+                    std::env::temp_dir()
+                        .join(format!("cc-switch-server-auth-failover-test-{nanos}")),
+                ),
+                web_dist_dir: None,
+                log_level: "warn".to_string(),
+                command: None,
+            },
+            std::sync::Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap();
+        let token_url = format!("http://{token_address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                    id: Some("auth-failover-account".to_string()),
+                    provider_type: ProviderType::ClaudeOAuth,
+                    email: Some("auth-failover@example.com".to_string()),
+                    access_token: Some("initial-rejected-access".to_string()),
+                    refresh_token: Some("initial-rejected-refresh".to_string()),
+                    id_token: None,
+                    token_type: Some("Bearer".to_string()),
+                    api_key: None,
+                    extra_headers: None,
+                    scopes: Vec::new(),
+                    profile: None,
+                    raw: Some(json!({"testOAuthTokenUrl": token_url})),
+                    subscription_level: None,
+                    entitlement_status: None,
+                    quota_percent: None,
+                    quota: None,
+                    quota_refreshed_at: None,
+                    quota_next_refresh_at: None,
+                    expires_at: Some(i64::MAX / 2),
+                    rate_limited_until: None,
+                    last_refresh_error: None,
+                });
+            })
+            .await
+            .unwrap();
+        let rejected_base_url = format!("http://{rejected_address}");
+        let fallback_base_url = format!("http://{fallback_address}");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Claude,
+                    Provider {
+                        id: "auth-failover-oauth".to_string(),
+                        name: "Auth Failover OAuth".to_string(),
+                        settings_config: json!({
+                            "env": {"ANTHROPIC_BASE_URL": rejected_base_url}
+                        }),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("claude_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("claude_oauth".to_string()),
+                                account_id: Some("auth-failover-account".to_string()),
+                                auth_identity_generation: None,
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+                providers.upsert(
+                    AppKind::Claude,
+                    Provider {
+                        id: "auth-failover-api-key".to_string(),
+                        name: "Auth Failover API Key".to_string(),
+                        settings_config: json!({
+                            "env": {
+                                "ANTHROPIC_BASE_URL": fallback_base_url,
+                                "ANTHROPIC_API_KEY": "sk-fallback"
+                            }
+                        }),
+                        category: None,
+                        meta: None,
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        state
+            .apply_ui_settings_patch_immediate(json!({
+                "currentProviderClaude": "auth-failover-oauth"
+            }))
+            .await
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["id"],
+            "msg-after-auth-failover"
+        );
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            rejected_authorizations.lock().unwrap().as_slice(),
+            [
+                "Bearer initial-rejected-access",
+                "Bearer still-rejected-access"
+            ]
+        );
+        assert_eq!(
+            fallback_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let usage = state.usage_snapshot().await;
+        assert_eq!(usage.logs.len(), 1);
+        assert_eq!(usage.logs[0].provider_id, "auth-failover-api-key");
     }
 
     use super::*;
@@ -5509,31 +6412,6 @@ mod tests {
             "anthropic-beta",
             ProviderType::ClaudeAuth
         ));
-    }
-
-    #[test]
-    fn context_1m_model_suffix_is_explicit_and_case_insensitive() {
-        assert!(model_requests_claude_context_1m("Claude-Opus-4-6[1M]"));
-        assert!(model_requests_claude_context_1m("claude-sonnet-4-6-1m"));
-        assert!(!model_requests_claude_context_1m("claude-opus-4-6"));
-        assert!(!model_requests_claude_context_1m("claude-1m-preview-extra"));
-
-        let mut request = adapters::AdapterRequest {
-            body: Bytes::new(),
-            upstream_endpoint: None,
-            upstream_headers: Vec::new(),
-            model: Some("claude-opus-4-6".to_string()),
-            requested_model: Some("Claude-Opus-4-6[1M]".to_string()),
-            actual_model: Some("claude-opus-4-6".to_string()),
-            actual_model_source: Some("model_catalog".to_string()),
-            pricing_model: None,
-            stream_requested: false,
-            custom_tool_names: BTreeSet::new(),
-        };
-        assert!(adapter_request_requests_claude_context_1m(&request));
-
-        request.actual_model_source = Some("request".to_string());
-        assert!(!adapter_request_requests_claude_context_1m(&request));
     }
 
     #[test]

@@ -340,9 +340,11 @@ async function tryAutoLoginFromCache(
 export async function invokeCommand<T>(
   command: string,
   args?: Record<string, unknown>,
+  options: { cache?: RequestCache } = {},
 ): Promise<T> {
   return jsonFetch<T>(`/web-api/invoke/${encodeURIComponent(command)}`, {
     method: "POST",
+    cache: options.cache,
     headers: { "content-type": "application/json" },
     body: JSON.stringify(args ?? {}),
   });

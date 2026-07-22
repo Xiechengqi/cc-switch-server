@@ -29,8 +29,15 @@
     "formatSuccess": "格式化成功",
     "formatError": "格式化失败：{{error}}",
     "copy": "复制",
+    "copied": "已复制",
+    "undo": "撤销",
     "view": "查看",
+    "show": "显示",
+    "hide": "隐藏",
     "back": "返回",
+    "continue": "继续",
+    "retry": "重试",
+    "logout": "退出登录",
     "refresh": "刷新",
     "refreshing": "刷新中...",
     "import": "导入",
@@ -100,6 +107,9 @@
     "windowClose": "关闭窗口"
   },
   "provider": {
+    "testLinkUnavailable": "当前供应商没有可测试的自定义接口地址；请使用模型测试验证账号和模型可用性。",
+    "configJsonPreview": "配置 JSON 预览",
+    "advancedConfigJson": "高级配置 JSON",
     "connectivityCheck": "检测连通",
     "refreshProviderInfo": "供应商信息刷新",
     "quotaNeverUpdated": "从未更新",
@@ -142,6 +152,13 @@
       "officialPricePercentPlaceholder": "留空则使用 Token Market 默认定价",
       "officialPricePercentHint": "只允许 1-100 的整数。",
       "officialPricePercentInvalid": "模型定价必须是 1-100 的整数。"
+    },
+    "unsavedChanges": {
+      "title": "放弃未保存的更改？",
+      "addMessage": "当前供应商配置尚未保存。关闭后，这些更改将丢失。",
+      "editMessage": "当前供应商或远程分享配置尚未保存。关闭后，这些更改将丢失。",
+      "discard": "放弃更改",
+      "keepEditing": "继续编辑"
     },
     "inUse": "使用中",
     "clickToClearCurrent": "点击取消启用",
@@ -1191,6 +1208,12 @@
     "openReleaseNotesFailed": "打开更新日志失败:"
   },
   "providerForm": {
+    "providerKeyStatusLoading": "正在加载供应商标识状态，请稍后再试",
+    "singleUpstreamModelRequired": "请填写真实上游模型",
+    "generatedConfigPreviewHint": "此配置由上方结构化字段生成；请通过模型映射、Endpoint 和认证字段修改。",
+    "singleModelMappingSummary": "无论客户端请求什么模型，都会统一转发为下面的真实上游模型。",
+    "singleUpstreamModelLabel": "真实上游模型",
+    "singleUpstreamModelPlaceholder": "例如：composer-2.5",
     "supplierName": "供应商名称",
     "supplierNameRequired": "供应商名称 *",
     "supplierNamePlaceholder": "例如：Anthropic 官方",
@@ -1413,6 +1436,23 @@
     "logoutAll": "注销所有账号",
     "retry": "重试",
     "copyCode": "复制代码",
+    "cliUnavailableInRemoteWeb": "远程 Web 模式下 localhost 回调不可达，请使用 Device Code",
+    "imageGeneration": "生成图片",
+    "imageGenerationDescription": "通过 ChatGPT Codex 后端启用 OpenAI 兼容的 /v1/images/generations 接口。",
+    "imageToolStripPolicy": "图片工具策略",
+    "imageToolStripPolicyDescription": "控制 Codex Responses 请求是否可以声明 image_generation 工具。",
+    "imageToolStripNever": "从不移除",
+    "imageToolStripOnError": "发生错误时移除",
+    "imageToolStripAlways": "始终移除",
+    "websocket": "Responses WebSocket",
+    "websocketDescription": "通常应保持开启。上游 WebSocket 故障时可关闭，强制客户端使用 POST /v1/responses SSE。",
+    "workspace": "ChatGPT 工作区",
+    "workspaceDescription": "只能选择已通过 OpenAI Token 声明验证的工作区。",
+    "loginWithCli": "CLI OAuth",
+    "loginWithDevice": "Device Code",
+    "addCliAccount": "添加 CLI OAuth",
+    "addDeviceAccount": "添加 Device Code",
+    "selectAccountRequired": "OpenAI OAuth 必须绑定一个 ChatGPT 账号",
     "fastMode": "FAST 模式",
     "fastModeDescription": "发送 service_tier=\"priority\" 换取更低延迟。默认关闭——开启后会按更高速率消耗 ChatGPT 配额。"
   },
@@ -1489,6 +1529,8 @@
     "quotaDispatchLimitPercentHint": "设置为非 0 后，router 会在任一重置周期达到该百分比时停止把此供应商调度给 Market。"
   },
   "codexConfig": {
+    "generatedConfigPreviewHint": "此配置由上方 auth.json、config.toml、模型目录和模型映射生成；请通过结构化字段修改。",
+    "localRoutingToggle": "需要本地路由映射",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex auth.json 配置内容",
@@ -3179,6 +3221,7 @@
     },
     "confirmDeleteTitle": "删除分享",
     "confirmDeleteMessage": "确认删除分享 “{{name}}” 吗？若存在运行中的隧道，会先停止再删除。",
+    "freeConfirm": "确认将出售方式设为免费吗？",
     "error": {
       "title": "加载分享失败"
     },
@@ -3214,6 +3257,232 @@
       "copyCurl": "已复制 Curl 命令"
     }
   },
+  "antigravityOauth": {
+    "authStatus": "Antigravity 认证",
+    "loginWithGoogle": "使用 Google 登录 Antigravity",
+    "loginRequired": "请先登录 Antigravity 账号",
+    "selectAccountRequired": "Antigravity OAuth 必须绑定一个 Antigravity 账号"
+  },
+  "claudeOauth": {
+    "localCallbackLogin": "本地回调登录",
+    "officialCallbackLogin": "官方链接登录",
+    "callbackModeHint": "本地回调会使用 127.0.0.1 自动完成授权；官方链接会在 platform.claude.com 显示授权码，复制后粘贴回这里完成登录。",
+    "remoteCallbackModeHint": "当前通过 Web 入口访问，本地回调不可达，请使用官方链接并粘贴授权码完成登录。",
+    "authStatus": "Claude 订阅认证",
+    "loginWithClaude": "使用 Claude.ai 登录",
+    "webPasteHint": "1. 点击下方链接在浏览器中完成 claude.ai 授权。\n2. 授权后会跳到 platform.claude.com 显示一段授权码。\n3. 复制该授权码并粘贴到下面的输入框，点击“提交”完成添加账号。",
+    "pasteCodeLabel": "从 platform.claude.com 复制的授权码",
+    "pasteCodePlaceholder": "粘贴授权码...",
+    "submitPasteCode": "提交",
+    "loginRequired": "请先登录 Claude 账号"
+  },
+  "cursorOauth": {
+    "authStatus": "Cursor OAuth 认证",
+    "loginWithCursor": "使用 Cursor 登录",
+    "importLocalServerTitle": "从运行 cc-switch-server 的这台机器读取 Cursor IDE 或 cursor-agent 登录状态",
+    "importLocalServer": "从本机 Cursor 导入",
+    "loginRequired": "请先登录 Cursor 账号",
+    "selectAccountRequired": "Cursor OAuth 必须绑定一个 Cursor 账号"
+  },
+  "deepseekAccount": {
+    "authStatus": "DeepSeek 账号",
+    "identifier": "邮箱或手机号",
+    "identifierPlaceholder": "请输入邮箱或手机号",
+    "password": "密码",
+    "addAccount": "添加账号",
+    "loginRequired": "请先添加 DeepSeek 账号",
+    "selectAccountRequired": "DeepSeek Account 必须绑定一个 DeepSeek 账号"
+  },
+  "geminiOauth": {
+    "authStatus": "Google Gemini 认证",
+    "loginWithGoogle": "使用 Google 登录",
+    "loginRequired": "请先登录 Google Gemini 账号",
+    "selectAccountRequired": "Google Official 必须绑定一个 Google Gemini 账号"
+  },
+  "grokOauth": {
+    "callbackRequired": "请粘贴 Grok 回调 URL、query string 或 code",
+    "loginSuccess": "Grok 账号已登录",
+    "authJsonRequired": "请粘贴 ~/.grok/auth.json 内容",
+    "authJsonInvalid": "auth.json 不是合法 JSON",
+    "importSuccess": "Grok auth.json 已导入",
+    "authStatus": "Grok OAuth 认证",
+    "loginWithGrok": "使用 Grok 登录",
+    "importAuthJson": "导入 auth.json",
+    "import": "导入",
+    "callbackPlaceholder": "http://127.0.0.1:56121/callback?code=...&state=... 或只粘贴 code",
+    "finishLogin": "完成登录",
+    "loginRequired": "请先登录 Grok 账号",
+    "selectAccountRequired": "Grok OAuth 必须绑定一个 Grok 账号"
+  },
+  "kiroOauth": {
+    "importSuccess": "Kiro 凭据已导入",
+    "credentialsInvalid": "credentials.json 不是合法 JSON",
+    "apiKeyInvalid": "Kiro API Key 必须以 ksk_ 开头",
+    "authStatus": "Kiro OAuth 认证",
+    "loginWithKiro": "使用 AWS Builder ID 登录",
+    "loginWithGoogle": "使用 Google 登录",
+    "loginWithGithub": "使用 GitHub 登录",
+    "addGoogleAccount": "添加 Google 账号",
+    "addGithubAccount": "添加 GitHub 账号",
+    "importJson": "导入 JSON",
+    "importApiKey": "API Key",
+    "importLocal": "本机 Kiro",
+    "userCodeHint": "AWS Builder ID 设备验证码：",
+    "copyUserCode": "复制验证码",
+    "loginRequired": "请先登录 AWS Builder ID 账号",
+    "selectAccountRequired": "Kiro OAuth 必须绑定一个 AWS Builder ID 账号"
+  },
+  "accountAuth": {
+    "accountCount": "{{count}} 个账号",
+    "notAuthenticated": "未认证",
+    "loggedInAccounts": "已登录账号",
+    "defaultAccount": "默认",
+    "selected": "已选中",
+    "setAsDefault": "设为默认",
+    "removeAccount": "移除账号",
+    "selectAccount": "选择账号",
+    "selectAccountPlaceholder": "选择一个账号",
+    "useDefaultAccount": "使用默认账号",
+    "addAnotherAccount": "添加其他账号",
+    "waitingForBrowser": "请打开下方授权链接并完成登录...",
+    "openLinkHint": "授权链接不会自动打开，请点击或复制后在浏览器中访问：",
+    "copyLink": "复制链接",
+    "openManually": "打开链接",
+    "logoutAll": "退出所有账号",
+    "retry": "重试"
+  },
+  "serverProviderForm": {
+    "categories": {
+      "official": "官方",
+      "cnOfficial": "国内官方",
+      "aggregator": "聚合服务",
+      "thirdParty": "第三方",
+      "custom": "自定义"
+    },
+    "validation": {
+      "nameRequired": "供应商名称不能为空",
+      "accountRequired": "请选择一个已认证账号",
+      "endpointInvalid": "请输入有效的 HTTP 或 HTTPS Endpoint",
+      "modelRequired": "实际请求模型不能为空",
+      "awsRegionRequired": "AWS Region 不能为空",
+      "replacementRequired": "请填写需要替换的凭据",
+      "requiredCredentialCannotClear": "必需凭据不能清除；请选择替换",
+      "customBindingMissing": "Custom Provider 协议配置缺失",
+      "unsupportedBinding": "当前协议与认证组合不受支持",
+      "authCredentialRequired": "请填写认证凭据",
+      "authRequired": "当前认证方式需要凭据",
+      "invalidHeader": "Header 名称无效：{{name}}",
+      "managedHeader": "Header 由驱动管理：{{name}}",
+      "duplicateHeader": "Header 名称重复：{{name}}",
+      "headerValueRequired": "请填写 Header {{name}} 的值",
+      "costMultiplierInvalid": "成本倍率必须是非负数字",
+      "quotaLimitInvalid": "调度用量上限必须是 1-100 的整数"
+    },
+    "credentials": {
+      "title": "认证凭据",
+      "apiToken": "API Key / Bearer Token",
+      "keep": "保留",
+      "replace": "替换",
+      "clear": "清除",
+      "newPlaceholder": "输入新凭据",
+      "placeholder": "输入凭据",
+      "loading": "正在读取已配置凭据...",
+      "loadFailed": "无法读取已配置凭据，可重试或直接输入新凭据替换。",
+      "loadFailedPlaceholder": "输入新凭据进行替换",
+      "willClear": "保存后将清除此可选凭据",
+      "willReplace": "保存后将替换当前凭据",
+      "configured": "已配置",
+      "optionalMissing": "未配置（可选）",
+      "missing": "未配置"
+    },
+    "unsupportedAccountType": "不支持的账号类型：{{type}}",
+    "toasts": {
+      "applyBindingFirst": "请先预览并应用协议绑定，再保存其他配置",
+      "customUnavailable": "Custom Provider 配置不可用",
+      "cloneIdInvalid": "请输入与原 Provider 不同的新 ID",
+      "cloneNameRequired": "请输入新 Provider 名称",
+      "customCreated": "Custom Provider 已创建",
+      "identityUpdated": "供应商身份配置已更新"
+    },
+    "identity": {
+      "stable": "稳定",
+      "experimental": "实验性",
+      "adoptTitle": "采用供应商配置",
+      "adoptMessage": "将 {{provider}} 绑定到 {{profile}}。",
+      "cloneTitle": "复制为 Custom Provider",
+      "cloneMessage": "创建 {{name}}（{{id}}）。",
+      "upstreamProtocolLine": "上游协议：{{protocol}}",
+      "authSchemeLine": "认证方式：{{scheme}}",
+      "rebindTitle": "更改 Custom 绑定",
+      "adoptSection": "采用标准配置",
+      "adoptPreview": "预览并采用",
+      "cloneSection": "复制为 Custom Provider",
+      "cloneDescription": "保留当前 Provider，创建一份具有显式协议身份的新配置。应用前会预览运行时差异。",
+      "newProviderId": "新 Provider ID",
+      "newName": "新名称",
+      "clonePreview": "预览并创建",
+      "confirmTitle": "确认身份变更",
+      "apply": "应用"
+    },
+    "basic": {
+      "title": "基本信息",
+      "name": "名称",
+      "website": "网站",
+      "notes": "备注"
+    },
+    "account": {
+      "title": "认证账号"
+    },
+    "aws": {
+      "title": "AWS 凭据"
+    },
+    "binding": {
+      "title": "协议与认证",
+      "upstreamProtocol": "上游协议",
+      "authScheme": "认证方式",
+      "credential": "认证凭据",
+      "queryParameter": "Query 参数名",
+      "headerName": "Header 名称",
+      "cancelChanges": "取消更改",
+      "previewApply": "预览并应用绑定",
+      "change": "更改协议绑定",
+      "pendingHint": "协议身份尚未应用。请先完成“预览并应用绑定”，再保存 Endpoint、模型或请求配置。"
+    },
+    "endpoint": {
+      "title": "API 请求地址"
+    },
+    "model": {
+      "title": "模型策略",
+      "upstreamModel": "实际上游模型",
+      "passthrough": "透传",
+      "passthroughHint": "使用请求中的模型"
+    },
+    "headers": {
+      "title": "额外请求 Header",
+      "value": "Header 值",
+      "remove": "删除 Header",
+      "add": "添加 Header"
+    },
+    "codex": {
+      "title": "Codex 运行选项",
+      "imageGeneration": "图片生成"
+    },
+    "usage": {
+      "title": "用量与请求",
+      "costMultiplier": "成本倍率",
+      "pricingModel": "计费模型",
+      "inherit": "继承全局",
+      "request": "请求模型",
+      "response": "返回模型",
+      "quotaLimit": "调度用量上限（%）",
+      "unlimited": "不限制",
+      "customUserAgent": "自定义 User-Agent"
+    },
+    "legacy": {
+      "title": "兼容状态",
+      "hint": "历史 Provider 仅允许修改显示信息；运行配置保持冻结。"
+    }
+  },
   "subscription": {
     "title": "订阅额度",
     "fiveHour": "5小时",
@@ -3227,6 +3496,7 @@
     "weeklyLimit": "每周",
     "monthly": "每月",
     "copilotPremium": "高级请求",
+    "cursorCredits": "用量",
     "kiroAgenticRequests": "Kiro Agentic Requests",
     "kiroEstimatedUsage": "预计用量",
     "kiroResetsOn": "{{date}} 重置",
@@ -3260,8 +3530,6 @@
   "terminal": {
     "title": "运维终端",
     "nav": "终端",
-    "backHome": "返回首页",
-    "subtitle": "服务器运行环境",
     "placeholderTitle": "正在连接运维终端",
     "placeholderBody": "离开本页不会中断后台命令；再次进入可恢复最近输出。",
     "authRequired": "需要登录后才能使用运维终端",

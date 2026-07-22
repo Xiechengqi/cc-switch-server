@@ -29,8 +29,15 @@
     "formatSuccess": "整形しました",
     "formatError": "整形に失敗しました: {{error}}",
     "copy": "コピー",
+    "copied": "コピーしました",
+    "undo": "元に戻す",
     "view": "表示",
+    "show": "表示",
+    "hide": "非表示",
     "back": "戻る",
+    "continue": "続行",
+    "retry": "再試行",
+    "logout": "ログアウト",
     "refresh": "更新",
     "refreshing": "更新中...",
     "import": "インポート",
@@ -100,6 +107,9 @@
     "windowClose": "ウィンドウを閉じる"
   },
   "provider": {
+    "testLinkUnavailable": "このプロバイダーにはテスト可能なカスタム Endpoint がありません。モデルテストでアカウントとモデルを確認してください。",
+    "configJsonPreview": "設定 JSON プレビュー",
+    "advancedConfigJson": "詳細設定 JSON",
     "connectivityCheck": "接続チェック",
     "refreshProviderInfo": "プロバイダー情報を更新",
     "quotaNeverUpdated": "未更新",
@@ -119,10 +129,21 @@
     "share": {
       "ownerNotConfigured": "先に Client Owner を設定してください",
       "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。",
+      "deleteShort": "Share を削除",
+      "deleteConfirmTitle": "Share を削除",
+      "deleteConfirmMessage": "削除すると Share ページから取り除かれ、元に戻せません。",
+      "deleteRemember": "選択を記憶し、次回から確認しない",
       "officialPricePercent": "モデル価格（公式価格に対する割合）",
       "officialPricePercentPlaceholder": "空欄の場合は Token Market の価格を使用",
       "officialPricePercentHint": "1 から 100 の整数のみ入力できます。",
       "officialPricePercentInvalid": "モデル価格は 1 から 100 の整数で入力してください。"
+    },
+    "unsavedChanges": {
+      "title": "未保存の変更を破棄しますか？",
+      "addMessage": "このプロバイダー設定は保存されていません。閉じると変更内容が失われます。",
+      "editMessage": "このプロバイダーまたはリモート Share の設定は保存されていません。閉じると変更内容が失われます。",
+      "discard": "変更を破棄",
+      "keepEditing": "編集を続ける"
     },
     "inUse": "使用中",
     "editProvider": "プロバイダーを編集",
@@ -447,6 +468,21 @@
       "restartAfterUpgrade": "アップグレード後すぐに再起動",
       "restartConfirmTitle": "再起動の確認",
       "restartConfirmMessage": "cc-switch-server を再起動しますか？再起動中は管理画面とプロキシサービスが一時的に利用できなくなります。",
+      "currentVersionOnly": "現在 {{current}}",
+      "versionCardUpdateAvailable": "現在のバージョン {{current}} -> 最新バージョン {{latest}}",
+      "versionCardUpToDate": "最新バージョン {{current}} を使用中です",
+      "upgradeStep": "ステップ {{step}} / {{total}}",
+      "upgradeRestarting": "アップグレード完了。サービスを再起動中…",
+      "upgradeRunning": "アップグレード中…",
+      "upgradeSucceeded": "アップグレード完了",
+      "rollbackScheduled": "ロールバックを開始しました。サービスの復旧を待機中…",
+      "checkUpdateFailed": "更新の確認に失敗しました：{{error}}",
+      "checkUpdateUpToDate": "最新バージョン（{{current}}）を使用中です。",
+      "checkUpdateReachableButUnavailable": "新しいバージョンがあります（現在 {{current}}、最新 {{latest}}）が、この環境では直接アップグレードできません（開発モードなど）。",
+      "checkUpdateAvailable": "現在のバージョンは {{current}}、最新は {{latest}} です。「アップグレード」をクリックしてインストールできます（{{size}}）。",
+      "rollback": "ロールバック",
+      "rollbackConfirmTitle": "ロールバックの確認",
+      "rollbackConfirmMessage": "アップグレード前のバックアップバイナリ（/tmp/cc-switch-server.bak）で現在のインストールを置き換え、サービスを再起動します。",
       "upgradeLogTitle": "アップグレード進行状況",
       "waitingLogs": "アップグレードログを待機中…",
       "streamDisconnected": "アップグレードログストリームが切断されました",
@@ -1093,6 +1129,12 @@
     "openReleaseNotesFailed": "リリースノートを開けませんでした:"
   },
   "providerForm": {
+    "providerKeyStatusLoading": "プロバイダー識別子の状態を読み込み中です。しばらくしてから再試行してください",
+    "singleUpstreamModelRequired": "実際の上流モデルを入力してください",
+    "generatedConfigPreviewHint": "この設定は上の構造化フィールドから生成されます。モデルマッピング、Endpoint、認証フィールドから変更してください。",
+    "singleModelMappingSummary": "クライアントが要求したモデルにかかわらず、下の実際の上流モデルへ転送します。",
+    "singleUpstreamModelLabel": "実際の上流モデル",
+    "singleUpstreamModelPlaceholder": "例：composer-2.5",
     "supplierName": "プロバイダー名",
     "supplierNameRequired": "プロバイダー名 *",
     "supplierNamePlaceholder": "例: Anthropic Official",
@@ -1315,6 +1357,23 @@
     "logoutAll": "すべてのアカウントをログアウト",
     "retry": "再試行",
     "copyCode": "コードをコピー",
+    "cliUnavailableInRemoteWeb": "リモート Web 画面では localhost コールバックを利用できません。Device Code を使用してください。",
+    "imageGeneration": "画像生成",
+    "imageGenerationDescription": "ChatGPT Codex バックエンドで OpenAI 互換の /v1/images/generations を有効にします。",
+    "imageToolStripPolicy": "画像ツールポリシー",
+    "imageToolStripPolicyDescription": "Codex Responses リクエストで image_generation ツールを宣言できるか制御します。",
+    "imageToolStripNever": "削除しない",
+    "imageToolStripOnError": "エラー時に削除",
+    "imageToolStripAlways": "常に削除",
+    "websocket": "Responses WebSocket",
+    "websocketDescription": "通常は有効のままにします。上流 WebSocket の障害時は無効にして、クライアントを POST /v1/responses SSE に切り替えます。",
+    "workspace": "ChatGPT ワークスペース",
+    "workspaceDescription": "検証済みの OpenAI Token クレームに含まれるワークスペースだけを選択できます。",
+    "loginWithCli": "CLI OAuth",
+    "loginWithDevice": "Device Code",
+    "addCliAccount": "CLI OAuth を追加",
+    "addDeviceAccount": "Device Code を追加",
+    "selectAccountRequired": "OpenAI OAuth を ChatGPT アカウントに関連付けてください",
     "fastMode": "FAST モード",
     "fastModeDescription": "低遅延のため service_tier=\"priority\" を送信します。既定ではオフ——オンにすると ChatGPT のクォータがより速く消費されます。"
   },
@@ -1391,6 +1450,8 @@
     "quotaDispatchLimitPercentHint": "0 以外に設定すると、いずれかのリセット周期の使用率がこの割合に達した時点で router はこのプロバイダーを Market にディスパッチしません。"
   },
   "codexConfig": {
+    "generatedConfigPreviewHint": "この設定は上の auth.json、config.toml、モデルカタログ、モデルマッピングから生成されます。構造化フィールドから変更してください。",
+    "localRoutingToggle": "ローカルルートマッピングが必要",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex の auth.json 設定内容",
@@ -3079,6 +3140,7 @@
     },
     "confirmDeleteTitle": "Share を削除",
     "confirmDeleteMessage": "「{{name}}」を削除しますか？ 実行中の tunnel があれば先に停止します。",
+    "freeConfirm": "販売設定を無料に変更しますか？",
     "error": {
       "title": "Share の読み込みに失敗しました"
     },
@@ -3114,6 +3176,232 @@
       "copyCurl": "Curl をコピーしました"
     }
   },
+  "antigravityOauth": {
+    "authStatus": "Antigravity 認証",
+    "loginWithGoogle": "Google で Antigravity にログイン",
+    "loginRequired": "先に Antigravity アカウントへログインしてください",
+    "selectAccountRequired": "Antigravity OAuth を Antigravity アカウントに関連付けてください"
+  },
+  "claudeOauth": {
+    "localCallbackLogin": "ローカルコールバック",
+    "officialCallbackLogin": "公式リンク",
+    "callbackModeHint": "ローカルコールバックは 127.0.0.1 で認証を自動完了します。公式リンクでは platform.claude.com に表示された認証コードをここに貼り付けます。",
+    "remoteCallbackModeHint": "Web 画面からはローカルコールバックに接続できません。公式リンクを使用し、認証コードを貼り付けてください。",
+    "authStatus": "Claude サブスクリプション認証",
+    "loginWithClaude": "Claude.ai でログイン",
+    "webPasteHint": "1. 下のリンクを開き、claude.ai で認証します。\n2. platform.claude.com に認証コードが表示されます。\n3. コードを下の入力欄に貼り付けて送信すると、アカウントが追加されます。",
+    "pasteCodeLabel": "platform.claude.com の認証コード",
+    "pasteCodePlaceholder": "認証コードを貼り付け...",
+    "submitPasteCode": "送信",
+    "loginRequired": "先に Claude アカウントへログインしてください"
+  },
+  "cursorOauth": {
+    "authStatus": "Cursor OAuth 認証",
+    "loginWithCursor": "Cursor でログイン",
+    "importLocalServerTitle": "cc-switch-server を実行しているマシンから Cursor IDE または cursor-agent のログイン状態を読み取ります",
+    "importLocalServer": "ローカルの Cursor からインポート",
+    "loginRequired": "先に Cursor アカウントへログインしてください",
+    "selectAccountRequired": "Cursor OAuth を Cursor アカウントに関連付けてください"
+  },
+  "deepseekAccount": {
+    "authStatus": "DeepSeek アカウント",
+    "identifier": "メールアドレスまたは電話番号",
+    "identifierPlaceholder": "メールアドレスまたは電話番号を入力",
+    "password": "パスワード",
+    "addAccount": "アカウントを追加",
+    "loginRequired": "先に DeepSeek アカウントを追加してください",
+    "selectAccountRequired": "DeepSeek Account を DeepSeek アカウントに関連付けてください"
+  },
+  "geminiOauth": {
+    "authStatus": "Google Gemini 認証",
+    "loginWithGoogle": "Google でログイン",
+    "loginRequired": "先に Google Gemini アカウントへログインしてください",
+    "selectAccountRequired": "Google Official を Google Gemini アカウントに関連付けてください"
+  },
+  "grokOauth": {
+    "callbackRequired": "Grok のコールバック URL、クエリ文字列、またはコードを貼り付けてください",
+    "loginSuccess": "Grok アカウントにログインしました",
+    "authJsonRequired": "~/.grok/auth.json の内容を貼り付けてください",
+    "authJsonInvalid": "auth.json は有効な JSON ではありません",
+    "importSuccess": "Grok auth.json をインポートしました",
+    "authStatus": "Grok OAuth 認証",
+    "loginWithGrok": "Grok でログイン",
+    "importAuthJson": "auth.json をインポート",
+    "import": "インポート",
+    "callbackPlaceholder": "http://127.0.0.1:56121/callback?code=...&state=... またはコードのみ貼り付け",
+    "finishLogin": "ログインを完了",
+    "loginRequired": "先に Grok アカウントへログインしてください",
+    "selectAccountRequired": "Grok OAuth を Grok アカウントに関連付けてください"
+  },
+  "kiroOauth": {
+    "importSuccess": "Kiro 認証情報をインポートしました",
+    "credentialsInvalid": "credentials.json は有効な JSON ではありません",
+    "apiKeyInvalid": "Kiro API Key は ksk_ で始まる必要があります",
+    "authStatus": "Kiro OAuth 認証",
+    "loginWithKiro": "AWS Builder ID でログイン",
+    "loginWithGoogle": "Google でログイン",
+    "loginWithGithub": "GitHub でログイン",
+    "addGoogleAccount": "Google アカウントを追加",
+    "addGithubAccount": "GitHub アカウントを追加",
+    "importJson": "JSON をインポート",
+    "importApiKey": "API Key",
+    "importLocal": "ローカル Kiro",
+    "userCodeHint": "AWS Builder ID デバイスコード：",
+    "copyUserCode": "確認コードをコピー",
+    "loginRequired": "先に AWS Builder ID アカウントへログインしてください",
+    "selectAccountRequired": "Kiro OAuth を AWS Builder ID アカウントに関連付けてください"
+  },
+  "accountAuth": {
+    "accountCount": "{{count}} アカウント",
+    "notAuthenticated": "未認証",
+    "loggedInAccounts": "ログイン済みアカウント",
+    "defaultAccount": "デフォルト",
+    "selected": "選択済み",
+    "setAsDefault": "デフォルトに設定",
+    "removeAccount": "アカウントを削除",
+    "selectAccount": "アカウントを選択",
+    "selectAccountPlaceholder": "アカウントを選択",
+    "useDefaultAccount": "デフォルトアカウントを使用",
+    "addAnotherAccount": "別のアカウントを追加",
+    "waitingForBrowser": "下の認証リンクを開いてログインを完了してください...",
+    "openLinkHint": "認証リンクは自動では開きません。クリックするかブラウザーにコピーしてください：",
+    "copyLink": "リンクをコピー",
+    "openManually": "リンクを開く",
+    "logoutAll": "すべてのアカウントからログアウト",
+    "retry": "再試行"
+  },
+  "serverProviderForm": {
+    "categories": {
+      "official": "公式",
+      "cnOfficial": "中国公式",
+      "aggregator": "アグリゲーター",
+      "thirdParty": "サードパーティ",
+      "custom": "カスタム"
+    },
+    "validation": {
+      "nameRequired": "プロバイダー名を入力してください",
+      "accountRequired": "認証済みアカウントを選択してください",
+      "endpointInvalid": "有効な HTTP または HTTPS Endpoint を入力してください",
+      "modelRequired": "実際に使用する上流モデルを入力してください",
+      "awsRegionRequired": "AWS Region を入力してください",
+      "replacementRequired": "置き換える認証情報を入力してください",
+      "requiredCredentialCannotClear": "必須の認証情報は削除できません。置換を選択してください",
+      "customBindingMissing": "Custom Provider のプロトコル設定がありません",
+      "unsupportedBinding": "このプロトコルと認証方式の組み合わせはサポートされていません",
+      "authCredentialRequired": "認証情報を入力してください",
+      "authRequired": "この認証方式には認証情報が必要です",
+      "invalidHeader": "Header 名が無効です：{{name}}",
+      "managedHeader": "この Header はドライバーが管理します：{{name}}",
+      "duplicateHeader": "Header 名が重複しています：{{name}}",
+      "headerValueRequired": "Header {{name}} の値を入力してください",
+      "costMultiplierInvalid": "コスト倍率は 0 以上の数値で入力してください",
+      "quotaLimitInvalid": "ディスパッチ使用量上限は 1 から 100 の整数で入力してください"
+    },
+    "credentials": {
+      "title": "認証情報",
+      "apiToken": "API Key / Bearer Token",
+      "keep": "保持",
+      "replace": "置換",
+      "clear": "削除",
+      "newPlaceholder": "新しい認証情報を入力",
+      "placeholder": "認証情報を入力",
+      "loading": "設定済みの認証情報を読み込んでいます...",
+      "loadFailed": "設定済みの認証情報を読み込めませんでした。再試行するか、新しい値を入力してください。",
+      "loadFailedPlaceholder": "新しい認証情報を入力",
+      "willClear": "保存すると、この任意の認証情報は削除されます",
+      "willReplace": "保存すると、設定済みの認証情報が置き換えられます",
+      "configured": "設定済み",
+      "optionalMissing": "未設定（任意）",
+      "missing": "未設定"
+    },
+    "unsupportedAccountType": "サポートされていないアカウント種別：{{type}}",
+    "toasts": {
+      "applyBindingFirst": "他の設定を保存する前にプロトコルバインドをプレビューして適用してください",
+      "customUnavailable": "Custom Provider 設定を利用できません",
+      "cloneIdInvalid": "元の Provider と異なる新しい ID を入力してください",
+      "cloneNameRequired": "新しい Provider 名を入力してください",
+      "customCreated": "Custom Provider を作成しました",
+      "identityUpdated": "プロバイダー ID 設定を更新しました"
+    },
+    "identity": {
+      "stable": "安定版",
+      "experimental": "実験的",
+      "adoptTitle": "プロバイダー設定を採用",
+      "adoptMessage": "{{provider}} を {{profile}} に関連付けます。",
+      "cloneTitle": "Custom Provider として複製",
+      "cloneMessage": "{{name}}（{{id}}）を作成します。",
+      "upstreamProtocolLine": "上流プロトコル：{{protocol}}",
+      "authSchemeLine": "認証方式：{{scheme}}",
+      "rebindTitle": "Custom バインドを変更",
+      "adoptSection": "標準設定を採用",
+      "adoptPreview": "プレビューして採用",
+      "cloneSection": "Custom Provider として複製",
+      "cloneDescription": "現在の Provider を保持したまま、明示的なプロトコル ID を持つ設定を新規作成します。適用前に実行時の差分を確認できます。",
+      "newProviderId": "新しい Provider ID",
+      "newName": "新しい名前",
+      "clonePreview": "プレビューして作成",
+      "confirmTitle": "ID 変更を確認",
+      "apply": "適用"
+    },
+    "basic": {
+      "title": "基本情報",
+      "name": "名前",
+      "website": "Web サイト",
+      "notes": "メモ"
+    },
+    "account": {
+      "title": "認証アカウント"
+    },
+    "aws": {
+      "title": "AWS 認証情報"
+    },
+    "binding": {
+      "title": "プロトコルと認証",
+      "upstreamProtocol": "上流プロトコル",
+      "authScheme": "認証方式",
+      "credential": "認証情報",
+      "queryParameter": "Query パラメーター名",
+      "headerName": "Header 名",
+      "cancelChanges": "変更をキャンセル",
+      "previewApply": "バインドをプレビューして適用",
+      "change": "プロトコルバインドを変更",
+      "pendingHint": "プロトコル ID はまだ適用されていません。Endpoint、モデル、リクエスト設定を保存する前にバインドをプレビューして適用してください。"
+    },
+    "endpoint": {
+      "title": "API リクエスト先"
+    },
+    "model": {
+      "title": "モデルポリシー",
+      "upstreamModel": "実際の上流モデル",
+      "passthrough": "そのまま転送",
+      "passthroughHint": "リクエスト内のモデルを使用"
+    },
+    "headers": {
+      "title": "追加リクエスト Header",
+      "value": "Header 値",
+      "remove": "Header を削除",
+      "add": "Header を追加"
+    },
+    "codex": {
+      "title": "Codex 実行オプション",
+      "imageGeneration": "画像生成"
+    },
+    "usage": {
+      "title": "使用量とリクエスト",
+      "costMultiplier": "コスト倍率",
+      "pricingModel": "課金モデル",
+      "inherit": "グローバル設定を継承",
+      "request": "リクエストモデル",
+      "response": "レスポンスモデル",
+      "quotaLimit": "ディスパッチ使用量上限（%）",
+      "unlimited": "無制限",
+      "customUserAgent": "カスタム User-Agent"
+    },
+    "legacy": {
+      "title": "互換性ステータス",
+      "hint": "従来の Provider では表示情報のみ変更できます。実行時設定は固定されたままです。"
+    }
+  },
   "subscription": {
     "title": "サブスクリプションクォータ",
     "fiveHour": "5時間",
@@ -3127,6 +3415,7 @@
     "weeklyLimit": "週間",
     "monthly": "月間",
     "copilotPremium": "プレミアム",
+    "cursorCredits": "使用量",
     "kiroAgenticRequests": "Kiro Agentic Requests",
     "kiroEstimatedUsage": "推定使用量",
     "kiroResetsOn": "{{date}}にリセット",
@@ -3160,8 +3449,6 @@
   "terminal": {
     "title": "運用ターミナル",
     "nav": "ターミナル",
-    "backHome": "ホームに戻る",
-    "subtitle": "サーバー実行環境",
     "placeholderTitle": "運用ターミナルに接続中",
     "placeholderBody": "このページを離れても実行中のコマンドは停止しません。再入場で直近の出力を復元できます。",
     "authRequired": "運用ターミナルにはログインが必要です",

@@ -1,0 +1,138 @@
+{
+  "common": {
+    "copied": "コピーしました"
+  },
+  "providers": {
+    "addProvider": "プロバイダーを追加"
+  },
+  "provider": {
+    "share": {
+      "sectionTitle": "リモート Share",
+      "addPageBadge": "保存後に利用可能",
+      "enableShare": "リモート共有を有効化",
+      "addPagePlaceholder": "先に Provider を保存し、編集画面を開き直してリモート共有を設定してください。",
+      "stateActive": "Share は有効です",
+      "statePaused": "Share は一時停止中です",
+      "stateError": "Share エラー",
+      "stateNone": "Share は無効です",
+      "invalidNumber": "有効な数値を入力してください",
+      "invalidConfiguration": "リモート Share 設定を修正してから保存してください",
+      "sectionHint": "各 Provider は 1 つの Share に対応します。共有パラメーターはここで設定し、高度な運用設定は Router Console で管理します。",
+      "openRouterConsole": "Router Console を開く",
+      "disabledHint": "有効にするとリモート共有を設定して Share を作成できます。",
+      "routerSyncFailed": "Router との同期に失敗しました：{{error}}",
+      "routerSyncPending": "Router に同期中",
+      "ownerRequired": "先に Share 設定ページで Client Tunnel Owner のメールを設定してください"
+    },
+    "form": {
+      "gemini": {
+        "antigravityOauthTitle": "Antigravity OAuth 認証モード",
+        "antigravityOauthHint": "Antigravity OAuth は管理対象の Antigravity アカウントを使用するため、API Key は不要です。"
+      }
+    }
+  },
+  "share": {
+    "unsupportedApp": "{{app}} は Share に対応していません。Claude、Codex、Gemini のいずれかのタブに切り替えて作成してください。",
+    "validation": {
+      "invalidEmail": "メールアドレスが無効です"
+    },
+    "saleMarketKind": {
+      "title": "Market 種別",
+      "token": "Token Market",
+      "share": "Share Market"
+    },
+    "market": {
+      "allSelected": "すべての Market を選択済み"
+    },
+    "accountMarket": {
+      "title": "Share Market",
+      "select": "Share Market を選択",
+      "required": "Share Market を選択してください"
+    },
+    "permanent": "無期限",
+    "expiration": "有効期限",
+    "userLimit": {
+      "periodLifetime": "累計",
+      "periodDay": "日次",
+      "periodWeek": "週次",
+      "periodMonth": "暦月",
+      "title": "ユーザー制限",
+      "hint": "Share 全体の制限は常に適用され、各ユーザーには個別の制限も適用されます。",
+      "add": "ユーザーを追加",
+      "edit": "ユーザー制限を編集",
+      "period": "Token 期間"
+    },
+    "boundProviderHint": "このアプリのリクエストはバインド済み Provider を常に使用し、フェイルオーバーには参加しません。",
+    "manageInProviderHint": "共有設定を変更するには、バインド済み Provider の編集画面を開いてください。",
+    "sharedWithEmails": "Share To",
+    "emptyReadOnlyHint": "Share は Provider 編集画面の「リモート共有」で作成、管理します。",
+    "readOnlyOverviewHint": "これは読み取り専用の概要です。共有設定の変更はバインド済み Provider の編集画面で行ってください。",
+    "routerOwner": {
+      "signedInOwner": "Owner {{email}} としてログイン中。設定を編集できます",
+      "signedInReadOnly": "{{email}} としてログイン中。Owner {{owner}} のみ設定を編集できます",
+      "signInPrompt": "Share Owner のメールでログインすると設定を編集できます",
+      "sendCode": "コードを送信",
+      "codePlaceholder": "確認コード",
+      "verify": "確認",
+      "changeEmail": "メールを変更",
+      "codeSent": "確認コードを {{target}} に送信しました"
+    }
+  },
+  "codexConfig": {
+    "noCommonConfigToApply": "共通設定が空か、書き込み可能な値がありません"
+  },
+  "claudeDesktop": {
+    "route": {
+      "stopBlockedByTakeover": "別のアプリがプロキシテイクオーバーを使用しています。設定で該当アプリのテイクオーバーを無効にしてからローカルルートを停止してください。"
+    }
+  },
+  "proxy": {
+    "routing": {
+      "ready": "ルーティング済み",
+      "needsProvider": "要設定"
+    },
+    "server": {
+      "stopped": "プロキシサーバーを停止しました",
+      "stopFailed": "プロキシサーバーの停止に失敗しました"
+    }
+  },
+  "settings": {
+    "loadFailed": "設定を読み込めません。ページを再読み込みしてもう一度お試しください。",
+    "selectFileFailed": "ディレクトリの選択に失敗しました",
+    "authCenter": {
+      "serverDescription": "上流プロキシで使用する公式 OAuth アカウントを管理します。使用量の更新は現在有効な Provider にのみ適用されます。",
+      "claudeOauthDescription": "Claude 公式サブスクリプションアカウントを管理",
+      "grokOauthDescription": "Grok/xAI サブスクリプションアカウントを管理",
+      "kiroOauthDescription": "Kiro AWS Builder ID アカウントを管理",
+      "cursorOauthDescription": "Cursor サブスクリプションアカウントを管理",
+      "geminiOauthDescription": "Google Gemini アカウントを管理",
+      "antigravityOauthDescription": "Antigravity サブスクリプションアカウントを管理",
+      "deepseekAccountDescription": "DeepSeek アカウントを管理"
+    },
+    "serverConfigDir": {
+      "title": "Server 設定ディレクトリ",
+      "description": "providers、shares、ui-settings などの永続化ファイルを保存するディレクトリです。リッスンアドレスとポートはプロセス起動引数で指定します。"
+    },
+    "serverSecurity": {
+      "currentPasswordRequired": "現在のパスワードを入力してください"
+    },
+    "share": {
+      "health": {
+        "clientTunnel": {
+          "conflict": "サブドメインが競合しているため Router に未登録です",
+          "claimFailed": "Router への登録に失敗しました",
+          "unclaimed": "設定済みですが Router に未登録です",
+          "connecting": "登録済み。Tunnel に接続中です"
+        }
+      }
+    }
+  },
+  "usage": {
+    "unpriced": "価格未設定"
+  },
+  "notifications": {
+    "clearCurrentSuccess": "Provider を無効にしました",
+    "clearCurrentFailedTitle": "Provider を無効にできませんでした",
+    "clearCurrentFailed": "Provider を無効にできませんでした：{{error}}"
+  }
+}

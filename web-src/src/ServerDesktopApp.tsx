@@ -302,7 +302,7 @@ export default function ServerDesktopApp({
               </div>
             }
           >
-            <TerminalPage onBackHome={() => setCurrentView("providers")} />
+            <TerminalPage />
           </Suspense>
         );
       default:
@@ -325,6 +325,7 @@ export default function ServerDesktopApp({
                 >
                   <ProviderList
                     providers={providers}
+                    resources={data?.resources}
                     currentProviderId={currentProviderId}
                     appId={activeApp}
                     isLoading={isLoading}
@@ -514,10 +515,10 @@ export default function ServerDesktopApp({
 
       <ConfirmDialog
         isOpen={confirmAction !== null}
-        title={t("providers.deleteConfirmTitle", {
+        title={t("confirm.deleteProvider", {
           defaultValue: "Delete provider?",
         })}
-        message={t("providers.deleteConfirmMessage", {
+        message={t("confirm.deleteProviderMessage", {
           defaultValue: "This action cannot be undone.",
           name: confirmAction?.provider.name ?? "",
         })}

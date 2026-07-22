@@ -312,6 +312,19 @@ pub fn redact_provider(provider: &Provider) -> (Provider, CredentialSummary) {
     (provider, summary)
 }
 
+pub fn reveal_provider_credential(provider: &Provider, slot: &str) -> anyhow::Result<String> {
+    let (_, summary) = redact_provider(provider);
+    if !summary.slots.iter().any(|configured| configured == slot) {
+        anyhow::bail!("Provider credential slot is not configured: {slot}");
+    }
+
+    let value = serde_json::to_value(provider).context("serialize Provider credential source")?;
+    credential_value_at_slot(&value, slot)?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("Provider credential slot is not a string: {slot}"))
+}
+
 /// Splits a Provider into a committed redacted record and its credential slots.
 /// The returned slot values are still plaintext and must only be held while sealing
 /// or materializing one operation.
@@ -1277,6 +1290,28 @@ mod tests {
             .slots
             .iter()
             .any(|slot| slot.contains("http_headers")));
+    }
+
+    #[test]
+    fn reveals_only_configured_credential_slots() {
+        let provider = provider();
+
+        assert_eq!(
+            reveal_provider_credential(&provider, "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN")
+                .unwrap(),
+            "secret-anthropic"
+        );
+        assert_eq!(
+            reveal_provider_credential(
+                &provider,
+                "/settingsConfig/config/model_providers/demo/query_params/key"
+            )
+            .unwrap(),
+            "secret-query"
+        );
+
+        let error = reveal_provider_credential(&provider, "/name").unwrap_err();
+        assert!(error.to_string().contains("not configured"));
     }
 
     #[test]

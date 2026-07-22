@@ -359,10 +359,6 @@ pub fn openai_chat_response_to_anthropic(input: &Value) -> Result<Value, Transfo
         }
     }
 
-    if content.is_empty() {
-        return Err(TransformError::new("openai chat response content is empty"));
-    }
-
     Ok(json!({
         "id": input.get("id").and_then(Value::as_str).unwrap_or("chatcmpl"),
         "type": "message",
@@ -409,10 +405,6 @@ pub fn openai_responses_response_to_anthropic(input: &Value) -> Result<Value, Tr
             content.push(json!({"type": "text", "text": text}));
         }
     }
-    if content.is_empty() {
-        return Err(TransformError::new("openai responses output is empty"));
-    }
-
     Ok(json!({
         "id": input.get("id").and_then(Value::as_str).unwrap_or("resp"),
         "type": "message",
@@ -586,10 +578,6 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
         .iter()
         .map(gemini_part_to_anthropic)
         .collect::<Vec<_>>();
-    if content.is_empty() {
-        return Err(TransformError::new("gemini response content is empty"));
-    }
-
     Ok(json!({
         "id": input.get("responseId").and_then(Value::as_str).unwrap_or("gemini"),
         "type": "message",
@@ -729,6 +717,8 @@ pub fn openai_responses_stream_to_anthropic(input: &Value) -> Vec<StreamFrame> {
                     "role": "assistant",
                     "model": input.pointer("/response/model").and_then(Value::as_str).unwrap_or_default(),
                     "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
                     "usage": {"input_tokens": 0, "output_tokens": 0}
                 }
             }),
@@ -3949,6 +3939,41 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn anthropic_response_bridges_preserve_empty_content_as_an_array() {
+        let chat = openai_chat_response_to_anthropic(&json!({
+            "id": "chatcmpl-empty",
+            "model": "empty-model",
+            "choices": [{
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        let responses = openai_responses_response_to_anthropic(&json!({
+            "id": "resp-empty",
+            "model": "empty-model",
+            "status": "completed",
+            "output": []
+        }))
+        .unwrap();
+        let gemini = gemini_response_to_anthropic(&json!({
+            "responseId": "gem-empty",
+            "modelVersion": "empty-model",
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "STOP"
+            }]
+        }))
+        .unwrap();
+
+        for output in [chat, responses, gemini] {
+            assert_eq!(output["content"], json!([]));
+            assert_eq!(output["stop_reason"], json!("end_turn"));
+            assert_eq!(output["stop_sequence"], Value::Null);
+        }
     }
 
     #[test]

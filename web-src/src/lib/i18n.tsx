@@ -14,7 +14,12 @@ export type Language = "zh" | "zh-TW" | "en" | "ja";
 
 type TranslationValue = string | TranslationTree;
 type TranslationTree = { [key: string]: TranslationValue };
-type Variables = Record<string, string | number | boolean | null | undefined>;
+type Variables = Record<
+  string,
+  string | number | boolean | null | undefined
+> & {
+  defaultValue?: string;
+};
 
 interface I18nContextValue {
   language: Language;
@@ -74,7 +79,8 @@ const serverResources: Record<Language, TranslationTree> = {
         setupTitle: "初始化 Server",
         loginSubtitle: "使用密码、邮箱验证码或 API Token 登录。",
         loginSubtitlePasswordOnly: "使用 Web 密码登录。",
-        setupSubtitle: "设置 Owner 邮箱、路由节点、Client 子域名与管理员密码。Client 子域名初始化后不可修改。",
+        setupSubtitle:
+          "设置 Owner 邮箱、路由节点、Client 子域名与管理员密码。Client 子域名初始化后不可修改。",
         methodPassword: "密码",
         methodEmail: "邮箱验证码",
         methodApiToken: "API Token",
@@ -91,6 +97,8 @@ const serverResources: Record<Language, TranslationTree> = {
         generateSubdomainFailed: "随机生成子域名失败",
         routerUnreachableForSubdomain: "Router 不可达，无法随机生成子域名",
         subdomainUnchecked: "未能验证子域名是否可用，提交时可能冲突",
+        setupClaimPending:
+          "Router client 注册状态：{{status}}。请检查 Router 连接或稍后重试。",
         clientWeb: {
           loginTitle: "Client Web 登录",
           setupTitle: "设置 Web 密码",
@@ -250,7 +258,8 @@ const serverResources: Record<Language, TranslationTree> = {
         setupTitle: "初始化 Server",
         loginSubtitle: "使用密碼、信箱驗證碼或 API Token 登入。",
         loginSubtitlePasswordOnly: "使用 Web 密碼登入。",
-        setupSubtitle: "設定 Owner 信箱、Router、Client 子網域與管理員密碼。Client 子網域初始化後不可修改。",
+        setupSubtitle:
+          "設定 Owner 信箱、Router、Client 子網域與管理員密碼。Client 子網域初始化後不可修改。",
         methodPassword: "密碼",
         methodEmail: "信箱驗證碼",
         methodApiToken: "API Token",
@@ -267,6 +276,8 @@ const serverResources: Record<Language, TranslationTree> = {
         generateSubdomainFailed: "隨機生成子網域失敗",
         routerUnreachableForSubdomain: "Router 不可達，無法隨機生成子網域",
         subdomainUnchecked: "未能驗證子網域是否可用，提交時可能衝突",
+        setupClaimPending:
+          "Router client 註冊狀態：{{status}}。請檢查 Router 連線或稍後重試。",
         clientWeb: {
           loginTitle: "Client Web 登入",
           setupTitle: "設定 Web 密碼",
@@ -426,23 +437,29 @@ const serverResources: Record<Language, TranslationTree> = {
         setupTitle: "Initialize server",
         loginSubtitle: "Sign in with password, email code, or API token.",
         loginSubtitlePasswordOnly: "Sign in with your Web password.",
-        setupSubtitle: "Configure the owner email, router node, Client subdomain, and admin password. The Client subdomain cannot be changed after setup.",
+        setupSubtitle:
+          "Configure the owner email, router node, Client subdomain, and admin password. The Client subdomain cannot be changed after setup.",
         methodPassword: "Password",
         methodEmail: "Email code",
         methodApiToken: "API Token",
         apiToken: "API Token",
         apiTokenHint: "Use the API token from setup or settings rotation.",
-        emailLoginHint: "The router sends a code to the configured owner email.",
+        emailLoginHint:
+          "The router sends a code to the configured owner email.",
         codeSentTo: "Verification code sent to {{destination}}",
         resendIn: "Resend in {{seconds}}s",
         clientSubdomainAuto: "Auto if blank",
         clientSubdomainAvailable: "Subdomain is available",
-        clientSubdomainTaken: "Subdomain is taken; choose another or use random generate",
+        clientSubdomainTaken:
+          "Subdomain is taken; choose another or use random generate",
         generateSubdomain: "Random",
         subdomainGenerating: "Generating…",
         generateSubdomainFailed: "Failed to generate subdomain",
-        routerUnreachableForSubdomain: "Router is unreachable; random generate is disabled",
+        routerUnreachableForSubdomain:
+          "Router is unreachable; random generate is disabled",
         subdomainUnchecked: "Could not verify availability; setup may conflict",
+        setupClaimPending:
+          "Router client registration status: {{status}}. Check the Router connection or retry later.",
         clientWeb: {
           loginTitle: "Client Web Sign In",
           setupTitle: "Set Web Password",
@@ -489,7 +506,8 @@ const serverResources: Record<Language, TranslationTree> = {
         requests: "Requests",
         loading: "Loading shares",
         noShares: "No shares",
-        noSharesHint: "Create a share and bind a provider before exposing it through router.",
+        noSharesHint:
+          "Create a share and bind a provider before exposing it through router.",
       },
       usage: {
         title: "Usage",
@@ -600,29 +618,39 @@ const serverResources: Record<Language, TranslationTree> = {
         clientSubdomain: "Client サブドメイン",
         loginTitle: "管理コンソールにログイン",
         setupTitle: "Server を初期化",
-        loginSubtitle: "パスワード、メールコード、または API Token でログインします。",
+        loginSubtitle:
+          "パスワード、メールコード、または API Token でログインします。",
         loginSubtitlePasswordOnly: "Web パスワードでログインします。",
-        setupSubtitle: "Owner メール、Router、Client サブドメイン、管理者パスワードを設定します。Client サブドメインは初期設定後に変更できません。",
+        setupSubtitle:
+          "Owner メール、Router、Client サブドメイン、管理者パスワードを設定します。Client サブドメインは初期設定後に変更できません。",
         methodPassword: "パスワード",
         methodEmail: "メールコード",
         methodApiToken: "API Token",
         apiToken: "API Token",
-        apiTokenHint: "初期設定または設定ページで発行した API Token を使用します。",
-        emailLoginHint: "Router が設定済み Owner メールに認証コードを送信します。",
+        apiTokenHint:
+          "初期設定または設定ページで発行した API Token を使用します。",
+        emailLoginHint:
+          "Router が設定済み Owner メールに認証コードを送信します。",
         codeSentTo: "認証コードを {{destination}} に送信しました",
         resendIn: "{{seconds}} 秒後に再送できます",
         clientSubdomainAuto: "空欄で自動生成",
         clientSubdomainAvailable: "サブドメインは利用可能です",
-        clientSubdomainTaken: "サブドメインは使用中です。別の名前にするかランダム生成を使ってください",
+        clientSubdomainTaken:
+          "サブドメインは使用中です。別の名前にするかランダム生成を使ってください",
         generateSubdomain: "ランダム生成",
         subdomainGenerating: "生成中…",
         generateSubdomainFailed: "サブドメインのランダム生成に失敗しました",
-        routerUnreachableForSubdomain: "Router に到達できないためランダム生成は無効です",
-        subdomainUnchecked: "利用可否を確認できませんでした。初期化時に競合する可能性があります",
+        routerUnreachableForSubdomain:
+          "Router に到達できないためランダム生成は無効です",
+        subdomainUnchecked:
+          "利用可否を確認できませんでした。初期化時に競合する可能性があります",
+        setupClaimPending:
+          "Router client の登録状態：{{status}}。Router 接続を確認するか、後でもう一度お試しください。",
         clientWeb: {
           loginTitle: "Client Web ログイン",
           setupTitle: "Web パスワードを設定",
-          setupSubtitle: "初回アクセス時に Web 管理パスワードを設定してください。",
+          setupSubtitle:
+            "初回アクセス時に Web 管理パスワードを設定してください。",
           webPassword: "Web パスワード",
           setupPasswordPlaceholder: "Web パスワードを設定",
           setupAndLogin: "設定してログイン",
@@ -630,7 +658,8 @@ const serverResources: Record<Language, TranslationTree> = {
           verificationCode: "認証コード",
           sendCode: "コードを送信",
           verifyAndLogin: "確認してログイン",
-          unauthorizedCredential: "この認証情報では現在の client にアクセスできません",
+          unauthorizedCredential:
+            "この認証情報では現在の client にアクセスできません",
           codeSent: "認証コードを送信しました",
           loggedIn: "client にログインしました",
           loggedInWithToken: "API token で client にログインしました",
@@ -649,7 +678,8 @@ const serverResources: Record<Language, TranslationTree> = {
         diagnosticCombinations: "{{count}} 件の診断専用組み合わせ",
         loading: "プロバイダーを読み込み中",
         noProvidersForApp: "{{app}} プロバイダーはありません",
-        noProvidersHint: "server に表示されているマトリクスからプロバイダーを追加します。",
+        noProvidersHint:
+          "server に表示されているマトリクスからプロバイダーを追加します。",
       },
       shares: {
         title: "Share",
@@ -665,7 +695,8 @@ const serverResources: Record<Language, TranslationTree> = {
         requests: "リクエスト数",
         loading: "Share を読み込み中",
         noShares: "Share はありません",
-        noSharesHint: "Share を作成し、プロバイダーを紐付けてから router 経由で公開します。",
+        noSharesHint:
+          "Share を作成し、プロバイダーを紐付けてから router 経由で公開します。",
       },
       usage: {
         title: "使用量",
@@ -690,7 +721,8 @@ const serverResources: Record<Language, TranslationTree> = {
         loading: "アカウントを読み込み中",
         providerTypes: "{{count}} 件のプロバイダータイプ",
         noAccounts: "アカウントはありません",
-        noAccountsHint: "アカウントをインポートするか、制御付きログインフローを開始します。",
+        noAccountsHint:
+          "アカウントをインポートするか、制御付きログインフローを開始します。",
       },
       settings: {
         title: "設定",
@@ -778,15 +810,19 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Copied JSON": "已复制 JSON",
     "Copied code": "已复制验证码",
     "Copied URL": "已复制 URL",
-    "Clipboard unavailable; copy the visible value manually.": "剪贴板不可用，请手动复制可见内容。",
-    "Copy failed; copy the visible value manually.": "复制失败，请手动复制可见内容。",
-    "Copy this JSON when clipboard access is unavailable.": "剪贴板不可用时复制此 JSON。",
+    "Clipboard unavailable; copy the visible value manually.":
+      "剪贴板不可用，请手动复制可见内容。",
+    "Copy failed; copy the visible value manually.":
+      "复制失败，请手动复制可见内容。",
+    "Copy this JSON when clipboard access is unavailable.":
+      "剪贴板不可用时复制此 JSON。",
     "Create From Preset": "从预设创建",
     "Default Pricing": "默认定价",
     "Device Flow": "设备授权流程",
     "Direct config": "直接配置",
     "Execute token exchange": "执行 token 交换",
-    "Enter the upstream API key for direct config.": "输入直连配置使用的上游 API Key。",
+    "Enter the upstream API key for direct config.":
+      "输入直连配置使用的上游 API Key。",
     "Export Shares": "导出 Share",
     "Get API Key": "获取 API Key",
     "Hide API key": "隐藏 API Key",
@@ -802,18 +838,21 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Share Subdomain": "Share 子域名",
     "Save Subdomain": "保存子域名",
     "{{app}} Binding": "{{app}} 绑定",
-    "Authorize": "授权",
+    Authorize: "授权",
     "Shared emails": "共享邮箱",
     selected: "指定市场",
     "Owner handoff": "Owner 移交流程",
-    "Email verification is required before saving this share owner change.": "保存 Share Owner 变更前需要先完成邮箱验证。",
+    "Email verification is required before saving this share owner change.":
+      "保存 Share Owner 变更前需要先完成邮箱验证。",
     "current owner": "当前 owner",
     "new owner": "新 owner",
     "request code": "请求验证码",
     "verify email": "验证邮箱",
     "save share": "保存 Share",
-    "Paste an exported array or { shares } object.": "粘贴导出的数组或 { shares } 对象。",
-    "Paste an exported array or { providers } object.": "粘贴导出的数组或 { providers } 对象。",
+    "Paste an exported array or { shares } object.":
+      "粘贴导出的数组或 { shares } 对象。",
+    "Paste an exported array or { providers } object.":
+      "粘贴导出的数组或 { providers } 对象。",
     "{{count}} model templates": "{{count}} 个模型模板",
     "account imported": "账号已导入",
     "token request preview ready": "Token 请求预览已就绪",
@@ -849,12 +888,14 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Model Pricing": "模型定价",
     "Model and pricing config": "模型和定价配置",
     "Model catalog and mapping": "模型目录和映射",
-    "API key is optional when a managed account is selected.": "选择托管账号时 API Key 可留空。",
+    "API key is optional when a managed account is selected.":
+      "选择托管账号时 API Key 可留空。",
     "Catalog models": "模型目录",
     Monthly: "每月",
     Name: "名称",
     "no key": "无 Key",
-    "No banked reset credits in the imported snapshot.": "导入快照中没有 banked reset 额度。",
+    "No banked reset credits in the imported snapshot.":
+      "导入快照中没有 banked reset 额度。",
     "No Codex banked reset snapshot": "没有 Codex banked reset 快照",
     "No model stats": "没有模型统计",
     "No pricing models": "没有定价模型",
@@ -864,16 +905,19 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "No runtime snapshot": "没有运行时快照",
     "No share sync diagnostics": "没有 Share 同步诊断",
     "No usage trend data": "没有用量趋势数据",
-    "One provider template can derive Claude, Codex and Gemini providers.": "一个供应商模板可以派生 Claude、Codex 和 Gemini 供应商。",
+    "One provider template can derive Claude, Codex and Gemini providers.":
+      "一个供应商模板可以派生 Claude、Codex 和 Gemini 供应商。",
     "Open authorize URL": "打开授权 URL",
     "Open verification": "打开验证页面",
     "Select catalog model": "选择目录模型",
     "Show API key": "显示 API Key",
-    "Optional JSON stored on each derived provider.": "可选 JSON 会保存到每个派生供应商。",
+    "Optional JSON stored on each derived provider.":
+      "可选 JSON 会保存到每个派生供应商。",
     "Output /M": "输出 /M",
     "Output cost /M": "输出成本 /M",
     "Owner email": "Owner 邮箱",
-    "Preset defaults are loaded into the editable form before saving.": "保存前会把预设默认值载入可编辑表单。",
+    "Preset defaults are loaded into the editable form before saving.":
+      "保存前会把预设默认值载入可编辑表单。",
     "Provider-scoped JSON overrides.": "供应商级 JSON 覆盖项。",
     "Public market email": "公开市场邮箱",
     "Quota snapshot": "Quota 快照",
@@ -889,8 +933,10 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Select market": "选择市场",
     "Select provider": "选择供应商",
     "Share market": "Share 市场",
-    "Share must be paused before binding changes are accepted.": "必须先暂停 Share，才能修改绑定。",
-    "Share routes expose selected providers through router and market flows.": "Share 路由会通过 router 和市场流程暴露选定供应商。",
+    "Share must be paused before binding changes are accepted.":
+      "必须先暂停 Share，才能修改绑定。",
+    "Share routes expose selected providers through router and market flows.":
+      "Share 路由会通过 router 和市场流程暴露选定供应商。",
     "Start tunnel": "启动隧道",
     "Stop tunnel": "停止隧道",
     Subdomain: "子域名",
@@ -923,15 +969,19 @@ const phraseResources: Record<Language, Record<string, string>> = {
     yes: "是",
     "Provider type is not available for this app": "此应用不支持该供应商类型",
     "Switch check passed for server runtime": "Server 运行时切换检查通过",
-    "Fetched {{models}} models; merged {{merged}}": "已拉取 {{models}} 个模型；合并 {{merged}} 个",
+    "Fetched {{models}} models; merged {{merged}}":
+      "已拉取 {{models}} 个模型；合并 {{merged}} 个",
     "Created from preset {{preset}}": "已从预设 {{preset}} 创建",
     "Delete provider {{name}}?": "删除供应商 {{name}}？",
     "{{count}} recent requests": "最近 {{count}} 个请求",
     "backfilled {{count}} usage records": "已回填 {{count}} 条用量记录",
-    "saved {{model}}; backfilled {{count}}": "已保存 {{model}}；回填 {{count}} 条",
-    "applied {{model}}; backfilled {{count}}": "已应用 {{model}}；回填 {{count}} 条",
+    "saved {{model}}; backfilled {{count}}":
+      "已保存 {{model}}；回填 {{count}} 条",
+    "applied {{model}}; backfilled {{count}}":
+      "已应用 {{model}}；回填 {{count}} 条",
     "all default pricing models already exist": "所有默认定价模型已存在",
-    "applied {{count}} default pricing models; backfilled {{backfilled}}": "已应用 {{count}} 个默认定价模型；回填 {{backfilled}} 条",
+    "applied {{count}} default pricing models; backfilled {{backfilled}}":
+      "已应用 {{count}} 个默认定价模型；回填 {{backfilled}} 条",
     "Delete pricing for {{model}}?": "删除 {{model}} 的定价？",
     "deleted {{model}}": "已删除 {{model}}",
     "{{model}} was not found": "未找到 {{model}}",
@@ -942,15 +992,18 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "deleted {{name}}": "已删除 {{name}}",
     "{{name}} was not found": "未找到 {{name}}",
     "duplicated {{name}}; {{summary}}": "已复制 {{name}}；{{summary}}",
-    "exported {{count}} providers to clipboard": "已导出 {{count}} 个供应商到剪贴板",
+    "exported {{count}} providers to clipboard":
+      "已导出 {{count}} 个供应商到剪贴板",
     "exported {{count}} providers": "已导出 {{count}} 个供应商",
-    "synced {{synced}}; skipped {{skipped}}; removed {{removed}}": "已同步 {{synced}}；跳过 {{skipped}}；移除 {{removed}}",
+    "synced {{synced}}; skipped {{skipped}}; removed {{removed}}":
+      "已同步 {{synced}}；跳过 {{skipped}}；移除 {{removed}}",
     "providers array is required": "必须提供 providers 数组",
     "Delete share {{name}}?": "删除 Share {{name}}？",
     "share deleted": "Share 已删除",
     "share not found": "未找到 Share",
     "{{action}} ok": "{{action}} 成功",
-    "exported {{count}} shares to clipboard": "已导出 {{count}} 个 Share 到剪贴板",
+    "exported {{count}} shares to clipboard":
+      "已导出 {{count}} 个 Share 到剪贴板",
     "exported {{count}} shares": "已导出 {{count}} 个 Share",
     "imported {{count}} shares": "已导入 {{count}} 个 Share",
     "code sent to {{destination}}": "验证码已发送到 {{destination}}",
@@ -972,16 +1025,19 @@ const phraseResources: Record<Language, Record<string, string>> = {
     configured: "已配置",
     "proxy disabled": "代理已禁用",
     "backup created: {{id}}": "备份已创建：{{id}}",
-    "Restore backup {{id}}? Current stores will be backed up first.": "恢复备份 {{id}}？当前存储会先自动备份。",
+    "Restore backup {{id}}? Current stores will be backed up first.":
+      "恢复备份 {{id}}？当前存储会先自动备份。",
     "restored {{id}}; safety {{safety}}": "已恢复 {{id}}；安全备份 {{safety}}",
     "new API token generated": "新的 API token 已生成",
-    "code sent to {{destination}}; cooldown {{seconds}}s": "验证码已发送到 {{destination}}；冷却 {{seconds}} 秒",
+    "code sent to {{destination}}; cooldown {{seconds}}s":
+      "验证码已发送到 {{destination}}；冷却 {{seconds}} 秒",
     "email verified and local session updated": "邮箱已验证，本地会话已更新",
     "direct config": "直接配置",
     "config only": "仅配置",
     switch: "切换",
     "provider is required for binding": "绑定需要选择供应商",
-    "share requires at least one provider binding": "Share 至少需要一个供应商绑定",
+    "share requires at least one provider binding":
+      "Share 至少需要一个供应商绑定",
     "advanced provider JSON must be an object": "高级供应商 JSON 必须是对象",
     "expires at is invalid": "过期时间无效",
   },
@@ -1020,15 +1076,19 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Copied JSON": "已複製 JSON",
     "Copied code": "已複製驗證碼",
     "Copied URL": "已複製 URL",
-    "Clipboard unavailable; copy the visible value manually.": "剪貼簿不可用，請手動複製可見內容。",
-    "Copy failed; copy the visible value manually.": "複製失敗，請手動複製可見內容。",
-    "Copy this JSON when clipboard access is unavailable.": "剪貼簿不可用時複製此 JSON。",
+    "Clipboard unavailable; copy the visible value manually.":
+      "剪貼簿不可用，請手動複製可見內容。",
+    "Copy failed; copy the visible value manually.":
+      "複製失敗，請手動複製可見內容。",
+    "Copy this JSON when clipboard access is unavailable.":
+      "剪貼簿不可用時複製此 JSON。",
     "Create From Preset": "從預設建立",
     "Default Pricing": "預設定價",
     "Device Flow": "裝置授權流程",
     "Direct config": "直接設定",
     "Execute token exchange": "執行 token 交換",
-    "Enter the upstream API key for direct config.": "輸入直連設定使用的上游 API Key。",
+    "Enter the upstream API key for direct config.":
+      "輸入直連設定使用的上游 API Key。",
     "Export Shares": "匯出 Share",
     "Get API Key": "取得 API Key",
     "Hide API key": "隱藏 API Key",
@@ -1044,18 +1104,21 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Share Subdomain": "Share 子網域",
     "Save Subdomain": "儲存子網域",
     "{{app}} Binding": "{{app}} 綁定",
-    "Authorize": "授權",
+    Authorize: "授權",
     "Shared emails": "共享信箱",
     selected: "指定市場",
     "Owner handoff": "Owner 移交流程",
-    "Email verification is required before saving this share owner change.": "儲存 Share Owner 變更前需要先完成信箱驗證。",
+    "Email verification is required before saving this share owner change.":
+      "儲存 Share Owner 變更前需要先完成信箱驗證。",
     "current owner": "目前 owner",
     "new owner": "新 owner",
     "request code": "請求驗證碼",
     "verify email": "驗證信箱",
     "save share": "儲存 Share",
-    "Paste an exported array or { shares } object.": "貼上匯出的陣列或 { shares } 物件。",
-    "Paste an exported array or { providers } object.": "貼上匯出的陣列或 { providers } 物件。",
+    "Paste an exported array or { shares } object.":
+      "貼上匯出的陣列或 { shares } 物件。",
+    "Paste an exported array or { providers } object.":
+      "貼上匯出的陣列或 { providers } 物件。",
     "{{count}} model templates": "{{count}} 個模型模板",
     "account imported": "帳號已匯入",
     "token request preview ready": "Token 請求預覽已就緒",
@@ -1091,12 +1154,14 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Model Pricing": "模型定價",
     "Model and pricing config": "模型和定價設定",
     "Model catalog and mapping": "模型目錄和對應",
-    "API key is optional when a managed account is selected.": "選擇託管帳號時 API Key 可留空。",
+    "API key is optional when a managed account is selected.":
+      "選擇託管帳號時 API Key 可留空。",
     "Catalog models": "模型目錄",
     Monthly: "每月",
     Name: "名稱",
     "no key": "無 Key",
-    "No banked reset credits in the imported snapshot.": "匯入快照中沒有 banked reset 額度。",
+    "No banked reset credits in the imported snapshot.":
+      "匯入快照中沒有 banked reset 額度。",
     "No Codex banked reset snapshot": "沒有 Codex banked reset 快照",
     "No model stats": "沒有模型統計",
     "No pricing models": "沒有定價模型",
@@ -1106,16 +1171,19 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "No runtime snapshot": "沒有執行時快照",
     "No share sync diagnostics": "沒有 Share 同步診斷",
     "No usage trend data": "沒有用量趨勢資料",
-    "One provider template can derive Claude, Codex and Gemini providers.": "一個供應商模板可以派生 Claude、Codex 和 Gemini 供應商。",
+    "One provider template can derive Claude, Codex and Gemini providers.":
+      "一個供應商模板可以派生 Claude、Codex 和 Gemini 供應商。",
     "Open authorize URL": "開啟授權 URL",
     "Open verification": "開啟驗證頁",
     "Select catalog model": "選擇目錄模型",
     "Show API key": "顯示 API Key",
-    "Optional JSON stored on each derived provider.": "可選 JSON 會儲存到每個派生供應商。",
+    "Optional JSON stored on each derived provider.":
+      "可選 JSON 會儲存到每個派生供應商。",
     "Output /M": "輸出 /M",
     "Output cost /M": "輸出成本 /M",
     "Owner email": "Owner 信箱",
-    "Preset defaults are loaded into the editable form before saving.": "儲存前會將預設值載入可編輯表單。",
+    "Preset defaults are loaded into the editable form before saving.":
+      "儲存前會將預設值載入可編輯表單。",
     "Provider-scoped JSON overrides.": "供應商級 JSON 覆寫項。",
     "Public market email": "公開市場信箱",
     "Quota snapshot": "Quota 快照",
@@ -1131,8 +1199,10 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Select market": "選擇市場",
     "Select provider": "選擇供應商",
     "Share market": "Share 市場",
-    "Share must be paused before binding changes are accepted.": "必須先暫停 Share，才能修改綁定。",
-    "Share routes expose selected providers through router and market flows.": "Share 路由會透過 router 和市場流程暴露選定供應商。",
+    "Share must be paused before binding changes are accepted.":
+      "必須先暫停 Share，才能修改綁定。",
+    "Share routes expose selected providers through router and market flows.":
+      "Share 路由會透過 router 和市場流程暴露選定供應商。",
     "Start tunnel": "啟動隧道",
     "Stop tunnel": "停止隧道",
     Subdomain: "子網域",
@@ -1165,15 +1235,19 @@ const phraseResources: Record<Language, Record<string, string>> = {
     yes: "是",
     "Provider type is not available for this app": "此應用不支援該供應商類型",
     "Switch check passed for server runtime": "Server 執行時切換檢查通過",
-    "Fetched {{models}} models; merged {{merged}}": "已拉取 {{models}} 個模型；合併 {{merged}} 個",
+    "Fetched {{models}} models; merged {{merged}}":
+      "已拉取 {{models}} 個模型；合併 {{merged}} 個",
     "Created from preset {{preset}}": "已從預設 {{preset}} 建立",
     "Delete provider {{name}}?": "刪除供應商 {{name}}？",
     "{{count}} recent requests": "最近 {{count}} 個請求",
     "backfilled {{count}} usage records": "已回填 {{count}} 筆用量記錄",
-    "saved {{model}}; backfilled {{count}}": "已儲存 {{model}}；回填 {{count}} 筆",
-    "applied {{model}}; backfilled {{count}}": "已套用 {{model}}；回填 {{count}} 筆",
+    "saved {{model}}; backfilled {{count}}":
+      "已儲存 {{model}}；回填 {{count}} 筆",
+    "applied {{model}}; backfilled {{count}}":
+      "已套用 {{model}}；回填 {{count}} 筆",
     "all default pricing models already exist": "所有預設定價模型已存在",
-    "applied {{count}} default pricing models; backfilled {{backfilled}}": "已套用 {{count}} 個預設定價模型；回填 {{backfilled}} 筆",
+    "applied {{count}} default pricing models; backfilled {{backfilled}}":
+      "已套用 {{count}} 個預設定價模型；回填 {{backfilled}} 筆",
     "Delete pricing for {{model}}?": "刪除 {{model}} 的定價？",
     "deleted {{model}}": "已刪除 {{model}}",
     "{{model}} was not found": "未找到 {{model}}",
@@ -1184,15 +1258,18 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "deleted {{name}}": "已刪除 {{name}}",
     "{{name}} was not found": "未找到 {{name}}",
     "duplicated {{name}}; {{summary}}": "已複製 {{name}}；{{summary}}",
-    "exported {{count}} providers to clipboard": "已匯出 {{count}} 個供應商到剪貼簿",
+    "exported {{count}} providers to clipboard":
+      "已匯出 {{count}} 個供應商到剪貼簿",
     "exported {{count}} providers": "已匯出 {{count}} 個供應商",
-    "synced {{synced}}; skipped {{skipped}}; removed {{removed}}": "已同步 {{synced}}；略過 {{skipped}}；移除 {{removed}}",
+    "synced {{synced}}; skipped {{skipped}}; removed {{removed}}":
+      "已同步 {{synced}}；略過 {{skipped}}；移除 {{removed}}",
     "providers array is required": "必須提供 providers 陣列",
     "Delete share {{name}}?": "刪除 Share {{name}}？",
     "share deleted": "Share 已刪除",
     "share not found": "未找到 Share",
     "{{action}} ok": "{{action}} 成功",
-    "exported {{count}} shares to clipboard": "已匯出 {{count}} 個 Share 到剪貼簿",
+    "exported {{count}} shares to clipboard":
+      "已匯出 {{count}} 個 Share 到剪貼簿",
     "exported {{count}} shares": "已匯出 {{count}} 個 Share",
     "imported {{count}} shares": "已匯入 {{count}} 個 Share",
     "code sent to {{destination}}": "驗證碼已傳送到 {{destination}}",
@@ -1214,16 +1291,20 @@ const phraseResources: Record<Language, Record<string, string>> = {
     configured: "已設定",
     "proxy disabled": "代理已停用",
     "backup created: {{id}}": "備份已建立：{{id}}",
-    "Restore backup {{id}}? Current stores will be backed up first.": "恢復備份 {{id}}？目前儲存會先自動備份。",
+    "Restore backup {{id}}? Current stores will be backed up first.":
+      "恢復備份 {{id}}？目前儲存會先自動備份。",
     "restored {{id}}; safety {{safety}}": "已恢復 {{id}}；安全備份 {{safety}}",
     "new API token generated": "新的 API token 已產生",
-    "code sent to {{destination}}; cooldown {{seconds}}s": "驗證碼已傳送到 {{destination}}；冷卻 {{seconds}} 秒",
-    "email verified and local session updated": "信箱已驗證，本地工作階段已更新",
+    "code sent to {{destination}}; cooldown {{seconds}}s":
+      "驗證碼已傳送到 {{destination}}；冷卻 {{seconds}} 秒",
+    "email verified and local session updated":
+      "信箱已驗證，本地工作階段已更新",
     "direct config": "直接設定",
     "config only": "僅設定",
     switch: "切換",
     "provider is required for binding": "綁定需要選擇供應商",
-    "share requires at least one provider binding": "Share 至少需要一個供應商綁定",
+    "share requires at least one provider binding":
+      "Share 至少需要一個供應商綁定",
     "advanced provider JSON must be an object": "進階供應商 JSON 必須是物件",
     "expires at is invalid": "到期時間無效",
   },
@@ -1262,15 +1343,19 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Copied JSON": "JSON をコピーしました",
     "Copied code": "コードをコピーしました",
     "Copied URL": "URL をコピーしました",
-    "Clipboard unavailable; copy the visible value manually.": "クリップボードが使えません。表示されている値を手動でコピーしてください。",
-    "Copy failed; copy the visible value manually.": "コピーに失敗しました。表示されている値を手動でコピーしてください。",
-    "Copy this JSON when clipboard access is unavailable.": "クリップボードが使えない場合はこの JSON をコピーします。",
+    "Clipboard unavailable; copy the visible value manually.":
+      "クリップボードが使えません。表示されている値を手動でコピーしてください。",
+    "Copy failed; copy the visible value manually.":
+      "コピーに失敗しました。表示されている値を手動でコピーしてください。",
+    "Copy this JSON when clipboard access is unavailable.":
+      "クリップボードが使えない場合はこの JSON をコピーします。",
     "Create From Preset": "プリセットから作成",
     "Default Pricing": "デフォルト料金",
     "Device Flow": "デバイス認証フロー",
     "Direct config": "直接設定",
     "Execute token exchange": "token 交換を実行",
-    "Enter the upstream API key for direct config.": "直接設定で使う上流 API Key を入力します。",
+    "Enter the upstream API key for direct config.":
+      "直接設定で使う上流 API Key を入力します。",
     "Export Shares": "Share をエクスポート",
     "Get API Key": "API Key を取得",
     "Hide API key": "API Key を非表示",
@@ -1286,21 +1371,25 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Share Subdomain": "Share サブドメイン",
     "Save Subdomain": "サブドメインを保存",
     "{{app}} Binding": "{{app}} バインド",
-    "Authorize": "認可",
+    Authorize: "認可",
     "Shared emails": "共有メール",
     selected: "指定マーケット",
     "Owner handoff": "Owner 引き継ぎ",
-    "Email verification is required before saving this share owner change.": "Share Owner の変更を保存する前にメール確認が必要です。",
+    "Email verification is required before saving this share owner change.":
+      "Share Owner の変更を保存する前にメール確認が必要です。",
     "current owner": "現在の owner",
     "new owner": "新しい owner",
     "request code": "コードをリクエスト",
     "verify email": "メールを確認",
     "save share": "Share を保存",
-    "Paste an exported array or { shares } object.": "エクスポートした配列または { shares } オブジェクトを貼り付けます。",
-    "Paste an exported array or { providers } object.": "エクスポートした配列または { providers } オブジェクトを貼り付けます。",
+    "Paste an exported array or { shares } object.":
+      "エクスポートした配列または { shares } オブジェクトを貼り付けます。",
+    "Paste an exported array or { providers } object.":
+      "エクスポートした配列または { providers } オブジェクトを貼り付けます。",
     "{{count}} model templates": "{{count}} 件のモデルテンプレート",
     "account imported": "アカウントをインポートしました",
-    "token request preview ready": "Token リクエストプレビューの準備ができました",
+    "token request preview ready":
+      "Token リクエストプレビューの準備ができました",
     "no credential flag": "認証情報フラグなし",
     "Refresh plan": "更新プラン",
     "Quota result": "Quota 結果",
@@ -1333,13 +1422,16 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Model Pricing": "モデル料金",
     "Model and pricing config": "モデルと料金設定",
     "Model catalog and mapping": "モデルカタログとマッピング",
-    "API key is optional when a managed account is selected.": "管理アカウントを選択している場合、API Key は省略できます。",
+    "API key is optional when a managed account is selected.":
+      "管理アカウントを選択している場合、API Key は省略できます。",
     "Catalog models": "モデルカタログ",
     Monthly: "月次",
     Name: "名前",
     "no key": "キーなし",
-    "No banked reset credits in the imported snapshot.": "インポートしたスナップショットに banked reset クレジットはありません。",
-    "No Codex banked reset snapshot": "Codex banked reset スナップショットはありません",
+    "No banked reset credits in the imported snapshot.":
+      "インポートしたスナップショットに banked reset クレジットはありません。",
+    "No Codex banked reset snapshot":
+      "Codex banked reset スナップショットはありません",
     "No model stats": "モデル統計はありません",
     "No pricing models": "料金モデルはありません",
     "No provider limits": "プロバイダー上限はありません",
@@ -1348,16 +1440,19 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "No runtime snapshot": "ランタイムスナップショットはありません",
     "No share sync diagnostics": "Share 同期診断はありません",
     "No usage trend data": "使用量トレンドデータはありません",
-    "One provider template can derive Claude, Codex and Gemini providers.": "1 つのプロバイダーテンプレートから Claude、Codex、Gemini プロバイダーを派生できます。",
+    "One provider template can derive Claude, Codex and Gemini providers.":
+      "1 つのプロバイダーテンプレートから Claude、Codex、Gemini プロバイダーを派生できます。",
     "Open authorize URL": "認可 URL を開く",
     "Open verification": "確認ページを開く",
     "Select catalog model": "カタログモデルを選択",
     "Show API key": "API Key を表示",
-    "Optional JSON stored on each derived provider.": "任意の JSON は各派生プロバイダーに保存されます。",
+    "Optional JSON stored on each derived provider.":
+      "任意の JSON は各派生プロバイダーに保存されます。",
     "Output /M": "出力 /M",
     "Output cost /M": "出力コスト /M",
     "Owner email": "Owner メール",
-    "Preset defaults are loaded into the editable form before saving.": "保存前にプリセットのデフォルト値を編集フォームへ読み込みます。",
+    "Preset defaults are loaded into the editable form before saving.":
+      "保存前にプリセットのデフォルト値を編集フォームへ読み込みます。",
     "Provider-scoped JSON overrides.": "プロバイダー単位の JSON 上書きです。",
     "Public market email": "公開マーケットメール",
     "Quota snapshot": "Quota スナップショット",
@@ -1373,8 +1468,10 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Select market": "マーケットを選択",
     "Select provider": "プロバイダーを選択",
     "Share market": "Share マーケット",
-    "Share must be paused before binding changes are accepted.": "バインド変更には先に Share を一時停止する必要があります。",
-    "Share routes expose selected providers through router and market flows.": "Share ルートは選択したプロバイダーを router とマーケットフローに公開します。",
+    "Share must be paused before binding changes are accepted.":
+      "バインド変更には先に Share を一時停止する必要があります。",
+    "Share routes expose selected providers through router and market flows.":
+      "Share ルートは選択したプロバイダーを router とマーケットフローに公開します。",
     "Start tunnel": "トンネル開始",
     "Stop tunnel": "トンネル停止",
     Subdomain: "サブドメイン",
@@ -1405,36 +1502,49 @@ const phraseResources: Record<Language, Record<string, string>> = {
     unknown: "不明",
     warning: "警告",
     yes: "はい",
-    "Provider type is not available for this app": "このアプリではこのプロバイダータイプを利用できません",
-    "Switch check passed for server runtime": "Server ランタイムの切り替えチェックに成功しました",
-    "Fetched {{models}} models; merged {{merged}}": "{{models}} 件のモデルを取得し、{{merged}} 件をマージしました",
+    "Provider type is not available for this app":
+      "このアプリではこのプロバイダータイプを利用できません",
+    "Switch check passed for server runtime":
+      "Server ランタイムの切り替えチェックに成功しました",
+    "Fetched {{models}} models; merged {{merged}}":
+      "{{models}} 件のモデルを取得し、{{merged}} 件をマージしました",
     "Created from preset {{preset}}": "プリセット {{preset}} から作成しました",
     "Delete provider {{name}}?": "プロバイダー {{name}} を削除しますか？",
     "{{count}} recent requests": "最近 {{count}} 件のリクエスト",
-    "backfilled {{count}} usage records": "{{count}} 件の使用量レコードをバックフィルしました",
-    "saved {{model}}; backfilled {{count}}": "{{model}} を保存し、{{count}} 件をバックフィルしました",
-    "applied {{model}}; backfilled {{count}}": "{{model}} を適用し、{{count}} 件をバックフィルしました",
-    "all default pricing models already exist": "すべてのデフォルト料金モデルは既に存在します",
-    "applied {{count}} default pricing models; backfilled {{backfilled}}": "{{count}} 個のデフォルト料金モデルを適用し、{{backfilled}} 件をバックフィルしました",
+    "backfilled {{count}} usage records":
+      "{{count}} 件の使用量レコードをバックフィルしました",
+    "saved {{model}}; backfilled {{count}}":
+      "{{model}} を保存し、{{count}} 件をバックフィルしました",
+    "applied {{model}}; backfilled {{count}}":
+      "{{model}} を適用し、{{count}} 件をバックフィルしました",
+    "all default pricing models already exist":
+      "すべてのデフォルト料金モデルは既に存在します",
+    "applied {{count}} default pricing models; backfilled {{backfilled}}":
+      "{{count}} 個のデフォルト料金モデルを適用し、{{backfilled}} 件をバックフィルしました",
     "Delete pricing for {{model}}?": "{{model}} の料金を削除しますか？",
     "deleted {{model}}": "{{model}} を削除しました",
     "{{model}} was not found": "{{model}} が見つかりません",
     "model id is required": "モデル ID は必須です",
     "display name is required": "表示名は必須です",
-    "prices must be non-negative decimals": "料金は 0 以上の小数である必要があります",
+    "prices must be non-negative decimals":
+      "料金は 0 以上の小数である必要があります",
     "saved {{name}}": "{{name}} を保存しました",
     "deleted {{name}}": "{{name}} を削除しました",
     "{{name}} was not found": "{{name}} が見つかりません",
     "duplicated {{name}}; {{summary}}": "{{name}} を複製しました；{{summary}}",
-    "exported {{count}} providers to clipboard": "{{count}} 件のプロバイダーをクリップボードへエクスポートしました",
-    "exported {{count}} providers": "{{count}} 件のプロバイダーをエクスポートしました",
-    "synced {{synced}}; skipped {{skipped}}; removed {{removed}}": "同期 {{synced}}；スキップ {{skipped}}；削除 {{removed}}",
+    "exported {{count}} providers to clipboard":
+      "{{count}} 件のプロバイダーをクリップボードへエクスポートしました",
+    "exported {{count}} providers":
+      "{{count}} 件のプロバイダーをエクスポートしました",
+    "synced {{synced}}; skipped {{skipped}}; removed {{removed}}":
+      "同期 {{synced}}；スキップ {{skipped}}；削除 {{removed}}",
     "providers array is required": "providers 配列が必要です",
     "Delete share {{name}}?": "Share {{name}} を削除しますか？",
     "share deleted": "Share を削除しました",
     "share not found": "Share が見つかりません",
     "{{action}} ok": "{{action}} 成功",
-    "exported {{count}} shares to clipboard": "{{count}} 件の Share をクリップボードへエクスポートしました",
+    "exported {{count}} shares to clipboard":
+      "{{count}} 件の Share をクリップボードへエクスポートしました",
     "exported {{count}} shares": "{{count}} 件の Share をエクスポートしました",
     "imported {{count}} shares": "{{count}} 件の Share をインポートしました",
     "code sent to {{destination}}": "{{destination}} にコードを送信しました",
@@ -1448,25 +1558,33 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "refreshed {{account}}": "{{account}} を更新しました",
     "quota refreshed": "Quota を更新しました",
     "quota snapshot": "Quota スナップショット",
-    "account import requires credential material": "アカウントのインポートには認証情報が必要です",
+    "account import requires credential material":
+      "アカウントのインポートには認証情報が必要です",
     "{{account}} imported": "{{account}} をインポートしました",
     "router saved: {{value}}": "Router を保存しました：{{value}}",
-    "client tunnel saved: {{value}}": "Client トンネルを保存しました：{{value}}",
+    "client tunnel saved: {{value}}":
+      "Client トンネルを保存しました：{{value}}",
     "proxy saved: {{value}}": "プロキシを保存しました：{{value}}",
     configured: "設定済み",
     "proxy disabled": "プロキシを無効にしました",
     "backup created: {{id}}": "バックアップを作成しました：{{id}}",
-    "Restore backup {{id}}? Current stores will be backed up first.": "バックアップ {{id}} を復元しますか？現在のストアは先にバックアップされます。",
-    "restored {{id}}; safety {{safety}}": "{{id}} を復元しました；安全バックアップ {{safety}}",
+    "Restore backup {{id}}? Current stores will be backed up first.":
+      "バックアップ {{id}} を復元しますか？現在のストアは先にバックアップされます。",
+    "restored {{id}}; safety {{safety}}":
+      "{{id}} を復元しました；安全バックアップ {{safety}}",
     "new API token generated": "新しい API token を生成しました",
-    "code sent to {{destination}}; cooldown {{seconds}}s": "{{destination}} にコードを送信しました；クールダウン {{seconds}} 秒",
-    "email verified and local session updated": "メールを確認し、ローカルセッションを更新しました",
+    "code sent to {{destination}}; cooldown {{seconds}}s":
+      "{{destination}} にコードを送信しました；クールダウン {{seconds}} 秒",
+    "email verified and local session updated":
+      "メールを確認し、ローカルセッションを更新しました",
     "direct config": "直接設定",
     "config only": "設定のみ",
     switch: "切り替え",
     "provider is required for binding": "バインドにはプロバイダーが必要です",
-    "share requires at least one provider binding": "Share には少なくとも 1 つのプロバイダーバインドが必要です",
-    "advanced provider JSON must be an object": "高度なプロバイダー JSON はオブジェクトである必要があります",
+    "share requires at least one provider binding":
+      "Share には少なくとも 1 つのプロバイダーバインドが必要です",
+    "advanced provider JSON must be an object":
+      "高度なプロバイダー JSON はオブジェクトである必要があります",
     "expires at is invalid": "期限日時が無効です",
   },
 };
@@ -1795,7 +1913,9 @@ const wordResources: Record<Exclude<Language, "en">, Record<string, string>> = {
 const I18nContext = createContext<I18nContextValue | null>(null);
 
 export function I18nProvider({ children }: { children: ReactNode }) {
-  const [language, setLanguageState] = useState<Language>(() => getInitialLanguage());
+  const [language, setLanguageState] = useState<Language>(() =>
+    getInitialLanguage(),
+  );
 
   const setLanguage = useCallback((next: Language) => {
     setLanguageState(next);
@@ -1836,18 +1956,30 @@ export function useI18n() {
   return value;
 }
 
-function translate(language: Language, key: string, variables?: Variables): string {
-  if (i18n.exists(key)) {
-    return i18n.t(key, variables as Record<string, unknown>);
+function translate(
+  language: Language,
+  key: string,
+  variables?: Variables,
+): string {
+  if (i18n.exists(key, { lng: language })) {
+    return i18n.t(key, {
+      ...variables,
+      lng: language,
+    } as Record<string, unknown>);
   }
   const template =
     lookup(serverResources[language], key) ??
     lookup(serverResources.en, key) ??
+    variables?.defaultValue ??
     key;
   return interpolate(template, variables);
 }
 
-function translateText(language: Language, text: string, variables?: Variables): string {
+function translateText(
+  language: Language,
+  text: string,
+  variables?: Variables,
+): string {
   if (language === "en") return interpolate(text, variables);
   const template =
     phraseResources[language]?.[text] ??
@@ -1858,7 +1990,8 @@ function translateText(language: Language, text: string, variables?: Variables):
 }
 
 function composeText(language: Language, text: string): string | undefined {
-  if (language === "en" || !/^[A-Za-z0-9 /._%+-]+$/.test(text)) return undefined;
+  if (language === "en" || !/^[A-Za-z0-9 /._%+-]+$/.test(text))
+    return undefined;
   const words = wordResources[language];
   const translated = text
     .split(/(\s+|\/|-)/)
@@ -1867,7 +2000,8 @@ function composeText(language: Language, text: string): string | undefined {
       if (/^\d+$|^%$|^M$/.test(part)) return part;
       const suffix = part.match(/^(.+?)([,:;()]+)$/);
       if (suffix) {
-        const base = words[suffix[1]] ?? words[toTitleCase(suffix[1])] ?? suffix[1];
+        const base =
+          words[suffix[1]] ?? words[toTitleCase(suffix[1])] ?? suffix[1];
         return `${base}${suffix[2]}`;
       }
       return words[part] ?? words[toTitleCase(part)] ?? part;
@@ -1879,7 +2013,9 @@ function composeText(language: Language, text: string): string | undefined {
 }
 
 function toTitleCase(value: string): string {
-  return value ? `${value.slice(0, 1).toUpperCase()}${value.slice(1).toLowerCase()}` : value;
+  return value
+    ? `${value.slice(0, 1).toUpperCase()}${value.slice(1).toLowerCase()}`
+    : value;
 }
 
 function lookup(tree: TranslationTree, key: string): string | undefined {
@@ -1902,7 +2038,9 @@ function interpolate(template: string, variables?: Variables): string {
 function getInitialLanguage(): Language {
   if (typeof window !== "undefined") {
     try {
-      const stored = normalizeLanguage(window.localStorage.getItem(LANGUAGE_KEY));
+      const stored = normalizeLanguage(
+        window.localStorage.getItem(LANGUAGE_KEY),
+      );
       if (stored) return stored;
     } catch (error) {
       console.warn("[i18n] Failed to read stored language preference", error);
@@ -1923,10 +2061,19 @@ function getInitialLanguage(): Language {
 function normalizeLanguage(value?: string | null): Language | null {
   const language = value?.toLowerCase();
   if (!language) return null;
-  if (language === "zh-tw" || language.startsWith("zh-hk") || language.startsWith("zh-mo") || language.startsWith("zh-hant")) {
+  if (
+    language === "zh-tw" ||
+    language.startsWith("zh-hk") ||
+    language.startsWith("zh-mo") ||
+    language.startsWith("zh-hant")
+  ) {
     return "zh-TW";
   }
-  if (language === "zh" || language.startsWith("zh-cn") || language.startsWith("zh-hans")) {
+  if (
+    language === "zh" ||
+    language.startsWith("zh-cn") ||
+    language.startsWith("zh-hans")
+  ) {
     return "zh";
   }
   if (language.startsWith("ja")) return "ja";

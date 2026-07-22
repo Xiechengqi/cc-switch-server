@@ -750,10 +750,14 @@ const fn initial_auth_identity_generation() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AccountAuthIdentitySnapshot {
     provider_type: ProviderType,
-    email: Option<String>,
-    auth_shape: u8,
-    scopes: Vec<String>,
-    principal_markers: BTreeMap<String, String>,
+    principal: Option<AccountPrincipal>,
+    fallback_email: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccountPrincipal {
+    kind: &'static str,
+    value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -792,7 +796,7 @@ fn advance_account_generations(previous: &Account, current: &mut Account) {
 
     current.auth_identity_generation = previous.auth_identity_generation.max(1);
     current.token_refresh_generation = previous.token_refresh_generation;
-    if previous_identity != current_identity {
+    if account_auth_identity_changed(&previous_identity, &current_identity) {
         current.auth_identity_generation = current.auth_identity_generation.saturating_add(1);
     }
     if previous_token != current_token {
@@ -801,79 +805,111 @@ fn advance_account_generations(previous: &Account, current: &mut Account) {
 }
 
 fn account_auth_identity_snapshot(account: &Account) -> AccountAuthIdentitySnapshot {
-    let mut scopes = account
-        .scopes
-        .iter()
-        .map(|scope| scope.trim())
-        .filter(|scope| !scope.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    scopes.sort();
-    scopes.dedup();
-
-    let mut principal_markers = BTreeMap::new();
-    collect_principal_markers("profile", account.profile.as_ref(), &mut principal_markers);
-    collect_principal_markers("raw", account.raw.as_ref(), &mut principal_markers);
-    if account.provider_type == ProviderType::CodexOAuth {
-        if let Some(workspace_id) = effective_codex_workspace_id(account) {
-            principal_markers.insert("codexWorkspaceId".to_string(), workspace_id);
-        }
-    }
-
-    let has_oauth = [
-        &account.access_token,
-        &account.refresh_token,
-        &account.id_token,
-    ]
-    .into_iter()
-    .any(|value| normalized_secret(value.as_deref()).is_some());
-    let has_api_key = normalized_secret(account.api_key.as_deref()).is_some();
-    let has_header_auth = account
-        .extra_headers
-        .values()
-        .any(|value| !value.trim().is_empty());
-    let auth_shape =
-        u8::from(has_oauth) | (u8::from(has_api_key) << 1) | (u8::from(has_header_auth) << 2);
-
     AccountAuthIdentitySnapshot {
         provider_type: account.provider_type,
-        email: account
-            .email
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_ascii_lowercase),
-        auth_shape,
-        scopes,
-        principal_markers,
+        principal: strongest_account_principal(account),
+        fallback_email: normalized_identity_email(account.email.as_deref()),
     }
 }
 
-fn collect_principal_markers(
-    source: &str,
-    value: Option<&Value>,
-    markers: &mut BTreeMap<String, String>,
-) {
-    let Some(value) = value else {
-        return;
-    };
-    for pointer in [
-        "/sub",
-        "/userId",
-        "/user_id",
-        "/accountId",
-        "/account_id",
-        "/organizationId",
-        "/organization_id",
-        "/profileArn",
-        "/login",
-        "/username",
-    ] {
-        let Some(marker) = value.pointer(pointer).and_then(identity_marker_value) else {
-            continue;
-        };
-        markers.insert(format!("{source}{pointer}"), marker);
+fn account_auth_identity_changed(
+    previous: &AccountAuthIdentitySnapshot,
+    current: &AccountAuthIdentitySnapshot,
+) -> bool {
+    if previous.provider_type != current.provider_type {
+        return true;
     }
+    match (&previous.principal, &current.principal) {
+        (Some(previous), Some(current)) => previous != current,
+        (None, None) => previous.fallback_email != current.fallback_email,
+        (None, Some(_)) => matches!(
+            (&previous.fallback_email, &current.fallback_email),
+            (Some(previous), Some(current)) if previous != current
+        ),
+        (Some(_), None) => true,
+    }
+}
+
+fn strongest_account_principal(account: &Account) -> Option<AccountPrincipal> {
+    if account.provider_type == ProviderType::ClaudeOAuth {
+        const CLAUDE_ACCOUNT_UUID_POINTERS: &[&str] = &[
+            "/accountUUID",
+            "/account_uuid",
+            "/account/uuid",
+            "/oauth_account/account_uuid",
+            "/token/account/uuid",
+            "/token/accountUUID",
+            "/profile/accountUUID",
+            "/profile/account_uuid",
+            "/profileRaw/accountUUID",
+            "/profileRaw/account_uuid",
+            "/profileRaw/account/uuid",
+            "/raw/account/uuid",
+        ];
+        if let Some(value) = account_principal_value(account, CLAUDE_ACCOUNT_UUID_POINTERS) {
+            return Some(AccountPrincipal {
+                kind: "claude_account_uuid",
+                value,
+            });
+        }
+    }
+
+    const PRINCIPAL_FIELDS: &[(&str, &[&str])] = &[
+        ("subject", &["/sub"]),
+        ("user_id", &["/userId", "/user_id"]),
+        ("account_id", &["/accountId", "/account_id"]),
+        ("profile_arn", &["/profileArn"]),
+        ("login", &["/login"]),
+        ("username", &["/username"]),
+        (
+            "organization_id",
+            &[
+                "/organizationId",
+                "/organization_id",
+                "/organizationUUID",
+                "/organization_uuid",
+                "/organization/uuid",
+            ],
+        ),
+    ];
+    for (kind, pointers) in PRINCIPAL_FIELDS {
+        if let Some(value) = account_principal_value(account, pointers) {
+            if account.provider_type == ProviderType::ClaudeOAuth
+                && *kind == "account_id"
+                && normalized_identity_email(account.email.as_deref())
+                    .is_some_and(|email| email.eq_ignore_ascii_case(&value))
+            {
+                continue;
+            }
+            return Some(AccountPrincipal { kind, value });
+        }
+    }
+    if account.provider_type == ProviderType::CodexOAuth {
+        if let Some(value) = effective_codex_workspace_id(account) {
+            return Some(AccountPrincipal {
+                kind: "codex_workspace_id",
+                value,
+            });
+        }
+    }
+    None
+}
+
+fn account_principal_value(account: &Account, pointers: &[&str]) -> Option<String> {
+    let sources = [account.profile.as_ref(), account.raw.as_ref()];
+    pointers.iter().find_map(|pointer| {
+        sources
+            .iter()
+            .filter_map(|source| *source)
+            .find_map(|source| source.pointer(pointer).and_then(identity_marker_value))
+    })
+}
+
+fn normalized_identity_email(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 fn identity_marker_value(value: &Value) -> Option<String> {
@@ -1546,6 +1582,7 @@ mod tests {
         input.access_token = Some("access-1".to_string());
         input.refresh_token = Some("refresh-1".to_string());
         input.scopes = vec!["openid".to_string(), "profile".to_string()];
+        input.profile = Some(json!({"sub": "principal-1", "plan": "free"}));
         let created = store.upsert(input);
         assert_eq!(created.auth_identity_generation, 1);
         assert_eq!(created.token_refresh_generation, 1);
@@ -1576,22 +1613,180 @@ mod tests {
         assert_eq!(observed.auth_identity_generation, 1);
         assert_eq!(observed.token_refresh_generation, 2);
 
-        let changed_scope = store
+        let enriched = store
             .mark_refresh_success(
                 "generation-account",
                 AccountRefreshUpdate {
                     scopes: Some(vec!["openid".to_string(), "email".to_string()]),
+                    email: Some("OWNER@EXAMPLE.COM".to_string()),
+                    profile: Some(json!({
+                        "sub": "principal-1",
+                        "plan": "pro",
+                        "displayName": "Owner"
+                    })),
                     ..Default::default()
                 },
             )
             .unwrap();
-        assert_eq!(changed_scope.auth_identity_generation, 2);
-        assert_eq!(changed_scope.token_refresh_generation, 2);
+        assert_eq!(enriched.auth_identity_generation, 1);
+        assert_eq!(enriched.token_refresh_generation, 2);
+
+        let changed_principal = store
+            .mark_refresh_success(
+                "generation-account",
+                AccountRefreshUpdate {
+                    profile: Some(json!({"sub": "principal-2", "plan": "pro"})),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed_principal.auth_identity_generation, 2);
+        assert_eq!(changed_principal.token_refresh_generation, 2);
 
         let persisted = serde_json::to_value(&store).unwrap();
         let reloaded: AccountStore = serde_json::from_value(persisted).unwrap();
         assert_eq!(reloaded.accounts[0].auth_identity_generation, 2);
         assert_eq!(reloaded.accounts[0].token_refresh_generation, 2);
+    }
+
+    #[test]
+    fn account_identity_uses_email_only_without_a_stable_principal() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("email-fallback-account".to_string());
+        input.email = Some("Owner@Example.COM".to_string());
+        input.profile = Some(json!({"plan": "pro"}));
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+
+        let same_email = store
+            .mark_refresh_success(
+                "email-fallback-account",
+                AccountRefreshUpdate {
+                    email: Some(" owner@example.com ".to_string()),
+                    profile: Some(json!({"plan": "max", "displayName": "Owner"})),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(same_email.auth_identity_generation, 1);
+
+        let different_email = store
+            .mark_refresh_success(
+                "email-fallback-account",
+                AccountRefreshUpdate {
+                    email: Some("other@example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(different_email.auth_identity_generation, 2);
+    }
+
+    #[test]
+    fn account_identity_is_stable_when_principal_moves_between_snapshots() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("principal-source-account".to_string());
+        input.profile = Some(json!({"userId": "user-123"}));
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+
+        let moved = store
+            .mark_refresh_success(
+                "principal-source-account",
+                AccountRefreshUpdate {
+                    profile: Some(json!({"plan": "pro"})),
+                    raw: Some(json!({"user_id": "user-123"})),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(moved.auth_identity_generation, 1);
+    }
+
+    #[test]
+    fn claude_identity_prefers_account_uuid_and_detects_replacement() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("claude-principal-account".to_string());
+        input.email = Some("owner@example.com".to_string());
+        input.profile = Some(json!({
+            "accountId": "owner@example.com",
+            "accountUUID": "claude-account-1"
+        }));
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+
+        let enriched = store
+            .mark_refresh_success(
+                "claude-principal-account",
+                AccountRefreshUpdate {
+                    email: Some("OWNER@EXAMPLE.COM".to_string()),
+                    profile: Some(json!({
+                        "accountId": "owner@example.com",
+                        "accountUUID": "claude-account-1",
+                        "plan": "max"
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(enriched.auth_identity_generation, 1);
+
+        let replaced = store
+            .mark_refresh_success(
+                "claude-principal-account",
+                AccountRefreshUpdate {
+                    profile: Some(json!({
+                        "accountId": "owner@example.com",
+                        "accountUUID": "claude-account-2"
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(replaced.auth_identity_generation, 2);
+    }
+
+    #[test]
+    fn claude_stable_principal_enrichment_does_not_stale_email_binding() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("claude-bootstrap-account".to_string());
+        input.email = Some("owner@example.com".to_string());
+        input.profile = Some(json!({"plan": "pro"}));
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+
+        let bootstrapped = store
+            .mark_refresh_success(
+                "claude-bootstrap-account",
+                AccountRefreshUpdate {
+                    email: Some("owner@example.com".to_string()),
+                    profile: Some(json!({
+                        "accountUUID": "claude-account-1",
+                        "plan": "pro"
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(bootstrapped.auth_identity_generation, 1);
+
+        let replaced = store
+            .mark_refresh_success(
+                "claude-bootstrap-account",
+                AccountRefreshUpdate {
+                    raw: Some(json!({
+                        "account": {"uuid": "claude-account-2"}
+                    })),
+                    profile: Some(json!({"plan": "pro"})),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(replaced.auth_identity_generation, 2);
     }
 
     #[test]

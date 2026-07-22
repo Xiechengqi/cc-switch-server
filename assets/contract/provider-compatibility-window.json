@@ -17,11 +17,11 @@
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "404b7d46f1d49c05a0bb5447e476ffe09060668945a65793f2915e7853f25e54"
+      "sha256": "930edaa4c4b8bf2243e3beb0a38dcb893129c9fa33dd96555ade07f70e429cdc"
     },
     {
       "path": "src/domain/providers/credentials.rs",
-      "sha256": "abf26766620d5ce9f5818cd72270911752e0f42a7b655947f2c11ce63aa99fda"
+      "sha256": "c684df94d39dee1f818a020b6bb35428d590cf9f1096cc311283914d0e1f1b02"
     },
     {
       "path": "src/domain/providers/model.rs",

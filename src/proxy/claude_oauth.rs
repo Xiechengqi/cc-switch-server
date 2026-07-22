@@ -199,11 +199,6 @@ fn claude_cli_headers(
     let mut headers = vec![
         ("user-agent", claude_cli_user_agent()),
         ("x-app", "cli".to_string()),
-        (
-            "anthropic-dangerous-direct-browser-access",
-            "true".to_string(),
-        ),
-        ("sec-fetch-mode", "cors".to_string()),
         ("x-stainless-lang", "js".to_string()),
         (
             "x-stainless-package-version",
@@ -229,17 +224,27 @@ fn claude_cli_headers(
 }
 
 fn ensure_claude_oauth_beta_query(url: &str) -> String {
-    let (base, query) = split_endpoint_and_query(url);
-    match query {
-        Some(query) if !query.is_empty() => {
-            if query.split('&').any(|part| part == "beta=true") {
-                url.to_string()
-            } else {
-                format!("{base}?beta=true&{query}")
-            }
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        let (base, query) = split_endpoint_and_query(url);
+        return match query {
+            Some(query) if !query.is_empty() => format!("{base}?beta=true&{query}"),
+            _ => format!("{base}?beta=true"),
+        };
+    };
+    let retained = parsed
+        .query_pairs()
+        .filter(|(name, _)| name != "beta")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    parsed.set_query(None);
+    {
+        let mut query = parsed.query_pairs_mut();
+        query.append_pair("beta", "true");
+        for (name, value) in retained {
+            query.append_pair(&name, &value);
         }
-        _ => format!("{base}?beta=true"),
     }
+    parsed.to_string()
 }
 
 fn split_endpoint_and_query(url: &str) -> (&str, Option<&str>) {
@@ -723,9 +728,9 @@ fn build_anthropic_beta_value(
     }
 
     let client_betas = headers
-        .get("anthropic-beta")
-        .and_then(|value| value.to_str().ok())
-        .into_iter()
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
         .flat_map(|beta| {
             beta.split(',')
                 .map(str::trim)
@@ -801,7 +806,14 @@ fn build_anthropic_beta_value(
 fn is_request_shape_beta(beta: &str) -> bool {
     matches!(
         beta,
-        CONTEXT_1M_BETA | EFFORT_BETA | EXTENDED_CACHE_TTL_BETA | TOKEN_COUNTING_BETA
+        INTERLEAVED_THINKING_BETA
+            | FINE_GRAINED_TOOL_STREAMING_BETA
+            | COMPUTER_USE_BETA
+            | CONTEXT_MANAGEMENT_BETA
+            | CONTEXT_1M_BETA
+            | EFFORT_BETA
+            | EXTENDED_CACHE_TTL_BETA
+            | TOKEN_COUNTING_BETA
     )
 }
 
@@ -812,6 +824,10 @@ fn beta_allowed_for_request(
     is_count_tokens: bool,
 ) -> bool {
     match beta {
+        INTERLEAVED_THINKING_BETA => body.is_some_and(body_has_thinking),
+        FINE_GRAINED_TOOL_STREAMING_BETA => body.is_some_and(body_has_streaming_tools),
+        COMPUTER_USE_BETA => body.is_some_and(body_has_computer_use_tool),
+        CONTEXT_MANAGEMENT_BETA => body.is_some_and(body_has_context_management),
         CONTEXT_1M_BETA => context_1m_requested,
         EFFORT_BETA => body.is_some_and(body_has_effort),
         EXTENDED_CACHE_TTL_BETA => body.is_some_and(body_has_extended_cache_ttl),
@@ -854,15 +870,7 @@ fn take_internal_anthropic_betas(body: &mut Value) -> Vec<String> {
 }
 
 fn is_known_safe_client_beta(beta: &str) -> bool {
-    matches!(
-        beta,
-        CLAUDE_CODE_BETA
-            | CLAUDE_OAUTH_BETA
-            | INTERLEAVED_THINKING_BETA
-            | FINE_GRAINED_TOOL_STREAMING_BETA
-            | COMPUTER_USE_BETA
-            | CONTEXT_MANAGEMENT_BETA
-    ) || KNOWN_SAFE_CLIENT_BETAS.contains(&beta)
+    matches!(beta, CLAUDE_CODE_BETA | CLAUDE_OAUTH_BETA) || KNOWN_SAFE_CLIENT_BETAS.contains(&beta)
 }
 
 fn push_beta(betas: &mut Vec<String>, beta: &str) {
@@ -1147,6 +1155,12 @@ mod tests {
             ensure_claude_oauth_beta_query("https://api.anthropic.com/v1/messages?foo=bar"),
             "https://api.anthropic.com/v1/messages?beta=true&foo=bar"
         );
+        assert_eq!(
+            ensure_claude_oauth_beta_query(
+                "https://api.anthropic.com/v1/messages?beta=false&foo=bar&beta=true"
+            ),
+            "https://api.anthropic.com/v1/messages?beta=true&foo=bar"
+        );
     }
 
     #[test]
@@ -1337,6 +1351,45 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_beta_for_claude_oauth_merges_repeated_header_fields() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        headers.append(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static("unknown-beta,token-efficient-tools-2025-02-19"),
+        );
+
+        let beta = build_anthropic_beta_value(&headers, None, &[], false, true, false);
+
+        assert!(beta.contains("prompt-caching-2024-07-31"));
+        assert!(beta.contains("token-efficient-tools-2025-02-19"));
+        assert!(!beta.contains("unknown-beta"));
+    }
+
+    #[test]
+    fn anthropic_beta_for_claude_oauth_rejects_shape_betas_without_matching_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static(
+                "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,computer-use-2024-10-22,context-management-2025-06-27,context-1m-2025-08-07,effort-2025-11-24,extended-cache-ttl-2025-04-11,token-counting-2024-11-01",
+            ),
+        );
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [],
+            "stream": false
+        });
+
+        let beta = build_anthropic_beta_value(&headers, Some(&body), &[], false, true, false);
+
+        assert_eq!(beta, "claude-code-20250219,oauth-2025-04-20");
+    }
+
+    #[test]
     fn anthropic_beta_non_oauth_path_preserves_client_markers() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1475,6 +1528,10 @@ mod tests {
             .headers
             .iter()
             .any(|(name, value)| *name == "x-claude-code-session-id" && value == session_id));
+        assert!(!contract.headers.iter().any(|(name, _)| matches!(
+            *name,
+            "anthropic-dangerous-direct-browser-access" | "sec-fetch-mode"
+        )));
         assert!(value
             .pointer("/metadata/user_id")
             .and_then(Value::as_str)

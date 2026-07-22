@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ArrowLeft, Loader2, Square } from "lucide-react";
+import { Loader2, Square } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -16,10 +16,6 @@ import {
   type ServerSentEvent,
 } from "@/lib/sse";
 
-export interface TerminalPageProps {
-  onBackHome: () => void;
-}
-
 type ConnState = "connecting" | "replaying" | "live" | "closed" | "error";
 
 type TerminalMessage = {
@@ -33,6 +29,16 @@ const MAX_FONT = 18;
 const TARGET_COLS = 100;
 const INPUT_BATCH_MS = 12;
 const RESIZE_DEBOUNCE_MS = 100;
+
+const STATUS_CLASS_NAME: Record<ConnState, string> = {
+  connecting:
+    "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  replaying:
+    "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  live: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  closed: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300",
+  error: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300",
+};
 
 function encodeBytes(data: string | Uint8Array): string {
   const bytes =
@@ -74,7 +80,10 @@ function readableError(error: unknown, fallback: string): string {
   const message = error.message.trim();
   if (message.startsWith("{")) {
     try {
-      const payload = JSON.parse(message) as { error?: string; message?: string };
+      const payload = JSON.parse(message) as {
+        error?: string;
+        message?: string;
+      };
       return payload.error || payload.message || fallback;
     } catch {
       return message;
@@ -83,7 +92,7 @@ function readableError(error: unknown, fallback: string): string {
   return message;
 }
 
-export default function TerminalPage({ onBackHome }: TerminalPageProps) {
+export default function TerminalPage() {
   const { t } = useTranslation();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -334,18 +343,15 @@ export default function TerminalPage({ onBackHome }: TerminalPageProps) {
       )}
     >
       <div className="flex shrink-0 flex-wrap items-center gap-2">
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={onBackHome}
-          className="gap-1.5 rounded-lg"
+        <span
+          className={cn(
+            "inline-flex h-7 items-center rounded-md border px-2.5 text-xs font-medium",
+            STATUS_CLASS_NAME[connState],
+          )}
         >
-          <ArrowLeft className="h-4 w-4" />
-          {t("terminal.backHome")}
-        </Button>
-        <div className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
-          {t("terminal.subtitle")} · {statusLabel}
-        </div>
+          {statusLabel}
+        </span>
+        <div className="min-w-0 flex-1" />
         <Button
           variant="outline"
           size="sm"

@@ -9,6 +9,7 @@ import type {
 import type { Provider } from "@/types";
 import { authApi, type AppId } from "@/lib/api";
 import type { ManagedAuthProvider, ManagedAuthStatus } from "@/lib/api";
+import type { ProviderResource } from "@/lib/api/providers";
 import { PROVIDER_TYPES } from "@/config/constants";
 import { cn } from "@/lib/utils";
 import { ProviderActions } from "@/components/providers/ProviderActions";
@@ -43,6 +44,7 @@ import { getOauthQuotaRefreshIntervalMinutes } from "@/lib/query/oauthQuotaRefre
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { isShareableApp } from "@/hooks/useProviderShare";
 import { useToggleProviderShare } from "@/hooks/useToggleProviderShare";
+import { providerResourceSupportsOperation } from "@/server/providerOperations";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import {
   isProviderShareDeleteConfirmSkipped,
@@ -57,6 +59,7 @@ interface DragHandleProps {
 
 interface ProviderCardProps {
   provider: Provider;
+  resource?: ProviderResource;
   isCurrent: boolean;
   appId: AppId;
   isInConfig?: boolean; // OpenCode: 是否已添加到 opencode.json
@@ -210,6 +213,7 @@ function useManagedOauthAccountLogin(
 
 export function ProviderCard({
   provider,
+  resource,
   isCurrent,
   appId,
   isInConfig = true,
@@ -237,6 +241,12 @@ export function ProviderCard({
   onSetAsDefault,
 }: ProviderCardProps) {
   const { t } = useTranslation();
+  const canTestLink =
+    providerResourceSupportsOperation(resource, "connectivity") ??
+    canTestLinkProvider(provider, appId);
+  const canTestModel =
+    providerResourceSupportsOperation(resource, "test") ??
+    canTestModelProvider(provider, appId);
 
   // OMO and OMO Slim share the same card behavior
   const isAnyOmo = isOmo || isOmoSlim;
@@ -316,9 +326,8 @@ export function ProviderCard({
   const supportsOfficialSubscription =
     isOfficial && ["claude", "codex", "gemini"].includes(appId);
   const { data: settingsData } = useSettingsQuery();
-  const accountQuotaRefreshIntervalMinutes = getOauthQuotaRefreshIntervalMinutes(
-    settingsData,
-  );
+  const accountQuotaRefreshIntervalMinutes =
+    getOauthQuotaRefreshIntervalMinutes(settingsData);
   const isHermesReadOnly =
     appId === "hermes" && isHermesReadOnlyProvider(provider.settingsConfig);
 
@@ -342,8 +351,7 @@ export function ProviderCard({
         ? false
         : isCurrent;
 
-  const shouldUseGreen =
-    !isAnyOmo && isProxyTakeover && isActiveProvider;
+  const shouldUseGreen = !isAnyOmo && isProxyTakeover && isActiveProvider;
   const shouldUseViolet = canManageShare && isSharing;
   const showInUseTag = isActiveProvider;
 
@@ -549,7 +557,9 @@ export function ProviderCard({
                 inline={true}
                 isCurrent={isCurrent}
               />
-            ) : isOfficial && supportsOfficialSubscription && !isManagedOauth ? (
+            ) : isOfficial &&
+              supportsOfficialSubscription &&
+              !isManagedOauth ? (
               <SubscriptionQuotaFooter
                 appId={appId}
                 inline={true}
@@ -574,12 +584,12 @@ export function ProviderCard({
               onEdit={() => onEdit(provider)}
               onDuplicate={() => onDuplicate(provider)}
               onTestLink={
-                onTestLink && canTestLinkProvider(provider, appId)
+                onTestLink && canTestLink
                   ? () => onTestLink(provider)
                   : undefined
               }
               onTestModel={
-                onTestModel && canTestModelProvider(provider, appId)
+                onTestModel && canTestModel
                   ? () => onTestModel(provider)
                   : undefined
               }

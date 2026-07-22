@@ -244,6 +244,8 @@ impl ResponsesAnthropicState {
                     "role": "assistant",
                     "model": input.pointer("/response/model").and_then(Value::as_str).unwrap_or_default(),
                     "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
                     "usage": {"input_tokens": 0, "output_tokens": 0}
                 }
             }),
@@ -406,7 +408,12 @@ impl ResponsesAnthropicState {
     }
 
     fn complete(&mut self, input: &Value) -> Vec<StreamFrame> {
-        let mut frames = self.close_open_blocks();
+        let mut frames = if self.text_block.is_none() && self.tools.is_empty() {
+            self.ensure_text_block()
+        } else {
+            Vec::new()
+        };
+        frames.extend(self.close_open_blocks());
         let response = input.get("response").unwrap_or(input);
         let stop_reason = if self.saw_tool {
             "tool_use"
@@ -582,7 +589,10 @@ impl ChatAnthropicState {
                     "id": input.get("id").and_then(Value::as_str).unwrap_or("chatcmpl"),
                     "type": "message", "role": "assistant",
                     "model": input.get("model").and_then(Value::as_str).unwrap_or_default(),
-                    "content": [], "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
                 }
             }),
         )]
@@ -590,6 +600,14 @@ impl ChatAnthropicState {
 
     fn finish(&mut self, input: &Value) -> Vec<StreamFrame> {
         let mut frames = Vec::new();
+        if self.text_block.is_none() && self.tools.is_empty() {
+            let index = self.allocate_index();
+            self.text_block = Some(BlockState { index, open: true });
+            frames.push(StreamFrame::event(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}}),
+            ));
+        }
         if let Some(block) = self.text_block.as_mut().filter(|block| block.open) {
             block.open = false;
             frames.push(content_block_stop(block.index));
@@ -743,6 +761,52 @@ mod tests {
         assert!(packed.is_empty());
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].payload_json()["type"], json!("content_block_stop"));
+    }
+
+    #[test]
+    fn empty_anthropic_stream_emits_a_balanced_text_block_and_null_start_state() {
+        let mut responses = ResponsesAnthropicState::default();
+        let start = responses.transform(&json!({
+            "type": "response.created",
+            "response": {"id": "resp-empty", "model": "empty-model"}
+        }));
+        let done = responses.transform(&json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"output_tokens": 0}}
+        }));
+
+        assert_eq!(
+            start[0].payload_json()["message"]["stop_reason"],
+            Value::Null
+        );
+        assert_eq!(
+            start[0].payload_json()["message"]["stop_sequence"],
+            Value::Null
+        );
+        assert_eq!(done[0].payload_json()["type"], json!("content_block_start"));
+        assert_eq!(done[0].payload_json()["content_block"]["text"], json!(""));
+        assert_eq!(done[1].payload_json()["type"], json!("content_block_stop"));
+        assert_eq!(
+            done.last().unwrap().payload_json()["type"],
+            json!("message_stop")
+        );
+
+        let mut chat = ChatAnthropicState::default();
+        let frames = chat.transform(&json!({
+            "id": "chatcmpl-empty",
+            "model": "empty-model",
+            "choices": [{"delta": {}, "finish_reason": "stop"}]
+        }));
+        assert_eq!(
+            frames[0].payload_json()["message"]["stop_reason"],
+            Value::Null
+        );
+        assert!(frames
+            .iter()
+            .any(|frame| frame.payload_json()["type"] == "content_block_start"));
+        assert!(frames
+            .iter()
+            .any(|frame| frame.payload_json()["type"] == "content_block_stop"));
     }
 
     #[test]

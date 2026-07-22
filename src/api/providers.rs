@@ -613,62 +613,71 @@ pub(in crate::api) async fn test_provider_inner(
     }
 
     if query.network.unwrap_or(false) {
-        if let crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
-            account_id,
-            expected_provider_type,
-            ..
-        } = &execution.plan.auth_ref
-        {
+        if let Some((provider_type, account_id)) = execution.managed_account_target() {
             state
-                .refresh_managed_account_if_needed(*expected_provider_type, Some(account_id))
+                .refresh_managed_account_if_needed(provider_type, account_id)
                 .await
                 .map_err(map_managed_account_refresh_error)?;
         }
     }
     let accounts = state.accounts_snapshot().await;
     let body = provider_test_body(stored.app, stored, Some(&model), requested_stream);
-    let mut adapter_request = adapter
-        .transform_request_for_route(Bytes::from(body), stored, route, gemini_path.as_deref())
-        .map_err(ApiError::proxy)?;
-    execution
-        .enforce_model_policy(&mut adapter_request)
-        .map_err(ApiError::proxy)?;
-    execution
-        .finalize_request(&mut adapter_request)
-        .map_err(ApiError::proxy)?;
-    let mut endpoint = execution
-        .resolve_endpoint(route, gemini_path, &adapter_request)
-        .map_err(ApiError::proxy)?;
-    let mut target_headers = adapter
-        .build_headers(stored.app, stored, &accounts)
-        .map_err(ApiError::proxy)?
-        .into_iter()
-        .map(|(name, value)| (name.to_string(), value))
-        .collect::<Vec<_>>();
-    target_headers.extend(
-        adapter_request
-            .upstream_headers
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.clone())),
-    );
-    execution
-        .apply_test_forward_contract(
-            route,
-            &mut adapter_request,
-            &mut endpoint,
-            &mut target_headers,
+    let (adapter_request, endpoint, target_headers) = if execution
+        .driver_is("oauth.claude_messages")
+    {
+        let prepared = execution
+            .prepare_claude_request(Bytes::from(body), route, &HeaderMap::new(), &accounts, None)
+            .map_err(ApiError::proxy)?;
+        (
+            prepared.adapter_request,
+            prepared.endpoint,
+            prepared.headers,
         )
-        .map_err(ApiError::proxy)?;
-    let materialized_auth = execution
-        .materialize_auth(&accounts)
-        .map_err(ApiError::proxy)?;
-    execution
-        .apply_auth(
-            &mut target_headers,
-            &mut endpoint,
-            materialized_auth.as_ref(),
-        )
-        .map_err(ApiError::proxy)?;
+    } else {
+        let mut adapter_request = adapter
+            .transform_request_for_route(Bytes::from(body), stored, route, gemini_path.as_deref())
+            .map_err(ApiError::proxy)?;
+        execution
+            .enforce_model_policy(&mut adapter_request)
+            .map_err(ApiError::proxy)?;
+        execution
+            .finalize_request(&mut adapter_request)
+            .map_err(ApiError::proxy)?;
+        let mut endpoint = execution
+            .resolve_endpoint(route, gemini_path, &adapter_request)
+            .map_err(ApiError::proxy)?;
+        let mut target_headers = adapter
+            .build_headers(stored.app, stored, &accounts)
+            .map_err(ApiError::proxy)?
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect::<Vec<_>>();
+        target_headers.extend(
+            adapter_request
+                .upstream_headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone())),
+        );
+        execution
+            .apply_test_forward_contract(
+                route,
+                &mut adapter_request,
+                &mut endpoint,
+                &mut target_headers,
+            )
+            .map_err(ApiError::proxy)?;
+        let materialized_auth = execution
+            .materialize_auth(&accounts)
+            .map_err(ApiError::proxy)?;
+        execution
+            .apply_auth(
+                &mut target_headers,
+                &mut endpoint,
+                materialized_auth.as_ref(),
+            )
+            .map_err(ApiError::proxy)?;
+        (adapter_request, endpoint, target_headers)
+    };
     let stream = adapter_request.stream_requested || requested_stream;
     let mut network_status_code = None;
     let mut network_latency_ms = None;

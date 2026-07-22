@@ -29,8 +29,15 @@
     "formatSuccess": "Formatted successfully",
     "formatError": "Format failed: {{error}}",
     "copy": "Copy",
+    "copied": "Copied",
+    "undo": "Undo",
     "view": "View",
+    "show": "Show",
+    "hide": "Hide",
     "back": "Back",
+    "continue": "Continue",
+    "retry": "Retry",
+    "logout": "Sign out",
     "refresh": "Refresh",
     "refreshing": "Refreshing...",
     "import": "Import",
@@ -100,6 +107,9 @@
     "windowClose": "Close window"
   },
   "provider": {
+    "testLinkUnavailable": "This provider has no custom endpoint to test. Use a model test to verify the account and model.",
+    "configJsonPreview": "Configuration JSON preview",
+    "advancedConfigJson": "Advanced configuration JSON",
     "connectivityCheck": "Connectivity check",
     "refreshProviderInfo": "Refresh provider info",
     "quotaNeverUpdated": "Never updated",
@@ -138,6 +148,13 @@
       "officialPricePercentPlaceholder": "Leave empty to use Token Market pricing",
       "officialPricePercentHint": "Enter an integer from 1 to 100.",
       "officialPricePercentInvalid": "Model pricing must be an integer from 1 to 100."
+    },
+    "unsavedChanges": {
+      "title": "Discard unsaved changes?",
+      "addMessage": "This provider configuration has not been saved. Closing it will discard these changes.",
+      "editMessage": "This provider or remote share configuration has not been saved. Closing it will discard these changes.",
+      "discard": "Discard changes",
+      "keepEditing": "Keep editing"
     },
     "inUse": "In Use",
     "clickToClearCurrent": "Click to disable",
@@ -1187,6 +1204,12 @@
     "openReleaseNotesFailed": "Failed to open release notes:"
   },
   "providerForm": {
+    "providerKeyStatusLoading": "Provider identifier status is still loading. Try again shortly.",
+    "singleUpstreamModelRequired": "Enter the actual upstream model",
+    "generatedConfigPreviewHint": "This configuration is generated from the structured fields above. Change model mapping, endpoint, and authentication through those fields.",
+    "singleModelMappingSummary": "All client model requests are forwarded to the actual upstream model below.",
+    "singleUpstreamModelLabel": "Actual upstream model",
+    "singleUpstreamModelPlaceholder": "e.g. composer-2.5",
     "supplierName": "Provider Name",
     "supplierNameRequired": "Provider Name *",
     "supplierNamePlaceholder": "e.g., Anthropic Official",
@@ -1409,6 +1432,23 @@
     "logoutAll": "Logout all accounts",
     "retry": "Retry",
     "copyCode": "Copy code",
+    "cliUnavailableInRemoteWeb": "The localhost callback is unavailable in the remote Web interface. Use Device Code instead.",
+    "imageGeneration": "Image generation",
+    "imageGenerationDescription": "Enable OpenAI-compatible /v1/images/generations through the ChatGPT Codex backend.",
+    "imageToolStripPolicy": "Image tool policy",
+    "imageToolStripPolicyDescription": "Control whether Codex Responses requests may declare image_generation tools.",
+    "imageToolStripNever": "Never strip",
+    "imageToolStripOnError": "On error",
+    "imageToolStripAlways": "Always strip",
+    "websocket": "Responses WebSocket",
+    "websocketDescription": "Keep enabled normally. Disable it to force clients onto POST /v1/responses SSE during an upstream WebSocket incident.",
+    "workspace": "ChatGPT Workspace",
+    "workspaceDescription": "Only workspaces present in the verified OpenAI token claims can be selected.",
+    "loginWithCli": "CLI OAuth",
+    "loginWithDevice": "Device Code",
+    "addCliAccount": "Add CLI OAuth account",
+    "addDeviceAccount": "Add Device Code account",
+    "selectAccountRequired": "OpenAI OAuth must be bound to a ChatGPT account",
     "fastMode": "FAST mode",
     "fastModeDescription": "Send service_tier=\"priority\" for lower latency. Off by default — enabling it consumes your ChatGPT quota at a higher rate."
   },
@@ -1485,6 +1525,8 @@
     "quotaDispatchLimitPercentHint": "When non-zero, router stops dispatching this provider to Market once any reset-window usage reaches this percentage."
   },
   "codexConfig": {
+    "generatedConfigPreviewHint": "This configuration is generated from auth.json, config.toml, the model catalog, and model mappings above. Change it through the structured fields.",
+    "localRoutingToggle": "Require local route mapping",
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
     "authJsonHint": "Codex auth.json configuration content",
@@ -3175,6 +3217,7 @@
     },
     "confirmDeleteTitle": "Delete Share",
     "confirmDeleteMessage": "Delete share \"{{name}}\"? Any running tunnel will be stopped first.",
+    "freeConfirm": "Set For Sale to Free?",
     "error": {
       "title": "Failed to load shares"
     },
@@ -3210,6 +3253,232 @@
       "copyCurl": "Curl copied"
     }
   },
+  "antigravityOauth": {
+    "authStatus": "Antigravity authentication",
+    "loginWithGoogle": "Sign in to Antigravity with Google",
+    "loginRequired": "Sign in to an Antigravity account first",
+    "selectAccountRequired": "Antigravity OAuth must be bound to an Antigravity account"
+  },
+  "claudeOauth": {
+    "localCallbackLogin": "Local callback",
+    "officialCallbackLogin": "Official link",
+    "callbackModeHint": "The local callback completes authorization through 127.0.0.1. The official link displays a code on platform.claude.com for you to paste here.",
+    "remoteCallbackModeHint": "The local callback is unavailable through the Web interface. Use the official link and paste the authorization code here.",
+    "authStatus": "Claude subscription authentication",
+    "loginWithClaude": "Sign in with Claude.ai",
+    "webPasteHint": "1. Open the link below and authorize on claude.ai.\n2. platform.claude.com will display an authorization code.\n3. Paste the code below and submit it to add the account.",
+    "pasteCodeLabel": "Authorization code from platform.claude.com",
+    "pasteCodePlaceholder": "Paste authorization code...",
+    "submitPasteCode": "Submit",
+    "loginRequired": "Sign in to a Claude account first"
+  },
+  "cursorOauth": {
+    "authStatus": "Cursor OAuth authentication",
+    "loginWithCursor": "Sign in with Cursor",
+    "importLocalServerTitle": "Read the Cursor IDE or cursor-agent sign-in from the machine running cc-switch-server",
+    "importLocalServer": "Import local Cursor account",
+    "loginRequired": "Sign in to a Cursor account first",
+    "selectAccountRequired": "Cursor OAuth must be bound to a Cursor account"
+  },
+  "deepseekAccount": {
+    "authStatus": "DeepSeek account",
+    "identifier": "Email or phone number",
+    "identifierPlaceholder": "Enter an email or phone number",
+    "password": "Password",
+    "addAccount": "Add account",
+    "loginRequired": "Add a DeepSeek account first",
+    "selectAccountRequired": "DeepSeek Account must be bound to a DeepSeek account"
+  },
+  "geminiOauth": {
+    "authStatus": "Google Gemini authentication",
+    "loginWithGoogle": "Sign in with Google",
+    "loginRequired": "Sign in to a Google Gemini account first",
+    "selectAccountRequired": "Google Official must be bound to a Google Gemini account"
+  },
+  "grokOauth": {
+    "callbackRequired": "Paste the Grok callback URL, query string, or code",
+    "loginSuccess": "Grok account signed in",
+    "authJsonRequired": "Paste the contents of ~/.grok/auth.json",
+    "authJsonInvalid": "auth.json is not valid JSON",
+    "importSuccess": "Grok auth.json imported",
+    "authStatus": "Grok OAuth authentication",
+    "loginWithGrok": "Sign in with Grok",
+    "importAuthJson": "Import auth.json",
+    "import": "Import",
+    "callbackPlaceholder": "http://127.0.0.1:56121/callback?code=...&state=... or paste only the code",
+    "finishLogin": "Complete sign-in",
+    "loginRequired": "Sign in to a Grok account first",
+    "selectAccountRequired": "Grok OAuth must be bound to a Grok account"
+  },
+  "kiroOauth": {
+    "importSuccess": "Kiro credentials imported",
+    "credentialsInvalid": "credentials.json is not valid JSON",
+    "apiKeyInvalid": "Kiro API Key must start with ksk_",
+    "authStatus": "Kiro OAuth authentication",
+    "loginWithKiro": "Sign in with AWS Builder ID",
+    "loginWithGoogle": "Sign in with Google",
+    "loginWithGithub": "Sign in with GitHub",
+    "addGoogleAccount": "Add Google account",
+    "addGithubAccount": "Add GitHub account",
+    "importJson": "Import JSON",
+    "importApiKey": "API Key",
+    "importLocal": "Local Kiro",
+    "userCodeHint": "AWS Builder ID device code:",
+    "copyUserCode": "Copy verification code",
+    "loginRequired": "Sign in to an AWS Builder ID account first",
+    "selectAccountRequired": "Kiro OAuth must be bound to an AWS Builder ID account"
+  },
+  "accountAuth": {
+    "accountCount": "{{count}} accounts",
+    "notAuthenticated": "Not authenticated",
+    "loggedInAccounts": "Signed-in accounts",
+    "defaultAccount": "Default",
+    "selected": "Selected",
+    "setAsDefault": "Set as default",
+    "removeAccount": "Remove account",
+    "selectAccount": "Select account",
+    "selectAccountPlaceholder": "Select an account",
+    "useDefaultAccount": "Use default account",
+    "addAnotherAccount": "Add another account",
+    "waitingForBrowser": "Open the authorization link below and complete sign-in...",
+    "openLinkHint": "The authorization link does not open automatically. Open or copy it into a browser:",
+    "copyLink": "Copy link",
+    "openManually": "Open link",
+    "logoutAll": "Sign out all accounts",
+    "retry": "Retry"
+  },
+  "serverProviderForm": {
+    "categories": {
+      "official": "Official",
+      "cnOfficial": "China official",
+      "aggregator": "Aggregator",
+      "thirdParty": "Third party",
+      "custom": "Custom"
+    },
+    "validation": {
+      "nameRequired": "Provider name is required",
+      "accountRequired": "Select an authenticated account",
+      "endpointInvalid": "Enter a valid HTTP or HTTPS endpoint",
+      "modelRequired": "Upstream model is required",
+      "awsRegionRequired": "AWS Region is required",
+      "replacementRequired": "Enter the replacement credential",
+      "requiredCredentialCannotClear": "A required credential cannot be cleared; choose Replace",
+      "customBindingMissing": "The Custom Provider protocol configuration is missing",
+      "unsupportedBinding": "This protocol and authentication combination is not supported",
+      "authCredentialRequired": "Enter an authentication credential",
+      "authRequired": "This authentication method requires a credential",
+      "invalidHeader": "Invalid Header name: {{name}}",
+      "managedHeader": "This Header is managed by the driver: {{name}}",
+      "duplicateHeader": "Duplicate Header name: {{name}}",
+      "headerValueRequired": "Enter a value for Header {{name}}",
+      "costMultiplierInvalid": "Cost multiplier must be a non-negative number",
+      "quotaLimitInvalid": "Dispatch usage limit must be an integer from 1 to 100"
+    },
+    "credentials": {
+      "title": "Authentication credential",
+      "apiToken": "API Key / Bearer Token",
+      "keep": "Keep",
+      "replace": "Replace",
+      "clear": "Clear",
+      "newPlaceholder": "Enter a new credential",
+      "placeholder": "Enter credential",
+      "loading": "Loading the configured credential...",
+      "loadFailed": "The configured credential could not be loaded. Retry or enter a replacement.",
+      "loadFailedPlaceholder": "Enter a replacement credential",
+      "willClear": "This optional credential will be cleared when saved",
+      "willReplace": "The configured credential will be replaced when saved",
+      "configured": "Configured",
+      "optionalMissing": "Not configured (optional)",
+      "missing": "Not configured"
+    },
+    "unsupportedAccountType": "Unsupported account type: {{type}}",
+    "toasts": {
+      "applyBindingFirst": "Preview and apply the protocol binding before saving other settings",
+      "customUnavailable": "Custom Provider configuration is unavailable",
+      "cloneIdInvalid": "Enter a new ID that differs from the original Provider",
+      "cloneNameRequired": "Enter the new Provider name",
+      "customCreated": "Custom Provider created",
+      "identityUpdated": "Provider identity configuration updated"
+    },
+    "identity": {
+      "stable": "Stable",
+      "experimental": "Experimental",
+      "adoptTitle": "Adopt provider profile",
+      "adoptMessage": "Bind {{provider}} to {{profile}}.",
+      "cloneTitle": "Clone as Custom Provider",
+      "cloneMessage": "Create {{name}} ({{id}}).",
+      "upstreamProtocolLine": "Upstream protocol: {{protocol}}",
+      "authSchemeLine": "Authentication: {{scheme}}",
+      "rebindTitle": "Change Custom binding",
+      "adoptSection": "Adopt standard profile",
+      "adoptPreview": "Preview and adopt",
+      "cloneSection": "Clone as Custom Provider",
+      "cloneDescription": "Keep the current Provider and create a new configuration with an explicit protocol identity. Runtime changes are previewed before applying.",
+      "newProviderId": "New Provider ID",
+      "newName": "New name",
+      "clonePreview": "Preview and create",
+      "confirmTitle": "Confirm identity change",
+      "apply": "Apply"
+    },
+    "basic": {
+      "title": "Basic information",
+      "name": "Name",
+      "website": "Website",
+      "notes": "Notes"
+    },
+    "account": {
+      "title": "Authentication account"
+    },
+    "aws": {
+      "title": "AWS credentials"
+    },
+    "binding": {
+      "title": "Protocol and authentication",
+      "upstreamProtocol": "Upstream protocol",
+      "authScheme": "Authentication method",
+      "credential": "Authentication credential",
+      "queryParameter": "Query parameter name",
+      "headerName": "Header name",
+      "cancelChanges": "Cancel changes",
+      "previewApply": "Preview and apply binding",
+      "change": "Change protocol binding",
+      "pendingHint": "The protocol identity has not been applied. Preview and apply the binding before saving endpoint, model, or request settings."
+    },
+    "endpoint": {
+      "title": "API request address"
+    },
+    "model": {
+      "title": "Model policy",
+      "upstreamModel": "Actual upstream model",
+      "passthrough": "Pass through",
+      "passthroughHint": "Use the model from the request"
+    },
+    "headers": {
+      "title": "Additional request Headers",
+      "value": "Header value",
+      "remove": "Remove Header",
+      "add": "Add Header"
+    },
+    "codex": {
+      "title": "Codex runtime options",
+      "imageGeneration": "Image generation"
+    },
+    "usage": {
+      "title": "Usage and requests",
+      "costMultiplier": "Cost multiplier",
+      "pricingModel": "Pricing model",
+      "inherit": "Inherit global setting",
+      "request": "Request model",
+      "response": "Response model",
+      "quotaLimit": "Dispatch usage limit (%)",
+      "unlimited": "Unlimited",
+      "customUserAgent": "Custom User-Agent"
+    },
+    "legacy": {
+      "title": "Compatibility status",
+      "hint": "Legacy Providers only allow display information changes; runtime configuration remains frozen."
+    }
+  },
   "subscription": {
     "title": "Subscription Quota",
     "fiveHour": "5-Hour",
@@ -3223,6 +3492,7 @@
     "weeklyLimit": "Weekly",
     "monthly": "Monthly",
     "copilotPremium": "Premium",
+    "cursorCredits": "Usage",
     "kiroAgenticRequests": "Kiro Agentic Requests",
     "kiroEstimatedUsage": "Estimated Usage",
     "kiroResetsOn": "resets on {{date}}",
@@ -3256,8 +3526,6 @@
   "terminal": {
     "title": "Ops Terminal",
     "nav": "Terminal",
-    "backHome": "Back to home",
-    "subtitle": "Server runtime environment",
     "placeholderTitle": "Connecting ops terminal",
     "placeholderBody": "Leaving this page does not stop running commands; re-enter to restore recent output.",
     "authRequired": "Sign in to use the ops terminal",

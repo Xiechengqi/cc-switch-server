@@ -293,7 +293,9 @@ export function BackupListSection({
         </div>
 
         {isLoading ? (
-          <div className="text-sm text-muted-foreground py-2">Loading...</div>
+          <div className="text-sm text-muted-foreground py-2">
+            {t("common.loading")}
+          </div>
         ) : backups.length === 0 ? (
           <div className="text-sm text-muted-foreground py-2">
             {t("settings.backupManager.empty", {

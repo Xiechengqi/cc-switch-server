@@ -206,7 +206,7 @@ sudo -u cc-switch-server cc-switch-server --config-dir /var/lib/cc-switch-server
 
 在至少两个稳定 bridge release 且不少于 14 天的观察窗口完成前，不清理降级快照，也不删除 S1/name/URL reader 或旧 Provider compatibility endpoint。当前门禁记录在 `assets/contract/provider-compatibility-window.json`。
 
-S2 只降低 `providers.json` 或不含根密钥的单个快照泄露风险。攻击者若同时取得完整数据目录、`accounts.key`、环境根密钥或 Server OS 用户权限，仍可解密 Provider 和 Account 凭据。
+S2 只降低 `providers.json` 或不含根密钥的单个快照泄露风险。Provider 列表和详情接口保持脱敏，但已登录的 Server 管理员可在供应商编辑页查看或复制单个已分类凭据。攻击者若取得管理员会话、完整数据目录、`accounts.key`、环境根密钥或 Server OS 用户权限，仍可获得 Provider 和 Account 凭据。
 
 备份恢复：
 

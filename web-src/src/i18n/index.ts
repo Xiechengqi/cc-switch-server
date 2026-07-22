@@ -5,6 +5,10 @@ import en from "./locales/en.json";
 import ja from "./locales/ja.json";
 import zh from "./locales/zh.json";
 import zhTW from "./locales/zh-TW.json";
+import serverEn from "./server-locales/en.json";
+import serverJa from "./server-locales/ja.json";
+import serverZh from "./server-locales/zh.json";
+import serverZhTW from "./server-locales/zh-TW.json";
 
 type Language = "zh" | "zh-TW" | "en" | "ja";
 
@@ -61,25 +65,88 @@ const getInitialLanguage = (): Language => {
   return DEFAULT_LANGUAGE;
 };
 
+const ACCOUNT_TRANSLATION_NAMESPACES = [
+  "antigravityOauth",
+  "claudeOauth",
+  "codexOauth",
+  "copilot",
+  "cursorOauth",
+  "deepseekAccount",
+  "geminiOauth",
+  "grokOauth",
+  "kiroOauth",
+] as const;
+
+function mergeTranslationTrees(
+  base: Record<string, unknown>,
+  overlay: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(overlay)) {
+    const existing = merged[key];
+    merged[key] =
+      existing &&
+      typeof existing === "object" &&
+      !Array.isArray(existing) &&
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value)
+        ? mergeTranslationTrees(
+            existing as Record<string, unknown>,
+            value as Record<string, unknown>,
+          )
+        : value;
+  }
+  return merged;
+}
+
+function withSharedAccountTranslations<T extends Record<string, unknown>>(
+  locale: T,
+): T {
+  const shared = locale.accountAuth;
+  if (!shared || typeof shared !== "object" || Array.isArray(shared)) {
+    return locale;
+  }
+  const translation: Record<string, unknown> = { ...locale };
+  for (const namespace of ACCOUNT_TRANSLATION_NAMESPACES) {
+    const existing = locale[namespace];
+    translation[namespace] = {
+      ...shared,
+      ...(existing && typeof existing === "object" && !Array.isArray(existing)
+        ? existing
+        : {}),
+    };
+  }
+  return translation as T;
+}
+
 const resources = {
   en: {
-    translation: en,
+    translation: withSharedAccountTranslations(
+      mergeTranslationTrees(en, serverEn),
+    ),
   },
   ja: {
-    translation: ja,
+    translation: withSharedAccountTranslations(
+      mergeTranslationTrees(ja, serverJa),
+    ),
   },
   zh: {
-    translation: zh,
+    translation: withSharedAccountTranslations(
+      mergeTranslationTrees(zh, serverZh),
+    ),
   },
   "zh-TW": {
-    translation: zhTW,
+    translation: withSharedAccountTranslations(
+      mergeTranslationTrees(zhTW, serverZhTW),
+    ),
   },
 };
 
 i18n.use(initReactI18next).init({
   resources,
   lng: getInitialLanguage(),
-  fallbackLng: "en", // 如果缺少中文翻译则退回英文
+  fallbackLng: "en",
 
   interpolation: {
     escapeValue: false, // React 已经默认转义
@@ -87,7 +154,6 @@ i18n.use(initReactI18next).init({
 
   showSupportNotice: false,
 
-  // 开发模式下显示调试信息
   debug: false,
 });
 

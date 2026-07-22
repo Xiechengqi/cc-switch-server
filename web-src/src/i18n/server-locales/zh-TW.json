@@ -1,0 +1,138 @@
+{
+  "common": {
+    "copied": "已複製"
+  },
+  "providers": {
+    "addProvider": "新增供應商"
+  },
+  "provider": {
+    "share": {
+      "sectionTitle": "遠端分享",
+      "addPageBadge": "儲存後可用",
+      "enableShare": "啟用遠端分享",
+      "addPagePlaceholder": "請先儲存供應商；儲存後重新開啟編輯頁即可設定遠端分享。",
+      "stateActive": "分享已啟用",
+      "statePaused": "分享已暫停",
+      "stateError": "分享異常",
+      "stateNone": "未啟用分享",
+      "invalidNumber": "請輸入有效數字",
+      "invalidConfiguration": "請修正遠端分享設定後再儲存",
+      "sectionHint": "每個 Provider 對應一個 Share。在此設定分享參數；Router Console 可管理進階營運選項。",
+      "openRouterConsole": "開啟 Router Console",
+      "disabledHint": "啟用後可設定遠端分享參數並建立 Share。",
+      "routerSyncFailed": "Router 同步失敗：{{error}}",
+      "routerSyncPending": "正在同步至 Router",
+      "ownerRequired": "請先在分享設定頁設定 Client Tunnel Owner 信箱"
+    },
+    "form": {
+      "gemini": {
+        "antigravityOauthTitle": "Antigravity OAuth 認證模式",
+        "antigravityOauthHint": "Antigravity OAuth 使用託管的 Antigravity 帳號，不需要填寫 API Key。"
+      }
+    }
+  },
+  "share": {
+    "unsupportedApp": "{{app}} 暫不支援分享；請切換至 Claude、Codex 或 Gemini 分頁後再建立 Share。",
+    "validation": {
+      "invalidEmail": "電子郵件格式無效"
+    },
+    "saleMarketKind": {
+      "title": "Market 類型",
+      "token": "Token Market",
+      "share": "Share Market"
+    },
+    "market": {
+      "allSelected": "已選取所有 Market"
+    },
+    "accountMarket": {
+      "title": "Share Market",
+      "select": "選擇 Share Market",
+      "required": "請選擇一個 Share Market"
+    },
+    "permanent": "永久",
+    "expiration": "到期",
+    "userLimit": {
+      "periodLifetime": "累計",
+      "periodDay": "每天",
+      "periodWeek": "每週",
+      "periodMonth": "自然月",
+      "title": "使用者限制",
+      "hint": "Share 總限制永遠生效；每位使用者也會受到各自限制。",
+      "add": "新增使用者",
+      "edit": "編輯使用者限制",
+      "period": "Token 週期"
+    },
+    "boundProviderHint": "此應用程式的請求固定使用綁定的 Provider，不參與故障轉移。",
+    "manageInProviderHint": "若要修改分享設定，請開啟綁定的 Provider 編輯頁。",
+    "sharedWithEmails": "Share To",
+    "emptyReadOnlyHint": "分享需在 Provider 編輯頁的「遠端分享」區域建立與管理。",
+    "readOnlyOverviewHint": "此為唯讀總覽。若要修改分享設定，請前往綁定的 Provider 編輯頁。",
+    "routerOwner": {
+      "signedInOwner": "已以 Owner {{email}} 登入，可編輯設定",
+      "signedInReadOnly": "目前登入 {{email}}，只有 Owner {{owner}} 可以編輯設定",
+      "signInPrompt": "使用 Share Owner 信箱登入後即可編輯設定",
+      "sendCode": "傳送驗證碼",
+      "codePlaceholder": "驗證碼",
+      "verify": "驗證",
+      "changeEmail": "更換信箱",
+      "codeSent": "驗證碼已傳送至 {{target}}"
+    }
+  },
+  "codexConfig": {
+    "noCommonConfigToApply": "通用設定片段為空或沒有可寫入的內容"
+  },
+  "claudeDesktop": {
+    "route": {
+      "stopBlockedByTakeover": "其他應用程式正在使用代理接管。請先在設定中關閉對應應用程式的接管，再停止本機路由。"
+    }
+  },
+  "proxy": {
+    "routing": {
+      "ready": "已路由",
+      "needsProvider": "待設定"
+    },
+    "server": {
+      "stopped": "代理服務已停止",
+      "stopFailed": "停止代理服務失敗"
+    }
+  },
+  "settings": {
+    "loadFailed": "無法載入設定，請重新整理頁面後再試。",
+    "selectFileFailed": "選擇目錄失敗",
+    "authCenter": {
+      "serverDescription": "管理用於上游反向代理的官方 OAuth 帳號。用量重新整理僅作用於目前啟用的 Provider。",
+      "claudeOauthDescription": "管理 Claude 官方訂閱帳號",
+      "grokOauthDescription": "管理 Grok/xAI 訂閱帳號",
+      "kiroOauthDescription": "管理 Kiro AWS Builder ID 帳號",
+      "cursorOauthDescription": "管理 Cursor 訂閱帳號",
+      "geminiOauthDescription": "管理 Google Gemini 帳號",
+      "antigravityOauthDescription": "管理 Antigravity 訂閱帳號",
+      "deepseekAccountDescription": "管理 DeepSeek 帳號"
+    },
+    "serverConfigDir": {
+      "title": "Server 設定目錄",
+      "description": "providers、shares、ui-settings 等持久化檔案所在目錄。監聽位址與連接埠由程序啟動參數決定。"
+    },
+    "serverSecurity": {
+      "currentPasswordRequired": "請輸入目前密碼"
+    },
+    "share": {
+      "health": {
+        "clientTunnel": {
+          "conflict": "子網域衝突，未向 Router 註冊",
+          "claimFailed": "Router 註冊失敗",
+          "unclaimed": "已設定，但未向 Router 註冊",
+          "connecting": "已註冊，Tunnel 連線中"
+        }
+      }
+    }
+  },
+  "usage": {
+    "unpriced": "未定價"
+  },
+  "notifications": {
+    "clearCurrentSuccess": "已停用",
+    "clearCurrentFailedTitle": "停用失敗",
+    "clearCurrentFailed": "停用失敗：{{error}}"
+  }
+}

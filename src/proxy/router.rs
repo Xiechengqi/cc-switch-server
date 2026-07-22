@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use axum::http::HeaderMap;
 
 use crate::domain::accounts::store::AccountStore;
@@ -122,6 +124,47 @@ pub(super) fn select_provider_for_claude_count_tokens(
             ..ProviderSelectionOptions::default()
         },
     )
+}
+
+pub(super) fn select_failover_provider(
+    store: &ProviderStore,
+    accounts: &AccountStore,
+    route: ProxyRoute,
+    account_in_flight: &AccountInFlightSnapshot,
+    excluded_provider_ids: &BTreeSet<String>,
+) -> Option<ProviderRouteSelection> {
+    let app = route.app();
+    let now = now_ms();
+    for provider in store.list(Some(app)) {
+        if excluded_provider_ids.contains(&provider.provider.id)
+            || (route == ProxyRoute::ClaudeCountTokens
+                && !provider_supports_claude_count_tokens(&provider))
+            || ensure_provider_account_does_not_need_relogin(&provider, accounts).is_err()
+            || ensure_provider_not_rate_limited(&provider, accounts, now).is_err()
+            || account_concurrency_for_provider(&provider, accounts, account_in_flight)
+                .is_some_and(|selection| selection.current >= selection.max_concurrent)
+        {
+            continue;
+        }
+        let execution = match ProviderExecution::from_store(store, provider) {
+            Ok(execution) => execution,
+            Err(error) => {
+                tracing::debug!(
+                    status = error.status.as_u16(),
+                    "skipping ineligible failover Provider"
+                );
+                continue;
+            }
+        };
+        if execution
+            .ensure_operation_supported(super::provider_ops::ProviderOperation::Forward)
+            .is_err()
+        {
+            continue;
+        }
+        return Some(ProviderRouteSelection { execution });
+    }
+    None
 }
 
 pub(super) fn provider_supports_claude_count_tokens(provider: &StoredProvider) -> bool {
@@ -418,7 +461,8 @@ fn provider_rate_limited_until(
 ) -> Option<i64> {
     if !matches!(
         provider.provider_type,
-        ProviderType::CodexOAuth
+        ProviderType::ClaudeOAuth
+            | ProviderType::CodexOAuth
             | ProviderType::GrokOAuth
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
@@ -774,6 +818,84 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn failover_selection_uses_authoritative_order_and_exclusions() {
+        let mut store = runtime_store(vec![
+            claude_oauth_provider("p1", "acct-1", None),
+            claude_oauth_provider("p2", "acct-2", None),
+            claude_oauth_provider("p3", "acct-3", None),
+        ]);
+        store.order.insert(
+            AppKind::Claude,
+            vec!["p3".to_string(), "p1".to_string(), "p2".to_string()],
+        );
+        let mut accounts = AccountStore::default();
+        for account_id in ["acct-1", "acct-2", "acct-3"] {
+            accounts.upsert(claude_oauth_account(account_id));
+        }
+        let excluded = BTreeSet::from(["p3".to_string()]);
+
+        let selected = select_failover_provider(
+            &store,
+            &accounts,
+            ProxyRoute::ClaudeMessages,
+            &AccountInFlightTracker::default().snapshot(),
+            &excluded,
+        )
+        .unwrap();
+
+        assert_eq!(selected.execution.stored.provider.id, "p1");
+    }
+
+    #[test]
+    fn failover_selection_skips_unhealthy_and_saturated_accounts() {
+        let store = runtime_store(vec![
+            claude_oauth_provider("excluded", "acct-excluded", None),
+            claude_oauth_provider("relogin", "acct-relogin", None),
+            claude_oauth_provider("limited", "acct-limited", None),
+            claude_oauth_provider("saturated", "acct-saturated", Some(1)),
+            claude_oauth_provider("healthy", "acct-healthy", None),
+        ]);
+        let mut accounts = AccountStore::default();
+        for account_id in [
+            "acct-excluded",
+            "acct-relogin",
+            "acct-limited",
+            "acct-saturated",
+            "acct-healthy",
+        ] {
+            accounts.upsert(claude_oauth_account(account_id));
+        }
+        accounts
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == "acct-relogin")
+            .unwrap()
+            .needs_relogin = true;
+        accounts
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == "acct-limited")
+            .unwrap()
+            .rate_limited_until = Some(now_ms() as i64 + 60_000);
+        let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
+        let _guard = tracker
+            .try_acquire(ProviderType::ClaudeOAuth, "acct-saturated", 1)
+            .unwrap();
+        let excluded = BTreeSet::from(["excluded".to_string()]);
+
+        let selected = select_failover_provider(
+            &store,
+            &accounts,
+            ProxyRoute::ClaudeMessages,
+            &tracker.snapshot(),
+            &excluded,
+        )
+        .unwrap();
+
+        assert_eq!(selected.execution.stored.provider.id, "healthy");
     }
 
     #[test]

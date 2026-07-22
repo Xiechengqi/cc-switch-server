@@ -19,7 +19,7 @@ import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
-import { providersApi } from "@/lib/api/providers";
+import { providersApi, type ProviderResource } from "@/lib/api/providers";
 import { useDragSort } from "@/hooks/useDragSort";
 import {
   useOpenClawLiveProviderIds,
@@ -45,6 +45,7 @@ import { isTauriRuntime } from "@/lib/runtime";
 
 interface ProviderListProps {
   providers: Record<string, Provider>;
+  resources?: Record<string, ProviderResource>;
   currentProviderId: string;
   appId: AppId;
   onSwitch: (provider: Provider) => void;
@@ -66,6 +67,7 @@ interface ProviderListProps {
 
 export function ProviderList({
   providers,
+  resources = {},
   currentProviderId,
   appId,
   onSwitch,
@@ -290,9 +292,7 @@ export function ProviderList({
   }
 
   if (sortedProviders.length === 0) {
-    return (
-      <ProviderEmptyState appId={appId} onCreate={onCreate} />
-    );
+    return <ProviderEmptyState appId={appId} onCreate={onCreate} />;
   }
 
   const renderProviderList = () => (
@@ -318,6 +318,7 @@ export function ProviderList({
               <SortableProviderCard
                 key={provider.id}
                 provider={provider}
+                resource={resources[provider.id]}
                 isCurrent={
                   isOmo
                     ? isOmoCurrent
@@ -482,6 +483,7 @@ export function ProviderList({
 
 interface SortableProviderCardProps {
   provider: Provider;
+  resource?: ProviderResource;
   isCurrent: boolean;
   appId: AppId;
   isInConfig: boolean;
@@ -510,6 +512,7 @@ interface SortableProviderCardProps {
 
 function SortableProviderCard({
   provider,
+  resource,
   isCurrent,
   appId,
   isInConfig,
@@ -552,6 +555,7 @@ function SortableProviderCard({
     <div ref={setNodeRef} style={style}>
       <ProviderCard
         provider={provider}
+        resource={resource}
         isCurrent={isCurrent}
         appId={appId}
         isInConfig={isInConfig}

@@ -46,11 +46,12 @@ use crate::domain::accounts::store::{
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::credentials::{
-    merge_provider_credentials, CredentialPatch, ProviderAccountBindingMigrationItem,
-    ProviderAccountBindingMigrationPreview, ProviderAccountBindingMigrationStatus,
-    ProviderCommandError, ProviderIdentityAction, ProviderIdentityChangePreview,
-    ProviderImportAction, ProviderImportItemPreview, ProviderImportPreview,
-    ProviderReferencePreview, ProviderRuntimeTransitionPreview, ProviderView, ProviderWriteDraft,
+    merge_provider_credentials, reveal_provider_credential, CredentialPatch,
+    ProviderAccountBindingMigrationItem, ProviderAccountBindingMigrationPreview,
+    ProviderAccountBindingMigrationStatus, ProviderCommandError, ProviderIdentityAction,
+    ProviderIdentityChangePreview, ProviderImportAction, ProviderImportItemPreview,
+    ProviderImportPreview, ProviderReferencePreview, ProviderRuntimeTransitionPreview,
+    ProviderView, ProviderWriteDraft,
 };
 use crate::domain::providers::model::{AppKind, AuthBinding, Provider, ProviderMeta, ProviderType};
 use crate::domain::providers::registry::{
@@ -2802,6 +2803,24 @@ impl ServerStateInner {
                 ProviderView::from_stored_with_order(stored, store.provider_order_index(stored))
             })
             .collect()
+    }
+
+    pub async fn reveal_provider_credential_command(
+        &self,
+        key: &ProviderKey,
+        slot: &str,
+    ) -> anyhow::Result<Result<String, ProviderCommandError>> {
+        let providers = self.providers.read().await;
+        let Some(stored) = providers
+            .providers
+            .iter()
+            .find(|stored| stored.app == key.app && stored.provider.id == key.provider_id)
+        else {
+            return Ok(Err(ProviderCommandError::NotFound));
+        };
+        let materialized = providers.materialize_provider_record(stored)?;
+        Ok(reveal_provider_credential(&materialized.provider, slot)
+            .map_err(|error| ProviderCommandError::Invalid(error.to_string())))
     }
 
     pub async fn provider_reference_preview(

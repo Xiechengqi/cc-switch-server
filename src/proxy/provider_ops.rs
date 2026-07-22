@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 use zeroize::Zeroize;
 
 use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
+use crate::domain::accounts::oauth::oauth_provider_spec;
 use crate::domain::accounts::store::{effective_codex_workspace_id, Account, AccountStore};
+use crate::domain::providers::model::ProviderType;
 use crate::domain::providers::registry::{
     provider_registry, AuthScheme, OperationSupport, UpstreamProtocol,
 };
@@ -16,7 +19,8 @@ use crate::domain::providers::runtime::{
 };
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
-use super::adapters::{self, AdapterRequest};
+use super::adapters::{self, AdapterRequest, ProviderAdapter};
+use super::claude_oauth::ClaudeBodyRetryStage;
 use super::router::ProxyRoute;
 use super::{codex_provider_api_key, setting, ProxyError};
 
@@ -24,6 +28,13 @@ use super::{codex_provider_api_key, setting, ProxyError};
 pub(crate) struct ProviderExecution {
     pub stored: StoredProvider,
     pub plan: Arc<ProviderRuntimePlan>,
+}
+
+pub(crate) struct PreparedProviderRequest {
+    pub adapter_request: AdapterRequest,
+    pub endpoint: String,
+    pub headers: Vec<(String, String)>,
+    pub session_id: Option<String>,
 }
 
 impl std::fmt::Debug for ProviderExecution {
@@ -143,6 +154,107 @@ impl ProviderExecution {
             RuntimeAuthRef::Legacy { account_id, .. } => account_id.as_deref(),
             _ => None,
         }
+    }
+
+    pub fn managed_account_target(&self) -> Option<(ProviderType, Option<&str>)> {
+        match &self.plan.auth_ref {
+            RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type,
+                ..
+            } => Some((*expected_provider_type, Some(account_id.as_str()))),
+            RuntimeAuthRef::Legacy { account_id, .. }
+                if provider_secret(&self.stored).is_none()
+                    && oauth_provider_spec(self.stored.provider_type).is_some_and(|spec| {
+                        spec.server_native_refresh_enabled() && !spec.token_urls.is_empty()
+                    }) =>
+            {
+                Some((self.stored.provider_type, account_id.as_deref()))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn prepare_claude_request(
+        &self,
+        body: Bytes,
+        route: ProxyRoute,
+        client_headers: &HeaderMap,
+        accounts: &AccountStore,
+        retry_stage: Option<ClaudeBodyRetryStage>,
+    ) -> Result<PreparedProviderRequest, ProxyError> {
+        if !self.driver_is("oauth.claude_messages") {
+            return Err(ProxyError::bad_request(format!(
+                "driver {} does not implement the Claude OAuth request contract",
+                self.plan.driver_id
+            )));
+        }
+        let stored = self.runtime_stored_view();
+        let adapter = adapters::adapter_for(stored.app, stored.provider_type);
+        let request = adapter.transform_request_for_route(body, &stored, route, None)?;
+        self.finalize_claude_request(request, route, client_headers, accounts, retry_stage)
+    }
+
+    pub fn finalize_claude_request(
+        &self,
+        mut request: AdapterRequest,
+        route: ProxyRoute,
+        client_headers: &HeaderMap,
+        accounts: &AccountStore,
+        retry_stage: Option<ClaudeBodyRetryStage>,
+    ) -> Result<PreparedProviderRequest, ProxyError> {
+        if !self.driver_is("oauth.claude_messages") {
+            return Err(ProxyError::bad_request(format!(
+                "driver {} does not implement the Claude OAuth request contract",
+                self.plan.driver_id
+            )));
+        }
+        let stored = self.runtime_stored_view();
+        let adapter = adapters::adapter_for(stored.app, stored.provider_type);
+        self.enforce_model_policy(&mut request)?;
+        let context_1m_requested = normalize_native_claude_context_1m_model(&mut request)?;
+        self.finalize_request(&mut request)?;
+        let mut endpoint = self.resolve_endpoint(route, None, &request)?;
+        let mut headers = adapter
+            .build_headers(stored.app, &stored, accounts)?
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect::<Vec<_>>();
+        for (name, value) in &request.upstream_headers {
+            replace_header(&mut headers, name, value);
+        }
+        let identity_seed = self.managed_account_id().unwrap_or(&stored.provider.id);
+        let contract = if route == ProxyRoute::ClaudeCountTokens {
+            request.stream_requested = false;
+            super::claude_oauth::apply_count_tokens_forward_contract(
+                &mut endpoint,
+                &mut request.body,
+                client_headers,
+                identity_seed,
+                context_1m_requested,
+            )?
+        } else {
+            super::claude_oauth::apply_forward_contract(
+                &mut endpoint,
+                &mut request.body,
+                client_headers,
+                identity_seed,
+                context_1m_requested,
+                retry_stage,
+            )?
+        };
+        for (name, value) in contract.headers {
+            replace_header(&mut headers, name, &value);
+        }
+        let materialized_auth = self.materialize_auth(accounts)?;
+        self.apply_auth(&mut headers, &mut endpoint, materialized_auth.as_ref())?;
+        apply_account_header_overrides(&mut headers, &stored, accounts)?;
+        Ok(PreparedProviderRequest {
+            adapter_request: request,
+            endpoint,
+            headers,
+            session_id: contract.session_id,
+        })
     }
 
     pub fn ensure_operation_supported(
@@ -714,6 +826,151 @@ fn replace_request_model(body: &[u8], model: &str) -> Result<bytes::Bytes, Proxy
         .map_err(|error| ProxyError::bad_request(format!("request encode failed: {error}")))
 }
 
+fn normalize_native_claude_context_1m_model(
+    request: &mut AdapterRequest,
+) -> Result<bool, ProxyError> {
+    let requested = request
+        .requested_model
+        .clone()
+        .or_else(|| request_model(&request.body));
+    let context_1m_requested = requested
+        .as_deref()
+        .is_some_and(model_requests_claude_context_1m);
+    if !context_1m_requested {
+        return Ok(false);
+    }
+
+    let body_model = request_model(&request.body);
+    if let Some((normalized, true)) = body_model
+        .as_deref()
+        .map(strip_bracketed_context_1m_suffixes)
+    {
+        request.body = replace_request_model(&request.body, &normalized)?;
+    }
+    normalize_request_model_field(&mut request.model);
+    normalize_request_model_field(&mut request.actual_model);
+    normalize_request_model_field(&mut request.pricing_model);
+    if request.actual_model_source.as_deref() == Some("request") {
+        request.actual_model_source = Some("claude_context_1m_suffix".to_string());
+    }
+    Ok(true)
+}
+
+fn normalize_request_model_field(model: &mut Option<String>) {
+    let Some(current) = model.as_deref() else {
+        return;
+    };
+    let (normalized, changed) = strip_bracketed_context_1m_suffixes(current);
+    if changed {
+        *model = Some(normalized);
+    }
+}
+
+fn strip_bracketed_context_1m_suffixes(model: &str) -> (String, bool) {
+    let mut normalized = model.trim();
+    let mut changed = false;
+    while normalized.len() >= 4
+        && normalized
+            .get(normalized.len() - 4..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("[1m]"))
+    {
+        normalized = normalized[..normalized.len() - 4].trim_end();
+        changed = true;
+    }
+    (normalized.to_string(), changed)
+}
+
+fn model_requests_claude_context_1m(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.ends_with("[1m]") || model.ends_with("-1m")
+}
+
+fn apply_account_header_overrides(
+    headers: &mut Vec<(String, String)>,
+    stored: &StoredProvider,
+    accounts: &AccountStore,
+) -> Result<(), ProxyError> {
+    let account_id = stored
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.account_id.as_deref());
+    let Some(account) = accounts.find_for_provider(stored.provider_type, account_id) else {
+        return Ok(());
+    };
+    for (name, value) in &account.extra_headers {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            ProxyError::bad_request(format!(
+                "account {} extra header name is invalid: {name}",
+                account.id
+            ))
+        })?;
+        let normalized_name = header_name.as_str();
+        if account_header_override_blocked(normalized_name, stored.provider_type) {
+            return Err(ProxyError::bad_request(format!(
+                "account {} extra header cannot override proxy-controlled header: {normalized_name}",
+                account.id
+            )));
+        }
+        HeaderValue::from_str(value).map_err(|_| {
+            ProxyError::bad_request(format!(
+                "account {} extra header value is invalid for {normalized_name}",
+                account.id
+            ))
+        })?;
+        replace_header(headers, normalized_name, value);
+    }
+    Ok(())
+}
+
+fn account_header_override_blocked(name: &str, provider_type: ProviderType) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    if provider_type == ProviderType::ClaudeOAuth
+        && (matches!(
+            normalized.as_str(),
+            "anthropic-beta"
+                | "anthropic-version"
+                | "x-app"
+                | "sec-fetch-mode"
+                | "anthropic-dangerous-direct-browser-access"
+                | "x-claude-code-session-id"
+        ) || normalized.starts_with("x-stainless-"))
+    {
+        return true;
+    }
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "host"
+            | "content-length"
+            | "content-type"
+            | "accept"
+            | "connection"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "cookie"
+            | "set-cookie"
+            | "user-agent"
+            | "originator"
+            | "version"
+            | "chatgpt-account-id"
+            | "session_id"
+            | "x-client-request-id"
+            | "x-codex-window-id"
+            | "openai-beta"
+    )
+}
+
 fn canonical_auth_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -961,6 +1218,204 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn managed_account_target_preserves_typed_and_legacy_oauth_bindings() {
+        let typed = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "typed-account".to_string(),
+                expected_provider_type: ProviderType::ClaudeOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::AnthropicMessages,
+            json!({}),
+            0,
+        );
+        assert_eq!(
+            typed.managed_account_target(),
+            Some((ProviderType::ClaudeOAuth, Some("typed-account")))
+        );
+
+        let mut legacy = execution_with_auth(
+            RuntimeAuthRef::Legacy {
+                account_id: Some("legacy-account".to_string()),
+                credential_generation: 0,
+            },
+            UpstreamProtocol::AnthropicMessages,
+            json!({}),
+            0,
+        );
+        legacy.stored.app = AppKind::Claude;
+        legacy.stored.provider_type = ProviderType::ClaudeOAuth;
+        legacy.plan = Arc::new(ProviderRuntimePlan {
+            configuration_state: RuntimeConfigurationState::LegacyCompat,
+            ..legacy.plan.as_ref().clone()
+        });
+        assert_eq!(
+            legacy.managed_account_target(),
+            Some((ProviderType::ClaudeOAuth, Some("legacy-account")))
+        );
+
+        legacy.stored.provider.settings_config =
+            json!({"env": {"ANTHROPIC_AUTH_TOKEN": "provider-secret"}});
+        assert_eq!(legacy.managed_account_target(), None);
+    }
+
+    #[test]
+    fn native_claude_context_suffix_normalizes_brackets_but_preserves_entity_models() {
+        let mut request = AdapterRequest {
+            body: bytes::Bytes::from_static(
+                br#"{"model":"Claude-Opus-4-6[1m][1M]","messages":[]}"#,
+            ),
+            upstream_endpoint: None,
+            upstream_headers: Vec::new(),
+            model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
+            requested_model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
+            actual_model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
+            actual_model_source: Some("request".to_string()),
+            pricing_model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
+            stream_requested: false,
+            custom_tool_names: Default::default(),
+        };
+
+        assert!(normalize_native_claude_context_1m_model(&mut request).unwrap());
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "Claude-Opus-4-6");
+        assert_eq!(
+            request.requested_model.as_deref(),
+            Some("Claude-Opus-4-6[1m][1M]")
+        );
+        assert_eq!(request.model.as_deref(), Some("Claude-Opus-4-6"));
+        assert_eq!(request.actual_model.as_deref(), Some("Claude-Opus-4-6"));
+        assert_eq!(request.pricing_model.as_deref(), Some("Claude-Opus-4-6"));
+        assert_eq!(
+            request.actual_model_source.as_deref(),
+            Some("claude_context_1m_suffix")
+        );
+
+        let mut entity_model = AdapterRequest {
+            body: bytes::Bytes::from_static(br#"{"model":"claude-sonnet-4-6-1m","messages":[]}"#),
+            upstream_endpoint: None,
+            upstream_headers: Vec::new(),
+            model: Some("claude-sonnet-4-6-1m".to_string()),
+            requested_model: Some("claude-sonnet-4-6-1m".to_string()),
+            actual_model: Some("claude-sonnet-4-6-1m".to_string()),
+            actual_model_source: Some("request".to_string()),
+            pricing_model: Some("claude-sonnet-4-6-1m".to_string()),
+            stream_requested: false,
+            custom_tool_names: Default::default(),
+        };
+        assert!(normalize_native_claude_context_1m_model(&mut entity_model).unwrap());
+        let body: Value = serde_json::from_slice(&entity_model.body).unwrap();
+        assert_eq!(body["model"], "claude-sonnet-4-6-1m");
+        assert_eq!(
+            entity_model.actual_model.as_deref(),
+            Some("claude-sonnet-4-6-1m")
+        );
+    }
+
+    #[test]
+    fn typed_claude_request_signs_the_normalized_body_once() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "claude-account".to_string(),
+                expected_provider_type: ProviderType::ClaudeOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::AnthropicMessages,
+            json!({}),
+            0,
+        );
+        execution.stored.app = AppKind::Claude;
+        execution.stored.provider.id = "typed-claude".to_string();
+        execution.stored.provider_type = ProviderType::ClaudeOAuth;
+        execution.stored.provider_type_id = ProviderType::ClaudeOAuth.as_str().to_string();
+        execution.stored.provider.meta = Some(crate::domain::providers::model::ProviderMeta {
+            auth_binding: Some(crate::domain::providers::model::AuthBinding {
+                source: Some("account".to_string()),
+                auth_provider: Some("claude_oauth".to_string()),
+                account_id: Some("claude-account".to_string()),
+                auth_identity_generation: Some(1),
+            }),
+            ..Default::default()
+        });
+        execution.plan = Arc::new(ProviderRuntimePlan {
+            provider_key: crate::domain::providers::registry::ProviderKey::new(
+                AppKind::Claude,
+                "typed-claude",
+            )
+            .unwrap(),
+            profile_id: crate::domain::providers::registry::ProfileId::parse(
+                "claude.official_oauth",
+            )
+            .unwrap(),
+            driver_id: crate::domain::providers::registry::DriverId::parse("oauth.claude_messages")
+                .unwrap(),
+            endpoint: "https://api.anthropic.com".to_string(),
+            ..execution.plan.as_ref().clone()
+        });
+        let account = serde_json::from_value(json!({
+            "id": "claude-account",
+            "providerType": "claude_oauth",
+            "authIdentityGeneration": 1,
+            "accessToken": "typed-access-token",
+            "tokenType": "Bearer"
+        }))
+        .unwrap();
+        let accounts = AccountStore {
+            accounts: vec![account],
+        };
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            "x-session-id",
+            HeaderValue::from_static("stable-session-id"),
+        );
+        let prepared = execution
+            .prepare_claude_request(
+                bytes::Bytes::from_static(
+                    br#"{"model":"claude-sonnet-4-6[1m][1M]","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+                ),
+                ProxyRoute::ClaudeMessages,
+                &client_headers,
+                &accounts,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            prepared.endpoint,
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
+        let body: Value = serde_json::from_slice(&prepared.adapter_request.body).unwrap();
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        let signed_text = body["system"][0]["text"].as_str().unwrap();
+        assert!(signed_text.contains("cch="));
+        assert!(!signed_text.contains("cch=00000"));
+        assert_eq!(
+            prepared
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .count(),
+            1
+        );
+        assert!(prepared.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("anthropic-beta") && value.contains("context-1m")
+        }));
+
+        let mut signed_again = prepared.adapter_request.body.clone();
+        let mut endpoint = "https://api.anthropic.com/v1/messages".to_string();
+        super::super::claude_oauth::apply_forward_contract(
+            &mut endpoint,
+            &mut signed_again,
+            &client_headers,
+            "claude-account",
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(signed_again, prepared.adapter_request.body);
     }
 
     #[test]

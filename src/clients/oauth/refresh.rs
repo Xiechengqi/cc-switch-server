@@ -122,12 +122,49 @@ pub async fn execute_native_account_refresh(
     now_ms: i64,
     quota_refresh_interval_ms: i64,
 ) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+    #[cfg(test)]
+    if let Some(token_url) = account
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("testOAuthTokenUrl"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let token_urls = [token_url];
+        return execute_native_account_refresh_with_token_urls(
+            http,
+            account,
+            now_ms,
+            quota_refresh_interval_ms,
+            Some(&token_urls),
+        )
+        .await;
+    }
+    execute_native_account_refresh_with_token_urls(
+        http,
+        account,
+        now_ms,
+        quota_refresh_interval_ms,
+        None,
+    )
+    .await
+}
+
+async fn execute_native_account_refresh_with_token_urls(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    quota_refresh_interval_ms: i64,
+    token_urls: Option<&[&str]>,
+) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
     let Some(refresh_key) = refresh_lock_key(account) else {
         return execute_native_account_refresh_inner(
             http,
             account,
             now_ms,
             quota_refresh_interval_ms,
+            token_urls,
         )
         .await;
     };
@@ -146,9 +183,14 @@ pub async fn execute_native_account_refresh(
         return Err(blocked);
     }
 
-    let result =
-        execute_native_account_refresh_inner(http, account, now_ms, quota_refresh_interval_ms)
-            .await;
+    let result = execute_native_account_refresh_inner(
+        http,
+        account,
+        now_ms,
+        quota_refresh_interval_ms,
+        token_urls,
+    )
+    .await;
     match &result {
         Ok(update) => {
             remember_refresh_success(&refresh_key, now_ms, update);
@@ -164,6 +206,7 @@ async fn execute_native_account_refresh_inner(
     account: &Account,
     now_ms: i64,
     quota_refresh_interval_ms: i64,
+    token_urls: Option<&[&str]>,
 ) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
     if account.provider_type == ProviderType::KiroOAuth {
         return crate::clients::oauth::kiro::refresh_kiro_account(
@@ -189,7 +232,7 @@ async fn execute_native_account_refresh_inner(
     }
 
     let mut last_error = None;
-    for token_url in spec.token_urls {
+    for token_url in token_urls.unwrap_or(spec.token_urls) {
         let request =
             build_refresh_request_for_token_url(account.provider_type, account, token_url)
                 .map_err(|error| {
@@ -697,6 +740,12 @@ fn refresh_status_code(upstream_status: Option<u16>, kind: OAuthErrorKind) -> u1
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use axum::routing::post;
+    use axum::{Json, Router};
+
     use super::*;
 
     fn request(url: &str) -> OAuthHttpRequest {
@@ -830,5 +879,89 @@ mod tests {
 
         assert_eq!(requests.len(), 1);
         assert!(requests[0].url.contains("/auth/poll?"));
+    }
+
+    #[tokio::test]
+    async fn claude_refresh_rotates_tokens_and_is_singleflight() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_route = Arc::clone(&captured);
+        let upstream = Router::new().route(
+            "/token",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let requests = Arc::clone(&requests_for_route);
+                let captured = Arc::clone(&captured_for_route);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    captured.lock().unwrap().push(body);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Json(serde_json::json!({
+                        "access_token": "rotated-access-token",
+                        "refresh_token": "rotated-refresh-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "account": {"uuid": "principal-1"}
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::ClaudeOAuth,
+            Some("expired-access-token"),
+            Some("original-refresh-token"),
+            Some(1),
+        );
+        account.id = "claude-refresh-singleflight".to_string();
+        let http = reqwest::Client::new();
+        let token_url = format!("http://{address}/token");
+        let token_urls = [token_url.as_str()];
+        let now_ms = 10_000_000;
+
+        let (first, second) = tokio::join!(
+            execute_native_account_refresh_with_token_urls(
+                &http,
+                &account,
+                now_ms,
+                60_000,
+                Some(&token_urls),
+            ),
+            execute_native_account_refresh_with_token_urls(
+                &http,
+                &account,
+                now_ms,
+                60_000,
+                Some(&token_urls),
+            )
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(first.access_token.as_deref(), Some("rotated-access-token"));
+        assert_eq!(
+            first.refresh_token.as_deref(),
+            Some("rotated-refresh-token")
+        );
+        assert_eq!(first.token_type.as_deref(), Some("Bearer"));
+        assert!(first
+            .expires_at
+            .is_some_and(|expires_at| expires_at > now_ms));
+        assert_eq!(second.access_token, first.access_token);
+        assert_eq!(second.refresh_token, first.refresh_token);
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0]["refresh_token"],
+            serde_json::json!("original-refresh-token")
+        );
     }
 }

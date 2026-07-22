@@ -11,16 +11,25 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
-          if (id.includes("node_modules/codemirror") || id.includes("node_modules/@codemirror")) {
+          if (
+            id.includes("node_modules/codemirror") ||
+            id.includes("node_modules/@codemirror")
+          ) {
             return "codemirror";
           }
-          if (id.includes("node_modules/recharts") || id.includes("node_modules/d3-")) {
+          if (
+            id.includes("node_modules/recharts") ||
+            id.includes("node_modules/d3-")
+          ) {
             return "recharts";
           }
           if (id.includes("node_modules/framer-motion")) {
             return "framer-motion";
           }
-          if (id.includes("/i18n/locales/")) {
+          if (
+            id.includes("/i18n/locales/") ||
+            id.includes("/i18n/server-locales/")
+          ) {
             return "locales";
           }
         },
@@ -38,12 +47,30 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
-      "@tauri-apps/api/core": path.resolve(__dirname, "./src/shims/tauri-apps/api/core.ts"),
-      "@tauri-apps/api/event": path.resolve(__dirname, "./src/shims/tauri-apps/api/event.ts"),
-      "@tauri-apps/api/app": path.resolve(__dirname, "./src/shims/tauri-apps/api/app.ts"),
-      "@tauri-apps/api/path": path.resolve(__dirname, "./src/shims/tauri-apps/api/path.ts"),
-      "@tauri-apps/plugin-process": path.resolve(__dirname, "./src/shims/tauri-apps/plugin-process.ts"),
-      "@tauri-apps/plugin-updater": path.resolve(__dirname, "./src/shims/tauri-apps/plugin-updater.ts"),
+      "@tauri-apps/api/core": path.resolve(
+        __dirname,
+        "./src/shims/tauri-apps/api/core.ts",
+      ),
+      "@tauri-apps/api/event": path.resolve(
+        __dirname,
+        "./src/shims/tauri-apps/api/event.ts",
+      ),
+      "@tauri-apps/api/app": path.resolve(
+        __dirname,
+        "./src/shims/tauri-apps/api/app.ts",
+      ),
+      "@tauri-apps/api/path": path.resolve(
+        __dirname,
+        "./src/shims/tauri-apps/api/path.ts",
+      ),
+      "@tauri-apps/plugin-process": path.resolve(
+        __dirname,
+        "./src/shims/tauri-apps/plugin-process.ts",
+      ),
+      "@tauri-apps/plugin-updater": path.resolve(
+        __dirname,
+        "./src/shims/tauri-apps/plugin-updater.ts",
+      ),
     },
   },
   clearScreen: false,

@@ -10,7 +10,7 @@
 
 > **2026-07-10 范围收缩**：下列计划中涉及 Universal Providers、Settings/universal tab、`components/universal/**`、`universalProviderPresets.ts`、以及 Provider「导入当前配置」的条目均已 **作废**；server 以 per-app `providers.json` 为唯一配置源，历史 Universal 数据只进入显式迁移预检，普通启动不写盘。
 
-> **2026-07-21 Server 边界**：server 必须搭配 Router；请求固定使用当前 Provider 或 Share binding，同一请求的有界重试不得切换 Provider。桌面自动故障转移、全局出站代理和 Settings 数据管理导入导出均为 excluded。跨环境迁移使用停机复制完整数据目录，见 `docs/server-data-migration.md`。
+> **2026-07-22 Server 边界**：server 必须搭配 Router；Share、显式 Provider 和所有非 Claude 请求固定使用选定 binding，同一请求不得切换 Provider。仅未固定的直接 Claude Messages/count_tokens 请求可在受控失败、3 次/10s 总预算和下游 commit 前按 Provider Store 顺序 failover。桌面可配置的自动故障转移、全局出站代理和 Settings 数据管理导入导出仍为 excluded。跨环境迁移使用停机复制完整数据目录，见 `docs/server-data-migration.md`。
 
 > **2026-07-21 Provider 边界**：Provider 业务表单不再追求 desktop 源码同构。Server 使用 Rust registry 投影和 `server/providers/editor/ServerProviderForm.tsx`，只呈现有真实 Server consumer 的 typed 字段。`components/providers/forms/ProviderForm.tsx` 及其 OpenCode/OpenClaw/Hermes/Claude Desktop 分支仅作为 pinned desktop 同步参考，Server Add/Edit 不导入它们；`audit-server-product-boundary.mjs` 固化该入口约束。下文 U12.2/U12.7 中与此冲突的旧任务均以本条为准。
 

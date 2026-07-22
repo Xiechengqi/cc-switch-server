@@ -1133,6 +1133,14 @@
       "notes": "Server web runtime shim for desktop-synced settings UI."
     },
     {
+      "name": "get_provider_credential",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /web-api/invoke/get_provider_credential",
+      "notes": "Returns one configured Provider credential slot to an authenticated admin for explicit edit, reveal, or copy actions; ordinary Provider resources remain redacted."
+    },
+    {
       "name": "get_provider_registry",
       "support": "native",
       "implemented": true,
@@ -1842,10 +1850,10 @@
     },
     {
       "name": "test_api_endpoints",
-      "support": "shim",
+      "support": "native",
       "implemented": true,
       "feature": "settings",
-      "notes": "Server web runtime shim."
+      "notes": "Authenticated, bounded server-side HTTP/HTTPS endpoint latency probe."
     },
     {
       "name": "testUsageScript",

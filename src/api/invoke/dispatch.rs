@@ -283,6 +283,20 @@ async fn web_invoke_dispatch(
         "get_provider_registry" => Ok(json!(
             crate::domain::providers::registry::provider_registry()
         )),
+        "get_provider_credential" => {
+            require_provider_write_contract(state, headers)?;
+            let app = web_arg_app(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
+            let slot = web_arg_string_any(&args, &["slot"])?;
+            let key = crate::domain::providers::registry::ProviderKey::new(app, provider_id)
+                .map_err(ApiError::bad_request)?;
+            let credential = state
+                .reveal_provider_credential_command(&key, &slot)
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            Ok(json!(credential))
+        }
         "get_provider_store_migration" => {
             let config_dir = state.config_dir.clone();
             let report = tokio::task::spawn_blocking(move || {
@@ -1829,7 +1843,15 @@ async fn web_invoke_dispatch(
         "get_default_cost_multiplier" => Ok(json!(1.0)),
         "set_default_cost_multiplier" => Ok(Value::Null),
         "read_live_provider_settings" => Ok(json!({})),
-        "test_api_endpoints" => Ok(json!([])),
+        "test_api_endpoints" => {
+            let urls: Vec<String> = web_arg_value(&args, "urls")?;
+            let timeout_secs = web_optional_u64(&args, &["timeoutSecs", "timeout_secs"]);
+            let http_client = state.http_client().await;
+            Ok(json!(
+                super::endpoint_latency::test_api_endpoints(&http_client, urls, timeout_secs,)
+                    .await?
+            ))
+        }
         "get_custom_endpoints" => Ok(json!([])),
         "add_custom_endpoint" | "remove_custom_endpoint" | "update_endpoint_last_used" => {
             Ok(Value::Null)

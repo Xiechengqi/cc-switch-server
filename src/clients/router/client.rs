@@ -2086,7 +2086,8 @@ async fn push_share_descriptor_ops_request(
             reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
         )
     {
-        let response = send_share_ops_request(http, &api_base, identity, ops).await?;
+        let response =
+            send_share_ops_request(http, &api_base, identity, legacy_share_operations(ops)).await?;
         if response.status().is_success() {
             return Ok(ShareDescriptorSyncOutcome::Legacy);
         }
@@ -2097,6 +2098,19 @@ async fn push_share_descriptor_ops_request(
 
     let body = response.text().await.unwrap_or_default();
     bail!("router strict Share descriptor sync failed: {status}: {body}");
+}
+
+fn legacy_share_operations(mut ops: Vec<ShareSyncOperation>) -> Vec<ShareSyncOperation> {
+    for operation in &mut ops {
+        if let Some(share) = operation.share.as_mut() {
+            // Legacy Routers deserialize and reserialize the signed payload before
+            // verification. Omit strict-only fields they do not know so both sides
+            // build the same canonical JSON.
+            share.descriptor_generation = 0;
+            share.descriptor_fingerprint.clear();
+        }
+    }
+    ops
 }
 
 async fn send_share_descriptor_ops_request(
@@ -3680,32 +3694,83 @@ mod tests {
 
     #[tokio::test]
     async fn descriptor_sync_falls_back_only_before_strict_mode_is_sticky() {
-        async fn strict_handler() -> StatusCode {
+        async fn strict_handler(
+            State(requests): State<Arc<Mutex<Vec<(String, Value)>>>>,
+            Json(request): Json<Value>,
+        ) -> StatusCode {
+            requests.lock().await.push(("strict".into(), request));
             StatusCode::NOT_FOUND
         }
-        async fn legacy_handler() -> Json<Value> {
+        async fn legacy_handler(
+            State(requests): State<Arc<Mutex<Vec<(String, Value)>>>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            requests.lock().await.push(("legacy".into(), request));
             Json(json!({"ok": true}))
         }
 
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
             .route("/v1/shares/descriptor-batch-sync", post(strict_handler))
-            .route("/v1/shares/batch-sync", post(legacy_handler));
+            .route("/v1/shares/batch-sync", post(legacy_handler))
+            .with_state(requests.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut config = ServerConfig::empty();
         config.router.url = Some(format!("http://{addr}"));
+        config.client.tunnel_subdomain = Some("client-alpha".into());
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-descriptor-fallback".into();
         config.router.identity = Some(identity);
+        let ops = vec![ShareSyncOperation {
+            kind: "upsert".into(),
+            share_id: None,
+            share: Some(ShareDescriptor {
+                share_id: "share-descriptor-fallback".into(),
+                share_name: "Descriptor fallback".into(),
+                subdomain: "fallback".into(),
+                descriptor_generation: 7,
+                descriptor_fingerprint: "descriptor-fingerprint".into(),
+                ..ShareDescriptor::default()
+            }),
+        }];
 
         assert_eq!(
-            push_share_descriptor_ops(&reqwest::Client::new(), &config, Vec::new(), false)
+            push_share_descriptor_ops(&reqwest::Client::new(), &config, ops.clone(), false)
                 .await
                 .unwrap(),
             ShareDescriptorSyncOutcome::Legacy
         );
-        let error = push_share_descriptor_ops(&reqwest::Client::new(), &config, Vec::new(), true)
+        let captured = requests.lock().await.clone();
+        assert_eq!(captured.len(), 2);
+        let strict_share = &captured[0].1["ops"][0]["share"];
+        assert_eq!(strict_share["descriptorGeneration"], 7);
+        assert_eq!(
+            strict_share["descriptorFingerprint"],
+            "descriptor-fingerprint"
+        );
+        let legacy_request = &captured[1].1;
+        let legacy_share = &legacy_request["ops"][0]["share"];
+        assert!(legacy_share.get("descriptorGeneration").is_none());
+        assert!(legacy_share.get("descriptorFingerprint").is_none());
+
+        let expected_legacy_ops =
+            legacy_share_operations(canonicalize_share_operations(&config, ops.clone()).unwrap());
+        let expected_signature = sign_payload(
+            config.registered_router_identity().unwrap(),
+            "share_batch_sync",
+            &expected_legacy_ops,
+            legacy_request["timestampMs"].as_i64().unwrap(),
+            legacy_request["nonce"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_request["signature"].as_str(),
+            Some(expected_signature.as_str())
+        );
+
+        let error = push_share_descriptor_ops(&reqwest::Client::new(), &config, ops, true)
             .await
             .expect_err("sticky strict mode must not downgrade after a 404");
         assert!(error.to_string().contains("404 Not Found"));

@@ -113,10 +113,10 @@ export function AddProviderDialog({
       </FullScreenPanel>
       <ConfirmDialog
         isOpen={closeGuard.confirmOpen}
-        title="放弃未保存的更改？"
-        message="当前供应商配置尚未保存。关闭后，这些更改将丢失。"
-        confirmText="放弃更改"
-        cancelText="继续编辑"
+        title={t("provider.unsavedChanges.title")}
+        message={t("provider.unsavedChanges.addMessage")}
+        confirmText={t("provider.unsavedChanges.discard")}
+        cancelText={t("provider.unsavedChanges.keepEditing")}
         variant="destructive"
         zIndex="top"
         onConfirm={closeGuard.discardAndClose}

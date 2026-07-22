@@ -147,6 +147,10 @@ textarea::placeholder {
   opacity: 1;
 }
 
+[role="combobox"][data-placeholder] {
+  color: hsl(var(--muted-foreground) / 0.55) !important;
+}
+
 html.dark {
   color-scheme: dark;
 }

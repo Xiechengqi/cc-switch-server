@@ -1,0 +1,138 @@
+{
+  "common": {
+    "copied": "已复制"
+  },
+  "providers": {
+    "addProvider": "添加供应商"
+  },
+  "provider": {
+    "share": {
+      "sectionTitle": "远程分享",
+      "addPageBadge": "保存后可用",
+      "enableShare": "启用远程分享",
+      "addPagePlaceholder": "请先保存供应商；保存后重新打开编辑页即可配置远程分享。",
+      "stateActive": "分享已启用",
+      "statePaused": "分享已暂停",
+      "stateError": "分享异常",
+      "stateNone": "未启用分享",
+      "invalidNumber": "请输入有效数字",
+      "invalidConfiguration": "请修正远程分享配置后再保存",
+      "sectionHint": "每个 Provider 对应一个 Share。在此配置分享参数；Router Console 可管理运营侧高级选项。",
+      "openRouterConsole": "打开 Router Console",
+      "disabledHint": "开启后可配置远程分享参数并创建 Share。",
+      "routerSyncFailed": "Router 同步失败：{{error}}",
+      "routerSyncPending": "正在同步到 Router",
+      "ownerRequired": "请先在分享设置页配置 Client Tunnel Owner 邮箱"
+    },
+    "form": {
+      "gemini": {
+        "antigravityOauthTitle": "Antigravity OAuth 认证模式",
+        "antigravityOauthHint": "Antigravity OAuth 使用托管的 Antigravity 账号，无需填写 API Key。"
+      }
+    }
+  },
+  "share": {
+    "unsupportedApp": "{{app}} 暂不支持分享；请切换到 Claude、Codex 或 Gemini 标签后再创建 Share。",
+    "validation": {
+      "invalidEmail": "邮箱格式无效"
+    },
+    "saleMarketKind": {
+      "title": "Market 类型",
+      "token": "Token Market",
+      "share": "Share Market"
+    },
+    "market": {
+      "allSelected": "已选中所有 Market"
+    },
+    "accountMarket": {
+      "title": "Share Market",
+      "select": "选择 Share Market",
+      "required": "请选择一个 Share Market"
+    },
+    "permanent": "永久",
+    "expiration": "到期",
+    "userLimit": {
+      "periodLifetime": "累计",
+      "periodDay": "每天",
+      "periodWeek": "每周",
+      "periodMonth": "自然月",
+      "title": "用户限制",
+      "hint": "总 Share 限制始终生效；每个用户还受自己的限制约束。",
+      "add": "添加用户",
+      "edit": "编辑用户限制",
+      "period": "Token 周期"
+    },
+    "boundProviderHint": "此应用的请求固定使用绑定的 Provider，不参与故障转移。",
+    "manageInProviderHint": "修改分享设置请打开绑定的 Provider 编辑页。",
+    "sharedWithEmails": "Share To",
+    "emptyReadOnlyHint": "分享在 Provider 编辑页的“远程分享”区域创建与管理。",
+    "readOnlyOverviewHint": "此为只读总览。修改分享设置请前往绑定的 Provider 编辑页。",
+    "routerOwner": {
+      "signedInOwner": "已以 Owner {{email}} 登录，可编辑配置",
+      "signedInReadOnly": "当前登录 {{email}}，只有 Owner {{owner}} 可以编辑配置",
+      "signInPrompt": "使用 Share Owner 邮箱登录后可编辑配置",
+      "sendCode": "发送验证码",
+      "codePlaceholder": "验证码",
+      "verify": "验证",
+      "changeEmail": "更换邮箱",
+      "codeSent": "验证码已发送到 {{target}}"
+    }
+  },
+  "codexConfig": {
+    "noCommonConfigToApply": "通用配置片段为空或没有可写入的内容"
+  },
+  "claudeDesktop": {
+    "route": {
+      "stopBlockedByTakeover": "其他应用正在使用代理接管。请先在设置中关闭对应应用的接管，再停止本地路由。"
+    }
+  },
+  "proxy": {
+    "routing": {
+      "ready": "已路由",
+      "needsProvider": "待配置"
+    },
+    "server": {
+      "stopped": "代理服务已停止",
+      "stopFailed": "停止代理服务失败"
+    }
+  },
+  "settings": {
+    "loadFailed": "无法加载设置，请刷新页面后重试。",
+    "selectFileFailed": "选择目录失败",
+    "authCenter": {
+      "serverDescription": "管理用于反代上游的官方 OAuth 账号。用量刷新仅作用于当前启用的 Provider。",
+      "claudeOauthDescription": "管理 Claude 官方订阅账号",
+      "grokOauthDescription": "管理 Grok/xAI 订阅账号",
+      "kiroOauthDescription": "管理 Kiro AWS Builder ID 账号",
+      "cursorOauthDescription": "管理 Cursor 订阅账号",
+      "geminiOauthDescription": "管理 Google Gemini 账号",
+      "antigravityOauthDescription": "管理 Antigravity 订阅账号",
+      "deepseekAccountDescription": "管理 DeepSeek 账号"
+    },
+    "serverConfigDir": {
+      "title": "Server 配置目录",
+      "description": "providers、shares、ui-settings 等持久化文件所在目录。监听地址与端口由进程启动参数决定。"
+    },
+    "serverSecurity": {
+      "currentPasswordRequired": "请输入当前密码"
+    },
+    "share": {
+      "health": {
+        "clientTunnel": {
+          "conflict": "子域名冲突，未在 Router 注册",
+          "claimFailed": "Router 注册失败",
+          "unclaimed": "已配置，未在 Router 注册",
+          "connecting": "已注册，隧道连接中"
+        }
+      }
+    }
+  },
+  "usage": {
+    "unpriced": "未定价"
+  },
+  "notifications": {
+    "clearCurrentSuccess": "已取消启用",
+    "clearCurrentFailedTitle": "取消启用失败",
+    "clearCurrentFailed": "取消启用失败：{{error}}"
+  }
+}

@@ -2210,9 +2210,20 @@ fn apply_auth_headers(
         .then(|| accounts.find_for_provider(stored.provider_type, account_id))
         .flatten();
     let account_credential = if provider_secret.is_none() {
-        manager_for(stored.provider_type)
-            .get_valid_token(accounts, stored.provider_type, account_id, now_ms_i64())
-            .ok()
+        let credential = manager_for(stored.provider_type).get_valid_token(
+            accounts,
+            stored.provider_type,
+            account_id,
+            now_ms_i64(),
+        );
+        if app == AppKind::Claude && stored.provider_type == ProviderType::ClaudeOAuth {
+            Some(credential.map_err(|error| ProxyError {
+                status: axum::http::StatusCode::UNAUTHORIZED,
+                message: format!("claude_oauth managed account credential is unavailable: {error}"),
+            })?)
+        } else {
+            credential.ok()
+        }
     } else {
         None
     };

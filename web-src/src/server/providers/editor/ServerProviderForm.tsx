@@ -1,10 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  ArrowLeft,
   Copy,
+  Gauge,
   KeyRound,
+  LoaderCircle,
   Plus,
+  RotateCcw,
   Save,
   Trash2,
 } from "lucide-react";
@@ -15,6 +21,8 @@ import {
   ProviderShareSection,
 } from "@/components/providers/ProviderShareSection";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { IconPicker } from "@/components/IconPicker";
+import { ProviderIcon } from "@/components/ProviderIcon";
 import { AntigravityOAuthSection } from "@/components/providers/forms/AntigravityOAuthSection";
 import { ClaudeOAuthSection } from "@/components/providers/forms/ClaudeOAuthSection";
 import { CodexOAuthSection } from "@/components/providers/forms/CodexOAuthSection";
@@ -30,6 +38,13 @@ import {
 } from "@/components/providers/forms/ProviderPresetSelector";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -48,6 +63,9 @@ import type {
   ProviderResource,
 } from "@/lib/api/providers";
 import { providersApi } from "@/lib/api/providers";
+import { vscodeApi } from "@/lib/api/vscode";
+import { copyText } from "@/lib/clipboard";
+import { getIconMetadata } from "@/icons/extracted/metadata";
 import { stableStringify } from "@/lib/stableStringify";
 import {
   customPolicyForProfile,
@@ -74,19 +92,16 @@ import {
   setSingleModel,
   type CoreProviderDraft,
 } from "./providerDraft";
+import {
+  credentialInputValue,
+  updateCredentialInput,
+  type CredentialEdit,
+  type CredentialRevealStatus,
+} from "./credentialEditing";
 
 const KEEP_SENTINEL = "__CC_SWITCH_SECRET_KEEP__";
 const PRIMARY_CREDENTIAL_SLOT = "/settingsConfig/apiKey";
 const EXTRA_HEADER_PREFIX = "/settingsConfig/extraHeaders/";
-
-type CredentialAction = "keep" | "replace" | "clear";
-
-interface CredentialEdit {
-  slot: string;
-  configured: boolean;
-  action: CredentialAction;
-  value: string;
-}
 
 interface ExtraHeaderEdit {
   id: string;
@@ -124,6 +139,14 @@ interface PendingIdentityAction {
   title: string;
   message: string;
   cloneDraft?: CloneAsCustomDraft;
+}
+
+interface EndpointProbeState {
+  url: string;
+  pending: boolean;
+  latency?: number;
+  status?: number;
+  error?: string;
 }
 
 interface CloneAsCustomDraft {
@@ -261,12 +284,12 @@ function presetEntriesForApp(app: CoreProviderApp): PresetEntry[] {
     });
 }
 
-const PRESET_CATEGORY_LABELS: Record<string, string> = {
-  official: "官方",
-  cn_official: "国内官方",
-  aggregator: "聚合服务",
-  third_party: "第三方",
-  custom: "自定义",
+const PRESET_CATEGORY_KEYS: Record<string, string> = {
+  official: "serverProviderForm.categories.official",
+  cn_official: "serverProviderForm.categories.cnOfficial",
+  aggregator: "serverProviderForm.categories.aggregator",
+  third_party: "serverProviderForm.categories.thirdParty",
+  custom: "serverProviderForm.categories.custom",
 };
 
 function actualSlot(
@@ -316,7 +339,6 @@ function buildCredentialEdits(
       "/AWS_SESSION_TOKEN",
     );
     const sessionToken = credentialEdit(session, resource, isEditMode);
-    if (!sessionToken.configured) sessionToken.action = "clear";
     return {
       accessKeyId: credentialEdit(access, resource, isEditMode),
       secretAccessKey: credentialEdit(secret, resource, isEditMode),
@@ -538,6 +560,7 @@ function collectPrimaryCredentialPatches(
   const patches: ProviderCredentialPatches = {};
   for (const edit of Object.values(state.credentials)) {
     if (edit.action === "replace") {
+      if (!edit.configured && !edit.value.trim()) continue;
       patches[edit.slot] = { action: "replace", value: edit.value.trim() };
     } else if (edit.action === "clear") {
       patches[edit.slot] = { action: "clear" };
@@ -614,36 +637,41 @@ function prepareSettingsForSubmit(
 function validateState(
   state: EditorState,
   profile: ProviderRegistryProfile,
+  t: TFunction,
 ): string | null {
-  if (!state.draft.name.trim()) return "供应商名称不能为空";
+  if (!state.draft.name.trim()) {
+    return t("serverProviderForm.validation.nameRequired");
+  }
   if (profile.formComposition === "legacy") return null;
   if (profile.credentialPolicy.mode === "managed_account" && !state.accountId) {
-    return "请选择一个已认证账号";
+    return t("serverProviderForm.validation.accountRequired");
   }
   if (
     (profile.endpointPolicy === "custom" ||
       profile.endpointPolicy === "override_allowed") &&
     !isValidEndpoint(state.endpoint)
   ) {
-    return "请输入有效的 HTTP 或 HTTPS Endpoint";
+    return t("serverProviderForm.validation.endpointInvalid");
   }
   if (profile.modelPolicy === "single" && !state.upstreamModel.trim()) {
-    return "实际请求模型不能为空";
+    return t("serverProviderForm.validation.modelRequired");
   }
   if (profile.formComposition === "aws" && !state.awsRegion.trim()) {
-    return "AWS Region 不能为空";
+    return t("serverProviderForm.validation.awsRegionRequired");
   }
   for (const [name, edit] of Object.entries(state.credentials)) {
     const required = name !== "sessionToken";
     if (edit.action === "replace" && required && !edit.value.trim()) {
-      return "请填写需要替换的凭据";
+      return t("serverProviderForm.validation.replacementRequired");
     }
     if (edit.action === "clear" && required) {
-      return "必需凭据不能清除；请选择替换";
+      return t("serverProviderForm.validation.requiredCredentialCannotClear");
     }
   }
   if (profile.formComposition === "custom") {
-    if (!state.customBinding) return "Custom Provider 协议配置缺失";
+    if (!state.customBinding) {
+      return t("serverProviderForm.validation.customBindingMissing");
+    }
     const customPolicy = customPolicyForProfile(profile);
     if (
       !customPolicy?.protocols.includes(
@@ -653,7 +681,7 @@ function validateState(
         state.customBinding.authScheme as ProviderAuthScheme,
       )
     ) {
-      return "当前协议与认证组合不受支持";
+      return t("serverProviderForm.validation.unsupportedBinding");
     }
     const authRequired = true;
     const primary = state.credentials.primary;
@@ -662,31 +690,47 @@ function validateState(
       primary?.action === "replace" &&
       !primary.value.trim()
     ) {
-      return "请填写认证凭据";
+      return t("serverProviderForm.validation.authCredentialRequired");
     }
     if (authRequired && primary?.action === "clear") {
-      return "当前认证方式需要凭据";
+      return t("serverProviderForm.validation.authRequired");
     }
     const names = new Set<string>();
     for (const header of state.extraHeaders.filter((item) => !item.removed)) {
       const name = header.name.trim().toLowerCase();
-      if (!isValidHeaderName(name)) return `Header 名称无效: ${header.name}`;
-      if (HEADER_DENYLIST.has(name)) return `Header 由驱动管理: ${header.name}`;
-      if (names.has(name)) return `Header 名称重复: ${header.name}`;
+      if (!isValidHeaderName(name)) {
+        return t("serverProviderForm.validation.invalidHeader", {
+          name: header.name,
+        });
+      }
+      if (HEADER_DENYLIST.has(name)) {
+        return t("serverProviderForm.validation.managedHeader", {
+          name: header.name,
+        });
+      }
+      if (names.has(name)) {
+        return t("serverProviderForm.validation.duplicateHeader", {
+          name: header.name,
+        });
+      }
       names.add(name);
       if (header.action === "replace" && !header.value.trim()) {
-        return `请填写 Header ${header.name} 的值`;
+        return t("serverProviderForm.validation.headerValueRequired", {
+          name: header.name,
+        });
       }
     }
   }
   if (state.costMultiplier.trim()) {
     const value = Number(state.costMultiplier);
-    if (!Number.isFinite(value) || value < 0) return "成本倍率必须是非负数字";
+    if (!Number.isFinite(value) || value < 0) {
+      return t("serverProviderForm.validation.costMultiplierInvalid");
+    }
   }
   if (state.quotaDispatchLimitPercent.trim()) {
     const value = Number(state.quotaDispatchLimitPercent);
     if (!Number.isInteger(value) || value < 1 || value > 100) {
-      return "调度用量上限必须是 1-100 的整数";
+      return t("serverProviderForm.validation.quotaLimitInvalid");
     }
   }
   return null;
@@ -729,57 +773,229 @@ function Section({
   );
 }
 
+function ProviderIconControl({
+  icon,
+  iconColor,
+  providerName,
+  onChange,
+}: {
+  icon?: string;
+  iconColor?: string;
+  providerName: string;
+  onChange: (icon: string, iconColor?: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+
+  const selectIcon = (nextIcon: string) => {
+    onChange(nextIcon, getIconMetadata(nextIcon)?.defaultColor);
+  };
+
+  return (
+    <div className="flex justify-center">
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogTrigger asChild>
+          <button
+            type="button"
+            className="flex h-20 w-20 items-center justify-center rounded-lg border-2 border-muted bg-muted/30 p-3 transition-colors hover:border-primary hover:bg-muted/50"
+            title={
+              icon
+                ? t("providerIcon.clickToChange")
+                : t("providerIcon.clickToSelect")
+            }
+            aria-label={
+              icon
+                ? t("providerIcon.clickToChange")
+                : t("providerIcon.clickToSelect")
+            }
+          >
+            <ProviderIcon
+              icon={icon}
+              name={providerName || "Provider"}
+              color={iconColor}
+              size={48}
+            />
+          </button>
+        </DialogTrigger>
+        <DialogContent
+          variant="fullscreen"
+          zIndex="top"
+          overlayClassName="bg-[hsl(var(--background))] backdrop-blur-0"
+          className="p-0 sm:rounded-none"
+        >
+          <div className="flex h-full flex-col">
+            <div className="flex shrink-0 items-center gap-4 border-b border-border-default bg-muted/40 px-6 py-4">
+              <DialogClose asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  title={t("common.back")}
+                  aria-label={t("common.back")}
+                >
+                  <ArrowLeft className="h-4 w-4" />
+                </Button>
+              </DialogClose>
+              <DialogTitle>{t("providerIcon.selectIcon")}</DialogTitle>
+            </div>
+            <div className="flex-1 overflow-y-auto px-6 py-6">
+              <div className="space-y-4">
+                <IconPicker
+                  value={icon}
+                  onValueChange={selectIcon}
+                  color={iconColor}
+                />
+                <div className="flex justify-end">
+                  <DialogClose asChild>
+                    <Button type="button" variant="outline">
+                      {t("common.done")}
+                    </Button>
+                  </DialogClose>
+                </div>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
 function CredentialControl({
   label,
   edit,
   optional = false,
+  revealedValue,
+  revealStatus = "idle",
+  onRetryReveal,
   onChange,
 }: {
   label: string;
   edit: CredentialEdit;
   optional?: boolean;
+  revealedValue?: string;
+  revealStatus?: CredentialRevealStatus;
+  onRetryReveal?: () => void;
   onChange: (next: CredentialEdit) => void;
 }) {
-  const actions: CredentialAction[] = edit.configured
-    ? optional
-      ? ["keep", "replace", "clear"]
-      : ["keep", "replace"]
-    : optional
-      ? ["replace", "clear"]
-      : ["replace"];
+  const { t } = useTranslation();
+  const value = credentialInputValue(edit, revealedValue);
+  const loadingCurrent =
+    edit.configured && edit.action === "keep" && revealStatus === "loading";
+  const currentRevealFailed =
+    edit.configured && edit.action === "keep" && revealStatus === "error";
+
+  const updateValue = (nextValue: string) => {
+    onChange(
+      updateCredentialInput(edit, nextValue, {
+        optional,
+        revealedValue,
+        revealStatus,
+      }),
+    );
+  };
+
+  const handleCopy = async () => {
+    if (!value) return;
+    try {
+      await copyText(value);
+      toast.success(t("common.copied"));
+    } catch (error) {
+      toast.error(String(error));
+    }
+  };
+
   return (
     <div className="space-y-2">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <Label>{label}</Label>
-        <div className="flex h-8 items-center rounded-md border border-border/60 p-0.5">
-          {actions.map((action) => (
-            <Button
-              key={action}
-              type="button"
-              size="sm"
-              variant={edit.action === action ? "secondary" : "ghost"}
-              className="h-7 rounded-sm px-2 text-xs"
-              onClick={() => onChange({ ...edit, action, value: "" })}
-            >
-              {action === "keep"
-                ? "保留"
-                : action === "replace"
-                  ? "替换"
-                  : "清除"}
-            </Button>
-          ))}
+      <Label>{label}</Label>
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <SecretInput
+            value={value}
+            disabled={loadingCurrent || edit.action === "clear"}
+            onChange={(event) => updateValue(event.target.value)}
+            autoComplete="new-password"
+            placeholder={
+              loadingCurrent
+                ? t("serverProviderForm.credentials.loading")
+                : currentRevealFailed
+                  ? t("serverProviderForm.credentials.loadFailedPlaceholder")
+                  : edit.action === "clear"
+                    ? t("serverProviderForm.credentials.willClear")
+                    : t("serverProviderForm.credentials.placeholder")
+            }
+          />
         </div>
+        <Button
+          type="button"
+          size="icon"
+          variant="outline"
+          disabled={!value || loadingCurrent || edit.action === "clear"}
+          title={t("common.copy")}
+          aria-label={t("common.copy")}
+          onClick={() => void handleCopy()}
+        >
+          {loadingCurrent ? (
+            <LoaderCircle className="h-4 w-4 animate-spin" />
+          ) : (
+            <Copy className="h-4 w-4" />
+          )}
+        </Button>
+        {optional && edit.configured ? (
+          <Button
+            type="button"
+            size="icon"
+            variant="outline"
+            title={
+              edit.action === "clear"
+                ? t("common.undo")
+                : t("serverProviderForm.credentials.clear")
+            }
+            aria-label={
+              edit.action === "clear"
+                ? t("common.undo")
+                : t("serverProviderForm.credentials.clear")
+            }
+            onClick={() =>
+              onChange({
+                ...edit,
+                action: edit.action === "clear" ? "keep" : "clear",
+                value: "",
+              })
+            }
+          >
+            {edit.action === "clear" ? (
+              <RotateCcw className="h-4 w-4" />
+            ) : (
+              <Trash2 className="h-4 w-4" />
+            )}
+          </Button>
+        ) : null}
+        {currentRevealFailed && onRetryReveal ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={onRetryReveal}
+          >
+            {t("common.retry")}
+          </Button>
+        ) : null}
       </div>
-      {edit.action === "replace" ? (
-        <SecretInput
-          value={edit.value}
-          onChange={(event) => onChange({ ...edit, value: event.target.value })}
-          autoComplete="new-password"
-          placeholder={edit.configured ? "输入新凭据" : "输入凭据"}
-        />
-      ) : null}
       <div className="text-xs text-muted-foreground">
-        {edit.configured ? "已配置" : optional ? "未配置（可选）" : "未配置"}
+        {loadingCurrent
+          ? t("serverProviderForm.credentials.loading")
+          : currentRevealFailed
+            ? t("serverProviderForm.credentials.loadFailed")
+            : edit.action === "clear"
+              ? t("serverProviderForm.credentials.willClear")
+              : edit.action === "replace" && edit.configured
+                ? t("serverProviderForm.credentials.willReplace")
+                : edit.configured
+                  ? t("serverProviderForm.credentials.configured")
+                  : optional
+                    ? t("serverProviderForm.credentials.optionalMissing")
+                    : t("serverProviderForm.credentials.missing")}
       </div>
     </div>
   );
@@ -794,6 +1010,7 @@ function ManagedAccountSection({
   accountId: string;
   onAccountSelect: (accountId: string | null) => void;
 }) {
+  const { t } = useTranslation();
   const common = {
     selectedAccountId: accountId || null,
     onAccountSelect,
@@ -830,7 +1047,9 @@ function ManagedAccountSection({
       return (
         <div className="flex items-center gap-2 text-sm text-destructive">
           <AlertTriangle className="h-4 w-4" />
-          不支持的账号类型：{providerType}
+          {t("serverProviderForm.unsupportedAccountType", {
+            type: providerType,
+          })}
         </div>
       );
   }
@@ -851,6 +1070,7 @@ export function ServerProviderForm({
   showButtons = true,
   onOpenShareSettings,
 }: ServerProviderFormProps) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const isEditMode = Boolean(initialData && providerId);
   const initializationKey = `${appId}:${providerId ?? "new"}:${resource?.revision ?? 0}`;
@@ -861,6 +1081,12 @@ export function ServerProviderForm({
     [initializationKey],
   );
   const presetEntries = useMemo(() => presetEntriesForApp(appId), [appId]);
+  const presetCategoryLabels = Object.fromEntries(
+    Object.entries(PRESET_CATEGORY_KEYS).map(([category, key]) => [
+      category,
+      t(key),
+    ]),
+  );
   const [state, setState] = useState<EditorState>(initial);
   const [baseline, setBaseline] = useState(() => stableStringify(initial));
   const [shareDirty, setShareDirty] = useState(false);
@@ -876,11 +1102,29 @@ export function ServerProviderForm({
   );
   const [pendingIdentityAction, setPendingIdentityAction] =
     useState<PendingIdentityAction | null>(null);
+  const [revealedCredentialValues, setRevealedCredentialValues] = useState<
+    Record<string, string>
+  >({});
+  const [credentialRevealStatuses, setCredentialRevealStatuses] = useState<
+    Record<string, CredentialRevealStatus>
+  >({});
+  const [endpointProbe, setEndpointProbe] = useState<EndpointProbeState | null>(
+    null,
+  );
+  const endpointProbeGeneration = useRef(0);
+  const credentialRevealGeneration = useRef(0);
+  const configuredCredentialSlots = Object.values(initial.credentials)
+    .filter((edit) => edit.configured)
+    .map((edit) => edit.slot)
+    .sort();
+  const configuredCredentialSlotsKey = configuredCredentialSlots.join("\n");
 
   useEffect(() => {
     setState(initial);
     setBaseline(stableStringify(initial));
     setShareDirty(false);
+    endpointProbeGeneration.current += 1;
+    setEndpointProbe(null);
     setRebindEditing(false);
     setAdoptAccountId("");
     const nextCloneDraft = buildCloneDraft(appId, resource);
@@ -889,6 +1133,76 @@ export function ServerProviderForm({
     // `initial` already includes the app/provider/revision initialization key.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initial]);
+
+  useEffect(() => {
+    const generation = credentialRevealGeneration.current + 1;
+    credentialRevealGeneration.current = generation;
+    setRevealedCredentialValues({});
+    setCredentialRevealStatuses(
+      Object.fromEntries(
+        configuredCredentialSlots.map((slot) => [slot, "loading" as const]),
+      ),
+    );
+
+    if (!providerId) return;
+    for (const slot of configuredCredentialSlots) {
+      void providersApi
+        .getCredential(appId, providerId, slot)
+        .then((value) => {
+          if (credentialRevealGeneration.current !== generation) return;
+          setRevealedCredentialValues((current) => ({
+            ...current,
+            [slot]: value,
+          }));
+          setCredentialRevealStatuses((current) => ({
+            ...current,
+            [slot]: "ready",
+          }));
+        })
+        .catch(() => {
+          if (credentialRevealGeneration.current !== generation) return;
+          setCredentialRevealStatuses((current) => ({
+            ...current,
+            [slot]: "error",
+          }));
+        });
+    }
+
+    return () => {
+      if (credentialRevealGeneration.current === generation) {
+        credentialRevealGeneration.current += 1;
+      }
+    };
+    // The serialized slot list changes only when the Provider revision changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appId, configuredCredentialSlotsKey, initializationKey, providerId]);
+
+  const retryCredentialReveal = async (slot: string) => {
+    if (!providerId) return;
+    const generation = credentialRevealGeneration.current;
+    setCredentialRevealStatuses((current) => ({
+      ...current,
+      [slot]: "loading",
+    }));
+    try {
+      const value = await providersApi.getCredential(appId, providerId, slot);
+      if (credentialRevealGeneration.current !== generation) return;
+      setRevealedCredentialValues((current) => ({
+        ...current,
+        [slot]: value,
+      }));
+      setCredentialRevealStatuses((current) => ({
+        ...current,
+        [slot]: "ready",
+      }));
+    } catch {
+      if (credentialRevealGeneration.current !== generation) return;
+      setCredentialRevealStatuses((current) => ({
+        ...current,
+        [slot]: "error",
+      }));
+    }
+  };
 
   const profile = profileById(state.profileId);
   if (!profile || profile.app !== appId) {
@@ -953,19 +1267,60 @@ export function ServerProviderForm({
     }));
   };
 
+  const testEndpoint = async () => {
+    const url = state.endpoint.trim();
+    if (!isValidEndpoint(url)) return;
+    const generation = endpointProbeGeneration.current + 1;
+    endpointProbeGeneration.current = generation;
+    setEndpointProbe({ url, pending: true });
+    try {
+      const [result] = await vscodeApi.testApiEndpoints([url], {
+        timeoutSecs: 5,
+      });
+      if (endpointProbeGeneration.current !== generation) return;
+      if (!result) {
+        setEndpointProbe({
+          url,
+          pending: false,
+          error: t("endpointTest.noResult"),
+        });
+        return;
+      }
+      setEndpointProbe({
+        url,
+        pending: false,
+        latency:
+          typeof result.latency === "number"
+            ? Math.round(result.latency)
+            : undefined,
+        status: result.status,
+        error: result.error,
+      });
+    } catch (error) {
+      if (endpointProbeGeneration.current !== generation) return;
+      setEndpointProbe({
+        url,
+        pending: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
   const selectProfile = (profileId: string) => {
     const nextProfile = profileById(profileId);
     if (!nextProfile || nextProfile.app !== appId) return;
+    endpointProbeGeneration.current += 1;
+    setEndpointProbe(null);
     setState(buildEditorState(appId, undefined, undefined, nextProfile));
   };
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (customBindingDirty) {
-      toast.error("请先预览并应用协议绑定，再保存其他配置");
+      toast.error(t("serverProviderForm.toasts.applyBindingFirst"));
       return;
     }
-    const validationError = validateState(state, profile);
+    const validationError = validateState(state, profile, t);
     if (validationError) {
       toast.error(validationError);
       return;
@@ -1009,7 +1364,7 @@ export function ServerProviderForm({
       suggestedProfile.credentialPolicy.mode === "managed_account" &&
       !adoptAccountId
     ) {
-      toast.error("请选择一个已认证账号");
+      toast.error(t("serverProviderForm.validation.accountRequired"));
       return;
     }
     setIdentityActionPending(true);
@@ -1028,9 +1383,12 @@ export function ServerProviderForm({
       setPendingIdentityAction({
         kind: "adopt",
         previewToken: result.preview.previewToken,
-        title: "采用供应商配置",
+        title: t("serverProviderForm.identity.adoptTitle"),
         message: [
-          `将 ${resource.provider.name} 绑定到 ${suggestedProfile.label}。`,
+          t("serverProviderForm.identity.adoptMessage", {
+            provider: resource.provider.name,
+            profile: suggestedProfile.label,
+          }),
           ...result.preview.warnings,
         ].join("\n"),
       });
@@ -1048,17 +1406,17 @@ export function ServerProviderForm({
       ? customPolicyForProfile(customProfile)
       : undefined;
     if (!customProfile || !policy) {
-      toast.error("Custom Provider 配置不可用");
+      toast.error(t("serverProviderForm.toasts.customUnavailable"));
       return;
     }
     const targetProviderId = cloneDraft.targetProviderId.trim();
     const targetName = cloneDraft.targetName.trim();
     if (!targetProviderId || targetProviderId === providerId) {
-      toast.error("请输入与原 Provider 不同的新 ID");
+      toast.error(t("serverProviderForm.toasts.cloneIdInvalid"));
       return;
     }
     if (!targetName) {
-      toast.error("请输入新 Provider 名称");
+      toast.error(t("serverProviderForm.toasts.cloneNameRequired"));
       return;
     }
     if (
@@ -1069,7 +1427,7 @@ export function ServerProviderForm({
         cloneDraft.customBinding.authScheme as ProviderAuthScheme,
       )
     ) {
-      toast.error("当前协议与认证组合不受支持");
+      toast.error(t("serverProviderForm.validation.unsupportedBinding"));
       return;
     }
     const request: CloneAsCustomDraft = {
@@ -1090,11 +1448,18 @@ export function ServerProviderForm({
       setPendingIdentityAction({
         kind: "clone",
         previewToken: result.preview.previewToken,
-        title: "复制为 Custom Provider",
+        title: t("serverProviderForm.identity.cloneTitle"),
         message: [
-          `创建 ${request.targetName}（${request.targetProviderId}）。`,
-          `上游协议：${request.customBinding.upstreamProtocol}`,
-          `认证方式：${request.customBinding.authScheme}`,
+          t("serverProviderForm.identity.cloneMessage", {
+            name: request.targetName,
+            id: request.targetProviderId,
+          }),
+          t("serverProviderForm.identity.upstreamProtocolLine", {
+            protocol: request.customBinding.upstreamProtocol,
+          }),
+          t("serverProviderForm.identity.authSchemeLine", {
+            scheme: request.customBinding.authScheme,
+          }),
           ...result.preview.warnings,
         ].join("\n"),
         cloneDraft: request,
@@ -1108,7 +1473,7 @@ export function ServerProviderForm({
 
   const beginCustomRebind = async () => {
     if (!providerId || !resource || !state.customBinding) return;
-    const validationError = validateState(state, profile);
+    const validationError = validateState(state, profile, t);
     if (validationError) {
       toast.error(validationError);
       return;
@@ -1126,10 +1491,14 @@ export function ServerProviderForm({
       setPendingIdentityAction({
         kind: "rebind",
         previewToken: result.preview.previewToken,
-        title: "更改 Custom 绑定",
+        title: t("serverProviderForm.identity.rebindTitle"),
         message: [
-          `上游协议：${state.customBinding.upstreamProtocol}`,
-          `认证方式：${state.customBinding.authScheme}`,
+          t("serverProviderForm.identity.upstreamProtocolLine", {
+            protocol: state.customBinding.upstreamProtocol,
+          }),
+          t("serverProviderForm.identity.authSchemeLine", {
+            scheme: state.customBinding.authScheme,
+          }),
           ...result.preview.warnings,
         ].join("\n"),
       });
@@ -1186,8 +1555,8 @@ export function ServerProviderForm({
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
       toast.success(
         pendingIdentityAction.kind === "clone"
-          ? "Custom Provider 已创建"
-          : "供应商身份配置已更新",
+          ? t("serverProviderForm.toasts.customCreated")
+          : t("serverProviderForm.toasts.identityUpdated"),
       );
       setPendingIdentityAction(null);
       if (pendingIdentityAction.kind === "clone") {
@@ -1226,22 +1595,32 @@ export function ServerProviderForm({
         <ProviderPresetSelector
           selectedPresetId={state.profileId}
           presetEntries={presetEntries}
-          presetCategoryLabels={PRESET_CATEGORY_LABELS}
+          presetCategoryLabels={presetCategoryLabels}
           onPresetChange={selectProfile}
           customPresetId={`${appId}.custom_http`}
           category={state.draft.category}
         />
       ) : (
-        <div className="flex flex-wrap items-center gap-2 border-b border-border/50 pb-4">
-          <Badge variant="outline">{profile.label}</Badge>
-          <Badge
-            variant={profile.maturity === "stable" ? "secondary" : "outline"}
-          >
-            {profile.maturity === "stable" ? "稳定" : "实验性"}
-          </Badge>
-          <span className="text-xs text-muted-foreground">
-            {profile.profileId}
-          </span>
+        <div className="space-y-4 border-b border-border/50 pb-4">
+          <ProviderIconControl
+            icon={state.draft.icon}
+            iconColor={state.draft.iconColor}
+            providerName={state.draft.name}
+            onChange={(icon, iconColor) => updateDraft({ icon, iconColor })}
+          />
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <Badge variant="outline">{profile.label}</Badge>
+            <Badge
+              variant={profile.maturity === "stable" ? "secondary" : "outline"}
+            >
+              {profile.maturity === "stable"
+                ? t("serverProviderForm.identity.stable")
+                : t("serverProviderForm.identity.experimental")}
+            </Badge>
+            <span className="text-xs text-muted-foreground">
+              {profile.profileId}
+            </span>
+          </div>
         </div>
       )}
 
@@ -1254,7 +1633,7 @@ export function ServerProviderForm({
 
       {resource?.identity.status === "adoption_available" &&
       suggestedProfile ? (
-        <Section title="采用标准配置">
+        <Section title={t("serverProviderForm.identity.adoptSection")}>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <Badge variant="secondary">{suggestedProfile.label}</Badge>
@@ -1268,7 +1647,7 @@ export function ServerProviderForm({
               disabled={identityActionPending}
               onClick={() => void beginAdoptProfile()}
             >
-              预览并采用
+              {t("serverProviderForm.identity.adoptPreview")}
             </Button>
           </div>
           {suggestedProfile.credentialPolicy.mode === "managed_account" ? (
@@ -1286,15 +1665,16 @@ export function ServerProviderForm({
       ) : null}
 
       {profile.formComposition === "legacy" && resource && cloneCustomPolicy ? (
-        <Section title="复制为 Custom Provider">
+        <Section title={t("serverProviderForm.identity.cloneSection")}>
           <div className="flex items-start gap-2 text-sm text-muted-foreground">
             <Copy className="mt-0.5 h-4 w-4 shrink-0" />
-            保留当前
-            Provider，创建一份具有显式协议身份的新配置。应用前会预览运行时差异。
+            {t("serverProviderForm.identity.cloneDescription")}
           </div>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="server-provider-clone-id">新 Provider ID</Label>
+              <Label htmlFor="server-provider-clone-id">
+                {t("serverProviderForm.identity.newProviderId")}
+              </Label>
               <Input
                 id="server-provider-clone-id"
                 value={cloneDraft.targetProviderId}
@@ -1307,7 +1687,9 @@ export function ServerProviderForm({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="server-provider-clone-name">新名称</Label>
+              <Label htmlFor="server-provider-clone-name">
+                {t("serverProviderForm.identity.newName")}
+              </Label>
               <Input
                 id="server-provider-clone-name"
                 value={cloneDraft.targetName}
@@ -1320,7 +1702,7 @@ export function ServerProviderForm({
               />
             </div>
             <div className="space-y-2">
-              <Label>上游协议</Label>
+              <Label>{t("serverProviderForm.binding.upstreamProtocol")}</Label>
               <Select
                 value={cloneDraft.customBinding.upstreamProtocol}
                 onValueChange={(value) =>
@@ -1347,7 +1729,7 @@ export function ServerProviderForm({
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>认证方式</Label>
+              <Label>{t("serverProviderForm.binding.authScheme")}</Label>
               <Select
                 value={cloneDraft.customBinding.authScheme}
                 onValueChange={(value) =>
@@ -1381,16 +1763,18 @@ export function ServerProviderForm({
               onClick={() => void beginCloneAsCustom()}
             >
               <Copy className="mr-2 h-4 w-4" />
-              预览并创建
+              {t("serverProviderForm.identity.clonePreview")}
             </Button>
           </div>
         </Section>
       ) : null}
 
-      <Section title="基本信息">
+      <Section title={t("serverProviderForm.basic.title")}>
         <div className="grid gap-4 md:grid-cols-2">
           <div className="space-y-2">
-            <Label htmlFor="server-provider-name">名称</Label>
+            <Label htmlFor="server-provider-name">
+              {t("serverProviderForm.basic.name")}
+            </Label>
             <Input
               id="server-provider-name"
               value={state.draft.name}
@@ -1404,7 +1788,9 @@ export function ServerProviderForm({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="server-provider-website">网站</Label>
+            <Label htmlFor="server-provider-website">
+              {t("serverProviderForm.basic.website")}
+            </Label>
             <Input
               id="server-provider-website"
               type="url"
@@ -1422,7 +1808,9 @@ export function ServerProviderForm({
           </div>
         </div>
         <div className="space-y-2">
-          <Label htmlFor="server-provider-notes">备注</Label>
+          <Label htmlFor="server-provider-notes">
+            {t("serverProviderForm.basic.notes")}
+          </Label>
           <Textarea
             id="server-provider-notes"
             value={state.draft.notes}
@@ -1434,7 +1822,7 @@ export function ServerProviderForm({
 
       {profile.formComposition === "managed_account" &&
       profile.credentialPolicy.mode === "managed_account" ? (
-        <Section title="认证账号">
+        <Section title={t("serverProviderForm.account.title")}>
           <ManagedAccountSection
             providerType={profile.credentialPolicy.accountProviderType}
             accountId={state.accountId}
@@ -1450,26 +1838,55 @@ export function ServerProviderForm({
 
       {profile.formComposition === "static_secret" &&
       state.credentials.primary ? (
-        <Section title="认证凭据">
+        <Section title={t("serverProviderForm.credentials.title")}>
           <CredentialControl
-            label="API Key / Bearer Token"
+            label={t("serverProviderForm.credentials.apiToken")}
             edit={state.credentials.primary}
+            revealedValue={
+              revealedCredentialValues[state.credentials.primary.slot]
+            }
+            revealStatus={
+              credentialRevealStatuses[state.credentials.primary.slot]
+            }
+            onRetryReveal={() =>
+              void retryCredentialReveal(state.credentials.primary.slot)
+            }
             onChange={(next) => updateCredential("primary", next)}
           />
         </Section>
       ) : null}
 
       {profile.formComposition === "aws" ? (
-        <Section title="AWS 凭据">
+        <Section title={t("serverProviderForm.aws.title")}>
           <div className="grid gap-4 md:grid-cols-2">
             <CredentialControl
               label="Access Key ID"
               edit={state.credentials.accessKeyId}
+              revealedValue={
+                revealedCredentialValues[state.credentials.accessKeyId.slot]
+              }
+              revealStatus={
+                credentialRevealStatuses[state.credentials.accessKeyId.slot]
+              }
+              onRetryReveal={() =>
+                void retryCredentialReveal(state.credentials.accessKeyId.slot)
+              }
               onChange={(next) => updateCredential("accessKeyId", next)}
             />
             <CredentialControl
               label="Secret Access Key"
               edit={state.credentials.secretAccessKey}
+              revealedValue={
+                revealedCredentialValues[state.credentials.secretAccessKey.slot]
+              }
+              revealStatus={
+                credentialRevealStatuses[state.credentials.secretAccessKey.slot]
+              }
+              onRetryReveal={() =>
+                void retryCredentialReveal(
+                  state.credentials.secretAccessKey.slot,
+                )
+              }
               onChange={(next) => updateCredential("secretAccessKey", next)}
             />
           </div>
@@ -1477,6 +1894,15 @@ export function ServerProviderForm({
             label="Session Token"
             edit={state.credentials.sessionToken}
             optional
+            revealedValue={
+              revealedCredentialValues[state.credentials.sessionToken.slot]
+            }
+            revealStatus={
+              credentialRevealStatuses[state.credentials.sessionToken.slot]
+            }
+            onRetryReveal={() =>
+              void retryCredentialReveal(state.credentials.sessionToken.slot)
+            }
             onChange={(next) => updateCredential("sessionToken", next)}
           />
           <div className="space-y-2">
@@ -1507,10 +1933,10 @@ export function ServerProviderForm({
       {profile.formComposition === "custom" &&
       state.customBinding &&
       customPolicy ? (
-        <Section title="协议与认证">
+        <Section title={t("serverProviderForm.binding.title")}>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label>上游协议</Label>
+              <Label>{t("serverProviderForm.binding.upstreamProtocol")}</Label>
               <Select
                 value={state.customBinding.upstreamProtocol}
                 disabled={isEditMode && !rebindEditing}
@@ -1538,7 +1964,7 @@ export function ServerProviderForm({
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>认证方式</Label>
+              <Label>{t("serverProviderForm.binding.authScheme")}</Label>
               <Select
                 value={state.customBinding.authScheme}
                 disabled={isEditMode && !rebindEditing}
@@ -1567,8 +1993,17 @@ export function ServerProviderForm({
           </div>
           {customAuthRequiresSecret && state.credentials.primary ? (
             <CredentialControl
-              label="认证凭据"
+              label={t("serverProviderForm.binding.credential")}
               edit={state.credentials.primary}
+              revealedValue={
+                revealedCredentialValues[state.credentials.primary.slot]
+              }
+              revealStatus={
+                credentialRevealStatuses[state.credentials.primary.slot]
+              }
+              onRetryReveal={() =>
+                void retryCredentialReveal(state.credentials.primary.slot)
+              }
               onChange={(next) => updateCredential("primary", next)}
             />
           ) : null}
@@ -1577,8 +2012,8 @@ export function ServerProviderForm({
             <div className="space-y-2">
               <Label htmlFor="server-provider-auth-field">
                 {state.customBinding.authScheme === "query"
-                  ? "Query 参数名"
-                  : "Header 名称"}
+                  ? t("serverProviderForm.binding.queryParameter")
+                  : t("serverProviderForm.binding.headerName")}
               </Label>
               <Input
                 id="server-provider-auth-field"
@@ -1614,7 +2049,7 @@ export function ServerProviderForm({
                       setRebindEditing(false);
                     }}
                   >
-                    取消更改
+                    {t("serverProviderForm.binding.cancelChanges")}
                   </Button>
                   <Button
                     type="button"
@@ -1622,7 +2057,7 @@ export function ServerProviderForm({
                     disabled={identityActionPending}
                     onClick={() => void beginCustomRebind()}
                   >
-                    预览并应用绑定
+                    {t("serverProviderForm.binding.previewApply")}
                   </Button>
                 </>
               ) : (
@@ -1631,7 +2066,7 @@ export function ServerProviderForm({
                   variant="outline"
                   onClick={() => setRebindEditing(true)}
                 >
-                  更改协议绑定
+                  {t("serverProviderForm.binding.change")}
                 </Button>
               )}
             </div>
@@ -1639,38 +2074,80 @@ export function ServerProviderForm({
           {customBindingDirty ? (
             <div className="flex items-start gap-2 text-sm text-amber-700 dark:text-amber-300">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              协议身份尚未应用。请先完成“预览并应用绑定”，再保存
-              Endpoint、模型或请求配置。
+              {t("serverProviderForm.binding.pendingHint")}
             </div>
           ) : null}
         </Section>
       ) : null}
 
       {showEndpoint ? (
-        <Section title="Endpoint">
-          <Input
-            value={state.endpoint}
-            readOnly={!endpointEditable}
-            className={
-              !endpointEditable
-                ? "bg-muted/40 text-muted-foreground"
-                : undefined
-            }
-            onChange={(event) =>
-              setState((current) => ({
-                ...current,
-                endpoint: event.target.value,
-              }))
-            }
-            placeholder="https://api.example.com"
-          />
+        <Section title={t("serverProviderForm.endpoint.title")}>
+          <div className="grid grid-cols-[minmax(0,1fr)_2.5rem_4.5rem] items-center gap-2">
+            <Input
+              value={state.endpoint}
+              readOnly={!endpointEditable}
+              className={
+                !endpointEditable
+                  ? "bg-muted/40 text-muted-foreground"
+                  : undefined
+              }
+              onChange={(event) => {
+                endpointProbeGeneration.current += 1;
+                setEndpointProbe(null);
+                setState((current) => ({
+                  ...current,
+                  endpoint: event.target.value,
+                }));
+              }}
+              placeholder="https://api.example.com"
+            />
+            <Button
+              type="button"
+              size="icon"
+              variant="outline"
+              disabled={
+                endpointProbe?.pending || !isValidEndpoint(state.endpoint)
+              }
+              title={t("endpointTest.testSpeed")}
+              aria-label={t("endpointTest.testSpeed")}
+              onClick={() => void testEndpoint()}
+            >
+              {endpointProbe?.pending ? (
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+              ) : (
+                <Gauge className="h-4 w-4" />
+              )}
+            </Button>
+            <span
+              className="min-w-[4.5rem] text-right font-mono text-xs text-muted-foreground"
+              aria-live="polite"
+              title={
+                endpointProbe?.error ??
+                (endpointProbe?.status
+                  ? `HTTP ${endpointProbe.status}`
+                  : undefined)
+              }
+            >
+              {endpointProbe?.pending
+                ? t("endpointTest.testing")
+                : endpointProbe?.url === state.endpoint.trim() &&
+                    endpointProbe.latency != null
+                  ? `${endpointProbe.latency} ms`
+                  : endpointProbe?.url === state.endpoint.trim() &&
+                      endpointProbe.error
+                    ? t("endpointTest.failed")
+                    : ""}
+            </span>
+          </div>
         </Section>
       ) : null}
 
-      <Section title="模型策略">
+      <Section title={t("serverProviderForm.model.title")}>
         {profile.modelPolicy === "single" ? (
           <div className="space-y-2">
-            <Label htmlFor="server-provider-model">实际上游模型</Label>
+            <Label htmlFor="server-provider-model">
+              {t("serverProviderForm.model.upstreamModel")}
+            </Label>
             <Input
               id="server-provider-model"
               value={state.upstreamModel}
@@ -1684,14 +2161,18 @@ export function ServerProviderForm({
           </div>
         ) : (
           <div className="flex items-center gap-2 text-sm">
-            <Badge variant="secondary">透传</Badge>
-            <span className="text-muted-foreground">使用请求中的模型</span>
+            <Badge variant="secondary">
+              {t("serverProviderForm.model.passthrough")}
+            </Badge>
+            <span className="text-muted-foreground">
+              {t("serverProviderForm.model.passthroughHint")}
+            </span>
           </div>
         )}
       </Section>
 
       {profile.formComposition === "custom" ? (
-        <Section title="额外请求 Header">
+        <Section title={t("serverProviderForm.headers.title")}>
           <div className="space-y-3">
             {state.extraHeaders
               .filter((header) => !header.removed)
@@ -1720,8 +2201,8 @@ export function ServerProviderForm({
                     disabled={header.action === "keep"}
                     placeholder={
                       header.configured && header.action === "keep"
-                        ? "已配置"
-                        : "Header 值"
+                        ? t("serverProviderForm.credentials.configured")
+                        : t("serverProviderForm.headers.value")
                     }
                     onChange={(event) =>
                       setState((current) => ({
@@ -1742,7 +2223,7 @@ export function ServerProviderForm({
                     type="button"
                     size="icon"
                     variant="ghost"
-                    title="删除 Header"
+                    title={t("serverProviderForm.headers.remove")}
                     onClick={() =>
                       setState((current) => ({
                         ...current,
@@ -1780,18 +2261,21 @@ export function ServerProviderForm({
               }
             >
               <Plus className="mr-2 h-4 w-4" />
-              添加 Header
+              {t("serverProviderForm.headers.add")}
             </Button>
           </div>
         </Section>
       ) : null}
 
       {showCodexOptions ? (
-        <Section title="Codex 运行选项">
+        <Section title={t("serverProviderForm.codex.title")}>
           <div className="grid gap-3 md:grid-cols-3">
             {[
               ["FAST", "codexFastMode"],
-              ["图片生成", "codexImageGenerationEnabled"],
+              [
+                t("serverProviderForm.codex.imageGeneration"),
+                "codexImageGenerationEnabled",
+              ],
               ["WebSocket", "codexWebsocketEnabled"],
             ].map(([label, key]) => (
               <div
@@ -1812,10 +2296,10 @@ export function ServerProviderForm({
       ) : null}
 
       {profile.formComposition !== "legacy" ? (
-        <Section title="用量与请求">
+        <Section title={t("serverProviderForm.usage.title")}>
           <div className="grid gap-4 md:grid-cols-3">
             <div className="space-y-2">
-              <Label>成本倍率</Label>
+              <Label>{t("serverProviderForm.usage.costMultiplier")}</Label>
               <Input
                 inputMode="decimal"
                 value={state.costMultiplier}
@@ -1829,7 +2313,7 @@ export function ServerProviderForm({
               />
             </div>
             <div className="space-y-2">
-              <Label>计费模型</Label>
+              <Label>{t("serverProviderForm.usage.pricingModel")}</Label>
               <Select
                 value={state.pricingModelSource}
                 onValueChange={(value) =>
@@ -1844,14 +2328,20 @@ export function ServerProviderForm({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="inherit">继承全局</SelectItem>
-                  <SelectItem value="request">请求模型</SelectItem>
-                  <SelectItem value="response">返回模型</SelectItem>
+                  <SelectItem value="inherit">
+                    {t("serverProviderForm.usage.inherit")}
+                  </SelectItem>
+                  <SelectItem value="request">
+                    {t("serverProviderForm.usage.request")}
+                  </SelectItem>
+                  <SelectItem value="response">
+                    {t("serverProviderForm.usage.response")}
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>调度用量上限（%）</Label>
+              <Label>{t("serverProviderForm.usage.quotaLimit")}</Label>
               <Input
                 inputMode="numeric"
                 value={state.quotaDispatchLimitPercent}
@@ -1861,12 +2351,12 @@ export function ServerProviderForm({
                     quotaDispatchLimitPercent: event.target.value,
                   }))
                 }
-                placeholder="不限制"
+                placeholder={t("serverProviderForm.usage.unlimited")}
               />
             </div>
           </div>
           <div className="space-y-2">
-            <Label>自定义 User-Agent</Label>
+            <Label>{t("serverProviderForm.usage.customUserAgent")}</Label>
             <Input
               value={state.customUserAgent}
               onChange={(event) =>
@@ -1879,10 +2369,10 @@ export function ServerProviderForm({
           </div>
         </Section>
       ) : (
-        <Section title="兼容状态">
+        <Section title={t("serverProviderForm.legacy.title")}>
           <div className="flex items-start gap-2 text-sm text-muted-foreground">
             <KeyRound className="mt-0.5 h-4 w-4 shrink-0" />
-            历史 Provider 仅允许修改显示信息；运行配置保持冻结。
+            {t("serverProviderForm.legacy.hint")}
           </div>
         </Section>
       )}
@@ -1902,7 +2392,7 @@ export function ServerProviderForm({
       {showButtons ? (
         <div className="flex justify-end gap-2 pt-2">
           <Button type="button" variant="outline" onClick={onCancel}>
-            取消
+            {t("common.cancel")}
           </Button>
           <Button
             type="submit"
@@ -1917,9 +2407,12 @@ export function ServerProviderForm({
       ) : null}
       <ConfirmDialog
         isOpen={pendingIdentityAction !== null}
-        title={pendingIdentityAction?.title ?? "确认身份变更"}
+        title={
+          pendingIdentityAction?.title ??
+          t("serverProviderForm.identity.confirmTitle")
+        }
         message={pendingIdentityAction?.message ?? ""}
-        confirmText="应用"
+        confirmText={t("serverProviderForm.identity.apply")}
         variant="info"
         zIndex="top"
         onConfirm={() => void applyIdentityAction()}

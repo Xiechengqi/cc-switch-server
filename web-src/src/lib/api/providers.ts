@@ -145,6 +145,22 @@ export const providersApi = {
     return await invokeCommand("get_provider_resources", { app: appId });
   },
 
+  async getCredential(
+    appId: AppId,
+    providerId: string,
+    slot: string,
+  ): Promise<string> {
+    return await invokeCommand(
+      "get_provider_credential",
+      {
+        app: appId,
+        providerId,
+        slot,
+      },
+      { cache: "no-store" },
+    );
+  },
+
   async getStoreMigration(): Promise<ProviderStoreMigrationReport> {
     return await invokeCommand("get_provider_store_migration");
   },
