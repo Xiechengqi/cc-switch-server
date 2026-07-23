@@ -1338,7 +1338,10 @@
     "logoutAll": "すべてのアカウントをログアウト",
     "retry": "再試行",
     "copyCode": "コードをコピー",
-    "cliUnavailableInRemoteWeb": "リモート Web 画面では localhost コールバックを利用できません。Device Code を使用してください。",
+    "cliUnavailableInRemoteWeb": "CLI OAuth は loopback または設定済みの HTTPS Client URL でのみ利用できます。ここでは Device Code を使用してください。",
+    "waitingForManualCallback": "認証完了後、ブラウザのアドレスバーに表示されたコールバック URL を送信してください",
+    "callbackUrl": "コールバック URL",
+    "submitCallback": "送信",
     "imageGeneration": "画像生成",
     "imageGenerationDescription": "ChatGPT Codex バックエンドで OpenAI 互換の /v1/images/generations を有効にします。",
     "imageToolStripPolicy": "画像ツールポリシー",
@@ -3207,7 +3210,8 @@
       "invalidHeader": "Header 名が無効です：{{name}}",
       "managedHeader": "この Header はドライバーが管理します：{{name}}",
       "duplicateHeader": "Header 名が重複しています：{{name}}",
-      "headerValueRequired": "Header {{name}} の値を入力してください"
+      "headerValueRequired": "Header {{name}} の値を入力してください",
+      "invalidUserAgent": "User-Agent に改行やその他の制御文字を含めることはできません"
     },
     "credentials": {
       "title": "認証情報",

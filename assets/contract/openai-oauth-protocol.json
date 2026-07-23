@@ -1,0 +1,89 @@
+{
+  "format": "cc-switch-openai-oauth-protocol",
+  "schemaVersion": 1,
+  "oauth": {
+    "authorizeUrl": "https://auth.openai.com/oauth/authorize",
+    "tokenUrl": "https://auth.openai.com/oauth/token",
+    "cliRedirectUri": "http://localhost:1455/auth/callback",
+    "deviceVerificationUrl": "https://auth.openai.com/codex/device"
+  },
+  "upstream": {
+    "httpBaseUrl": "https://chatgpt.com/backend-api/codex",
+    "websocketUrl": "wss://chatgpt.com/backend-api/codex/responses",
+    "workspaceHeader": "chatgpt-account-id",
+    "originatorHeader": "originator",
+    "versionHeader": "version"
+  },
+  "identityCases": [
+    {
+      "name": "workspace_falls_back_to_verified_access_token",
+      "idTokenClaims": {
+        "sub": "user-1",
+        "email": "owner@example.com",
+        "https://api.openai.com/auth": {}
+      },
+      "accessTokenClaims": {
+        "sub": "user-1",
+        "https://api.openai.com/auth": {
+          "chatgpt_account_id": "workspace-1",
+          "chatgpt_plan_type": "pro"
+        }
+      },
+      "expected": {
+        "subject": "user-1",
+        "chatgptAccountId": "workspace-1",
+        "planType": "pro"
+      }
+    },
+    {
+      "name": "legacy_flat_claim_remains_readable",
+      "idTokenClaims": {},
+      "accessTokenClaims": {
+        "sub": "user-2",
+        "chatgpt_account_id": "workspace-2",
+        "chatgpt_plan_type": "plus"
+      },
+      "expected": {
+        "subject": "user-2",
+        "chatgptAccountId": "workspace-2",
+        "planType": "plus"
+      }
+    },
+    {
+      "name": "user_subject_is_not_a_workspace",
+      "idTokenClaims": {
+        "sub": "user-only"
+      },
+      "accessTokenClaims": {
+        "sub": "user-only"
+      },
+      "expected": {
+        "subject": "user-only",
+        "chatgptAccountId": null,
+        "planType": null
+      }
+    },
+    {
+      "name": "conflicting_verified_workspaces_fail_closed",
+      "idTokenClaims": {
+        "sub": "user-3",
+        "https://api.openai.com/auth": {
+          "chatgpt_account_id": "workspace-a"
+        }
+      },
+      "accessTokenClaims": {
+        "sub": "user-3",
+        "https://api.openai.com/auth": {
+          "chatgpt_account_id": "workspace-b"
+        }
+      },
+      "mergeError": "chatgpt_account_id"
+    }
+  ],
+  "websocketFallback": {
+    "handshakeFallbackStatuses": [500, 502, 503, 504],
+    "handshakeNoFallbackStatuses": [400, 401, 403, 429],
+    "maxSseEventBytes": 134217728,
+    "replayBoundary": "before_first_business_event"
+  }
+}

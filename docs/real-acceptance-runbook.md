@@ -159,11 +159,11 @@ OAuth refresh fixture 的最小验收顺序：
 
 Codex OAuth 专项补充：
 
-1. Device Code 同一 `device_code` 并发 poll 时只允许一个上游 exchange，其余返回 pending；完成后重复 poll 返回同一账号结果，cancel 后必须失效。
-2. 新登录和 refresh 的 `id_token` 必须通过 OpenAI JWKS 的 RS256、issuer、audience、expiry/nbf 校验；轮换 `kid` 时应刷新缓存，未知 `kid` 必须 fail closed。
+1. Device Code 的 start/poll/cancel 必须绑定发起登录的管理员主体和 device-code 有效期，另一管理员不能 poll/cancel。同一 `device_code` 并发 poll 时只允许一个上游 exchange，其余返回 pending；完成后重复 poll 返回同一账号结果，cancel 后必须失效。
+2. 新登录和 refresh 的 ID/access token 必须通过 OpenAI JWKS 的 RS256、issuer、各自 audience、expiry/nbf 校验；合并身份必须同时含非空 `subject` 和 `chatgpt_account_id`，冲突或缺失任一字段均 fail closed。轮换 `kid` 时应刷新缓存，未知 `kid` 必须拒绝。
 3. 同一 refresh token 导入第二个账号必须拒绝；模拟 `refresh_token_reused` 时账号应立即进入 relogin，不等待普通 invalid-grant 阈值。
 4. 抓包确认 HTTP、WebSocket、Images 的 `originator` 与 User-Agent family 匹配，`version` 不低于 `0.144.0`；默认应为 `0.144.1`。
-5. 多 workspace 账号只能选择 token claims 中的 organization/Account-ID；修改后出站 `ChatGPT-Account-Id` 应随选择变化，伪造 ID 必须被控制面拒绝。
+5. 本地账号 ID 必须由已验证 user subject 稳定派生，同 subject 重登应原子复用旧记录；workspace 只能选择 token claims 中的 organization/Account-ID，不能作为本地 principal。修改后出站 `ChatGPT-Account-Id` 应随选择变化，伪造 ID 必须被控制面拒绝。
 6. Responses Lite 请求应覆盖 `additional_tools`、custom tool call/output continuation、tool_search forced choice 和同名冲突错误；Chat 上游回程应恢复 custom item，stream 完成事件包含非空 output。
 7. SSE 与 WebSocket 分别模拟空 `response.completed.response.output`，确认按 `output_index` 重建；已有非空 output 不覆盖，第二个 response 不得串入前一轮状态。
 8. provider 的 `codexWebsocketEnabled=false` 应使 GET WS 返回 503，并保持 POST Responses SSE 可用；恢复开关后再跑 text/binary WS 与 Windows reset 场景。
@@ -171,6 +171,13 @@ Codex OAuth 专项补充：
 10. usage fixture 同时覆盖 nested `cache_write_tokens`、cache read、cache creation 显式零值和 Anthropic exclusive input，核对 fresh/read/write/output 四桶与总 Token。
 11. `/v1/images/generations` 使用短图片 prompt 验证既有 Codex bridge、身份头和账号冷却；不要把已有 Images 路由误报为未实现。
 12. server 不应自动读取或写入运行主机用户的 `~/.codex/auth.json`；只测试显式登录/导入。TLS/JA3 只有在 rustls 请求出现可重复的上游拒绝证据时才开启专项评估。
+13. 从配置中的非 loopback HTTPS Client URL 发起 CLI OAuth，确认授权请求仍使用 `http://localhost:1455/auth/callback`。浏览器本地回调失败后提交完整地址栏 URL 应完成同一管理员主体的会话；裸 code、`127.0.0.1`、错误端口/path、重复 state、过期/取消会话、另一管理员会话、非同源页面、未配置的 host 和远程 HTTP Client URL 都必须拒绝。另以 `0.0.0.0` 或 `::` 启动 Server，确认携带伪造 `Host: 127.0.0.1` 的远程请求仍被拒绝；只有 Server 实际绑定 loopback 时才允许本机例外。Device OAuth 同时保持可用。
+14. Provider 中伪造 OAuth authorize/token、quota 或 inference endpoint 后保存/转发必须被固定 endpoint policy 拒绝或覆盖，OAuth token 不得发往自定义 host；managed OAuth Provider 缺少显式账号绑定时必须拒绝保存，不能隐式选同类型第一个账号。
+15. `GET /api/accounts`、账号 upsert/refresh/quota 响应及兼容 invoke 响应不得包含 access/refresh/id token、API key、extra headers、profile、raw 或 refresh error 原文；只允许 `has*`/状态/配额/脱敏身份字段。
+16. HTTP non-stream、SSE、Images、image-tool 去除后的二次请求、WebSocket handshake 与 WS→HTTP fallback 分别模拟首次 401：同一账号只强刷一次并重物化 Authorization/workspace header；仍为 401 时才记录 cooldown/选择未固定的下一 Provider。显式 `x-cc-provider-id` 和 Share binding 不得跨 Provider。
+17. 至少配置两个绑定不同账号、并发上限不同的同类型 Codex OAuth Provider。自动请求应优先选占用比例较低且未 cooldown/耗尽的账号；同负载下同一 session 应稳定落到同一 Provider，达到上限后跳过，SSE/WS 结束或断连后 inflight 必须归零。
+18. 同一 Codex session 连续两个 WS response 应只建立一个上游连接；更换 Provider/runtime/workspace/credential 必须生成新 pool key。用 `CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 缩短参数验证 capacity/idle TTL/max age，并验证 `codexWebsocketEnabled=false` 的禁用行为。
+19. 分别模拟 WS connect refused/timeout、握手 5xx、stale cached socket、首事件前 send/read/close 1009，确认只在首个业务 JSON 事件前通过同账号 HTTP/SSE 回退；握手 400/401/403/429 不得作为传输 fallback。缩短 `STREAM_FIRST_BYTE_TIMEOUT_MS` 验证首事件超时可回退，再缩短 `STREAM_IDLE_TIMEOUT_MS` 验证已收到 `response.created` 后只终止流且不重放。`cc_switch_codex_websocket_fallback_total{source,result}` 与 cache/retry 指标应对应增加。
 
 Claude OAuth 专项补充：
 
@@ -190,7 +197,7 @@ Claude OAuth 专项补充：
 14. Claude OAuth 客户端 header 中加入未知 beta（例如 `prompt-caching-scope-2026-01-05`）时，上游不得收到该 token；已审计的 `prompt-caching-2024-07-31` 与 `token-efficient-tools-2025-02-19` 应保留，server debug 日志应能定位被过滤事件但不得记录 token/account 身份。
 15. 同一 OAuth state 在多 tab 重复完成时应返回同一 completed/account 结果；Pending/preview session 可通过 `/api/accounts/login/cancel` 或 `auth_cancel_login` 幂等取消，取消后 finish/poll 必须终止，未知 state 必须拒绝。exchange 已开始后 cancel 应返回冲突，避免授权码已消费但账号未持久化。
 16. Claude OAuth 多账号并发时，应优先选择当前占用比例较低的账号；默认每账号上限为 8，provider 的 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS` 可覆盖，`CC_SWITCH_ACCOUNT_MAX_CONCURRENT=0` 可关闭。达到上限的账号应从自动选择中跳过，显式 provider/share 绑定应返回 429，SSE 结束或中断后容量必须释放。
-17. 如使用 `~/.claude/.credentials.json` 迁移，只通过显式 `POST /api/accounts/claude/credentials/import` / `GET /api/accounts/:id/claude/credentials` 操作；server 不自动扫描本机目录，也不写 Claude Desktop profile。
+17. 如使用 `~/.claude/.credentials.json` 迁移，只通过显式 `POST /api/accounts/claude/credentials/import` 导入；server 不自动扫描本机目录、不写 Claude Desktop profile，也不通过控制面提供明文凭据导出。
 18. 缺省 `max_tokens` / `temperature` 的请求应分别补为 `128000` / `1`；thinking 请求强制 `temperature=1` 并删除冲突的 `top_p`/`top_k`，非 thinking 显式 sampling 保持不变。
 19. `POST /v1/messages/count_tokens` 与 `/claude/v1/messages/count_tokens` 应只选择 `claude`、`claude_auth`、`claude_oauth`；OAuth 抓包应包含 token-counting beta、无 generation 字段且 CCH 对最终 body 有效。Codex/Gemini/OpenRouter provider 必须被拒绝，成功响应的 `input_tokens` 原样返回且不产生生成 usage。
 20. Responses/Chat 上游转 Anthropic stream 时，使用两个并行工具和 packed `function_call_arguments.done` 验证每个 block 只 start/stop 一次、arguments 不丢不重；分别以 CRLF、多事件同 chunk、JSON 每个切分点和 EOF 半帧注入，已输出后的错误不得重放请求。

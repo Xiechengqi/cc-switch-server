@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::domain::accounts::store::AccountStore;
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
@@ -47,8 +48,9 @@ use super::request_governance::{
 use super::router::{
     account_concurrency_for_provider, ensure_provider_account_does_not_need_relogin,
     ensure_provider_account_usage_available, provider_supports_claude_count_tokens,
-    select_failover_provider, select_provider, select_provider_for_claude_count_tokens,
-    select_provider_for_codex_image_generation, select_provider_with_account_inflight, ProxyRoute,
+    select_failover_provider, select_failover_provider_matching,
+    select_provider_for_claude_count_tokens, select_provider_for_codex_image_generation,
+    select_provider_with_account_inflight, ProxyRoute,
 };
 use super::streaming::{ClaudeSseErrorDetector, StreamUsageAccumulator};
 use super::usage::{log_usage, update_stream_usage};
@@ -56,9 +58,157 @@ use super::{setting, ProxyError};
 
 const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const CODEX_IMAGES_DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
-const MAX_CLAUDE_RETRY_ATTEMPTS: u32 = 3;
-const MAX_CLAUDE_RETRY_ELAPSED_MS: u128 = 10_000;
+const MAX_FORWARD_RETRY_ATTEMPTS: u32 = 3;
+const MAX_FORWARD_RETRY_ELAPSED_MS: u128 = 10_000;
 const DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 60_000;
+const DEFAULT_UPSTREAM_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
+const DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_CONNECTIONS: usize = 64;
+const DEFAULT_CODEX_WEBSOCKET_CACHE_IDLE_MS: u64 = 5 * 60 * 1000;
+const DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_AGE_MS: u64 = 55 * 60 * 1000;
+const MAX_CODEX_HTTP_FALLBACK_SSE_EVENT_BYTES: usize = 128 * 1024 * 1024;
+
+type ResponsesUpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+struct CachedResponsesWebSocket {
+    socket: ResponsesUpstreamWebSocket,
+    created_at: Instant,
+    last_used_at: Instant,
+}
+
+#[derive(Default)]
+struct ResponsesWebSocketPool {
+    entries: BTreeMap<String, VecDeque<CachedResponsesWebSocket>>,
+    total: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponsesWebSocketPoolPolicy {
+    max_connections: usize,
+    idle_timeout: Duration,
+    max_age: Duration,
+}
+
+impl ResponsesWebSocketPoolPolicy {
+    fn current() -> Self {
+        Self {
+            max_connections: codex_websocket_cache_max_connections(),
+            idle_timeout: codex_websocket_cache_idle_timeout(),
+            max_age: codex_websocket_cache_max_age(),
+        }
+    }
+}
+
+impl ResponsesWebSocketPool {
+    fn acquire(&mut self, key: &str) -> Option<CachedResponsesWebSocket> {
+        self.acquire_with_policy(key, ResponsesWebSocketPoolPolicy::current())
+    }
+
+    fn acquire_with_policy(
+        &mut self,
+        key: &str,
+        policy: ResponsesWebSocketPoolPolicy,
+    ) -> Option<CachedResponsesWebSocket> {
+        self.prune_expired_with_policy(policy);
+        let entry = self.entries.get_mut(key)?.pop_back()?;
+        self.total = self.total.saturating_sub(1);
+        if self.entries.get(key).is_some_and(VecDeque::is_empty) {
+            self.entries.remove(key);
+        }
+        Some(entry)
+    }
+
+    fn release(&mut self, key: String, entry: CachedResponsesWebSocket) {
+        self.release_with_policy(key, entry, ResponsesWebSocketPoolPolicy::current());
+    }
+
+    fn release_with_policy(
+        &mut self,
+        key: String,
+        mut entry: CachedResponsesWebSocket,
+        policy: ResponsesWebSocketPoolPolicy,
+    ) {
+        if policy.max_connections == 0 || entry.created_at.elapsed() >= policy.max_age {
+            return;
+        }
+        self.prune_expired_with_policy(policy);
+        entry.last_used_at = Instant::now();
+        self.entries.entry(key).or_default().push_back(entry);
+        self.total = self.total.saturating_add(1);
+        while self.total > policy.max_connections {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
+    }
+
+    fn prune_expired_with_policy(&mut self, policy: ResponsesWebSocketPoolPolicy) {
+        for entries in self.entries.values_mut() {
+            let before = entries.len();
+            entries.retain(|entry| {
+                entry.last_used_at.elapsed() < policy.idle_timeout
+                    && entry.created_at.elapsed() < policy.max_age
+            });
+            self.total = self
+                .total
+                .saturating_sub(before.saturating_sub(entries.len()));
+        }
+        self.entries.retain(|_, entries| !entries.is_empty());
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let oldest_key = self
+            .entries
+            .iter()
+            .filter_map(|(key, entries)| entries.front().map(|entry| (key, entry.last_used_at)))
+            .min_by_key(|(_, last_used_at)| *last_used_at)
+            .map(|(key, _)| key.clone());
+        let Some(key) = oldest_key else {
+            return false;
+        };
+        if let Some(entries) = self.entries.get_mut(&key) {
+            if entries.pop_front().is_some() {
+                self.total = self.total.saturating_sub(1);
+            }
+            if entries.is_empty() {
+                self.entries.remove(&key);
+            }
+        }
+        true
+    }
+}
+
+fn responses_websocket_pool() -> &'static StdMutex<ResponsesWebSocketPool> {
+    static POOL: OnceLock<StdMutex<ResponsesWebSocketPool>> = OnceLock::new();
+    POOL.get_or_init(|| StdMutex::new(ResponsesWebSocketPool::default()))
+}
+
+fn codex_websocket_cache_max_connections() -> usize {
+    std::env::var("CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_CONNECTIONS)
+        .min(512)
+}
+
+fn codex_websocket_cache_idle_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("CC_SWITCH_CODEX_WS_CACHE_IDLE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_CODEX_WEBSOCKET_CACHE_IDLE_MS)
+            .clamp(1_000, 30 * 60 * 1000),
+    )
+}
+
+fn codex_websocket_cache_max_age() -> Duration {
+    Duration::from_millis(
+        std::env::var("CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_AGE_MS)
+            .clamp(60_000, 6 * 60 * 60 * 1000),
+    )
+}
 
 #[derive(Debug, Clone)]
 struct ForwardAttemptContext {
@@ -85,8 +235,8 @@ impl Default for ForwardAttemptContext {
 
 impl ForwardAttemptContext {
     fn retry_allowed(&self) -> bool {
-        self.attempt < MAX_CLAUDE_RETRY_ATTEMPTS
-            && current_time_ms().saturating_sub(self.started_at_ms) < MAX_CLAUDE_RETRY_ELAPSED_MS
+        self.attempt < MAX_FORWARD_RETRY_ATTEMPTS
+            && current_time_ms().saturating_sub(self.started_at_ms) < MAX_FORWARD_RETRY_ELAPSED_MS
     }
 
     fn next(
@@ -168,9 +318,39 @@ async fn forward_with_attempt(
             None
         };
         let accounts_for_selection = state.accounts_snapshot().await;
-        let (execution, account_in_flight_guard) =
-            if let Some(execution) = attempt_context.execution.clone() {
-                execution.ensure_operation_supported(ProviderOperation::Forward)?;
+        let (execution, account_in_flight_guard) = if let Some(execution) =
+            attempt_context.execution.clone()
+        {
+            execution.ensure_operation_supported(ProviderOperation::Forward)?;
+            let snapshot = state.account_in_flight.snapshot();
+            let guard = acquire_account_in_flight(
+                &state,
+                &execution.stored,
+                &accounts_for_selection,
+                &snapshot,
+            )?;
+            (execution, guard)
+        } else {
+            let shares = state.shares.read().await.clone();
+            let providers = state.providers.read().await;
+            let ui_settings = state.ui_settings.read().await.for_frontend();
+            let configured_provider_id =
+                current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
+            if let Some(share_id) = request_context.share_id.as_deref() {
+                let (execution, _share_name) = select_share_execution(
+                    &providers,
+                    &shares,
+                    &accounts_for_selection,
+                    app,
+                    share_id,
+                )?;
+                if route == ProxyRoute::ClaudeCountTokens
+                    && !provider_supports_claude_count_tokens(&execution.stored)
+                {
+                    return Err(ProxyError::bad_request(
+                        "Claude count_tokens requires a native Anthropic provider",
+                    ));
+                }
                 let snapshot = state.account_in_flight.snapshot();
                 let guard = acquire_account_in_flight(
                     &state,
@@ -180,77 +360,31 @@ async fn forward_with_attempt(
                 )?;
                 (execution, guard)
             } else {
-                let shares = state.shares.read().await.clone();
-                let providers = state.providers.read().await;
-                let ui_settings = state.ui_settings.read().await.for_frontend();
-                let configured_provider_id =
-                    current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
-                if let Some(share_id) = request_context.share_id.as_deref() {
-                    let (execution, _share_name) = select_share_execution(
-                        &providers,
-                        &shares,
-                        &accounts_for_selection,
-                        app,
-                        share_id,
-                    )?;
-                    if route == ProxyRoute::ClaudeCountTokens
-                        && !provider_supports_claude_count_tokens(&execution.stored)
-                    {
-                        return Err(ProxyError::bad_request(
-                            "Claude count_tokens requires a native Anthropic provider",
-                        ));
-                    }
-                    let snapshot = state.account_in_flight.snapshot();
-                    let guard = acquire_account_in_flight(
-                        &state,
-                        &execution.stored,
-                        &accounts_for_selection,
-                        &snapshot,
-                    )?;
-                    (execution, guard)
-                } else {
-                    let mut attempts = 0;
-                    loop {
-                        let snapshot = state.account_in_flight.snapshot();
-                        let execution = if route == ProxyRoute::ClaudeCountTokens {
-                            select_provider_for_claude_count_tokens(
-                                &providers,
-                                &accounts_for_selection,
-                                &headers,
-                                configured_provider_id.as_deref(),
-                                &snapshot,
-                            )
-                        } else {
-                            select_provider_with_account_inflight(
-                                &providers,
-                                &accounts_for_selection,
-                                app,
-                                &headers,
-                                configured_provider_id.as_deref(),
-                                &snapshot,
-                            )
-                        }?
-                        .execution;
-                        match try_acquire_account_in_flight(
-                            &state,
-                            &execution.stored,
+                select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
+                    if route == ProxyRoute::ClaudeCountTokens {
+                        select_provider_for_claude_count_tokens(
+                            &providers,
                             &accounts_for_selection,
-                            &snapshot,
-                        ) {
-                            AccountInFlightAcquire::Acquired(guard) => {
-                                break (execution, Some(guard));
-                            }
-                            AccountInFlightAcquire::NotManaged => break (execution, None),
-                            AccountInFlightAcquire::Saturated => {
-                                attempts += 1;
-                                if attempts >= 3 {
-                                    return Err(account_concurrency_proxy_error(&execution.stored));
-                                }
-                            }
-                        }
+                            &headers,
+                            configured_provider_id.as_deref(),
+                            snapshot,
+                            request_context.session_id.as_deref(),
+                        )
+                    } else {
+                        select_provider_with_account_inflight(
+                            &providers,
+                            &accounts_for_selection,
+                            app,
+                            &headers,
+                            configured_provider_id.as_deref(),
+                            snapshot,
+                            request_context.session_id.as_deref(),
+                        )
                     }
-                }
-            };
+                    .map(|selection| selection.execution)
+                })?
+            }
+        };
         let stored = execution.runtime_stored_view();
         validate_codex_allowed_client(
             &stored,
@@ -277,6 +411,7 @@ async fn forward_with_attempt(
                 stored,
                 adapter_request,
                 request_context,
+                account_in_flight_guard,
                 share_invocation_guard,
             })
             .await;
@@ -289,6 +424,7 @@ async fn forward_with_attempt(
                 headers,
                 body,
                 request_context,
+                account_in_flight_guard,
                 share_invocation_guard,
                 started,
             })
@@ -301,6 +437,7 @@ async fn forward_with_attempt(
                 stored,
                 body,
                 request_context,
+                account_in_flight_guard,
                 share_invocation_guard,
                 started,
             })
@@ -459,6 +596,7 @@ async fn forward_with_attempt(
                         "token-counting-2024-11-01".to_string(),
                     );
                 }
+                execution.finalize_outbound_identity(&mut target_headers)?;
                 (adapter_request, url, target_headers)
             };
 
@@ -540,49 +678,18 @@ async fn forward_with_attempt(
         let mut status_code = status.as_u16();
         let mut response_headers = upstream.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
-        if matches!(
-            route,
-            ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
-        ) && execution.driver_is("oauth.claude_messages")
-            && status == StatusCode::UNAUTHORIZED
-            && !attempt_context.auth_refresh_attempted
-            && attempt_context.retry_allowed()
-        {
-            if let Some((provider_type, account_id)) = execution.managed_account_target() {
-                state
-                    .refresh_managed_account_now(provider_type, account_id)
-                    .await
-                    .map_err(managed_account_refresh_error_to_proxy_error)?;
-                if route == ProxyRoute::ClaudeCountTokens {
-                    crate::metrics::record_claude_count_tokens_outcome("auth_refresh");
-                }
-                crate::metrics::record_claude_retry("auth", "unauthorized");
-                attempt_context = attempt_context.after_auth_refresh(&execution);
-                drop(upstream);
-                drop(account_in_flight_guard);
-                drop(share_invocation_guard);
-                continue 'attempt;
-            }
-        }
-        if matches!(
-            route,
-            ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
-        ) && execution.driver_is("oauth.claude_messages")
-            && status == StatusCode::UNAUTHORIZED
-            && attempt_context.auth_refresh_attempted
-            && !claude_request_is_provider_pinned(&headers, &request_context)
-        {
-            if let Some(next_attempt) = next_claude_provider_failover(
+        if status == StatusCode::UNAUTHORIZED {
+            if let Some(next_attempt) = next_unauthorized_attempt(
                 &state,
                 route,
+                &headers,
+                &request_context,
                 &attempt_context,
                 &execution,
-                "unauthorized_after_refresh",
+                &stored,
             )
-            .await
+            .await?
             {
-                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
-                    .await;
                 attempt_context = next_attempt;
                 drop(upstream);
                 drop(account_in_flight_guard);
@@ -594,16 +701,11 @@ async fn forward_with_attempt(
             route,
             ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
         ) && status.as_u16() == 529
-            && !claude_request_is_provider_pinned(&headers, &request_context)
+            && !request_is_provider_pinned(&headers, &request_context)
         {
-            if let Some(next_attempt) = next_claude_provider_failover(
-                &state,
-                route,
-                &attempt_context,
-                &execution,
-                "http_529",
-            )
-            .await
+            if let Some(next_attempt) =
+                next_provider_failover(&state, route, &attempt_context, &execution, "http_529")
+                    .await
             {
                 record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
                     .await;
@@ -658,6 +760,25 @@ async fn forward_with_attempt(
                             maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
                             maybe_mark_grok_cooldown(&state, &stored, status, &response_headers)
                                 .await;
+                            if status == StatusCode::UNAUTHORIZED {
+                                if let Some(next_attempt) = next_unauthorized_attempt(
+                                    &state,
+                                    route,
+                                    &headers,
+                                    &request_context,
+                                    &attempt_context,
+                                    &execution,
+                                    &stored,
+                                )
+                                .await?
+                                {
+                                    attempt_context = next_attempt;
+                                    drop(upstream);
+                                    drop(account_in_flight_guard);
+                                    drop(share_invocation_guard);
+                                    continue 'attempt;
+                                }
+                            }
                             content_type = response_headers
                                 .get(CONTENT_TYPE)
                                 .and_then(|value| value.to_str().ok())
@@ -794,19 +915,10 @@ async fn forward_with_attempt(
                 &decoded.body,
             )
             .await;
-            if matches!(
-                route,
-                ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
-            ) && !claude_request_is_provider_pinned(&headers, &request_context)
-            {
-                if let Some(next_attempt) = next_claude_provider_failover(
-                    &state,
-                    route,
-                    &attempt_context,
-                    &execution,
-                    "http_429",
-                )
-                .await
+            if !request_is_provider_pinned(&headers, &request_context) {
+                if let Some(next_attempt) =
+                    next_provider_failover(&state, route, &attempt_context, &execution, "http_429")
+                        .await
                 {
                     record_provider_outcome(
                         &state,
@@ -1033,6 +1145,10 @@ async fn forward_with_attempt(
                     route,
                     adapter_request.custom_tool_names.clone(),
                 ),
+                claude_tool_name_stream_patcher:
+                    super::claude_oauth::ClaudeToolNameStreamPatcher::new(
+                        adapter_request.claude_tool_name_map.clone(),
+                    ),
                 timeouts,
                 pending_chunk,
                 sse_error_detector,
@@ -1114,6 +1230,9 @@ async fn forward_with_attempt(
                             }
                         };
                         let transformed = stream_state
+                            .claude_tool_name_stream_patcher
+                            .push(transformed);
+                        let transformed = stream_state
                             .codex_custom_tool_stream_patcher
                             .push(transformed);
                         Ok(Some((transformed, stream_state)))
@@ -1162,6 +1281,9 @@ async fn forward_with_attempt(
                             };
                             let transformed = join_bytes(transformed, tail);
                             let transformed = stream_state
+                                .claude_tool_name_stream_patcher
+                                .push(transformed);
+                            let transformed = stream_state
                                 .codex_custom_tool_stream_patcher
                                 .push(transformed);
                             return Ok(Some((transformed, stream_state)));
@@ -1172,9 +1294,16 @@ async fn forward_with_attempt(
                                 return stream_state.terminate_transform_error(error).await
                             }
                         };
+                        let claude_tail = stream_state
+                            .claude_tool_name_stream_patcher
+                            .push(transform_tail);
+                        let claude_tail = join_bytes(
+                            claude_tail,
+                            stream_state.claude_tool_name_stream_patcher.finish(),
+                        );
                         let transformed_tail = stream_state
                             .codex_custom_tool_stream_patcher
-                            .push(transform_tail);
+                            .push(claude_tail);
                         let custom_tail = join_bytes(
                             transformed_tail,
                             stream_state.codex_custom_tool_stream_patcher.finish(),
@@ -1331,6 +1460,10 @@ async fn forward_with_attempt(
         };
         let bytes =
             adapter.transform_response_for_request(bytes, &stored, route, &adapter_request)?;
+        let bytes = super::claude_oauth::restore_claude_tool_names_in_response_bytes(
+            bytes,
+            &adapter_request.claude_tool_name_map,
+        );
         let share_id_for_record = request_context.share_id.clone();
         if route == ProxyRoute::ClaudeCountTokens {
             crate::metrics::record_claude_count_tokens_outcome(count_tokens_metric_outcome(status));
@@ -1384,6 +1517,7 @@ pub async fn forward_codex_responses_ws(
     let route = ProxyRoute::CodexResponses;
     let app = route.app();
     let mut request_context = request_context_from_headers(&headers);
+    request_context.session_id = session_id_from_request(route, &headers, b"");
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
@@ -1402,19 +1536,32 @@ pub async fn forward_codex_responses_ws(
     let ui_settings = state.ui_settings.read().await.for_frontend();
     let configured_provider_id =
         current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
-    let execution = if let Some(share_id) = request_context.share_id.as_deref() {
+    let (execution, account_in_flight_guard) = if let Some(share_id) =
+        request_context.share_id.as_deref()
+    {
         let (execution, _share_name) =
             select_share_execution(&providers, &shares, &accounts_for_selection, app, share_id)?;
-        execution
-    } else {
-        select_provider(
-            &providers,
+        let snapshot = state.account_in_flight.snapshot();
+        let guard = acquire_account_in_flight(
+            &state,
+            &execution.stored,
             &accounts_for_selection,
-            app,
-            &headers,
-            configured_provider_id.as_deref(),
-        )?
-        .execution
+            &snapshot,
+        )?;
+        (execution, guard)
+    } else {
+        select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
+            select_provider_with_account_inflight(
+                &providers,
+                &accounts_for_selection,
+                app,
+                &headers,
+                configured_provider_id.as_deref(),
+                snapshot,
+                request_context.session_id.as_deref(),
+            )
+            .map(|selection| selection.execution)
+        })?
     };
     drop(providers);
     let stored = execution.runtime_stored_view();
@@ -1431,9 +1578,6 @@ pub async fn forward_codex_responses_ws(
     }
     validate_codex_allowed_client(&stored, route, &headers, request_context.share_id.is_some())?;
     refresh_execution_managed_account_if_needed(&state, &execution).await?;
-    let accounts = state.accounts_snapshot().await;
-    let adapter = adapters::adapter_for(app, stored.provider_type);
-    let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
     let mut session_id = codex_oauth_session_id_from_request(&headers, b"").or_else(|| {
         execution
             .driver_is("oauth.grok_responses")
@@ -1448,34 +1592,14 @@ pub async fn forward_codex_responses_ws(
             ));
         }
     }
-    append_codex_oauth_session_headers(&mut target_headers, session_id.as_deref());
-    if execution.driver_is("oauth.openai_codex") {
-        crate::codex_identity::finalize_headers(&mut target_headers);
-    }
-    if execution.driver_is("oauth.grok_responses") {
-        if let Some(session_id) = session_id.as_deref() {
-            replace_or_push_header(
-                &mut target_headers,
-                "x-grok-conv-id",
-                session_id.to_string(),
-            );
-        }
-    }
-    let mut target_headers = owned_headers(target_headers);
-    let mut ws_url = if execution.driver_is("oauth.grok_responses") {
-        super::grok::websocket_url().to_string()
-    } else {
-        "wss://chatgpt.com/backend-api/codex/responses".to_string()
-    };
-    let materialized_auth = execution.materialize_auth(&accounts)?;
-    execution.apply_auth(&mut target_headers, &mut ws_url, materialized_auth.as_ref())?;
-    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
-
     let ws_mode = if execution.driver_is("oauth.grok_responses") {
         ResponsesWebsocketMode::Grok
     } else {
         ResponsesWebsocketMode::Codex
     };
+    let target =
+        prepare_responses_websocket_target(&state, &execution, ws_mode, session_id.as_deref())
+            .await?;
     let websocket_upstream_model = match &execution.plan.model_policy {
         crate::domain::providers::runtime::RuntimeModelPolicy::Single { upstream_model } => {
             Some(upstream_model.clone())
@@ -1483,6 +1607,9 @@ pub async fn forward_codex_responses_ws(
         crate::domain::providers::runtime::RuntimeModelPolicy::Passthrough => None,
     };
     let request_timeout = execution.request_timeout();
+    let first_byte_timeout = execution.stream_first_byte_timeout();
+    let stream_idle_timeout = execution.stream_idle_timeout();
+    let provider_pinned = request_is_provider_pinned(&headers, &request_context);
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let state_for_share = state.clone();
@@ -1491,14 +1618,19 @@ pub async fn forward_codex_responses_ws(
         if let Err(error) = bridge_responses_websocket(
             socket,
             ResponsesWebsocketBridgeOptions {
-                headers: target_headers,
+                headers: target.headers,
                 connect_timeout: request_timeout,
-                ws_url,
+                first_byte_timeout,
+                stream_idle_timeout,
+                ws_url: target.ws_url,
+                pool_key: target.pool_key,
                 mode: ws_mode,
                 grok_session_id: session_id,
                 single_upstream_model: websocket_upstream_model,
                 state: &state_for_share,
-                execution: &execution,
+                execution,
+                account_in_flight_guard,
+                provider_pinned,
             },
         )
         .await
@@ -1560,6 +1692,7 @@ pub async fn forward_grok_media(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
+    let account_in_flight = state.account_in_flight.snapshot();
     let ui_settings = state.ui_settings.read().await.for_frontend();
     let configured_provider_id =
         current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
@@ -1583,6 +1716,12 @@ pub async fn forward_grok_media(
         )?
         .execution
     };
+    let account_in_flight_guard = acquire_account_in_flight(
+        &state,
+        &execution.stored,
+        &accounts_for_selection,
+        &account_in_flight,
+    )?;
     drop(providers);
     if !execution.driver_is("oauth.grok_responses") {
         return Err(ProxyError::bad_request(
@@ -1598,6 +1737,7 @@ pub async fn forward_grok_media(
         body,
         request_context.share_id,
         request_context.user_email,
+        account_in_flight_guard,
         share_invocation_guard,
     )
     .await
@@ -1610,6 +1750,8 @@ pub async fn forward_images_generations(
 ) -> Result<Response, ProxyError> {
     let body = decode_request_body_for_proxy(&headers, body)?;
     let mut request_context = request_context_from_headers(&headers);
+    request_context.session_id =
+        session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
@@ -1628,24 +1770,36 @@ pub async fn forward_images_generations(
     let ui_settings = state.ui_settings.read().await.for_frontend();
     let configured_provider_id =
         current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
-    let execution = if let Some(share_id) = request_context.share_id.as_deref() {
-        let (execution, _share_name) = select_share_execution(
-            &providers,
-            &shares,
-            &accounts_for_selection,
-            AppKind::Codex,
-            share_id,
-        )?;
-        execution
-    } else {
-        select_provider_for_codex_image_generation(
-            &providers,
-            &accounts_for_selection,
-            &headers,
-            configured_provider_id.as_deref(),
-        )?
-        .execution
-    };
+    let (execution, account_in_flight_guard) =
+        if let Some(share_id) = request_context.share_id.as_deref() {
+            let (execution, _share_name) = select_share_execution(
+                &providers,
+                &shares,
+                &accounts_for_selection,
+                AppKind::Codex,
+                share_id,
+            )?;
+            let snapshot = state.account_in_flight.snapshot();
+            let guard = acquire_account_in_flight(
+                &state,
+                &execution.stored,
+                &accounts_for_selection,
+                &snapshot,
+            )?;
+            (execution, guard)
+        } else {
+            select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
+                select_provider_for_codex_image_generation(
+                    &providers,
+                    &accounts_for_selection,
+                    &headers,
+                    configured_provider_id.as_deref(),
+                    snapshot,
+                    request_context.session_id.as_deref(),
+                )
+                .map(|selection| selection.execution)
+            })?
+        };
     drop(providers);
 
     if execution.driver_is("oauth.grok_responses") {
@@ -1658,6 +1812,7 @@ pub async fn forward_images_generations(
             body,
             request_context.share_id,
             request_context.user_email,
+            account_in_flight_guard,
             share_invocation_guard,
         )
         .await
@@ -1668,6 +1823,7 @@ pub async fn forward_images_generations(
             headers,
             body,
             request_context,
+            account_in_flight_guard,
             share_invocation_guard,
         )
         .await
@@ -1688,6 +1844,7 @@ async fn forward_grok_media_with_execution(
     body: Bytes,
     share_id: Option<String>,
     user_email: Option<String>,
+    _account_in_flight_guard: Option<AccountInFlightGuard>,
     _share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
     let stored = execution.runtime_stored_view();
@@ -1725,6 +1882,7 @@ async fn forward_grok_media_with_execution(
     let materialized_auth = execution.materialize_auth(&accounts)?;
     execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
     apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
+    execution.finalize_outbound_identity(&mut target_headers)?;
     let http_client = forward_http_client(&state, &stored).await?;
     let mut request = http_client
         .request(method.clone(), &url)
@@ -1811,45 +1969,229 @@ async fn forward_grok_media_with_execution(
 
 async fn forward_codex_images_generations(
     state: ServerState,
-    execution: ProviderExecution,
+    mut execution: ProviderExecution,
     headers: HeaderMap,
     body: Bytes,
     request_context: UsageLogContext,
+    mut _account_in_flight_guard: Option<AccountInFlightGuard>,
     _share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
-    let stored = execution.runtime_stored_view();
-    refresh_execution_managed_account_if_needed(&state, &execution).await?;
-    validate_codex_allowed_client(
-        &stored,
-        ProxyRoute::CodexResponses,
-        &headers,
-        request_context.share_id.is_some(),
-    )?;
     let prepared = codex_images_generation_request(&body)?;
+    let session_id = codex_oauth_session_id_from_request(&headers, &body);
+    let started = Instant::now();
+    let provider_pinned = request_is_provider_pinned(&headers, &request_context);
+    let mut excluded_provider_ids = BTreeSet::new();
+
+    'provider: loop {
+        let stored = execution.runtime_stored_view();
+        refresh_execution_managed_account_if_needed(&state, &execution).await?;
+        validate_codex_allowed_client(
+            &stored,
+            ProxyRoute::CodexResponses,
+            &headers,
+            request_context.share_id.is_some(),
+        )?;
+        let mut adapter_request = adapters::AdapterRequest {
+            body: prepared.body.clone(),
+            upstream_endpoint: None,
+            upstream_headers: Vec::new(),
+            model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
+            requested_model: Some(prepared.tool_model.clone()),
+            actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
+            actual_model_source: Some("codex_image_generation_bridge".to_string()),
+            stream_requested: true,
+            custom_tool_names: Default::default(),
+            claude_tool_name_map: Default::default(),
+        };
+        execution.enforce_model_policy(&mut adapter_request)?;
+        let mut auth_refresh_attempted = false;
+        let upstream = loop {
+            let upstream = match send_codex_images_attempt(
+                &state,
+                &execution,
+                &stored,
+                &adapter_request,
+                session_id.as_deref(),
+            )
+            .await
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                    return Err(error);
+                }
+            };
+            if upstream.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
+                if let Some((provider_type, account_id)) = execution.managed_account_target() {
+                    drop(upstream);
+                    let refresh_result = state
+                        .refresh_managed_account_now(provider_type, account_id)
+                        .await;
+                    if let Err(error) = refresh_result {
+                        mark_managed_account_auth_cooldown(
+                            &state,
+                            &execution,
+                            "images_forced_refresh_failed",
+                        )
+                        .await;
+                        if !provider_pinned
+                            && switch_to_ready_codex_provider(
+                                &state,
+                                &mut execution,
+                                &mut _account_in_flight_guard,
+                                &mut excluded_provider_ids,
+                                codex_oauth_image_failover_provider,
+                                "images_auth_refresh_failed",
+                            )
+                            .await
+                        {
+                            record_provider_outcome(
+                                &state,
+                                &stored,
+                                ProviderOutcome::Failure { status_code: 401 },
+                            )
+                            .await;
+                            continue 'provider;
+                        }
+                        return Err(managed_account_refresh_error_to_proxy_error(error));
+                    }
+                    auth_refresh_attempted = true;
+                    record_forward_retry(ProxyRoute::CodexResponses, "auth", "images_unauthorized");
+                    continue;
+                }
+            }
+            break upstream;
+        };
+        let status = upstream.status();
+        let status_code = status.as_u16();
+        if status == StatusCode::UNAUTHORIZED && auth_refresh_attempted {
+            mark_managed_account_auth_cooldown(
+                &state,
+                &execution,
+                "images_unauthorized_after_refresh",
+            )
+            .await;
+            if !provider_pinned
+                && switch_to_ready_codex_provider(
+                    &state,
+                    &mut execution,
+                    &mut _account_in_flight_guard,
+                    &mut excluded_provider_ids,
+                    codex_oauth_image_failover_provider,
+                    "images_unauthorized_after_refresh",
+                )
+                .await
+            {
+                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
+                    .await;
+                drop(upstream);
+                continue 'provider;
+            }
+        }
+        let mut response_headers = upstream.headers().clone();
+        strip_hop_by_hop_response_headers(&mut response_headers);
+        let content_type = response_headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let content_encoding = content_encoding_value(&response_headers);
+        let bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
+        let decoded = decode_response_body_for_proxy(&response_headers, bytes);
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            maybe_mark_upstream_rate_limited(
+                &state,
+                &execution,
+                status,
+                &response_headers,
+                &decoded.body,
+            )
+            .await;
+        }
+        record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
+        if !status.is_success() {
+            record_share_invocation_result(
+                &state,
+                request_context.share_id.as_deref(),
+                request_context.user_email.as_deref(),
+                TokenUsage::default(),
+            )
+            .await;
+            let mut response = Response::new(Body::from(decoded.body));
+            *response.status_mut() = status;
+            if let Some(content_type) = content_type {
+                if let Ok(value) = HeaderValue::from_str(&content_type) {
+                    response.headers_mut().insert(CONTENT_TYPE, value);
+                }
+            }
+            if decoded.preserve_content_encoding {
+                if let Some(value) = content_encoding {
+                    response.headers_mut().insert(CONTENT_ENCODING, value);
+                }
+            }
+            copy_safe_upstream_response_headers(&response_headers, &mut response);
+            return Ok(response);
+        }
+        let image_response = codex_images_response_from_responses_body(
+            &decoded.body,
+            prepared.response_format.as_deref(),
+            prepared.stream,
+        )?;
+        log_usage(
+            &state,
+            &stored,
+            status_code,
+            started.elapsed().as_millis(),
+            UsageModelMetadata {
+                model: Some(prepared.tool_model.clone()),
+                requested_model: Some(prepared.tool_model.clone()),
+                actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
+                actual_model_source: Some("codex_image_generation_bridge".to_string()),
+            },
+            TokenUsage::default(),
+            UsageLogContext {
+                is_streaming: prepared.stream,
+                stream_status: Some("completed".to_string()),
+                ..request_context.clone()
+            },
+        )
+        .await;
+        record_share_invocation_result(
+            &state,
+            request_context.share_id.as_deref(),
+            request_context.user_email.as_deref(),
+            TokenUsage::default(),
+        )
+        .await;
+        let mut response = Response::new(Body::from(image_response.body));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static(image_response.content_type),
+        );
+        copy_safe_upstream_response_headers(&response_headers, &mut response);
+        return Ok(response);
+    }
+}
+
+async fn send_codex_images_attempt(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    stored: &StoredProvider,
+    adapter_request: &adapters::AdapterRequest,
+    session_id: Option<&str>,
+) -> Result<reqwest::Response, ProxyError> {
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
-    let mut target_headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
-    let session_id = codex_oauth_session_id_from_request(&headers, &body);
-    append_codex_oauth_session_headers(&mut target_headers, session_id.as_deref());
+    let mut target_headers = adapter.build_headers(AppKind::Codex, stored, &accounts)?;
+    append_codex_oauth_session_headers(&mut target_headers, session_id);
     crate::codex_identity::finalize_headers(&mut target_headers);
     let mut target_headers = owned_headers(target_headers);
-    let mut adapter_request = adapters::AdapterRequest {
-        body: prepared.body.clone(),
-        upstream_endpoint: None,
-        upstream_headers: Vec::new(),
-        model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
-        requested_model: Some(prepared.tool_model.clone()),
-        actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
-        actual_model_source: Some("codex_image_generation_bridge".to_string()),
-        stream_requested: true,
-        custom_tool_names: Default::default(),
-    };
-    execution.enforce_model_policy(&mut adapter_request)?;
-    let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, &adapter_request)?;
+    let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, adapter_request)?;
     let materialized_auth = execution.materialize_auth(&accounts)?;
     execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
-    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
-    let http_client = forward_http_client(&state, &stored).await?;
+    apply_account_header_overrides(&mut target_headers, stored, &accounts)?;
+    execution.finalize_outbound_identity(&mut target_headers)?;
+    let http_client = forward_http_client(state, stored).await?;
     let mut request = http_client
         .post(&url)
         .header(ACCEPT, "application/json, text/event-stream")
@@ -1859,101 +2201,7 @@ async fn forward_codex_images_generations(
     for (name, value) in &target_headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    let started = Instant::now();
-    let upstream = request.send().await.map_err(|error| {
-        tokio::spawn({
-            let state = state.clone();
-            let stored = stored.clone();
-            async move {
-                record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-            }
-        });
-        ProxyError::bad_gateway(error)
-    })?;
-    let status = upstream.status();
-    let status_code = status.as_u16();
-    let mut response_headers = upstream.headers().clone();
-    strip_hop_by_hop_response_headers(&mut response_headers);
-    let content_type = response_headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let content_encoding = content_encoding_value(&response_headers);
-    let bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
-    let decoded = decode_response_body_for_proxy(&response_headers, bytes);
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        maybe_mark_upstream_rate_limited(
-            &state,
-            &execution,
-            status,
-            &response_headers,
-            &decoded.body,
-        )
-        .await;
-    }
-    record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
-    if !status.is_success() {
-        record_share_invocation_result(
-            &state,
-            request_context.share_id.as_deref(),
-            request_context.user_email.as_deref(),
-            TokenUsage::default(),
-        )
-        .await;
-        let mut response = Response::new(Body::from(decoded.body));
-        *response.status_mut() = status;
-        if let Some(content_type) = content_type {
-            if let Ok(value) = HeaderValue::from_str(&content_type) {
-                response.headers_mut().insert(CONTENT_TYPE, value);
-            }
-        }
-        if decoded.preserve_content_encoding {
-            if let Some(value) = content_encoding {
-                response.headers_mut().insert(CONTENT_ENCODING, value);
-            }
-        }
-        copy_safe_upstream_response_headers(&response_headers, &mut response);
-        return Ok(response);
-    }
-    let image_response = codex_images_response_from_responses_body(
-        &decoded.body,
-        prepared.response_format.as_deref(),
-        prepared.stream,
-    )?;
-    log_usage(
-        &state,
-        &stored,
-        status_code,
-        started.elapsed().as_millis(),
-        UsageModelMetadata {
-            model: Some(prepared.tool_model.clone()),
-            requested_model: Some(prepared.tool_model),
-            actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
-            actual_model_source: Some("codex_image_generation_bridge".to_string()),
-        },
-        TokenUsage::default(),
-        UsageLogContext {
-            is_streaming: prepared.stream,
-            stream_status: Some("completed".to_string()),
-            ..request_context.clone()
-        },
-    )
-    .await;
-    record_share_invocation_result(
-        &state,
-        request_context.share_id.as_deref(),
-        request_context.user_email.as_deref(),
-        TokenUsage::default(),
-    )
-    .await;
-    let mut response = Response::new(Body::from(image_response.body));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static(image_response.content_type),
-    );
-    copy_safe_upstream_response_headers(&response_headers, &mut response);
-    Ok(response)
+    request.send().await.map_err(ProxyError::bad_gateway)
 }
 
 struct CodexImagesPreparedRequest {
@@ -2275,12 +2523,105 @@ enum ResponsesWebsocketMode {
 struct ResponsesWebsocketBridgeOptions<'a> {
     headers: Vec<(String, String)>,
     connect_timeout: Duration,
+    first_byte_timeout: Option<Duration>,
+    stream_idle_timeout: Option<Duration>,
     ws_url: String,
+    pool_key: Option<String>,
     mode: ResponsesWebsocketMode,
     grok_session_id: Option<String>,
     single_upstream_model: Option<String>,
     state: &'a ServerState,
-    execution: &'a ProviderExecution,
+    execution: ProviderExecution,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    provider_pinned: bool,
+}
+
+struct PreparedResponsesWebSocketTarget {
+    headers: Vec<(String, String)>,
+    ws_url: String,
+    pool_key: Option<String>,
+}
+
+async fn prepare_responses_websocket_target(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    mode: ResponsesWebsocketMode,
+    session_id: Option<&str>,
+) -> Result<PreparedResponsesWebSocketTarget, ProxyError> {
+    let stored = execution.runtime_stored_view();
+    let accounts = state.accounts_snapshot().await;
+    let adapter = adapters::adapter_for(stored.app, stored.provider_type);
+    let mut headers = adapter.build_headers(stored.app, &stored, &accounts)?;
+    append_codex_oauth_session_headers(&mut headers, session_id);
+    if matches!(mode, ResponsesWebsocketMode::Codex) {
+        crate::codex_identity::finalize_headers(&mut headers);
+    } else if let Some(session_id) = session_id {
+        replace_or_push_header(&mut headers, "x-grok-conv-id", session_id.to_string());
+    }
+    let mut headers = owned_headers(headers);
+    let mut ws_url = if matches!(mode, ResponsesWebsocketMode::Grok) {
+        super::grok::websocket_url().to_string()
+    } else {
+        codex_responses_websocket_url(execution)
+    };
+    let materialized_auth = execution.materialize_auth(&accounts)?;
+    execution.apply_auth(&mut headers, &mut ws_url, materialized_auth.as_ref())?;
+    apply_account_header_overrides(&mut headers, &stored, &accounts)?;
+    execution.finalize_outbound_identity(&mut headers)?;
+    let pool_key = if matches!(mode, ResponsesWebsocketMode::Codex) {
+        session_id.map(|session_id| {
+            responses_websocket_pool_key(state, execution, session_id, &ws_url, &headers)
+        })
+    } else {
+        None
+    };
+    Ok(PreparedResponsesWebSocketTarget {
+        headers,
+        ws_url,
+        pool_key,
+    })
+}
+
+fn codex_responses_websocket_url(_execution: &ProviderExecution) -> String {
+    #[cfg(test)]
+    if let Some(url) = _execution
+        .plan
+        .driver_options
+        .get("testCodexWebsocketUrl")
+        .and_then(Value::as_str)
+    {
+        return url.to_string();
+    }
+    "wss://chatgpt.com/backend-api/codex/responses".to_string()
+}
+
+fn responses_websocket_pool_key(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    session_id: &str,
+    ws_url: &str,
+    headers: &[(String, String)],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    for value in [
+        state.process_instance_id.as_str(),
+        execution.stored.provider.id.as_str(),
+        execution.plan.runtime_fingerprint.as_str(),
+        session_id,
+        ws_url,
+    ] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    for (name, value) in headers {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    hex::encode(digest.finalize())
 }
 
 async fn bridge_responses_websocket(
@@ -2288,103 +2629,1275 @@ async fn bridge_responses_websocket(
     options: ResponsesWebsocketBridgeOptions<'_>,
 ) -> Result<(), ProxyError> {
     let ResponsesWebsocketBridgeOptions {
-        headers,
+        mut headers,
         connect_timeout,
-        ws_url,
+        first_byte_timeout,
+        stream_idle_timeout,
+        mut ws_url,
+        mut pool_key,
         mode,
         grok_session_id,
         single_upstream_model,
         state,
-        execution,
+        mut execution,
+        account_in_flight_guard: mut _account_in_flight_guard,
+        provider_pinned,
     } = options;
-    let mut request = ws_url.into_client_request().map_err(|error| {
-        ProxyError::bad_gateway(format!("build responses websocket request: {error}"))
-    })?;
-    for (name, value) in headers {
-        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
-            continue;
-        };
-        let Ok(value) = HeaderValue::from_str(&value) else {
-            continue;
-        };
-        request.headers_mut().insert(name, value);
-    }
-    if matches!(mode, ResponsesWebsocketMode::Codex) {
-        request.headers_mut().insert(
-            HeaderName::from_static("openai-beta"),
-            HeaderValue::from_static("responses_websockets=2026-02-06"),
-        );
-    }
+    let mut excluded_provider_ids = BTreeSet::new();
+    let mut entry = None;
+    let mut entry_was_cached = false;
+    let mut downstream = downstream;
+    let mut response_in_flight = false;
+    let mut emitted_business_event = false;
+    let mut active_response_body = None;
+    let mut auth_refresh_attempted = false;
+    let mut refresh_target_before_connect = false;
+    let mut upstream_read_deadline = None;
+    let mut output_patcher = CodexWebsocketOutputPatcher::default();
+    loop {
+        tokio::select! {
+            downstream_message = downstream.next() => {
+                let Some(message) = downstream_message else {
+                    break;
+                };
+                let message = message
+                    .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                match message {
+                    AxumWsMessage::Close(_) => break,
+                    AxumWsMessage::Ping(bytes) => {
+                        downstream
+                            .send(AxumWsMessage::Pong(bytes))
+                            .await
+                            .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                        continue;
+                    }
+                    AxumWsMessage::Pong(_) => continue,
+                    AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {}
+                }
+                let Some(message) = axum_ws_message_to_tungstenite(
+                    message,
+                    mode,
+                    grok_session_id.as_deref(),
+                    single_upstream_model.as_deref(),
+                ) else {
+                    break;
+                };
+                let starts_response = responses_websocket_request_starts_response(&message);
+                if starts_response {
+                    if response_in_flight {
+                        return Err(ProxyError::bad_request(
+                            "responses websocket received response.create while a response is in flight",
+                        ));
+                    }
+                    active_response_body = matches!(mode, ResponsesWebsocketMode::Codex)
+                        .then(|| responses_websocket_http_body(&message))
+                        .transpose()?;
+                    response_in_flight = true;
+                    emitted_business_event = false;
+                    auth_refresh_attempted = false;
+                    // A provider is excluded only for the active response. A later
+                    // response may retry it after its cooldown or transient failure.
+                    excluded_provider_ids.clear();
 
-    let connect = tokio_tungstenite::connect_async(request);
-    let connect_result = tokio::time::timeout(connect_timeout, connect)
-        .await
-        .map_err(|_| ProxyError {
-            status: StatusCode::GATEWAY_TIMEOUT,
-            message: "codex websocket connect timeout".to_string(),
-        })?;
-    let (upstream, _) = match connect_result {
-        Ok(upstream) => upstream,
-        Err(error) => return Err(responses_websocket_connect_error(state, execution, error).await),
-    };
-    let (mut upstream_write, mut upstream_read) = upstream.split();
-    let (mut downstream_write, mut downstream_read) = downstream.split();
-
-    let client_to_upstream = async {
-        while let Some(message) = downstream_read.next().await {
-            let message = message.map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
-            let Some(message) = axum_ws_message_to_tungstenite(
-                message,
-                mode,
-                grok_session_id.as_deref(),
-                single_upstream_model.as_deref(),
-            ) else {
-                break;
-            };
-            upstream_write
-                .send(message)
-                .await
-                .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
-        }
-        Ok::<(), ProxyError>(())
-    };
-
-    let upstream_to_client = async {
-        let mut output_patcher = CodexWebsocketOutputPatcher::default();
-        while let Some(message) = upstream_read.next().await {
-            let mut message = match message {
-                Ok(message) => message,
-                Err(error) if websocket_message_too_big(&error) => {
-                    let body = websocket_message_too_big_error_body();
-                    let _ = downstream_write
-                        .send(AxumWsMessage::Text(body.clone()))
+                    if entry.is_none() {
+                        if refresh_target_before_connect {
+                            let target = prepare_responses_websocket_target(
+                                state,
+                                &execution,
+                                mode,
+                                grok_session_id.as_deref(),
+                            )
+                            .await?;
+                            headers = target.headers;
+                            ws_url = target.ws_url;
+                            pool_key = target.pool_key;
+                            refresh_target_before_connect = false;
+                        }
+                        (entry, entry_was_cached) = acquire_cached_responses_websocket(&pool_key);
+                    }
+                    if entry.is_none() {
+                        match connect_responses_websocket(
+                            state,
+                            &mut execution,
+                            mode,
+                            grok_session_id.as_deref(),
+                            connect_timeout,
+                            &mut headers,
+                            &mut ws_url,
+                            &mut pool_key,
+                            &mut auth_refresh_attempted,
+                            &mut _account_in_flight_guard,
+                            provider_pinned,
+                            &mut excluded_provider_ids,
+                        )
+                        .await
+                        {
+                            Ok(connected) => {
+                                entry = Some(connected);
+                                entry_was_cached = false;
+                            }
+                            Err(failure) => {
+                                let Some(source) = failure
+                                    .fallback_source
+                                    .filter(|_| matches!(mode, ResponsesWebsocketMode::Codex))
+                                else {
+                                    return Err(failure.error);
+                                };
+                                let body = active_response_body.as_ref().ok_or_else(|| {
+                                    ProxyError::bad_request(
+                                        "response.create body is unavailable for HTTP fallback",
+                                    )
+                                })?;
+                                let outcome = run_codex_websocket_http_fallback(
+                                    &mut downstream,
+                                    state,
+                                    &mut execution,
+                                    body,
+                                    grok_session_id.as_deref(),
+                                    first_byte_timeout,
+                                    stream_idle_timeout,
+                                    source,
+                                    &mut auth_refresh_attempted,
+                                    &mut _account_in_flight_guard,
+                                    provider_pinned,
+                                    &mut excluded_provider_ids,
+                                    &mut output_patcher,
+                                )
+                                .await?;
+                                if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                    return Ok(());
+                                }
+                                response_in_flight = false;
+                                active_response_body = None;
+                                refresh_target_before_connect = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if entry.is_none() {
+                    return Err(ProxyError::bad_request(
+                        "the first responses websocket request must be response.create",
+                    ));
+                }
+                let send_result = entry
+                    .as_mut()
+                    .expect("upstream websocket is connected")
+                    .socket
+                    .send(message)
+                    .await;
+                if let Err(error) = send_result {
+                    let _failed_entry = entry.take();
+                    if matches!(mode, ResponsesWebsocketMode::Codex)
+                        && response_in_flight
+                        && !emitted_business_event
+                    {
+                        let body = active_response_body.as_ref().ok_or_else(|| {
+                            ProxyError::bad_request(
+                                "response.create body is unavailable for HTTP fallback",
+                            )
+                        })?;
+                        let source = if entry_was_cached {
+                            "cached_stale"
+                        } else {
+                            "send_failure"
+                        };
+                        let outcome = run_codex_websocket_http_fallback(
+                            &mut downstream,
+                            state,
+                            &mut execution,
+                            body,
+                            grok_session_id.as_deref(),
+                            first_byte_timeout,
+                            stream_idle_timeout,
+                            source,
+                            &mut auth_refresh_attempted,
+                            &mut _account_in_flight_guard,
+                            provider_pinned,
+                            &mut excluded_provider_ids,
+                            &mut output_patcher,
+                        )
+                        .await?;
+                        if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                            return Ok(());
+                        }
+                        response_in_flight = false;
+                        active_response_body = None;
+                        refresh_target_before_connect = true;
+                        continue;
+                    }
+                    return Err(ProxyError::bad_gateway(error.to_string()));
+                }
+                if starts_response {
+                    upstream_read_deadline = first_byte_timeout
+                        .map(|timeout| tokio::time::Instant::now() + timeout);
+                }
+            }
+            upstream_read = next_responses_websocket_message(&mut entry, upstream_read_deadline) => {
+                let upstream_message = match upstream_read {
+                    ResponsesWebsocketRead::Message(message) => message,
+                    ResponsesWebsocketRead::TimedOut => {
+                        let _timed_out_entry = entry.take();
+                        if matches!(mode, ResponsesWebsocketMode::Codex)
+                            && response_in_flight
+                            && !emitted_business_event
+                        {
+                            let body = active_response_body.as_ref().ok_or_else(|| {
+                                ProxyError::bad_request(
+                                    "response.create body is unavailable for HTTP fallback",
+                                )
+                            })?;
+                            let outcome = run_codex_websocket_http_fallback(
+                                &mut downstream,
+                                state,
+                                &mut execution,
+                                body,
+                                grok_session_id.as_deref(),
+                                first_byte_timeout,
+                                stream_idle_timeout,
+                                "first_byte_timeout",
+                                &mut auth_refresh_attempted,
+                                &mut _account_in_flight_guard,
+                                provider_pinned,
+                                &mut excluded_provider_ids,
+                                &mut output_patcher,
+                            )
+                            .await?;
+                            if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                return Ok(());
+                            }
+                            response_in_flight = false;
+                            active_response_body = None;
+                            upstream_read_deadline = None;
+                            refresh_target_before_connect = true;
+                            continue;
+                        }
+                        record_provider_outcome(
+                            state,
+                            &execution.runtime_stored_view(),
+                            ProviderOutcome::NetworkFailure,
+                        )
                         .await;
-                    return Err(ProxyError {
-                        status: StatusCode::PAYLOAD_TOO_LARGE,
-                        message: body,
+                        return Err(ProxyError {
+                            status: StatusCode::GATEWAY_TIMEOUT,
+                            message: if emitted_business_event {
+                                "responses websocket stream idle timeout".to_string()
+                            } else {
+                                "responses websocket first byte timeout".to_string()
+                            },
+                        });
+                    }
+                };
+                let Some(message) = upstream_message else {
+                    let _closed_entry = entry.take();
+                    if matches!(mode, ResponsesWebsocketMode::Codex)
+                        && response_in_flight
+                        && !emitted_business_event
+                    {
+                        let body = active_response_body.as_ref().ok_or_else(|| {
+                            ProxyError::bad_request(
+                                "response.create body is unavailable for HTTP fallback",
+                            )
+                        })?;
+                        let source = if entry_was_cached {
+                            "cached_stale"
+                        } else {
+                            "closed_before_event"
+                        };
+                        let outcome = run_codex_websocket_http_fallback(
+                            &mut downstream,
+                            state,
+                            &mut execution,
+                            body,
+                            grok_session_id.as_deref(),
+                            first_byte_timeout,
+                            stream_idle_timeout,
+                            source,
+                            &mut auth_refresh_attempted,
+                            &mut _account_in_flight_guard,
+                            provider_pinned,
+                            &mut excluded_provider_ids,
+                            &mut output_patcher,
+                        )
+                        .await?;
+                        if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                            return Ok(());
+                        }
+                        response_in_flight = false;
+                        active_response_body = None;
+                        refresh_target_before_connect = true;
+                        continue;
+                    }
+                    if response_in_flight {
+                        return Err(ProxyError::bad_gateway(
+                            "upstream websocket closed before a terminal response event",
+                        ));
+                    }
+                    refresh_target_before_connect = true;
+                    continue;
+                };
+                let mut message = match message {
+                    Ok(message) => message,
+                    Err(error)
+                        if matches!(mode, ResponsesWebsocketMode::Codex)
+                            && response_in_flight
+                            && !emitted_business_event
+                            && websocket_read_fallback_source(&error, entry_was_cached).is_some() =>
+                    {
+                        let source = websocket_read_fallback_source(&error, entry_was_cached)
+                            .expect("checked websocket fallback source");
+                        let _failed_entry = entry.take();
+                        let body = active_response_body.as_ref().ok_or_else(|| {
+                            ProxyError::bad_request(
+                                "response.create body is unavailable for HTTP fallback",
+                            )
+                        })?;
+                        let outcome = run_codex_websocket_http_fallback(
+                            &mut downstream,
+                            state,
+                            &mut execution,
+                            body,
+                            grok_session_id.as_deref(),
+                            first_byte_timeout,
+                            stream_idle_timeout,
+                            source,
+                            &mut auth_refresh_attempted,
+                            &mut _account_in_flight_guard,
+                            provider_pinned,
+                            &mut excluded_provider_ids,
+                            &mut output_patcher,
+                        )
+                        .await?;
+                        if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                            return Ok(());
+                        }
+                        response_in_flight = false;
+                        active_response_body = None;
+                        refresh_target_before_connect = true;
+                        continue;
+                    }
+                    Err(error) if websocket_message_too_big(&error) => {
+                        let body = websocket_message_too_big_error_body();
+                        let _ = downstream.send(AxumWsMessage::Text(body.clone())).await;
+                        return Err(ProxyError {
+                            status: StatusCode::PAYLOAD_TOO_LARGE,
+                            message: body,
+                        });
+                    }
+                    Err(error) if websocket_expected_reset(&error) && !response_in_flight => {
+                        let _closed_entry = entry.take();
+                        refresh_target_before_connect = true;
+                        continue;
+                    }
+                    Err(error) => return Err(ProxyError::bad_gateway(error.to_string())),
+                };
+                let upstream_closed = matches!(message, TungsteniteMessage::Close(_));
+                if upstream_closed {
+                    let fallback_source = websocket_close_fallback_source(
+                        &message,
+                        entry_was_cached,
+                    );
+                    let _closed_entry = entry.take();
+                    if let Some(source) = fallback_source.filter(|_| {
+                        matches!(mode, ResponsesWebsocketMode::Codex)
+                            && response_in_flight
+                            && !emitted_business_event
+                    }) {
+                        let body = active_response_body.as_ref().ok_or_else(|| {
+                            ProxyError::bad_request(
+                                "response.create body is unavailable for HTTP fallback",
+                            )
+                        })?;
+                        let outcome = run_codex_websocket_http_fallback(
+                            &mut downstream,
+                            state,
+                            &mut execution,
+                            body,
+                            grok_session_id.as_deref(),
+                            first_byte_timeout,
+                            stream_idle_timeout,
+                            source,
+                            &mut auth_refresh_attempted,
+                            &mut _account_in_flight_guard,
+                            provider_pinned,
+                            &mut excluded_provider_ids,
+                            &mut output_patcher,
+                        )
+                        .await?;
+                        if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                            return Ok(());
+                        }
+                        response_in_flight = false;
+                        active_response_body = None;
+                        refresh_target_before_connect = true;
+                        continue;
+                    }
+                    if !response_in_flight {
+                        refresh_target_before_connect = true;
+                        continue;
+                    }
+                }
+                if responses_websocket_response_is_terminal(&message) {
+                    response_in_flight = false;
+                    active_response_body = None;
+                    upstream_read_deadline = None;
+                } else if response_in_flight
+                    && matches!(message, TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_))
+                {
+                    upstream_read_deadline = stream_idle_timeout
+                        .map(|timeout| tokio::time::Instant::now() + timeout);
+                }
+                if matches!(mode, ResponsesWebsocketMode::Codex) {
+                    output_patcher.patch_message(&mut message);
+                }
+                if matches!(message, TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_)) {
+                    emitted_business_event = true;
+                }
+                let Some(message) = tungstenite_message_to_axum_ws(message) else {
+                    continue;
+                };
+                let closes = matches!(message, AxumWsMessage::Close(_));
+                downstream
+                    .send(message)
+                    .await
+                    .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                if closes || upstream_closed {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    if !response_in_flight {
+        if let (Some(pool_key), Some(entry)) = (pool_key, entry.take()) {
+            responses_websocket_pool()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .release(pool_key, entry);
+            crate::metrics::record_codex_websocket_cache("release");
+            return Ok(());
+        }
+    }
+    if let Some(mut entry) = entry {
+        let _ = entry.socket.close(None).await;
+    }
+    Ok(())
+}
+
+fn acquire_cached_responses_websocket(
+    pool_key: &Option<String>,
+) -> (Option<CachedResponsesWebSocket>, bool) {
+    let Some(pool_key) = pool_key.as_deref() else {
+        return (None, false);
+    };
+    let cached = responses_websocket_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .acquire(pool_key);
+    if cached.is_some() {
+        crate::metrics::record_codex_websocket_cache("hit");
+        (cached, true)
+    } else {
+        crate::metrics::record_codex_websocket_cache("miss");
+        (None, false)
+    }
+}
+
+enum ResponsesWebsocketRead {
+    Message(Option<Result<TungsteniteMessage, TungsteniteError>>),
+    TimedOut,
+}
+
+async fn next_responses_websocket_message(
+    entry: &mut Option<CachedResponsesWebSocket>,
+    deadline: Option<tokio::time::Instant>,
+) -> ResponsesWebsocketRead {
+    match entry {
+        Some(entry) => {
+            if let Some(deadline) = deadline {
+                match tokio::time::timeout_at(deadline, entry.socket.next()).await {
+                    Ok(message) => ResponsesWebsocketRead::Message(message),
+                    Err(_) => ResponsesWebsocketRead::TimedOut,
+                }
+            } else {
+                ResponsesWebsocketRead::Message(entry.socket.next().await)
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+struct ResponsesWebsocketConnectFailure {
+    error: ProxyError,
+    fallback_source: Option<&'static str>,
+}
+
+#[allow(clippy::too_many_arguments)] // The connect loop updates one authenticated WS target in place.
+async fn connect_responses_websocket(
+    state: &ServerState,
+    execution: &mut ProviderExecution,
+    mode: ResponsesWebsocketMode,
+    session_id: Option<&str>,
+    connect_timeout: Duration,
+    headers: &mut Vec<(String, String)>,
+    ws_url: &mut String,
+    pool_key: &mut Option<String>,
+    auth_refresh_attempted: &mut bool,
+    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
+    provider_pinned: bool,
+    excluded_provider_ids: &mut BTreeSet<String>,
+) -> Result<CachedResponsesWebSocket, ResponsesWebsocketConnectFailure> {
+    loop {
+        let mut request = ws_url.clone().into_client_request().map_err(|error| {
+            ResponsesWebsocketConnectFailure {
+                error: ProxyError::bad_gateway(format!(
+                    "build responses websocket request: {error}"
+                )),
+                fallback_source: None,
+            }
+        })?;
+        for (name, value) in headers.iter() {
+            let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = HeaderValue::from_str(value) else {
+                continue;
+            };
+            request.headers_mut().insert(name, value);
+        }
+        if matches!(mode, ResponsesWebsocketMode::Codex) {
+            request.headers_mut().insert(
+                HeaderName::from_static("openai-beta"),
+                HeaderValue::from_static("responses_websockets=2026-02-06"),
+            );
+        }
+
+        let connect = tokio_tungstenite::connect_async(request);
+        let connect_result = match tokio::time::timeout(connect_timeout, connect).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Err(ResponsesWebsocketConnectFailure {
+                    error: ProxyError {
+                        status: StatusCode::GATEWAY_TIMEOUT,
+                        message: "codex websocket connect timeout".to_string(),
+                    },
+                    fallback_source: matches!(mode, ResponsesWebsocketMode::Codex)
+                        .then_some("connect_timeout"),
+                })
+            }
+        };
+        match connect_result {
+            Ok((upstream, _)) => {
+                return Ok(CachedResponsesWebSocket {
+                    socket: upstream,
+                    created_at: Instant::now(),
+                    last_used_at: Instant::now(),
+                })
+            }
+            Err(error)
+                if matches!(mode, ResponsesWebsocketMode::Codex)
+                    && !*auth_refresh_attempted
+                    && responses_websocket_http_error(&error)
+                        .is_some_and(|(status, _, _)| status == StatusCode::UNAUTHORIZED) =>
+            {
+                let Some((provider_type, account_id)) = execution.managed_account_target() else {
+                    return Err(ResponsesWebsocketConnectFailure {
+                        error: responses_websocket_connect_error(state, execution, error).await,
+                        fallback_source: None,
+                    });
+                };
+                let refresh_result = state
+                    .refresh_managed_account_now(provider_type, account_id)
+                    .await;
+                if let Err(error) = refresh_result {
+                    mark_managed_account_auth_cooldown(
+                        state,
+                        execution,
+                        "websocket_forced_refresh_failed",
+                    )
+                    .await;
+                    if !provider_pinned
+                        && switch_codex_websocket_provider(
+                            state,
+                            execution,
+                            account_in_flight_guard,
+                            excluded_provider_ids,
+                            session_id,
+                            headers,
+                            ws_url,
+                            pool_key,
+                            "websocket_auth_refresh_failed",
+                        )
+                        .await
+                        .map_err(|error| {
+                            ResponsesWebsocketConnectFailure {
+                                error,
+                                fallback_source: None,
+                            }
+                        })?
+                    {
+                        *auth_refresh_attempted = false;
+                        continue;
+                    }
+                    return Err(ResponsesWebsocketConnectFailure {
+                        error: managed_account_refresh_error_to_proxy_error(error),
+                        fallback_source: None,
                     });
                 }
-                Err(error) if websocket_expected_reset(&error) => return Ok(()),
-                Err(error) => return Err(ProxyError::bad_gateway(error.to_string())),
-            };
-            if matches!(mode, ResponsesWebsocketMode::Codex) {
-                output_patcher.patch_message(&mut message);
+                *auth_refresh_attempted = true;
+                record_forward_retry(ProxyRoute::CodexResponses, "auth", "websocket_unauthorized");
+                let target = prepare_responses_websocket_target(state, execution, mode, session_id)
+                    .await
+                    .map_err(|error| ResponsesWebsocketConnectFailure {
+                        error,
+                        fallback_source: None,
+                    })?;
+                *headers = target.headers;
+                *ws_url = target.ws_url;
+                *pool_key = target.pool_key;
             }
-            let Some(message) = tungstenite_message_to_axum_ws(message) else {
-                break;
-            };
-            downstream_write
-                .send(message)
-                .await
-                .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+            Err(error) => {
+                let fallback_source = websocket_connect_fallback_source(mode, &error);
+                let error = responses_websocket_connect_error(state, execution, error).await;
+                if matches!(mode, ResponsesWebsocketMode::Codex)
+                    && error.status == StatusCode::UNAUTHORIZED
+                    && *auth_refresh_attempted
+                {
+                    mark_managed_account_auth_cooldown(
+                        state,
+                        execution,
+                        "websocket_unauthorized_after_refresh",
+                    )
+                    .await;
+                    if !provider_pinned
+                        && switch_codex_websocket_provider(
+                            state,
+                            execution,
+                            account_in_flight_guard,
+                            excluded_provider_ids,
+                            session_id,
+                            headers,
+                            ws_url,
+                            pool_key,
+                            "websocket_unauthorized_after_refresh",
+                        )
+                        .await
+                        .map_err(|error| {
+                            ResponsesWebsocketConnectFailure {
+                                error,
+                                fallback_source: None,
+                            }
+                        })?
+                    {
+                        *auth_refresh_attempted = false;
+                        continue;
+                    }
+                }
+                return Err(ResponsesWebsocketConnectFailure {
+                    error,
+                    fallback_source,
+                });
+            }
         }
-        Ok::<(), ProxyError>(())
-    };
-
-    tokio::select! {
-        result = client_to_upstream => result,
-        result = upstream_to_client => result,
     }
+}
+
+#[allow(clippy::too_many_arguments)] // A failover atomically replaces the authenticated WS target and its account lease.
+async fn switch_codex_websocket_provider(
+    state: &ServerState,
+    execution: &mut ProviderExecution,
+    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
+    excluded_provider_ids: &mut BTreeSet<String>,
+    session_id: Option<&str>,
+    headers: &mut Vec<(String, String)>,
+    ws_url: &mut String,
+    pool_key: &mut Option<String>,
+    reason: &'static str,
+) -> Result<bool, ProxyError> {
+    if !switch_to_ready_codex_provider(
+        state,
+        execution,
+        account_in_flight_guard,
+        excluded_provider_ids,
+        codex_oauth_websocket_failover_provider,
+        reason,
+    )
+    .await
+    {
+        return Ok(false);
+    }
+    let target = prepare_responses_websocket_target(
+        state,
+        execution,
+        ResponsesWebsocketMode::Codex,
+        session_id,
+    )
+    .await?;
+    *headers = target.headers;
+    *ws_url = target.ws_url;
+    *pool_key = target.pool_key;
+    Ok(true)
+}
+
+fn websocket_connect_fallback_source(
+    mode: ResponsesWebsocketMode,
+    error: &TungsteniteError,
+) -> Option<&'static str> {
+    if !matches!(mode, ResponsesWebsocketMode::Codex) {
+        return None;
+    }
+    match responses_websocket_http_error(error) {
+        Some((status, _, _)) if status.is_server_error() => Some("handshake_server_error"),
+        Some(_) => None,
+        None => Some("connect_transport"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexHttpFallbackOutcome {
+    Completed,
+    DownstreamClosed,
+}
+
+struct PreparedCodexHttpFallbackTarget {
+    http_client: reqwest::Client,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+}
+
+#[allow(clippy::too_many_arguments)] // Fallback preserves the active bridge, identity, timeout, and patch state.
+async fn run_codex_websocket_http_fallback(
+    downstream: &mut WebSocket,
+    state: &ServerState,
+    execution: &mut ProviderExecution,
+    response_body: &Value,
+    session_id: Option<&str>,
+    first_event_timeout: Option<Duration>,
+    stream_idle_timeout: Option<Duration>,
+    source: &'static str,
+    auth_refresh_attempted: &mut bool,
+    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
+    provider_pinned: bool,
+    excluded_provider_ids: &mut BTreeSet<String>,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+) -> Result<CodexHttpFallbackOutcome, ProxyError> {
+    record_forward_retry(ProxyRoute::CodexResponses, "transport", source);
+    crate::metrics::record_codex_websocket_fallback(source, "attempt");
+
+    loop {
+        let stored = execution.runtime_stored_view();
+        let target =
+            match prepare_codex_http_fallback_target(state, execution, response_body, session_id)
+                .await
+            {
+                Ok(target) => target,
+                Err(error) => {
+                    crate::metrics::record_codex_websocket_fallback(source, "error");
+                    return Err(error);
+                }
+            };
+        let mut request = target
+            .http_client
+            .post(&target.url)
+            .header(ACCEPT, "text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .body(target.body);
+        for (name, value) in &target.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let first_event_deadline =
+            first_event_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+        let send_result = match first_event_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, request.send())
+                .await
+                .map_err(|_| ()),
+            None => Ok(request.send().await),
+        };
+        let upstream = match send_result {
+            Ok(Ok(upstream)) => upstream,
+            Ok(Err(error)) => {
+                record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
+                crate::metrics::record_codex_websocket_fallback(source, "error");
+                return Err(ProxyError::bad_gateway(error));
+            }
+            Err(_) => {
+                record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
+                crate::metrics::record_codex_websocket_fallback(source, "error");
+                return Err(ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "Codex HTTP fallback first event timeout after {}ms",
+                        first_event_timeout
+                            .expect("a deadline exists only when the timeout is enabled")
+                            .as_millis()
+                    ),
+                });
+            }
+        };
+        let status = upstream.status();
+        if status == StatusCode::UNAUTHORIZED && !*auth_refresh_attempted {
+            let Some((provider_type, account_id)) = execution.managed_account_target() else {
+                crate::metrics::record_codex_websocket_fallback(source, "error");
+                return Err(ProxyError {
+                    status,
+                    message: "Codex HTTP fallback upstream rejected authentication".to_string(),
+                });
+            };
+            drop(upstream);
+            let refresh_result = state
+                .refresh_managed_account_now(provider_type, account_id)
+                .await;
+            if let Err(error) = refresh_result {
+                mark_managed_account_auth_cooldown(
+                    state,
+                    execution,
+                    "websocket_http_fallback_refresh_failed",
+                )
+                .await;
+                if !provider_pinned
+                    && switch_to_ready_codex_provider(
+                        state,
+                        execution,
+                        account_in_flight_guard,
+                        excluded_provider_ids,
+                        codex_oauth_websocket_failover_provider,
+                        "websocket_http_fallback_refresh_failed",
+                    )
+                    .await
+                {
+                    *auth_refresh_attempted = false;
+                    continue;
+                }
+                crate::metrics::record_codex_websocket_fallback(source, "error");
+                return Err(managed_account_refresh_error_to_proxy_error(error));
+            }
+            *auth_refresh_attempted = true;
+            record_forward_retry(
+                ProxyRoute::CodexResponses,
+                "auth",
+                "websocket_http_fallback_unauthorized",
+            );
+            continue;
+        }
+        if status == StatusCode::UNAUTHORIZED && *auth_refresh_attempted {
+            mark_managed_account_auth_cooldown(
+                state,
+                execution,
+                "websocket_http_fallback_unauthorized_after_refresh",
+            )
+            .await;
+            if !provider_pinned
+                && switch_to_ready_codex_provider(
+                    state,
+                    execution,
+                    account_in_flight_guard,
+                    excluded_provider_ids,
+                    codex_oauth_websocket_failover_provider,
+                    "websocket_http_fallback_unauthorized_after_refresh",
+                )
+                .await
+            {
+                record_provider_outcome(
+                    state,
+                    &stored,
+                    provider_outcome_from_status(status.as_u16()),
+                )
+                .await;
+                *auth_refresh_attempted = false;
+                drop(upstream);
+                continue;
+            }
+        }
+        if !status.is_success() {
+            let response_headers = upstream.headers().clone();
+            let body = match first_event_deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, upstream.bytes()).await {
+                    Ok(body) => body.unwrap_or_default(),
+                    Err(_) => {
+                        record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure)
+                            .await;
+                        crate::metrics::record_codex_websocket_fallback(source, "error");
+                        return Err(ProxyError {
+                            status: StatusCode::GATEWAY_TIMEOUT,
+                            message: format!(
+                                "Codex HTTP fallback first event timeout after {}ms",
+                                first_event_timeout
+                                    .expect("a deadline exists only when the timeout is enabled")
+                                    .as_millis()
+                            ),
+                        });
+                    }
+                },
+                None => upstream.bytes().await.unwrap_or_default(),
+            };
+            maybe_mark_upstream_rate_limited(state, execution, status, &response_headers, &body)
+                .await;
+            record_provider_outcome(
+                state,
+                &stored,
+                provider_outcome_from_status(status.as_u16()),
+            )
+            .await;
+            crate::metrics::record_codex_websocket_fallback(source, "error");
+            return Err(ProxyError {
+                status,
+                message: format!(
+                    "Codex HTTP fallback upstream returned HTTP {}",
+                    status.as_u16()
+                ),
+            });
+        }
+
+        match relay_codex_http_fallback_stream(
+            downstream,
+            upstream,
+            first_event_deadline,
+            first_event_timeout,
+            stream_idle_timeout,
+            output_patcher,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                record_provider_outcome(
+                    state,
+                    &stored,
+                    ProviderOutcome::Success { status_code: 200 },
+                )
+                .await;
+                crate::metrics::record_codex_websocket_fallback(source, "success");
+                return Ok(outcome);
+            }
+            Err(error) => {
+                record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
+                crate::metrics::record_codex_websocket_fallback(source, "error");
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn prepare_codex_http_fallback_target(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    response_body: &Value,
+    session_id: Option<&str>,
+) -> Result<PreparedCodexHttpFallbackTarget, ProxyError> {
+    let stored = execution.runtime_stored_view();
+    let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
+    let body = serde_json::to_vec(response_body)
+        .map(Bytes::from)
+        .map_err(|error| {
+            ProxyError::bad_request(format!("encode response.create body: {error}"))
+        })?;
+    let mut adapter_request =
+        adapter.transform_request_for_route(body, &stored, ProxyRoute::CodexResponses, None)?;
+    adapter_request.body = normalize_codex_oauth_responses_body_bytes(
+        &adapter_request.body,
+        session_id,
+        codex_image_tool_strip_policy(&stored),
+    )?;
+    adapter_request.stream_requested = true;
+    execution.enforce_model_policy(&mut adapter_request)?;
+    execution.finalize_request(&mut adapter_request)?;
+    let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, &adapter_request)?;
+
+    refresh_execution_managed_account_if_needed(state, execution).await?;
+    let accounts = state.accounts_snapshot().await;
+    let mut headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
+    headers.extend(adapter_request.upstream_headers.iter().cloned());
+    append_codex_oauth_session_headers(&mut headers, session_id);
+    crate::codex_identity::finalize_headers(&mut headers);
+    let mut headers = owned_headers(headers);
+    let materialized_auth = execution.materialize_auth(&accounts)?;
+    execution.apply_auth(&mut headers, &mut url, materialized_auth.as_ref())?;
+    apply_account_header_overrides(&mut headers, &stored, &accounts)?;
+    execution.finalize_outbound_identity(&mut headers)?;
+
+    Ok(PreparedCodexHttpFallbackTarget {
+        http_client: forward_http_client(state, &stored).await?,
+        url,
+        headers,
+        body: adapter_request.body,
+    })
+}
+
+fn responses_websocket_http_body(message: &TungsteniteMessage) -> Result<Value, ProxyError> {
+    let bytes = match message {
+        TungsteniteMessage::Text(text) => text.as_bytes(),
+        TungsteniteMessage::Binary(bytes) => bytes.as_slice(),
+        _ => {
+            return Err(ProxyError::bad_request(
+                "response.create must be a text or binary JSON frame",
+            ))
+        }
+    };
+    let mut value = serde_json::from_slice::<Value>(bytes).map_err(|error| {
+        ProxyError::bad_request(format!("invalid response.create JSON: {error}"))
+    })?;
+    if value.get("type").and_then(Value::as_str) != Some("response.create") {
+        return Err(ProxyError::bad_request(
+            "Codex HTTP fallback requires a response.create frame",
+        ));
+    }
+    if value.get("response").is_some() {
+        return value
+            .get("response")
+            .filter(|response| response.is_object())
+            .cloned()
+            .ok_or_else(|| ProxyError::bad_request("response.create.response must be an object"));
+    }
+    let Some(object) = value.as_object_mut() else {
+        return Err(ProxyError::bad_request(
+            "response.create payload must be an object",
+        ));
+    };
+    object.remove("type");
+    Ok(value)
+}
+
+async fn relay_codex_http_fallback_stream(
+    downstream: &mut WebSocket,
+    upstream: reqwest::Response,
+    first_event_deadline: Option<tokio::time::Instant>,
+    first_event_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+) -> Result<CodexHttpFallbackOutcome, ProxyError> {
+    let mut upstream = upstream.bytes_stream();
+    let mut decoder = CodexHttpFallbackSseDecoder::default();
+    let mut first_event_seen = false;
+    let mut deadline = first_event_deadline;
+
+    loop {
+        let current_deadline = deadline;
+        let waiting_for_first_event = !first_event_seen;
+        let upstream_next = async {
+            if let Some(deadline) = current_deadline {
+                tokio::time::timeout_at(deadline, upstream.try_next())
+                    .await
+                    .map_err(|_| ProxyError {
+                        status: StatusCode::GATEWAY_TIMEOUT,
+                        message: if waiting_for_first_event {
+                            format!(
+                                "Codex HTTP fallback first event timeout after {}ms",
+                                first_event_timeout
+                                    .expect("a first-event deadline has a configured timeout")
+                                    .as_millis()
+                            )
+                        } else {
+                            "Codex HTTP fallback stream idle timeout".to_string()
+                        },
+                    })?
+                    .map_err(ProxyError::bad_gateway)
+            } else {
+                upstream.try_next().await.map_err(ProxyError::bad_gateway)
+            }
+        };
+        tokio::pin!(upstream_next);
+
+        let next_chunk = tokio::select! {
+            downstream_message = downstream.next() => {
+                let Some(message) = downstream_message else {
+                    return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+                };
+                let message = message
+                    .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                match message {
+                    AxumWsMessage::Close(_) => {
+                        return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+                    }
+                    AxumWsMessage::Ping(bytes) => {
+                        downstream
+                            .send(AxumWsMessage::Pong(bytes))
+                            .await
+                            .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                    }
+                    AxumWsMessage::Pong(_) => {}
+                    AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {
+                        return Err(ProxyError::bad_request(
+                            "responses websocket received a request while HTTP fallback was in flight",
+                        ));
+                    }
+                }
+                continue;
+            }
+            chunk = &mut upstream_next => chunk?,
+        };
+
+        match next_chunk {
+            Some(chunk) => {
+                for payload in decoder.push(&chunk)? {
+                    if relay_codex_http_fallback_event(downstream, output_patcher, payload).await? {
+                        return Ok(CodexHttpFallbackOutcome::Completed);
+                    }
+                    first_event_seen = true;
+                    deadline = idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+                }
+            }
+            None => {
+                for payload in decoder.finish()? {
+                    if relay_codex_http_fallback_event(downstream, output_patcher, payload).await? {
+                        return Ok(CodexHttpFallbackOutcome::Completed);
+                    }
+                }
+                return Err(ProxyError::bad_gateway(
+                    "Codex HTTP fallback stream ended before a terminal response event",
+                ));
+            }
+        }
+    }
+}
+
+async fn relay_codex_http_fallback_event(
+    downstream: &mut WebSocket,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+    payload: String,
+) -> Result<bool, ProxyError> {
+    let mut message = TungsteniteMessage::Text(payload);
+    let terminal = responses_websocket_response_is_terminal(&message)
+        || websocket_message_json_type(&message).as_deref() == Some("error");
+    output_patcher.patch_message(&mut message);
+    let Some(message) = tungstenite_message_to_axum_ws(message) else {
+        return Ok(terminal);
+    };
+    downstream
+        .send(message)
+        .await
+        .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+    Ok(terminal)
+}
+
+#[derive(Debug, Default)]
+struct CodexHttpFallbackSseDecoder {
+    buffer: Vec<u8>,
+}
+
+impl CodexHttpFallbackSseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, ProxyError> {
+        self.buffer.extend_from_slice(chunk);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> Result<Vec<String>, ProxyError> {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, finish: bool) -> Result<Vec<String>, ProxyError> {
+        self.drain_with_limit(finish, MAX_CODEX_HTTP_FALLBACK_SSE_EVENT_BYTES)
+    }
+
+    fn drain_with_limit(
+        &mut self,
+        finish: bool,
+        max_event_bytes: usize,
+    ) -> Result<Vec<String>, ProxyError> {
+        let mut payloads = Vec::new();
+        while let Some((event_end, delimiter_len)) = codex_sse_event_boundary(&self.buffer) {
+            if event_end > max_event_bytes {
+                return Err(codex_http_fallback_sse_event_too_large());
+            }
+            let event = self.buffer[..event_end].to_vec();
+            self.buffer.drain(..event_end + delimiter_len);
+            if let Some(payload) = codex_sse_json_payload(&event)? {
+                payloads.push(payload);
+            }
+        }
+        let pending_event_bytes = if finish {
+            self.buffer.len()
+        } else {
+            self.buffer
+                .len()
+                .saturating_sub(codex_sse_delimiter_prefix_len(&self.buffer))
+        };
+        if pending_event_bytes > max_event_bytes {
+            return Err(codex_http_fallback_sse_event_too_large());
+        }
+        if finish && !self.buffer.is_empty() {
+            let event = std::mem::take(&mut self.buffer);
+            if let Some(payload) = codex_sse_json_payload(&event)? {
+                payloads.push(payload);
+            }
+        }
+        Ok(payloads)
+    }
+}
+
+fn codex_http_fallback_sse_event_too_large() -> ProxyError {
+    ProxyError {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        message: "Codex HTTP fallback SSE event exceeded 128 MiB".to_string(),
+    }
+}
+
+fn codex_sse_delimiter_prefix_len(buffer: &[u8]) -> usize {
+    [b"\r\n\r".as_slice(), b"\r\n", b"\r", b"\n"]
+        .into_iter()
+        .find(|prefix| buffer.ends_with(prefix))
+        .map_or(0, <[u8]>::len)
+}
+
+fn codex_sse_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len() {
+        if buffer.get(index..index + 2) == Some(b"\n\n") {
+            return Some((index, 2));
+        }
+        if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+    }
+    None
+}
+
+fn codex_sse_json_payload(event: &[u8]) -> Result<Option<String>, ProxyError> {
+    let event = std::str::from_utf8(event)
+        .map_err(|error| ProxyError::bad_gateway(format!("Codex SSE is not UTF-8: {error}")))?;
+    let data = event
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>();
+    let payload = if data.is_empty() {
+        let event = event.trim();
+        if !event.starts_with('{') {
+            return Ok(None);
+        }
+        event.to_string()
+    } else {
+        data.join("\n").trim().to_string()
+    };
+    if payload.is_empty() || payload == "[DONE]" {
+        return Ok(None);
+    }
+    serde_json::from_str::<Value>(&payload).map_err(|error| {
+        ProxyError::bad_gateway(format!("Codex SSE data is not valid JSON: {error}"))
+    })?;
+    Ok(Some(payload))
+}
+
+fn responses_websocket_request_starts_response(message: &TungsteniteMessage) -> bool {
+    websocket_message_json_type(message).as_deref() == Some("response.create")
+}
+
+fn responses_websocket_response_is_terminal(message: &TungsteniteMessage) -> bool {
+    matches!(
+        websocket_message_json_type(message).as_deref(),
+        Some("response.completed" | "response.failed" | "response.incomplete" | "error")
+    )
+}
+
+fn websocket_message_json_type(message: &TungsteniteMessage) -> Option<String> {
+    let bytes = match message {
+        TungsteniteMessage::Text(text) => text.as_bytes(),
+        TungsteniteMessage::Binary(bytes) => bytes.as_slice(),
+        _ => return None,
+    };
+    serde_json::from_slice::<Value>(bytes)
+        .ok()?
+        .get("type")?
+        .as_str()
+        .map(str::to_string)
 }
 
 async fn responses_websocket_connect_error(
@@ -2454,7 +3967,7 @@ impl CodexWebsocketOutputPatcher {
                     }
                 }
             }
-            Some("response.failed") | Some("response.incomplete") => self.clear(),
+            Some("response.failed") | Some("response.incomplete") | Some("error") => self.clear(),
             _ => {}
         }
     }
@@ -2567,7 +4080,11 @@ fn transform_responses_websocket_request(
 
 fn enforce_responses_websocket_model(value: &mut Value, model: &str) {
     let target = if value.get("type").and_then(Value::as_str) == Some("response.create") {
-        value.get_mut("response")
+        if value.get("response").is_some() {
+            value.get_mut("response")
+        } else {
+            Some(value)
+        }
     } else if value.get("type").is_none() {
         Some(value)
     } else {
@@ -2607,6 +4124,57 @@ fn websocket_message_too_big(error: &TungsteniteError) -> bool {
         error,
         TungsteniteError::Capacity(CapacityError::MessageTooLong { .. })
     ) || error.to_string().contains("1009")
+}
+
+fn websocket_read_fallback_source(error: &TungsteniteError, cached: bool) -> Option<&'static str> {
+    if websocket_message_too_big(error) {
+        return Some("message_too_big");
+    }
+    if websocket_expected_reset(error) {
+        return Some(if cached {
+            "cached_stale"
+        } else {
+            "read_failure"
+        });
+    }
+    if matches!(
+        error,
+        TungsteniteError::ConnectionClosed
+            | TungsteniteError::AlreadyClosed
+            | TungsteniteError::Io(_)
+    ) {
+        return Some(if cached {
+            "cached_stale"
+        } else {
+            "read_failure"
+        });
+    }
+    None
+}
+
+fn websocket_close_fallback_source(
+    message: &TungsteniteMessage,
+    cached: bool,
+) -> Option<&'static str> {
+    let TungsteniteMessage::Close(frame) = message else {
+        return None;
+    };
+    let Some(frame) = frame else {
+        return Some(if cached {
+            "cached_stale"
+        } else {
+            "closed_before_event"
+        });
+    };
+    let code: u16 = frame.code.into();
+    if code == 1009 {
+        return Some("message_too_big");
+    }
+    matches!(code, 1000 | 1001 | 1006 | 1011 | 1012 | 1013).then_some(if cached {
+        "cached_stale"
+    } else {
+        "closed_before_event"
+    })
 }
 
 fn websocket_expected_reset(error: &TungsteniteError) -> bool {
@@ -2658,6 +4226,34 @@ async fn maybe_mark_upstream_rate_limited(
     let message = format!("upstream returned 429; account is rate limited until {until}");
     state
         .mark_account_rate_limited_until(&account_id, until, Some(message))
+        .await;
+}
+
+async fn mark_managed_account_auth_cooldown(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    source: &'static str,
+) {
+    let Some((provider_type, requested_account_id)) = execution.managed_account_target() else {
+        return;
+    };
+    let Some(account_id) = state
+        .find_account_for_provider(provider_type, requested_account_id)
+        .await
+        .map(|account| account.id)
+    else {
+        return;
+    };
+    let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let until = now.saturating_add(DEFAULT_UPSTREAM_AUTH_FAILURE_COOLDOWN_MS);
+    state
+        .mark_account_rate_limited_until(
+            &account_id,
+            until,
+            Some(format!(
+                "upstream authentication remained unauthorized after refresh ({source})"
+            )),
+        )
         .await;
 }
 
@@ -2763,6 +4359,7 @@ struct ClaudeKiroForwardOptions {
     headers: HeaderMap,
     body: Bytes,
     request_context: UsageLogContext,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
 }
@@ -2773,6 +4370,7 @@ struct ClaudeDeepSeekForwardOptions {
     stored: StoredProvider,
     body: Bytes,
     request_context: UsageLogContext,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
 }
@@ -2786,6 +4384,7 @@ async fn forward_claude_deepseek(
         stored,
         body,
         request_context,
+        account_in_flight_guard,
         share_invocation_guard,
         started,
     } = options;
@@ -2804,6 +4403,7 @@ async fn forward_claude_deepseek(
         actual_model_source: model_selection.actual_model_source.clone(),
         stream_requested: false,
         custom_tool_names: Default::default(),
+        claude_tool_name_map: Default::default(),
     };
     execution.enforce_model_policy(&mut runtime_request)?;
     let body = runtime_request.body;
@@ -2888,6 +4488,7 @@ async fn forward_claude_deepseek(
             input_tokens,
         );
         let stream = async_stream::stream! {
+            let _account_in_flight_guard = account_in_flight_guard;
             let _share_invocation_guard = share_invocation_guard;
             let mut interrupt_guard = ShareStreamInterruptGuard {
                 armed: true,
@@ -3029,6 +4630,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         headers,
         body,
         request_context,
+        account_in_flight_guard,
         share_invocation_guard,
         started,
     } = options;
@@ -3047,6 +4649,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         actual_model_source: model_selection.actual_model_source.clone(),
         stream_requested: false,
         custom_tool_names: Default::default(),
+        claude_tool_name_map: Default::default(),
     };
     execution.enforce_model_policy(&mut runtime_request)?;
     let body = runtime_request.body;
@@ -3143,6 +4746,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             request_body,
             tool_name_map: prepared.tool_name_map,
             request_context,
+            account_in_flight_guard,
             share_invocation_guard,
             started,
             status,
@@ -3267,6 +4871,7 @@ struct ClaudeKiroStreamOptions {
     request_body: Value,
     tool_name_map: std::collections::HashMap<String, String>,
     request_context: UsageLogContext,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
     status: reqwest::StatusCode,
@@ -3285,6 +4890,7 @@ async fn forward_claude_kiro_stream(
         request_body,
         tool_name_map,
         request_context,
+        account_in_flight_guard,
         share_invocation_guard,
         started,
         status,
@@ -3313,6 +4919,7 @@ async fn forward_claude_kiro_stream(
         &request_body,
     );
     let stream = async_stream::stream! {
+        let _account_in_flight_guard = account_in_flight_guard;
         let _share_invocation_guard = share_invocation_guard;
         let mut interrupt_guard = ShareStreamInterruptGuard {
             armed: true,
@@ -3490,6 +5097,28 @@ enum AccountInFlightAcquire {
     Acquired(AccountInFlightGuard),
     NotManaged,
     Saturated,
+}
+
+fn select_and_acquire_account_in_flight(
+    state: &ServerState,
+    accounts: &crate::domain::accounts::store::AccountStore,
+    mut select: impl FnMut(&AccountInFlightSnapshot) -> Result<ProviderExecution, ProxyError>,
+) -> Result<(ProviderExecution, Option<AccountInFlightGuard>), ProxyError> {
+    const MAX_SELECTION_ATTEMPTS: usize = 3;
+
+    for attempt in 0..MAX_SELECTION_ATTEMPTS {
+        let snapshot = state.account_in_flight.snapshot();
+        let execution = select(&snapshot)?;
+        match try_acquire_account_in_flight(state, &execution.stored, accounts, &snapshot) {
+            AccountInFlightAcquire::Acquired(guard) => return Ok((execution, Some(guard))),
+            AccountInFlightAcquire::NotManaged => return Ok((execution, None)),
+            AccountInFlightAcquire::Saturated if attempt + 1 < MAX_SELECTION_ATTEMPTS => {}
+            AccountInFlightAcquire::Saturated => {
+                return Err(account_concurrency_proxy_error(&execution.stored));
+            }
+        }
+    }
+    unreachable!("account selection attempts are bounded and non-zero")
 }
 
 fn try_acquire_account_in_flight(
@@ -3855,14 +5484,90 @@ async fn next_claude_transport_attempt(
     {
         return None;
     }
-    if claude_request_is_provider_pinned(headers, request_context) {
-        crate::metrics::record_claude_retry("transport", reason);
+    if request_is_provider_pinned(headers, request_context) {
+        record_forward_retry(route, "transport", reason);
         return Some(attempt_context.next(failed, attempt_context.body_retry_stage));
     }
-    next_claude_provider_failover(state, route, attempt_context, failed, reason).await
+    next_provider_failover(state, route, attempt_context, failed, reason).await
 }
 
-async fn next_claude_provider_failover(
+async fn next_unauthorized_attempt(
+    state: &ServerState,
+    route: ProxyRoute,
+    headers: &HeaderMap,
+    request_context: &UsageLogContext,
+    attempt_context: &ForwardAttemptContext,
+    execution: &ProviderExecution,
+    stored: &StoredProvider,
+) -> Result<Option<ForwardAttemptContext>, ProxyError> {
+    if !supports_forced_auth_refresh(route, execution) {
+        return Ok(None);
+    }
+
+    if !attempt_context.auth_refresh_attempted && attempt_context.retry_allowed() {
+        let Some((provider_type, account_id)) = execution.managed_account_target() else {
+            return Ok(None);
+        };
+        if let Err(error) = state
+            .refresh_managed_account_now(provider_type, account_id)
+            .await
+        {
+            mark_managed_account_auth_cooldown(state, execution, "forced_refresh_failed").await;
+            if !request_is_provider_pinned(headers, request_context) {
+                if let Some(next_attempt) = next_provider_failover(
+                    state,
+                    route,
+                    attempt_context,
+                    execution,
+                    "auth_refresh_failed",
+                )
+                .await
+                {
+                    record_provider_outcome(
+                        state,
+                        stored,
+                        ProviderOutcome::Failure { status_code: 401 },
+                    )
+                    .await;
+                    return Ok(Some(next_attempt));
+                }
+            }
+            return Err(managed_account_refresh_error_to_proxy_error(error));
+        }
+        if route == ProxyRoute::ClaudeCountTokens {
+            crate::metrics::record_claude_count_tokens_outcome("auth_refresh");
+        }
+        record_forward_retry(route, "auth", "unauthorized");
+        return Ok(Some(attempt_context.after_auth_refresh(execution)));
+    }
+
+    if attempt_context.auth_refresh_attempted {
+        mark_managed_account_auth_cooldown(state, execution, "unauthorized_after_refresh").await;
+        if !request_is_provider_pinned(headers, request_context) {
+            if let Some(next_attempt) = next_provider_failover(
+                state,
+                route,
+                attempt_context,
+                execution,
+                "unauthorized_after_refresh",
+            )
+            .await
+            {
+                record_provider_outcome(
+                    state,
+                    stored,
+                    ProviderOutcome::Failure { status_code: 401 },
+                )
+                .await;
+                return Ok(Some(next_attempt));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn next_provider_failover(
     state: &ServerState,
     route: ProxyRoute,
     attempt_context: &ForwardAttemptContext,
@@ -3883,21 +5588,164 @@ async fn next_claude_provider_failover(
         reason,
         from_provider_id = %failed.stored.provider.id,
         to_provider_id = %next.stored.provider.id,
-        "switching Claude request to failover Provider"
+        "switching request to failover Provider"
     );
-    crate::metrics::record_claude_retry("provider", reason);
+    record_forward_retry(route, "provider", reason);
     Some(attempt_context.after_provider_failover(failed, &next))
 }
 
-fn claude_request_is_provider_pinned(
-    headers: &HeaderMap,
-    request_context: &UsageLogContext,
+async fn next_capability_provider_failover(
+    state: &ServerState,
+    route: ProxyRoute,
+    failed: &ProviderExecution,
+    excluded_provider_ids: &mut BTreeSet<String>,
+    provider_filter: fn(&StoredProvider) -> bool,
+    reason: &'static str,
+) -> Option<(ProviderExecution, Option<AccountInFlightGuard>)> {
+    excluded_provider_ids.insert(failed.stored.provider.id.clone());
+    loop {
+        let accounts = state.accounts_snapshot().await;
+        let in_flight = state.account_in_flight.snapshot();
+        let next = {
+            let providers = state.providers.read().await;
+            select_failover_provider_matching(
+                &providers,
+                &accounts,
+                route,
+                &in_flight,
+                excluded_provider_ids,
+                provider_filter,
+            )?
+            .execution
+        };
+        let guard = match acquire_capability_failover_candidate(
+            state,
+            &next.stored,
+            &accounts,
+            &in_flight,
+            excluded_provider_ids,
+        ) {
+            CapabilityFailoverAcquire::Ready(guard) => guard,
+            CapabilityFailoverAcquire::Saturated => {
+                tracing::debug!(
+                    provider_id = %next.stored.provider.id,
+                    "reselecting capability-compatible failover Provider after account saturation"
+                );
+                continue;
+            }
+        };
+        tracing::debug!(
+            reason,
+            from_provider_id = %failed.stored.provider.id,
+            to_provider_id = %next.stored.provider.id,
+            "switching request to capability-compatible failover Provider"
+        );
+        record_forward_retry(route, "provider", reason);
+        return Some((next, guard));
+    }
+}
+
+enum CapabilityFailoverAcquire {
+    Ready(Option<AccountInFlightGuard>),
+    Saturated,
+}
+
+fn acquire_capability_failover_candidate(
+    state: &ServerState,
+    stored: &StoredProvider,
+    accounts: &crate::domain::accounts::store::AccountStore,
+    snapshot: &AccountInFlightSnapshot,
+    excluded_provider_ids: &mut BTreeSet<String>,
+) -> CapabilityFailoverAcquire {
+    match try_acquire_account_in_flight(state, stored, accounts, snapshot) {
+        AccountInFlightAcquire::Acquired(guard) => CapabilityFailoverAcquire::Ready(Some(guard)),
+        AccountInFlightAcquire::NotManaged => CapabilityFailoverAcquire::Ready(None),
+        AccountInFlightAcquire::Saturated => {
+            excluded_provider_ids.insert(stored.provider.id.clone());
+            CapabilityFailoverAcquire::Saturated
+        }
+    }
+}
+
+async fn switch_to_ready_codex_provider(
+    state: &ServerState,
+    execution: &mut ProviderExecution,
+    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
+    excluded_provider_ids: &mut BTreeSet<String>,
+    provider_filter: fn(&StoredProvider) -> bool,
+    reason: &'static str,
 ) -> bool {
+    let mut failed = execution.clone();
+    loop {
+        let Some((next, next_guard)) = next_capability_provider_failover(
+            state,
+            ProxyRoute::CodexResponses,
+            &failed,
+            excluded_provider_ids,
+            provider_filter,
+            reason,
+        )
+        .await
+        else {
+            return false;
+        };
+        if let Err(error) = refresh_execution_managed_account_if_needed(state, &next).await {
+            mark_managed_account_auth_cooldown(state, &next, "failover_account_refresh_failed")
+                .await;
+            tracing::debug!(
+                provider_id = %next.stored.provider.id,
+                %error,
+                "skipping failover Provider after managed account refresh failure"
+            );
+            failed = next;
+            drop(next_guard);
+            continue;
+        }
+        *execution = next;
+        *account_in_flight_guard = next_guard;
+        return true;
+    }
+}
+
+fn codex_oauth_image_failover_provider(provider: &StoredProvider) -> bool {
+    provider.provider_type == ProviderType::CodexOAuth
+        && provider
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_image_generation_enabled)
+            .unwrap_or(false)
+}
+
+fn codex_oauth_websocket_failover_provider(provider: &StoredProvider) -> bool {
+    provider.provider_type == ProviderType::CodexOAuth && codex_websocket_enabled(provider)
+}
+
+fn request_is_provider_pinned(headers: &HeaderMap, request_context: &UsageLogContext) -> bool {
     request_context.share_id.is_some()
         || headers
             .get("x-cc-provider-id")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn supports_forced_auth_refresh(route: ProxyRoute, execution: &ProviderExecution) -> bool {
+    match route {
+        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens => {
+            execution.driver_is("oauth.claude_messages")
+        }
+        ProxyRoute::CodexChatCompletions
+        | ProxyRoute::CodexResponses
+        | ProxyRoute::CodexResponsesCompact => execution.driver_is("oauth.openai_codex"),
+        ProxyRoute::Gemini => false,
+    }
+}
+
+fn record_forward_retry(route: ProxyRoute, stage: &'static str, source: &'static str) {
+    crate::metrics::record_forward_retry(route.app().as_str(), stage, source);
+    if route.app() == AppKind::Claude {
+        crate::metrics::record_claude_retry(stage, source);
+    }
 }
 
 fn managed_account_id(stored: &StoredProvider) -> Option<&str> {
@@ -4136,9 +5984,10 @@ fn apply_account_header_overrides(
     stored: &StoredProvider,
     accounts: &AccountStore,
 ) -> Result<(), ProxyError> {
-    let Some(account) =
-        accounts.find_for_provider(stored.provider_type, managed_account_id(stored))
-    else {
+    let Some(account_id) = managed_account_id(stored) else {
+        return Ok(());
+    };
+    let Some(account) = accounts.find_for_provider(stored.provider_type, Some(account_id)) else {
         return Ok(());
     };
     for (name, value) in &account.extra_headers {
@@ -4592,6 +6441,7 @@ struct StreamForwardState {
     codex_pending_function_call_patcher: CodexPendingFunctionCallPatcher,
     codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher,
     stream_transform: super::stream_transforms::StreamEventTransformer,
+    claude_tool_name_stream_patcher: super::claude_oauth::ClaudeToolNameStreamPatcher,
     timeouts: StreamTimeoutConfig,
     pending_chunk: Option<Bytes>,
     sse_error_detector: Option<ClaudeSseErrorDetector>,
@@ -5696,6 +7546,222 @@ mod tests {
         );
     }
 
+    #[test]
+    fn images_and_websocket_reselect_after_atomic_account_acquire_race() {
+        let mut accounts = AccountStore::default();
+        for account_id in ["race-account-1", "race-account-2"] {
+            accounts.upsert(
+                serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": "codex_oauth",
+                    "accessToken": format!("{account_id}-token"),
+                    "profile": {
+                        "codexWorkspaceProvenance": {
+                            "workspaceId": format!("{account_id}-workspace"),
+                            "source": "test_fixture"
+                        }
+                    }
+                }))
+                .unwrap(),
+            );
+        }
+        let mut first = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({"ACCOUNT_MAX_CONCURRENT": 1}),
+            Some("race-account-1"),
+        );
+        first.provider.id = "race-provider-1".to_string();
+        let first_meta = first.provider.meta.as_mut().unwrap();
+        first_meta.codex_image_generation_enabled = Some(true);
+        first_meta.codex_websocket_enabled = Some(true);
+        let mut second = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({"ACCOUNT_MAX_CONCURRENT": 1}),
+            Some("race-account-2"),
+        );
+        second.provider.id = "race-provider-2".to_string();
+        let second_meta = second.provider.meta.as_mut().unwrap();
+        second_meta.codex_image_generation_enabled = Some(true);
+        second_meta.codex_websocket_enabled = Some(true);
+        let mut providers = ProviderStore {
+            providers: vec![first, second],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+
+        for selection_kind in ["images", "websocket"] {
+            let state = forwarder_test_state(selection_kind);
+            let mut competing_guard = None;
+            let mut selection_calls = 0;
+            let (execution, selected_guard) =
+                select_and_acquire_account_in_flight(&state, &accounts, |snapshot| {
+                    let selection = if selection_kind == "images" {
+                        select_provider_for_codex_image_generation(
+                            &providers,
+                            &accounts,
+                            &HeaderMap::new(),
+                            Some("race-provider-1"),
+                            snapshot,
+                            None,
+                        )
+                    } else {
+                        select_provider_with_account_inflight(
+                            &providers,
+                            &accounts,
+                            AppKind::Codex,
+                            &HeaderMap::new(),
+                            Some("race-provider-1"),
+                            snapshot,
+                            None,
+                        )
+                    }?;
+                    if selection_calls == 0 {
+                        assert_eq!(selection.execution.stored.provider.id, "race-provider-1");
+                        competing_guard = state.account_in_flight.try_acquire(
+                            ProviderType::CodexOAuth,
+                            "race-account-1",
+                            1,
+                        );
+                        assert!(competing_guard.is_some());
+                    }
+                    selection_calls += 1;
+                    Ok(selection.execution)
+                })
+                .unwrap();
+
+            assert_eq!(selection_calls, 2, "{selection_kind}");
+            assert_eq!(execution.stored.provider.id, "race-provider-2");
+            let snapshot = state.account_in_flight.snapshot();
+            assert_eq!(
+                snapshot.current(ProviderType::CodexOAuth, "race-account-1"),
+                1
+            );
+            assert_eq!(
+                snapshot.current(ProviderType::CodexOAuth, "race-account-2"),
+                1
+            );
+            drop(selected_guard);
+            drop(competing_guard);
+            let snapshot = state.account_in_flight.snapshot();
+            assert_eq!(
+                snapshot.current(ProviderType::CodexOAuth, "race-account-1"),
+                0
+            );
+            assert_eq!(
+                snapshot.current(ProviderType::CodexOAuth, "race-account-2"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn capability_failover_excludes_candidate_lost_to_atomic_acquire_race() {
+        let mut accounts = AccountStore::default();
+        for account_id in ["failover-race-account-1", "failover-race-account-2"] {
+            accounts.upsert(
+                serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": "codex_oauth",
+                    "accessToken": format!("{account_id}-token"),
+                    "profile": {
+                        "codexWorkspaceProvenance": {
+                            "workspaceId": format!("{account_id}-workspace"),
+                            "source": "test_fixture"
+                        }
+                    }
+                }))
+                .unwrap(),
+            );
+        }
+        let mut first = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({"ACCOUNT_MAX_CONCURRENT": 1}),
+            Some("failover-race-account-1"),
+        );
+        first.provider.id = "failover-race-provider-1".to_string();
+        let mut second = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({"ACCOUNT_MAX_CONCURRENT": 1}),
+            Some("failover-race-account-2"),
+        );
+        second.provider.id = "failover-race-provider-2".to_string();
+        let mut providers = ProviderStore {
+            providers: vec![first, second],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let state = forwarder_test_state("capability-failover-acquire-race");
+        let mut excluded = BTreeSet::new();
+
+        let stale_snapshot = state.account_in_flight.snapshot();
+        let first = select_failover_provider_matching(
+            &providers,
+            &accounts,
+            ProxyRoute::CodexResponses,
+            &stale_snapshot,
+            &excluded,
+            |_| true,
+        )
+        .unwrap()
+        .execution;
+        assert_eq!(first.stored.provider.id, "failover-race-provider-1");
+        let competing_guard = state
+            .account_in_flight
+            .try_acquire(ProviderType::CodexOAuth, "failover-race-account-1", 1)
+            .unwrap();
+
+        assert!(matches!(
+            acquire_capability_failover_candidate(
+                &state,
+                &first.stored,
+                &accounts,
+                &stale_snapshot,
+                &mut excluded,
+            ),
+            CapabilityFailoverAcquire::Saturated
+        ));
+        assert!(excluded.contains("failover-race-provider-1"));
+
+        let fresh_snapshot = state.account_in_flight.snapshot();
+        let second = select_failover_provider_matching(
+            &providers,
+            &accounts,
+            ProxyRoute::CodexResponses,
+            &fresh_snapshot,
+            &excluded,
+            |_| true,
+        )
+        .unwrap()
+        .execution;
+        assert_eq!(second.stored.provider.id, "failover-race-provider-2");
+        let selected_guard = match acquire_capability_failover_candidate(
+            &state,
+            &second.stored,
+            &accounts,
+            &fresh_snapshot,
+            &mut excluded,
+        ) {
+            CapabilityFailoverAcquire::Ready(Some(guard)) => guard,
+            _ => panic!("second failover candidate should acquire its account lease"),
+        };
+
+        let snapshot = state.account_in_flight.snapshot();
+        assert_eq!(
+            snapshot.current(ProviderType::CodexOAuth, "failover-race-account-1"),
+            1
+        );
+        assert_eq!(
+            snapshot.current(ProviderType::CodexOAuth, "failover-race-account-2"),
+            1
+        );
+        drop(selected_guard);
+        drop(competing_guard);
+    }
+
     #[tokio::test]
     async fn concurrent_legacy_claude_forwards_refresh_once_and_use_rotated_token() {
         let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -5815,6 +7881,7 @@ mod tests {
             .await
             .unwrap();
         let base_url = format!("http://{anthropic_address}");
+        let runtime_base_url = base_url.clone();
         state
             .mutate_providers_immediate(move |providers| {
                 providers.upsert(
@@ -5840,6 +7907,14 @@ mod tests {
                     },
                 );
             })
+            .await
+            .unwrap();
+        state
+            .override_provider_runtime_endpoint_for_test(
+                AppKind::Claude,
+                "legacy-refresh-provider",
+                runtime_base_url,
+            )
             .await
             .unwrap();
 
@@ -6081,6 +8156,7 @@ mod tests {
             .await
             .unwrap();
         let base_url = format!("http://{anthropic_address}");
+        let runtime_base_url = base_url.clone();
         state
             .mutate_providers_immediate(move |providers| {
                 for kind in ["messages", "count"] {
@@ -6110,6 +8186,16 @@ mod tests {
             })
             .await
             .unwrap();
+        for kind in ["messages", "count"] {
+            state
+                .override_provider_runtime_endpoint_for_test(
+                    AppKind::Claude,
+                    &format!("unauthorized-{kind}-provider"),
+                    runtime_base_url.clone(),
+                )
+                .await
+                .unwrap();
+        }
 
         for (kind, route) in [
             ("messages", ProxyRoute::ClaudeMessages),
@@ -6306,6 +8392,7 @@ mod tests {
             .await
             .unwrap();
         let rejected_base_url = format!("http://{rejected_address}");
+        let rejected_runtime_base_url = rejected_base_url.clone();
         let fallback_base_url = format!("http://{fallback_address}");
         state
             .mutate_providers_immediate(move |providers| {
@@ -6348,6 +8435,14 @@ mod tests {
                     },
                 );
             })
+            .await
+            .unwrap();
+        state
+            .override_provider_runtime_endpoint_for_test(
+                AppKind::Claude,
+                "auth-failover-oauth",
+                rejected_runtime_base_url,
+            )
             .await
             .unwrap();
         state
@@ -6394,6 +8489,59 @@ mod tests {
         let usage = state.usage_snapshot().await;
         assert_eq!(usage.logs.len(), 1);
         assert_eq!(usage.logs[0].provider_id, "auth-failover-api-key");
+        let failed_account = state
+            .find_account_by_id("auth-failover-account")
+            .await
+            .unwrap();
+        assert!(failed_account
+            .rate_limited_until
+            .is_some_and(|until| until > crate::infra::time::now_ms() as i64));
+
+        let pinned_token_url = format!("http://{token_address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                let account = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "auth-failover-account")
+                    .expect("managed account");
+                account.rate_limited_until = None;
+                account.raw = Some(json!({"testOAuthTokenUrl": pinned_token_url}));
+            })
+            .await
+            .unwrap();
+        let mut pinned_headers = HeaderMap::new();
+        pinned_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        pinned_headers.insert(
+            "x-cc-provider-id",
+            HeaderValue::from_static("auth-failover-oauth"),
+        );
+        let pinned = forward(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            None,
+            pinned_headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"stay pinned"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pinned.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            fallback_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an explicitly pinned request must not cross providers"
+        );
+        assert_eq!(rejected_authorizations.lock().unwrap().len(), 4);
+        let failed_account = state
+            .find_account_by_id("auth-failover-account")
+            .await
+            .unwrap();
+        assert!(failed_account
+            .rate_limited_until
+            .is_some_and(|until| until > crate::infra::time::now_ms() as i64));
     }
 
     use super::*;
@@ -6426,6 +8574,993 @@ mod tests {
             provider_type,
             provider_type_id: provider_type.as_str().to_string(),
             resource: Default::default(),
+        }
+    }
+
+    async fn test_responses_upstream_socket(
+    ) -> (ResponsesUpstreamWebSocket, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while websocket.next().await.is_some() {}
+        });
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        (client, server)
+    }
+
+    fn forwarder_test_state(name: &str) -> ServerState {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(
+                    std::env::temp_dir().join(format!("cc-switch-server-forwarder-{name}-{nanos}")),
+                ),
+                web_dist_dir: None,
+                log_level: "warn".to_string(),
+                command: None,
+            },
+            std::sync::Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn kiro_stream_holds_account_lease_until_response_body_is_dropped() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(|| async {
+                let pending =
+                    futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+                Response::new(Body::from_stream(pending))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let upstream = reqwest::Client::new()
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .unwrap();
+
+        let state = forwarder_test_state("kiro-stream-account-lease");
+        let account_id = "kiro-stream-account";
+        let account_in_flight_guard = state
+            .account_in_flight
+            .try_acquire(ProviderType::KiroOAuth, account_id, 1)
+            .unwrap();
+        let stored = stored_provider(
+            AppKind::Claude,
+            ProviderType::KiroOAuth,
+            json!({}),
+            Some(account_id),
+        );
+        let response = forward_claude_kiro_stream(ClaudeKiroStreamOptions {
+            state: state.clone(),
+            stored,
+            upstream,
+            response_model: "claude-sonnet-4-6".to_string(),
+            model_metadata: UsageModelMetadata::default(),
+            request_body: json!({
+                "model": "claude-sonnet-4-6",
+                "messages": []
+            }),
+            tool_name_map: Default::default(),
+            request_context: UsageLogContext::default(),
+            account_in_flight_guard: Some(account_in_flight_guard),
+            share_invocation_guard: None,
+            started: Instant::now(),
+            status: reqwest::StatusCode::OK,
+            status_code: StatusCode::OK.as_u16(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::KiroOAuth, account_id),
+            1
+        );
+        let mut body = response.into_body().into_data_stream();
+        let first_chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
+            .await
+            .unwrap()
+            .expect("Kiro stream should emit its initial SSE frame")
+            .unwrap();
+        assert!(!first_chunk.is_empty());
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::KiroOAuth, account_id),
+            1
+        );
+
+        drop(body);
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::KiroOAuth, account_id),
+            0
+        );
+        server.abort();
+    }
+
+    async fn codex_bridge_test_context(
+        name: &str,
+        endpoint: String,
+    ) -> (ServerState, ProviderExecution) {
+        let state = forwarder_test_state(name);
+        let account_input = crate::domain::accounts::store::UpsertAccountInput {
+            id: Some(format!("{name}-account")),
+            provider_type: ProviderType::CodexOAuth,
+            email: Some(format!("{name}@example.com")),
+            access_token: Some(format!("{name}-access-token")),
+            refresh_token: None,
+            id_token: None,
+            token_type: Some("Bearer".to_string()),
+            api_key: None,
+            extra_headers: None,
+            scopes: Vec::new(),
+            profile: Some(json!({
+                "codexWorkspaceProvenance": {
+                    "workspaceId": format!("{name}-workspace"),
+                    "source": "test_fixture"
+                }
+            })),
+            raw: None,
+            subscription_level: None,
+            entitlement_status: None,
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at: None,
+            rate_limited_until: None,
+            last_refresh_error: None,
+        };
+        let account_input_for_state = account_input.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(account_input_for_state);
+            })
+            .await
+            .unwrap();
+
+        let account_id = format!("{name}-account");
+        let mut stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({}),
+            Some(&account_id),
+        );
+        stored.provider.id = format!("{name}-provider");
+        let mut accounts = AccountStore::default();
+        accounts.upsert(account_input);
+        let mut providers = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let mut plan = providers
+            .runtime_plan(AppKind::Codex, &stored.provider.id)
+            .unwrap()
+            .as_ref()
+            .clone();
+        plan.driver_id =
+            crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
+        plan.endpoint = endpoint;
+        plan.runtime_fingerprint = format!("{name}-runtime");
+        (
+            state,
+            ProviderExecution {
+                stored,
+                plan: std::sync::Arc::new(plan),
+            },
+        )
+    }
+
+    struct TestCodexProviderSpec {
+        name: String,
+        endpoint: String,
+        websocket_url: Option<String>,
+    }
+
+    async fn install_codex_test_provider_set(
+        state: &ServerState,
+        specs: Vec<TestCodexProviderSpec>,
+    ) -> Vec<ProviderExecution> {
+        let accounts = state.accounts_snapshot().await;
+        let mut stored_providers = Vec::new();
+        for spec in &specs {
+            let account_id = format!("{}-account", spec.name);
+            let mut stored = stored_provider(
+                AppKind::Codex,
+                ProviderType::CodexOAuth,
+                json!({}),
+                Some(&account_id),
+            );
+            stored.provider.id = format!("{}-provider", spec.name);
+            let meta = stored.provider.meta.get_or_insert_with(Default::default);
+            meta.codex_image_generation_enabled = Some(true);
+            meta.codex_websocket_enabled = Some(true);
+            stored_providers.push(stored);
+        }
+        let mut providers = ProviderStore {
+            providers: stored_providers,
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        for (stored, spec) in providers.providers.iter().zip(&specs) {
+            let mut plan = providers
+                .runtime_plan(AppKind::Codex, &stored.provider.id)
+                .unwrap()
+                .as_ref()
+                .clone();
+            plan.driver_id =
+                crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
+            plan.endpoint = spec.endpoint.clone();
+            plan.runtime_fingerprint = format!("{}-runtime", spec.name);
+            if let Some(websocket_url) = spec.websocket_url.as_ref() {
+                plan.driver_options.insert(
+                    "testCodexWebsocketUrl".to_string(),
+                    Value::String(websocket_url.clone()),
+                );
+            }
+            std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
+        }
+        let executions = providers
+            .providers
+            .iter()
+            .cloned()
+            .map(|stored| ProviderExecution::from_store(&providers, stored).unwrap())
+            .collect::<Vec<_>>();
+        *state.providers.write().await = providers;
+        executions
+    }
+
+    async fn insert_static_codex_test_account(state: &ServerState, name: &str, access_token: &str) {
+        let account_id = format!("{name}-account");
+        let workspace_id = format!("{name}-workspace");
+        let email = format!("{name}@example.com");
+        let access_token = access_token.to_string();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                    id: Some(account_id),
+                    provider_type: ProviderType::CodexOAuth,
+                    email: Some(email),
+                    access_token: Some(access_token),
+                    refresh_token: None,
+                    id_token: None,
+                    token_type: Some("Bearer".to_string()),
+                    api_key: None,
+                    extra_headers: None,
+                    scopes: Vec::new(),
+                    profile: Some(json!({
+                        "codexWorkspaceProvenance": {
+                            "workspaceId": workspace_id,
+                            "source": "test_fixture"
+                        }
+                    })),
+                    raw: None,
+                    subscription_level: None,
+                    entitlement_status: None,
+                    quota_percent: None,
+                    quota: None,
+                    quota_refreshed_at: None,
+                    quota_next_refresh_at: None,
+                    expires_at: None,
+                    rate_limited_until: None,
+                    last_refresh_error: None,
+                });
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn spawn_test_responses_bridge(
+        state: ServerState,
+        execution: ProviderExecution,
+        upstream_ws_url: String,
+        pool_key: Option<String>,
+        session_id: &str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_test_responses_bridge_with_timeouts(
+            state,
+            execution,
+            upstream_ws_url,
+            pool_key,
+            session_id,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_test_responses_bridge_with_timeouts(
+        state: ServerState,
+        execution: ProviderExecution,
+        upstream_ws_url: String,
+        pool_key: Option<String>,
+        session_id: &str,
+        first_event_timeout: Option<Duration>,
+        idle_timeout: Option<Duration>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let session_id = session_id.to_string();
+        let prepared = prepare_responses_websocket_target(
+            &state,
+            &execution,
+            ResponsesWebsocketMode::Codex,
+            Some(&session_id),
+        )
+        .await
+        .unwrap();
+        let upstream_headers = prepared.headers;
+        let app = axum::Router::new().route(
+            "/bridge",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let state = state.clone();
+                let execution = execution.clone();
+                let upstream_ws_url = upstream_ws_url.clone();
+                let pool_key = pool_key.clone();
+                let session_id = session_id.clone();
+                let upstream_headers = upstream_headers.clone();
+                async move {
+                    let accounts = state.accounts_snapshot().await;
+                    let in_flight = state.account_in_flight.snapshot();
+                    let account_in_flight_guard =
+                        acquire_account_in_flight(&state, &execution.stored, &accounts, &in_flight)
+                            .expect("test websocket account lease");
+                    ws.on_upgrade(move |socket| async move {
+                        let _ = bridge_responses_websocket(
+                            socket,
+                            ResponsesWebsocketBridgeOptions {
+                                headers: upstream_headers,
+                                connect_timeout: Duration::from_secs(1),
+                                first_byte_timeout: first_event_timeout,
+                                stream_idle_timeout: idle_timeout,
+                                ws_url: upstream_ws_url,
+                                pool_key,
+                                mode: ResponsesWebsocketMode::Codex,
+                                grok_session_id: Some(session_id),
+                                single_upstream_model: None,
+                                state: &state,
+                                execution,
+                                account_in_flight_guard,
+                                provider_pinned: false,
+                            },
+                        )
+                        .await;
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, server)
+    }
+
+    async fn send_test_bridge_request(address: std::net::SocketAddr, input: &str) -> Vec<Value> {
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/bridge"))
+            .await
+            .unwrap();
+        socket
+            .send(TungsteniteMessage::Text(
+                json!({
+                    "type": "response.create",
+                    "model": "gpt-5.4",
+                    "input": input
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        loop {
+            let message = match tokio::time::timeout(Duration::from_secs(2), socket.next()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+            };
+            match message {
+                TungsteniteMessage::Text(text) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                        let terminal = matches!(
+                            value.get("type").and_then(Value::as_str),
+                            Some("response.completed" | "response.failed" | "response.incomplete")
+                        );
+                        events.push(value);
+                        if terminal {
+                            break;
+                        }
+                    }
+                }
+                TungsteniteMessage::Binary(bytes) => {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                        events.push(value);
+                    }
+                }
+                TungsteniteMessage::Close(_) => break,
+                _ => {}
+            }
+        }
+        let _ = socket.close(None).await;
+        events
+    }
+
+    async fn wait_for_cached_responses_websocket(pool_key: &str) {
+        for _ in 0..100 {
+            let present = responses_websocket_pool()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entries
+                .contains_key(pool_key);
+            if present {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("responses websocket was not released into the cache");
+    }
+
+    async fn wait_for_codex_account_leases_to_release(state: &ServerState, names: &[&str]) {
+        for _ in 0..100 {
+            let snapshot = state.account_in_flight.snapshot();
+            if names.iter().all(|name| {
+                snapshot.current(ProviderType::CodexOAuth, &format!("{name}-account")) == 0
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("Codex account lease was not released after websocket completion");
+    }
+
+    async fn remove_cached_responses_websocket(pool_key: &str) {
+        let entry = responses_websocket_pool()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .acquire(pool_key);
+        if let Some(mut entry) = entry {
+            let _ = entry.socket.close(None).await;
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestCodexWebSocketBehavior {
+        Complete,
+        CompleteThenClose,
+        CloseSize,
+        CloseSizeThenDelayHttpFirstEvent,
+        CloseSizeThenStallHttpErrorBody,
+        EmitThenCloseSize,
+        Silent,
+    }
+
+    const TEST_OPENAI_RSA_KID: &str = "cc-switch-openai-test-rsa";
+    const TEST_OPENAI_RSA_N: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
+    const TEST_OPENAI_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDJETqse41HRBsc
+7cfcq3ak4oZWFCoZlcic525A3FfO4qW9BMtRO/iXiyCCHn8JhiL9y8j5JdVP2Q9Z
+IpfElcFd3/guS9w+5RqQGgCR+H56IVUyHZWtTJbKPcwWXQdNUX0rBFcsBzCRESJL
+eelOEdHIjG7LRkx5l/FUvlqsyHDVJEQsHwegZ8b8C0fz0EgT2MMEdn10t6Ur1rXz
+jMB/wvCg8vG8lvciXmedyo9xJ8oMOh0wUEgxziVDMMovmC+aJctcHUAYubwoGN8T
+yzcvnGqL7JSh36Pwy28iPzXZ2RLhAyJFU39vLaHdljwthUaupldlNyCfa6Ofy4qN
+ctlUPlN1AgMBAAECggEAdESTQjQ70O8QIp1ZSkCYXeZjuhj081CK7jhhp/4ChK7J
+GlFQZMwiBze7d6K84TwAtfQGZhQ7km25E1kOm+3hIDCoKdVSKch/oL54f/BK6sKl
+qlIzQEAenho4DuKCm3I4yAw9gEc0DV70DuMTR0LEpYyXcNJY3KNBOTjN5EYQAR9s
+2MeurpgK2MdJlIuZaIbzSGd+diiz2E6vkmcufJLtmYUT/k/ddWvEtz+1DnO6bRHh
+xuuDMeJA/lGB/EYloSLtdyCF6sII6C6slJJtgfb0bPy7l8VtL5iDyz46IKyzdyzW
+tKAn394dm7MYR1RlUBEfqFUyNK7C+pVMVoTwCC2V4QKBgQD64syfiQ2oeUlLYDm4
+CcKSP3RnES02bcTyEDFSuGyyS1jldI4A8GXHJ/lG5EYgiYa1RUivge4lJrlNfjyf
+dV230xgKms7+JiXqag1FI+3mqjAgg4mYiNjaao8N8O3/PD59wMPeWYImsWXNyeHS
+55rUKiHERtCcvdzKl4u35ZtTqQKBgQDNKnX2bVqOJ4WSqCgHRhOm386ugPHfy+8j
+m6cicmUR46ND6ggBB03bCnEG9OtGisxTo/TuYVRu3WP4KjoJs2LD5fwdwJqpgtHl
+yVsk45Y1Hfo+7M6lAuR8rzCi6kHHNb0HyBmZjysHWZsn79ZM+sQnLpgaYgQGRbKV
+DZWlbw7g7QKBgQCl1u+98UGXAP1jFutwbPsx40IVszP4y5ypCe0gqgon3UiY/G+1
+zTLp79GGe/SjI2VpQ7AlW7TI2A0bXXvDSDi3/5Dfya9ULnFXv9yfvH1QwWToySpW
+Kvd1gYSoiX84/WCtjZOr0e0HmLIb0vw0hqZA4szJSqoxQgvF22EfIWaIaQKBgQCf
+34+OmMYw8fEvSCPxDxVvOwW2i7pvV14hFEDYIeZKW2W1HWBhVMzBfFB5SE8yaCQy
+pRfOzj9aKOCm2FjjiErVNpkQoi6jGtLvScnhZAt/lr2TXTrl8OwVkPrIaN0bG/AS
+aUYxmBPCpXu3UjhfQiWqFq/mFyzlqlgvuCc9g95HPQKBgAscKP8mLxdKwOgX8yFW
+GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
+2pOhmquJQVDPDLuZHdrIiKiDM20dy9sMfHygWcZjQ4WSxf/J7T9canLZIXFhHAZT
+3wc9h4G8BBCtWN2TN/LsGZdB
+-----END PRIVATE KEY-----"#;
+
+    async fn signed_openai_access_token(workspace_id: &str) -> String {
+        let jwk = serde_json::from_value(json!({
+            "kty": "RSA",
+            "n": TEST_OPENAI_RSA_N,
+            "e": "AQAB",
+            "kid": TEST_OPENAI_RSA_KID,
+            "alg": "RS256",
+            "use": "sig"
+        }))
+        .unwrap();
+        crate::clients::oauth::openai_jwks::install_test_jwk(jwk).await;
+
+        let now = chrono::Utc::now().timestamp();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(TEST_OPENAI_RSA_KID.to_string());
+        jsonwebtoken::encode(
+            &header,
+            &json!({
+                "iss": "https://auth.openai.com",
+                "aud": "https://api.openai.com/v1",
+                "sub": format!("subject-{workspace_id}"),
+                "iat": now,
+                "nbf": now - 1,
+                "exp": now + 3600,
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": workspace_id,
+                    "chatgpt_plan_type": "plus"
+                }
+            }),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(TEST_OPENAI_RSA_PRIVATE_KEY.as_bytes())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    struct TestCodexUpstream {
+        address: std::net::SocketAddr,
+        websocket_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        websocket_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        http_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        http_observations: std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    struct TestCodexWebsocketAuthUpstream {
+        address: std::net::SocketAddr,
+        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        authorizations: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_test_codex_websocket_auth_upstream(
+        accepted_authorization: Option<String>,
+    ) -> TestCodexWebsocketAuthUpstream {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connections_for_route = std::sync::Arc::clone(&connections);
+        let authorizations_for_route = std::sync::Arc::clone(&authorizations);
+        let app = axum::Router::new().route(
+            "/ws",
+            axum::routing::get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
+                let connections = std::sync::Arc::clone(&connections_for_route);
+                let authorizations = std::sync::Arc::clone(&authorizations_for_route);
+                let accepted_authorization = accepted_authorization.clone();
+                async move {
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    authorizations.lock().unwrap().push(authorization.clone());
+                    if accepted_authorization.as_deref() != Some(authorization.as_str()) {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .body(Body::from("unauthorized"))
+                            .unwrap();
+                    }
+                    ws.on_upgrade(move |mut socket| async move {
+                        connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if matches!(message, AxumWsMessage::Text(_) | AxumWsMessage::Binary(_))
+                            {
+                                let _ = socket
+                                    .send(AxumWsMessage::Text(
+                                        json!({
+                                            "type": "response.completed",
+                                            "response": {
+                                                "id": "resp-auth-failover",
+                                                "status": "completed",
+                                                "output": []
+                                            }
+                                        })
+                                        .to_string(),
+                                    ))
+                                    .await;
+                            }
+                        }
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestCodexWebsocketAuthUpstream {
+            address,
+            connections,
+            authorizations,
+            server,
+        }
+    }
+
+    async fn spawn_test_codex_upstream(behavior: TestCodexWebSocketBehavior) -> TestCodexUpstream {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let websocket_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let websocket_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http_observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let ws_connections_for_route = std::sync::Arc::clone(&websocket_connections);
+        let ws_requests_for_route = std::sync::Arc::clone(&websocket_requests);
+        let http_requests_for_route = std::sync::Arc::clone(&http_requests);
+        let http_observations_for_route = std::sync::Arc::clone(&http_observations);
+        let app = axum::Router::new()
+            .route(
+                "/ws",
+                axum::routing::get(move |ws: WebSocketUpgrade| {
+                    let connections = std::sync::Arc::clone(&ws_connections_for_route);
+                    let requests = std::sync::Arc::clone(&ws_requests_for_route);
+                    async move {
+                        ws.on_upgrade(move |mut socket| async move {
+                            connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            while let Some(Ok(message)) = socket.recv().await {
+                                if matches!(message, AxumWsMessage::Close(_)) {
+                                    break;
+                                }
+                                if !matches!(
+                                    message,
+                                    AxumWsMessage::Text(_) | AxumWsMessage::Binary(_)
+                                ) {
+                                    continue;
+                                }
+                                let request_index = requests
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                    + 1;
+                                match behavior {
+                                    TestCodexWebSocketBehavior::Complete => {
+                                        let _ = socket
+                                            .send(AxumWsMessage::Text(
+                                                json!({
+                                                    "type": "response.completed",
+                                                    "response": {
+                                                        "id": format!("resp-ws-{request_index}"),
+                                                        "status": "completed",
+                                                        "output": []
+                                                    }
+                                                })
+                                                .to_string(),
+                                            ))
+                                            .await;
+                                    }
+                                    TestCodexWebSocketBehavior::CompleteThenClose => {
+                                        let _ = socket
+                                            .send(AxumWsMessage::Text(
+                                                json!({
+                                                    "type": "response.completed",
+                                                    "response": {
+                                                        "id": "resp-before-stale",
+                                                        "status": "completed",
+                                                        "output": []
+                                                    }
+                                                })
+                                                .to_string(),
+                                            ))
+                                            .await;
+                                        tokio::time::sleep(Duration::from_millis(150)).await;
+                                        let _ = socket
+                                            .send(AxumWsMessage::Close(Some(
+                                                axum::extract::ws::CloseFrame {
+                                                    code: 1000,
+                                                    reason: "idle close".into(),
+                                                },
+                                            )))
+                                            .await;
+                                        break;
+                                    }
+                                    TestCodexWebSocketBehavior::CloseSize
+                                    | TestCodexWebSocketBehavior::CloseSizeThenDelayHttpFirstEvent
+                                    | TestCodexWebSocketBehavior::CloseSizeThenStallHttpErrorBody => {
+                                        let _ = socket
+                                            .send(AxumWsMessage::Close(Some(
+                                                axum::extract::ws::CloseFrame {
+                                                    code: 1009,
+                                                    reason: "message too big".into(),
+                                                },
+                                            )))
+                                            .await;
+                                        break;
+                                    }
+                                    TestCodexWebSocketBehavior::EmitThenCloseSize => {
+                                        let _ = socket
+                                            .send(AxumWsMessage::Text(
+                                                json!({
+                                                    "type": "response.created",
+                                                    "response": {
+                                                        "id": "resp-committed",
+                                                        "status": "in_progress"
+                                                    }
+                                                })
+                                                .to_string(),
+                                            ))
+                                            .await;
+                                        let _ = socket
+                                            .send(AxumWsMessage::Close(Some(
+                                                axum::extract::ws::CloseFrame {
+                                                    code: 1009,
+                                                    reason: "message too big".into(),
+                                                },
+                                            )))
+                                            .await;
+                                        break;
+                                    }
+                                    TestCodexWebSocketBehavior::Silent => {}
+                                }
+                            }
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                    let requests = std::sync::Arc::clone(&http_requests_for_route);
+                    let observations = std::sync::Arc::clone(&http_observations_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let workspace = headers
+                            .get("chatgpt-account-id")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let body = serde_json::from_slice::<Value>(&body).unwrap();
+                        observations
+                            .lock()
+                            .unwrap()
+                            .push((authorization, workspace, body));
+                        let sse = concat!(
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-http\",\"status\":\"in_progress\"}}\n\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fallback\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                            "data: [DONE]\n\n"
+                        );
+                        let (status, body) = match behavior {
+                            TestCodexWebSocketBehavior::CloseSizeThenDelayHttpFirstEvent => (
+                                StatusCode::OK,
+                                Body::from_stream(futures_util::stream::once(async move {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                                        sse.as_bytes(),
+                                    ))
+                                })),
+                            ),
+                            TestCodexWebSocketBehavior::CloseSizeThenStallHttpErrorBody => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Body::from_stream(futures_util::stream::pending::<Result<
+                                    Bytes,
+                                    std::convert::Infallible,
+                                >>()),
+                            ),
+                            _ => (StatusCode::OK, Body::from(sse)),
+                        };
+                        let mut response = Response::new(body);
+                        *response.status_mut() = status;
+                        response.headers_mut().insert(
+                            CONTENT_TYPE,
+                            HeaderValue::from_static("text/event-stream"),
+                        );
+                        response
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        TestCodexUpstream {
+            address,
+            websocket_connections,
+            websocket_requests,
+            http_requests,
+            http_observations,
+            server,
+        }
+    }
+
+    struct TestCodexRefreshEndpoint {
+        url: String,
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_test_codex_refresh_endpoint(access_token: String) -> TestCodexRefreshEndpoint {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                let access_token = access_token.clone();
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "access_token": access_token,
+                        "refresh_token": "rotated-refresh-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestCodexRefreshEndpoint {
+            url: format!("http://{address}/token"),
+            requests,
+            server,
+        }
+    }
+
+    async fn configure_codex_refresh_test_account(
+        state: &ServerState,
+        name: &str,
+        token_url: String,
+    ) {
+        let account_id = format!("{name}-account");
+        let workspace_id = format!("{name}-workspace");
+        let email = format!("{name}@example.com");
+        let access_token = format!("{name}-access-token");
+        let refresh_token = format!("{name}-initial-refresh-token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                    id: Some(account_id),
+                    provider_type: ProviderType::CodexOAuth,
+                    email: Some(email),
+                    access_token: Some(access_token),
+                    refresh_token: Some(refresh_token),
+                    id_token: None,
+                    token_type: Some("Bearer".to_string()),
+                    api_key: None,
+                    extra_headers: None,
+                    scopes: Vec::new(),
+                    profile: Some(json!({
+                        "codexWorkspaceProvenance": {
+                            "workspaceId": workspace_id,
+                            "source": "test_fixture"
+                        }
+                    })),
+                    raw: Some(json!({"testOAuthTokenUrl": token_url})),
+                    subscription_level: None,
+                    entitlement_status: None,
+                    quota_percent: None,
+                    quota: None,
+                    quota_refreshed_at: None,
+                    quota_next_refresh_at: None,
+                    expires_at: Some(i64::MAX / 2),
+                    rate_limited_until: None,
+                    last_refresh_error: None,
+                });
+            })
+            .await
+            .unwrap();
+    }
+
+    struct TestUnauthorizedCodexUpstream {
+        address: std::net::SocketAddr,
+        authorizations: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_test_unauthorized_codex_upstream(
+        refreshed_access_token: String,
+        success_content_type: &'static str,
+        success_body: String,
+    ) -> TestUnauthorizedCodexUpstream {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authorizations_for_route = std::sync::Arc::clone(&authorizations);
+        let app = axum::Router::new()
+            .route(
+                "/ws",
+                axum::routing::get(|ws: WebSocketUpgrade| async move {
+                    ws.on_upgrade(|mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if matches!(message, AxumWsMessage::Text(_) | AxumWsMessage::Binary(_))
+                            {
+                                let _ = socket
+                                    .send(AxumWsMessage::Close(Some(
+                                        axum::extract::ws::CloseFrame {
+                                            code: 1009,
+                                            reason: "message too big".into(),
+                                        },
+                                    )))
+                                    .await;
+                                break;
+                            }
+                        }
+                    })
+                }),
+            )
+            .route(
+                "/v1/responses",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let authorizations = std::sync::Arc::clone(&authorizations_for_route);
+                    let refreshed_access_token = refreshed_access_token.clone();
+                    let success_body = success_body.clone();
+                    async move {
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        authorizations.lock().unwrap().push(authorization.clone());
+                        if authorization != format!("Bearer {refreshed_access_token}") {
+                            return Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    json!({"error": {"type": "authentication_error"}}).to_string(),
+                                ))
+                                .unwrap();
+                        }
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, success_content_type)
+                            .body(Body::from(success_body))
+                            .unwrap()
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestUnauthorizedCodexUpstream {
+            address,
+            authorizations,
+            server,
         }
     }
 
@@ -7492,6 +10627,1171 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[test]
+    fn websocket_handshake_client_errors_never_enable_http_fallback() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../assets/contract/openai-oauth-protocol.json"
+        ))
+        .unwrap();
+        let statuses = |pointer: &str| {
+            fixture
+                .pointer(pointer)
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|status| status.as_u64().unwrap() as u16)
+                .collect::<Vec<_>>()
+        };
+
+        for status in statuses("/websocketFallback/handshakeNoFallbackStatuses") {
+            let response = tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(status)
+                .body(Some(Vec::new()))
+                .unwrap();
+            let error = TungsteniteError::Http(response);
+
+            assert_eq!(
+                websocket_connect_fallback_source(ResponsesWebsocketMode::Codex, &error),
+                None,
+                "HTTP {status} must remain an application/authentication response"
+            );
+        }
+
+        for status in statuses("/websocketFallback/handshakeFallbackStatuses") {
+            let response = tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(status)
+                .body(Some(Vec::new()))
+                .unwrap();
+            let error = TungsteniteError::Http(response);
+
+            assert_eq!(
+                websocket_connect_fallback_source(ResponsesWebsocketMode::Codex, &error),
+                Some("handshake_server_error")
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_http_fallback_extracts_flat_and_nested_response_create_bodies() {
+        let flat = TungsteniteMessage::Text(
+            r#"{"type":"response.create","model":"gpt-5.4","input":"ping"}"#.to_string(),
+        );
+        let nested = TungsteniteMessage::Text(
+            r#"{"type":"response.create","response":{"model":"gpt-5.4","input":"ping"}}"#
+                .to_string(),
+        );
+
+        for body in [
+            responses_websocket_http_body(&flat).unwrap(),
+            responses_websocket_http_body(&nested).unwrap(),
+        ] {
+            assert_eq!(body["model"], "gpt-5.4");
+            assert_eq!(body["input"], "ping");
+            assert!(body.get("type").is_none());
+        }
+    }
+
+    #[test]
+    fn codex_websocket_single_model_updates_flat_response_create() {
+        let transformed = transform_responses_websocket_request(
+            r#"{"type":"response.create","model":"gpt-5.4","input":"ping"}"#,
+            ResponsesWebsocketMode::Codex,
+            Some("session-1"),
+            Some("gpt-5.5"),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&transformed).unwrap();
+
+        assert_eq!(value.get("model").and_then(Value::as_str), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn codex_http_fallback_sse_decoder_handles_fragmented_crlf_and_ignores_metadata() {
+        let mut decoder = CodexHttpFallbackSseDecoder::default();
+        assert!(decoder
+            .push(b"event: response.created\r\ndata: {\"type\":\"response.cre")
+            .unwrap()
+            .is_empty());
+        let payloads = decoder
+            .push(b"ated\",\"response\":{}}\r\n\r\n: keepalive\r\n\r\n")
+            .unwrap();
+
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&payloads[0]).unwrap()["type"],
+            "response.created"
+        );
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_http_fallback_sse_decoder_bounds_pending_and_final_events() {
+        let mut decoder = CodexHttpFallbackSseDecoder {
+            buffer: b"data:{}\n\ndata:123456789".to_vec(),
+        };
+        let error = decoder.drain_with_limit(false, 8).unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let mut fragmented_delimiter = CodexHttpFallbackSseDecoder {
+            buffer: b"12345678\r\n\r".to_vec(),
+        };
+        assert!(fragmented_delimiter.drain_with_limit(false, 8).is_ok());
+        let error = fragmented_delimiter.drain_with_limit(true, 8).unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let mut final_event = CodexHttpFallbackSseDecoder {
+            buffer: b"123456789".to_vec(),
+        };
+        let error = final_event.drain_with_limit(true, 8).unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn websocket_fallback_rejects_policy_close_but_accepts_size_and_transport_close() {
+        let close = |code| {
+            TungsteniteMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                code,
+                reason: "test".into(),
+            }))
+        };
+
+        assert_eq!(
+            websocket_close_fallback_source(&close(CloseCode::Size), false),
+            Some("message_too_big")
+        );
+        assert_eq!(
+            websocket_close_fallback_source(&close(CloseCode::Error), false),
+            Some("closed_before_event")
+        );
+        assert_eq!(
+            websocket_close_fallback_source(&close(CloseCode::Policy), true),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_websocket_pool_enforces_capacity_idle_ttl_and_max_age() {
+        let policy = ResponsesWebSocketPoolPolicy {
+            max_connections: 1,
+            idle_timeout: Duration::from_secs(1),
+            max_age: Duration::from_secs(10),
+        };
+        let (socket_a, server_a) = test_responses_upstream_socket().await;
+        let (socket_b, server_b) = test_responses_upstream_socket().await;
+        let mut pool = ResponsesWebSocketPool::default();
+        pool.release_with_policy(
+            "a".to_string(),
+            CachedResponsesWebSocket {
+                socket: socket_a,
+                created_at: Instant::now(),
+                last_used_at: Instant::now(),
+            },
+            policy,
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        pool.release_with_policy(
+            "b".to_string(),
+            CachedResponsesWebSocket {
+                socket: socket_b,
+                created_at: Instant::now(),
+                last_used_at: Instant::now(),
+            },
+            policy,
+        );
+
+        assert_eq!(pool.total, 1);
+        assert!(pool.acquire_with_policy("a", policy).is_none());
+        let entry = pool.acquire_with_policy("b", policy).unwrap();
+        pool.release_with_policy("b".to_string(), entry, policy);
+        pool.entries
+            .get_mut("b")
+            .unwrap()
+            .front_mut()
+            .unwrap()
+            .last_used_at = Instant::now() - Duration::from_secs(2);
+        assert!(pool.acquire_with_policy("b", policy).is_none());
+        assert_eq!(pool.total, 0);
+
+        let (socket_c, server_c) = test_responses_upstream_socket().await;
+        pool.release_with_policy(
+            "c".to_string(),
+            CachedResponsesWebSocket {
+                socket: socket_c,
+                created_at: Instant::now() - Duration::from_secs(11),
+                last_used_at: Instant::now(),
+            },
+            policy,
+        );
+        assert_eq!(pool.total, 0);
+
+        server_a.abort();
+        server_b.abort();
+        server_c.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_non_stream_401_forces_one_signed_refresh_and_replays_same_provider() {
+        let name = "codex-http-401";
+        let workspace = format!("{name}-workspace");
+        let refreshed_access_token = signed_openai_access_token(&workspace).await;
+        let upstream = spawn_test_unauthorized_codex_upstream(
+            refreshed_access_token.clone(),
+            "application/json",
+            json!({
+                "id": "resp-refreshed-http",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5.4",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })
+            .to_string(),
+        )
+        .await;
+        let refresh = spawn_test_codex_refresh_endpoint(refreshed_access_token.clone()).await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        configure_codex_refresh_test_account(&state, name, refresh.url.clone()).await;
+        assert!(supports_forced_auth_refresh(
+            ProxyRoute::CodexResponses,
+            &execution
+        ));
+        assert!(execution.managed_account_target().is_some());
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":false}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "refresh_requests={}, authorizations={:?}",
+            refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
+            upstream.authorizations.lock().unwrap()
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["id"],
+            "resp-refreshed-http"
+        );
+        assert_eq!(
+            refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream.authorizations.lock().unwrap().as_slice(),
+            [
+                format!("Bearer {name}-access-token"),
+                format!("Bearer {refreshed_access_token}")
+            ]
+        );
+
+        upstream.server.abort();
+        refresh.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_sse_401_forces_one_signed_refresh_before_downstream_commit() {
+        let name = "codex-sse-401";
+        let workspace = format!("{name}-workspace");
+        let refreshed_access_token = signed_openai_access_token(&workspace).await;
+        let upstream = spawn_test_unauthorized_codex_upstream(
+            refreshed_access_token.clone(),
+            "text/event-stream",
+            concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-refreshed-sse\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-refreshed-sse\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        )
+        .await;
+        let refresh = spawn_test_codex_refresh_endpoint(refreshed_access_token.clone()).await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        configure_codex_refresh_test_account(&state, name, refresh.url.clone()).await;
+        assert!(supports_forced_auth_refresh(
+            ProxyRoute::CodexResponses,
+            &execution
+        ));
+        assert!(execution.managed_account_target().is_some());
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "refresh_requests={}, authorizations={:?}",
+            refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
+            upstream.authorizations.lock().unwrap()
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("resp-refreshed-sse"));
+        assert_eq!(
+            refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream.authorizations.lock().unwrap().as_slice(),
+            [
+                format!("Bearer {name}-access-token"),
+                format!("Bearer {refreshed_access_token}")
+            ]
+        );
+
+        upstream.server.abort();
+        refresh.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_image_tool_retry_401_reenters_forced_refresh_flow() {
+        let name = "codex-image-tool-retry-401";
+        let workspace = format!("{name}-workspace");
+        let refreshed_access_token = signed_openai_access_token(&workspace).await;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, bool)>::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let refreshed_for_route = refreshed_access_token.clone();
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let observations = std::sync::Arc::clone(&observations_for_route);
+                let refreshed_access_token = refreshed_for_route.clone();
+                async move {
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let has_image_tool = body
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tools| tools.iter().any(is_codex_image_generation_tool));
+                    observations
+                        .lock()
+                        .unwrap()
+                        .push((authorization.clone(), has_image_tool));
+
+                    if has_image_tool {
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({"error": {"message": "unsupported image_generation tool"}})
+                                    .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    if authorization != format!("Bearer {refreshed_access_token}") {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({"error": {"type": "authentication_error"}}).to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({
+                                "id": "resp-image-tool-refreshed",
+                                "object": "response",
+                                "status": "completed",
+                                "model": "gpt-5.4",
+                                "output": [],
+                                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.unwrap();
+        });
+        let refresh = spawn_test_codex_refresh_endpoint(refreshed_access_token.clone()).await;
+        let (state, mut execution) =
+            codex_bridge_test_context(name, format!("http://{address}")).await;
+        execution
+            .stored
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .codex_image_tool_strip_policy = Some(CodexImageToolStripPolicy::OnError);
+        configure_codex_refresh_test_account(&state, name, refresh.url.clone()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"gpt-5.4","input":"ping","stream":false,"tools":[{"type":"image_generation"}]}"#,
+            ),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["id"],
+            "resp-image-tool-refreshed"
+        );
+        assert_eq!(
+            refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            observations.lock().unwrap().as_slice(),
+            [
+                (format!("Bearer {name}-access-token"), true),
+                (format!("Bearer {name}-access-token"), false),
+                (format!("Bearer {refreshed_access_token}"), true),
+                (format!("Bearer {refreshed_access_token}"), false),
+            ]
+        );
+
+        upstream_server.abort();
+        refresh.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_401_forces_one_signed_refresh_and_replays_same_account() {
+        let name = "codex-images-401";
+        let workspace = format!("{name}-workspace");
+        let refreshed_access_token = signed_openai_access_token(&workspace).await;
+        let upstream = spawn_test_unauthorized_codex_upstream(
+            refreshed_access_token.clone(),
+            "text/event-stream",
+            concat!(
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ig_1\",\"type\":\"image_generation_call\",\"result\":\"aGVsbG8=\",\"output_format\":\"png\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1800000000,\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        )
+        .await;
+        let refresh = spawn_test_codex_refresh_endpoint(refreshed_access_token.clone()).await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        configure_codex_refresh_test_account(&state, name, refresh.url.clone()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_codex_images_generations(
+            state.clone(),
+            execution,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"gpt-image-2","prompt":"cat","response_format":"b64_json"}"#,
+            ),
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(body.pointer("/data/0/b64_json"), Some(&json!("aGVsbG8=")));
+        assert_eq!(
+            refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream.authorizations.lock().unwrap().as_slice(),
+            [
+                format!("Bearer {name}-access-token"),
+                format!("Bearer {refreshed_access_token}")
+            ]
+        );
+
+        upstream.server.abort();
+        refresh.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_persistent_401_cools_account_and_fails_over() {
+        let primary = "codex-images-persistent-primary";
+        let fallback = "codex-images-persistent-fallback";
+        let refreshed_access_token =
+            signed_openai_access_token(&format!("{primary}-workspace")).await;
+        let rejected = spawn_test_unauthorized_codex_upstream(
+            "never-accepted".to_string(),
+            "application/json",
+            "{}".to_string(),
+        )
+        .await;
+        let fallback_access_token = "images-fallback-access-token";
+        let accepted = spawn_test_unauthorized_codex_upstream(
+            fallback_access_token.to_string(),
+            "text/event-stream",
+            concat!(
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ig_failover\",\"type\":\"image_generation_call\",\"result\":\"ZmFpbG92ZXI=\",\"output_format\":\"png\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1800000000,\"output\":[]}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        )
+        .await;
+        let refresh = spawn_test_codex_refresh_endpoint(refreshed_access_token.clone()).await;
+        let state = forwarder_test_state("codex-images-persistent-failover");
+        configure_codex_refresh_test_account(&state, primary, refresh.url.clone()).await;
+        insert_static_codex_test_account(&state, fallback, fallback_access_token).await;
+        let mut executions = install_codex_test_provider_set(
+            &state,
+            vec![
+                TestCodexProviderSpec {
+                    name: primary.to_string(),
+                    endpoint: format!("http://{}", rejected.address),
+                    websocket_url: None,
+                },
+                TestCodexProviderSpec {
+                    name: fallback.to_string(),
+                    endpoint: format!("http://{}", accepted.address),
+                    websocket_url: None,
+                },
+            ],
+        )
+        .await;
+        let execution = executions.remove(0);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let accounts = state.accounts_snapshot().await;
+        let in_flight = state.account_in_flight.snapshot();
+        let account_in_flight_guard =
+            acquire_account_in_flight(&state, &execution.stored, &accounts, &in_flight)
+                .expect("primary image account lease");
+
+        let response = forward_codex_images_generations(
+            state.clone(),
+            execution,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"gpt-image-2","prompt":"fail over","response_format":"b64_json"}"#,
+            ),
+            UsageLogContext::default(),
+            account_in_flight_guard,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["data"][0]["b64_json"],
+            "ZmFpbG92ZXI="
+        );
+        assert_eq!(
+            rejected.authorizations.lock().unwrap().as_slice(),
+            [
+                format!("Bearer {primary}-access-token"),
+                format!("Bearer {refreshed_access_token}")
+            ]
+        );
+        assert_eq!(
+            accepted.authorizations.lock().unwrap().as_slice(),
+            [format!("Bearer {fallback_access_token}")]
+        );
+        let primary_account = state
+            .find_account_by_id(&format!("{primary}-account"))
+            .await
+            .unwrap();
+        assert!(primary_account
+            .rate_limited_until
+            .is_some_and(|until| until > crate::infra::time::now_ms() as i64));
+        let in_flight = state.account_in_flight.snapshot();
+        assert_eq!(
+            in_flight.current(ProviderType::CodexOAuth, &format!("{primary}-account")),
+            0
+        );
+        assert_eq!(
+            in_flight.current(ProviderType::CodexOAuth, &format!("{fallback}-account")),
+            0
+        );
+
+        rejected.server.abort();
+        accepted.server.abort();
+        refresh.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_persistent_handshake_401_fails_over_before_business_event() {
+        let primary = "codex-ws-persistent-primary";
+        let fallback = "codex-ws-persistent-fallback";
+        let refreshed_access_token =
+            signed_openai_access_token(&format!("{primary}-workspace")).await;
+        let rejected = spawn_test_codex_websocket_auth_upstream(None).await;
+        let fallback_access_token = "ws-fallback-access-token";
+        let accepted = spawn_test_codex_websocket_auth_upstream(Some(format!(
+            "Bearer {fallback_access_token}"
+        )))
+        .await;
+        let refresh = spawn_test_codex_refresh_endpoint(refreshed_access_token.clone()).await;
+        let state = forwarder_test_state("codex-ws-persistent-failover");
+        configure_codex_refresh_test_account(&state, primary, refresh.url.clone()).await;
+        insert_static_codex_test_account(&state, fallback, fallback_access_token).await;
+        let mut executions = install_codex_test_provider_set(
+            &state,
+            vec![
+                TestCodexProviderSpec {
+                    name: primary.to_string(),
+                    endpoint: format!("http://{}", rejected.address),
+                    websocket_url: Some(format!("ws://{}/ws", rejected.address)),
+                },
+                TestCodexProviderSpec {
+                    name: fallback.to_string(),
+                    endpoint: format!("http://{}", accepted.address),
+                    websocket_url: Some(format!("ws://{}/ws", accepted.address)),
+                },
+            ],
+        )
+        .await;
+        let execution = executions.remove(0);
+        let state_for_assert = state.clone();
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", rejected.address),
+            None,
+            "persistent-auth-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "fail over auth").await;
+        wait_for_codex_account_leases_to_release(&state_for_assert, &[primary, fallback]).await;
+
+        assert!(events.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-auth-failover")
+                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(
+            rejected.authorizations.lock().unwrap().as_slice(),
+            [
+                format!("Bearer {primary}-access-token"),
+                format!("Bearer {refreshed_access_token}")
+            ]
+        );
+        assert_eq!(
+            accepted.authorizations.lock().unwrap().as_slice(),
+            [format!("Bearer {fallback_access_token}")]
+        );
+        assert_eq!(
+            accepted
+                .connections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let primary_account = state_for_assert
+            .find_account_by_id(&format!("{primary}-account"))
+            .await
+            .unwrap();
+        assert!(primary_account
+            .rate_limited_until
+            .is_some_and(|until| until > crate::infra::time::now_ms() as i64));
+
+        bridge_server.abort();
+        rejected.server.abort();
+        accepted.server.abort();
+        refresh.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_http_fallback_401_refreshes_once_before_replay() {
+        let name = "codex-ws-http-401";
+        let workspace = format!("{name}-workspace");
+        let refreshed_access_token = signed_openai_access_token(&workspace).await;
+        let upstream = spawn_test_unauthorized_codex_upstream(
+            refreshed_access_token.clone(),
+            "text/event-stream",
+            concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-ws-http-refresh\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ws-http-refresh\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        )
+        .await;
+        let refresh = spawn_test_codex_refresh_endpoint(refreshed_access_token.clone()).await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        configure_codex_refresh_test_account(&state, name, refresh.url.clone()).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "ws-http-refresh-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "refresh fallback").await;
+        assert!(events.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-ws-http-refresh")
+                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(
+            refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream.authorizations.lock().unwrap().as_slice(),
+            [
+                format!("Bearer {name}-access-token"),
+                format!("Bearer {refreshed_access_token}")
+            ]
+        );
+
+        bridge_server.abort();
+        upstream.server.abort();
+        refresh.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_cache_reuses_same_session_connection() {
+        let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) = codex_bridge_test_context("ws-reuse", endpoint).await;
+        let pool_key = format!(
+            "ws-reuse-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            Some(pool_key.clone()),
+            "reuse-session",
+        )
+        .await;
+
+        let first = send_test_bridge_request(bridge_address, "first").await;
+        assert_eq!(
+            first
+                .last()
+                .and_then(|event| event.pointer("/response/id"))
+                .and_then(Value::as_str),
+            Some("resp-ws-1")
+        );
+        wait_for_cached_responses_websocket(&pool_key).await;
+        let second = send_test_bridge_request(bridge_address, "second").await;
+        assert_eq!(
+            second
+                .last()
+                .and_then(|event| event.pointer("/response/id"))
+                .and_then(Value::as_str),
+            Some("resp-ws-2")
+        );
+        wait_for_cached_responses_websocket(&pool_key).await;
+
+        assert_eq!(
+            upstream
+                .websocket_connections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream
+                .websocket_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        remove_cached_responses_websocket(&pool_key).await;
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_pool_key_separates_credentials_and_workspaces() {
+        let (state, execution) =
+            codex_bridge_test_context("ws-key", "http://127.0.0.1:9".to_string()).await;
+        let base = vec![
+            ("authorization".to_string(), "Bearer token-a".to_string()),
+            ("chatgpt-account-id".to_string(), "workspace-a".to_string()),
+        ];
+        let credential_changed = vec![
+            ("authorization".to_string(), "Bearer token-b".to_string()),
+            ("chatgpt-account-id".to_string(), "workspace-a".to_string()),
+        ];
+        let workspace_changed = vec![
+            ("authorization".to_string(), "Bearer token-a".to_string()),
+            ("chatgpt-account-id".to_string(), "workspace-b".to_string()),
+        ];
+
+        let key = responses_websocket_pool_key(
+            &state,
+            &execution,
+            "session-a",
+            "wss://chatgpt.com/backend-api/codex/responses",
+            &base,
+        );
+        assert_ne!(
+            key,
+            responses_websocket_pool_key(
+                &state,
+                &execution,
+                "session-a",
+                "wss://chatgpt.com/backend-api/codex/responses",
+                &credential_changed,
+            )
+        );
+        assert_ne!(
+            key,
+            responses_websocket_pool_key(
+                &state,
+                &execution,
+                "session-a",
+                "wss://chatgpt.com/backend-api/codex/responses",
+                &workspace_changed,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_size_close_falls_back_to_http_with_same_identity() {
+        let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::CloseSize).await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) = codex_bridge_test_context("ws-size", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "size-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "size fallback").await;
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
+                && event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+        }));
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let observations = upstream.http_observations.lock().unwrap();
+        let (authorization, workspace, body) = &observations[0];
+        assert_eq!(authorization, "Bearer ws-size-access-token");
+        assert_eq!(workspace, "ws-size-workspace");
+        assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+        assert_eq!(body.get("store"), Some(&Value::Bool(false)));
+        assert_eq!(
+            body.get("prompt_cache_key").and_then(Value::as_str),
+            Some("size-session")
+        );
+        assert!(body.get("type").is_none());
+        drop(observations);
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_first_byte_timeout_falls_back_to_http() {
+        let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Silent).await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) = codex_bridge_test_context("ws-timeout", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "timeout-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "timeout fallback").await;
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
+                && event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+        }));
+        assert_eq!(
+            upstream
+                .websocket_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_headers_do_not_satisfy_first_event_timeout() {
+        let upstream =
+            spawn_test_codex_upstream(TestCodexWebSocketBehavior::CloseSizeThenDelayHttpFirstEvent)
+                .await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) =
+            codex_bridge_test_context("ws-http-first-event-timeout", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "http-first-event-timeout-session",
+            Some(Duration::from_millis(50)),
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "delayed first event").await;
+        assert!(
+            events.is_empty(),
+            "the delayed SSE event must not be relayed"
+        );
+        assert_eq!(
+            upstream
+                .websocket_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_error_body_obeys_first_event_timeout() {
+        let upstream =
+            spawn_test_codex_upstream(TestCodexWebSocketBehavior::CloseSizeThenStallHttpErrorBody)
+                .await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) =
+            codex_bridge_test_context("ws-http-error-body-timeout", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "http-error-body-timeout-session",
+            Some(Duration::from_millis(50)),
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+
+        let events = tokio::time::timeout(
+            Duration::from_millis(500),
+            send_test_bridge_request(bridge_address, "stalled error body"),
+        )
+        .await
+        .expect("the HTTP error body must not outlive the first-event deadline");
+        assert!(events.is_empty(), "an HTTP error must not emit SSE events");
+        assert_eq!(
+            upstream
+                .websocket_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_handshake_transport_failure_falls_back_to_http() {
+        let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let unavailable_listener =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+        let unavailable_address = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) = codex_bridge_test_context("ws-connect", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{unavailable_address}/ws"),
+            None,
+            "connect-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "connect fallback").await;
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream
+                .websocket_connections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_stale_cached_socket_recovers_via_http() {
+        let upstream =
+            spawn_test_codex_upstream(TestCodexWebSocketBehavior::CompleteThenClose).await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) = codex_bridge_test_context("ws-stale", endpoint).await;
+        let pool_key = format!(
+            "ws-stale-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            Some(pool_key.clone()),
+            "stale-session",
+        )
+        .await;
+
+        let first = send_test_bridge_request(bridge_address, "seed cache").await;
+        assert!(first.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-before-stale")
+        }));
+        wait_for_cached_responses_websocket(&pool_key).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let second = send_test_bridge_request(bridge_address, "recover stale").await;
+        assert!(second.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+        }));
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream
+                .websocket_connections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        remove_cached_responses_websocket(&pool_key).await;
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_does_not_fallback_after_business_event_is_emitted() {
+        let upstream =
+            spawn_test_codex_upstream(TestCodexWebSocketBehavior::EmitThenCloseSize).await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) = codex_bridge_test_context("ws-committed", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "committed-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "no replay").await;
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.created")
+        }));
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[test]
     fn grok_websocket_single_model_matches_http_routing_policy() {
         for requested in [Some("gpt-5.5"), Some("grok-4.3"), Some("grok"), None] {
             let request = match requested {
@@ -7681,6 +11981,27 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             panic!("expected binary frame");
         };
         assert_eq!(completed, raw.as_bytes());
+    }
+
+    #[test]
+    fn websocket_error_is_terminal_and_clears_collected_output() {
+        let mut patcher = CodexWebsocketOutputPatcher::default();
+        let mut collected = TungsteniteMessage::Text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"stale"}}"#
+                .to_string(),
+        );
+        patcher.patch_message(&mut collected);
+
+        let mut error = TungsteniteMessage::Text(
+            r#"{"type":"error","error":{"message":"request failed"}}"#.to_string(),
+        );
+        assert!(responses_websocket_response_is_terminal(&error));
+        patcher.patch_message(&mut error);
+
+        let raw = r#"{"type":"response.completed","response":{"output":[]}}"#;
+        let mut completed = TungsteniteMessage::Text(raw.to_string());
+        patcher.patch_message(&mut completed);
+        assert_eq!(completed, TungsteniteMessage::Text(raw.to_string()));
     }
 
     #[test]

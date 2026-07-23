@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::{AppKind, ProviderType};
 
-pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 1;
+pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 2;
 pub const PROVIDER_REGISTRY_FORMAT: &str = "cc-switch-provider-registry";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -197,7 +197,42 @@ pub struct DriverSpec {
     pub accepted_auth_schemes: Vec<AuthScheme>,
     pub operations: DriverOperations,
     pub capabilities: DriverCapabilities,
+    pub outbound_identity_policy: OutboundIdentityPolicy,
     pub option_schema_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum OutboundIdentityPolicy {
+    ManagedIdentity { family: ManagedIdentityFamily },
+    ManagedVersion { family: ManagedVersionFamily },
+    ServerIdentity,
+    Omit,
+    CustomOverride,
+    LegacyFrozen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedIdentityFamily {
+    ClaudeCode,
+    CodexCli,
+    GrokCli,
+    Kiro,
+    Cursor,
+    Copilot,
+    Deepseek,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedVersionFamily {
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -258,6 +293,7 @@ pub struct CustomPolicySpec {
     pub protocols: Vec<UpstreamProtocol>,
     pub auth_schemes: Vec<AuthScheme>,
     pub allowed_driver_ids: Vec<DriverId>,
+    pub outbound_identity_policy: OutboundIdentityPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +459,12 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         if !driver_ids.insert(driver.driver_id.as_str()) {
             bail!("duplicate driver id {}", driver.driver_id);
         }
+        if driver.outbound_identity_policy == OutboundIdentityPolicy::CustomOverride {
+            bail!(
+                "driver {} cannot delegate outbound identity to a Provider override",
+                driver.driver_id
+            );
+        }
         validate_operation_contract(driver)?;
     }
     for policy in &registry.custom_policies {
@@ -439,6 +481,12 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         if policy.protocols.is_empty() || policy.auth_schemes.is_empty() {
             bail!(
                 "custom policy {} must declare protocols and auth schemes",
+                policy.custom_policy_id
+            );
+        }
+        if policy.outbound_identity_policy != OutboundIdentityPolicy::CustomOverride {
+            bail!(
+                "custom policy {} must use custom_override outbound identity",
                 policy.custom_policy_id
             );
         }
@@ -677,6 +725,22 @@ fn validate_profile_contract(
                 .iter()
                 .find(|driver| driver.driver_id == *driver_id)
                 .expect("driver id set was checked");
+            if profile.form_composition == FormComposition::Legacy
+                && driver.outbound_identity_policy != OutboundIdentityPolicy::LegacyFrozen
+            {
+                bail!(
+                    "legacy profile {} must use a legacy_frozen identity driver",
+                    profile.profile_id
+                );
+            }
+            if profile.form_composition != FormComposition::Legacy
+                && driver.outbound_identity_policy == OutboundIdentityPolicy::LegacyFrozen
+            {
+                bail!(
+                    "profile {} cannot use a legacy_frozen identity driver",
+                    profile.profile_id
+                );
+            }
             match &profile.credential_policy {
                 CredentialPolicy::ManagedAccount { .. }
                     if !driver.accepted_auth_schemes.contains(&AuthScheme::OAuth) =>
@@ -841,5 +905,36 @@ mod tests {
         );
         assert!(ProviderKey::new(AppKind::Codex, "").is_err());
         assert!(ProviderKey::new(AppKind::Gemini, " id ").is_err());
+    }
+
+    #[test]
+    fn outbound_identity_is_explicit_for_every_driver_and_custom_policy() {
+        let registry = provider_registry();
+        assert!(registry.drivers.iter().all(|driver| {
+            driver.outbound_identity_policy != OutboundIdentityPolicy::CustomOverride
+        }));
+        assert!(registry.custom_policies.iter().all(|policy| {
+            policy.outbound_identity_policy == OutboundIdentityPolicy::CustomOverride
+        }));
+        assert_eq!(
+            registry
+                .drivers
+                .iter()
+                .find(|driver| driver.driver_id.as_str() == "oauth.openai_codex")
+                .unwrap()
+                .outbound_identity_policy,
+            OutboundIdentityPolicy::ManagedIdentity {
+                family: ManagedIdentityFamily::CodexCli
+            }
+        );
+        assert_eq!(
+            registry
+                .drivers
+                .iter()
+                .find(|driver| driver.driver_id.as_str() == "aws.bedrock_sigv4")
+                .unwrap()
+                .outbound_identity_policy,
+            OutboundIdentityPolicy::Omit
+        );
     }
 }

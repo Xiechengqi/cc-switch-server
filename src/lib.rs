@@ -9,6 +9,7 @@ pub mod domain;
 pub mod infra;
 pub mod logging;
 pub mod metrics;
+pub mod provider_identity;
 pub mod proxy;
 pub mod self_update;
 pub mod setup;

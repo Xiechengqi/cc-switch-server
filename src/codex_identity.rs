@@ -64,6 +64,27 @@ pub(crate) fn finalize_headers(headers: &mut Vec<(&'static str, String)>) {
     replace_or_push(headers, "version", version);
 }
 
+pub(crate) fn finalize_owned_headers(headers: &mut Vec<(String, String)>) {
+    let configured_version = configured_version();
+    let candidate = owned_header_value(headers, "user-agent")
+        .map(str::to_string)
+        .unwrap_or_else(default_user_agent);
+    let (originator, user_agent) = pair_user_agent(&candidate).unwrap_or_else(|| {
+        (
+            DEFAULT_CODEX_ORIGINATOR.to_string(),
+            default_user_agent_for_version(&configured_version),
+        )
+    });
+    let version = owned_header_value(headers, "version")
+        .filter(|value| version_at_least(value, MIN_CODEX_UPSTREAM_VERSION))
+        .map(str::to_string)
+        .unwrap_or(configured_version);
+
+    replace_or_push_owned(headers, "user-agent", user_agent);
+    replace_or_push_owned(headers, "originator", originator);
+    replace_or_push_owned(headers, "version", version);
+}
+
 fn default_user_agent_for_version(version: &str) -> String {
     format!("codex_cli_rs/{version} (Ubuntu 22.04.0; x86_64) xterm-256color")
 }
@@ -80,6 +101,20 @@ fn header_value<'a>(headers: &'a [(&'static str, String)], name: &str) -> Option
 fn replace_or_push(headers: &mut Vec<(&'static str, String)>, name: &'static str, value: String) {
     headers.retain(|(candidate, _)| !candidate.eq_ignore_ascii_case(name));
     headers.push((name, value));
+}
+
+fn owned_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn replace_or_push_owned(headers: &mut Vec<(String, String)>, name: &str, value: String) {
+    headers.retain(|(candidate, _)| !candidate.eq_ignore_ascii_case(name));
+    headers.push((name.to_string(), value));
 }
 
 fn pair_user_agent(user_agent: &str) -> Option<(String, String)> {

@@ -1297,7 +1297,10 @@
     "logoutAll": "登出所有帳號",
     "retry": "重試",
     "copyCode": "複製程式碼",
-    "cliUnavailableInRemoteWeb": "遠端 Web 模式無法連線 localhost 回呼，請使用 Device Code",
+    "cliUnavailableInRemoteWeb": "CLI OAuth 僅可透過本機 loopback 或已設定的 HTTPS Client URL 使用，請改用 Device Code",
+    "waitingForManualCallback": "完成授權後，提交瀏覽器網址列中的回呼 URL",
+    "callbackUrl": "回呼 URL",
+    "submitCallback": "提交",
     "imageGeneration": "生成圖片",
     "imageGenerationDescription": "透過 ChatGPT Codex 後端啟用 OpenAI 相容的 /v1/images/generations 介面。",
     "imageToolStripPolicy": "圖片工具策略",
@@ -2848,7 +2851,8 @@
       "invalidHeader": "Header 名稱無效：{{name}}",
       "managedHeader": "Header 由驅動程式管理：{{name}}",
       "duplicateHeader": "Header 名稱重複：{{name}}",
-      "headerValueRequired": "請填寫 Header {{name}} 的值"
+      "headerValueRequired": "請填寫 Header {{name}} 的值",
+      "invalidUserAgent": "User-Agent 不能包含換行或其他控制字元"
     },
     "credentials": {
       "title": "認證憑據",

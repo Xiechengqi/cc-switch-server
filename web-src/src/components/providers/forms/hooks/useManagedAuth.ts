@@ -67,21 +67,27 @@ export function useManagedAuth(
 
   const startLoginMutation = useMutation({
     mutationFn: (params?: {
-      oauthFlowMode?: "web_paste" | "localhost" | "cli" | "device";
-      codexCallbackUrl?: string | null;
+      oauthFlowMode?: "web_paste" | "localhost" | "cli" | "cli_manual" | "device";
       kiroLoginProvider?: "google" | "github" | null;
     }) =>
       authApi.authStartLogin(
         authProvider,
         githubDomain,
         params?.oauthFlowMode,
-        params?.codexCallbackUrl,
         params?.kiroLoginProvider,
       ),
     onSuccess: async (response) => {
       setDeviceCode(response);
       setPollingState("polling");
       setError(null);
+
+      if (response.flow === "cli_manual") {
+        pollingTimeoutRef.current = setTimeout(() => {
+          setPollingState("error");
+          setError("OAuth session expired. Please try again.");
+        }, response.expires_in * 1000);
+        return;
+      }
 
       // Add a small buffer on top of GitHub's suggested interval to avoid
       // hitting slow_down responses too aggressively during device polling.
@@ -133,6 +139,31 @@ export function useManagedAuth(
     },
     onError: (e) => {
       setPollingState("error");
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
+  const submitOauthCallbackMutation = useMutation({
+    mutationFn: (callbackUrl: string) => {
+      if (!deviceCode?.device_code) {
+        throw new Error("OAuth session is not active.");
+      }
+      return authApi.authSubmitOauthCallback(
+        authProvider,
+        deviceCode.device_code,
+        callbackUrl,
+      );
+    },
+    onSuccess: async () => {
+      stopPolling();
+      setPollingState("success");
+      await refetchStatus();
+      await invalidateManagedAccountViews();
+      setPollingState("idle");
+      setDeviceCode(null);
+      setError(null);
+    },
+    onError: (e) => {
       setError(e instanceof Error ? e.message : String(e));
     },
   });
@@ -221,9 +252,8 @@ export function useManagedAuth(
 
   const startAuth = useCallback(
     (
-      oauthFlowMode?: "web_paste" | "localhost" | "cli" | "device",
+      oauthFlowMode?: "web_paste" | "localhost" | "cli" | "cli_manual" | "device",
       options?: {
-        codexCallbackUrl?: string | null;
         kiroLoginProvider?: "google" | "github" | null;
       },
     ) => {
@@ -232,10 +262,9 @@ export function useManagedAuth(
       setError(null);
       stopPolling();
       startLoginMutation.mutate(
-        oauthFlowMode || options?.codexCallbackUrl || options?.kiroLoginProvider
+        oauthFlowMode || options?.kiroLoginProvider
           ? {
               oauthFlowMode,
-              codexCallbackUrl: options?.codexCallbackUrl,
               kiroLoginProvider: options?.kiroLoginProvider,
             }
           : undefined,
@@ -322,6 +351,7 @@ export function useManagedAuth(
     isRemovingAccount: removeAccountMutation.isPending,
     isSettingDefaultAccount: setDefaultAccountMutation.isPending,
     isSettingWorkspace: setWorkspaceMutation.isPending,
+    isSubmittingOauthCallback: submitOauthCallbackMutation.isPending,
     startAuth: startDefaultAuth,
     addAccount: startDefaultAuth,
     addAccountWithMode: startAuth,
@@ -330,6 +360,7 @@ export function useManagedAuth(
     removeAccount,
     setDefaultAccount,
     setWorkspace,
+    submitOauthCallback: submitOauthCallbackMutation.mutateAsync,
     importCursorLocalAuth,
     refetchStatus,
   };

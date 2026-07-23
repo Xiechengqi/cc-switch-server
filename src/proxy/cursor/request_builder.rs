@@ -999,12 +999,16 @@ pub fn build_output_constraints(body: &Value, protocol: InboundProtocol) -> Stri
 }
 
 pub fn tool_commit_enabled() -> bool {
-    match std::env::var("CC_SWITCH_CURSOR_TOOL_DIRECTIVE")
+    let configured = std::env::var("CC_SWITCH_CURSOR_TOOL_DIRECTIVE")
         .or_else(|_| std::env::var("CURSOR_TOOL_DIRECTIVE"))
-    {
-        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")),
-        Err(_) => true,
-    }
+        .ok();
+    tool_commit_enabled_from(configured.as_deref())
+}
+
+fn tool_commit_enabled_from(configured: Option<&str>) -> bool {
+    configured.is_none_or(|value| {
+        !(value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off"))
+    })
 }
 
 pub fn enhance_agent_user_text(
@@ -1335,10 +1339,11 @@ mod tests {
 
     #[test]
     fn tool_commit_can_be_disabled_via_env() {
-        std::env::set_var("CC_SWITCH_CURSOR_TOOL_DIRECTIVE", "0");
-        assert!(!tool_commit_enabled());
-        std::env::remove_var("CC_SWITCH_CURSOR_TOOL_DIRECTIVE");
-        assert!(tool_commit_enabled());
+        assert!(!tool_commit_enabled_from(Some("0")));
+        assert!(!tool_commit_enabled_from(Some("false")));
+        assert!(!tool_commit_enabled_from(Some("OFF")));
+        assert!(tool_commit_enabled_from(Some("1")));
+        assert!(tool_commit_enabled_from(None));
     }
 
     #[test]

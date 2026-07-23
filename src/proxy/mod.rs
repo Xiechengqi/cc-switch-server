@@ -12,6 +12,7 @@ mod deepseek;
 mod forwarder;
 mod grok;
 pub(crate) mod kiro;
+mod outbound_identity;
 pub(crate) mod provider_ops;
 mod request_governance;
 mod responses_wire;
@@ -337,7 +338,9 @@ mod tests {
             api_key: None,
             extra_headers: None,
             scopes: Vec::new(),
-            profile: Some(json!({"chatgpt_account_id":"acct_123"})),
+            profile: Some(json!({
+                "verifiedOpenAiClaims": {"chatgpt_account_id":"acct_123"}
+            })),
             raw: None,
             subscription_level: None,
             entitlement_status: None,
@@ -361,10 +364,6 @@ mod tests {
                 ("chatgpt-account-id", "acct_123".to_string()),
                 ("originator", "codex_cli_rs".to_string()),
                 ("version", "0.144.1".to_string()),
-                (
-                    "user-agent",
-                    "codex_cli_rs/0.144.1 (Ubuntu 22.04.0; x86_64) xterm-256color".to_string()
-                ),
             ]
         );
     }

@@ -94,6 +94,24 @@ pub fn redact_sensitive_text(input: &str) -> String {
         .join("\n")
 }
 
+pub fn redact_sensitive_text_with_values<'a>(
+    input: &str,
+    sensitive_values: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut redacted = redact_sensitive_text(input);
+    for sensitive_value in sensitive_values
+        .into_iter()
+        .filter(|value| !value.is_empty())
+    {
+        if redacted == sensitive_value {
+            redacted = "[REDACTED]".to_string();
+        } else if sensitive_value.len() >= 8 && redacted.contains(sensitive_value) {
+            redacted = redacted.replace(sensitive_value, "[REDACTED]");
+        }
+    }
+    redacted
+}
+
 pub fn mask_kiro_api_keys(input: &str) -> String {
     const PREFIX: &str = "ksk_";
     let mut output = String::with_capacity(input.len());
@@ -109,14 +127,7 @@ pub fn mask_kiro_api_keys(input: &str) -> String {
             }
             end += 1;
         }
-        let token = &input[start..end];
-        if token.len() > 8 {
-            output.push_str(&token[..4]);
-            output.push_str("...");
-            output.push_str(&token[token.len() - 4..]);
-        } else {
-            output.push_str("[REDACTED_KIRO_API_KEY]");
-        }
+        output.push_str("[REDACTED_KIRO_API_KEY]");
         cursor = end;
     }
     output.push_str(&input[cursor..]);
@@ -190,11 +201,20 @@ mod tests {
     fn masks_kiro_api_keys_without_hiding_surrounding_error() {
         assert_eq!(
             mask_kiro_api_keys("upstream rejected ksk_abcdefghijklmnop; retry denied"),
-            "upstream rejected ksk_...mnop; retry denied"
+            "upstream rejected [REDACTED_KIRO_API_KEY]; retry denied"
         );
         assert_eq!(
             redact_sensitive_text("error: invalid ksk_1234567890"),
-            "error: invalid ksk_...7890"
+            "error: invalid [REDACTED_KIRO_API_KEY]"
         );
+    }
+
+    #[test]
+    fn redacts_known_sensitive_values_reflected_without_a_field_name() {
+        let redacted = redact_sensitive_text_with_values(
+            "upstream rejected refresh-secret-value; retry denied",
+            ["refresh-secret-value"],
+        );
+        assert_eq!(redacted, "upstream rejected [REDACTED]; retry denied");
     }
 }

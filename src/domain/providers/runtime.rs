@@ -15,7 +15,8 @@ use super::model::{AppKind, Provider, ProviderType};
 use super::model_routing::{policy_from_settings, ModelRoutingMode};
 use super::registry::{
     profile_by_id, provider_registry, resolve_custom_binding, AuthScheme, CredentialPolicy,
-    DriverBinding, DriverId, ModelPolicyKind, ProfileId, UpstreamProtocol,
+    DriverBinding, DriverId, EndpointPolicy, ModelPolicyKind, OutboundIdentityPolicy, ProfileId,
+    UpstreamProtocol,
 };
 use super::store::{ProviderStore, StoredProvider};
 
@@ -113,6 +114,7 @@ pub struct ProviderRuntimePlan {
     pub driver_contract_revision: u32,
     pub endpoint: String,
     pub upstream_protocol: UpstreamProtocol,
+    pub outbound_identity_policy: OutboundIdentityPolicy,
     pub auth_ref: RuntimeAuthRef,
     pub model_policy: RuntimeModelPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +158,11 @@ impl ProviderRuntimeIndex {
 
     pub fn is_empty(&self) -> bool {
         self.plans.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_plan_for_test(&mut self, plan: ProviderRuntimePlan) {
+        self.plans.insert(plan.provider_key.clone(), Arc::new(plan));
     }
 }
 
@@ -207,8 +214,35 @@ pub fn compile_runtime_plan(
         .iter()
         .find(|driver| driver.driver_id == driver_id)
         .with_context(|| format!("runtime Driver {driver_id} is not registered"))?;
-    let endpoint = configured_base_url(&stored.provider, stored.app)
-        .or_else(|| default_base_url(stored.provider_type).map(str::to_string));
+    let configured_endpoint = configured_base_url(&stored.provider, stored.app);
+    let default_endpoint = default_base_url(stored.provider_type).map(str::to_string);
+    let endpoint_policy = profile_policy
+        .map(|profile| profile.endpoint_policy)
+        .unwrap_or_else(|| {
+            if managed_oauth_endpoint_is_fixed(stored.provider_type) {
+                EndpointPolicy::Fixed
+            } else {
+                EndpointPolicy::FrozenLegacy
+            }
+        });
+    let endpoint = match endpoint_policy {
+        EndpointPolicy::Fixed => {
+            if configured_endpoint.as_deref().is_some_and(|configured| {
+                default_endpoint
+                    .as_deref()
+                    .is_none_or(|default| !endpoints_equivalent(configured, default))
+            }) {
+                warnings.push(
+                    "fixed endpoint policy ignored a configured endpoint override".to_string(),
+                );
+            }
+            default_endpoint
+        }
+        EndpointPolicy::OverrideAllowed
+        | EndpointPolicy::Template
+        | EndpointPolicy::FrozenLegacy => configured_endpoint.or(default_endpoint),
+        EndpointPolicy::Custom => configured_endpoint,
+    };
     let endpoint = match endpoint {
         Some(endpoint) => match validate_endpoint(&endpoint, stored) {
             Ok(endpoint) => endpoint,
@@ -241,7 +275,15 @@ pub fn compile_runtime_plan(
     if matches!(auth_ref, RuntimeAuthRef::Missing) {
         configuration_state = RuntimeConfigurationState::NeedsAttention;
     }
-    let driver_options = runtime_driver_options(&stored.provider);
+    let outbound_identity_policy = runtime_outbound_identity_policy(profile_policy, driver)?;
+    let driver_options = match runtime_driver_options(&stored.provider, outbound_identity_policy) {
+        Ok(options) => options,
+        Err(error) => {
+            configuration_state = RuntimeConfigurationState::NeedsAttention;
+            warnings.push(error.to_string());
+            BTreeMap::new()
+        }
+    };
     let media_policy = runtime_media_policy(&stored.provider);
     let transport_policy = runtime_transport_policy(&stored.provider);
     let extra_headers = match runtime_extra_headers(stored, profile_policy) {
@@ -261,6 +303,7 @@ pub fn compile_runtime_plan(
         "driverContractRevision": driver.driver_contract_revision,
         "endpoint": &endpoint,
         "upstreamProtocol": driver.upstream_protocol,
+        "outboundIdentityPolicy": outbound_identity_policy,
         "authRef": &auth_ref,
         "modelPolicy": &model_policy,
         "mediaPolicy": &media_policy,
@@ -278,6 +321,7 @@ pub fn compile_runtime_plan(
         driver_contract_revision: driver.driver_contract_revision,
         endpoint,
         upstream_protocol: driver.upstream_protocol,
+        outbound_identity_policy,
         auth_ref,
         model_policy,
         media_policy,
@@ -370,6 +414,7 @@ pub fn validate_custom_header_name(name: &str) -> anyhow::Result<String> {
             | "x-api-key"
             | "api-key"
             | "x-goog-api-key"
+            | "user-agent"
     ) {
         bail!("custom header {canonical} is controlled by the Provider driver");
     }
@@ -548,19 +593,18 @@ fn runtime_single_model(settings: &Value) -> Option<String> {
         })
 }
 
-fn runtime_driver_options(provider: &Provider) -> BTreeMap<String, Value> {
+fn runtime_driver_options(
+    provider: &Provider,
+    outbound_identity_policy: OutboundIdentityPolicy,
+) -> anyhow::Result<BTreeMap<String, Value>> {
     let mut options = BTreeMap::new();
     let Some(meta) = provider.meta.as_ref() else {
-        return options;
+        return Ok(options);
     };
     for (name, value) in [
         (
             "apiKeyField",
             meta.api_key_field.as_ref().map(|value| json!(value)),
-        ),
-        (
-            "customUserAgent",
-            meta.custom_user_agent.as_ref().map(|value| json!(value)),
         ),
         ("isFullUrl", meta.is_full_url.map(|value| json!(value))),
         (
@@ -581,7 +625,45 @@ fn runtime_driver_options(provider: &Provider) -> BTreeMap<String, Value> {
             options.insert(name.to_string(), value);
         }
     }
-    options
+    if outbound_identity_policy == OutboundIdentityPolicy::CustomOverride {
+        if let Some(user_agent) = meta
+            .custom_user_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            validate_custom_user_agent(user_agent)?;
+            options.insert("customUserAgent".to_string(), json!(user_agent));
+        }
+    }
+    Ok(options)
+}
+
+fn runtime_outbound_identity_policy(
+    profile: Option<&super::registry::ProfileSpec>,
+    driver: &super::registry::DriverSpec,
+) -> anyhow::Result<OutboundIdentityPolicy> {
+    let Some(profile) = profile else {
+        return Ok(driver.outbound_identity_policy);
+    };
+    let DriverBinding::Custom { custom_policy_id } = &profile.driver_binding else {
+        return Ok(driver.outbound_identity_policy);
+    };
+    provider_registry()
+        .custom_policies
+        .iter()
+        .find(|policy| policy.custom_policy_id == *custom_policy_id)
+        .map(|policy| policy.outbound_identity_policy)
+        .with_context(|| format!("custom policy {custom_policy_id} is not registered"))
+}
+
+pub fn validate_custom_user_agent(value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("custom User-Agent cannot be empty");
+    }
+    http::HeaderValue::from_str(value).context("custom User-Agent is not a valid header value")?;
+    Ok(value.to_string())
 }
 
 fn runtime_media_policy(provider: &Provider) -> Option<Value> {
@@ -706,6 +788,17 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::GrokOAuth => Some("https://api.x.ai/v1"),
         ProviderType::ClaudeAuth => None,
     }
+}
+
+fn managed_oauth_endpoint_is_fixed(provider_type: ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+    )
+}
+
+fn endpoints_equivalent(left: &str, right: &str) -> bool {
+    left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/')
 }
 
 fn validate_endpoint(endpoint: &str, stored: &StoredProvider) -> anyhow::Result<String> {
@@ -944,9 +1037,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_fingerprint_changes_for_endpoint_but_ignores_proxy_fields() {
+    fn custom_runtime_fingerprint_changes_for_endpoint_but_ignores_proxy_fields() {
         let accounts = AccountStore::default();
-        let mut stored = provider("codex.openrouter", ProviderType::OpenRouter);
+        let mut stored = provider("codex.custom_http", ProviderType::Codex);
+        stored.resource.custom_binding = Some(super::super::registry::CustomBindingInput {
+            upstream_protocol: UpstreamProtocol::OpenAiResponses,
+            auth_scheme: AuthScheme::Bearer,
+        });
         stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
         let first = compile_runtime_plan(&stored, &accounts).unwrap();
 
@@ -968,6 +1065,66 @@ mod tests {
             .unwrap()
             .to_ascii_lowercase()
             .contains("proxy.invalid"));
+    }
+
+    #[test]
+    fn fixed_endpoint_policy_ignores_configured_override() {
+        let accounts = AccountStore::default();
+        let mut stored = provider("codex.openrouter", ProviderType::OpenRouter);
+        stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
+
+        let first = compile_runtime_plan(&stored, &accounts).unwrap();
+        assert_eq!(first.endpoint, "https://openrouter.ai/api");
+        assert!(first
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ignored a configured endpoint override")));
+
+        stored.provider.settings_config["env"]["OPENAI_BASE_URL"] =
+            json!("https://another.example.test/v1");
+        let second = compile_runtime_plan(&stored, &accounts).unwrap();
+        assert_eq!(second.endpoint, "https://openrouter.ai/api");
+        assert_eq!(first.runtime_fingerprint, second.runtime_fingerprint);
+    }
+
+    #[test]
+    fn legacy_managed_oauth_providers_ignore_endpoint_overrides() {
+        let accounts = AccountStore::default();
+        for (app, provider_type, endpoint) in [
+            (
+                AppKind::Claude,
+                ProviderType::ClaudeOAuth,
+                "https://api.anthropic.com",
+            ),
+            (
+                AppKind::Codex,
+                ProviderType::CodexOAuth,
+                "https://chatgpt.com/backend-api/codex",
+            ),
+        ] {
+            let mut stored = provider("codex.openai_oauth", provider_type);
+            stored.app = app;
+            stored.resource.profile_id = None;
+            stored.resource.profile_schema_revision = None;
+            stored.provider.settings_config = match app {
+                AppKind::Claude => json!({
+                    "env": {"ANTHROPIC_BASE_URL": "https://attacker.example/oauth"}
+                }),
+                AppKind::Codex => json!({
+                    "env": {"OPENAI_BASE_URL": "https://attacker.example/oauth"}
+                }),
+                AppKind::Gemini => unreachable!(),
+            };
+
+            let plan = compile_runtime_plan(&stored, &accounts).unwrap();
+
+            assert_eq!(plan.endpoint, endpoint);
+            assert!(!plan.endpoint.contains("attacker.example"));
+            assert!(plan
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ignored a configured endpoint override")));
+        }
     }
 
     #[test]
@@ -1043,6 +1200,88 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("controlled by the Provider driver")));
+    }
+
+    #[test]
+    fn custom_extra_headers_cannot_bypass_the_user_agent_policy() {
+        let accounts = AccountStore::default();
+        let profile = profile_by_id("codex.custom_http").unwrap();
+        let mut stored = provider_for_profile(profile, 10, &mut AccountStore::default());
+        stored.provider.settings_config["extraHeaders"] = json!({
+            "User-Agent": "shadow-agent/1"
+        });
+
+        let plan = compile_runtime_plan(&stored, &accounts).unwrap();
+
+        assert_eq!(
+            plan.configuration_state,
+            RuntimeConfigurationState::NeedsAttention
+        );
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("user-agent")
+                && warning.contains("controlled by the Provider driver")));
+    }
+
+    #[test]
+    fn runtime_only_compiles_custom_user_agent_for_custom_profiles() {
+        let accounts = AccountStore::default();
+        let mut preset = provider("codex.openrouter", ProviderType::OpenRouter);
+        preset.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
+        preset.provider.meta.as_mut().unwrap().custom_user_agent =
+            Some("legacy-preset-override/1".to_string());
+        let preset_plan = compile_runtime_plan(&preset, &accounts).unwrap();
+        assert_eq!(
+            preset_plan.outbound_identity_policy,
+            OutboundIdentityPolicy::ServerIdentity
+        );
+        assert!(!preset_plan.driver_options.contains_key("customUserAgent"));
+
+        let mut custom = provider("codex.custom_http", ProviderType::Codex);
+        custom.resource.custom_binding = Some(super::super::registry::CustomBindingInput {
+            upstream_protocol: UpstreamProtocol::OpenAiResponses,
+            auth_scheme: AuthScheme::Bearer,
+        });
+        custom.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
+        custom.provider.meta.as_mut().unwrap().custom_user_agent =
+            Some(" custom-agent/2 ".to_string());
+        let custom_plan = compile_runtime_plan(&custom, &accounts).unwrap();
+        assert_eq!(
+            custom_plan.outbound_identity_policy,
+            OutboundIdentityPolicy::CustomOverride
+        );
+        assert_eq!(
+            custom_plan
+                .driver_options
+                .get("customUserAgent")
+                .and_then(Value::as_str),
+            Some("custom-agent/2")
+        );
+    }
+
+    #[test]
+    fn invalid_custom_user_agent_marks_the_runtime_plan_for_attention() {
+        let accounts = AccountStore::default();
+        let mut custom = provider("codex.custom_http", ProviderType::Codex);
+        custom.resource.custom_binding = Some(super::super::registry::CustomBindingInput {
+            upstream_protocol: UpstreamProtocol::OpenAiResponses,
+            auth_scheme: AuthScheme::Bearer,
+        });
+        custom.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
+        custom.provider.meta.as_mut().unwrap().custom_user_agent =
+            Some("agent/1\nforged: value".to_string());
+
+        let plan = compile_runtime_plan(&custom, &accounts).unwrap();
+
+        assert_eq!(
+            plan.configuration_state,
+            RuntimeConfigurationState::NeedsAttention
+        );
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("custom User-Agent")));
     }
 
     #[test]

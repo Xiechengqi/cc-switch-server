@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     cc_switch_server::metrics::init()?;
+    cc_switch_server::provider_identity::spawn_antigravity_version_updater();
     let state =
         ServerStateInner::load(cli.clone(), log_capture).context("initialize server state")?;
     state.sync_log_config_from_ui_settings().await;

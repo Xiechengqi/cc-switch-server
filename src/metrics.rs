@@ -55,6 +55,33 @@ pub fn record_claude_retry(stage: &str, source: &str) {
     .increment(1);
 }
 
+pub fn record_forward_retry(app: &str, stage: &str, source: &str) {
+    metrics::counter!(
+        "cc_switch_forward_retry_total",
+        "app" => app.to_string(),
+        "stage" => stage.to_string(),
+        "source" => source.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_codex_websocket_cache(result: &'static str) {
+    metrics::counter!(
+        "cc_switch_codex_websocket_cache_total",
+        "result" => result
+    )
+    .increment(1);
+}
+
+pub fn record_codex_websocket_fallback(source: &'static str, result: &'static str) {
+    metrics::counter!(
+        "cc_switch_codex_websocket_fallback_total",
+        "source" => source,
+        "result" => result
+    )
+    .increment(1);
+}
+
 pub fn record_provider_outcome(app: &str, provider_id: &str, outcome: ProviderRequestOutcome) {
     let outcome = match outcome {
         ProviderRequestOutcome::Success { .. } => "success",
@@ -128,6 +155,18 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_claude_retry_total",
         "Claude OAuth transparent retries by body stage and response source"
+    );
+    metrics::describe_counter!(
+        "cc_switch_forward_retry_total",
+        "Protocol-safe transparent forwarding retries by application, stage, and source"
+    );
+    metrics::describe_counter!(
+        "cc_switch_codex_websocket_cache_total",
+        "Codex WebSocket cache hits, misses, and releases"
+    );
+    metrics::describe_counter!(
+        "cc_switch_codex_websocket_fallback_total",
+        "Codex WebSocket to HTTP fallback attempts and outcomes"
     );
     metrics::describe_counter!(
         "cc_switch_provider_outcome_total",

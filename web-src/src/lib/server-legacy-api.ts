@@ -101,15 +101,15 @@ export interface AccountRecord {
   id: string;
   providerType: string;
   email?: string | null;
-  accessToken?: string | null;
-  refreshToken?: string | null;
-  idToken?: string | null;
   tokenType?: string | null;
-  apiKey?: string | null;
-  extraHeaders?: Record<string, string>;
   scopes?: string[];
-  profile?: unknown;
-  raw?: unknown;
+  hasAccessToken: boolean;
+  hasRefreshToken: boolean;
+  hasIdToken: boolean;
+  hasApiKey: boolean;
+  hasExtraHeaders: boolean;
+  hasProfile: boolean;
+  hasRaw: boolean;
   subscriptionLevel?: string | null;
   entitlementStatus?: string | null;
   quotaPercent?: number | null;
@@ -117,7 +117,7 @@ export interface AccountRecord {
   quotaRefreshedAt?: number | null;
   quotaNextRefreshAt?: number | null;
   expiresAt?: number | null;
-  lastRefreshError?: string | null;
+  hasRefreshError: boolean;
   refreshConsecutiveFailures?: number;
   needsRelogin?: boolean;
 }

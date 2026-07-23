@@ -1,9 +1,61 @@
 use anyhow::Context;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+const PROVISION_IP_FAMILY_ENV: &str = "CC_SWITCH_PROVISION_IP_FAMILY";
+
+#[derive(Debug, Clone, Copy)]
+enum ProvisionIpFamily {
+    V4,
+    V6,
+}
+
+#[derive(Debug)]
+struct ProvisionIpFamilyResolver {
+    family: ProvisionIpFamily,
+}
+
+impl Resolve for ProvisionIpFamilyResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        let family = self.family;
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let selected = addresses
+                .filter(|address| match family {
+                    ProvisionIpFamily::V4 => address.is_ipv4(),
+                    ProvisionIpFamily::V6 => address.is_ipv6(),
+                })
+                .collect::<Vec<SocketAddr>>();
+            if selected.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("{host} has no address in the provisioning IP family"),
+                )
+                .into());
+            }
+            Ok(Box::new(selected.into_iter()) as Addrs)
+        })
+    }
+}
+
+fn provision_ip_family() -> Option<ProvisionIpFamily> {
+    match std::env::var(PROVISION_IP_FAMILY_ENV).ok().as_deref() {
+        Some("4") => Some(ProvisionIpFamily::V4),
+        Some("6") => Some(ProvisionIpFamily::V6),
+        _ => None,
+    }
+}
 
 pub fn direct_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .no_proxy()
-        .redirect(same_origin_redirect_policy())
+        .redirect(same_origin_redirect_policy());
+    if let Some(family) = provision_ip_family() {
+        builder = builder.dns_resolver(Arc::new(ProvisionIpFamilyResolver { family }));
+    }
+    builder
 }
 
 pub fn self_update_client_builder() -> reqwest::ClientBuilder {

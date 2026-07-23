@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import {
   Select,
@@ -25,11 +26,9 @@ import {
 } from "lucide-react";
 import { useCodexOauth } from "./hooks/useCodexOauth";
 import { copyText } from "@/lib/clipboard";
-import {
-  ENABLE_CODEX_BANKED_RESET,
-  ENABLE_CODEX_CLI_REMOTE_CALLBACK,
-} from "@/config/constants";
-import { isRemoteWebMode } from "@/lib/api/auth";
+import { ENABLE_CODEX_BANKED_RESET } from "@/config/constants";
+import { canUseOpenAiCliOAuth, isRemoteWebMode } from "@/lib/api/auth";
+import { useClientTunnelQuery } from "@/lib/query/share";
 import CodexBankedResetPanel from "./CodexBankedResetPanel";
 import { AccountSubscriptionExpiryControl } from "@/components/settings/AccountSubscriptionExpiryControl";
 
@@ -90,6 +89,9 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   const { t } = useTranslation();
   const [copied, setCopied] = React.useState(false);
   const [linkCopied, setLinkCopied] = React.useState(false);
+  const [callbackUrl, setCallbackUrl] = React.useState("");
+  const remoteWebMode = isRemoteWebMode();
+  const { data: clientTunnel } = useClientTunnelQuery(remoteWebMode);
 
   const {
     accounts,
@@ -102,6 +104,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     isRemovingAccount,
     isSettingDefaultAccount,
     isSettingWorkspace,
+    isSubmittingOauthCallback,
     defaultAccountId,
     cancelAuth,
     logout,
@@ -109,27 +112,29 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     setDefaultAccount,
     setWorkspace,
     addAccountWithMode,
+    submitOauthCallback,
   } = useCodexOauth();
-  const isRemoteClientWeb = isRemoteWebMode();
-  const isHttpsClientOrigin =
-    typeof window !== "undefined" && window.location.protocol === "https:";
-  const canUseRemoteCliCallback =
-    isRemoteClientWeb &&
-    ENABLE_CODEX_CLI_REMOTE_CALLBACK &&
-    isHttpsClientOrigin;
-  const codexCliCallbackUrl =
-    canUseRemoteCliCallback && typeof window !== "undefined"
-      ? `${window.location.origin}/web-api/oauth/openai-cli/callback`
-      : null;
-  const cliLoginTitle =
-    isRemoteClientWeb && !canUseRemoteCliCallback
-      ? t("codexOauth.cliUnavailableInRemoteWeb", {
-          defaultValue:
-            "远程 Web 模式下 localhost 回调不可达，请使用 Device Code",
-        })
-      : undefined;
-  const startCliLogin = () =>
-    addAccountWithMode?.("cli", { codexCallbackUrl: codexCliCallbackUrl });
+  const configuredClientUrl =
+    clientTunnel?.config?.expectedUrl ?? clientTunnel?.config?.tunnelUrl;
+  const canUseCliOauth = canUseOpenAiCliOAuth(configuredClientUrl);
+  const cliLoginTitle = !canUseCliOauth
+    ? t("codexOauth.cliUnavailableInRemoteWeb", {
+        defaultValue:
+          "CLI OAuth 仅可通过本机 loopback 或已配置的 HTTPS Client URL 使用，请改用 Device Code",
+      })
+    : undefined;
+  const startCliLogin = () => addAccountWithMode?.("cli_manual");
+  const isManualCliLogin = deviceCode?.flow === "cli_manual";
+
+  React.useEffect(() => {
+    setCallbackUrl("");
+  }, [deviceCode?.device_code]);
+
+  const finishCliLogin = async () => {
+    const value = callbackUrl.trim();
+    if (!value) return;
+    await submitOauthCallback(value);
+  };
   const activeAccount =
     accounts.find((account) => account.id === selectedAccountId) ??
     accounts.find((account) => account.id === defaultAccountId) ??
@@ -439,9 +444,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             onClick={startCliLogin}
             className="w-full"
             variant="outline"
-            disabled={
-              (isRemoteClientWeb && !canUseRemoteCliCallback) || isAddingAccount
-            }
+            disabled={!canUseCliOauth || isAddingAccount}
             title={cliLoginTitle}
           >
             <Sparkles className="mr-2 h-4 w-4" />
@@ -467,9 +470,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             type="button"
             onClick={startCliLogin}
             variant="outline"
-            disabled={
-              isAddingAccount || (isRemoteClientWeb && !canUseRemoteCliCallback)
-            }
+            disabled={isAddingAccount || !canUseCliOauth}
             title={cliLoginTitle}
           >
             <Plus className="mr-2 h-4 w-4" />
@@ -491,12 +492,45 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
       {isPolling && deviceCode && (
         <div className="space-y-3 p-4 rounded-lg border border-border bg-muted/50">
           <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
+            {!isManualCliLogin && <Loader2 className="h-4 w-4 animate-spin" />}
             {t(
-              "codexOauth.waitingForAuth",
-              "请手动打开下方授权链接并完成登录...",
+              isManualCliLogin
+                ? "codexOauth.waitingForManualCallback"
+                : "codexOauth.waitingForAuth",
+              isManualCliLogin
+                ? "完成授权后提交浏览器地址栏中的回调 URL"
+                : "请手动打开下方授权链接并完成登录...",
             )}
           </div>
+
+          {isManualCliLogin && (
+            <div className="space-y-2">
+              <Label htmlFor="codex-cli-callback-url">
+                {t("codexOauth.callbackUrl", "Callback URL")}
+              </Label>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <Input
+                  id="codex-cli-callback-url"
+                  type="url"
+                  value={callbackUrl}
+                  onChange={(event) => setCallbackUrl(event.target.value)}
+                  placeholder="http://localhost:1455/auth/callback?code=...&state=..."
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <Button
+                  type="button"
+                  onClick={() => void finishCliLogin()}
+                  disabled={!callbackUrl.trim() || isSubmittingOauthCallback}
+                >
+                  {isSubmittingOauthCallback && (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  {t("codexOauth.submitCallback", "提交")}
+                </Button>
+              </div>
+            </div>
+          )}
 
           {deviceCode.user_code ? (
             <div className="text-center">
@@ -589,7 +623,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             <Button
               type="button"
               onClick={() =>
-                isRemoteClientWeb && !canUseRemoteCliCallback
+                !canUseCliOauth
                   ? addAccountWithMode?.("device")
                   : startCliLogin()
               }

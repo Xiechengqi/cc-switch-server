@@ -22,14 +22,6 @@ use crate::domain::providers::model::ProviderType;
 
 const ACCOUNTS_FILE_NAME: &str = "accounts.json";
 const ENCRYPTED_PREFIX: &str = "ccenc:v1:";
-const SECRET_FIELDS: &[&str] = &[
-    "accessToken",
-    "refreshToken",
-    "idToken",
-    "apiKey",
-    "clientSecret",
-    "kiroApiKey",
-];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -543,6 +535,25 @@ impl AccountStore {
             .find(|item| item.provider_type == provider_type)
     }
 
+    pub fn codex_account_id_for_verified_subject(&self, subject: &str) -> Option<&str> {
+        let subject = subject.trim();
+        if subject.is_empty() {
+            return None;
+        }
+        self.accounts
+            .iter()
+            .find(|account| {
+                account.provider_type == ProviderType::CodexOAuth
+                    && account
+                        .profile
+                        .as_ref()
+                        .and_then(|profile| profile.pointer("/verifiedOpenAiClaims/subject"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|candidate| candidate.trim() == subject)
+            })
+            .map(|account| account.id.as_str())
+    }
+
     pub fn refresh_token_owner(
         &self,
         provider_type: ProviderType,
@@ -942,6 +953,14 @@ fn account_auth_identity_changed(
 }
 
 fn strongest_account_principal(account: &Account) -> Option<AccountPrincipal> {
+    if account.provider_type == ProviderType::CodexOAuth {
+        if let Some(value) = account_principal_value(account, &["/verifiedOpenAiClaims/subject"]) {
+            return Some(AccountPrincipal {
+                kind: "openai_subject",
+                value,
+            });
+        }
+    }
     if account.provider_type == ProviderType::ClaudeOAuth {
         const CLAUDE_ACCOUNT_UUID_POINTERS: &[&str] = &[
             "/accountUUID",
@@ -1088,12 +1107,25 @@ fn collect_nested_secrets(value: &Value, path: &str, secrets: &mut Vec<(String, 
             fields.sort_by(|left, right| left.0.cmp(right.0));
             for (field, value) in fields {
                 let next_path = format!("{path}/{field}");
-                if SECRET_FIELDS.contains(&field.as_str()) {
+                if account_extra_headers_field(field) {
+                    if let Some(headers) = value.as_object() {
+                        for (name, value) in headers {
+                            if let Some(secret) = value.as_str().and_then(|value| {
+                                let value = value.trim();
+                                (!value.is_empty()).then_some(value)
+                            }) {
+                                secrets.push((format!("{next_path}/{name}"), secret.to_string()));
+                            }
+                        }
+                    }
+                } else if account_secret_field(field) {
                     if let Some(secret) = value.as_str().and_then(|value| {
                         let value = value.trim();
                         (!value.is_empty()).then_some(value)
                     }) {
                         secrets.push((next_path, secret.to_string()));
+                    } else {
+                        collect_nested_secrets(value, &next_path, secrets);
                     }
                 } else {
                     collect_nested_secrets(value, &next_path, secrets);
@@ -1178,7 +1210,7 @@ pub fn trusted_codex_workspace(account: &Account) -> Option<TrustedCodexWorkspac
                 .any(|workspace| workspace.id == default_id)
                 .then_some(TrustedCodexWorkspace {
                     id: default_id,
-                    source: "verified_id_token".to_string(),
+                    source: "verified_openai_token".to_string(),
                 })
         })
         .or_else(|| {
@@ -1227,14 +1259,19 @@ pub fn codex_workspace_options(account: &Account) -> Vec<CodexWorkspace> {
         if let Some(id) = codex_account_id_from_value(value) {
             workspaces.entry(id.clone()).or_insert(id);
         }
-        for pointer in [
-            "/organizations",
-            "/openai_auth/organizations",
-            "/openaiAuth/organizations",
-            "/token/organizations",
-            "/token/openai_auth/organizations",
+        for organizations in [
+            value.get("organizations"),
+            value
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| auth.get("organizations")),
+            value
+                .get("openai_auth")
+                .and_then(|auth| auth.get("organizations")),
+            value
+                .get("openaiAuth")
+                .and_then(|auth| auth.get("organizations")),
         ] {
-            if let Some(items) = value.pointer(pointer).and_then(Value::as_array) {
+            if let Some(items) = organizations.and_then(Value::as_array) {
                 for item in items {
                     let Some(id) = [
                         "id",
@@ -1306,21 +1343,27 @@ fn preserve_codex_profile_selection(existing: Option<&Value>, incoming: &mut Val
 }
 
 fn codex_account_id_from_value(value: &Value) -> Option<String> {
-    [
-        "/chatgpt_account_id",
-        "/chatgptAccountId",
-        "/openai_auth/chatgpt_account_id",
-        "/openaiAuth/chatgptAccountId",
-        "/accountId",
-        "/account_id",
-        "/token/chatgpt_account_id",
-        "/token/openai_auth/chatgpt_account_id",
-    ]
-    .into_iter()
-    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-    .map(str::trim)
-    .filter(|value| !value.is_empty())
-    .map(str::to_string)
+    value
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("chatgpt_account_id").and_then(Value::as_str))
+        .or_else(|| value.get("chatgptAccountId").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("openai_auth")
+                .and_then(|auth| auth.get("chatgpt_account_id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("openaiAuth")
+                .and_then(|auth| auth.get("chatgptAccountId"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn refresh_token_fingerprint(refresh_token: &str) -> Option<[u8; 32]> {
@@ -1384,11 +1427,12 @@ fn account_store_has_encrypted_fields(value: &Value) -> bool {
 fn value_has_encrypted_secret(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(field, value)| {
-            (SECRET_FIELDS.contains(&field.as_str())
+            (account_secret_field(field)
                 && value
                     .as_str()
                     .is_some_and(|value| value.starts_with(ENCRYPTED_PREFIX)))
-                || (field == "extraHeaders" && extra_headers_have_encrypted_secret(value))
+                || (account_extra_headers_field(field)
+                    && extra_headers_have_encrypted_secret(value))
                 || value_has_encrypted_secret(value)
         }),
         Value::Array(values) => values.iter().any(value_has_encrypted_secret),
@@ -1434,13 +1478,15 @@ fn transform_secret_fields(
     match value {
         Value::Object(object) => {
             for (field, value) in object {
-                if field == "extraHeaders" {
+                if account_extra_headers_field(field) {
                     transform_extra_header_values(value, transform)?;
-                } else if SECRET_FIELDS.contains(&field.as_str()) {
+                } else if account_secret_field(field) {
                     if let Value::String(secret) = value {
                         if !secret.trim().is_empty() {
                             *secret = transform(secret)?;
                         }
+                    } else {
+                        transform_secret_fields(value, transform)?;
                     }
                 } else {
                     transform_secret_fields(value, transform)?;
@@ -1457,6 +1503,52 @@ fn transform_secret_fields(
     Ok(())
 }
 
+fn account_extra_headers_field(field: &str) -> bool {
+    compact_account_field(field) == "extraheaders"
+}
+
+fn account_secret_field(field: &str) -> bool {
+    let compact = compact_account_field(field);
+    matches!(
+        compact.as_str(),
+        "token"
+            | "key"
+            | "secret"
+            | "authorization"
+            | "proxyauthorization"
+            | "cookie"
+            | "password"
+            | "sessiontoken"
+            | "githubtoken"
+            | "copilottoken"
+            | "devicecode"
+            | "usercode"
+            | "codeverifier"
+            | "authorizationcode"
+            | "clientassertion"
+    ) || [
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "apikey",
+        "clientsecret",
+        "kiroapikey",
+        "secretaccesskey",
+        "privatekey",
+        "signingkey",
+    ]
+    .iter()
+    .any(|suffix| compact.ends_with(suffix))
+}
+
+fn compact_account_field(field: &str) -> String {
+    field
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
 fn transform_extra_header_values(
     value: &mut Value,
     transform: &impl Fn(&str) -> anyhow::Result<String>,
@@ -1469,6 +1561,8 @@ fn transform_extra_header_values(
             if !secret.trim().is_empty() {
                 *secret = transform(secret)?;
             }
+        } else {
+            transform_secret_fields(value, transform)?;
         }
     }
     Ok(())
@@ -1927,6 +2021,61 @@ mod tests {
         let reloaded: AccountStore = serde_json::from_value(persisted).unwrap();
         assert_eq!(reloaded.accounts[0].auth_identity_generation, 2);
         assert_eq!(reloaded.accounts[0].token_refresh_generation, 2);
+    }
+
+    #[test]
+    fn codex_identity_generation_prefers_verified_subject_over_workspace() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::CodexOAuth);
+        input.id = Some("codex-subject-account".to_string());
+        input.profile = Some(json!({
+            "accountId": "workspace-a",
+            "verifiedOpenAiClaims": {
+                "subject": "user-a",
+                "chatgpt_account_id": "workspace-a"
+            }
+        }));
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+        assert_eq!(
+            store.codex_account_id_for_verified_subject(" user-a "),
+            Some("codex-subject-account")
+        );
+        assert_eq!(store.codex_account_id_for_verified_subject("user-b"), None);
+
+        let moved_workspace = store
+            .mark_refresh_success(
+                "codex-subject-account",
+                AccountRefreshUpdate {
+                    profile: Some(json!({
+                        "accountId": "workspace-b",
+                        "verifiedOpenAiClaims": {
+                            "subject": "user-a",
+                            "chatgpt_account_id": "workspace-b"
+                        }
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(moved_workspace.auth_identity_generation, 1);
+
+        let replaced_subject = store
+            .mark_refresh_success(
+                "codex-subject-account",
+                AccountRefreshUpdate {
+                    profile: Some(json!({
+                        "accountId": "workspace-b",
+                        "verifiedOpenAiClaims": {
+                            "subject": "user-b",
+                            "chatgpt_account_id": "workspace-b"
+                        }
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(replaced_subject.auth_identity_generation, 2);
     }
 
     #[test]
@@ -2578,7 +2727,7 @@ mod tests {
             trusted_codex_workspace(&account),
             Some(TrustedCodexWorkspace {
                 id: "workspace-signed".to_string(),
-                source: "verified_id_token".to_string(),
+                source: "verified_openai_token".to_string(),
             })
         );
         clear_codex_workspace_provenance(&mut account.profile);
@@ -2858,7 +3007,15 @@ mod tests {
             profile: None,
             raw: Some(serde_json::json!({
                 "clientSecret": "kiro-client-secret",
-                "tokenResponse": {"refreshToken": "nested-refresh-secret"}
+                "tokenResponse": {
+                    "access_token": "nested-snake-access-secret",
+                    "refreshToken": "nested-refresh-secret",
+                    "id_token": "nested-snake-id-secret"
+                },
+                "githubToken": "github-token-secret",
+                "copilotToken": {"token": "copilot-token-secret"},
+                "entry": {"key": "grok-key-secret"},
+                "extra_headers": {"x-private": "extra-header-secret"}
             })),
             subscription_level: None,
             entitlement_status: None,
@@ -2877,6 +3034,12 @@ mod tests {
         assert!(!content.contains("refresh-secret"));
         assert!(!content.contains("kiro-client-secret"));
         assert!(!content.contains("nested-refresh-secret"));
+        assert!(!content.contains("nested-snake-access-secret"));
+        assert!(!content.contains("nested-snake-id-secret"));
+        assert!(!content.contains("github-token-secret"));
+        assert!(!content.contains("copilot-token-secret"));
+        assert!(!content.contains("grok-key-secret"));
+        assert!(!content.contains("extra-header-secret"));
         assert!(content.contains(ENCRYPTED_PREFIX));
         assert!(accounts_key_path(&config_dir).exists());
 
@@ -2903,6 +3066,30 @@ mod tests {
                 .and_then(|value| value.pointer("/tokenResponse/refreshToken"))
                 .and_then(Value::as_str),
             Some("nested-refresh-secret")
+        );
+        assert_eq!(
+            account
+                .raw
+                .as_ref()
+                .and_then(|value| value.pointer("/tokenResponse/access_token"))
+                .and_then(Value::as_str),
+            Some("nested-snake-access-secret")
+        );
+        assert_eq!(
+            account
+                .raw
+                .as_ref()
+                .and_then(|value| value.pointer("/copilotToken/token"))
+                .and_then(Value::as_str),
+            Some("copilot-token-secret")
+        );
+        assert_eq!(
+            account
+                .raw
+                .as_ref()
+                .and_then(|value| value.pointer("/extra_headers/x-private"))
+                .and_then(Value::as_str),
+            Some("extra-header-secret")
         );
 
         let _ = fs::remove_dir_all(&config_dir);

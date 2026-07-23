@@ -1193,7 +1193,22 @@ async fn web_invoke_dispatch(
                     .then(|| web_optional_string_any(&args, &["deviceCode", "device_code"]))
                     .flatten()
             });
-            let code = web_optional_string_any(&args, &["code"]);
+            let callback_input =
+                web_optional_string_any(&args, &["callbackUrl", "callback_url", "code"]);
+            let (session_id, state_arg, code) = if provider_type == ProviderType::CodexOAuth {
+                require_secure_manual_cli_origin(state, headers).await?;
+                let callback_input = callback_input.ok_or_else(|| {
+                    ApiError::bad_request("a complete OpenAI callback URL is required")
+                })?;
+                let (code, callback_state) = parse_openai_cli_callback_input(&callback_input)?;
+                let manual_session_id = session_id.or_else(|| {
+                    web_optional_string_any(&args, &["deviceCode", "device_code"])
+                        .and_then(|value| value.strip_prefix("manual:").map(str::to_string))
+                });
+                (manual_session_id, Some(callback_state), Some(code))
+            } else {
+                (session_id, state_arg, callback_input)
+            };
             let response = finish_account_login(
                 State(state.clone()),
                 headers.clone(),
@@ -1202,6 +1217,7 @@ async fn web_invoke_dispatch(
                     state: state_arg,
                     code,
                     execute_token_exchange: Some(true),
+                    expected_provider_type: Some(provider_type),
                 }),
             )
             .await?
@@ -1822,10 +1838,10 @@ async fn web_invoke_dispatch(
                     .ok_or_else(|| ApiError::not_found("codex oauth account not found"))?;
                 account.id.clone()
             };
-            let response = account_quota(
+            let _response = account_quota(
                 State(state.clone()),
                 headers.clone(),
-                Path(account_id),
+                Path(account_id.clone()),
                 Query(AccountQuotaQuery {
                     refresh: Some(true),
                     force: web_optional_bool(&args, &["force"]),
@@ -1833,13 +1849,13 @@ async fn web_invoke_dispatch(
             )
             .await?
             .0;
-            let account = response
-                .account
-                .as_ref()
+            let account = state
+                .find_account_by_id(&account_id)
+                .await
                 .ok_or_else(|| ApiError::not_found("codex oauth account not found"))?;
             Ok(
                 crate::clients::oauth::quota::codex_banked_reset_status_snapshot(
-                    account,
+                    &account,
                     crate::infra::time::now_ms() as i64,
                 ),
             )

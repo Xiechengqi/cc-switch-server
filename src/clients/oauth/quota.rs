@@ -1817,10 +1817,12 @@ async fn refresh_antigravity_quota(
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
     let metadata = antigravity_code_assist_metadata();
+    let user_agent = crate::provider_identity::antigravity_user_agent();
     let load_request = http
         .post(GEMINI_LOAD_CODE_ASSIST_URL)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/json")
+        .header(USER_AGENT, &user_agent)
         .header("client-metadata", metadata.to_string())
         .json(&json!({ "metadata": metadata }))
         .timeout(request_timeout);
@@ -1852,6 +1854,7 @@ async fn refresh_antigravity_quota(
         .post(GEMINI_RETRIEVE_USER_QUOTA_URL)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/json")
+        .header(USER_AGENT, user_agent)
         .json(&quota_body)
         .timeout(request_timeout);
     let body = request_json(account.provider_type, quota_request, now_ms).await?;
@@ -2945,8 +2948,13 @@ async fn recover_signed_codex_workspace(
             return None;
         }
     };
+    let identity = crate::domain::accounts::oauth::openai_identity_from_claims(&claims);
+    let canonical_claims = crate::domain::accounts::oauth::canonical_openai_claims(&identity);
     let mut profile = account.profile.clone();
-    crate::domain::accounts::store::set_verified_openai_claims(&mut profile, Some(claims));
+    crate::domain::accounts::store::set_verified_openai_claims(
+        &mut profile,
+        Some(canonical_claims),
+    );
     let mut candidate = account.clone();
     candidate.profile = profile.clone();
     let workspace = crate::domain::accounts::store::trusted_codex_workspace(&candidate)?;
@@ -3592,38 +3600,7 @@ fn chatgpt_plan_family(plan: &str) -> String {
 
 fn codex_account_id(account: &Account) -> Option<String> {
     crate::domain::accounts::store::effective_codex_workspace_id(account)
-        .or_else(|| {
-            account
-                .profile
-                .as_ref()
-                .and_then(|value| string_at(value, CODEX_ACCOUNT_ID_POINTERS))
-        })
-        .or_else(|| {
-            account
-                .raw
-                .as_ref()
-                .and_then(|value| string_at(value, CODEX_ACCOUNT_ID_POINTERS))
-        })
 }
-
-const CODEX_ACCOUNT_ID_POINTERS: &[&str] = &[
-    "/accountId",
-    "/account_id",
-    "/chatgptAccountId",
-    "/chatgpt_account_id",
-    "/openai_auth/chatgpt_account_id",
-    "/openaiAuth/chatgptAccountId",
-    "/verifiedOpenAiClaims/chatgpt_account_id",
-    "/verifiedOpenAiClaims/chatgptAccountId",
-    "/organizationId",
-    "/organization_id",
-    "/account/id",
-    "/account/account_id",
-    "/account/chatgpt_account_id",
-    "/account/organization_id",
-    "/raw/chatgpt_account_id",
-    "/raw/openai_auth/chatgpt_account_id",
-];
 
 #[derive(Debug, Deserialize)]
 struct CodexUsageResponse {
@@ -4008,24 +3985,7 @@ pub fn codex_banked_reset_status_snapshot(account: &Account, _now_ms: i64) -> Va
 }
 
 fn antigravity_code_assist_metadata() -> Value {
-    let platform = if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            2
-        } else {
-            1
-        }
-    } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "aarch64") {
-            4
-        } else {
-            3
-        }
-    } else if cfg!(target_os = "windows") {
-        5
-    } else {
-        0
-    };
-    json!({ "ideType": 9, "platform": platform, "pluginType": 2 })
+    crate::provider_identity::antigravity_client_metadata()
 }
 
 fn value_at(value: &Value, pointers: &[&str]) -> Option<Value> {
@@ -5043,7 +5003,9 @@ mod tests {
             ProviderType::CodexOAuth,
             json!({"codexBankedReset": {"availableCount": 99}}),
         );
-        account.profile = Some(json!({"accountId": "workspace-a"}));
+        account.profile = Some(json!({
+            "verifiedOpenAiClaims": {"chatgpt_account_id": "workspace-a"}
+        }));
         account.quota = Some(AccountQuota {
             success: true,
             credential_message: None,
@@ -5079,7 +5041,9 @@ mod tests {
             ProviderType::CodexOAuth,
             json!({"accountId": "workspace-b"}),
         );
-        account.profile = Some(json!({"accountId": "workspace-b"}));
+        account.profile = Some(json!({
+            "verifiedOpenAiClaims": {"chatgpt_account_id": "workspace-b"}
+        }));
         account.quota = Some(AccountQuota {
             success: true,
             extra_usage: Some(json!({

@@ -1413,7 +1413,10 @@
     "logoutAll": "Logout all accounts",
     "retry": "Retry",
     "copyCode": "Copy code",
-    "cliUnavailableInRemoteWeb": "The localhost callback is unavailable in the remote Web interface. Use Device Code instead.",
+    "cliUnavailableInRemoteWeb": "CLI OAuth is available only on loopback or the configured HTTPS Client URL. Use Device Code here.",
+    "waitingForManualCallback": "Complete authorization, then submit the callback URL from the browser address bar",
+    "callbackUrl": "Callback URL",
+    "submitCallback": "Submit",
     "imageGeneration": "Image generation",
     "imageGenerationDescription": "Enable OpenAI-compatible /v1/images/generations through the ChatGPT Codex backend.",
     "imageToolStripPolicy": "Image tool policy",
@@ -3284,7 +3287,8 @@
       "invalidHeader": "Invalid Header name: {{name}}",
       "managedHeader": "This Header is managed by the driver: {{name}}",
       "duplicateHeader": "Duplicate Header name: {{name}}",
-      "headerValueRequired": "Enter a value for Header {{name}}"
+      "headerValueRequired": "Enter a value for Header {{name}}",
+      "invalidUserAgent": "User-Agent must not contain line breaks or other control characters"
     },
     "credentials": {
       "title": "Authentication credential",

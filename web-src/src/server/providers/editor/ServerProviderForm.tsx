@@ -67,6 +67,7 @@ import { vscodeApi } from "@/lib/api/vscode";
 import { copyText } from "@/lib/clipboard";
 import { getIconMetadata } from "@/icons/extracted/metadata";
 import { stableStringify } from "@/lib/stableStringify";
+import { isValidUserAgentHeader } from "@/lib/userAgent";
 import {
   customPolicyForProfile,
   driverForProfile,
@@ -223,6 +224,7 @@ const HEADER_DENYLIST = new Set([
   "x-api-key",
   "api-key",
   "x-goog-api-key",
+  "user-agent",
 ]);
 
 function clone<T>(value: T): T {
@@ -455,7 +457,10 @@ function buildEditorState(
     customBinding,
     credentials: buildCredentialEdits(profile, resource, isEditMode),
     extraHeaders: buildExtraHeaderEdits(draft.settingsConfig, resource),
-    customUserAgent: draft.meta.customUserAgent ?? "",
+    customUserAgent:
+      profile.formComposition === "custom"
+        ? (draft.meta.customUserAgent ?? "")
+        : "",
     codexFastMode: draft.meta.codexFastMode ?? false,
     codexImageGenerationEnabled:
       draft.meta.codexImageGenerationEnabled ?? false,
@@ -487,7 +492,11 @@ function providerMetaForSubmit(
   const meta = clone(state.draft.meta);
   if (profile.formComposition === "legacy") return meta;
   meta.providerType = profile.compatibilityProviderType;
-  meta.customUserAgent = state.customUserAgent.trim() || undefined;
+  if (profile.formComposition === "custom") {
+    meta.customUserAgent = state.customUserAgent.trim() || undefined;
+  } else {
+    delete meta.customUserAgent;
+  }
 
   if (profile.credentialPolicy.mode === "managed_account") {
     meta.authBinding = {
@@ -650,6 +659,9 @@ function validateState(
   if (profile.formComposition === "custom") {
     if (!state.customBinding) {
       return t("serverProviderForm.validation.customBindingMissing");
+    }
+    if (!isValidUserAgentHeader(state.customUserAgent)) {
+      return t("serverProviderForm.validation.invalidUserAgent");
     }
     const customPolicy = customPolicyForProfile(profile);
     if (
@@ -2262,12 +2274,13 @@ export function ServerProviderForm({
         </Section>
       ) : null}
 
-      {profile.formComposition !== "legacy" ? (
+      {profile.formComposition === "custom" ? (
         <Section title={t("serverProviderForm.usage.title")}>
           <div className="space-y-2">
             <Label>{t("serverProviderForm.usage.customUserAgent")}</Label>
             <Input
               value={state.customUserAgent}
+              placeholder="custom-client/1.0"
               onChange={(event) =>
                 setState((current) => ({
                   ...current,
@@ -2277,14 +2290,14 @@ export function ServerProviderForm({
             />
           </div>
         </Section>
-      ) : (
+      ) : profile.formComposition === "legacy" ? (
         <Section title={t("serverProviderForm.legacy.title")}>
           <div className="flex items-start gap-2 text-sm text-muted-foreground">
             <KeyRound className="mt-0.5 h-4 w-4 shrink-0" />
             {t("serverProviderForm.legacy.hint")}
           </div>
         </Section>
-      )}
+      ) : null}
 
       {providerId ? (
         <ProviderShareSection

@@ -23,7 +23,7 @@ use crate::domain::providers::model::ProviderType;
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
 use crate::proxy::adapters::AdapterRequest;
-use crate::state::{ServerState, ShareInFlightGuard};
+use crate::state::{AccountInFlightGuard, ServerState, ShareInFlightGuard};
 
 use super::super::forwarder::{record_provider_outcome, record_share_invocation_result};
 use super::super::router::ProxyRoute;
@@ -69,6 +69,7 @@ pub struct AgentServiceForwardOptions {
     pub stored: StoredProvider,
     pub adapter_request: AdapterRequest,
     pub request_context: UsageLogContext,
+    pub account_in_flight_guard: Option<AccountInFlightGuard>,
     pub share_invocation_guard: Option<ShareInFlightGuard>,
 }
 
@@ -113,6 +114,7 @@ pub async fn forward_agentservice(
         stored,
         adapter_request,
         request_context,
+        account_in_flight_guard,
         share_invocation_guard,
     } = options;
     let started = Instant::now();
@@ -181,6 +183,7 @@ pub async fn forward_agentservice(
             request_context,
             started,
             model,
+            account_in_flight_guard,
             share_invocation_guard,
         )
         .await);
@@ -260,6 +263,7 @@ async fn stream_response(
     request_context: UsageLogContext,
     started: Instant,
     model: UsageModelMetadata,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Response {
     let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens);
@@ -298,6 +302,7 @@ async fn stream_response(
     };
     let stream = stream! {
         let interrupted_guard = interrupted_guard;
+        let _account_in_flight_guard = account_in_flight_guard;
         let _share_invocation_guard = share_invocation_guard;
         let mut filter = ComposerMarkerFilter::default();
         let mut exec_dedup = ExecDedup::default();
@@ -1129,7 +1134,7 @@ fn is_cursor_account_provider(provider_type: ProviderType) -> bool {
     )
 }
 
-async fn cursor_bound_account_id(state: &ServerState, stored: &StoredProvider) -> Option<String> {
+async fn cursor_bound_account_id(_state: &ServerState, stored: &StoredProvider) -> Option<String> {
     let explicit = stored
         .provider
         .meta
@@ -1137,13 +1142,7 @@ async fn cursor_bound_account_id(state: &ServerState, stored: &StoredProvider) -
         .and_then(|meta| meta.auth_binding.as_ref())
         .and_then(|binding| binding.account_id.as_deref())
         .map(str::to_string);
-    if explicit.is_some() {
-        return explicit;
-    }
-    let accounts = state.accounts.read().await;
-    accounts
-        .find_for_provider(stored.provider_type, None)
-        .map(|account| account.id.clone())
+    explicit
 }
 
 fn cursor_rate_limit_until_from_body(body: &[u8], now_ms: i64) -> Option<i64> {
@@ -1469,6 +1468,111 @@ impl Drop for CursorStreamInterruptGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+
+    fn cursor_stream_test_state(name: &str) -> ServerState {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(
+                    std::env::temp_dir().join(format!("cc-switch-cursor-{name}-{nanos}")),
+                ),
+                web_dist_dir: None,
+                log_level: "warn".to_string(),
+                command: None,
+            },
+            std::sync::Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cursor_stream_holds_account_lease_until_response_body_is_dropped() {
+        let state = cursor_stream_test_state("stream-account-lease");
+        let account_id = "cursor-stream-account";
+        let account_in_flight_guard = state
+            .account_in_flight
+            .try_acquire(ProviderType::CursorOAuth, account_id, 1)
+            .unwrap();
+        let stored = StoredProvider {
+            app: crate::domain::providers::model::AppKind::Claude,
+            provider: crate::domain::providers::model::Provider {
+                id: "cursor-stream-provider".to_string(),
+                name: "Cursor stream provider".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorOAuth,
+            provider_type_id: ProviderType::CursorOAuth.as_str().to_string(),
+            resource: Default::default(),
+        };
+        let session_entry = Arc::new(tokio::sync::Mutex::new(CursorSession {
+            conversation_id: "cursor-stream-session".to_string(),
+            stream: None,
+            declared_tool_names: Vec::new(),
+            declared_tools: Vec::new(),
+            working_directory: "/workspace".to_string(),
+            pending_tool_calls: HashMap::new(),
+            blob_store: HashMap::new(),
+            state: SessionState::Running,
+            last_activity: Instant::now(),
+        }));
+        let response = stream_response(
+            state.clone(),
+            stored,
+            session_entry,
+            "cursor-stream-session".to_string(),
+            super::super::protocol::CursorResponseFormat::AnthropicMessages,
+            "claude-sonnet-4-6".to_string(),
+            1,
+            UsageLogContext::default(),
+            Instant::now(),
+            UsageModelMetadata::default(),
+            Some(account_in_flight_guard),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::CursorOAuth, account_id),
+            1
+        );
+        let mut body = response.into_body().into_data_stream();
+        let first_chunk = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .unwrap()
+            .expect("Cursor stream should emit its initial SSE frame")
+            .unwrap();
+        assert!(!first_chunk.is_empty());
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::CursorOAuth, account_id),
+            1
+        );
+
+        drop(body);
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::CursorOAuth, account_id),
+            0
+        );
+    }
 
     #[test]
     fn cursor_error_message_extracts_known_json_shapes() {

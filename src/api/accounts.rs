@@ -8,10 +8,14 @@ pub(in crate::api) async fn list_accounts(
     headers: HeaderMap,
 ) -> Result<Json<ListAccountsResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    Ok(Json(ListAccountsResponse {
-        ok: true,
-        accounts: state.accounts_snapshot().await.accounts,
-    }))
+    let accounts = state
+        .accounts_snapshot()
+        .await
+        .accounts
+        .iter()
+        .map(AccountPublicView::from)
+        .collect();
+    Ok(Json(ListAccountsResponse { ok: true, accounts }))
 }
 
 pub(in crate::api) async fn upsert_account(
@@ -20,7 +24,7 @@ pub(in crate::api) async fn upsert_account(
     Json(mut input): Json<UpsertAccountInput>,
 ) -> Result<Json<UpsertAccountResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    verify_and_mark_codex_account_input(&state, &mut input).await?;
+    verify_and_mark_codex_account_input(&state, &mut input, false).await?;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             let manager = manager_for(input.provider_type);
@@ -30,7 +34,10 @@ pub(in crate::api) async fn upsert_account(
         })
         .await
         .map_err(ApiError::internal)??;
-    Ok(Json(UpsertAccountResponse { ok: true, account }))
+    Ok(Json(UpsertAccountResponse {
+        ok: true,
+        account: account.into(),
+    }))
 }
 
 pub(in crate::api) async fn account_capabilities() -> Json<AccountCapabilitiesResponse> {
@@ -191,8 +198,12 @@ pub(in crate::api) async fn import_cursor_local_auth(
     let (profile_raw, profile_error) = match profile_result {
         Ok(profile) => (profile, None),
         Err(error) => {
-            tracing::debug!(error = %error.message, "cursor local import profile enrichment failed");
-            (None, Some(error.message))
+            let diagnostic = crate::logging::redact_sensitive_text_with_values(
+                &error.message,
+                [import.access_token.as_str()],
+            );
+            tracing::debug!(error = %diagnostic, "cursor local import profile enrichment failed");
+            (None, Some(diagnostic))
         }
     };
     let upsert = upsert_input_from_cursor_local_import(import, profile_raw, now_ms() as i64);
@@ -213,45 +224,35 @@ pub(in crate::api) async fn import_cursor_local_auth(
     }))
 }
 
-pub(in crate::api) async fn export_claude_credentials(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<ExportClaudeCredentialsResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let account = state
-        .find_account_by_id(&id)
-        .await
-        .ok_or_else(|| ApiError::not_found(format!("account not found: {id}")))?;
-    if account.provider_type != ProviderType::ClaudeOAuth {
-        return Err(ApiError::bad_request(format!(
-            "account {} is {}, expected claude_oauth",
-            account.id,
-            account.provider_type.as_str()
-        )));
-    }
-    Ok(Json(ExportClaudeCredentialsResponse {
-        ok: true,
-        credentials: claude_credentials_from_account(&account),
-    }))
-}
-
 pub(in crate::api) async fn start_account_login(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(input): Json<StartAccountLoginRequest>,
 ) -> Result<Json<StartAccountLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let redirect_uri = input.redirect_uri.or_else(|| {
-        if input.provider_type == ProviderType::GrokOAuth {
-            Some(crate::domain::accounts::oauth::XAI_LOOPBACK_REDIRECT_URI.to_string())
-        } else {
-            Some(default_account_login_redirect_uri(&state))
-        }
-    });
+    let principal = require_web_admin_session(&state, &headers).await?;
+    if input.provider_type == ProviderType::CodexOAuth {
+        crate::api::invoke::handlers::require_secure_manual_cli_origin(&state, &headers).await?;
+    }
+    let redirect_uri = if input.provider_type == ProviderType::CodexOAuth {
+        Some(crate::domain::accounts::oauth::CODEX_CLI_REDIRECT_URI.to_string())
+    } else {
+        input.redirect_uri.or_else(|| {
+            if input.provider_type == ProviderType::GrokOAuth {
+                Some(crate::domain::accounts::oauth::XAI_LOOPBACK_REDIRECT_URI.to_string())
+            } else {
+                Some(default_account_login_redirect_uri(&state))
+            }
+        })
+    };
+    let principal_id = principal.oauth_binding_id();
     let login = state
         .mutate_oauth_logins(|store| {
-            store.start(input.provider_type, redirect_uri, now_ms() as i64)
+            store.start_for_principal(
+                input.provider_type,
+                redirect_uri,
+                principal_id,
+                now_ms() as i64,
+            )
         })
         .await
         .map_err(oauth_login_api_error)?;
@@ -263,14 +264,23 @@ pub(in crate::api) async fn cancel_account_login(
     headers: HeaderMap,
     Json(input): Json<CancelAccountLoginRequest>,
 ) -> Result<Json<CancelAccountLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let principal_id = principal.oauth_binding_id();
     let login = state
-        .mutate_oauth_logins(|store| {
-            store.cancel(
+        .mutate_oauth_logins(|store| match input.expected_provider_type {
+            Some(expected_provider_type) => store.cancel_for_principal_with_expected_provider(
                 input.session_id.as_deref(),
                 input.state.as_deref(),
+                &principal_id,
+                expected_provider_type,
                 now_ms() as i64,
-            )
+            ),
+            None => store.cancel_for_principal(
+                input.session_id.as_deref(),
+                input.state.as_deref(),
+                &principal_id,
+                now_ms() as i64,
+            ),
         })
         .await
         .map_err(oauth_login_api_error)?;
@@ -282,28 +292,25 @@ pub(in crate::api) async fn account_login_callback(
     Query(query): Query<AccountLoginCallbackQuery>,
 ) -> Result<Json<FinishAccountLoginResponse>, ApiError> {
     let AccountLoginCallbackQuery {
-        session_id,
         state: oauth_state,
         code,
         error,
         error_description,
     } = query;
     if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
-        let message = error_description
-            .filter(|value| !value.trim().is_empty())
-            .map(|description| format!("{error}: {description}"))
-            .unwrap_or(error);
+        let message = oauth_callback_public_error(error, error_description);
         return Err(ApiError::bad_request(message));
     }
     let finish = state
         .mutate_oauth_logins(|store| {
-            store.finish(
-                session_id.as_deref(),
-                oauth_state.as_deref(),
-                code.as_deref(),
-                false,
-                now_ms() as i64,
-            )
+            let oauth_state = oauth_state
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    OAuthLoginError::RequestShape("oauth callback state is required".to_string())
+                })?;
+            store.finish_from_oauth_callback(oauth_state, code.as_deref(), false, now_ms() as i64)
         })
         .await
         .map_err(oauth_login_api_error)?;
@@ -339,40 +346,40 @@ async fn cli_oauth_callback(
         code,
         error,
         error_description,
-        ..
     } = query;
     if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
-        let message = error_description
-            .filter(|value| !value.trim().is_empty())
-            .map(|description| format!("{error}: {description}"))
-            .unwrap_or(error);
+        let message = oauth_callback_public_error(error, error_description);
         return Ok(Html(oauth_callback_html(label, false, &message)));
     }
-    let mut finish = state
+    let finish_result = state
         .mutate_oauth_logins(|store| {
-            store.finish(
-                None,
-                oauth_state.as_deref(),
+            let oauth_state = oauth_state
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    OAuthLoginError::RequestShape("oauth callback state is required".to_string())
+                })?;
+            store.finish_from_oauth_callback_with_expected_provider(
+                oauth_state,
                 code.as_deref(),
                 true,
+                expected_provider_type,
                 now_ms() as i64,
             )
         })
-        .await
-        .map_err(oauth_login_api_error)?;
-    if finish.provider_type != expected_provider_type {
-        mark_account_login_exchange_failed(&state, &finish.session_id).await;
-        return Ok(Html(oauth_callback_html(
-            label,
-            false,
-            &format!(
-                "{} OAuth callback received {}, expected {}",
+        .await;
+    let mut finish = match finish_result {
+        Ok(finish) => finish,
+        Err(OAuthLoginError::ProviderMismatch) => {
+            return Ok(Html(oauth_callback_html(
                 label,
-                finish.provider_type.as_str(),
-                expected_provider_type.as_str()
-            ),
-        )));
-    }
+                false,
+                &format!("{label} OAuth callback does not match this login session"),
+            )));
+        }
+        Err(error) => return Err(oauth_login_api_error(error)),
+    };
     if finish.status == OAuthLoginStatus::TokenExchanged {
         let account = finish
             .account_id
@@ -390,6 +397,17 @@ async fn cli_oauth_callback(
         true,
         &format!("{label} OAuth login completed for {}", account.id),
     )))
+}
+
+fn oauth_callback_public_error(error: String, description: Option<String>) -> String {
+    let message = description
+        .filter(|value| !value.trim().is_empty())
+        .map(|description| format!("{error}: {description}"))
+        .unwrap_or(error);
+    crate::logging::redact_sensitive_text(&message)
+        .chars()
+        .take(800)
+        .collect()
 }
 
 fn oauth_callback_html(label: &str, success: bool, message: &str) -> String {
@@ -521,22 +539,6 @@ fn upsert_input_from_claude_credentials(
         expires_at,
         rate_limited_until: None,
         last_refresh_error: None,
-    })
-}
-
-fn claude_credentials_from_account(account: &Account) -> Value {
-    json!({
-        "claudeAiOauth": {
-            "accountId": account.id,
-            "email": account.email,
-            "accessToken": account.access_token,
-            "refreshToken": account.refresh_token,
-            "tokenType": account.token_type.as_deref().unwrap_or("Bearer"),
-            "expiresAt": account.expires_at,
-            "scopes": account.scopes,
-        },
-        "source": "cc-switch-server",
-        "exportedAtMs": now_ms(),
     })
 }
 
@@ -742,21 +744,96 @@ fn stable_grok_import_account_id(
     format!("grok-oauth-{suffix}")
 }
 
+fn device_flow_expires_at(now_ms: i64, expires_in_secs: u64) -> i64 {
+    let ttl_ms = i64::try_from(expires_in_secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000);
+    now_ms.saturating_add(ttl_ms)
+}
+
+async fn require_device_flow_owner(
+    state: &ServerState,
+    provider_type: ProviderType,
+    device_code: &str,
+    principal_id: &str,
+    now_ms: i64,
+    provider_label: &str,
+) -> Result<(), ApiError> {
+    if state
+        .device_flow_is_owned_by(provider_type, device_code, principal_id, now_ms)
+        .await
+    {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized(format!(
+            "{provider_label} device flow is expired or unknown"
+        )))
+    }
+}
+
+fn verified_codex_subject(input: &UpsertAccountInput) -> Option<String> {
+    input
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.pointer("/verifiedOpenAiClaims/subject"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+        .map(str::to_string)
+}
+
+fn reuse_existing_codex_subject_account(
+    store: &crate::domain::accounts::store::AccountStore,
+    input: &mut UpsertAccountInput,
+    subject: &str,
+) {
+    if let Some(account_id) = store.codex_account_id_for_verified_subject(subject) {
+        input.id = Some(account_id.to_string());
+    }
+}
+
 pub(in crate::api) async fn finish_account_login(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(input): Json<FinishAccountLoginRequest>,
 ) -> Result<Json<FinishAccountLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let mut finish = state
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let principal_id = principal.oauth_binding_id();
+    let provider_type = state
         .mutate_oauth_logins(|store| {
-            store.finish(
+            store.provider_type_for_principal(
+                input.session_id.as_deref(),
+                input.state.as_deref(),
+                &principal_id,
+                now_ms() as i64,
+            )
+        })
+        .await
+        .map_err(oauth_login_api_error)?;
+    if provider_type == ProviderType::CodexOAuth {
+        crate::api::invoke::handlers::require_secure_manual_cli_origin(&state, &headers).await?;
+    }
+    let mut finish = state
+        .mutate_oauth_logins(|store| match input.expected_provider_type {
+            Some(expected_provider_type) => store.finish_for_principal_with_expected_provider(
+                OAuthLoginFinishAttempt {
+                    session_id: input.session_id.as_deref(),
+                    state: input.state.as_deref(),
+                    code: input.code.as_deref(),
+                    execute_token_exchange: input.execute_token_exchange.unwrap_or(false),
+                },
+                &principal_id,
+                expected_provider_type,
+                now_ms() as i64,
+            ),
+            None => store.finish_for_principal(
                 input.session_id.as_deref(),
                 input.state.as_deref(),
                 input.code.as_deref(),
                 input.execute_token_exchange.unwrap_or(false),
+                &principal_id,
                 now_ms() as i64,
-            )
+            ),
         })
         .await
         .map_err(oauth_login_api_error)?;
@@ -784,12 +861,61 @@ pub(in crate::api) async fn finish_account_login(
     }))
 }
 
+pub(in crate::api) fn parse_openai_cli_callback_input(
+    input: &str,
+) -> Result<(String, String), ApiError> {
+    let callback = url::Url::parse(input.trim())
+        .map_err(|_| ApiError::bad_request("a complete OpenAI callback URL is required"))?;
+    if callback.scheme() != "http"
+        || callback.host_str() != Some("localhost")
+        || callback.port_or_known_default() != Some(1455)
+        || callback.path() != "/auth/callback"
+        || !callback.username().is_empty()
+        || callback.password().is_some()
+        || callback.fragment().is_some()
+    {
+        return Err(ApiError::bad_request(
+            "OpenAI callback URL must match http://localhost:1455/auth/callback",
+        ));
+    }
+    let mut code = None;
+    let mut state = None;
+    let mut oauth_error = None;
+    for (key, value) in callback.query_pairs() {
+        match key.as_ref() {
+            "code" if code.is_none() => code = Some(value.into_owned()),
+            "state" if state.is_none() => state = Some(value.into_owned()),
+            "error" if oauth_error.is_none() => oauth_error = Some(value.into_owned()),
+            "code" | "state" => {
+                return Err(ApiError::bad_request(
+                    "OpenAI callback URL contains duplicate OAuth parameters",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if oauth_error.is_some() {
+        return Err(ApiError::bad_request(
+            "OpenAI authorization returned an OAuth error",
+        ));
+    }
+    let code = code
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("OpenAI callback URL is missing code"))?;
+    let state = state
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("OpenAI callback URL is missing state"))?;
+    Ok((code, state))
+}
+
 pub(in crate::api) async fn start_copilot_device_login(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(input): Json<StartCopilotDeviceLoginRequest>,
 ) -> Result<Json<StartCopilotDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
     let http_client = state.http_client().await;
     let device = crate::clients::oauth::copilot_device::start_device_flow(
         &http_client,
@@ -797,6 +923,16 @@ pub(in crate::api) async fn start_copilot_device_login(
     )
     .await
     .map_err(map_copilot_device_error)?;
+    let now = now_ms() as i64;
+    state
+        .bind_device_flow_principal(
+            ProviderType::GitHubCopilot,
+            device.device_code.clone(),
+            principal.oauth_binding_id(),
+            device_flow_expires_at(now, device.expires_in),
+            now,
+        )
+        .await;
     Ok(Json(StartCopilotDeviceLoginResponse { ok: true, device }))
 }
 
@@ -805,16 +941,45 @@ pub(in crate::api) async fn poll_copilot_device_login(
     headers: HeaderMap,
     Json(input): Json<PollCopilotDeviceLoginRequest>,
 ) -> Result<Json<PollCopilotDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let now = now_ms() as i64;
+    let principal_id = principal.oauth_binding_id();
+    require_device_flow_owner(
+        &state,
+        ProviderType::GitHubCopilot,
+        &input.device_code,
+        &principal_id,
+        now,
+        "copilot",
+    )
+    .await?;
     let http_client = state.http_client().await;
-    let result = crate::clients::oauth::copilot_device::poll_device_flow(
+    let result = match crate::clients::oauth::copilot_device::poll_device_flow(
         &http_client,
         &input.device_code,
         input.github_domain.as_deref(),
-        now_ms() as i64,
+        now,
     )
     .await
-    .map_err(map_copilot_device_error)?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            if matches!(
+                error.status,
+                StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
+            ) {
+                state
+                    .remove_device_flow_principal(
+                        ProviderType::GitHubCopilot,
+                        &input.device_code,
+                        &principal_id,
+                        now,
+                    )
+                    .await;
+            }
+            return Err(map_copilot_device_error(error));
+        }
+    };
     if result.pending {
         return Ok(Json(PollCopilotDeviceLoginResponse {
             ok: true,
@@ -824,6 +989,14 @@ pub(in crate::api) async fn poll_copilot_device_login(
             account: None,
         }));
     }
+    state
+        .remove_device_flow_principal(
+            ProviderType::GitHubCopilot,
+            &input.device_code,
+            &principal_id,
+            now,
+        )
+        .await;
     let account_input = result
         .account_input
         .ok_or_else(|| ApiError::bad_gateway("copilot device flow completed without account"))?;
@@ -850,7 +1023,8 @@ pub(in crate::api) async fn start_kiro_device_login(
     headers: HeaderMap,
     Json(input): Json<StartKiroDeviceLoginRequest>,
 ) -> Result<Json<StartKiroDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let principal_id = principal.oauth_binding_id();
     let http_client = state.http_client().await;
     let now = now_ms() as i64;
     if let Some(login_provider) = input
@@ -870,6 +1044,15 @@ pub(in crate::api) async fn start_kiro_device_login(
         state
             .insert_kiro_social_device_flow(device.device_code.clone(), flow, now)
             .await;
+        state
+            .bind_device_flow_principal(
+                ProviderType::KiroOAuth,
+                device.device_code.clone(),
+                principal_id,
+                device_flow_expires_at(now, device.expires_in),
+                now,
+            )
+            .await;
         return Ok(Json(StartKiroDeviceLoginResponse { ok: true, device }));
     }
     let (device, flow) = crate::clients::oauth::kiro_device::start_device_flow(
@@ -884,6 +1067,15 @@ pub(in crate::api) async fn start_kiro_device_login(
     state
         .insert_kiro_device_flow(device.device_code.clone(), flow, now)
         .await;
+    state
+        .bind_device_flow_principal(
+            ProviderType::KiroOAuth,
+            device.device_code.clone(),
+            principal_id,
+            device_flow_expires_at(now, device.expires_in),
+            now,
+        )
+        .await;
     Ok(Json(StartKiroDeviceLoginResponse { ok: true, device }))
 }
 
@@ -892,8 +1084,18 @@ pub(in crate::api) async fn poll_kiro_device_login(
     headers: HeaderMap,
     Json(input): Json<PollKiroDeviceLoginRequest>,
 ) -> Result<Json<PollKiroDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
     let now = now_ms() as i64;
+    let principal_id = principal.oauth_binding_id();
+    require_device_flow_owner(
+        &state,
+        ProviderType::KiroOAuth,
+        &input.device_code,
+        &principal_id,
+        now,
+        "kiro",
+    )
+    .await?;
     let http_client = state.http_client().await;
     let (result, social) =
         if let Some(flow) = state.get_kiro_device_flow(&input.device_code, now).await {
@@ -933,6 +1135,14 @@ pub(in crate::api) async fn poll_kiro_device_login(
                 error.status,
                 StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
             ) {
+                state
+                    .remove_device_flow_principal(
+                        ProviderType::KiroOAuth,
+                        &input.device_code,
+                        &principal_id,
+                        now,
+                    )
+                    .await;
                 if social {
                     state
                         .remove_kiro_social_device_flow(&input.device_code)
@@ -960,6 +1170,14 @@ pub(in crate::api) async fn poll_kiro_device_login(
     } else {
         state.remove_kiro_device_flow(&input.device_code).await;
     }
+    state
+        .remove_device_flow_principal(
+            ProviderType::KiroOAuth,
+            &input.device_code,
+            &principal_id,
+            now,
+        )
+        .await;
     let account_input = result
         .account_input
         .ok_or_else(|| ApiError::bad_gateway("kiro device flow completed without account"))?;
@@ -986,7 +1204,7 @@ pub(in crate::api) async fn start_codex_device_login(
     headers: HeaderMap,
     Json(_input): Json<StartCodexDeviceLoginRequest>,
 ) -> Result<Json<StartCodexDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
     let http_client = state.http_client().await;
     let now = now_ms() as i64;
     let (device, flow) = crate::clients::oauth::codex_device::start_device_flow(&http_client, now)
@@ -994,6 +1212,15 @@ pub(in crate::api) async fn start_codex_device_login(
         .map_err(map_codex_device_error)?;
     state
         .insert_codex_device_flow(device.device_code.clone(), flow, now)
+        .await;
+    state
+        .bind_device_flow_principal(
+            ProviderType::CodexOAuth,
+            device.device_code.clone(),
+            principal.oauth_binding_id(),
+            device_flow_expires_at(now, device.expires_in),
+            now,
+        )
         .await;
     Ok(Json(StartCodexDeviceLoginResponse { ok: true, device }))
 }
@@ -1003,8 +1230,18 @@ pub(in crate::api) async fn poll_codex_device_login(
     headers: HeaderMap,
     Json(input): Json<PollCodexDeviceLoginRequest>,
 ) -> Result<Json<PollCodexDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
     let now = now_ms() as i64;
+    let principal_id = principal.oauth_binding_id();
+    require_device_flow_owner(
+        &state,
+        ProviderType::CodexOAuth,
+        &input.device_code,
+        &principal_id,
+        now,
+        "codex",
+    )
+    .await?;
     let lease = state
         .begin_codex_device_poll(&input.device_code, now)
         .await
@@ -1022,11 +1259,21 @@ pub(in crate::api) async fn poll_codex_device_login(
             {
                 Ok(mut result) => {
                     if let Some(account_input) = result.account_input.as_mut() {
-                        if let Err(error) =
-                            verify_and_mark_codex_account_input(&state, account_input).await
+                        match verify_and_mark_codex_account_input(&state, account_input, true).await
                         {
-                            state.fail_codex_device_poll(&input.device_code, true).await;
-                            return Err(error);
+                            Ok(()) => {}
+                            Err(error) => {
+                                state.fail_codex_device_poll(&input.device_code, true).await;
+                                state
+                                    .remove_device_flow_principal(
+                                        ProviderType::CodexOAuth,
+                                        &input.device_code,
+                                        &principal_id,
+                                        now,
+                                    )
+                                    .await;
+                                return Err(error);
+                            }
                         }
                     }
                     if !state
@@ -1047,6 +1294,16 @@ pub(in crate::api) async fn poll_codex_device_login(
                     state
                         .fail_codex_device_poll(&input.device_code, terminal)
                         .await;
+                    if terminal {
+                        state
+                            .remove_device_flow_principal(
+                                ProviderType::CodexOAuth,
+                                &input.device_code,
+                                &principal_id,
+                                now,
+                            )
+                            .await;
+                    }
                     return Err(map_codex_device_error(error));
                 }
             }
@@ -1071,13 +1328,17 @@ pub(in crate::api) async fn poll_codex_device_login(
             account: None,
         }));
     }
-    let account_input = result
+    let mut account_input = result
         .account_input
         .clone()
         .ok_or_else(|| ApiError::bad_gateway("codex device flow completed without account"))?;
+    let verified_subject = verified_codex_subject(&account_input);
     let provider_type = account_input.provider_type;
     let account = state
         .try_mutate_accounts_immediate(|store| {
+            if let Some(subject) = verified_subject.as_deref() {
+                reuse_existing_codex_subject_account(store, &mut account_input, subject);
+            }
             manager_for(provider_type)
                 .finish_login(store, account_input)
                 .map_err(ApiError::bad_request)
@@ -1098,8 +1359,21 @@ pub(in crate::api) async fn cancel_codex_device_login(
     headers: HeaderMap,
     Json(input): Json<CancelCodexDeviceLoginRequest>,
 ) -> Result<Json<CancelCodexDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let cancelled = state.cancel_codex_device_flow(&input.device_code).await;
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let now = now_ms() as i64;
+    let owned = state
+        .remove_device_flow_principal(
+            ProviderType::CodexOAuth,
+            &input.device_code,
+            &principal.oauth_binding_id(),
+            now,
+        )
+        .await;
+    let cancelled = if owned {
+        state.cancel_codex_device_flow(&input.device_code).await
+    } else {
+        false
+    };
     Ok(Json(CancelCodexDeviceLoginResponse {
         ok: true,
         cancelled,
@@ -1111,7 +1385,7 @@ pub(in crate::api) async fn start_grok_device_login(
     headers: HeaderMap,
     Json(_input): Json<StartGrokDeviceLoginRequest>,
 ) -> Result<Json<StartGrokDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
     let http_client = state.http_client().await;
     let now = now_ms() as i64;
     let (device, flow) = crate::clients::oauth::grok_device::start_device_flow(&http_client, now)
@@ -1119,6 +1393,15 @@ pub(in crate::api) async fn start_grok_device_login(
         .map_err(map_grok_device_error)?;
     state
         .insert_grok_device_flow(device.device_code.clone(), flow, now)
+        .await;
+    state
+        .bind_device_flow_principal(
+            ProviderType::GrokOAuth,
+            device.device_code.clone(),
+            principal.oauth_binding_id(),
+            device_flow_expires_at(now, device.expires_in),
+            now,
+        )
         .await;
     Ok(Json(StartGrokDeviceLoginResponse { ok: true, device }))
 }
@@ -1128,8 +1411,18 @@ pub(in crate::api) async fn poll_grok_device_login(
     headers: HeaderMap,
     Json(input): Json<PollGrokDeviceLoginRequest>,
 ) -> Result<Json<PollGrokDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
     let now = now_ms() as i64;
+    let principal_id = principal.oauth_binding_id();
+    require_device_flow_owner(
+        &state,
+        ProviderType::GrokOAuth,
+        &input.device_code,
+        &principal_id,
+        now,
+        "grok",
+    )
+    .await?;
     let lease = state
         .begin_grok_device_poll(&input.device_code, now)
         .await
@@ -1164,6 +1457,16 @@ pub(in crate::api) async fn poll_grok_device_login(
                     state
                         .fail_grok_device_poll(&input.device_code, terminal)
                         .await;
+                    if terminal {
+                        state
+                            .remove_device_flow_principal(
+                                ProviderType::GrokOAuth,
+                                &input.device_code,
+                                &principal_id,
+                                now,
+                            )
+                            .await;
+                    }
                     return Err(map_grok_device_error(error));
                 }
             }
@@ -1215,8 +1518,21 @@ pub(in crate::api) async fn cancel_grok_device_login(
     headers: HeaderMap,
     Json(input): Json<CancelGrokDeviceLoginRequest>,
 ) -> Result<Json<CancelGrokDeviceLoginResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let cancelled = state.cancel_grok_device_flow(&input.device_code).await;
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let now = now_ms() as i64;
+    let owned = state
+        .remove_device_flow_principal(
+            ProviderType::GrokOAuth,
+            &input.device_code,
+            &principal.oauth_binding_id(),
+            now,
+        )
+        .await;
+    let cancelled = if owned {
+        state.cancel_grok_device_flow(&input.device_code).await
+    } else {
+        false
+    };
     Ok(Json(CancelGrokDeviceLoginResponse {
         ok: true,
         cancelled,
@@ -1246,23 +1562,26 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
             return Err(account_refresh_api_error(error));
         }
     };
-    let verified_openai_claims = if finish.provider_type == ProviderType::CodexOAuth {
-        if let Some(id_token) = token_response.id_token.as_deref() {
-            match crate::clients::oauth::openai_jwks::verify_openai_id_token(&http_client, id_token)
-                .await
-            {
-                Ok(claims) => Some(claims),
-                Err(error) => {
-                    mark_account_login_exchange_failed(state, &finish.session_id).await;
-                    return Err(ApiError::bad_request(error));
-                }
+    let verified_openai_identity = if finish.provider_type == ProviderType::CodexOAuth {
+        match crate::clients::oauth::openai_jwks::verify_openai_identity_tokens(
+            &http_client,
+            token_response.id_token.as_deref(),
+            &token_response.access_token,
+        )
+        .await
+        {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                mark_account_login_exchange_failed(state, &finish.session_id).await;
+                return Err(ApiError::bad_request(error));
             }
-        } else {
-            None
         }
     } else {
         None
     };
+    let verified_openai_subject = verified_openai_identity
+        .as_ref()
+        .and_then(|verified| verified.identity.subject.clone());
     let profile_raw = match execute_account_login_profile_request(
         state,
         finish.provider_type,
@@ -1278,29 +1597,41 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
         }
     };
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-    let mut input = match upsert_input_from_login_response(
-        finish.provider_type,
-        &token_response,
-        raw,
-        profile_raw,
-        now_ms() as i64,
-        interval_ms,
-    ) {
+    let input_result = if let Some(verified) = verified_openai_identity.as_ref() {
+        upsert_input_from_verified_openai_login_response(
+            &token_response,
+            raw,
+            profile_raw,
+            &verified.identity,
+            now_ms() as i64,
+            interval_ms,
+        )
+    } else {
+        upsert_input_from_login_response(
+            finish.provider_type,
+            &token_response,
+            raw,
+            profile_raw,
+            now_ms() as i64,
+            interval_ms,
+        )
+    };
+    let mut input = match input_result {
         Ok(input) => input,
         Err(error) => {
             mark_account_login_exchange_failed(state, &finish.session_id).await;
             return Err(ApiError::bad_request(error.message));
         }
     };
-    if finish.provider_type == ProviderType::CodexOAuth {
-        crate::domain::accounts::store::set_verified_openai_claims(
-            &mut input.profile,
-            verified_openai_claims,
-        );
+    if let Some(verified) = verified_openai_identity {
+        apply_verified_codex_identity(&mut input, verified, true);
     }
 
     let account_result = match state
         .try_mutate_accounts_immediate(|store| {
+            if let Some(subject) = verified_openai_subject.as_deref() {
+                reuse_existing_codex_subject_account(store, &mut input, subject);
+            }
             manager_for(input.provider_type).finish_login(store, input)
         })
         .await
@@ -1339,29 +1670,49 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
 async fn verify_and_mark_codex_account_input(
     state: &ServerState,
     input: &mut UpsertAccountInput,
+    replace_account_record_id: bool,
 ) -> Result<(), ApiError> {
     if input.provider_type != ProviderType::CodexOAuth {
         return Ok(());
     }
     crate::domain::accounts::store::clear_codex_workspace_provenance(&mut input.profile);
-    let id_token = input
-        .id_token
+    let access_token = input
+        .access_token
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let claims = match id_token {
-        Some(id_token) => Some(
-            crate::clients::oauth::openai_jwks::verify_openai_id_token(
-                &state.http_client().await,
-                id_token,
-            )
-            .await
-            .map_err(ApiError::bad_request)?,
-        ),
-        None => None,
-    };
-    crate::domain::accounts::store::set_verified_openai_claims(&mut input.profile, claims);
+        .ok_or_else(|| ApiError::bad_request("Codex OAuth access_token is required"))?;
+    let verified = crate::clients::oauth::openai_jwks::verify_openai_identity_tokens(
+        &state.http_client().await,
+        input.id_token.as_deref(),
+        access_token,
+    )
+    .await
+    .map_err(ApiError::bad_request)?;
+    apply_verified_codex_identity(input, verified, replace_account_record_id);
     Ok(())
+}
+
+fn apply_verified_codex_identity(
+    input: &mut UpsertAccountInput,
+    verified: crate::clients::oauth::openai_jwks::VerifiedOpenAiIdentity,
+    replace_account_record_id: bool,
+) {
+    if replace_account_record_id || input.id.is_none() {
+        input.id = verified
+            .identity
+            .subject
+            .as_deref()
+            .and_then(crate::domain::accounts::oauth::openai_account_record_id_from_subject);
+    }
+    if verified.identity.email.is_some() {
+        input.email = verified.identity.email;
+    }
+    if verified.identity.plan_type.is_some() {
+        input.subscription_level = verified.identity.plan_type;
+    }
+    crate::domain::accounts::store::set_verified_openai_claims(
+        &mut input.profile,
+        Some(verified.canonical_claims),
+    );
 }
 
 pub(in crate::api) async fn execute_account_login_profile_request(
@@ -1386,7 +1737,11 @@ pub(in crate::api) async fn execute_account_login_profile_request(
         return match execute_cursor_profile_request(state, access_token, None).await {
             Ok(profile) => Ok(profile),
             Err(error) => {
-                tracing::debug!(error = %error.message, "cursor oauth profile enrichment failed");
+                let diagnostic = crate::logging::redact_sensitive_text_with_values(
+                    &error.message,
+                    [access_token],
+                );
+                tracing::debug!(error = %diagnostic, "cursor oauth profile enrichment failed");
                 Ok(None)
             }
         };
@@ -1609,7 +1964,10 @@ pub(in crate::api) async fn refresh_account(
             .refresh_account_runtime_metadata_if_changed(&existing, &account)
             .await
             .map_err(ApiError::internal)?;
-        return Ok(Json(UpsertAccountResponse { ok: true, account }));
+        return Ok(Json(UpsertAccountResponse {
+            ok: true,
+            account: account.into(),
+        }));
     }
 
     let account = state
@@ -1624,13 +1982,16 @@ pub(in crate::api) async fn refresh_account(
         .refresh_account_runtime_metadata_if_changed(&existing, &account)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(UpsertAccountResponse { ok: true, account }))
+    Ok(Json(UpsertAccountResponse {
+        ok: true,
+        account: account.into(),
+    }))
 }
 
 pub(in crate::api) fn account_refresh_api_error(error: AccountRefreshFailure) -> ApiError {
     ApiError::new(
         StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-        error.message,
+        oauth_error_public_message(error.kind),
     )
 }
 
@@ -1720,8 +2081,8 @@ pub(in crate::api) async fn account_quota(
         let next_refresh_at = existing.quota_next_refresh_at;
         return Ok(Json(AccountQuotaResponse {
             ok: true,
-            quota,
-            account: Some(existing),
+            quota: account_quota_public_view(&existing, quota.as_ref()),
+            account: Some((&existing).into()),
             refreshed: false,
             message: Some(
                 "quota snapshot returned; use refresh=true to query upstream".to_string(),
@@ -1760,8 +2121,8 @@ pub(in crate::api) async fn account_quota(
     if waited_for_in_flight && quota_refresh_satisfied_by_in_flight(&existing, &active_account) {
         return Ok(Json(AccountQuotaResponse {
             ok: true,
-            quota: active_account.quota.clone(),
-            account: Some(active_account.clone()),
+            quota: account_quota_public_view(&active_account, active_account.quota.as_ref()),
+            account: Some((&active_account).into()),
             refreshed: false,
             message: Some("quota refresh coalesced with an in-flight account refresh".to_string()),
             next_refresh_at: active_account.quota_next_refresh_at,
@@ -1773,8 +2134,11 @@ pub(in crate::api) async fn account_quota(
             if next_refresh_at > now {
                 return Ok(Json(AccountQuotaResponse {
                     ok: true,
-                    quota: active_account.quota.clone(),
-                    account: Some(active_account),
+                    quota: account_quota_public_view(
+                        &active_account,
+                        active_account.quota.as_ref(),
+                    ),
+                    account: Some((&active_account).into()),
                     refreshed: false,
                     message: Some(format!("quota refresh skipped until {next_refresh_at}")),
                     next_refresh_at: Some(next_refresh_at),
@@ -1853,8 +2217,8 @@ pub(in crate::api) async fn account_quota(
             state.emit_oauth_quota_updated_event(&account, true);
             Ok(Json(AccountQuotaResponse {
                 ok: true,
-                quota: account.quota.clone(),
-                account: Some(account.clone()),
+                quota: account_quota_public_view(&account, account.quota.as_ref()),
+                account: Some((&account).into()),
                 refreshed: true,
                 message: Some(message),
                 next_refresh_at: account.quota_next_refresh_at,
@@ -1873,14 +2237,15 @@ pub(in crate::api) async fn account_quota(
                 .map_err(ApiError::internal)?;
             Ok(Json(AccountQuotaResponse {
                 ok: true,
-                quota: active_account.quota.clone(),
-                account: Some(active_account),
+                quota: account_quota_public_view(&active_account, active_account.quota.as_ref()),
+                account: Some((&active_account).into()),
                 refreshed: false,
                 message: Some(message),
                 next_refresh_at: Some(next_refresh_at),
             }))
         }
         Err(error) => {
+            let public_error = redact_account_public_diagnostic(&active_account, &error.message);
             let next_refresh_at = Some(error.next_refresh_at.unwrap_or_else(|| {
                 now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS)
             }));
@@ -1905,7 +2270,7 @@ pub(in crate::api) async fn account_quota(
             }
             Err(ApiError::new(
                 StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-                error.message,
+                public_error,
             ))
         }
     }
@@ -1994,6 +2359,22 @@ mod tests {
 
     use super::*;
     use crate::domain::accounts::oauth::{OAuthHttpRequest, OAuthRequestBodyFormat};
+
+    #[test]
+    fn account_refresh_api_error_does_not_expose_upstream_message() {
+        let error = account_refresh_api_error(AccountRefreshFailure {
+            status_code: 400,
+            message: "invalid_grant refresh_token=refresh-secret".to_string(),
+            kind: crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
+            retryable: false,
+        });
+
+        assert_eq!(
+            error.message,
+            "OAuth credentials were rejected; sign in again"
+        );
+        assert!(!error.message.contains("refresh-secret"));
+    }
 
     #[test]
     fn quota_singleflight_only_coalesces_when_quota_marker_advanced() {
@@ -2085,5 +2466,124 @@ mod tests {
         assert!(!serialized.contains("refresh-token"));
         assert!(!serialized.contains("secret-verifier"));
         assert!(serialized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn openai_manual_callback_requires_exact_url_code_and_state() {
+        let (code, state) = parse_openai_cli_callback_input(
+            "http://localhost:1455/auth/callback?code=code%2Fvalue&state=state-value",
+        )
+        .unwrap();
+        assert_eq!(code, "code/value");
+        assert_eq!(state, "state-value");
+
+        for invalid in [
+            "code-only",
+            "http://127.0.0.1:1455/auth/callback?code=x&state=y",
+            "http://localhost:1455/other?code=x&state=y",
+            "http://localhost:1455/auth/callback?code=x",
+            "http://localhost:1455/auth/callback?code=x&state=y&state=z",
+        ] {
+            assert!(
+                parse_openai_cli_callback_input(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_callback_error_redacts_provider_diagnostics() {
+        let message = oauth_callback_public_error(
+            "access_denied".to_string(),
+            Some("api_key=secret-provider-detail".to_string()),
+        );
+
+        assert!(message.contains("access_denied"));
+        assert!(!message.contains("secret-provider-detail"));
+        assert!(message.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn verified_openai_identity_preserves_explicit_local_record_id() {
+        let mut aliased: UpsertAccountInput = serde_json::from_value(json!({
+            "id": "local-account-alias",
+            "providerType": "codex_oauth",
+            "accessToken": "signed-access-token"
+        }))
+        .unwrap();
+        apply_verified_codex_identity(
+            &mut aliased,
+            crate::clients::oauth::openai_jwks::VerifiedOpenAiIdentity {
+                identity: crate::domain::accounts::oauth::OAuthIdentity {
+                    account_id: Some("workspace-verified".to_string()),
+                    subject: Some("user-verified".to_string()),
+                    ..Default::default()
+                },
+                canonical_claims: json!({
+                    "subject": "user-verified",
+                    "chatgpt_account_id": "workspace-verified"
+                }),
+            },
+            false,
+        );
+
+        assert_eq!(aliased.id.as_deref(), Some("local-account-alias"));
+        assert_eq!(
+            aliased
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.pointer("/verifiedOpenAiClaims/chatgpt_account_id"))
+                .and_then(Value::as_str),
+            Some("workspace-verified")
+        );
+
+        let mut login = aliased;
+        apply_verified_codex_identity(
+            &mut login,
+            crate::clients::oauth::openai_jwks::VerifiedOpenAiIdentity {
+                identity: crate::domain::accounts::oauth::OAuthIdentity {
+                    account_id: Some("workspace-login".to_string()),
+                    subject: Some("user-login".to_string()),
+                    ..Default::default()
+                },
+                canonical_claims: json!({
+                    "subject": "user-login",
+                    "chatgpt_account_id": "workspace-login"
+                }),
+            },
+            true,
+        );
+        assert_eq!(
+            login.id,
+            crate::domain::accounts::oauth::openai_account_record_id_from_subject("user-login")
+        );
+    }
+
+    #[test]
+    fn managed_codex_login_reuses_legacy_record_for_verified_subject() {
+        let mut store = crate::domain::accounts::store::AccountStore::default();
+        let existing: UpsertAccountInput = serde_json::from_value(json!({
+            "id": "legacy-workspace-id",
+            "providerType": "codex_oauth",
+            "accessToken": "old-access-token",
+            "profile": {
+                "verifiedOpenAiClaims": {
+                    "subject": "user-legacy",
+                    "chatgpt_account_id": "workspace-shared"
+                }
+            }
+        }))
+        .unwrap();
+        store.upsert(existing);
+        let mut login: UpsertAccountInput = serde_json::from_value(json!({
+            "id": "codex-oauth-new-id",
+            "providerType": "codex_oauth",
+            "accessToken": "new-access-token"
+        }))
+        .unwrap();
+
+        reuse_existing_codex_subject_account(&store, &mut login, "user-legacy");
+
+        assert_eq!(login.id.as_deref(), Some("legacy-workspace-id"));
     }
 }

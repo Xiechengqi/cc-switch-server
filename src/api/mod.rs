@@ -94,13 +94,14 @@ use crate::domain::accounts::cursor_import::{
     upsert_input_from_cursor_local_import,
 };
 use crate::domain::accounts::login::{
-    OAuthLoginError, OAuthLoginFinish, OAuthLoginStart, OAuthLoginStatus, OAuthSessionPollState,
+    OAuthLoginError, OAuthLoginFinish, OAuthLoginFinishAttempt, OAuthLoginStart, OAuthLoginStatus,
+    OAuthSessionPollState,
 };
 use crate::domain::accounts::managers::{manager_for, AccountManager};
 use crate::domain::accounts::oauth::{
     build_cursor_profile_request, build_profile_request, build_refresh_request, identity_from_jwt,
-    oauth_provider_spec, token_expires_soon, upsert_input_from_login_response, OAuthAuthorizeFlow,
-    OAuthHttpRequest,
+    oauth_provider_spec, token_expires_soon, upsert_input_from_login_response,
+    upsert_input_from_verified_openai_login_response, OAuthAuthorizeFlow, OAuthHttpRequest,
 };
 use crate::domain::accounts::store::{
     Account, AccountRefreshUpdate, AccountStore, UpsertAccountInput,
@@ -336,10 +337,6 @@ pub fn app_router(state: ServerState) -> Router {
         .route(
             "/api/accounts/:id/delete-preview",
             get(account_delete_preview),
-        )
-        .route(
-            "/api/accounts/:id/claude/credentials",
-            get(export_claude_credentials),
         )
         .route("/api/accounts/:id/refresh", post(refresh_account))
         .route("/api/accounts/:id/refresh-plan", get(account_refresh_plan))
@@ -603,6 +600,7 @@ async fn verify_router_ingress(
         "x-cc-switch-web-role",
         "x-cc-switch-installation-id",
         "x-cc-switch-client-tunnel-subdomain",
+        "x-cc-switch-client-tunnel-host",
     ] {
         request.headers_mut().remove(name);
     }
@@ -665,6 +663,10 @@ async fn verify_router_ingress(
             (
                 "x-cc-switch-client-tunnel-subdomain",
                 context.public_host.split('.').next(),
+            ),
+            (
+                "x-cc-switch-client-tunnel-host",
+                Some(context.public_host.as_str()),
             ),
         ] {
             if let Some(value) = value.and_then(|value| value.parse().ok()) {
@@ -1079,9 +1081,10 @@ fn oauth_login_api_error(error: OAuthLoginError) -> ApiError {
         OAuthLoginError::Unsupported(message) | OAuthLoginError::RequestShape(message) => {
             ApiError::not_implemented(message)
         }
-        error @ (OAuthLoginError::MissingCode | OAuthLoginError::StateMismatch) => {
-            ApiError::bad_request(error)
-        }
+        OAuthLoginError::PrincipalMismatch => ApiError::forbidden(error.to_string()),
+        error @ (OAuthLoginError::MissingCode
+        | OAuthLoginError::StateMismatch
+        | OAuthLoginError::ProviderMismatch) => ApiError::bad_request(error),
         error @ (OAuthLoginError::Expired
         | OAuthLoginError::AlreadyConsumed
         | OAuthLoginError::Cancelled

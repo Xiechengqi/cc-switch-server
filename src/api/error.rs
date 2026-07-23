@@ -210,28 +210,28 @@ pub(crate) fn map_share_patch_error(
 pub(crate) fn map_copilot_device_error(error: CopilotDeviceError) -> ApiError {
     ApiError::new(
         StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-        error.message,
+        super::providers::redact_provider_test_error(&error.message),
     )
 }
 
 pub(crate) fn map_kiro_device_error(error: KiroDeviceError) -> ApiError {
     ApiError::new(
         StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-        error.message,
+        super::providers::redact_provider_test_error(&error.message),
     )
 }
 
 pub(crate) fn map_codex_device_error(error: CodexDeviceError) -> ApiError {
     ApiError::new(
         StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-        error.message,
+        super::providers::redact_provider_test_error(&error.message),
     )
 }
 
 pub(crate) fn map_grok_device_error(error: GrokDeviceError) -> ApiError {
     ApiError::new(
         StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-        error.message,
+        super::providers::redact_provider_test_error(&error.message),
     )
 }
 
@@ -275,6 +275,39 @@ mod tests {
         assert_eq!(body["type"].as_str(), Some("upstream_tool_json_error"));
         assert_eq!(body["retryable"].as_bool(), Some(false));
         assert!(!body["error"].as_str().unwrap().starts_with('['));
+    }
+
+    #[test]
+    fn device_error_mappers_redact_provider_diagnostics() {
+        let copilot = map_copilot_device_error(CopilotDeviceError {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            message: "request https://client:password@example.com/token?code=private failed"
+                .to_string(),
+        });
+        assert!(!copilot.message.contains("client"));
+        assert!(!copilot.message.contains("password"));
+        assert!(!copilot.message.contains("private"));
+
+        let kiro = map_kiro_device_error(KiroDeviceError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            message: "provider rejected ksk_abcdefghijklmnop".to_string(),
+        });
+        assert!(!kiro.message.contains("abcdefghijklmnop"));
+        assert!(!kiro.message.contains("mnop"));
+        assert!(kiro.message.contains("[REDACTED_KIRO_API_KEY]"));
+
+        let grok = map_grok_device_error(GrokDeviceError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: "access_token=secret-provider-detail".to_string(),
+        });
+        assert!(!grok.message.contains("secret-provider-detail"));
+        assert!(grok.message.contains("[REDACTED]"));
+
+        let codex = map_codex_device_error(CodexDeviceError {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            message: "x".repeat(2_000),
+        });
+        assert_eq!(codex.message.chars().count(), 800);
     }
 
     async fn json_body(response: axum::response::Response) -> serde_json::Value {

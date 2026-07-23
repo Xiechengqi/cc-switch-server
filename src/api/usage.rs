@@ -204,9 +204,12 @@ pub(in crate::api) fn provider_limit_status(
         account_quota_refreshed_at: account
             .as_ref()
             .and_then(|account| account.quota_refreshed_at),
-        account_last_refresh_error: account
-            .as_ref()
-            .and_then(|account| account.last_refresh_error.clone()),
+        account_last_refresh_error: account.as_ref().and_then(|account| {
+            account
+                .last_refresh_error
+                .as_deref()
+                .map(|error| redact_account_public_diagnostic(account, error))
+        }),
         shares: share_limits,
         warnings,
         blocked: account_blocked || share_blocked,

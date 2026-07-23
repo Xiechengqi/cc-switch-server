@@ -163,10 +163,7 @@ export interface PublicMarket {
 }
 
 export type PayoutToken = "USDC" | "USDT";
-export type PayoutNetwork =
-  | "eip155:56"
-  | "eip155:8453"
-  | "eip155:42161";
+export type PayoutNetwork = "eip155:56" | "eip155:8453" | "eip155:42161";
 
 export interface PayoutProfile {
   addressType: "evm";
@@ -295,6 +292,7 @@ export interface ClientTunnelConfig {
   enabled: boolean;
   autoStart: boolean;
   tunnelUrl?: string | null;
+  expectedUrl?: string | null;
 }
 
 export interface ClientTunnelState {
@@ -488,15 +486,17 @@ async function stopTunnel(shareId: string): Promise<void> {
 }
 
 async function getTunnelStatus(shareId: string): Promise<ShareTunnelStatus> {
-  const raw = await invokeCommand<ShareTunnelStatus & {
-    runtimeStatus?: {
-      tunnelUrl?: string | null;
-      subdomain?: string | null;
-      remotePort?: number | null;
-      status?: string | null;
-      lastError?: string | null;
-    } | null;
-  }>("get_tunnel_status", { shareId });
+  const raw = await invokeCommand<
+    ShareTunnelStatus & {
+      runtimeStatus?: {
+        tunnelUrl?: string | null;
+        subdomain?: string | null;
+        remotePort?: number | null;
+        status?: string | null;
+        lastError?: string | null;
+      } | null;
+    }
+  >("get_tunnel_status", { shareId });
   return normalizeShareTunnelStatus(raw);
 }
 

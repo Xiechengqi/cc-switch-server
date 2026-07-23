@@ -5,8 +5,12 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::domain::accounts::oauth::{upsert_input_from_token_response, OAuthTokenResponse};
+use crate::domain::accounts::oauth::{
+    classify_oauth_error, upsert_input_from_verified_openai_token_response, OAuthErrorKind,
+    OAuthTokenResponse,
+};
 use crate::domain::accounts::store::UpsertAccountInput;
+#[cfg(test)]
 use crate::domain::providers::model::ProviderType;
 
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -155,6 +159,42 @@ impl CodexDeviceError {
             message: message.into(),
         }
     }
+
+    fn upstream(context: &str, status: StatusCode, body: &str) -> Self {
+        let classified = classify_oauth_error(Some(status.as_u16()), body);
+        let (public_status, reason) = match classified.kind {
+            OAuthErrorKind::AuthorizationPending => {
+                (StatusCode::BAD_GATEWAY, "authorization is still pending")
+            }
+            OAuthErrorKind::AccessDenied => (StatusCode::UNAUTHORIZED, "authorization was denied"),
+            OAuthErrorKind::InvalidGrant | OAuthErrorKind::ExpiredToken => {
+                (StatusCode::UNAUTHORIZED, "OAuth credentials were rejected")
+            }
+            OAuthErrorKind::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "OAuth provider rate limited the request",
+            ),
+            OAuthErrorKind::ProviderRejected => (
+                StatusCode::BAD_GATEWAY,
+                "OAuth provider rejected the request",
+            ),
+            OAuthErrorKind::MissingCredential => {
+                (StatusCode::BAD_GATEWAY, "OAuth response was incomplete")
+            }
+            OAuthErrorKind::Network => (StatusCode::BAD_GATEWAY, "OAuth provider request failed"),
+            OAuthErrorKind::Parse => (
+                StatusCode::BAD_GATEWAY,
+                "OAuth provider returned an invalid response",
+            ),
+            OAuthErrorKind::Unsupported | OAuthErrorKind::Unknown => {
+                (StatusCode::BAD_GATEWAY, "OAuth request failed")
+            }
+        };
+        Self {
+            status: public_status,
+            message: format!("{context}: upstream HTTP {} ({reason})", status.as_u16()),
+        }
+    }
 }
 
 impl fmt::Display for CodexDeviceError {
@@ -199,9 +239,11 @@ pub async fn start_device_flow(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(CodexDeviceError::bad_gateway(format!(
-            "codex device code request failed: {status} - {text}"
-        )));
+        return Err(CodexDeviceError::upstream(
+            "codex device code request failed",
+            status,
+            &text,
+        ));
     }
 
     let device: DeviceCodeResponse = response.json().await.map_err(|error| {
@@ -270,9 +312,11 @@ pub async fn poll_device_flow(
     }
     if !status.is_success() {
         let text = poll_response.text().await.unwrap_or_default();
-        return Err(CodexDeviceError::bad_gateway(format!(
-            "codex device poll failed: {status} - {text}"
-        )));
+        return Err(CodexDeviceError::upstream(
+            "codex device poll failed",
+            status,
+            &text,
+        ));
     }
 
     let success: DevicePollSuccess = poll_response.json().await.map_err(|error| {
@@ -294,9 +338,20 @@ pub async fn poll_device_flow(
         "loginMethod": "device",
     });
 
-    let account_input =
-        upsert_input_from_token_response(ProviderType::CodexOAuth, &tokens, raw, now_ms)
+    let verified = crate::clients::oauth::openai_jwks::verify_openai_identity_tokens(
+        http,
+        tokens.id_token.as_deref(),
+        &tokens.access_token,
+    )
+    .await
+    .map_err(|error| CodexDeviceError::unauthorized(error.to_string()))?;
+    let mut account_input =
+        upsert_input_from_verified_openai_token_response(&tokens, raw, &verified.identity, now_ms)
             .map_err(|error| CodexDeviceError::bad_gateway(error.message))?;
+    crate::domain::accounts::store::set_verified_openai_claims(
+        &mut account_input.profile,
+        Some(verified.canonical_claims),
+    );
 
     Ok(CodexDevicePollResult {
         pending: false,
@@ -331,9 +386,11 @@ async fn exchange_code_for_tokens(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(CodexDeviceError::bad_gateway(format!(
-            "codex oauth token exchange failed: {status} - {text}"
-        )));
+        return Err(CodexDeviceError::upstream(
+            "codex oauth token exchange failed",
+            status,
+            &text,
+        ));
     }
 
     response.json().await.map_err(|error| {
@@ -357,6 +414,20 @@ fn flow_poll_interval_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_error_does_not_expose_provider_description() {
+        let error = CodexDeviceError::upstream(
+            "codex oauth token exchange failed",
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant","error_description":"api_key=secret-provider-detail"}"#,
+        );
+
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(!error.message.contains("secret-provider-detail"));
+        assert!(!error.message.contains("invalid_grant"));
+        assert!(error.message.contains("upstream HTTP 400"));
+    }
     use axum::http::HeaderMap;
     use axum::routing::post;
     use axum::Router;
@@ -455,7 +526,7 @@ mod tests {
         let poll_count_for_poll = poll_count.clone();
         let poll_count_for_token = poll_count.clone();
         let id_token = jwt(
-            r#"{"chatgpt_account_id":"acct-42","email":"owner@example.com","openai_auth":{"chatgpt_plan_type":"plus"}}"#,
+            r#"{"sub":"user-42","chatgpt_account_id":"acct-42","email":"owner@example.com","openai_auth":{"chatgpt_plan_type":"plus"}}"#,
         );
         let app = Router::new()
             .route(
@@ -561,7 +632,10 @@ mod tests {
         assert!(!completed.pending);
         let account = completed.account_input.expect("account input");
         assert_eq!(account.provider_type, ProviderType::CodexOAuth);
-        assert_eq!(account.id.as_deref(), Some("acct-42"));
+        assert_eq!(
+            account.id,
+            crate::domain::accounts::oauth::openai_account_record_id_from_subject("user-42")
+        );
         assert_eq!(account.refresh_token.as_deref(), Some("refresh-token"));
     }
 
@@ -644,9 +718,18 @@ mod tests {
             "importedBy": "codex_oauth_device_flow",
             "importedAtMs": now_ms,
         });
-        let account_input =
-            upsert_input_from_token_response(ProviderType::CodexOAuth, &tokens, raw, now_ms)
-                .map_err(|error| CodexDeviceError::bad_gateway(error.message))?;
+        let verified_identity = tokens
+            .id_token
+            .as_deref()
+            .and_then(crate::domain::accounts::oauth::identity_from_jwt)
+            .ok_or_else(|| CodexDeviceError::unauthorized("test token has no identity"))?;
+        let account_input = upsert_input_from_verified_openai_token_response(
+            &tokens,
+            raw,
+            &verified_identity,
+            now_ms,
+        )
+        .map_err(|error| CodexDeviceError::bad_gateway(error.message))?;
 
         Ok(CodexDevicePollResult {
             pending: false,

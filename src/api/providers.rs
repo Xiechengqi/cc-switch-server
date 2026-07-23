@@ -676,6 +676,9 @@ pub(in crate::api) async fn test_provider_inner(
                 materialized_auth.as_ref(),
             )
             .map_err(ApiError::proxy)?;
+        execution
+            .finalize_outbound_identity(&mut target_headers)
+            .map_err(ApiError::proxy)?;
         (adapter_request, endpoint, target_headers)
     };
     let stream = adapter_request.stream_requested || requested_stream;
@@ -724,7 +727,7 @@ pub(in crate::api) async fn test_provider_inner(
                 }
             }
             Err(error) => {
-                network_error = Some(error.to_string());
+                network_error = Some(redact_provider_test_error(&error.to_string()));
             }
         }
     }
@@ -922,6 +925,9 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     execution
         .apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())
         .map_err(ApiError::proxy)?;
+    execution
+        .finalize_outbound_identity(&mut target_headers)
+        .map_err(ApiError::proxy)?;
     let http_client = state.http_client().await;
     let mut request = http_client.get(&url);
     for (name, value) in target_headers {
@@ -931,10 +937,12 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         .filter(|value| *value > 0)
         .map(std::time::Duration::from_millis)
         .unwrap_or_else(|| execution.request_timeout());
-    let response =
-        request.timeout(timeout).send().await.map_err(|error| {
-            ApiError::bad_gateway(format!("fetch provider models failed: {error}"))
-        })?;
+    let response = request.timeout(timeout).send().await.map_err(|error| {
+        ApiError::bad_gateway(format!(
+            "fetch provider models failed: {}",
+            redact_provider_test_error(&error.to_string())
+        ))
+    })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -1480,7 +1488,7 @@ pub(in crate::api) fn provider_test_stream_completed(app: AppKind, body: &str) -
 }
 
 pub(in crate::api) fn redact_provider_test_error(value: &str) -> String {
-    let mut redacted = value.to_string();
+    let mut redacted = crate::logging::redact_sensitive_text(&redact_urls_in_text(value));
     for marker in ["sk-", "ya29.", "Bearer "] {
         while let Some(index) = redacted.find(marker) {
             let end = redacted[index..]
@@ -1491,6 +1499,37 @@ pub(in crate::api) fn redact_provider_test_error(value: &str) -> String {
         }
     }
     redacted.chars().take(800).collect()
+}
+
+fn redact_urls_in_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let remaining = &value[cursor..];
+        let next_http = remaining.find("http://");
+        let next_https = remaining.find("https://");
+        let Some(relative_start) = next_http.into_iter().chain(next_https).min() else {
+            output.push_str(remaining);
+            break;
+        };
+        let start = cursor + relative_start;
+        output.push_str(&value[cursor..start]);
+        let end = value[start..]
+            .char_indices()
+            .find(|(_, character)| {
+                character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>' | ')' | ']')
+            })
+            .map(|(offset, _)| start + offset)
+            .unwrap_or(value.len());
+        let candidate = &value[start..end];
+        if reqwest::Url::parse(candidate).is_ok() {
+            output.push_str(&redact_provider_endpoint(candidate));
+        } else {
+            output.push_str(candidate);
+        }
+        cursor = end;
+    }
+    output
 }
 
 fn map_managed_account_refresh_error(error: crate::state::ManagedAccountRefreshError) -> ApiError {
@@ -1507,10 +1546,14 @@ fn map_managed_account_refresh_error(error: crate::state::ManagedAccountRefreshE
         ManagedAccountRefreshError::NotFound => ApiError::not_found("managed account not found"),
         ManagedAccountRefreshError::Refresh {
             status_code,
-            message,
+            message: _,
         } => ApiError::new(
             StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-            format!("managed account refresh failed: {message}"),
+            match status_code {
+                400 | 401 | 403 => "managed account refresh was rejected; sign in again",
+                429 => "managed account refresh was rate limited; retry later",
+                _ => "managed account refresh failed",
+            },
         ),
     }
 }
@@ -1641,12 +1684,16 @@ mod tests {
     #[test]
     fn provider_test_error_redaction_removes_common_secret_shapes() {
         let redacted = redact_provider_test_error(
-            r#"{"error":"bad sk-abc1234567890 and ya29.secret-token and Bearer abc.def"}"#,
+            "bad sk-abc1234567890 and ya29.secret-token and Bearer abc.def\napi_key=unknown-secret\nrequest https://client:password@example.com/v1/models?tenant=private failed",
         );
 
         assert!(!redacted.contains("sk-abc"));
         assert!(!redacted.contains("ya29.secret"));
         assert!(!redacted.contains("Bearer abc"));
+        assert!(!redacted.contains("unknown-secret"));
+        assert!(!redacted.contains("client"));
+        assert!(!redacted.contains("password"));
+        assert!(!redacted.contains("private"));
         assert!(redacted.contains("[REDACTED]"));
     }
 

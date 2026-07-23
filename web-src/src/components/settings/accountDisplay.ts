@@ -67,10 +67,10 @@ export function accountProviderIcon(providerType: string): { icon?: string; colo
 
 export function credentialFlags(account: AccountRecord): string[] {
   const flags: string[] = [];
-  if (account.accessToken) flags.push("access");
-  if (account.refreshToken) flags.push("refresh");
-  if (account.apiKey) flags.push("api key");
-  if (account.idToken) flags.push("id token");
+  if (account.hasAccessToken) flags.push("access");
+  if (account.hasRefreshToken) flags.push("refresh");
+  if (account.hasApiKey) flags.push("api key");
+  if (account.hasIdToken) flags.push("id token");
   return flags;
 }
 
@@ -142,16 +142,7 @@ export function clampPercent(value: number): number {
 }
 
 export function bankedResetSummary(account: AccountRecord): BankedResetSummary | null {
-  const source =
-    valueAt(account.quota?.extraUsage, ["bankedReset", "codexBankedReset"]) ??
-    valueAt(account.raw, [
-      "bankedReset",
-      "banked_reset",
-      "codexBankedReset",
-      "codex_banked_reset",
-      "rateLimitResetCredits",
-      "rate_limit_reset_credits",
-    ]);
+  const source = valueAt(account.quota?.extraUsage, ["bankedReset", "codexBankedReset"]);
   if (!source) return null;
   const record = asRecord(source);
   const credits = bankedResetCredits(source);
@@ -212,10 +203,10 @@ function refreshRegressionBadge(
   if (account.needsRelogin) {
     return { label: "refresh", value: "relogin", tone: "danger" };
   }
-  if (account.lastRefreshError) {
+  if (account.hasRefreshError) {
     return { label: "refresh", value: "error", tone: "danger" };
   }
-  if (capability?.supportsRefresh && account.refreshToken) {
+  if (capability?.supportsRefresh && account.hasRefreshToken) {
     return { label: "refresh", value: "ready", tone: "success" };
   }
   if (capability?.supportsRefresh) {
@@ -229,8 +220,8 @@ function tokenRegressionBadge(account: AccountRecord): AccountRegressionBadge {
   if (expiry == null) {
     return {
       label: "token",
-      value: account.accessToken || account.apiKey ? "no-expiry" : "missing",
-      tone: account.accessToken || account.apiKey ? "warning" : "danger",
+      value: account.hasAccessToken || account.hasApiKey ? "no-expiry" : "missing",
+      tone: account.hasAccessToken || account.hasApiKey ? "warning" : "danger",
     };
   }
   const remaining = expiry - Date.now();

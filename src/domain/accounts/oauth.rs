@@ -151,6 +151,7 @@ pub struct OAuthTokenResponse {
 #[serde(rename_all = "camelCase")]
 pub struct OAuthIdentity {
     pub account_id: Option<String>,
+    pub subject: Option<String>,
     pub email: Option<String>,
     pub plan_type: Option<String>,
     pub subscription_expires_at: Option<String>,
@@ -160,6 +161,7 @@ pub struct OAuthIdentity {
 
 static CODEX_TOKEN_URLS: &[&str] = &["https://auth.openai.com/oauth/token"];
 static CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+pub const CODEX_CLI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 static CODEX_AUTHORIZE_SCOPE: &str = "openid profile email offline_access";
 static CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
 static CLAUDE_TOKEN_URLS: &[&str] = &[CLAUDE_API_TOKEN_URL, CLAUDE_PLATFORM_TOKEN_URL];
@@ -947,8 +949,14 @@ pub fn refresh_update_from_token_response(
     now_ms: i64,
     quota_refresh_interval_ms: i64,
 ) -> AccountRefreshUpdate {
-    let mut identity = identity_from_token_response(response);
-    if identity == OAuthIdentity::default() {
+    // OpenAI identity is populated only by callers that completed JWKS
+    // verification. Token material still needs to be persisted here.
+    let mut identity = if provider_type == ProviderType::CodexOAuth {
+        OAuthIdentity::default()
+    } else {
+        unverified_identity_from_token_response(provider_type, response)
+    };
+    if provider_type != ProviderType::CodexOAuth && identity == OAuthIdentity::default() {
         identity = identity_from_provider_value(&raw).unwrap_or_default();
     }
     let quota = quota_from_provider_snapshot(provider_type, &raw);
@@ -977,6 +985,26 @@ pub fn refresh_update_from_token_response(
             .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000))),
         ..Default::default()
     }
+}
+
+pub fn refresh_update_from_verified_openai_token_response(
+    response: &OAuthTokenResponse,
+    raw: Value,
+    verified_identity: &OAuthIdentity,
+    now_ms: i64,
+    quota_refresh_interval_ms: i64,
+) -> AccountRefreshUpdate {
+    let mut update = refresh_update_from_token_response(
+        ProviderType::CodexOAuth,
+        response,
+        raw.clone(),
+        now_ms,
+        quota_refresh_interval_ms,
+    );
+    update.email = verified_identity.email.clone();
+    update.subscription_level = verified_identity.plan_type.clone();
+    update.profile = profile_value(ProviderType::CodexOAuth, verified_identity, &raw);
+    update
 }
 
 pub fn refresh_update_from_profile_response(
@@ -1039,13 +1067,94 @@ pub fn upsert_input_from_login_response(
     now_ms: i64,
     quota_refresh_interval_ms: i64,
 ) -> Result<UpsertAccountInput, OAuthErrorClassification> {
-    let identity = login_identity(provider_type, response, &token_raw, profile_raw.as_ref());
-    let account_id = identity.account_id.clone().ok_or_else(|| {
-        missing_credential(format!(
-            "{} token response does not contain an account id",
-            provider_type.as_str()
-        ))
-    })?;
+    upsert_input_from_login_response_inner(
+        provider_type,
+        response,
+        token_raw,
+        profile_raw,
+        now_ms,
+        quota_refresh_interval_ms,
+        None,
+    )
+}
+
+pub fn upsert_input_from_verified_openai_token_response(
+    response: &OAuthTokenResponse,
+    token_raw: Value,
+    verified_identity: &OAuthIdentity,
+    now_ms: i64,
+) -> Result<UpsertAccountInput, OAuthErrorClassification> {
+    upsert_input_from_verified_openai_login_response(
+        response,
+        token_raw,
+        None,
+        verified_identity,
+        now_ms,
+        crate::domain::settings::ui_settings::default_oauth_quota_refresh_interval_ms(),
+    )
+}
+
+pub fn upsert_input_from_verified_openai_login_response(
+    response: &OAuthTokenResponse,
+    token_raw: Value,
+    profile_raw: Option<Value>,
+    verified_identity: &OAuthIdentity,
+    now_ms: i64,
+    quota_refresh_interval_ms: i64,
+) -> Result<UpsertAccountInput, OAuthErrorClassification> {
+    upsert_input_from_login_response_inner(
+        ProviderType::CodexOAuth,
+        response,
+        token_raw,
+        profile_raw,
+        now_ms,
+        quota_refresh_interval_ms,
+        Some(verified_identity),
+    )
+}
+
+fn upsert_input_from_login_response_inner(
+    provider_type: ProviderType,
+    response: &OAuthTokenResponse,
+    token_raw: Value,
+    profile_raw: Option<Value>,
+    now_ms: i64,
+    quota_refresh_interval_ms: i64,
+    verified_openai_identity: Option<&OAuthIdentity>,
+) -> Result<UpsertAccountInput, OAuthErrorClassification> {
+    let identity = if provider_type == ProviderType::CodexOAuth {
+        verified_openai_identity.cloned().ok_or_else(|| {
+            missing_credential("codex_oauth account import requires verified OpenAI identity")
+        })?
+    } else {
+        login_identity(provider_type, response, &token_raw, profile_raw.as_ref())
+    };
+    let account_id = if provider_type == ProviderType::CodexOAuth {
+        if identity
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            return Err(missing_credential(
+                "codex_oauth verified identity does not contain chatgpt_account_id",
+            ));
+        }
+        identity
+            .subject
+            .as_deref()
+            .and_then(openai_account_record_id_from_subject)
+            .ok_or_else(|| {
+                missing_credential("codex_oauth verified identity does not contain subject")
+            })?
+    } else {
+        identity.account_id.clone().ok_or_else(|| {
+            missing_credential(format!(
+                "{} token response does not contain an account id",
+                provider_type.as_str()
+            ))
+        })?
+    };
     if provider_token_exchange_available(provider_type)
         && response
             .refresh_token
@@ -1065,16 +1174,18 @@ pub fn upsert_input_from_login_response(
         now_ms,
         quota_refresh_interval_ms,
     );
-    if let Some(profile_raw) = profile_raw.clone() {
-        update = merge_refresh_updates(
-            update,
-            refresh_update_from_profile_response(
-                provider_type,
-                profile_raw,
-                now_ms,
-                quota_refresh_interval_ms,
-            ),
-        );
+    if provider_type != ProviderType::CodexOAuth {
+        if let Some(profile_raw) = profile_raw.clone() {
+            update = merge_refresh_updates(
+                update,
+                refresh_update_from_profile_response(
+                    provider_type,
+                    profile_raw,
+                    now_ms,
+                    quota_refresh_interval_ms,
+                ),
+            );
+        }
     }
     if update.email.is_none() {
         update.email = identity.email.clone();
@@ -1164,7 +1275,21 @@ pub fn merge_refresh_updates(
     base
 }
 
-pub fn identity_from_token_response(response: &OAuthTokenResponse) -> OAuthIdentity {
+/// Parses provider-returned JWT payloads without authenticating them. This is
+/// intentionally private; security boundaries must use provider verification.
+fn unverified_identity_from_token_response(
+    provider_type: ProviderType,
+    response: &OAuthTokenResponse,
+) -> OAuthIdentity {
+    if provider_type == ProviderType::CodexOAuth {
+        let primary = response
+            .id_token
+            .as_deref()
+            .and_then(openai_identity_from_jwt)
+            .unwrap_or_default();
+        let fallback = openai_identity_from_jwt(&response.access_token).unwrap_or_default();
+        return merge_verified_openai_identities(primary, fallback).unwrap_or_default();
+    }
     response
         .id_token
         .as_deref()
@@ -1181,6 +1306,7 @@ pub fn identity_from_jwt(token: &str) -> Option<OAuthIdentity> {
             .or_else(|| string_at(&claims, &["/organizations/0/id"]))
             .or_else(|| string_at(&claims, &["/user_id"]))
             .or_else(|| string_at(&claims, &["/sub"])),
+        subject: string_at(&claims, &["/sub"]),
         email: string_at(&claims, &["/email", "/preferred_username"]),
         plan_type: plan_type_at(
             &claims,
@@ -1211,12 +1337,167 @@ pub fn identity_from_jwt(token: &str) -> Option<OAuthIdentity> {
     })
 }
 
+const OPENAI_AUTH_CLAIM: &str = "https://api.openai.com/auth";
+const OPENAI_PROFILE_CLAIM: &str = "https://api.openai.com/profile";
+
+/// Extract OpenAI identity claims without deciding whether the containing JWT
+/// is trusted. Callers at security boundaries must verify the token first.
+/// A ChatGPT workspace is never inferred from a user subject, organization, or
+/// generic account ID.
+pub fn openai_identity_from_claims(claims: &Value) -> OAuthIdentity {
+    let auth = claims.get(OPENAI_AUTH_CLAIM);
+    let legacy_auth = claims.get("openai_auth");
+    let profile = claims.get(OPENAI_PROFILE_CLAIM);
+    OAuthIdentity {
+        account_id: string_field(auth, "chatgpt_account_id")
+            .or_else(|| string_field(Some(claims), "chatgpt_account_id"))
+            .or_else(|| string_field(legacy_auth, "chatgpt_account_id")),
+        subject: string_field(Some(claims), "sub")
+            .or_else(|| string_field(Some(claims), "subject")),
+        email: string_field(Some(claims), "email")
+            .or_else(|| string_field(profile, "email"))
+            .or_else(|| string_field(Some(claims), "preferred_username")),
+        plan_type: plan_type_field(auth, "chatgpt_plan_type")
+            .or_else(|| plan_type_field(legacy_auth, "chatgpt_plan_type"))
+            .or_else(|| plan_type_field(Some(claims), "chatgpt_plan_type"))
+            .or_else(|| plan_type_field(Some(claims), "plan_type")),
+        subscription_expires_at: string_or_integer_field(auth, "chatgpt_subscription_active_until")
+            .or_else(|| string_or_integer_field(legacy_auth, "chatgpt_subscription_active_until"))
+            .or_else(|| string_or_integer_field(Some(claims), "subscription_expires_at"))
+            .or_else(|| {
+                claims
+                    .get("subscription")
+                    .and_then(|value| string_or_integer_field(Some(value), "expiresAt"))
+            }),
+        poid: string_field(auth, "poid")
+            .or_else(|| string_field(legacy_auth, "poid"))
+            .or_else(|| string_field(Some(claims), "poid")),
+        organizations: claims
+            .get("organizations")
+            .or_else(|| auth.and_then(|value| value.get("organizations")))
+            .or_else(|| legacy_auth.and_then(|value| value.get("organizations")))
+            .cloned(),
+    }
+}
+
+pub fn merge_verified_openai_identities(
+    primary: OAuthIdentity,
+    fallback: OAuthIdentity,
+) -> Result<OAuthIdentity, String> {
+    reject_openai_identity_conflict(
+        "subject",
+        primary.subject.as_deref(),
+        fallback.subject.as_deref(),
+    )?;
+    reject_openai_identity_conflict(
+        "chatgpt_account_id",
+        primary.account_id.as_deref(),
+        fallback.account_id.as_deref(),
+    )?;
+    Ok(OAuthIdentity {
+        account_id: primary.account_id.or(fallback.account_id),
+        subject: primary.subject.or(fallback.subject),
+        email: primary.email.or(fallback.email),
+        plan_type: primary.plan_type.or(fallback.plan_type),
+        subscription_expires_at: primary
+            .subscription_expires_at
+            .or(fallback.subscription_expires_at),
+        poid: primary.poid.or(fallback.poid),
+        organizations: primary.organizations.or(fallback.organizations),
+    })
+}
+
+pub fn canonical_openai_claims(identity: &OAuthIdentity) -> Value {
+    let mut claims = serde_json::Map::new();
+    insert_optional_string(&mut claims, "subject", identity.subject.as_deref());
+    insert_optional_string(
+        &mut claims,
+        "chatgpt_account_id",
+        identity.account_id.as_deref(),
+    );
+    insert_optional_string(&mut claims, "email", identity.email.as_deref());
+    insert_optional_string(
+        &mut claims,
+        "chatgpt_plan_type",
+        identity.plan_type.as_deref(),
+    );
+    insert_optional_string(
+        &mut claims,
+        "subscription_expires_at",
+        identity.subscription_expires_at.as_deref(),
+    );
+    insert_optional_string(&mut claims, "poid", identity.poid.as_deref());
+    if let Some(organizations) = identity.organizations.clone() {
+        claims.insert("organizations".to_string(), organizations);
+    }
+    Value::Object(claims)
+}
+
+fn reject_openai_identity_conflict(
+    field: &str,
+    primary: Option<&str>,
+    fallback: Option<&str>,
+) -> Result<(), String> {
+    if let (Some(primary), Some(fallback)) = (primary, fallback) {
+        if primary.trim() != fallback.trim() {
+            return Err(format!(
+                "verified OpenAI tokens contain conflicting {field} values"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn string_field(value: Option<&Value>, field: &str) -> Option<String> {
+    value
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn string_or_integer_field(value: Option<&Value>, field: &str) -> Option<String> {
+    let value = value?.get(field)?;
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| value.as_i64().map(|value| value.to_string()))
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
+}
+
+fn plan_type_field(value: Option<&Value>, field: &str) -> Option<String> {
+    string_field(value, field).and_then(normalize_oauth_plan_type)
+}
+
+fn insert_optional_string(
+    map: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        map.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
 pub fn chatgpt_account_id_from_jwt(token: &str) -> Option<String> {
     let claims = decode_jwt_claims(token)?;
-    string_at(
-        &claims,
-        &["/chatgpt_account_id", "/openai_auth/chatgpt_account_id"],
-    )
+    openai_identity_from_claims(&claims).account_id
+}
+
+pub fn openai_account_record_id_from_subject(subject: &str) -> Option<String> {
+    let subject = subject.trim();
+    if subject.is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(subject.as_bytes());
+    Some(format!("codex-oauth-{}", hex::encode(&digest[..16])))
+}
+
+fn openai_identity_from_jwt(token: &str) -> Option<OAuthIdentity> {
+    decode_jwt_claims(token).map(|claims| openai_identity_from_claims(&claims))
 }
 
 pub fn classify_oauth_error(status_code: Option<u16>, body: &str) -> OAuthErrorClassification {
@@ -1392,7 +1673,7 @@ fn login_identity(
     token_raw: &Value,
     profile_raw: Option<&Value>,
 ) -> OAuthIdentity {
-    let mut identity = identity_from_token_response(response);
+    let mut identity = unverified_identity_from_token_response(provider_type, response);
     if identity == OAuthIdentity::default() {
         identity = identity_from_provider_value(token_raw).unwrap_or_default();
     }
@@ -1536,6 +1817,7 @@ fn identity_from_provider_value(value: &Value) -> Option<OAuthIdentity> {
                 "/sub",
             ],
         ),
+        subject: string_at(value, &["/sub"]),
         email: string_at(
             value,
             &[
@@ -1972,7 +2254,7 @@ mod tests {
     #[test]
     fn parses_codex_jwt_identity_and_refresh_update() {
         let id_token = jwt(
-            r#"{"chatgpt_account_id":"acc-123","email":"owner@example.com","openai_auth":{"chatgpt_plan_type":"plus"}}"#,
+            r#"{"sub":"user-123","email":"owner@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acc-123","chatgpt_plan_type":"plus"}}"#,
         );
         let raw = json!({
             "access_token": "access-new",
@@ -1983,15 +2265,16 @@ mod tests {
             "expires_in": 3600
         });
         let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
-        let identity = identity_from_token_response(&response);
+        let identity = unverified_identity_from_token_response(ProviderType::CodexOAuth, &response);
         assert_eq!(identity.account_id.as_deref(), Some("acc-123"));
+        assert_eq!(identity.subject.as_deref(), Some("user-123"));
         assert_eq!(identity.email.as_deref(), Some("owner@example.com"));
         assert_eq!(identity.plan_type.as_deref(), Some("plus"));
 
-        let update = refresh_update_from_token_response(
-            ProviderType::CodexOAuth,
+        let update = refresh_update_from_verified_openai_token_response(
             &response,
             raw,
+            &identity,
             1_000,
             30 * 60 * 1000,
         );
@@ -2014,10 +2297,11 @@ mod tests {
             "token_type": "Bearer"
         });
         let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
-        let update = refresh_update_from_token_response(
-            ProviderType::CodexOAuth,
+        let identity = unverified_identity_from_token_response(ProviderType::CodexOAuth, &response);
+        let update = refresh_update_from_verified_openai_token_response(
             &response,
             raw,
+            &identity,
             1_000,
             30 * 60 * 1000,
         );
@@ -2038,7 +2322,9 @@ mod tests {
 
     #[test]
     fn chatgpt_account_id_from_jwt_does_not_fall_back_to_user_subject() {
-        let nested = jwt(r#"{"sub":"user-1","openai_auth":{"chatgpt_account_id":"workspace-1"}}"#);
+        let nested = jwt(
+            r#"{"sub":"user-1","https://api.openai.com/auth":{"chatgpt_account_id":"workspace-1"}}"#,
+        );
         assert_eq!(
             chatgpt_account_id_from_jwt(&nested).as_deref(),
             Some("workspace-1")
@@ -2046,6 +2332,108 @@ mod tests {
 
         let user_only = jwt(r#"{"sub":"user-1","user_id":"user-1"}"#);
         assert!(chatgpt_account_id_from_jwt(&user_only).is_none());
+    }
+
+    #[test]
+    fn openai_account_record_id_is_stable_and_subject_scoped() {
+        let first = openai_account_record_id_from_subject(" user-1 ").unwrap();
+        assert_eq!(
+            first,
+            openai_account_record_id_from_subject("user-1").unwrap()
+        );
+        assert_ne!(
+            first,
+            openai_account_record_id_from_subject("user-2").unwrap()
+        );
+        assert!(first.starts_with("codex-oauth-"));
+        assert!(openai_account_record_id_from_subject("  ").is_none());
+    }
+
+    #[test]
+    fn canonical_openai_identity_merges_verified_sources_and_rejects_conflicts() {
+        let id_identity = openai_identity_from_claims(&json!({
+            "sub": "user-1",
+            "email": "owner@example.com"
+        }));
+        let access_identity = openai_identity_from_claims(&json!({
+            "sub": "user-1",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "workspace-1",
+                "chatgpt_plan_type": "pro"
+            },
+            "https://api.openai.com/profile": {"email": "owner@example.com"}
+        }));
+        let merged = merge_verified_openai_identities(id_identity, access_identity).unwrap();
+        assert_eq!(merged.subject.as_deref(), Some("user-1"));
+        assert_eq!(merged.account_id.as_deref(), Some("workspace-1"));
+        assert_eq!(merged.plan_type.as_deref(), Some("pro"));
+        assert_eq!(
+            canonical_openai_claims(&merged)["chatgpt_account_id"],
+            "workspace-1"
+        );
+
+        let conflict = merge_verified_openai_identities(
+            openai_identity_from_claims(&json!({"sub": "user-1"})),
+            openai_identity_from_claims(&json!({"sub": "user-2"})),
+        )
+        .unwrap_err();
+        assert!(conflict.contains("subject"));
+    }
+
+    #[test]
+    fn openai_protocol_fixture_matches_identity_and_oauth_contract() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../assets/contract/openai-oauth-protocol.json"
+        ))
+        .unwrap();
+        let spec = oauth_provider_spec(ProviderType::CodexOAuth).unwrap();
+        assert_eq!(
+            spec.authorize_url,
+            fixture
+                .pointer("/oauth/authorizeUrl")
+                .and_then(Value::as_str)
+        );
+        assert_eq!(
+            spec.token_urls.first().copied(),
+            fixture.pointer("/oauth/tokenUrl").and_then(Value::as_str)
+        );
+        assert_eq!(
+            Some(CODEX_CLI_REDIRECT_URI),
+            fixture
+                .pointer("/oauth/cliRedirectUri")
+                .and_then(Value::as_str)
+        );
+
+        for case in fixture["identityCases"].as_array().unwrap() {
+            let primary = openai_identity_from_claims(&case["idTokenClaims"]);
+            let fallback = openai_identity_from_claims(&case["accessTokenClaims"]);
+            if let Some(expected_error) = case.get("mergeError").and_then(Value::as_str) {
+                let error = merge_verified_openai_identities(primary, fallback).unwrap_err();
+                assert!(error.contains(expected_error), "{}: {error}", case["name"]);
+                continue;
+            }
+
+            let identity = merge_verified_openai_identities(primary, fallback).unwrap();
+            let expected = &case["expected"];
+            assert_eq!(
+                identity.subject.as_deref(),
+                expected.get("subject").and_then(Value::as_str),
+                "{}",
+                case["name"]
+            );
+            assert_eq!(
+                identity.account_id.as_deref(),
+                expected.get("chatgptAccountId").and_then(Value::as_str),
+                "{}",
+                case["name"]
+            );
+            assert_eq!(
+                identity.plan_type.as_deref(),
+                expected.get("planType").and_then(Value::as_str),
+                "{}",
+                case["name"]
+            );
+        }
     }
 
     #[test]
@@ -2075,7 +2463,7 @@ mod tests {
     #[test]
     fn codex_token_response_builds_account_import_input() {
         let id_token = jwt(
-            r#"{"chatgpt_account_id":"acc-123","email":"owner@example.com","poid":"poid-123","organizations":[{"id":"org-1"}],"openai_auth":{"chatgpt_plan_type":"pro"}}"#,
+            r#"{"sub":"user-123","chatgpt_account_id":"acc-123","email":"owner@example.com","poid":"poid-123","organizations":[{"id":"org-1"}],"openai_auth":{"chatgpt_plan_type":"pro"}}"#,
         );
         let raw = json!({
             "access_token": "access-new",
@@ -2086,11 +2474,12 @@ mod tests {
             "expires_in": 3600
         });
         let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
+        let identity = unverified_identity_from_token_response(ProviderType::CodexOAuth, &response);
         let input =
-            upsert_input_from_token_response(ProviderType::CodexOAuth, &response, raw, 1_000)
+            upsert_input_from_verified_openai_token_response(&response, raw, &identity, 1_000)
                 .expect("account input");
 
-        assert_eq!(input.id.as_deref(), Some("acc-123"));
+        assert_eq!(input.id, openai_account_record_id_from_subject("user-123"));
         assert_eq!(input.provider_type, ProviderType::CodexOAuth);
         assert_eq!(input.email.as_deref(), Some("owner@example.com"));
         assert_eq!(input.refresh_token.as_deref(), Some("refresh-new"));
@@ -2106,15 +2495,17 @@ mod tests {
 
     #[test]
     fn codex_account_import_rejects_missing_refresh_token_or_account_id() {
-        let id_token = jwt(r#"{"chatgpt_account_id":"acc-123","email":"owner@example.com"}"#);
+        let id_token =
+            jwt(r#"{"sub":"user-123","chatgpt_account_id":"acc-123","email":"owner@example.com"}"#);
         let raw = json!({
             "access_token": "access-new",
             "id_token": id_token,
             "expires_in": 3600
         });
         let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
+        let identity = unverified_identity_from_token_response(ProviderType::CodexOAuth, &response);
         let error =
-            upsert_input_from_token_response(ProviderType::CodexOAuth, &response, raw, 1_000)
+            upsert_input_from_verified_openai_token_response(&response, raw, &identity, 1_000)
                 .expect_err("missing refresh token");
         assert!(error.message.contains("refresh_token"));
 
@@ -2123,10 +2514,31 @@ mod tests {
             "refresh_token": "refresh-new"
         });
         let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
-        let error =
-            upsert_input_from_token_response(ProviderType::CodexOAuth, &response, raw, 1_000)
-                .expect_err("missing account id");
-        assert!(error.message.contains("account id"));
+        let error = upsert_input_from_verified_openai_token_response(
+            &response,
+            raw,
+            &OAuthIdentity::default(),
+            1_000,
+        )
+        .expect_err("missing account id");
+        assert!(error.message.contains("chatgpt_account_id"));
+
+        let raw = json!({
+            "access_token": "plain-access-token",
+            "refresh_token": "refresh-new"
+        });
+        let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
+        let error = upsert_input_from_verified_openai_token_response(
+            &response,
+            raw,
+            &OAuthIdentity {
+                account_id: Some("workspace-only".to_string()),
+                ..Default::default()
+            },
+            1_000,
+        )
+        .expect_err("missing subject");
+        assert!(error.message.contains("subject"));
     }
 
     #[test]
@@ -2335,8 +2747,9 @@ mod tests {
 
     #[test]
     fn parses_camel_case_token_response_and_access_token_identity() {
-        let access_token =
-            jwt(r#"{"sub":"subject-123","email":"owner@example.com","plan":"team"}"#);
+        let access_token = jwt(
+            r#"{"sub":"subject-123","https://api.openai.com/auth":{"chatgpt_account_id":"workspace-123","chatgpt_plan_type":"team"},"https://api.openai.com/profile":{"email":"owner@example.com"}}"#,
+        );
         let raw = json!({
             "accessToken": access_token,
             "refreshToken": "refresh-new",
@@ -2344,16 +2757,17 @@ mod tests {
             "expiresIn": 120
         });
         let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
-        let identity = identity_from_token_response(&response);
+        let identity = unverified_identity_from_token_response(ProviderType::CodexOAuth, &response);
 
-        assert_eq!(identity.account_id.as_deref(), Some("subject-123"));
+        assert_eq!(identity.account_id.as_deref(), Some("workspace-123"));
+        assert_eq!(identity.subject.as_deref(), Some("subject-123"));
         assert_eq!(identity.email.as_deref(), Some("owner@example.com"));
         assert_eq!(identity.plan_type.as_deref(), Some("team"));
 
-        let update = refresh_update_from_token_response(
-            ProviderType::CodexOAuth,
+        let update = refresh_update_from_verified_openai_token_response(
             &response,
             raw,
+            &identity,
             10,
             30 * 60 * 1000,
         );

@@ -109,6 +109,23 @@ impl ProviderExecution {
                 self.plan.warnings.join("; ")
             )));
         }
+        if matches!(
+            self.plan.auth_ref,
+            RuntimeAuthRef::Legacy {
+                account_id: None,
+                ..
+            }
+        ) && provider_secret(&self.stored).is_none()
+            && oauth_provider_spec(self.stored.provider_type).is_some_and(|spec| {
+                spec.server_native_refresh_enabled() && !spec.token_urls.is_empty()
+            })
+        {
+            return Err(ProxyError::bad_request(format!(
+                "Provider {} must explicitly bind a {} managed account",
+                self.stored.provider.id,
+                self.stored.provider_type.as_str()
+            )));
+        }
         Ok(())
     }
 
@@ -163,13 +180,15 @@ impl ProviderExecution {
                 expected_provider_type,
                 ..
             } => Some((*expected_provider_type, Some(account_id.as_str()))),
-            RuntimeAuthRef::Legacy { account_id, .. }
-                if provider_secret(&self.stored).is_none()
-                    && oauth_provider_spec(self.stored.provider_type).is_some_and(|spec| {
-                        spec.server_native_refresh_enabled() && !spec.token_urls.is_empty()
-                    }) =>
+            RuntimeAuthRef::Legacy {
+                account_id: Some(account_id),
+                ..
+            } if provider_secret(&self.stored).is_none()
+                && oauth_provider_spec(self.stored.provider_type).is_some_and(|spec| {
+                    spec.server_native_refresh_enabled() && !spec.token_urls.is_empty()
+                }) =>
             {
-                Some((self.stored.provider_type, account_id.as_deref()))
+                Some((self.stored.provider_type, Some(account_id.as_str())))
             }
             _ => None,
         }
@@ -243,12 +262,14 @@ impl ProviderExecution {
                 retry_stage,
             )?
         };
+        request.claude_tool_name_map = contract.tool_name_map;
         for (name, value) in contract.headers {
             replace_header(&mut headers, name, &value);
         }
         let materialized_auth = self.materialize_auth(accounts)?;
         self.apply_auth(&mut headers, &mut endpoint, materialized_auth.as_ref())?;
         apply_account_header_overrides(&mut headers, &stored, accounts)?;
+        self.finalize_outbound_identity(&mut headers)?;
         Ok(PreparedProviderRequest {
             adapter_request: request,
             endpoint,
@@ -447,6 +468,13 @@ impl ProviderExecution {
             *url = parsed.to_string();
         }
         Ok(())
+    }
+
+    pub fn finalize_outbound_identity(
+        &self,
+        headers: &mut Vec<(String, String)>,
+    ) -> Result<(), ProxyError> {
+        super::outbound_identity::finalize_headers(&self.plan, headers)
     }
 
     pub fn enforce_model_policy(&self, request: &mut AdapterRequest) -> Result<(), ProxyError> {
@@ -884,13 +912,16 @@ fn apply_account_header_overrides(
     stored: &StoredProvider,
     accounts: &AccountStore,
 ) -> Result<(), ProxyError> {
-    let account_id = stored
+    let Some(account_id) = stored
         .provider
         .meta
         .as_ref()
         .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref());
-    let Some(account) = accounts.find_for_provider(stored.provider_type, account_id) else {
+        .and_then(|binding| binding.account_id.as_deref())
+    else {
+        return Ok(());
+    };
+    let Some(account) = accounts.find_for_provider(stored.provider_type, Some(account_id)) else {
         return Ok(());
     };
     for (name, value) in &account.extra_headers {
@@ -1047,6 +1078,8 @@ mod tests {
                 driver_contract_revision: 1,
                 endpoint: "https://example.test".to_string(),
                 upstream_protocol: protocol,
+                outbound_identity_policy:
+                    crate::domain::providers::registry::OutboundIdentityPolicy::CustomOverride,
                 auth_ref,
                 model_policy: RuntimeModelPolicy::Passthrough,
                 media_policy: None,
@@ -1096,6 +1129,8 @@ mod tests {
                 driver_contract_revision: 1,
                 endpoint: "https://example.test".to_string(),
                 upstream_protocol: UpstreamProtocol::OpenAiResponses,
+                outbound_identity_policy:
+                    crate::domain::providers::registry::OutboundIdentityPolicy::ServerIdentity,
                 auth_ref: RuntimeAuthRef::Missing,
                 model_policy: RuntimeModelPolicy::Single {
                     upstream_model: "actual-model".to_string(),
@@ -1119,6 +1154,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
+            claude_tool_name_map: Default::default(),
         };
 
         execution.enforce_model_policy(&mut request).unwrap();
@@ -1256,6 +1292,29 @@ mod tests {
     }
 
     #[test]
+    fn unbound_legacy_managed_oauth_is_not_ready_and_never_selects_first_account() {
+        let mut legacy = execution_with_auth(
+            RuntimeAuthRef::Legacy {
+                account_id: None,
+                credential_generation: 0,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({}),
+            0,
+        );
+        legacy.stored.provider_type = ProviderType::CodexOAuth;
+        legacy.plan = Arc::new(ProviderRuntimePlan {
+            configuration_state: RuntimeConfigurationState::LegacyCompat,
+            ..legacy.plan.as_ref().clone()
+        });
+
+        let error = legacy.ensure_ready().unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("must explicitly bind"));
+        assert_eq!(legacy.managed_account_target(), None);
+    }
+
+    #[test]
     fn native_claude_context_suffix_normalizes_brackets_but_preserves_entity_models() {
         let mut request = AdapterRequest {
             body: bytes::Bytes::from_static(
@@ -1269,6 +1328,7 @@ mod tests {
             actual_model_source: Some("request".to_string()),
             stream_requested: false,
             custom_tool_names: Default::default(),
+            claude_tool_name_map: Default::default(),
         };
 
         assert!(normalize_native_claude_context_1m_model(&mut request).unwrap());
@@ -1295,6 +1355,7 @@ mod tests {
             actual_model_source: Some("request".to_string()),
             stream_requested: false,
             custom_tool_names: Default::default(),
+            claude_tool_name_map: Default::default(),
         };
         assert!(normalize_native_claude_context_1m_model(&mut entity_model).unwrap());
         let body: Value = serde_json::from_slice(&entity_model.body).unwrap();
@@ -1364,7 +1425,7 @@ mod tests {
         let prepared = execution
             .prepare_claude_request(
                 bytes::Bytes::from_static(
-                    br#"{"model":"claude-sonnet-4-6[1m][1M]","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+                    br#"{"model":"claude-sonnet-4-6[1m][1M]","max_tokens":16,"messages":[{"role":"user","content":"ping"}],"tools":[{"name":"read","input_schema":{"type":"object"}}]}"#,
                 ),
                 ProxyRoute::ClaudeMessages,
                 &client_headers,
@@ -1379,6 +1440,15 @@ mod tests {
         );
         let body: Value = serde_json::from_slice(&prepared.adapter_request.body).unwrap();
         assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(body.pointer("/tools/0/name"), Some(&json!("Read")));
+        assert_eq!(
+            prepared
+                .adapter_request
+                .claude_tool_name_map
+                .get("read")
+                .map(String::as_str),
+            Some("read")
+        );
         let signed_text = body["system"][0]["text"].as_str().unwrap();
         assert!(signed_text.contains("cch="));
         assert!(!signed_text.contains("cch=00000"));

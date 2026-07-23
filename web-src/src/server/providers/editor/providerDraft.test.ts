@@ -121,4 +121,15 @@ describe("Server Provider profile drafts", () => {
     expect(env).not.toHaveProperty("AWS_ACCESS_KEY_ID");
     expect(env).not.toHaveProperty("AWS_SECRET_ACCESS_KEY");
   });
+
+  it("reserves custom User-Agent overrides for Custom HTTP profiles", () => {
+    for (const driver of providerRegistry.drivers) {
+      expect(driver.outboundIdentityPolicy.kind).not.toBe("custom_override");
+    }
+    for (const policy of providerRegistry.customPolicies) {
+      expect(policy.outboundIdentityPolicy).toEqual({
+        kind: "custom_override",
+      });
+    }
+  });
 });

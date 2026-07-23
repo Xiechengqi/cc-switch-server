@@ -125,6 +125,14 @@ impl WebAdminPrincipal {
     pub(crate) fn role(&self) -> &str {
         &self.role
     }
+
+    pub(crate) fn oauth_binding_id(&self) -> String {
+        format!(
+            "{}:{}",
+            self.user_email.trim().to_ascii_lowercase(),
+            self.role.trim().to_ascii_lowercase()
+        )
+    }
 }
 
 pub(crate) async fn require_event_session(

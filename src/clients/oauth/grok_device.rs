@@ -336,9 +336,9 @@ fn pending_result_from_error(
         _ => parsed
             .and_then(|value| value.error_description)
             .filter(|message| message.contains("authorization_pending"))
-            .map(|message| GrokDevicePollResult {
+            .map(|_| GrokDevicePollResult {
                 pending: true,
-                message,
+                message: "authorization_pending".to_string(),
                 retry_after_secs: Some(interval),
                 account_input: None,
             }),
@@ -361,4 +361,24 @@ fn xai_client_id() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| XAI_CLIENT_ID.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_description_never_becomes_public_message() {
+        let result = pending_result_from_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"temporarily_unavailable","error_description":"authorization_pending access_token=secret-provider-detail"}"#,
+            5,
+        )
+        .expect("pending response");
+
+        assert!(result.pending);
+        assert_eq!(result.message, "authorization_pending");
+        assert_eq!(result.retry_after_secs, Some(5));
+        assert!(!result.message.contains("secret-provider-detail"));
+    }
 }

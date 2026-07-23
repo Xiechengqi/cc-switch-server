@@ -352,8 +352,9 @@ fn account_for_provider<'a>(
         .meta
         .as_ref()
         .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref());
-    accounts.and_then(|accounts| accounts.find_for_provider(provider.provider_type, account_id))
+        .and_then(|binding| binding.account_id.as_deref())?;
+    accounts
+        .and_then(|accounts| accounts.find_for_provider(provider.provider_type, Some(account_id)))
 }
 
 pub(crate) fn share_bindings(share: &Share) -> Vec<(AppKind, String)> {
@@ -396,7 +397,7 @@ mod tests {
 
     use super::*;
     use crate::domain::accounts::store::AccountQuota;
-    use crate::domain::providers::model::{Provider, ProviderType};
+    use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
     use crate::domain::sharing::shares::{ShareAcl, ShareBinding, ShareMarketGrantStatus};
     use crate::domain::usage::store::{UsageLogContext, UsageModelMetadata};
 
@@ -649,7 +650,15 @@ mod tests {
                     "models": ["gpt-5.5"]
                 }),
                 category: None,
-                meta: None,
+                meta: Some(ProviderMeta {
+                    auth_binding: Some(AuthBinding {
+                        source: Some("managed_account".to_string()),
+                        auth_provider: Some(provider_type.as_str().to_string()),
+                        account_id: Some("acct-1".to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
                 extra: Default::default(),
             },
             provider_type,

@@ -111,6 +111,74 @@ struct RebindCustomProviderInput {
     credential_patches: BTreeMap<String, CredentialPatch>,
 }
 
+#[derive(Debug, Clone)]
+struct DeviceFlowPrincipalBinding {
+    principal_id: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug, Default)]
+struct DeviceFlowPrincipalStore {
+    bindings: BTreeMap<(String, String), DeviceFlowPrincipalBinding>,
+}
+
+impl DeviceFlowPrincipalStore {
+    fn insert(
+        &mut self,
+        provider_type: ProviderType,
+        device_code: String,
+        principal_id: String,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) {
+        self.cleanup(now_ms);
+        self.bindings.insert(
+            (provider_type.as_str().to_string(), device_code),
+            DeviceFlowPrincipalBinding {
+                principal_id,
+                expires_at_ms,
+            },
+        );
+    }
+
+    fn is_owned_by(
+        &mut self,
+        provider_type: ProviderType,
+        device_code: &str,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> bool {
+        self.cleanup(now_ms);
+        self.bindings
+            .get(&(provider_type.as_str().to_string(), device_code.to_string()))
+            .is_some_and(|binding| binding.principal_id == principal_id)
+    }
+
+    fn remove_for_principal(
+        &mut self,
+        provider_type: ProviderType,
+        device_code: &str,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> bool {
+        self.cleanup(now_ms);
+        let key = (provider_type.as_str().to_string(), device_code.to_string());
+        if self
+            .bindings
+            .get(&key)
+            .is_none_or(|binding| binding.principal_id != principal_id)
+        {
+            return false;
+        }
+        self.bindings.remove(&key).is_some()
+    }
+
+    fn cleanup(&mut self, now_ms: i64) {
+        self.bindings
+            .retain(|_, binding| binding.expires_at_ms > now_ms);
+    }
+}
+
 #[derive(Debug)]
 pub struct ServerStateInner {
     pub bind_addr: SocketAddr,
@@ -136,6 +204,7 @@ pub struct ServerStateInner {
     grok_device_flows: RwLock<GrokDeviceFlowStore>,
     kiro_device_flows: RwLock<KiroDeviceFlowStore>,
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
+    device_flow_principals: RwLock<DeviceFlowPrincipalStore>,
     pub cursor_sessions: CursorSessionManager,
     pub account_refresh_locks: AccountRefreshLocks,
     pub account_in_flight: Arc<AccountInFlightTracker>,
@@ -1015,11 +1084,17 @@ fn validate_and_resolve_provider_binding(
     existing: Option<&StoredProvider>,
     accounts: &AccountStore,
 ) -> Result<(), ProviderCommandError> {
-    let Some(profile_id) = candidate.resource.profile_id.as_ref() else {
+    let Some(profile_id) = candidate
+        .resource
+        .profile_id
+        .as_ref()
+        .map(|profile_id| profile_id.as_str().to_string())
+    else {
         return Ok(());
     };
-    let profile = profile_by_id(profile_id.as_str())
+    let profile = profile_by_id(&profile_id)
         .ok_or_else(|| ProviderCommandError::Invalid(format!("unknown profileId {profile_id}")))?;
+    normalize_provider_outbound_identity(candidate, existing, profile)?;
     if let Some(expected_type) = profile.compatibility_provider_type {
         if candidate.provider_type != expected_type {
             return Err(ProviderCommandError::Invalid(format!(
@@ -1096,6 +1171,55 @@ fn validate_and_resolve_provider_binding(
         account_id: Some(account_id.to_string()),
         auth_identity_generation: Some(expected_generation),
     });
+    Ok(())
+}
+
+fn normalize_provider_outbound_identity(
+    candidate: &mut StoredProvider,
+    existing: Option<&StoredProvider>,
+    profile: &crate::domain::providers::registry::ProfileSpec,
+) -> Result<(), ProviderCommandError> {
+    use crate::domain::providers::registry::FormComposition;
+
+    if profile.form_composition == FormComposition::Legacy {
+        return Ok(());
+    }
+    let incoming = candidate
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.custom_user_agent.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if profile.form_composition == FormComposition::Custom {
+        let normalized = incoming
+            .map(|value| {
+                crate::domain::providers::runtime::validate_custom_user_agent(&value)
+                    .map_err(|error| ProviderCommandError::Invalid(error.to_string()))
+            })
+            .transpose()?;
+        if let Some(meta) = candidate.provider.meta.as_mut() {
+            meta.custom_user_agent = normalized;
+        }
+        return Ok(());
+    }
+
+    if let Some(incoming) = incoming {
+        let existing_value = existing
+            .and_then(|stored| stored.provider.meta.as_ref())
+            .and_then(|meta| meta.custom_user_agent.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if existing_value != Some(incoming.as_str()) {
+            return Err(ProviderCommandError::Invalid(
+                "customUserAgent is only supported by Custom HTTP Providers".to_string(),
+            ));
+        }
+    }
+    if let Some(meta) = candidate.provider.meta.as_mut() {
+        meta.custom_user_agent = None;
+    }
     Ok(())
 }
 
@@ -2140,6 +2264,7 @@ impl ServerStateInner {
             grok_device_flows: RwLock::new(GrokDeviceFlowStore::default()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
+            device_flow_principals: RwLock::new(DeviceFlowPrincipalStore::default()),
             cursor_sessions: CursorSessionManager::default(),
             account_refresh_locks: AccountRefreshLocks::default(),
             account_in_flight: Arc::new(AccountInFlightTracker::default()),
@@ -3301,6 +3426,47 @@ impl ServerStateInner {
         .map_err(|never| match never {})
     }
 
+    #[cfg(test)]
+    pub(crate) async fn override_provider_runtime_endpoint_for_test(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        endpoint: String,
+    ) -> anyhow::Result<()> {
+        let parsed = url::Url::parse(&endpoint).context("parse test Provider endpoint")?;
+        let host_is_loopback = parsed.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+        if parsed.scheme() != "http"
+            || !host_is_loopback
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            anyhow::bail!("test Provider endpoint must be a credential-free loopback HTTP URL");
+        }
+
+        let mut providers = self.providers.write().await;
+        let mut plan = providers
+            .runtime_plan(app, provider_id)
+            .with_context(|| {
+                format!(
+                    "test Provider runtime plan not found: {}/{provider_id}",
+                    app.as_str()
+                )
+            })?
+            .as_ref()
+            .clone();
+        plan.endpoint = endpoint;
+        plan.runtime_fingerprint = format!("{}:loopback-test", plan.runtime_fingerprint);
+        Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
+        Ok(())
+    }
+
     pub async fn mutate_providers_immediate_if_changed<R>(
         self: &Arc<Self>,
         mutate: impl FnOnce(&mut ProviderStore) -> (R, bool) + Send + 'static,
@@ -4120,6 +4286,51 @@ impl ServerStateInner {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         sessions.retain(|_, binding| binding.expires_at_ms > now);
         sessions.get(session_key).cloned()
+    }
+
+    pub async fn bind_device_flow_principal(
+        &self,
+        provider_type: ProviderType,
+        device_code: String,
+        principal_id: String,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) {
+        self.device_flow_principals.write().await.insert(
+            provider_type,
+            device_code,
+            principal_id,
+            expires_at_ms,
+            now_ms,
+        );
+    }
+
+    pub async fn device_flow_is_owned_by(
+        &self,
+        provider_type: ProviderType,
+        device_code: &str,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> bool {
+        self.device_flow_principals.write().await.is_owned_by(
+            provider_type,
+            device_code,
+            principal_id,
+            now_ms,
+        )
+    }
+
+    pub async fn remove_device_flow_principal(
+        &self,
+        provider_type: ProviderType,
+        device_code: &str,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> bool {
+        self.device_flow_principals
+            .write()
+            .await
+            .remove_for_principal(provider_type, device_code, principal_id, now_ms)
     }
 
     pub async fn insert_kiro_device_flow(
@@ -5380,10 +5591,11 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                     "failure"
                 };
             crate::metrics::record_warm_refresh(account.provider_type.as_str(), metric_result);
+            let diagnostic = redact_account_error_for_log(&account, &error.message);
             tracing::warn!(
                 account_id = %account.id,
                 provider_type = %account.provider_type.as_str(),
-                error = %error.message,
+                error = %diagnostic,
                 "background OAuth token warm-refresh failed"
             );
             let updated = {
@@ -5415,6 +5627,20 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
             }
         }
     }
+}
+
+fn redact_account_error_for_log(account: &Account, message: &str) -> String {
+    crate::logging::redact_sensitive_text_with_values(
+        message,
+        account
+            .access_token
+            .as_deref()
+            .into_iter()
+            .chain(account.refresh_token.as_deref())
+            .chain(account.id_token.as_deref())
+            .chain(account.api_key.as_deref())
+            .chain(account.extra_headers.values().map(String::as_str)),
+    )
 }
 
 async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
@@ -10089,6 +10315,62 @@ mod tests {
         )])
     }
 
+    fn stored_provider_with_user_agent(profile_id: &str, user_agent: &str) -> StoredProvider {
+        let mut provider = test_provider("identity-provider", "Identity Provider");
+        provider.meta = Some(ProviderMeta {
+            custom_user_agent: Some(user_agent.to_string()),
+            ..Default::default()
+        });
+        StoredProvider {
+            app: AppKind::Codex,
+            provider,
+            provider_type: ProviderType::Codex,
+            provider_type_id: ProviderType::Codex.as_str().to_string(),
+            resource: ProviderResourceMetadata {
+                profile_id: Some(ProfileId::parse(profile_id).unwrap()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn provider_write_rejects_new_preset_user_agent_and_cleans_carried_legacy_value() {
+        let profile = profile_by_id("codex.openai_api_key").unwrap();
+        let mut new_value =
+            stored_provider_with_user_agent("codex.openai_api_key", "custom-agent/1");
+        let error =
+            normalize_provider_outbound_identity(&mut new_value, None, profile).unwrap_err();
+        assert!(
+            matches!(error, ProviderCommandError::Invalid(message) if message.contains("Custom HTTP"))
+        );
+
+        let existing = stored_provider_with_user_agent("codex.openai_api_key", "legacy-agent/1");
+        let mut carried = existing.clone();
+        normalize_provider_outbound_identity(&mut carried, Some(&existing), profile).unwrap();
+        assert!(carried
+            .provider
+            .meta
+            .as_ref()
+            .unwrap()
+            .custom_user_agent
+            .is_none());
+    }
+
+    #[test]
+    fn provider_write_normalizes_custom_profile_user_agent() {
+        let profile = profile_by_id("codex.custom_http").unwrap();
+        let mut custom = stored_provider_with_user_agent("codex.custom_http", " custom-agent/2 ");
+        normalize_provider_outbound_identity(&mut custom, None, profile).unwrap();
+        assert_eq!(
+            custom
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.custom_user_agent.as_deref()),
+            Some("custom-agent/2")
+        );
+    }
+
     #[tokio::test]
     async fn provider_command_persists_profile_revision_and_idempotent_create() {
         let state = test_state();
@@ -10887,6 +11169,42 @@ mod tests {
         assert!(tracker
             .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
             .is_some());
+    }
+
+    #[test]
+    fn device_flow_principal_store_enforces_owner_and_expiry() {
+        let mut store = DeviceFlowPrincipalStore::default();
+        store.insert(
+            ProviderType::CodexOAuth,
+            "device-1".to_string(),
+            "alice:admin".to_string(),
+            2_000,
+            1_000,
+        );
+
+        assert!(store.is_owned_by(ProviderType::CodexOAuth, "device-1", "alice:admin", 1_500));
+        assert!(!store.is_owned_by(ProviderType::CodexOAuth, "device-1", "bob:admin", 1_500));
+        assert!(!store.remove_for_principal(
+            ProviderType::CodexOAuth,
+            "device-1",
+            "bob:admin",
+            1_500
+        ));
+        assert!(store.remove_for_principal(
+            ProviderType::CodexOAuth,
+            "device-1",
+            "alice:admin",
+            1_500
+        ));
+
+        store.insert(
+            ProviderType::GrokOAuth,
+            "device-2".to_string(),
+            "alice:admin".to_string(),
+            2_000,
+            1_000,
+        );
+        assert!(!store.is_owned_by(ProviderType::GrokOAuth, "device-2", "alice:admin", 2_000));
     }
 
     #[test]

@@ -38,6 +38,7 @@ struct OAuthLoginSession {
     status: OAuthLoginStatus,
     authorization_code: Option<String>,
     completed_account_id: Option<String>,
+    principal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,14 @@ pub struct OAuthLoginFinish {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OAuthLoginFinishAttempt<'a> {
+    pub session_id: Option<&'a str>,
+    pub state: Option<&'a str>,
+    pub code: Option<&'a str>,
+    pub execute_token_exchange: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OAuthLoginCancellation {
@@ -113,6 +122,8 @@ pub enum OAuthLoginError {
     NotFound,
     Expired,
     StateMismatch,
+    ProviderMismatch,
+    PrincipalMismatch,
     MissingCode,
     AlreadyConsumed,
     Cancelled,
@@ -127,6 +138,12 @@ impl std::fmt::Display for OAuthLoginError {
             Self::NotFound => formatter.write_str("oauth login session not found"),
             Self::Expired => formatter.write_str("oauth login session expired"),
             Self::StateMismatch => formatter.write_str("oauth login state does not match session"),
+            Self::ProviderMismatch => {
+                formatter.write_str("oauth login session provider does not match request")
+            }
+            Self::PrincipalMismatch => {
+                formatter.write_str("oauth login session belongs to another management principal")
+            }
             Self::MissingCode => formatter.write_str("authorization code is required"),
             Self::AlreadyConsumed => formatter.write_str("oauth login session is already consumed"),
             Self::Cancelled => formatter.write_str("oauth login session was cancelled"),
@@ -145,6 +162,26 @@ impl OAuthLoginStore {
         &mut self,
         provider_type: ProviderType,
         redirect_uri: Option<String>,
+        now_ms: i64,
+    ) -> Result<OAuthLoginStart, OAuthLoginError> {
+        self.start_internal(provider_type, redirect_uri, None, now_ms)
+    }
+
+    pub fn start_for_principal(
+        &mut self,
+        provider_type: ProviderType,
+        redirect_uri: Option<String>,
+        principal_id: String,
+        now_ms: i64,
+    ) -> Result<OAuthLoginStart, OAuthLoginError> {
+        self.start_internal(provider_type, redirect_uri, Some(principal_id), now_ms)
+    }
+
+    fn start_internal(
+        &mut self,
+        provider_type: ProviderType,
+        redirect_uri: Option<String>,
+        principal_id: Option<String>,
         now_ms: i64,
     ) -> Result<OAuthLoginStart, OAuthLoginError> {
         self.cleanup_expired(now_ms);
@@ -191,6 +228,7 @@ impl OAuthLoginStore {
             status: OAuthLoginStatus::Pending,
             authorization_code: None,
             completed_account_id: None,
+            principal_id,
         };
         self.sessions.insert(session_id.clone(), session);
 
@@ -224,15 +262,123 @@ impl OAuthLoginStore {
         execute_token_exchange: bool,
         now_ms: i64,
     ) -> Result<OAuthLoginFinish, OAuthLoginError> {
+        self.finish_internal(
+            OAuthLoginFinishAttempt {
+                session_id,
+                state,
+                code,
+                execute_token_exchange,
+            },
+            OAuthLoginAccess::Unbound,
+            None,
+            now_ms,
+        )
+    }
+
+    pub fn finish_from_oauth_callback(
+        &mut self,
+        state: &str,
+        code: Option<&str>,
+        execute_token_exchange: bool,
+        now_ms: i64,
+    ) -> Result<OAuthLoginFinish, OAuthLoginError> {
+        self.finish_internal(
+            OAuthLoginFinishAttempt {
+                session_id: None,
+                state: Some(state),
+                code,
+                execute_token_exchange,
+            },
+            OAuthLoginAccess::Callback,
+            None,
+            now_ms,
+        )
+    }
+
+    pub fn finish_from_oauth_callback_with_expected_provider(
+        &mut self,
+        state: &str,
+        code: Option<&str>,
+        execute_token_exchange: bool,
+        expected_provider_type: ProviderType,
+        now_ms: i64,
+    ) -> Result<OAuthLoginFinish, OAuthLoginError> {
+        self.finish_internal(
+            OAuthLoginFinishAttempt {
+                session_id: None,
+                state: Some(state),
+                code,
+                execute_token_exchange,
+            },
+            OAuthLoginAccess::Callback,
+            Some(expected_provider_type),
+            now_ms,
+        )
+    }
+
+    pub fn finish_for_principal(
+        &mut self,
+        session_id: Option<&str>,
+        state: Option<&str>,
+        code: Option<&str>,
+        execute_token_exchange: bool,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> Result<OAuthLoginFinish, OAuthLoginError> {
+        self.finish_internal(
+            OAuthLoginFinishAttempt {
+                session_id,
+                state,
+                code,
+                execute_token_exchange,
+            },
+            OAuthLoginAccess::Principal(principal_id),
+            None,
+            now_ms,
+        )
+    }
+
+    pub fn finish_for_principal_with_expected_provider(
+        &mut self,
+        attempt: OAuthLoginFinishAttempt<'_>,
+        principal_id: &str,
+        expected_provider_type: ProviderType,
+        now_ms: i64,
+    ) -> Result<OAuthLoginFinish, OAuthLoginError> {
+        self.finish_internal(
+            attempt,
+            OAuthLoginAccess::Principal(principal_id),
+            Some(expected_provider_type),
+            now_ms,
+        )
+    }
+
+    fn finish_internal(
+        &mut self,
+        attempt: OAuthLoginFinishAttempt<'_>,
+        access: OAuthLoginAccess<'_>,
+        expected_provider_type: Option<ProviderType>,
+        now_ms: i64,
+    ) -> Result<OAuthLoginFinish, OAuthLoginError> {
+        let OAuthLoginFinishAttempt {
+            session_id,
+            state,
+            code,
+            execute_token_exchange,
+        } = attempt;
         self.cleanup_expired(now_ms);
         let session_key = self.session_key(session_id, state)?;
         let session = self
             .sessions
             .get_mut(&session_key)
             .ok_or(OAuthLoginError::NotFound)?;
+        ensure_principal(session, access)?;
         if session.expires_at_ms <= now_ms {
             session.status = OAuthLoginStatus::Expired;
             return Err(OAuthLoginError::Expired);
+        }
+        if expected_provider_type.is_some_and(|expected| expected != session.provider_type) {
+            return Err(OAuthLoginError::ProviderMismatch);
         }
         if session.status == OAuthLoginStatus::TokenExchanged {
             return Ok(OAuthLoginFinish {
@@ -391,15 +537,62 @@ impl OAuthLoginStore {
         state: Option<&str>,
         now_ms: i64,
     ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
+        self.cancel_internal(session_id, state, None, None, now_ms)
+    }
+
+    pub fn cancel_for_principal(
+        &mut self,
+        session_id: Option<&str>,
+        state: Option<&str>,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
+        self.cancel_internal(session_id, state, Some(principal_id), None, now_ms)
+    }
+
+    pub fn cancel_for_principal_with_expected_provider(
+        &mut self,
+        session_id: Option<&str>,
+        state: Option<&str>,
+        principal_id: &str,
+        expected_provider_type: ProviderType,
+        now_ms: i64,
+    ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
+        self.cancel_internal(
+            session_id,
+            state,
+            Some(principal_id),
+            Some(expected_provider_type),
+            now_ms,
+        )
+    }
+
+    fn cancel_internal(
+        &mut self,
+        session_id: Option<&str>,
+        state: Option<&str>,
+        principal_id: Option<&str>,
+        expected_provider_type: Option<ProviderType>,
+        now_ms: i64,
+    ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
         self.cleanup_expired(now_ms);
         let session_key = self.session_key(session_id, state)?;
         let session = self
             .sessions
             .get_mut(&session_key)
             .ok_or(OAuthLoginError::NotFound)?;
+        ensure_principal(
+            session,
+            principal_id
+                .map(OAuthLoginAccess::Principal)
+                .unwrap_or(OAuthLoginAccess::Unbound),
+        )?;
         if session.expires_at_ms <= now_ms {
             session.status = OAuthLoginStatus::Expired;
             return Err(OAuthLoginError::Expired);
+        }
+        if expected_provider_type.is_some_and(|expected| expected != session.provider_type) {
+            return Err(OAuthLoginError::ProviderMismatch);
         }
         match session.status {
             OAuthLoginStatus::Pending | OAuthLoginStatus::TokenRequestPreviewed => {
@@ -425,12 +618,59 @@ impl OAuthLoginStore {
         state: &str,
         now_ms: i64,
     ) -> Result<OAuthSessionPollState, OAuthLoginError> {
+        self.poll_state_internal(None, Some(state), None, now_ms)
+    }
+
+    pub fn poll_state_for_principal(
+        &mut self,
+        session_id: Option<&str>,
+        state: Option<&str>,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> Result<OAuthSessionPollState, OAuthLoginError> {
+        self.poll_state_internal(session_id, state, Some(principal_id), now_ms)
+    }
+
+    pub fn provider_type_for_principal(
+        &mut self,
+        session_id: Option<&str>,
+        state: Option<&str>,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> Result<ProviderType, OAuthLoginError> {
         self.cleanup_expired(now_ms);
+        let session_key = self.session_key(session_id, state)?;
         let session = self
             .sessions
-            .values()
-            .find(|session| session.state == state)
+            .get_mut(&session_key)
             .ok_or(OAuthLoginError::NotFound)?;
+        ensure_principal(session, OAuthLoginAccess::Principal(principal_id))?;
+        if session.expires_at_ms <= now_ms {
+            session.status = OAuthLoginStatus::Expired;
+            return Err(OAuthLoginError::Expired);
+        }
+        Ok(session.provider_type)
+    }
+
+    fn poll_state_internal(
+        &mut self,
+        session_id: Option<&str>,
+        state: Option<&str>,
+        principal_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<OAuthSessionPollState, OAuthLoginError> {
+        self.cleanup_expired(now_ms);
+        let session_key = self.session_key(session_id, state)?;
+        let session = self
+            .sessions
+            .get(&session_key)
+            .ok_or(OAuthLoginError::NotFound)?;
+        ensure_principal(
+            session,
+            principal_id
+                .map(OAuthLoginAccess::Principal)
+                .unwrap_or(OAuthLoginAccess::Unbound),
+        )?;
         if session.expires_at_ms <= now_ms {
             return Err(OAuthLoginError::Expired);
         }
@@ -497,6 +737,29 @@ impl OAuthLoginStore {
     fn cleanup_expired(&mut self, now_ms: i64) {
         self.sessions
             .retain(|_, session| session.expires_at_ms > now_ms);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OAuthLoginAccess<'a> {
+    Unbound,
+    Principal(&'a str),
+    Callback,
+}
+
+fn ensure_principal(
+    session: &OAuthLoginSession,
+    access: OAuthLoginAccess<'_>,
+) -> Result<(), OAuthLoginError> {
+    let Some(expected) = session.principal_id.as_deref() else {
+        return Ok(());
+    };
+    match access {
+        OAuthLoginAccess::Callback => Ok(()),
+        OAuthLoginAccess::Principal(actual) if actual == expected => Ok(()),
+        OAuthLoginAccess::Unbound | OAuthLoginAccess::Principal(_) => {
+            Err(OAuthLoginError::PrincipalMismatch)
+        }
     }
 }
 
@@ -587,6 +850,196 @@ mod tests {
         assert!(login.authorize_url.contains("code_challenge_method=S256"));
         assert!(login.authorize_url.contains("originator=codex_cli_rs"));
         assert_eq!(login.expires_at_ms, 301_000);
+    }
+
+    #[test]
+    fn oauth_session_rejects_another_management_principal() {
+        let mut store = OAuthLoginStore::default();
+        let login = store
+            .start_for_principal(
+                ProviderType::CodexOAuth,
+                Some(super::super::oauth::CODEX_CLI_REDIRECT_URI.to_string()),
+                "owner@example.com:admin".to_string(),
+                1_000,
+            )
+            .unwrap();
+
+        let error = store
+            .finish_for_principal(
+                Some(&login.session_id),
+                Some(&login.state),
+                Some("auth-code"),
+                false,
+                "other@example.com:admin",
+                2_000,
+            )
+            .unwrap_err();
+        assert!(matches!(error, OAuthLoginError::PrincipalMismatch));
+
+        let error = store
+            .finish(
+                Some(&login.session_id),
+                Some(&login.state),
+                Some("auth-code"),
+                false,
+                2_000,
+            )
+            .unwrap_err();
+        assert!(matches!(error, OAuthLoginError::PrincipalMismatch));
+
+        let finish = store
+            .finish_for_principal(
+                Some(&login.session_id),
+                Some(&login.state),
+                Some("auth-code"),
+                false,
+                "owner@example.com:admin",
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(finish.status, OAuthLoginStatus::TokenRequestPreviewed);
+
+        let callback_login = store
+            .start_for_principal(
+                ProviderType::CodexOAuth,
+                Some(super::super::oauth::CODEX_CLI_REDIRECT_URI.to_string()),
+                "owner@example.com:admin".to_string(),
+                3_000,
+            )
+            .unwrap();
+        let finish = store
+            .finish_from_oauth_callback(&callback_login.state, Some("auth-code"), false, 3_001)
+            .unwrap();
+        assert_eq!(finish.status, OAuthLoginStatus::TokenRequestPreviewed);
+    }
+
+    #[test]
+    fn provider_type_lookup_enforces_management_principal() {
+        let mut store = OAuthLoginStore::default();
+        let login = store
+            .start_for_principal(
+                ProviderType::CodexOAuth,
+                Some(super::super::oauth::CODEX_CLI_REDIRECT_URI.to_string()),
+                "owner@example.com:admin".to_string(),
+                1_000,
+            )
+            .unwrap();
+
+        let error = store
+            .provider_type_for_principal(
+                Some(&login.session_id),
+                Some(&login.state),
+                "other@example.com:admin",
+                2_000,
+            )
+            .unwrap_err();
+        assert!(matches!(error, OAuthLoginError::PrincipalMismatch));
+
+        assert_eq!(
+            store
+                .provider_type_for_principal(
+                    Some(&login.session_id),
+                    Some(&login.state),
+                    "owner@example.com:admin",
+                    2_001,
+                )
+                .unwrap(),
+            ProviderType::CodexOAuth
+        );
+    }
+
+    #[test]
+    fn oauth_session_rejects_provider_mismatch_before_consuming_code() {
+        let mut store = OAuthLoginStore::default();
+        let login = store
+            .start_for_principal(
+                ProviderType::CodexOAuth,
+                Some(super::super::oauth::CODEX_CLI_REDIRECT_URI.to_string()),
+                "owner@example.com:admin".to_string(),
+                1_000,
+            )
+            .unwrap();
+
+        let error = store
+            .finish_for_principal_with_expected_provider(
+                OAuthLoginFinishAttempt {
+                    session_id: Some(&login.session_id),
+                    state: Some(&login.state),
+                    code: Some("wrong-provider-code"),
+                    execute_token_exchange: true,
+                },
+                "owner@example.com:admin",
+                ProviderType::ClaudeOAuth,
+                2_000,
+            )
+            .unwrap_err();
+        assert!(matches!(error, OAuthLoginError::ProviderMismatch));
+
+        let finish = store
+            .finish_for_principal_with_expected_provider(
+                OAuthLoginFinishAttempt {
+                    session_id: Some(&login.session_id),
+                    state: Some(&login.state),
+                    code: Some("correct-provider-code"),
+                    execute_token_exchange: false,
+                },
+                "owner@example.com:admin",
+                ProviderType::CodexOAuth,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(finish.status, OAuthLoginStatus::TokenRequestPreviewed);
+        assert_eq!(
+            finish
+                .token_request
+                .as_ref()
+                .and_then(|request| request.body.get("code"))
+                .and_then(Value::as_str),
+            Some("correct-provider-code")
+        );
+    }
+
+    #[test]
+    fn oauth_callback_rejects_provider_mismatch_before_consuming_code() {
+        let mut store = OAuthLoginStore::default();
+        let login = store
+            .start_for_principal(
+                ProviderType::ClaudeOAuth,
+                Some("http://localhost:54545/web-api/oauth/claude-cli/callback".to_string()),
+                "owner@example.com:admin".to_string(),
+                1_000,
+            )
+            .unwrap();
+
+        let error = store
+            .finish_from_oauth_callback_with_expected_provider(
+                &login.state,
+                Some("wrong-provider-code"),
+                true,
+                ProviderType::CodexOAuth,
+                2_000,
+            )
+            .unwrap_err();
+        assert!(matches!(error, OAuthLoginError::ProviderMismatch));
+
+        let finish = store
+            .finish_from_oauth_callback_with_expected_provider(
+                &login.state,
+                Some("correct-provider-code"),
+                false,
+                ProviderType::ClaudeOAuth,
+                2_001,
+            )
+            .unwrap();
+        assert_eq!(finish.status, OAuthLoginStatus::TokenRequestPreviewed);
+        assert_eq!(
+            finish
+                .token_request
+                .as_ref()
+                .and_then(|request| request.body.get("code"))
+                .and_then(Value::as_str),
+            Some("correct-provider-code")
+        );
     }
 
     #[test]
@@ -813,6 +1266,41 @@ mod tests {
             store.poll_state_by_oauth_state(&login.state, 2_003),
             Err(OAuthLoginError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn oauth_session_cancel_rejects_provider_mismatch_before_mutation() {
+        let mut store = OAuthLoginStore::default();
+        let login = store
+            .start_for_principal(
+                ProviderType::CodexOAuth,
+                Some(super::super::oauth::CODEX_CLI_REDIRECT_URI.to_string()),
+                "owner@example.com:admin".to_string(),
+                1_000,
+            )
+            .unwrap();
+
+        let error = store
+            .cancel_for_principal_with_expected_provider(
+                Some(&login.session_id),
+                Some(&login.state),
+                "owner@example.com:admin",
+                ProviderType::ClaudeOAuth,
+                2_000,
+            )
+            .unwrap_err();
+        assert!(matches!(error, OAuthLoginError::ProviderMismatch));
+
+        let cancelled = store
+            .cancel_for_principal_with_expected_provider(
+                Some(&login.session_id),
+                Some(&login.state),
+                "owner@example.com:admin",
+                ProviderType::CodexOAuth,
+                2_001,
+            )
+            .unwrap();
+        assert_eq!(cancelled.status, OAuthLoginStatus::Cancelled);
     }
 
     #[test]

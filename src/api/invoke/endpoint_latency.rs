@@ -62,6 +62,7 @@ async fn probe_endpoint(
         .timeout(timeout)
         .header("accept", "*/*")
         .header("accept-encoding", "identity")
+        .header("user-agent", crate::provider_identity::server_user_agent())
         .send()
         .await
     {

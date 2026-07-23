@@ -28,6 +28,27 @@ export type ProviderAuthScheme =
   | "custom_header"
   | "query";
 
+export type ProviderOutboundIdentityPolicy =
+  | {
+      kind: "managed_identity";
+      family:
+        | "claude_code"
+        | "codex_cli"
+        | "grok_cli"
+        | "kiro"
+        | "cursor"
+        | "copilot"
+        | "deepseek";
+    }
+  | { kind: "managed_version"; family: "antigravity" }
+  | {
+      kind:
+        | "server_identity"
+        | "omit"
+        | "custom_override"
+        | "legacy_frozen";
+    };
+
 export type ProviderCredentialPolicy =
   | { mode: "managed_account"; accountProviderType: string }
   | { mode: "static_secret"; slots: string[]; authScheme: ProviderAuthScheme }
@@ -70,6 +91,7 @@ export interface ProviderRegistryDriver {
     "supported" | "unsupported"
   >;
   capabilities: { stream: boolean; tools: boolean; images: boolean };
+  outboundIdentityPolicy: ProviderOutboundIdentityPolicy;
   optionSchemaId: string;
 }
 
@@ -79,6 +101,7 @@ export interface ProviderCustomPolicy {
   protocols: ProviderUpstreamProtocol[];
   authSchemes: ProviderAuthScheme[];
   allowedDriverIds: string[];
+  outboundIdentityPolicy: ProviderOutboundIdentityPolicy;
 }
 
 export interface ProviderRegistrySnapshot {

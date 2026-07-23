@@ -42,7 +42,9 @@ market or direct share URL
 - 已接入 Claude/Codex/Gemini/OpenAI-compatible/Gemini-native/Anthropic-native 之间的主要跨协议 adapter contract，并把 OpenRouter、Ollama、Nvidia、DeepSeek、SubRouter、OpenCode Go 等 preset 纳入 coverage。
 - Cursor 三入口保持 AgentService planned；已移植协议、请求、事件、tool、h2、session、identity、image 前置层，并在显式 opt-in 下接入 Claude/Codex/Gemini AgentService driver。
 - GitHub Copilot 和 Kiro 已提供 device flow 静态导入路径；真实 token refresh、live models、usage 和 proxy 回归完成前仍保持 fallback/manual-import。
-- Codex、Claude、Gemini、Ollama、Antigravity/Agy 等账号在手动导入 refresh token 后可执行 server-native refresh/profile/quota；proxy 转发前会自动刷新临近过期的 managed account。
+- Codex 同时支持 Device OAuth 与官方 CLI PKCE OAuth；远程 HTTPS Client URL 可在浏览器 localhost 回调失败后，将完整 callback URL 提交回 Server 完成认证。浏览器和 device flow 的 start/poll/cancel 都绑定发起登录的管理员主体及短期有效期。Codex、Claude、Gemini、Ollama、Antigravity/Agy 等账号可执行 server-native refresh/profile/quota。
+- Managed OAuth Provider 必须显式绑定账号；自动路由按账号占用比例、quota/cooldown/concurrency 和 session affinity 选择候选，HTTP/SSE/Images/WebSocket 的首个 401 会在同账号强刷一次，仍失败才进入冷却或 Provider failover。
+- Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接或首业务事件前的传输失败/超时可回退到同账号 HTTP/SSE，首事件后切换为空闲超时并且绝不透明重放。
 - 支持 router installation register、client tunnel、share tunnel、share batch sync、installation 级公开收款资料同步、direct share request log sync、pending share edit pull/ack/event 监听。
 - 支持 share-market grant add/revoke 通过 router pending edit 应用到 server share，并同步 per-app 授权展示状态。
 - usage log 记录 requestId、sessionId、source、provider、model、stream status、cache/usage detail，并提供 summary/trends/provider/model stats。
@@ -60,7 +62,7 @@ market or direct share URL
 | Code Agent | 反代入口 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | **Claude Code** | `POST /v1/messages` | ✅ Native | Anthropic Messages 原生转发；支持 Claude/Codex/Gemini/OpenRouter 等跨协议 adapter |
-| **Codex CLI** | `POST /v1/responses`、`POST /v1/chat/completions`、`POST /v1/images/generations` | ✅ Native | Responses 与 Chat Completions 互转；Codex OAuth device flow 与 image-generation bridge 已接线 |
+| **Codex CLI** | `POST /v1/responses`、`GET /v1/responses` (WebSocket)、`POST /v1/chat/completions`、`POST /v1/images/generations` | ✅ Native | Responses/Chat 互转；Device + CLI OAuth；有界 WS cache 与提交前 HTTP/SSE fallback |
 | **Gemini CLI** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 透传；`GET /v1beta/models` 等列表端点已覆盖 |
 | **OpenAI-compatible** | `GET /v1/models`、`GET /models` | ✅ Native | 模型列表与 OpenAI-compatible 探测 |
 | **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | ⚠️ Partial | OAuth/模型列表已接入；无独立 `/antigravity/v1*` 路由组 |
@@ -93,7 +95,7 @@ market or direct share URL
 | **核心 4（Claude/Codex/Gemini/Antigravity）均分** | 7.50 | **9.58** | 8.63 | 8.50 | 6.75 | 8.05 | **7.70** | 0 |
 | **IDE 体验类 4（Cursor/Copilot/Kiro/Qoder）均分** | 8.25 | 0 | 8.50 | 0.63 | 4.88 | 6.50 | **5.88** | 2.30 |
 
-> **cc-switch-server 的产品边界**：不依赖 Tauri 桌面运行时，**不提供 Claude Code 热切换**（需重启 CLI 使 provider 变更生效）；OAuth 浏览器登录部分能力仍待 Server-native 接线；提供 share/router 隧道、Web 管理面、remote usage 同步与多租户 share binding。Cursor/Kiro/Copilot/DeepSeek 等跨厂商后端桥由本仓库独立维护，capability 升级以 Server 契约和真实验收为 gate。
+> **cc-switch-server 的产品边界**：不依赖 Tauri 桌面运行时，**不提供 Claude Code 热切换**（需重启 CLI 使 provider 变更生效）；提供 Server-native OAuth、share/router 隧道、Web 管理面、remote usage 同步与多租户 share binding。Cursor/Kiro/Copilot/DeepSeek 等跨厂商后端桥由本仓库独立维护，capability 升级以 Server 契约和真实验收为 gate。
 >
 > 其他项目分数摘自本地 `proxy` 目录静态分析（2026-07）；`cockpit-tools` 反代能力继承自内嵌 CLIProxyAPI sidecar，自身侧重账号管理 GUI。
 
@@ -143,6 +145,16 @@ curl -fsS -X POST http://127.0.0.1:15721/api/setup/bootstrap \
 ```
 
 `clientTunnelSubdomain` 留空时，server 会生成可读的随机单词子域名并尽量在 Router 上验证可用性。响应中的 `sessionToken` 可直接作为 Bearer token 使用。
+
+### 远程 OpenAI CLI OAuth
+
+通过非本机 Client URL 管理 Server 时，OpenAI 仍只接受官方 `http://localhost:1455/auth/callback`，Server 不替换或伪造 redirect URI。Web 管理面在 HTTPS 下提供安全的手工回传流程：
+
+1. 在 Codex OAuth 账号区选择 CLI OAuth 并打开授权链接。
+2. 浏览器授权后会跳转到本机 `localhost:1455`；页面不可达是远程部署下的预期现象。
+3. 从地址栏提交完整的 `http://localhost:1455/auth/callback?code=...&state=...` URL，Server 校验固定 scheme/host/port/path、state、当前管理员主体和会话期限后交换 token。
+
+只有 Server 实际绑定 loopback 地址、请求未经过 forwarded host 且 `Host` 也是 loopback 时才允许本机例外；监听 `0.0.0.0`、`::` 或其他非 loopback 地址时，伪造 loopback `Host` 不会降级安全要求。非 loopback Client URL 必须是 Server 配置中的 HTTPS Client URL，并由同源 Web 页面发起；只接受完整 callback URL，不接受裸 code。Device OAuth 保持可用。`GET /api/accounts` 等控制面响应只返回凭据存在性和运行状态，不返回或导出 access/refresh/id token、API key、extra headers、profile 或 raw 上游载荷。
 
 或使用 CLI 在启动 HTTP 前写本地配置：
 
@@ -280,10 +292,12 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | 日志级别 | `--log-level` / `CC_SWITCH_SERVER_LOG`，默认 `info` |
 | Router 心跳 | `CC_SWITCH_SERVER_ROUTER_HEARTBEAT_INTERVAL_SECS`，默认 `60` 秒，实际发送间隔带 ±10% jitter（允许范围 `15`-`60` 秒） |
 | OAuth client | Gemini 浏览器登录需要 `CC_SWITCH_SERVER_GEMINI_CLIENT_ID` / `CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET`；Antigravity/Agy 浏览器登录需要 `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID` / `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET` |
-| Claude OAuth 并发 | 每账号默认最多 8 个 in-flight 请求；provider 可设置 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS`，全局可用 `CC_SWITCH_ACCOUNT_MAX_CONCURRENT` 覆盖，设为 `0` 关闭 |
+| Managed OAuth 并发 | 每账号默认最多 8 个 in-flight 请求；provider 可设置 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS`，全局可用 `CC_SWITCH_ACCOUNT_MAX_CONCURRENT` 覆盖，设为 `0` 关闭 |
+| Streaming 超时 | Provider 默认首业务事件超时 120 秒、后续事件空闲超时 300 秒；`STREAM_FIRST_BYTE_TIMEOUT_MS` / `UPSTREAM_STREAM_FIRST_BYTE_TIMEOUT_MS` 和 `STREAM_IDLE_TIMEOUT_MS` / `UPSTREAM_STREAM_IDLE_TIMEOUT_MS` 可覆盖，设为 `0` 关闭对应超时 |
 | Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
+| Codex WebSocket cache | 默认最多缓存 64 条空闲连接，idle TTL 5 分钟、max age 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 可覆盖，provider 的 `codexWebsocketEnabled=false` 可紧急关闭 WS |
 | OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出其固定 Provider 内的账号调度；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
-| Prometheus | `GET /metrics` 暴露账号并发、Claude 同 Provider retry、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
+| Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
 | 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_MARKET_GRANT_TOKEN` |
 | stream 验收 | `STREAM_PROBE`、`REQUIRE_STREAM_USAGE` |
 | release readiness | `RUN_REAL`、`RUN_DEPLOYMENT_TESTS` |

@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::{oauth_error_public_message, redact_account_public_diagnostic};
 use crate::domain::accounts::store::Account;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -348,6 +349,7 @@ pub(crate) async fn refresh_share_usage_item(
                 }
             }
             Err(error) => {
+                let public_error = oauth_error_public_message(error.kind).to_string();
                 let updated = state
                     .mutate_accounts_debounced(|accounts| {
                         accounts.mark_native_refresh_failure(
@@ -379,7 +381,7 @@ pub(crate) async fn refresh_share_usage_item(
                     auth_provider,
                     account_id: Some(account_id),
                     refreshed: false,
-                    error: Some(error.message),
+                    error: Some(public_error),
                     message: None,
                 };
             }
@@ -399,6 +401,7 @@ pub(crate) async fn refresh_share_usage_item(
     .await
     {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
+            let public_message = redact_account_public_diagnostic(&active_account, &message);
             let updated = state
                 .mutate_accounts_debounced(|accounts| {
                     accounts.mark_refresh_success(&active_account.id, update)
@@ -430,10 +433,11 @@ pub(crate) async fn refresh_share_usage_item(
                 ),
                 refreshed: updated.is_some(),
                 error: updated.is_none().then(|| "account_not_found".to_string()),
-                message: updated.map(|_| message),
+                message: updated.map(|_| public_message),
             }
         }
         Ok(QuotaRefreshResult::SkippedCooldown { message, .. }) => {
+            let public_error = redact_account_public_diagnostic(&active_account, &message);
             if let Err(error) = state
                 .refresh_account_runtime_metadata_if_changed(
                     &account_before_refresh,
@@ -454,11 +458,12 @@ pub(crate) async fn refresh_share_usage_item(
                 auth_provider,
                 account_id: Some(account_id),
                 refreshed: false,
-                error: Some(message),
+                error: Some(public_error),
                 message: None,
             }
         }
         Err(error) => {
+            let public_error = redact_account_public_diagnostic(&active_account, &error.message);
             let updated = mark_quota_refresh_error(state, &active_account.id, &error).await;
             if let Some(updated) = updated {
                 if let Err(sync_error) = state
@@ -479,7 +484,7 @@ pub(crate) async fn refresh_share_usage_item(
                 auth_provider,
                 account_id: Some(account_id),
                 refreshed: false,
-                error: Some(error.message),
+                error: Some(public_error),
                 message: None,
             }
         }

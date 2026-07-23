@@ -1,6 +1,6 @@
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::cache_injector::{inject_prompt_cache, CacheInjectionConfig};
@@ -13,6 +13,7 @@ use super::request_governance::{govern_request_body, RequestGovernanceConfig};
 use super::thinking::{apply_thinking_pipeline, ThinkingPipelineConfig};
 use super::{join_url, setting, transforms, ProxyError, ProxyRoute};
 use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
+use crate::domain::accounts::oauth::oauth_provider_spec;
 use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
@@ -104,6 +105,7 @@ pub struct AdapterRequest {
     pub actual_model_source: Option<String>,
     pub stream_requested: bool,
     pub custom_tool_names: BTreeSet<String>,
+    pub claude_tool_name_map: BTreeMap<String, String>,
 }
 
 type CopilotPreflightResult = (Bytes, Vec<(&'static str, String)>, Option<&'static str>);
@@ -265,6 +267,7 @@ impl GenericForwardingAdapter {
             stream_requested,
             upstream_headers,
             custom_tool_names,
+            claude_tool_name_map: Default::default(),
         })
     }
 
@@ -451,6 +454,7 @@ pub(super) fn cursor_agentservice_request(
         actual_model_source: model.actual_model_source,
         stream_requested,
         custom_tool_names,
+        claude_tool_name_map: Default::default(),
     })
 }
 
@@ -2202,6 +2206,16 @@ fn apply_auth_headers(
         AppKind::Gemini => setting(provider, &["GEMINI_API_KEY", "GOOGLE_API_KEY", "API_KEY"]),
     };
     let provider_secret_configured = provider_secret.is_some();
+    if !provider_secret_configured
+        && account_id.is_none()
+        && oauth_provider_spec(stored.provider_type)
+            .is_some_and(|spec| spec.server_native_refresh_enabled() && !spec.token_urls.is_empty())
+    {
+        return Err(ProxyError::bad_request(format!(
+            "{} managed account binding is required",
+            stored.provider_type.as_str()
+        )));
+    }
     let bound_account = (!provider_secret_configured)
         .then(|| accounts.find_for_provider(stored.provider_type, account_id))
         .flatten();
@@ -2300,43 +2314,7 @@ fn apply_auth_headers(
 fn codex_oauth_chatgpt_account_id(
     account: &crate::domain::accounts::store::Account,
 ) -> Option<String> {
-    if let Some(workspace_id) =
-        crate::domain::accounts::store::effective_codex_workspace_id(account)
-    {
-        return Some(workspace_id);
-    }
-    account
-        .profile
-        .as_ref()
-        .and_then(codex_oauth_chatgpt_account_id_from_value)
-        .or_else(|| {
-            account
-                .raw
-                .as_ref()
-                .and_then(codex_oauth_chatgpt_account_id_from_value)
-        })
-}
-
-fn codex_oauth_chatgpt_account_id_from_value(value: &Value) -> Option<String> {
-    [
-        "/chatgpt_account_id",
-        "/chatgptAccountId",
-        "/openai_auth/chatgpt_account_id",
-        "/openaiAuth/chatgptAccountId",
-        "/accountId",
-        "/account_id",
-        "/raw/chatgpt_account_id",
-        "/raw/openai_auth/chatgpt_account_id",
-    ]
-    .into_iter()
-    .find_map(|pointer| {
-        value
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-    })
+    crate::domain::accounts::store::effective_codex_workspace_id(account)
 }
 
 fn apply_common_provider_headers(
@@ -2344,32 +2322,6 @@ fn apply_common_provider_headers(
     provider: &crate::domain::providers::model::Provider,
     provider_type: ProviderType,
 ) {
-    if provider_type == ProviderType::CodexOAuth {
-        if !headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-        {
-            let user_agent = provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.custom_user_agent.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(crate::codex_identity::default_user_agent);
-            headers.push(("user-agent", user_agent));
-        }
-    } else if provider_type != ProviderType::GitHubCopilot {
-        if let Some(user_agent) = provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.custom_user_agent.as_deref())
-            .filter(|value| !value.trim().is_empty())
-        {
-            headers.push(("user-agent", user_agent.trim().to_string()));
-        }
-    }
-
     if provider_type == ProviderType::OpenRouter {
         if let Some(referer) = setting(provider, &["OPENROUTER_SITE_URL", "HTTP_REFERER"]) {
             headers.push(("http-referer", referer));
@@ -4817,9 +4769,9 @@ mod tests {
         assert!(headers
             .iter()
             .any(|item| item == &("x-title", "cc-switch-server".to_string())));
-        assert!(headers
+        assert!(!headers
             .iter()
-            .any(|item| item == &("user-agent", "cc-switch-server-test".to_string())));
+            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent")));
     }
 
     #[test]
@@ -5257,7 +5209,11 @@ mod tests {
         accounts.accounts.push(codex_oauth_account(
             "acct-1",
             "access-token",
-            json!({"accountId": "chatgpt-account-1"}),
+            json!({
+                "verifiedOpenAiClaims": {
+                    "chatgpt_account_id": "chatgpt-account-1"
+                }
+            }),
         ));
 
         let headers = adapter_for(AppKind::Codex, ProviderType::CodexOAuth)
@@ -5750,6 +5706,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: true,
             custom_tool_names: Default::default(),
+            claude_tool_name_map: Default::default(),
         };
         let plan =
             bedrock_sigv4_request_plan(&stored, &request, "20260701", "20260701T000000Z").unwrap();
@@ -5818,6 +5775,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
+            claude_tool_name_map: Default::default(),
         };
 
         let signed =
@@ -5902,6 +5860,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
+            claude_tool_name_map: Default::default(),
         };
         let signed =
             bedrock_sigv4_signed_request_parts(&stored, &request, "20260701", "20260701T000000Z")
@@ -6009,6 +5968,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
+            claude_tool_name_map: Default::default(),
         };
 
         let plan =

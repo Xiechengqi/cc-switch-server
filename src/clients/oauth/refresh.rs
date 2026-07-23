@@ -268,31 +268,41 @@ async fn execute_native_account_refresh_inner(
                     "OAuth refresh response is missing token fields: {error}"
                 ))
             })?;
-        let verified_openai_claims = if account.provider_type == ProviderType::CodexOAuth {
-            if let Some(id_token) = token_response.id_token.as_deref() {
-                Some(
-                    crate::clients::oauth::openai_jwks::verify_openai_id_token(http, id_token)
-                        .await
-                        .map_err(|error| AccountRefreshFailure {
-                            status_code: 400,
-                            message: error.to_string(),
-                            kind: OAuthErrorKind::InvalidGrant,
-                            retryable: false,
-                        })?,
-                )
-            } else {
-                None
-            }
+        let verified_openai_identity = if account.provider_type == ProviderType::CodexOAuth {
+            let verified = crate::clients::oauth::openai_jwks::verify_openai_identity_tokens(
+                http,
+                token_response.id_token.as_deref(),
+                &token_response.access_token,
+            )
+            .await
+            .map_err(|error| AccountRefreshFailure {
+                status_code: 400,
+                message: error.to_string(),
+                kind: OAuthErrorKind::InvalidGrant,
+                retryable: false,
+            })?;
+            ensure_openai_refresh_subject_matches(account, &verified.identity)?;
+            Some(verified)
         } else {
             None
         };
-        let mut update = refresh_update_from_token_response(
-            account.provider_type,
-            &token_response,
-            raw,
-            now_ms,
-            quota_refresh_interval_ms,
-        );
+        let mut update = if let Some(verified) = verified_openai_identity.as_ref() {
+            crate::domain::accounts::oauth::refresh_update_from_verified_openai_token_response(
+                &token_response,
+                raw,
+                &verified.identity,
+                now_ms,
+                quota_refresh_interval_ms,
+            )
+        } else {
+            refresh_update_from_token_response(
+                account.provider_type,
+                &token_response,
+                raw,
+                now_ms,
+                quota_refresh_interval_ms,
+            )
+        };
 
         if let Some(profile_request) =
             build_profile_request(account.provider_type, &token_response.access_token)
@@ -309,10 +319,16 @@ async fn execute_native_account_refresh_inner(
                 .await,
             );
         }
-        if let Some(claims) = verified_openai_claims {
+        if let Some(verified) = verified_openai_identity {
+            if verified.identity.email.is_some() {
+                update.email = verified.identity.email;
+            }
+            if verified.identity.plan_type.is_some() {
+                update.subscription_level = verified.identity.plan_type;
+            }
             crate::domain::accounts::store::set_verified_openai_claims(
                 &mut update.profile,
-                Some(claims),
+                Some(verified.canonical_claims),
             );
         }
 
@@ -322,6 +338,40 @@ async fn execute_native_account_refresh_inner(
     Err(last_error.unwrap_or_else(|| {
         AccountRefreshFailure::bad_request("OAuth refresh did not produce a request")
     }))
+}
+
+fn ensure_openai_refresh_subject_matches(
+    account: &Account,
+    refreshed_identity: &crate::domain::accounts::oauth::OAuthIdentity,
+) -> Result<(), AccountRefreshFailure> {
+    let existing_subject = account
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.pointer("/verifiedOpenAiClaims/subject"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty());
+    let refreshed_subject = refreshed_identity
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+        .ok_or_else(|| AccountRefreshFailure {
+            status_code: 400,
+            message: "OpenAI OAuth refresh did not produce a verified subject".to_string(),
+            kind: OAuthErrorKind::InvalidGrant,
+            retryable: false,
+        })?;
+
+    if existing_subject.is_some_and(|subject| subject != refreshed_subject) {
+        return Err(AccountRefreshFailure {
+            status_code: 400,
+            message: "OpenAI OAuth refresh subject does not match the existing account".to_string(),
+            kind: OAuthErrorKind::InvalidGrant,
+            retryable: false,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -833,6 +883,35 @@ mod tests {
         let mut relogin = account(ProviderType::CodexOAuth, None, Some("refresh"), None);
         relogin.needs_relogin = true;
         assert!(!account_needs_native_refresh(&relogin, now_ms));
+    }
+
+    #[test]
+    fn openai_refresh_rejects_verified_subject_switch_but_allows_legacy_migration() {
+        let mut existing = account(
+            ProviderType::CodexOAuth,
+            Some("access"),
+            Some("refresh"),
+            None,
+        );
+        existing.profile = Some(serde_json::json!({
+            "verifiedOpenAiClaims": {"subject": "subject-a"}
+        }));
+        let matching = crate::domain::accounts::oauth::OAuthIdentity {
+            subject: Some("subject-a".to_string()),
+            ..Default::default()
+        };
+        ensure_openai_refresh_subject_matches(&existing, &matching).unwrap();
+
+        let switched = crate::domain::accounts::oauth::OAuthIdentity {
+            subject: Some("subject-b".to_string()),
+            ..Default::default()
+        };
+        let error = ensure_openai_refresh_subject_matches(&existing, &switched).unwrap_err();
+        assert_eq!(error.kind, OAuthErrorKind::InvalidGrant);
+        assert!(!error.retryable);
+
+        existing.profile = None;
+        ensure_openai_refresh_subject_matches(&existing, &switched).unwrap();
     }
 
     #[test]

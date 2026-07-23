@@ -1417,7 +1417,10 @@
     "logoutAll": "注销所有账号",
     "retry": "重试",
     "copyCode": "复制代码",
-    "cliUnavailableInRemoteWeb": "远程 Web 模式下 localhost 回调不可达，请使用 Device Code",
+    "cliUnavailableInRemoteWeb": "CLI OAuth 仅可通过本机 loopback 或已配置的 HTTPS Client URL 使用，请改用 Device Code",
+    "waitingForManualCallback": "完成授权后，提交浏览器地址栏中的回调 URL",
+    "callbackUrl": "回调 URL",
+    "submitCallback": "提交",
     "imageGeneration": "生成图片",
     "imageGenerationDescription": "通过 ChatGPT Codex 后端启用 OpenAI 兼容的 /v1/images/generations 接口。",
     "imageToolStripPolicy": "图片工具策略",
@@ -3288,7 +3291,8 @@
       "invalidHeader": "Header 名称无效：{{name}}",
       "managedHeader": "Header 由驱动管理：{{name}}",
       "duplicateHeader": "Header 名称重复：{{name}}",
-      "headerValueRequired": "请填写 Header {{name}} 的值"
+      "headerValueRequired": "请填写 Header {{name}} 的值",
+      "invalidUserAgent": "User-Agent 不能包含换行或其他控制字符"
     },
     "credentials": {
       "title": "认证凭据",

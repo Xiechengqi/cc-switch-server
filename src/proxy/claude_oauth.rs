@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hasher;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,9 +34,30 @@ const KNOWN_SAFE_CLIENT_BETAS: &[&str] = &[
 const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
 const CLAUDE_CACHE_TTL_ENV: &str = "CC_SWITCH_CLAUDE_CACHE_TTL";
 const CLAUDE_CODE_PROMPT_MATCH_THRESHOLD: f64 = 0.5;
+const CLAUDE_CODE_TOOL_NAMES: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
 pub(crate) struct ClaudeForwardContract {
     pub headers: Vec<(&'static str, String)>,
     pub session_id: Option<String>,
+    pub tool_name_map: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +146,7 @@ fn apply_forward_contract_inner(
     let mut session_id = claude_session_id_from_headers(client_headers);
     let mut body_shape = None;
     let mut internal_betas = Vec::new();
+    let mut tool_name_map = BTreeMap::new();
     if !body.is_empty() {
         let mut value = serde_json::from_slice(body).map_err(|error| {
             ProxyError::bad_request(format!(
@@ -138,6 +160,7 @@ fn apply_forward_contract_inner(
             ensure_claude_metadata_user_id(&mut value, identity_seed, session_id);
         }
         value = normalize_claude_code_identity(value);
+        tool_name_map = normalize_claude_oauth_tool_names(&mut value)?;
         if let Some(stage) = retry_stage {
             apply_body_retry_stage_unsigned(&mut value, stage);
         }
@@ -167,7 +190,271 @@ fn apply_forward_contract_inner(
     Ok(ClaudeForwardContract {
         headers,
         session_id,
+        tool_name_map,
     })
+}
+
+fn normalize_claude_oauth_tool_names(
+    body: &mut Value,
+) -> Result<BTreeMap<String, String>, ProxyError> {
+    let mut aliases = BTreeMap::new();
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            let Some(original) = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let lookup = original.to_ascii_lowercase();
+            if aliases
+                .get(&lookup)
+                .is_some_and(|existing| existing != &original)
+            {
+                return Err(ProxyError::bad_request(format!(
+                    "Claude tool names collide case-insensitively: {original}"
+                )));
+            }
+            aliases.insert(lookup, original);
+            canonicalize_claude_code_tool_name_field(tool, "name");
+        }
+    }
+    if let Some(tool_choice) = body.get_mut("tool_choice") {
+        canonicalize_claude_code_tool_name_field(tool_choice, "name");
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for block in blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("tool_use" | "server_tool_use") => {
+                        canonicalize_claude_code_tool_name_field(block, "name");
+                    }
+                    Some("tool_reference") => {
+                        canonicalize_claude_code_tool_name_field(block, "tool_name");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(aliases)
+}
+
+fn canonicalize_claude_code_tool_name_field(value: &mut Value, field: &str) {
+    let Some(name) = value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    let Some(canonical) = CLAUDE_CODE_TOOL_NAMES
+        .iter()
+        .copied()
+        .find(|canonical| canonical.eq_ignore_ascii_case(name))
+    else {
+        return;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(field.to_string(), Value::String(canonical.to_string()));
+    }
+}
+
+pub(crate) fn restore_claude_tool_names_in_response_bytes(
+    body: Bytes,
+    aliases: &BTreeMap<String, String>,
+) -> Bytes {
+    if aliases.is_empty() {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    if !restore_claude_tool_names_in_value(&mut value, aliases) {
+        return body;
+    }
+    serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
+}
+
+fn restore_claude_tool_names_in_value(
+    value: &mut Value,
+    aliases: &BTreeMap<String, String>,
+) -> bool {
+    let Value::Object(object) = value else {
+        if let Value::Array(items) = value {
+            return items.iter_mut().fold(false, |changed, item| {
+                restore_claude_tool_names_in_value(item, aliases) | changed
+            });
+        }
+        return false;
+    };
+
+    let mut changed = false;
+    if object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| {
+            matches!(
+                kind,
+                "tool_use"
+                    | "server_tool_use"
+                    | "function_call"
+                    | "custom_tool_call"
+                    | "mcp_tool_call"
+            )
+        })
+    {
+        changed |= restore_claude_tool_name_field(object, "name", aliases);
+    }
+    for nested_key in ["function", "functionCall", "function_call"] {
+        if let Some(nested) = object.get_mut(nested_key).and_then(Value::as_object_mut) {
+            changed |= restore_claude_tool_name_field(nested, "name", aliases);
+        }
+    }
+    for child in object.values_mut() {
+        changed |= restore_claude_tool_names_in_value(child, aliases);
+    }
+    changed
+}
+
+fn restore_claude_tool_name_field(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    aliases: &BTreeMap<String, String>,
+) -> bool {
+    let Some(current) = object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return false;
+    };
+    let Some(original) = aliases.get(&current.to_ascii_lowercase()) else {
+        return false;
+    };
+    if current == original {
+        return false;
+    }
+    object.insert(field.to_string(), Value::String(original.clone()));
+    true
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ClaudeToolNameStreamPatcher {
+    aliases: BTreeMap<String, String>,
+    buffer: Vec<u8>,
+}
+
+impl ClaudeToolNameStreamPatcher {
+    pub(crate) fn new(aliases: BTreeMap<String, String>) -> Self {
+        Self {
+            aliases,
+            buffer: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, chunk: Bytes) -> Bytes {
+        if self.aliases.is_empty() {
+            return chunk;
+        }
+        self.buffer.extend_from_slice(&chunk);
+        self.drain(false)
+    }
+
+    pub(crate) fn finish(&mut self) -> Bytes {
+        if self.aliases.is_empty() {
+            return Bytes::new();
+        }
+        self.drain(true)
+    }
+
+    fn drain(&mut self, finish: bool) -> Bytes {
+        let mut output = Vec::new();
+        while let Some((event_end, delimiter_len)) = claude_sse_event_boundary(&self.buffer) {
+            let event = self.buffer[..event_end].to_vec();
+            let delimiter = self.buffer[event_end..event_end + delimiter_len].to_vec();
+            self.buffer.drain(..event_end + delimiter_len);
+            output.extend_from_slice(&rewrite_claude_sse_event(&event, &self.aliases));
+            output.extend_from_slice(&delimiter);
+        }
+        if finish && !self.buffer.is_empty() {
+            let event = std::mem::take(&mut self.buffer);
+            output.extend_from_slice(&rewrite_claude_sse_event(&event, &self.aliases));
+        }
+        Bytes::from(output)
+    }
+}
+
+fn claude_sse_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len() {
+        if buffer.get(index..index + 2) == Some(b"\n\n") {
+            return Some((index, 2));
+        }
+        if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+    }
+    None
+}
+
+fn rewrite_claude_sse_event(event: &[u8], aliases: &BTreeMap<String, String>) -> Vec<u8> {
+    let Some((payload_start, payload_end)) = single_sse_data_payload_range(event) else {
+        let Ok(mut value) = serde_json::from_slice::<Value>(event) else {
+            return event.to_vec();
+        };
+        if !restore_claude_tool_names_in_value(&mut value, aliases) {
+            return event.to_vec();
+        }
+        return serde_json::to_vec(&value).unwrap_or_else(|_| event.to_vec());
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(&event[payload_start..payload_end]) else {
+        return event.to_vec();
+    };
+    if !restore_claude_tool_names_in_value(&mut value, aliases) {
+        return event.to_vec();
+    }
+    let Ok(payload) = serde_json::to_vec(&value) else {
+        return event.to_vec();
+    };
+    let mut output = Vec::with_capacity(event.len() + payload.len());
+    output.extend_from_slice(&event[..payload_start]);
+    output.extend_from_slice(&payload);
+    output.extend_from_slice(&event[payload_end..]);
+    output
+}
+
+fn single_sse_data_payload_range(event: &[u8]) -> Option<(usize, usize)> {
+    let mut cursor = 0;
+    let mut found = None;
+    while cursor < event.len() {
+        let line_end = event[cursor..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(event.len());
+        let content_end = line_end
+            .checked_sub(1)
+            .filter(|index| event.get(*index) == Some(&b'\r'))
+            .unwrap_or(line_end);
+        let line = &event[cursor..content_end];
+        if let Some(payload) = line.strip_prefix(b"data:") {
+            if found.is_some() {
+                return None;
+            }
+            let leading_spaces = payload.iter().take_while(|byte| **byte == b' ').count();
+            found = Some((cursor + b"data:".len() + leading_spaces, content_end));
+        }
+        cursor = line_end.saturating_add(1);
+    }
+    found
 }
 
 fn remove_generation_fields_for_count_tokens(body: &mut Value) {
@@ -1573,6 +1860,78 @@ mod tests {
         assert!(text.find("\"model\"").unwrap() < text.find("\"max_tokens\"").unwrap());
         assert!(text.find("\"max_tokens\"").unwrap() < text.find("\"messages\"").unwrap());
         assert!(text.find("\"messages\"").unwrap() < text.find("\"stream\"").unwrap());
+    }
+
+    #[test]
+    fn claude_oauth_tool_names_use_canonical_wire_case_and_restore_declared_case() {
+        let mut request = json!({
+            "tools": [
+                {"name": "read", "input_schema": {"type": "object"}},
+                {"name": "CustomLookup", "input_schema": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "tool", "name": "READ"},
+            "messages": [{
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "rEaD", "input": {}}]
+            }]
+        });
+
+        let aliases = normalize_claude_oauth_tool_names(&mut request).unwrap();
+        assert_eq!(request.pointer("/tools/0/name"), Some(&json!("Read")));
+        assert_eq!(
+            request.pointer("/tools/1/name"),
+            Some(&json!("CustomLookup"))
+        );
+        assert_eq!(request.pointer("/tool_choice/name"), Some(&json!("Read")));
+        assert_eq!(
+            request.pointer("/messages/0/content/0/name"),
+            Some(&json!("Read"))
+        );
+
+        let response = Bytes::from_static(
+            br#"{"content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{}},{"type":"tool_use","id":"toolu_2","name":"customlookup","input":{}}]}"#,
+        );
+        let restored = restore_claude_tool_names_in_response_bytes(response, &aliases);
+        let restored: Value = serde_json::from_slice(&restored).unwrap();
+        assert_eq!(restored.pointer("/content/0/name"), Some(&json!("read")));
+        assert_eq!(
+            restored.pointer("/content/1/name"),
+            Some(&json!("CustomLookup"))
+        );
+    }
+
+    #[test]
+    fn claude_oauth_tool_names_reject_case_insensitive_declaration_collisions() {
+        let mut request = json!({
+            "tools": [
+                {"name": "read", "input_schema": {"type": "object"}},
+                {"name": "Read", "input_schema": {"type": "object"}}
+            ]
+        });
+
+        let error = normalize_claude_oauth_tool_names(&mut request).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("collide case-insensitively"));
+    }
+
+    #[test]
+    fn claude_tool_name_stream_patcher_restores_fragmented_sse_events() {
+        let aliases = BTreeMap::from([("read".to_string(), "read".to_string())]);
+        let mut patcher = ClaudeToolNameStreamPatcher::new(aliases);
+
+        assert!(patcher
+            .push(Bytes::from_static(
+                b"event: content_block_start\r\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"Re"
+            ))
+            .is_empty());
+        let output = patcher.push(Bytes::from_static(
+            b"ad\",\"input\":{}}}\r\n\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
+        ));
+        let output = std::str::from_utf8(&output).unwrap();
+        assert!(output.contains("\"name\":\"read\""));
+        assert!(output.contains("event: content_block_start\r\n"));
+        assert!(output.contains("data: {\"type\":\"message_stop\"}"));
+        assert!(patcher.finish().is_empty());
     }
 
     #[test]

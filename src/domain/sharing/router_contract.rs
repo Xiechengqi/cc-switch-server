@@ -935,8 +935,8 @@ fn account_for_provider<'a>(
         .meta
         .as_ref()
         .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref());
-    accounts.find_for_provider(provider.provider_type, account_id)
+        .and_then(|binding| binding.account_id.as_deref())?;
+    accounts.find_for_provider(provider.provider_type, Some(account_id))
 }
 
 fn account_subscription_expires_at(account: &Account) -> Option<String> {
@@ -1320,7 +1320,7 @@ mod tests {
 
     use super::*;
     use crate::domain::accounts::store::{AccountQuota, AccountQuotaTier, AccountStore};
-    use crate::domain::providers::model::{Provider, ProviderType};
+    use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
     use crate::domain::sharing::shares::{ShareAcl, ShareBinding};
     use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
 
@@ -1816,7 +1816,15 @@ mod tests {
                     "models": ["glm-5.2"]
                 }),
                 category: None,
-                meta: None,
+                meta: Some(ProviderMeta {
+                    auth_binding: Some(AuthBinding {
+                        source: Some("managed_account".to_string()),
+                        auth_provider: Some(provider_type.as_str().to_string()),
+                        account_id: Some("acct-1".to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
                 extra: Default::default(),
             },
             provider_type,

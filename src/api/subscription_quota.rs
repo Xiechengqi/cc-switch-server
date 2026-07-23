@@ -1,7 +1,9 @@
 use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 
-use super::types::AccountQuotaResponse;
+use super::types::{
+    account_quota_public_view, redact_account_public_diagnostic, AccountQuotaResponse,
+};
 use crate::domain::accounts::store::{Account, AccountQuota, AccountQuotaTier};
 use crate::domain::accounts::subscription_expiry::{
     resolved_subscription_expiry, SubscriptionExpirySource,
@@ -117,6 +119,9 @@ fn subscription_quota_from_parts(
         return subscription_quota_not_found(tool);
     }
 
+    let public_quota = account_quota_public_view(account, quota);
+    let quota = public_quota.as_ref();
+
     let queried_at = quota
         .and_then(|quota| quota.extra_usage.as_ref())
         .as_ref()
@@ -145,7 +150,7 @@ fn subscription_quota_from_parts(
         account
             .last_refresh_error
             .as_deref()
-            .map(|message| Value::String(message.to_string()))
+            .map(|message| Value::String(redact_account_public_diagnostic(account, message)))
             .or_else(|| {
                 quota
                     .and_then(|quota| quota.credential_message.as_ref())
@@ -431,7 +436,7 @@ mod tests {
         let response = AccountQuotaResponse {
             ok: true,
             quota: account.quota.clone(),
-            account: Some(account.clone()),
+            account: Some((&account).into()),
             refreshed: false,
             message: None,
             next_refresh_at: Some(1_700_000_300_000),

@@ -68,11 +68,7 @@ export interface ManagedAuthSubscriptionExpiry {
   manualExpiresAt: string | null;
   effectiveExpiresAt: string | null;
   source: "automatic" | "recurring_rule" | "manual" | null;
-  kind:
-    | "subscription"
-    | "recurring_billing_period"
-    | "billing_period"
-    | null;
+  kind: "subscription" | "recurring_billing_period" | "billing_period" | null;
 }
 
 export interface ManagedAuthStatus {
@@ -85,6 +81,8 @@ export interface ManagedAuthStatus {
 
 export interface ManagedAuthDeviceCodeResponse {
   provider: ManagedAuthProvider;
+  flow?: "device" | "browser" | "cli_manual";
+  session_id?: string | null;
   device_code: string;
   user_code: string;
   verification_uri: string;
@@ -139,6 +137,65 @@ function isLoopbackHostname(hostname: string): boolean {
     value === "::1" ||
     value === "[::1]"
   );
+}
+
+function isSecureLoopbackHostname(hostname: string): boolean {
+  const value = hostname.trim().toLowerCase();
+  if (
+    value === "localhost" ||
+    value.endsWith(".localhost") ||
+    value === "::1" ||
+    value === "[::1]"
+  ) {
+    return true;
+  }
+  const octets = value.split(".");
+  return (
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.every((octet) => {
+      const parsed = Number(octet);
+      return /^\d{1,3}$/.test(octet) && parsed >= 0 && parsed <= 255;
+    })
+  );
+}
+
+/** Match the backend's origin requirement for manually submitted CLI OAuth callbacks. */
+export function canUseOpenAiCliOAuth(
+  configuredClientUrl?: string | null,
+): boolean {
+  return isOpenAiCliOAuthOriginAllowed(
+    typeof window === "undefined" ? undefined : window.location.origin,
+    configuredClientUrl,
+    isTauriRuntime(),
+  );
+}
+
+export function isOpenAiCliOAuthOriginAllowed(
+  currentOrigin: string | undefined,
+  configuredClientUrl?: string | null,
+  tauriRuntime = false,
+): boolean {
+  if (tauriRuntime || currentOrigin === undefined) return true;
+
+  let current: URL;
+  try {
+    current = new URL(currentOrigin);
+  } catch {
+    return false;
+  }
+  if (!["http:", "https:"].includes(current.protocol)) return false;
+  if (isSecureLoopbackHostname(current.hostname)) return true;
+  if (current.protocol !== "https:" || !configuredClientUrl) return false;
+
+  try {
+    const configured = new URL(configuredClientUrl);
+    return (
+      configured.protocol === "https:" && configured.origin === current.origin
+    );
+  } catch {
+    return false;
+  }
 }
 
 const DIRECT_SERVER_PORTS = new Set(["15721", "15722"]);
@@ -209,8 +266,7 @@ export async function authStartLogin(
    * Backend treats anything else (including undefined) as the classic localhost
    * callback flow.
    */
-  oauthFlowMode?: "web_paste" | "localhost" | "cli" | "device",
-  codexCallbackUrl?: string | null,
+  oauthFlowMode?: "web_paste" | "localhost" | "cli" | "cli_manual" | "device",
   kiroLoginProvider?: "google" | "github" | null,
 ): Promise<ManagedAuthDeviceCodeResponse> {
   if (shouldBlockLocalCallbackAuthInClientWeb(authProvider)) {
@@ -220,7 +276,6 @@ export async function authStartLogin(
     authProvider,
     githubDomain: githubDomain || null,
     oauthFlowMode: oauthFlowMode || null,
-    codexCallbackUrl: codexCallbackUrl || null,
     kiroLoginProvider: kiroLoginProvider || null,
   });
 }
@@ -238,6 +293,18 @@ export async function authSubmitOauthCode(
     authProvider,
     deviceCode,
     code,
+  });
+}
+
+export async function authSubmitOauthCallback(
+  authProvider: ManagedAuthProvider,
+  deviceCode: string,
+  callbackUrl: string,
+): Promise<ManagedAuthAccount> {
+  return invokeCommand<ManagedAuthAccount>("auth_submit_oauth_code", {
+    authProvider,
+    deviceCode,
+    callbackUrl,
   });
 }
 

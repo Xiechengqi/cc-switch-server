@@ -824,6 +824,21 @@ async fn oauth_login_cancel_is_authenticated_idempotent_and_terminal() {
         .unwrap()
         .to_string();
     let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_cancel_login",
+            json!({
+                "authProvider": "cursor_oauth",
+                "deviceCode": device_code
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
         .oneshot(json_request(
             Method::POST,
             "/web-api/invoke/auth_cancel_login",
@@ -837,6 +852,405 @@ async fn oauth_login_cancel_is_authenticated_idempotent_and_terminal() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["cancelled"], true);
+}
+
+#[tokio::test]
+async fn provider_specific_oauth_callback_rejects_mismatch_without_consuming_session() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/login/start",
+            json!({
+                "providerType": "claude_oauth",
+                "redirectUri": "http://localhost:15721/web-api/oauth/claude-cli/callback"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let login = json_body(response).await["login"].clone();
+    let session_id = login["sessionId"].as_str().unwrap();
+    let oauth_state = login["state"].as_str().unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/web-api/oauth/openai-cli/callback?state={oauth_state}&code=wrong-provider-code"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Codex OAuth failed"));
+    assert!(html.contains("does not match this login session"));
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/login/finish",
+            json!({
+                "sessionId": session_id,
+                "state": oauth_state,
+                "code": "correct-provider-code",
+                "executeTokenExchange": false
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["login"]["status"],
+        "token_request_previewed"
+    );
+}
+
+#[tokio::test]
+async fn non_loopback_bind_rejects_spoofed_loopback_host_for_manual_codex_login() {
+    let state = test_state_with_host(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let mut request = json_request(
+        Method::POST,
+        "/api/accounts/login/start",
+        json!({
+            "providerType": "codex_oauth",
+            "redirectUri": "http://localhost:1455/auth/callback"
+        }),
+        Some(&token),
+    );
+    request
+        .headers_mut()
+        .insert(axum::http::header::HOST, "127.0.0.1:54545".parse().unwrap());
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn remote_manual_codex_login_uses_fixed_localhost_redirect_and_https_gate() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    let mut insecure = json_request(
+        Method::POST,
+        "/web-api/invoke/auth_start_login",
+        json!({
+            "authProvider": "codex_oauth",
+            "oauthFlowMode": "cli_manual",
+            "codexCallbackUrl": "https://attacker.example/callback"
+        }),
+        Some(&token),
+    );
+    insecure
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    insecure
+        .headers_mut()
+        .insert("x-forwarded-proto", "http".parse().unwrap());
+    let response = app.clone().oneshot(insecure).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut unconfigured_host = json_request(
+        Method::POST,
+        "/web-api/invoke/auth_start_login",
+        json!({
+            "authProvider": "codex_oauth",
+            "oauthFlowMode": "cli_manual",
+            "codexCallbackUrl": "https://attacker.example/callback"
+        }),
+        Some(&token),
+    );
+    unconfigured_host
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    unconfigured_host
+        .headers_mut()
+        .insert("x-forwarded-proto", "https".parse().unwrap());
+    unconfigured_host
+        .headers_mut()
+        .insert("origin", "https://client.example".parse().unwrap());
+    let response = app.clone().oneshot(unconfigured_host).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut direct_insecure = json_request(
+        Method::POST,
+        "/api/accounts/login/start",
+        json!({
+            "providerType": "codex_oauth",
+            "redirectUri": "https://attacker.example/callback"
+        }),
+        Some(&token),
+    );
+    direct_insecure
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    direct_insecure
+        .headers_mut()
+        .insert("x-forwarded-proto", "http".parse().unwrap());
+    let response = app.clone().oneshot(direct_insecure).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut loopback = json_request(
+        Method::POST,
+        "/api/accounts/login/start",
+        json!({
+            "providerType": "codex_oauth",
+            "redirectUri": "https://attacker.example/callback"
+        }),
+        Some(&token),
+    );
+    loopback
+        .headers_mut()
+        .insert(axum::http::header::HOST, "127.0.0.1:54545".parse().unwrap());
+    let response = app.clone().oneshot(loopback).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let loopback_login = json_body(response).await["login"].clone();
+    assert_eq!(
+        loopback_login["redirectUri"],
+        "http://localhost:1455/auth/callback"
+    );
+    assert!(!loopback_login.to_string().contains("attacker.example"));
+
+    let mut config = state.config_snapshot().await;
+    config.router.domain = Some("example".to_string());
+    config.client.tunnel_subdomain = Some("client".to_string());
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-cli-oauth".to_string(),
+        public_key: "public-key".to_string(),
+        private_key: "private-key".to_string(),
+        control_secret: Some("cli-oauth-control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+
+    let mut unsigned_spoof = json_request(
+        Method::POST,
+        "/web-api/invoke/auth_start_login",
+        json!({
+            "authProvider": "codex_oauth",
+            "oauthFlowMode": "cli_manual"
+        }),
+        Some(&token),
+    );
+    unsigned_spoof
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    unsigned_spoof
+        .headers_mut()
+        .insert("x-forwarded-proto", "https".parse().unwrap());
+    unsigned_spoof
+        .headers_mut()
+        .insert("origin", "https://client.example".parse().unwrap());
+    let response = app.clone().oneshot(unsigned_spoof).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut wrong_origin = json_request(
+        Method::POST,
+        "/web-api/invoke/auth_start_login",
+        json!({
+            "authProvider": "codex_oauth",
+            "oauthFlowMode": "cli_manual"
+        }),
+        Some(&token),
+    );
+    wrong_origin
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    wrong_origin
+        .headers_mut()
+        .insert("x-forwarded-proto", "https".parse().unwrap());
+    wrong_origin
+        .headers_mut()
+        .insert("origin", "http://client.example".parse().unwrap());
+    let wrong_origin = client_router_ingress_request(wrong_origin, "wrong-origin");
+    let response = app.clone().oneshot(wrong_origin).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut direct_secure = json_request(
+        Method::POST,
+        "/api/accounts/login/start",
+        json!({
+            "providerType": "codex_oauth",
+            "redirectUri": "https://attacker.example/callback"
+        }),
+        Some(&token),
+    );
+    direct_secure
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    direct_secure
+        .headers_mut()
+        .insert("x-forwarded-proto", "https".parse().unwrap());
+    direct_secure
+        .headers_mut()
+        .insert("origin", "https://client.example".parse().unwrap());
+    let direct_secure = client_router_ingress_request(direct_secure, "direct-secure-start");
+    let response = app.clone().oneshot(direct_secure).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let direct_login = json_body(response).await["login"].clone();
+    let direct_session_id = direct_login["sessionId"].as_str().unwrap();
+    let direct_oauth_state = direct_login["state"].as_str().unwrap();
+    assert_eq!(
+        direct_login["redirectUri"],
+        "http://localhost:1455/auth/callback"
+    );
+    assert!(!direct_login.to_string().contains("attacker.example"));
+
+    let mut direct_insecure_finish = json_request(
+        Method::POST,
+        "/api/accounts/login/finish",
+        json!({
+            "sessionId": direct_session_id,
+            "state": direct_oauth_state,
+            "code": "must-not-be-consumed",
+            "executeTokenExchange": false
+        }),
+        Some(&token),
+    );
+    direct_insecure_finish
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    direct_insecure_finish
+        .headers_mut()
+        .insert("x-forwarded-proto", "http".parse().unwrap());
+    direct_insecure_finish
+        .headers_mut()
+        .insert("origin", "https://client.example".parse().unwrap());
+    let direct_insecure_finish =
+        client_router_ingress_request(direct_insecure_finish, "direct-insecure-finish");
+    let response = app.clone().oneshot(direct_insecure_finish).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let poll_state = state
+        .mutate_oauth_logins(|store| {
+            store.poll_state_for_principal(
+                Some(direct_session_id),
+                Some(direct_oauth_state),
+                "owner@example.com:owner",
+                now_ms() as i64,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        poll_state,
+        cc_switch_server::domain::accounts::login::OAuthSessionPollState::Pending
+    );
+
+    let mut direct_secure_finish = json_request(
+        Method::POST,
+        "/api/accounts/login/finish",
+        json!({
+            "sessionId": direct_session_id,
+            "state": direct_oauth_state,
+            "code": "secure-provider-code",
+            "executeTokenExchange": false
+        }),
+        Some(&token),
+    );
+    direct_secure_finish
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    direct_secure_finish
+        .headers_mut()
+        .insert("x-forwarded-proto", "https".parse().unwrap());
+    direct_secure_finish
+        .headers_mut()
+        .insert("origin", "https://client.example".parse().unwrap());
+    let direct_secure_finish =
+        client_router_ingress_request(direct_secure_finish, "direct-secure-finish");
+    let response = app.clone().oneshot(direct_secure_finish).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["login"]["status"],
+        "token_request_previewed"
+    );
+
+    let mut secure = json_request(
+        Method::POST,
+        "/web-api/invoke/auth_start_login",
+        json!({
+            "authProvider": "codex_oauth",
+            "oauthFlowMode": "cli_manual",
+            "codexCallbackUrl": "https://attacker.example/callback"
+        }),
+        Some(&token),
+    );
+    secure
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    secure
+        .headers_mut()
+        .insert("x-forwarded-proto", "https".parse().unwrap());
+    secure
+        .headers_mut()
+        .insert("origin", "https://client.example".parse().unwrap());
+    let secure = client_router_ingress_request(secure, "secure");
+    let response = app.clone().oneshot(secure).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let login = json_body(response).await;
+    assert_eq!(login["flow"], "cli_manual");
+    assert!(login["device_code"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("manual:")));
+    assert!(login["session_id"].as_str().is_some());
+    let authorize_url = url::Url::parse(login["verification_uri"].as_str().unwrap()).unwrap();
+    let redirect_uri = authorize_url
+        .query_pairs()
+        .find(|(key, _)| key == "redirect_uri")
+        .map(|(_, value)| value.into_owned());
+    assert_eq!(
+        redirect_uri.as_deref(),
+        Some("http://localhost:1455/auth/callback")
+    );
+    assert!(!login.to_string().contains("attacker.example"));
+
+    let callback_url = format!(
+        "http://localhost:1455/auth/callback?code=test-code&state={}",
+        login["verification_uri"]
+            .as_str()
+            .and_then(|url| url::Url::parse(url).ok())
+            .and_then(|url| {
+                url.query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .unwrap()
+    );
+    let mut unsigned_submit = json_request(
+        Method::POST,
+        "/web-api/invoke/auth_submit_oauth_code",
+        json!({
+            "authProvider": "codex_oauth",
+            "sessionId": login["session_id"],
+            "callbackUrl": callback_url
+        }),
+        Some(&token),
+    );
+    unsigned_submit
+        .headers_mut()
+        .insert("x-forwarded-host", "client.example".parse().unwrap());
+    unsigned_submit
+        .headers_mut()
+        .insert("x-forwarded-proto", "https".parse().unwrap());
+    unsigned_submit
+        .headers_mut()
+        .insert("origin", "https://client.example".parse().unwrap());
+    let response = app.oneshot(unsigned_submit).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -1750,7 +2164,7 @@ async fn non_stream_proxy_timeout_records_bad_gateway() {
 }
 
 #[tokio::test]
-async fn claude_oauth_legacy_and_typed_requests_share_the_forward_contract() {
+async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
     type CapturedRequest = (String, HeaderMap, Value);
 
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1838,10 +2252,6 @@ async fn claude_oauth_legacy_and_typed_requests_share_the_forward_contract() {
     let state = test_state();
     state
         .mutate_accounts_immediate(|accounts| {
-            let mut legacy =
-                test_account_input("legacy-claude-forward-account", ProviderType::ClaudeOAuth);
-            legacy.access_token = Some("legacy-forward-access-token".to_string());
-            accounts.upsert(legacy);
             let mut typed =
                 test_account_input("typed-claude-forward-account", ProviderType::ClaudeOAuth);
             typed.access_token = Some("typed-forward-access-token".to_string());
@@ -1852,10 +2262,10 @@ async fn claude_oauth_legacy_and_typed_requests_share_the_forward_contract() {
     upsert_test_provider(
         &state,
         AppKind::Claude,
-        legacy_claude_managed_oauth_test_provider(
+        legacy_claude_oauth_relay_test_provider(
             "legacy-claude-forward",
             &format!("http://{upstream_addr}"),
-            Some("legacy-claude-forward-account"),
+            "legacy-forward-access-token",
         ),
     )
     .await;
@@ -1883,27 +2293,10 @@ async fn claude_oauth_legacy_and_typed_requests_share_the_forward_contract() {
         .as_str()
         .unwrap()
         .to_string();
-    let typed_provider_id_for_update = typed_provider_id.clone();
-    let test_base_url = format!("http://{upstream_addr}");
-    state
-        .mutate_providers_immediate(move |providers| {
-            let stored = providers
-                .providers
-                .iter_mut()
-                .find(|stored| {
-                    stored.app == AppKind::Claude
-                        && stored.provider.id == typed_provider_id_for_update
-                })
-                .unwrap();
-            stored.provider.settings_config["env"]["ANTHROPIC_BASE_URL"] =
-                Value::String(test_base_url);
-            stored.resource.revision = stored.resource.revision.saturating_add(1);
-        })
-        .await
-        .unwrap();
-
+    // The managed preset remains fixed to the official endpoint, so inspect its
+    // prepared request without sending the account token to the local fixture.
     let network_test_uri = format!(
-        "/api/providers/{typed_provider_id}/test?app=claude&network=true&stream=false&model=claude-sonnet-4-6%5B1m%5D%5B1M%5D"
+        "/api/providers/{typed_provider_id}/test?app=claude&network=false&stream=false&model=claude-sonnet-4-6%5B1m%5D%5B1M%5D"
     );
     let network_test = app
         .clone()
@@ -1917,8 +2310,8 @@ async fn claude_oauth_legacy_and_typed_requests_share_the_forward_contract() {
         .unwrap();
     assert_eq!(network_test.status(), StatusCode::OK);
     let network_test = json_body(network_test).await;
-    assert_eq!(network_test["ok"], true);
-    assert_eq!(network_test["networkStatusCode"], 200);
+    assert_eq!(network_test["ok"], true, "{network_test}");
+    assert!(network_test["networkStatusCode"].is_null());
     assert_eq!(network_test["driverId"], "oauth.claude_messages");
     let network_header_names = network_test["headerNames"].as_array().unwrap();
     for expected in [
@@ -1931,7 +2324,7 @@ async fn claude_oauth_legacy_and_typed_requests_share_the_forward_contract() {
         assert!(network_header_names.iter().any(|name| name == expected));
     }
 
-    for provider_id in ["legacy-claude-forward", typed_provider_id.as_str()] {
+    for provider_id in ["legacy-claude-forward"] {
         for stream in [false, true] {
             let response = app
                 .clone()
@@ -1993,7 +2386,7 @@ async fn claude_oauth_legacy_and_typed_requests_share_the_forward_contract() {
     }
 
     let captured = captured.lock().unwrap();
-    assert_eq!(captured.len(), 7);
+    assert_eq!(captured.len(), 3);
     for (path_and_query, headers, body) in captured.iter() {
         assert_eq!(path_and_query.matches("beta=true").count(), 1);
         let authorization = headers
@@ -2002,10 +2395,7 @@ async fn claude_oauth_legacy_and_typed_requests_share_the_forward_contract() {
             .map(|value| value.to_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(authorization.len(), 1);
-        assert!(matches!(
-            authorization[0],
-            "Bearer legacy-forward-access-token" | "Bearer typed-forward-access-token"
-        ));
+        assert_eq!(authorization[0], "Bearer legacy-forward-access-token");
         assert!(headers
             .get("anthropic-beta")
             .and_then(|value| value.to_str().ok())
@@ -2064,7 +2454,6 @@ async fn legacy_claude_oauth_missing_credential_fails_before_upstream() {
         ),
     )
     .await;
-
     let response = app_router(state)
         .oneshot(
             Request::builder()
@@ -2086,7 +2475,9 @@ async fn legacy_claude_oauth_missing_credential_fails_before_upstream() {
         .unwrap();
 
     assert!(response.status().is_client_error());
-    assert!(body_text(response).await.contains("credential"));
+    let body = body_text(response).await;
+    assert!(body.contains("explicitly bind"), "{body}");
+    assert!(body.contains("managed account"), "{body}");
     assert_eq!(upstream_requests.load(Ordering::SeqCst), 0);
 }
 
@@ -2131,7 +2522,7 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
         AppKind::Claude,
         Provider {
             id: "claude-count-oauth".to_string(),
-            name: "Claude Count OAuth".to_string(),
+            name: "Claude Official".to_string(),
             settings_config: json!({
                 "env": {
                     "ANTHROPIC_BASE_URL": format!("http://{upstream_addr}"),
@@ -2140,7 +2531,7 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
             }),
             category: None,
             meta: Some(ProviderMeta {
-                provider_type: Some("claude_oauth".to_string()),
+                provider_type: Some("claude_auth".to_string()),
                 ..Default::default()
             }),
             extra: Default::default(),
@@ -2845,7 +3236,11 @@ async fn claude_oauth_body_retry_stays_on_original_provider() {
     upsert_test_provider(
         &state,
         AppKind::Claude,
-        legacy_claude_oauth_test_provider("claude-body-retry", &format!("http://{oauth_addr}")),
+        legacy_claude_oauth_relay_test_provider(
+            "claude-body-retry",
+            &format!("http://{oauth_addr}"),
+            "oauth-test-token",
+        ),
     )
     .await;
     upsert_test_provider(
@@ -6062,6 +6457,10 @@ async fn payout_profile_admin_write_public_read_and_clear_contract() {
 }
 
 fn test_state() -> ServerState {
+    test_state_with_host(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+fn test_state_with_host(host: IpAddr) -> ServerState {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -6072,7 +6471,7 @@ fn test_state() -> ServerState {
     ));
     ServerStateInner::load(
         Cli {
-            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host,
             port: 0,
             config_dir: Some(config_dir),
             web_dist_dir: None,
@@ -6627,6 +7026,92 @@ async fn managed_auth_list_accounts_returns_sanitized_subscription_views() {
     ] {
         assert!(!body.contains(secret), "leaked secret value");
     }
+}
+
+#[tokio::test]
+async fn account_control_api_returns_public_views_without_credentials() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            let mut input = test_account_input("acct-public-view", ProviderType::ClaudeOAuth);
+            input.id_token = Some("id-token-canary".to_string());
+            input.api_key = Some("api-key-canary".to_string());
+            input.extra_headers = Some(BTreeMap::from([(
+                "x-secret".to_string(),
+                "header-canary".to_string(),
+            )]));
+            input.profile = Some(json!({"identity": "profile-canary"}));
+            input.raw = Some(json!({"upstream": "raw-canary"}));
+            input.last_refresh_error = Some("refresh-error-canary".to_string());
+            accounts.upsert(input);
+        })
+        .await
+        .unwrap();
+
+    for uri in ["/api/accounts", "/api/accounts/acct-public-view/quota"] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::GET, uri, Value::Null, Some(&token)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = json_body(response).await;
+        let account = if uri == "/api/accounts" {
+            &body["accounts"][0]
+        } else {
+            &body["account"]
+        };
+        assert_eq!(account["id"], "acct-public-view");
+        assert_eq!(account["hasAccessToken"], true);
+        assert_eq!(account["hasRefreshToken"], true);
+        assert_eq!(account["hasIdToken"], true);
+        assert_eq!(account["hasApiKey"], true);
+        assert_eq!(account["hasExtraHeaders"], true);
+        assert_eq!(account["hasProfile"], true);
+        assert_eq!(account["hasRaw"], true);
+        assert_eq!(account["hasRefreshError"], true);
+        for sensitive_key in [
+            "accessToken",
+            "refreshToken",
+            "idToken",
+            "apiKey",
+            "extraHeaders",
+            "profile",
+            "raw",
+            "lastRefreshError",
+        ] {
+            assert!(
+                account.get(sensitive_key).is_none(),
+                "leaked {sensitive_key}"
+            );
+        }
+        let serialized = body.to_string();
+        for canary in [
+            "access-token",
+            "refresh-token",
+            "id-token-canary",
+            "api-key-canary",
+            "header-canary",
+            "profile-canary",
+            "raw-canary",
+            "refresh-error-canary",
+        ] {
+            assert!(!serialized.contains(canary), "leaked {canary} from {uri}");
+        }
+    }
+
+    let response = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/accounts/acct-public-view/claude/credentials",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -7296,19 +7781,21 @@ fn claude_api_key_test_provider(id: &str, base_url: &str) -> Provider {
     }
 }
 
-fn legacy_claude_oauth_test_provider(id: &str, base_url: &str) -> Provider {
+fn legacy_claude_oauth_relay_test_provider(id: &str, base_url: &str, token: &str) -> Provider {
     Provider {
         id: id.to_string(),
-        name: id.to_string(),
+        // This legacy name selects the official OAuth wire driver, while the
+        // bearer-relay type keeps the fixture endpoint intentionally mutable.
+        name: "Claude Official".to_string(),
         settings_config: json!({
             "env": {
                 "ANTHROPIC_BASE_URL": base_url,
-                "ANTHROPIC_AUTH_TOKEN": "oauth-test-token"
+                "ANTHROPIC_AUTH_TOKEN": token
             }
         }),
         category: None,
         meta: Some(ProviderMeta {
-            provider_type: Some("claude_oauth".to_string()),
+            provider_type: Some("claude_auth".to_string()),
             ..Default::default()
         }),
         extra: Default::default(),
@@ -7670,6 +8157,40 @@ async fn configure_share_router_identity(state: &ServerState) {
     });
     config.client.tunnel_subdomain = Some("client-alpha".to_string());
     state.replace_config(config).await.unwrap();
+}
+
+fn client_router_ingress_request(mut request: Request<Body>, request_id: &str) -> Request<Body> {
+    let timestamp_ms = now_ms() as i64;
+    let context = cc_switch_server::clients::router::ingress::IngressContext {
+        protocol_epoch: cc_switch_server::clients::router::ingress::PROTOCOL_EPOCH.to_string(),
+        router_id: "example".to_string(),
+        route_id: "client:inst-cli-oauth".to_string(),
+        installation_id: "inst-cli-oauth".to_string(),
+        target_lane_id: "inst-cli-oauth".to_string(),
+        public_host: "client.example".to_string(),
+        share_id: None,
+        request_id: format!("cli-oauth-{request_id}"),
+        user_email: Some("owner@example.com".to_string()),
+        user_role: Some("owner".to_string()),
+        user_country: Some("JP".to_string()),
+        issued_at_ms: timestamp_ms,
+    };
+    let encoded_context = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context).unwrap());
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"cli-oauth-control-secret").unwrap();
+    mac.update(b"cc-switch-router-ingress-v1\n");
+    mac.update(cc_switch_server::clients::router::ingress::PROTOCOL_EPOCH.as_bytes());
+    mac.update(b"\n");
+    mac.update(encoded_context.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    request.headers_mut().insert(
+        cc_switch_server::clients::router::ingress::INGRESS_CONTEXT_HEADER,
+        encoded_context.parse().unwrap(),
+    );
+    request.headers_mut().insert(
+        cc_switch_server::clients::router::ingress::INGRESS_SIGNATURE_HEADER,
+        signature.parse().unwrap(),
+    );
+    request
 }
 
 fn share_router_request(

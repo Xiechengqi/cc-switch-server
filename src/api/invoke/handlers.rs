@@ -134,7 +134,12 @@ pub(in crate::api) async fn web_fetch_models_for_config(
         .header("authorization", format!("Bearer {api_key}"))
         .send()
         .await
-        .map_err(|error| ApiError::bad_gateway(format!("fetch models failed: {error}")))?;
+        .map_err(|error| {
+            ApiError::bad_gateway(format!(
+                "fetch models failed: {}",
+                redact_provider_test_error(&error.to_string())
+            ))
+        })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -201,7 +206,7 @@ pub(in crate::api) async fn web_provider_quota(
     let response = account_quota(
         State(state.clone()),
         headers.clone(),
-        Path(account_id),
+        Path(account_id.clone()),
         Query(AccountQuotaQuery {
             refresh: Some(false),
             force: None,
@@ -209,11 +214,11 @@ pub(in crate::api) async fn web_provider_quota(
     )
     .await?
     .0;
-    let Some(account) = response.account.as_ref() else {
+    let Some(account) = state.find_account_by_id(&account_id).await else {
         return Ok(Value::Null);
     };
     Ok(subscription_quota_from_response(
-        account,
+        &account,
         &response,
         managed_auth_provider_label(provider_type),
     ))
@@ -254,7 +259,7 @@ pub(in crate::api) async fn web_cached_oauth_quota(
     let response = account_quota(
         State(state.clone()),
         headers.clone(),
-        Path(account_id),
+        Path(account_id.clone()),
         Query(AccountQuotaQuery {
             refresh: Some(refresh),
             force,
@@ -262,12 +267,12 @@ pub(in crate::api) async fn web_cached_oauth_quota(
     )
     .await?
     .0;
-    let Some(account) = response.account.as_ref() else {
+    let Some(account) = state.find_account_by_id(&account_id).await else {
         return Ok(Value::Null);
     };
     Ok(cached_oauth_quota_from_response(
         &auth_provider,
-        account,
+        &account,
         &response,
         provider_id.as_deref(),
         app_type.as_deref(),
@@ -298,7 +303,7 @@ pub(in crate::api) async fn web_subscription_quota(
     let response = account_quota(
         State(state.clone()),
         headers.clone(),
-        Path(account_id),
+        Path(account_id.clone()),
         Query(AccountQuotaQuery {
             refresh: Some(true),
             force: Some(force),
@@ -306,10 +311,10 @@ pub(in crate::api) async fn web_subscription_quota(
     )
     .await?
     .0;
-    let Some(account) = response.account.as_ref() else {
+    let Some(account) = state.find_account_by_id(&account_id).await else {
         return Ok(subscription_quota_not_found(tool));
     };
-    Ok(subscription_quota_from_response(account, &response, tool))
+    Ok(subscription_quota_from_response(&account, &response, tool))
 }
 
 pub(in crate::api) async fn web_resolve_account_id(
@@ -1979,7 +1984,7 @@ pub(in crate::api) fn managed_auth_is_cli_oauth_flow(oauth_flow_mode: Option<&st
             .map(str::trim)
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("cli") | Some("browser") | Some("cli_oauth") | Some("clioauth")
+        Some("cli") | Some("cli_manual") | Some("browser") | Some("cli_oauth") | Some("clioauth")
     )
 }
 
@@ -1990,6 +1995,10 @@ pub(in crate::api) fn web_managed_auth_redirect_uri(
     provider_type: ProviderType,
     oauth_flow_mode: Option<&str>,
 ) -> String {
+    if provider_type == ProviderType::CodexOAuth && managed_auth_is_cli_oauth_flow(oauth_flow_mode)
+    {
+        return crate::domain::accounts::oauth::CODEX_CLI_REDIRECT_URI.to_string();
+    }
     if provider_type == ProviderType::ClaudeOAuth
         && matches!(
             oauth_flow_mode
@@ -2004,15 +2013,7 @@ pub(in crate::api) fn web_managed_auth_redirect_uri(
     if provider_type == ProviderType::GrokOAuth {
         return XAI_LOOPBACK_REDIRECT_URI.to_string();
     }
-    if let Some(uri) = web_optional_string_any(
-        args,
-        &[
-            "redirectUri",
-            "redirect_uri",
-            "codexCallbackUrl",
-            "codex_callback_url",
-        ],
-    ) {
+    if let Some(uri) = web_optional_string_any(args, &["redirectUri", "redirect_uri"]) {
         return uri;
     }
     if let Some(host) = headers
@@ -2039,6 +2040,7 @@ pub(in crate::api) fn map_managed_auth_device_code(
     interval: u64,
 ) -> Value {
     json!({
+        "flow": "device",
         "provider": provider_label,
         "device_code": device_code,
         "user_code": user_code,
@@ -2056,11 +2058,13 @@ pub(in crate::api) fn map_managed_auth_browser_login(
     interval: u64,
 ) -> Value {
     let device_code = if cli_prefix {
-        format!("cli:{}", login.state)
+        format!("manual:{}", login.session_id)
     } else {
         login.state.clone()
     };
     json!({
+        "flow": if cli_prefix { "cli_manual" } else { "browser" },
+        "session_id": login.session_id,
         "provider": provider_label,
         "device_code": device_code,
         "user_code": "",
@@ -2109,6 +2113,11 @@ pub(in crate::api) async fn web_managed_auth_start_login(
     let provider_label = managed_auth_provider_label(provider_type);
     let oauth_flow_mode = web_optional_string_any(args, &["oauthFlowMode", "oauth_flow_mode"]);
     let oauth_flow_mode_ref = oauth_flow_mode.as_deref();
+    if provider_type == ProviderType::CodexOAuth
+        && managed_auth_is_cli_oauth_flow(oauth_flow_mode_ref)
+    {
+        require_secure_manual_cli_origin(&state, &headers).await?;
+    }
 
     match provider_type {
         ProviderType::GitHubCopilot => {
@@ -2267,7 +2276,9 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 })?;
             web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }
-        ProviderType::CodexOAuth if !device_code.starts_with("cli:") => {
+        ProviderType::CodexOAuth
+            if !device_code.starts_with("cli:") && !device_code.starts_with("manual:") =>
+        {
             let response = poll_codex_device_login(
                 State(state.clone()),
                 headers,
@@ -2288,12 +2299,22 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
             web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }
         _ => {
-            let poll_state = device_code
-                .strip_prefix("cli:")
-                .unwrap_or(device_code.as_str());
+            let principal = require_web_admin_session(&state, &headers).await?;
+            let principal_id = principal.oauth_binding_id();
+            let manual_session_id = device_code.strip_prefix("manual:");
+            let poll_state = manual_session_id.is_none().then(|| {
+                device_code
+                    .strip_prefix("cli:")
+                    .unwrap_or(device_code.as_str())
+            });
             let poll_status = state
                 .mutate_oauth_logins(|store| {
-                    store.poll_state_by_oauth_state(poll_state, now_ms() as i64)
+                    store.poll_state_for_principal(
+                        manual_session_id,
+                        poll_state,
+                        &principal_id,
+                        now_ms() as i64,
+                    )
                 })
                 .await;
             match poll_status {
@@ -2313,10 +2334,11 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 State(state.clone()),
                 headers,
                 Json(FinishAccountLoginRequest {
-                    session_id: None,
-                    state: Some(poll_state.to_string()),
+                    state: poll_state.map(str::to_string),
+                    session_id: manual_session_id.map(str::to_string),
                     code: None,
                     execute_token_exchange: Some(true),
+                    expected_provider_type: Some(provider_type),
                 }),
             )
             .await;
@@ -2352,7 +2374,10 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
 ) -> Result<Value, ApiError> {
     let provider_type = web_auth_provider_type(args)?;
     let device_code = web_arg_string_any(args, &["deviceCode", "device_code"])?;
-    if provider_type == ProviderType::CodexOAuth && !device_code.starts_with("cli:") {
+    if provider_type == ProviderType::CodexOAuth
+        && !device_code.starts_with("cli:")
+        && !device_code.starts_with("manual:")
+    {
         let response = cancel_codex_device_login(
             State(state),
             headers,
@@ -2368,16 +2393,20 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
     ) {
         return Ok(json!({"ok": true, "cancelled": false}));
     }
-    let oauth_state = device_code
-        .strip_prefix("cli:")
-        .unwrap_or(device_code.as_str())
-        .to_string();
+    let manual_session_id = device_code.strip_prefix("manual:").map(str::to_string);
+    let oauth_state = manual_session_id.is_none().then(|| {
+        device_code
+            .strip_prefix("cli:")
+            .unwrap_or(device_code.as_str())
+            .to_string()
+    });
     let response = cancel_account_login(
         State(state),
         headers,
         Json(CancelAccountLoginRequest {
-            session_id: None,
-            state: Some(oauth_state),
+            session_id: manual_session_id,
+            state: oauth_state,
+            expected_provider_type: Some(provider_type),
         }),
     )
     .await?
@@ -2387,6 +2416,122 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
         "cancelled": response.login.status == OAuthLoginStatus::Cancelled,
         "status": response.login.status,
     }))
+}
+
+pub(in crate::api) async fn require_secure_manual_cli_origin(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let direct_authority = first_header_authority(headers, header::HOST);
+    let forwarded_authority = first_header_authority(headers, "x-forwarded-host");
+
+    if state.bind_addr.ip().is_loopback()
+        && forwarded_authority.is_none()
+        && direct_authority.as_ref().is_some_and(authority_is_loopback)
+    {
+        return Ok(());
+    }
+
+    let presented_authority = forwarded_authority.or(direct_authority).ok_or_else(|| {
+        ApiError::forbidden("manual CLI OAuth requires an identifiable Client URL origin")
+    })?;
+    let scheme = first_header_value(headers, "x-forwarded-proto");
+    if scheme.as_deref() != Some("https") {
+        return Err(ApiError::forbidden(
+            "manual CLI OAuth requires HTTPS when accessed through a non-loopback Client URL",
+        ));
+    }
+
+    let expected_authority = configured_client_authority(state).await.ok_or_else(|| {
+        ApiError::forbidden(
+            "manual CLI OAuth through a remote URL requires a configured Client URL",
+        )
+    })?;
+    let signed_ingress_authority =
+        first_header_authority(headers, "x-cc-switch-client-tunnel-host");
+    if signed_ingress_authority.as_ref() != Some(&expected_authority)
+        || presented_authority != expected_authority
+    {
+        return Err(ApiError::forbidden(
+            "manual CLI OAuth is only available through the signed configured Client URL",
+        ));
+    }
+
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| url::Url::parse(value.trim()).ok());
+    let origin_is_expected = origin.as_ref().is_some_and(|origin| {
+        origin.scheme() == "https"
+            && url_authority(origin).as_ref() == Some(&expected_authority)
+            && origin.path() == "/"
+            && origin.query().is_none()
+            && origin.fragment().is_none()
+    });
+    if !origin_is_expected {
+        return Err(ApiError::forbidden(
+            "manual CLI OAuth requires a same-origin HTTPS Client URL request",
+        ));
+    }
+    Ok(())
+}
+
+async fn configured_client_authority(state: &ServerState) -> Option<(String, Option<u16>)> {
+    let config = state.config_snapshot().await;
+    let router_domain = state
+        .ui_settings
+        .read()
+        .await
+        .settings_for_frontend(&config)
+        .get("shareRouterDomain")
+        .and_then(Value::as_str)
+        .map(str::to_string)?;
+    let client_subdomain = config.client.tunnel_subdomain.as_deref()?;
+    let url = expected_client_tunnel_url(client_subdomain, &router_domain)?;
+    url::Url::parse(&url)
+        .ok()
+        .and_then(|url| url_authority(&url))
+}
+
+fn first_header_value(headers: &HeaderMap, name: impl header::AsHeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn first_header_authority(
+    headers: &HeaderMap,
+    name: impl header::AsHeaderName,
+) -> Option<(String, Option<u16>)> {
+    let value = first_header_value(headers, name)?;
+    let url = url::Url::parse(&format!("http://{value}")).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let (host, port) = url_authority(&url)?;
+    Some((host, port.filter(|port| *port != 443)))
+}
+
+fn url_authority(url: &url::Url) -> Option<(String, Option<u16>)> {
+    Some((url.host_str()?.to_ascii_lowercase(), url.port()))
+}
+
+fn authority_is_loopback(authority: &(String, Option<u16>)) -> bool {
+    let hostname = authority.0.as_str();
+    hostname.eq_ignore_ascii_case("localhost")
+        || hostname.to_ascii_lowercase().ends_with(".localhost")
+        || hostname
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 pub(in crate::api) async fn web_managed_auth_remove_account(
