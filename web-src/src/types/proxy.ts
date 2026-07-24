@@ -43,15 +43,35 @@ export interface ProxyTakeoverStatus {
   gemini_pending?: boolean;
 }
 
+export type ProviderHealthStatus =
+  | "unknown"
+  | "healthy"
+  | "degraded"
+  | "unhealthy";
+
+export type ProviderProbeSupport = "supported" | "unsupported";
+
 export interface ProviderHealth {
   provider_id: string;
   app_type: string;
+  status: ProviderHealthStatus;
+  probe_support: ProviderProbeSupport;
+  available: boolean;
   is_healthy: boolean;
+  consecutive_successes: number;
   consecutive_failures: number;
+  confirmation_pending: boolean;
   last_success_at: string | null;
   last_failure_at: string | null;
   last_error: string | null;
   updated_at: string;
+  checked_at: string | null;
+  stale_at: string | null;
+  source: string | null;
+  latency_ms: number | null;
+  model: string | null;
+  status_code: number | null;
+  error_category: string | null;
 }
 
 export interface ProxyUsageRecord {

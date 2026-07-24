@@ -1531,7 +1531,12 @@ export function ServerProviderForm({
           previewToken: pendingIdentityAction.previewToken,
         });
       }
-      await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["providers", appId] }),
+        queryClient.invalidateQueries({
+          queryKey: ["providerHealth", "app", appId],
+        }),
+      ]);
       toast.success(
         pendingIdentityAction.kind === "clone"
           ? t("serverProviderForm.toasts.customCreated")

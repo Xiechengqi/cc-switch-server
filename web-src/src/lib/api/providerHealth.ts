@@ -5,4 +5,8 @@ export const providerHealthApi = {
   async get(providerId: string, appType: string): Promise<ProviderHealth> {
     return invokeCommand("get_provider_health", { providerId, appType });
   },
+
+  async list(appType: string): Promise<ProviderHealth[]> {
+    return invokeCommand("get_provider_health", { appType });
+  },
 };

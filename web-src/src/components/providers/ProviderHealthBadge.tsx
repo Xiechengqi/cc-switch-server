@@ -1,57 +1,111 @@
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
+import type { ProviderHealth } from "@/types/proxy";
 
 interface ProviderHealthBadgeProps {
-  failureCount: number;
-  isHealthy?: boolean;
+  health: ProviderHealth;
   className?: string;
 }
 
-/**
- * 供应商健康状态徽章
- * 根据连续失败次数显示不同颜色的状态指示器
- */
 export function ProviderHealthBadge({
-  failureCount,
-  isHealthy,
+  health,
   className,
 }: ProviderHealthBadgeProps) {
   const { t } = useTranslation();
 
-  // 根据失败次数计算状态
   const getStatus = () => {
-    if (failureCount === 0) {
+    if (health.probe_support === "unsupported") {
+      return {
+        labelKey: "health.unsupported",
+        labelFallback: "暂不支持检测",
+        color: "bg-muted-foreground/60",
+        bgColor: "bg-muted",
+        textColor: "text-muted-foreground",
+      };
+    }
+    if (health.status === "healthy") {
       return {
         labelKey: "health.operational",
         labelFallback: "正常",
-        color: "bg-green-500",
-        // 使用更深/柔和的背景色，去除可能的白色内容感
-        bgColor: "bg-green-500/10",
-        textColor: "text-green-600 dark:text-green-400",
+        color: "bg-emerald-500",
+        bgColor: "bg-emerald-500/10",
+        textColor: "text-emerald-700 dark:text-emerald-400",
       };
-    } else if (isHealthy !== false) {
+    }
+    if (health.status === "degraded") {
       return {
         labelKey: "health.degraded",
-        labelFallback: "降级",
-        color: "bg-yellow-500",
-        bgColor: "bg-yellow-500/10",
-        textColor: "text-yellow-600 dark:text-yellow-400",
+        labelFallback: "响应较慢",
+        color: "bg-amber-500",
+        bgColor: "bg-amber-500/10",
+        textColor: "text-amber-700 dark:text-amber-400",
       };
-    } else {
+    }
+    if (health.confirmation_pending) {
+      return {
+        labelKey: "health.confirmationPending",
+        labelFallback: "等待二次确认",
+        color: "bg-amber-500",
+        bgColor: "bg-amber-500/10",
+        textColor: "text-amber-700 dark:text-amber-400",
+      };
+    }
+    if (health.status === "unhealthy") {
       return {
         labelKey: "health.unavailable",
         labelFallback: "异常",
         color: "bg-red-500",
         bgColor: "bg-red-500/10",
-        textColor: "text-red-600 dark:text-red-400",
+        textColor: "text-red-700 dark:text-red-400",
       };
     }
+    return {
+      labelKey: "health.unknown",
+      labelFallback: "待检测",
+      color: "bg-muted-foreground/60",
+      bgColor: "bg-muted",
+      textColor: "text-muted-foreground",
+    };
   };
 
   const statusConfig = getStatus();
   const label = t(statusConfig.labelKey, {
     defaultValue: statusConfig.labelFallback,
   });
+
+  const details = [
+    health.checked_at
+      ? t("health.checkedAt", {
+          value: new Date(Number(health.checked_at)).toLocaleString(),
+          defaultValue: `检测时间：${new Date(Number(health.checked_at)).toLocaleString()}`,
+        })
+      : t("health.notChecked", { defaultValue: "尚未检测" }),
+    health.source
+      ? t("health.source", {
+          value: health.source,
+          defaultValue: `来源：${health.source}`,
+        })
+      : null,
+    health.model
+      ? t("health.model", {
+          value: health.model,
+          defaultValue: `模型：${health.model}`,
+        })
+      : null,
+    health.latency_ms != null
+      ? t("health.latency", {
+          value: health.latency_ms,
+          defaultValue: `延迟：${health.latency_ms} ms`,
+        })
+      : null,
+    health.status_code != null
+      ? t("health.statusCode", {
+          value: health.status_code,
+          defaultValue: `HTTP：${health.status_code}`,
+        })
+      : null,
+    health.last_error,
+  ].filter((value): value is string => Boolean(value));
 
   return (
     <div
@@ -61,10 +115,7 @@ export function ProviderHealthBadge({
         statusConfig.textColor,
         className,
       )}
-      title={t("health.failedRequests", {
-        count: failureCount,
-        defaultValue: `失败请求 ${failureCount} 次`,
-      })}
+      title={details.join("\n")}
     >
       <div className={cn("w-2 h-2 rounded-full", statusConfig.color)} />
       <span>{label}</span>

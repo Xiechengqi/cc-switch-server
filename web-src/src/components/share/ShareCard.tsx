@@ -171,16 +171,22 @@ export function ShareCard({
                       <span
                         className={cn(
                           "mr-1 inline-block h-2 w-2 rounded-full",
-                          boundProviderHealth
-                            ? boundProviderHealth.is_healthy
+                          boundProviderHealth?.probe_support === "unsupported" ||
+                            !boundProviderHealth ||
+                            boundProviderHealth.status === "unknown"
+                            ? "bg-muted-foreground/40"
+                            : boundProviderHealth.confirmation_pending
+                              ? "bg-amber-500"
+                            : boundProviderHealth.status === "healthy"
                               ? "bg-emerald-500"
-                              : "bg-red-500"
-                            : "bg-muted-foreground/40",
+                              : boundProviderHealth.status === "degraded"
+                                ? "bg-amber-500"
+                                : "bg-red-500",
                         )}
                         aria-label={
-                          boundProviderHealth?.is_healthy
-                            ? "provider-healthy"
-                            : "provider-unhealthy-or-unknown"
+                          boundProviderHealth?.confirmation_pending
+                            ? "provider-confirmation-pending"
+                            : `provider-${boundProviderHealth?.status ?? "unknown"}`
                         }
                       />
                     ) : null}

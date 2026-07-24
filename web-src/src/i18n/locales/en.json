@@ -2478,10 +2478,19 @@
   },
   "health": {
     "operational": "Operational",
-    "degraded": "Degraded",
+    "degraded": "Slow response",
     "failed": "Failed",
     "unavailable": "Unhealthy",
-    "failedRequests": "{{count}} failed requests"
+    "unknown": "Pending check",
+    "unsupported": "Check unsupported",
+    "failedRequests": "{{count}} failed requests",
+    "checkedAt": "Checked: {{value}}",
+    "notChecked": "Not checked yet",
+    "source": "Source: {{value}}",
+    "model": "Model: {{value}}",
+    "latency": "Latency: {{value}} ms",
+    "statusCode": "HTTP: {{value}}",
+    "confirmationPending": "Awaiting confirmation"
   },
   "proxy": {
     "panel": {

@@ -2403,10 +2403,19 @@
   },
   "health": {
     "operational": "正常",
-    "degraded": "低下",
+    "degraded": "応答低下",
     "failed": "失敗",
     "unavailable": "異常",
-    "failedRequests": "失敗したリクエスト {{count}} 件"
+    "unknown": "未検査",
+    "unsupported": "検査未対応",
+    "failedRequests": "失敗したリクエスト {{count}} 件",
+    "checkedAt": "検査日時：{{value}}",
+    "notChecked": "まだ検査されていません",
+    "source": "ソース：{{value}}",
+    "model": "モデル：{{value}}",
+    "latency": "遅延：{{value}} ms",
+    "statusCode": "HTTP：{{value}}",
+    "confirmationPending": "再確認待ち"
   },
   "proxy": {
     "panel": {

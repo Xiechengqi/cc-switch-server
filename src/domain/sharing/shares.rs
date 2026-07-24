@@ -1549,11 +1549,16 @@ fn runtime_snapshot_for_share(
         .providers
         .iter()
         .find(|item| item.app == share.app && item.provider.id == share.provider_id);
-    let health = provider.map(|item| crate::domain::health::provider_health(item, usage));
+    let health = provider.map(|item| {
+        let runtime_plan = providers.runtime_plan(item.app, &item.provider.id);
+        crate::domain::health::provider_health_for_plan(item, usage, runtime_plan.as_deref())
+    });
     let last_request = usage
         .logs
         .iter()
-        .filter(|log| log.provider_id == share.provider_id && log.app == share.app)
+        .filter(|log| {
+            !log.is_health_check && log.provider_id == share.provider_id && log.app == share.app
+        })
         .max_by_key(|log| log.created_at_ms);
 
     json!({

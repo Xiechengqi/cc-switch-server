@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::domain::accounts::store::{
     active_account_usage_block, Account, AccountStore, AccountUsageBlock,
 };
+use crate::domain::health::ProviderHealthStatus;
 use crate::domain::providers::model::AppKind;
+use crate::domain::providers::runtime::ProviderRuntimePlan;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::Share;
 use crate::domain::usage::store::{UsageLog, UsageStore};
@@ -70,7 +72,10 @@ pub fn summary_for_share(
                 &block,
             ))
         } else {
-            usage.and_then(|usage| latest_health_result(share, app, provider, usage))
+            let runtime_plan = providers.runtime_plan(app, &provider.provider.id);
+            usage.and_then(|usage| {
+                provider_snapshot_result(share, app, provider, usage, runtime_plan.as_deref())
+            })
         };
 
         if let Some(result) = result {
@@ -80,21 +85,51 @@ pub fn summary_for_share(
     summary
 }
 
-fn latest_health_result(
+fn provider_snapshot_result(
     share: &Share,
     app: AppKind,
     provider: &StoredProvider,
     usage: &UsageStore,
+    runtime_plan: Option<&ProviderRuntimePlan>,
 ) -> Option<ShareModelHealthResult> {
+    let health = crate::domain::health::provider_health_for_plan(provider, usage, runtime_plan);
+    if health.status == ProviderHealthStatus::Unknown {
+        return None;
+    }
+
     let logs = health_logs_for_binding(share, app, provider, usage);
-    let latest = logs.first()?;
-    let mut result = result_from_log(app, provider, latest);
-    result.recent_results = logs
-        .iter()
-        .take(RECENT_RESULT_LIMIT)
-        .map(|log| status_for_log(log).to_string())
-        .collect();
-    Some(result)
+    let status = match (health.available, health.status) {
+        (true, ProviderHealthStatus::Degraded) => "degraded",
+        (true, _) => "success",
+        (false, _) => "failed",
+    };
+    let requested_model = health
+        .model
+        .clone()
+        .or_else(|| default_model_for_provider(provider))
+        .unwrap_or_else(|| app.as_str().to_string());
+    let mut recent_results = vec![status.to_string()];
+    recent_results.extend(
+        logs.iter()
+            .take(RECENT_RESULT_LIMIT.saturating_sub(1))
+            .map(|log| status_for_log(log).to_string()),
+    );
+    Some(ShareModelHealthResult {
+        app_type: app.as_str().to_string(),
+        actual_model: actual_model_for_provider(provider, &requested_model),
+        requested_model,
+        status: status.to_string(),
+        recent_results,
+        status_code: health.last_status_code,
+        latency_ms: health.probe_latency_ms.unwrap_or(0),
+        error_message: (!health.available).then_some(health.reason).flatten(),
+        checked_at: health.checked_at_ms.map(ms_to_seconds).unwrap_or_default(),
+        source: health
+            .source
+            .unwrap_or_else(|| "cc-switch-health-check".to_string()),
+        provider_id: Some(provider.provider.id.clone()),
+        provider_name: Some(provider.provider.name.clone()),
+    })
 }
 
 fn health_logs_for_binding<'a>(
@@ -115,44 +150,6 @@ fn health_logs_for_binding<'a>(
         .collect::<Vec<_>>();
     logs.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
     logs
-}
-
-fn result_from_log(
-    app: AppKind,
-    provider: &StoredProvider,
-    log: &UsageLog,
-) -> ShareModelHealthResult {
-    let requested_model = requested_model_from_log_or_provider(log, provider);
-    let actual_model = log
-        .actual_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| actual_model_for_provider(provider, &requested_model));
-    let status = status_for_log(log);
-    ShareModelHealthResult {
-        app_type: app.as_str().to_string(),
-        requested_model,
-        actual_model,
-        status: status.to_string(),
-        recent_results: Vec::new(),
-        status_code: Some(log.status_code),
-        latency_ms: saturating_u128_to_u64(log.duration_ms),
-        error_message: log
-            .error_message
-            .clone()
-            .or_else(|| error_message_for_log(log, status)),
-        checked_at: ms_to_seconds(log.created_at_ms),
-        source: log
-            .data_source
-            .as_deref()
-            .filter(|source| source.starts_with("cc-switch-"))
-            .unwrap_or("cc-switch-health-check")
-            .to_string(),
-        provider_id: Some(provider.provider.id.clone()),
-        provider_name: Some(provider.provider.name.clone()),
-    }
 }
 
 fn latest_quota_health_log<'a>(
@@ -223,28 +220,6 @@ fn status_for_log(log: &UsageLog) -> &'static str {
     } else {
         "failed"
     }
-}
-
-fn error_message_for_log(log: &UsageLog, status: &str) -> Option<String> {
-    if status == "success" {
-        return None;
-    }
-    if log.is_streaming {
-        let stream_status = log.stream_status.as_deref().unwrap_or("unknown");
-        return Some(format!("stream {stream_status}"));
-    }
-    Some(format!("HTTP {}", log.status_code))
-}
-
-fn requested_model_from_log_or_provider(log: &UsageLog, provider: &StoredProvider) -> String {
-    log.requested_model
-        .as_deref()
-        .or(log.model.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| default_model_for_provider(provider))
-        .unwrap_or_else(|| provider.app.as_str().to_string())
 }
 
 fn actual_model_for_provider(provider: &StoredProvider, requested_model: &str) -> String {
@@ -397,6 +372,7 @@ mod tests {
 
     use super::*;
     use crate::domain::accounts::store::AccountQuota;
+    use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
     use crate::domain::sharing::shares::{ShareAcl, ShareBinding, ShareMarketGrantStatus};
     use crate::domain::usage::store::{UsageLogContext, UsageModelMetadata};
@@ -416,10 +392,20 @@ mod tests {
         let mut other_share_log = own_log.clone();
         other_share_log.share_id = Some("share-2".to_string());
         other_share_log.created_at_ms = 3000;
-        let usage = UsageStore {
+        let mut usage = UsageStore {
             logs: vec![other_share_log, own_log],
             ..Default::default()
         };
+        record_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Healthy,
+            now_ms(),
+            "cc-switch-scheduled",
+            false,
+            Some(200),
+            None,
+        );
         let providers = ProviderStore {
             providers: vec![provider],
             ..Default::default()
@@ -444,10 +430,20 @@ mod tests {
         );
         let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::Codex);
         let log = health_log(&share, &provider, 200, false, None, Some("gpt-5.5"), None);
-        let usage = UsageStore {
+        let mut usage = UsageStore {
             logs: vec![log],
             ..Default::default()
         };
+        record_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Healthy,
+            now_ms(),
+            "cc-switch-scheduled",
+            false,
+            Some(200),
+            None,
+        );
         let providers = ProviderStore {
             providers: vec![provider],
             ..Default::default()
@@ -459,7 +455,41 @@ mod tests {
         assert_eq!(result.requested_model, "gpt-5.5");
         assert_eq!(result.actual_model, "glm-5.2");
         assert_eq!(result.status, "success");
-        assert_eq!(result.recent_results, vec!["success"]);
+        assert_eq!(result.recent_results, vec!["success", "success"]);
+    }
+
+    #[test]
+    fn degraded_snapshot_remains_available_and_is_projected_to_router() {
+        let share = test_share(
+            "share-1",
+            AppKind::Codex,
+            "p-codex",
+            ProviderType::Codex,
+            None,
+        );
+        let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::Codex);
+        let mut usage = UsageStore::default();
+        record_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Degraded,
+            now_ms(),
+            "cc-switch-scheduled",
+            false,
+            Some(200),
+            None,
+        );
+        let providers = ProviderStore {
+            providers: vec![provider],
+            ..Default::default()
+        };
+
+        let summary = summary_for_share(&share, &providers, None, Some(&usage));
+        let result = summary.codex.first().unwrap();
+
+        assert_eq!(result.status, "degraded");
+        assert_eq!(result.recent_results, vec!["degraded"]);
+        assert!(result.error_message.is_none());
     }
 
     #[test]
@@ -573,13 +603,35 @@ mod tests {
             Some("gpt-5.5"),
             None,
         );
-        log.created_at_ms = 1_783_917_271_880;
+        let checked_at = now_ms();
+        log.created_at_ms = checked_at;
         log.data_source = Some("cc-switch-scheduled".to_string());
         log.error_message = Some("upstream connection timed out".to_string());
-        let usage = UsageStore {
+        let mut usage = UsageStore {
             logs: vec![log],
             ..Default::default()
         };
+        record_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Unhealthy,
+            checked_at
+                .saturating_sub(crate::domain::health::PROVIDER_HEALTH_TRANSIENT_CONFIRM_AFTER_MS),
+            "cc-switch-scheduled",
+            true,
+            Some(599),
+            Some("upstream connection timed out"),
+        );
+        record_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Unhealthy,
+            checked_at,
+            "cc-switch-scheduled-confirmation",
+            true,
+            Some(599),
+            Some("upstream connection timed out"),
+        );
         let providers = ProviderStore {
             providers: vec![provider],
             ..Default::default()
@@ -589,8 +641,8 @@ mod tests {
         let result = summary.codex.first().unwrap();
 
         assert_eq!(result.status, "failed");
-        assert_eq!(result.checked_at, 1_783_917_271);
-        assert_eq!(result.source, "cc-switch-scheduled");
+        assert_eq!(result.checked_at, ms_to_seconds(checked_at));
+        assert_eq!(result.source, "cc-switch-scheduled-confirmation");
         assert_eq!(
             result.error_message.as_deref(),
             Some("upstream connection timed out")
@@ -616,10 +668,32 @@ mod tests {
             Some("gpt-5.5"),
             Some("glm-5.2"),
         );
-        let usage = UsageStore {
+        let mut usage = UsageStore {
             logs: vec![log],
             ..Default::default()
         };
+        let checked_at = now_ms();
+        record_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Unhealthy,
+            checked_at
+                .saturating_sub(crate::domain::health::PROVIDER_HEALTH_TRANSIENT_CONFIRM_AFTER_MS),
+            "cc-switch-scheduled",
+            true,
+            Some(200),
+            Some("stream interrupted"),
+        );
+        record_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Unhealthy,
+            checked_at,
+            "cc-switch-scheduled-confirmation",
+            true,
+            Some(200),
+            Some("stream interrupted"),
+        );
         let providers = ProviderStore {
             providers: vec![provider],
             ..Default::default()
@@ -803,6 +877,34 @@ mod tests {
             ..UsageLogContext::default()
         });
         log
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_snapshot(
+        usage: &mut UsageStore,
+        provider: &StoredProvider,
+        status: ProviderHealthStatus,
+        checked_at_ms: u128,
+        source: &str,
+        transient_failure: bool,
+        status_code: Option<u16>,
+        error_message: Option<&str>,
+    ) {
+        usage.provider_health.record(ProviderHealthObservation {
+            app: provider.app,
+            provider_id: provider.provider.id.clone(),
+            provider_revision: provider.resource.revision,
+            runtime_fingerprint: "runtime-test".to_string(),
+            status,
+            checked_at_ms,
+            source: source.to_string(),
+            status_code,
+            latency_ms: Some(123),
+            model: Some("gpt-5.5".to_string()),
+            error_category: (!status.is_success()).then(|| "network".to_string()),
+            error_message: error_message.map(str::to_string),
+            transient_failure,
+        });
     }
 
     #[test]

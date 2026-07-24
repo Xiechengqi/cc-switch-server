@@ -233,7 +233,6 @@ export function ProviderCard({
   onOpenTerminal,
   isTestingLink,
   isTestingModel,
-  isProxyRunning,
   isProxyTakeover = false,
   dragHandleProps,
   // OpenClaw: default model
@@ -430,12 +429,7 @@ export function ProviderCard({
                 </span>
               )}
 
-              {isProxyRunning && health && (
-                <ProviderHealthBadge
-                  failureCount={health.consecutive_failures}
-                  isHealthy={health.is_healthy}
-                />
-              )}
+              {health ? <ProviderHealthBadge health={health} /> : null}
 
               {provider.category === "third_party" &&
                 provider.meta?.isPartner && (

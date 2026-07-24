@@ -9,6 +9,7 @@ import type {
   ProviderCustomBinding,
 } from "@/lib/api/providers";
 import type { ProvidersQueryData } from "@/lib/query/queries";
+import { providerHealthKeys } from "@/lib/query/providerHealth";
 import type { CoreProviderApp } from "@/server/providerRegistry";
 import type { Provider } from "@/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -30,7 +31,13 @@ export function useServerProviderActions(activeApp: CoreProviderApp) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const invalidate = useCallback(
-    () => queryClient.invalidateQueries({ queryKey: ["providers", activeApp] }),
+    () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["providers", activeApp] }),
+        queryClient.invalidateQueries({
+          queryKey: providerHealthKeys.app(activeApp),
+        }),
+      ]),
     [activeApp, queryClient],
   );
 

@@ -2362,10 +2362,19 @@
   },
   "health": {
     "operational": "正常",
-    "degraded": "降級",
+    "degraded": "回應較慢",
     "failed": "失敗",
     "unavailable": "異常",
-    "failedRequests": "失敗請求 {{count}} 次"
+    "unknown": "待檢測",
+    "unsupported": "暫不支援檢測",
+    "failedRequests": "失敗請求 {{count}} 次",
+    "checkedAt": "檢測時間：{{value}}",
+    "notChecked": "尚未檢測",
+    "source": "來源：{{value}}",
+    "model": "模型：{{value}}",
+    "latency": "延遲：{{value}} ms",
+    "statusCode": "HTTP：{{value}}",
+    "confirmationPending": "等待二次確認"
   },
   "proxy": {
     "panel": {

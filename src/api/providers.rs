@@ -396,11 +396,18 @@ pub(in crate::api) async fn provider_health(
     Query(query): Query<ListProvidersQuery>,
 ) -> Result<Json<ProviderHealthResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let providers = state.providers.read().await.list(query.app);
+    let provider_store = state.providers.read().await;
+    let providers = provider_store.list(query.app);
     let usage = state.usage.read().await;
     Ok(Json(ProviderHealthResponse {
         ok: true,
-        providers: crate::domain::health::provider_health_list(&providers, &usage),
+        providers: providers
+            .iter()
+            .map(|provider| {
+                let plan = provider_store.runtime_plan(provider.app, &provider.provider.id);
+                crate::domain::health::provider_health_for_plan(provider, &usage, plan.as_deref())
+            })
+            .collect(),
     }))
 }
 
@@ -430,7 +437,28 @@ pub(in crate::api) async fn test_provider(
 ) -> Result<Json<TestProviderResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let execution = resolve_provider_execution_by_key(&state, query.app, &id).await?;
-    Ok(Json(test_provider_inner(&state, execution, &query).await?))
+    let provider = execution.runtime_stored_view();
+    let response = test_provider_inner(&state, execution, &query).await?;
+    if query.network.unwrap_or(false) {
+        let config = web_stream_check_config(&state).await;
+        if let Err(error) = crate::api::provider_health_scheduler::record_provider_test_response(
+            &state,
+            &provider,
+            &response,
+            &config,
+            "cc-switch-manual",
+        )
+        .await
+        {
+            tracing::warn!(
+                app = provider.app.as_str(),
+                provider_id = %provider.provider.id,
+                error = %error,
+                "failed to persist manual Provider health result"
+            );
+        }
+    }
+    Ok(Json(response))
 }
 
 pub(in crate::api) async fn fetch_provider_models(
@@ -530,8 +558,14 @@ pub(in crate::api) async fn test_providers(
         .collect::<Result<Vec<_>, _>>()
         .map_err(ApiError::proxy)?;
     drop(providers);
+    let health_config = if input.network.unwrap_or(false) {
+        Some(web_stream_check_config(&state).await)
+    } else {
+        None
+    };
     let mut results = Vec::new();
     for execution in selected {
+        let provider = execution.runtime_stored_view();
         let query = TestProviderQuery {
             app: execution.stored.app,
             network: input.network,
@@ -539,7 +573,27 @@ pub(in crate::api) async fn test_providers(
             model: input.model.clone(),
             stream: input.stream,
         };
-        results.push(test_provider_inner(&state, execution, &query).await?);
+        let response = test_provider_inner(&state, execution, &query).await?;
+        if let Some(config) = health_config.as_ref() {
+            if let Err(error) =
+                crate::api::provider_health_scheduler::record_provider_test_response(
+                    &state,
+                    &provider,
+                    &response,
+                    config,
+                    "cc-switch-manual",
+                )
+                .await
+            {
+                tracing::warn!(
+                    app = provider.app.as_str(),
+                    provider_id = %provider.provider.id,
+                    error = %error,
+                    "failed to persist manual Provider health result"
+                );
+            }
+        }
+        results.push(response);
     }
     Ok(Json(TestProvidersResponse { ok: true, results }))
 }
@@ -788,6 +842,7 @@ fn provider_test_outcome(
             200..=399 if error.is_none() => ProviderOperationOutcome::Success,
             401 | 403 => ProviderOperationOutcome::Auth,
             402 => ProviderOperationOutcome::Quota,
+            408 => ProviderOperationOutcome::Timeout,
             429 if error.is_some_and(provider_error_mentions_quota) => {
                 ProviderOperationOutcome::Quota
             }
@@ -1727,6 +1782,10 @@ mod tests {
         );
         assert_eq!(
             provider_test_outcome(true, None, Some("request timeout")),
+            ProviderOperationOutcome::Timeout
+        );
+        assert_eq!(
+            provider_test_outcome(true, Some(408), Some("request timeout")),
             ProviderOperationOutcome::Timeout
         );
     }

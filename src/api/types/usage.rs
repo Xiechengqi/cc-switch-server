@@ -44,7 +44,7 @@ impl From<UsageLogsQuery> for UsageLogFilter {
             user_email: query.user_email,
             session_id: query.session_id,
             data_source: query.data_source,
-            is_health_check: query.is_health_check,
+            is_health_check: query.is_health_check.or(Some(false)),
             stream_status: query.stream_status,
         }
     }
@@ -98,7 +98,7 @@ impl From<UsageStatsQuery> for UsageStatsFilter {
             user_email: query.user_email,
             session_id: query.session_id,
             data_source: query.data_source,
-            is_health_check: query.is_health_check,
+            is_health_check: query.is_health_check.or(Some(false)),
             stream_status: query.stream_status,
         }
     }
@@ -144,6 +144,27 @@ pub(in crate::api) struct UsageProviderStatsResponse {
 pub(in crate::api) struct UsageModelStatsResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) models: Vec<ModelUsageStats>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_queries_exclude_health_checks_unless_explicitly_requested() {
+        let logs: UsageLogsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        let logs_filter: UsageLogFilter = logs.into();
+        assert_eq!(logs_filter.is_health_check, Some(false));
+
+        let stats: UsageStatsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        let stats_filter: UsageStatsFilter = stats.into();
+        assert_eq!(stats_filter.is_health_check, Some(false));
+
+        let health: UsageStatsQuery =
+            serde_json::from_value(serde_json::json!({ "isHealthCheck": true })).unwrap();
+        let health_filter: UsageStatsFilter = health.into();
+        assert_eq!(health_filter.is_health_check, Some(true));
+    }
 }
 
 #[derive(Debug, Serialize)]

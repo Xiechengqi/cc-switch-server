@@ -351,6 +351,7 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::accounts::store::accounts_path(config_dir),
         crate::domain::accounts::store::accounts_key_path(config_dir),
         crate::domain::usage::store::usage_path(config_dir),
+        crate::domain::health::provider_health_path(config_dir),
         crate::domain::sharing::shares::shares_path(config_dir),
         crate::clients::router::tunnel::tunnels_path(config_dir),
     ]
@@ -455,6 +456,10 @@ fn validate_server_backup_restore_stage(
     }
     if includes("usage-logs.json") {
         UsageStore::load_or_default(stage_dir).context("validate staged usage-logs.json")?;
+    }
+    if includes("provider-health.json") {
+        crate::domain::health::ProviderHealthStore::load_or_default(stage_dir)
+            .context("validate staged provider-health.json")?;
     }
     if includes("shares.json") {
         ShareStore::load_or_default(stage_dir).context("validate staged shares.json")?;
@@ -3594,6 +3599,12 @@ impl ServerStateInner {
 
         let changed_projection_keys = provider_runtime_projection_changes(&current, &candidate);
         *self.providers.write().await = candidate;
+        if let Err(error) = self.prune_provider_health_snapshots().await {
+            tracing::warn!(
+                %error,
+                "Provider commit succeeded but stale health snapshots could not be pruned"
+            );
+        }
         if !changed_projection_keys.is_empty() {
             let share_ids = {
                 let shares = self.shares.read().await;
@@ -4009,6 +4020,60 @@ impl ServerStateInner {
 
     pub async fn usage_snapshot(&self) -> UsageStore {
         self.usage.read().await.clone()
+    }
+
+    pub async fn record_provider_health_observation(
+        &self,
+        observation: crate::domain::health::ProviderHealthObservation,
+    ) -> anyhow::Result<Option<crate::domain::health::ProviderHealthSnapshot>> {
+        let event_app = observation.app;
+        let event_provider_id = observation.provider_id.clone();
+        let snapshot = {
+            let providers = self.providers.read().await;
+            let Some(provider) = providers.providers.iter().find(|provider| {
+                provider.app == observation.app && provider.provider.id == observation.provider_id
+            }) else {
+                return Ok(None);
+            };
+            if provider.resource.revision != observation.provider_revision {
+                return Ok(None);
+            }
+            let runtime_matches =
+                match providers.runtime_plan(observation.app, &observation.provider_id) {
+                    Some(plan) => plan.runtime_fingerprint == observation.runtime_fingerprint,
+                    None => observation.runtime_fingerprint.is_empty(),
+                };
+            if !runtime_matches {
+                return Ok(None);
+            }
+
+            let mut usage = self.usage.write().await;
+            let mut provider_health = usage.provider_health.clone();
+            let snapshot = provider_health.record(observation);
+            provider_health.save(&self.config_dir)?;
+            usage.provider_health = provider_health;
+            snapshot
+        };
+        self.emit_event(
+            ServerEvent::new("provider-health.changed", "provider_health")
+                .id(event_provider_id)
+                .app(event_app)
+                .success(snapshot.status.is_success())
+                .message(format!("{:?}", snapshot.status).to_ascii_lowercase()),
+        );
+        Ok(Some(snapshot))
+    }
+
+    pub async fn prune_provider_health_snapshots(&self) -> anyhow::Result<bool> {
+        let providers = self.providers.read().await;
+        let mut usage = self.usage.write().await;
+        let mut provider_health = usage.provider_health.clone();
+        let changed = provider_health.retain_providers(&providers.providers);
+        if changed {
+            provider_health.save(&self.config_dir)?;
+            usage.provider_health = provider_health;
+        }
+        Ok(changed)
     }
 
     pub async fn push_usage_log(&self, log: UsageLog) -> anyhow::Result<()> {
@@ -7530,6 +7595,7 @@ mod tests {
     use crate::cli::Cli;
     use crate::clients::router::tunnel::TunnelRuntimeStatus;
     use crate::domain::accounts::store::Account;
+    use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AppKind, ProviderType};
     use crate::domain::providers::store::providers_path;
     use crate::domain::sharing::shares::{Share, ShareAcl, UpsertShareInput};
@@ -10315,6 +10381,28 @@ mod tests {
         )])
     }
 
+    fn healthy_provider_observation(
+        provider: &StoredProvider,
+        runtime_fingerprint: &str,
+        checked_at_ms: u128,
+    ) -> ProviderHealthObservation {
+        ProviderHealthObservation {
+            app: provider.app,
+            provider_id: provider.provider.id.clone(),
+            provider_revision: provider.resource.revision,
+            runtime_fingerprint: runtime_fingerprint.to_string(),
+            status: ProviderHealthStatus::Healthy,
+            checked_at_ms,
+            source: "test".to_string(),
+            status_code: Some(200),
+            latency_ms: Some(10),
+            model: Some("gpt-5.5".to_string()),
+            error_category: None,
+            error_message: None,
+            transient_failure: false,
+        }
+    }
+
     fn stored_provider_with_user_agent(profile_id: &str, user_agent: &str) -> StoredProvider {
         let mut provider = test_provider("identity-provider", "Identity Provider");
         provider.meta = Some(ProviderMeta {
@@ -10451,6 +10539,130 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn provider_health_discards_observations_for_changed_runtime() {
+        let state = test_state();
+        let created = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("health-race-provider", "Health race"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                Some("health-race-create".to_string()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let original_fingerprint = state
+            .provider_runtime_plan(AppKind::Codex, &created.provider.id)
+            .await
+            .unwrap()
+            .runtime_fingerprint
+            .clone();
+        let original = healthy_provider_observation(&created, &original_fingerprint, 1_000);
+        assert!(state
+            .record_provider_health_observation(original.clone())
+            .await
+            .unwrap()
+            .is_some());
+
+        let updated = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider(&created.provider.id, "Health race renamed"),
+                None,
+                Some(created.resource.revision),
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(updated.resource.revision, created.resource.revision);
+
+        let mut stale_revision = original;
+        stale_revision.checked_at_ms = 2_000;
+        assert!(state
+            .record_provider_health_observation(stale_revision)
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut stale_fingerprint =
+            healthy_provider_observation(&updated, "stale-runtime-fingerprint", 3_000);
+        stale_fingerprint.provider_revision = updated.resource.revision;
+        assert!(state
+            .record_provider_health_observation(stale_fingerprint)
+            .await
+            .unwrap()
+            .is_none());
+
+        let snapshot = state
+            .usage_snapshot()
+            .await
+            .provider_health
+            .get(AppKind::Codex, &created.provider.id)
+            .cloned()
+            .unwrap();
+        assert_eq!(snapshot.checked_at_ms, 1_000);
+        assert_eq!(snapshot.provider_revision, created.resource.revision);
+    }
+
+    #[tokio::test]
+    async fn provider_delete_prunes_persisted_health_snapshot() {
+        let state = test_state();
+        let created = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("health-delete-provider", "Health delete"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                Some("health-delete-create".to_string()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let runtime_fingerprint = state
+            .provider_runtime_plan(AppKind::Codex, &created.provider.id)
+            .await
+            .unwrap()
+            .runtime_fingerprint
+            .clone();
+        state
+            .record_provider_health_observation(healthy_provider_observation(
+                &created,
+                &runtime_fingerprint,
+                1_000,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(state
+            .delete_provider_command(
+                AppKind::Codex,
+                created.provider.id.clone(),
+                created.resource.revision,
+            )
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(state
+            .usage_snapshot()
+            .await
+            .provider_health
+            .get(AppKind::Codex, &created.provider.id)
+            .is_none());
+        assert!(
+            crate::domain::health::ProviderHealthStore::load_or_default(&state.config_dir)
+                .unwrap()
+                .get(AppKind::Codex, &created.provider.id)
+                .is_none()
+        );
     }
 
     #[tokio::test]

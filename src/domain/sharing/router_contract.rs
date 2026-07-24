@@ -11,6 +11,7 @@ use crate::domain::accounts::store::{
 use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
 use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::runtime::ProviderRuntimePlan;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::{share_router_for_sale_label, Share, ShareMarketGrantStatus};
@@ -580,31 +581,58 @@ pub fn descriptor_for_share_with_accounts_and_usage(
             .iter()
             .find(|item| app_key(item.app) == app && item.provider.id == *provider_id)
         {
-            let upstream = upstream_provider(app, provider, share, accounts, usage);
-            let availability = provider_availability(app, provider, accounts, usage);
+            let runtime_plan = providers.runtime_plan(provider.app, &provider.provider.id);
+            let upstream = upstream_provider(
+                app,
+                provider,
+                share,
+                accounts,
+                usage,
+                runtime_plan.as_deref(),
+            );
+            let availability =
+                provider_availability(app, provider, accounts, usage, runtime_plan.as_deref());
             if app.as_str() == app_key(share.app) {
                 primary_upstream = Some(upstream.clone());
             }
             match app.as_str() {
                 "claude" => {
                     app_runtimes.claude = Some(upstream.clone());
-                    app_providers
-                        .claude
-                        .push(app_provider(app, provider, share, accounts, usage, true));
+                    app_providers.claude.push(app_provider(
+                        app,
+                        provider,
+                        share,
+                        accounts,
+                        usage,
+                        runtime_plan.as_deref(),
+                        true,
+                    ));
                     app_availability.claude = Some(availability);
                 }
                 "codex" => {
                     app_runtimes.codex = Some(upstream.clone());
-                    app_providers
-                        .codex
-                        .push(app_provider(app, provider, share, accounts, usage, true));
+                    app_providers.codex.push(app_provider(
+                        app,
+                        provider,
+                        share,
+                        accounts,
+                        usage,
+                        runtime_plan.as_deref(),
+                        true,
+                    ));
                     app_availability.codex = Some(availability);
                 }
                 "gemini" => {
                     app_runtimes.gemini = Some(upstream.clone());
-                    app_providers
-                        .gemini
-                        .push(app_provider(app, provider, share, accounts, usage, true));
+                    app_providers.gemini.push(app_provider(
+                        app,
+                        provider,
+                        share,
+                        accounts,
+                        usage,
+                        runtime_plan.as_deref(),
+                        true,
+                    ));
                     app_availability.gemini = Some(availability);
                 }
                 _ => {}
@@ -771,8 +799,9 @@ fn upstream_provider(
     share: &Share,
     accounts: Option<&AccountStore>,
     usage: Option<&UsageStore>,
+    runtime_plan: Option<&ProviderRuntimePlan>,
 ) -> ShareUpstreamProvider {
-    let health = usage.map(|usage| provider_health(provider, usage));
+    let health = usage.map(|usage| provider_health(provider, usage, runtime_plan));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let account_context = account_context_for_share(provider, share, accounts);
     let usage_block = account.and_then(current_account_usage_block);
@@ -807,9 +836,10 @@ fn app_provider(
     share: &Share,
     accounts: Option<&AccountStore>,
     usage: Option<&UsageStore>,
+    runtime_plan: Option<&ProviderRuntimePlan>,
     is_current: bool,
 ) -> ShareAppProvider {
-    let health = usage.map(|usage| provider_health(provider, usage));
+    let health = usage.map(|usage| provider_health(provider, usage, runtime_plan));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let account_context = account_context_for_share(provider, share, accounts);
     let usage_block = account.and_then(current_account_usage_block);
@@ -852,13 +882,17 @@ fn provider_availability(
     provider: &StoredProvider,
     accounts: Option<&AccountStore>,
     usage: Option<&UsageStore>,
+    runtime_plan: Option<&ProviderRuntimePlan>,
 ) -> ShareProviderAvailability {
-    let health = usage.map(|usage| health::provider_health(provider, usage));
+    let health = usage.map(|usage| health::provider_health_for_plan(provider, usage, runtime_plan));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let usage_block = account.and_then(current_account_usage_block);
     let quota_blocked = account.map(|_| usage_block.is_some());
-    let available =
-        health.as_ref().map(|health| health.healthy).unwrap_or(true) && quota_blocked != Some(true);
+    let available = health
+        .as_ref()
+        .map(|health| health.available)
+        .unwrap_or(true)
+        && quota_blocked != Some(true);
     let reason = usage_block
         .map(|block| block.reason.to_string())
         .or_else(|| health.as_ref().and_then(|health| health.reason.clone()));
@@ -874,10 +908,14 @@ fn provider_availability(
     }
 }
 
-fn provider_health(provider: &StoredProvider, usage: &UsageStore) -> ShareProviderHealth {
-    let health = health::provider_health(provider, usage);
+fn provider_health(
+    provider: &StoredProvider,
+    usage: &UsageStore,
+    runtime_plan: Option<&ProviderRuntimePlan>,
+) -> ShareProviderHealth {
+    let health = health::provider_health_for_plan(provider, usage, runtime_plan);
     ShareProviderHealth {
-        healthy: health.healthy,
+        healthy: health.available,
         requests: health.requests,
         successes: health.successes,
         failures: health.failures,
@@ -1320,6 +1358,7 @@ mod tests {
 
     use super::*;
     use crate::domain::accounts::store::{AccountQuota, AccountQuotaTier, AccountStore};
+    use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
     use crate::domain::sharing::shares::{ShareAcl, ShareBinding};
     use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
@@ -1607,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_maps_recent_provider_failure_to_availability() {
+    fn descriptor_maps_confirmed_provider_failure_to_availability() {
         let share = test_share(ProviderType::Codex, Some(42.0));
         let provider = test_provider(ProviderType::Codex);
         let mut log = UsageLog::new(
@@ -1621,10 +1660,18 @@ mod tests {
             Default::default(),
         );
         log.created_at_ms = crate::infra::time::now_ms();
-        let usage = UsageStore {
+        let mut usage = UsageStore {
             logs: vec![log],
             ..Default::default()
         };
+        record_health_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Unhealthy,
+            false,
+            Some(500),
+            Some("upstream rejected the request"),
+        );
         let providers = ProviderStore {
             providers: vec![provider],
             ..Default::default()
@@ -1667,10 +1714,18 @@ mod tests {
             stream_status: Some("completed".to_string()),
             ..UsageLogContext::default()
         });
-        let usage = UsageStore {
+        let mut usage = UsageStore {
             logs: vec![log],
             ..Default::default()
         };
+        record_health_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Healthy,
+            false,
+            Some(200),
+            None,
+        );
         let providers = ProviderStore {
             providers: vec![provider],
             ..Default::default()
@@ -1683,6 +1738,68 @@ mod tests {
         assert_eq!(result.actual_model, "glm-5.2");
         assert_eq!(result.status, "success");
         assert_eq!(result.source, "cc-switch-health-check");
+    }
+
+    #[test]
+    fn descriptor_waits_for_confirmation_before_disabling_transient_failure() {
+        let share = test_share(ProviderType::Codex, None);
+        let provider = test_provider(ProviderType::Codex);
+        let providers = ProviderStore {
+            providers: vec![provider.clone()],
+            ..Default::default()
+        };
+        let mut usage = UsageStore::default();
+        let confirmed_at = crate::infra::time::now_ms();
+        record_health_snapshot_at(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Unhealthy,
+            true,
+            None,
+            Some("network unavailable"),
+            confirmed_at
+                .saturating_sub(crate::domain::health::PROVIDER_HEALTH_TRANSIENT_CONFIRM_AFTER_MS),
+        );
+
+        let first = descriptor_for_share_with_usage(&share, &providers, Some(&usage));
+        assert!(first.app_availability.codex.unwrap().available);
+        assert!(first.upstream_provider.as_ref().unwrap().available.unwrap());
+        assert!(first.app_providers.codex[0].available.unwrap());
+        assert!(
+            first.app_providers.codex[0]
+                .health
+                .as_ref()
+                .unwrap()
+                .healthy
+        );
+        assert_eq!(first.model_health.codex[0].status, "success");
+
+        record_health_snapshot_at(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Unhealthy,
+            true,
+            None,
+            Some("network unavailable"),
+            confirmed_at,
+        );
+        let confirmed = descriptor_for_share_with_usage(&share, &providers, Some(&usage));
+        assert!(!confirmed.app_availability.codex.unwrap().available);
+        assert!(!confirmed
+            .upstream_provider
+            .as_ref()
+            .unwrap()
+            .available
+            .unwrap());
+        assert!(!confirmed.app_providers.codex[0].available.unwrap());
+        assert!(
+            !confirmed.app_providers.codex[0]
+                .health
+                .as_ref()
+                .unwrap()
+                .healthy
+        );
+        assert_eq!(confirmed.model_health.codex[0].status, "failed");
     }
 
     #[test]
@@ -1883,6 +2000,51 @@ mod tests {
             router_synced_descriptor_fingerprint: None,
             user_grants: BTreeMap::new(),
         }
+    }
+
+    fn record_health_snapshot(
+        usage: &mut UsageStore,
+        provider: &StoredProvider,
+        status: ProviderHealthStatus,
+        transient_failure: bool,
+        status_code: Option<u16>,
+        error_message: Option<&str>,
+    ) {
+        record_health_snapshot_at(
+            usage,
+            provider,
+            status,
+            transient_failure,
+            status_code,
+            error_message,
+            crate::infra::time::now_ms(),
+        );
+    }
+
+    fn record_health_snapshot_at(
+        usage: &mut UsageStore,
+        provider: &StoredProvider,
+        status: ProviderHealthStatus,
+        transient_failure: bool,
+        status_code: Option<u16>,
+        error_message: Option<&str>,
+        checked_at_ms: u128,
+    ) {
+        usage.provider_health.record(ProviderHealthObservation {
+            app: provider.app,
+            provider_id: provider.provider.id.clone(),
+            provider_revision: provider.resource.revision,
+            runtime_fingerprint: "runtime-test".to_string(),
+            status,
+            checked_at_ms,
+            source: "cc-switch-health-check".to_string(),
+            status_code,
+            latency_ms: Some(250),
+            model: Some("gpt-5.5".to_string()),
+            error_category: (!status.is_success()).then(|| "network".to_string()),
+            error_message: error_message.map(str::to_string),
+            transient_failure,
+        });
     }
 
     fn test_account(provider_type: ProviderType) -> Account {

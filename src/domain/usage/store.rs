@@ -7,6 +7,7 @@ use anyhow::Context;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+use crate::domain::health::ProviderHealthStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::infra::time::now_ms;
 
@@ -39,6 +40,8 @@ pub struct UsageStore {
     pub writes_since_compact: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) journal_checkpoint: Option<UsageJournalCheckpoint>,
+    #[serde(skip)]
+    pub provider_health: ProviderHealthStore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +82,7 @@ impl Default for UsageStore {
             },
             writes_since_compact: 0,
             journal_checkpoint: Some(checkpoint),
+            provider_health: ProviderHealthStore::default(),
         }
     }
 }
@@ -167,6 +171,7 @@ impl UsageStore {
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
         let path = usage_path(config_dir);
         let jsonl_path = usage_jsonl_path(config_dir);
+        let provider_health = ProviderHealthStore::load_rebuildable(config_dir);
         let snapshot_exists = path.exists();
         let mut store = if snapshot_exists {
             let content = fs::read_to_string(&path)
@@ -176,6 +181,7 @@ impl UsageStore {
         } else {
             Self::default()
         };
+        store.provider_health = provider_health;
         let snapshot_needs_migration = store.schema_version < USAGE_SCHEMA_VERSION;
         let journal = load_usage_journal(&jsonl_path)?;
         let journal_needs_migration = journal.needs_migration();
@@ -413,7 +419,7 @@ impl UsageStore {
             return self.rollups.rollup_filtered(&UsageStatsFilter::default());
         }
         let mut rollup = UsageRollup::default();
-        for log in &self.logs {
+        for log in self.logs.iter().filter(|log| !log.is_health_check) {
             rollup.requests += 1;
             if (200..400).contains(&log.status_code) {
                 rollup.successes += 1;
@@ -570,7 +576,7 @@ pub struct UsageLogFilter {
     pub stream_status: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UsageStatsFilter {
     pub limit: Option<usize>,
     pub from_ms: Option<u128>,
@@ -586,6 +592,27 @@ pub struct UsageStatsFilter {
     pub data_source: Option<String>,
     pub is_health_check: Option<bool>,
     pub stream_status: Option<String>,
+}
+
+impl Default for UsageStatsFilter {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            from_ms: None,
+            to_ms: None,
+            window_ms: None,
+            app: None,
+            provider_id: None,
+            provider_name: None,
+            model: None,
+            share_id: None,
+            user_email: None,
+            session_id: None,
+            data_source: None,
+            is_health_check: Some(false),
+            stream_status: None,
+        }
+    }
 }
 
 impl UsageLog {
@@ -871,6 +898,7 @@ struct UsageRollupBucket {
     user_email: Option<String>,
     session_id: Option<String>,
     data_source: Option<String>,
+    #[serde(default)]
     is_health_check: bool,
     stream_status: Option<String>,
     stats: UsageStatsAccumulator,
@@ -2394,6 +2422,56 @@ mod tests {
     }
 
     #[test]
+    fn business_usage_stats_exclude_health_checks_by_default() {
+        let mut business = UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                total_tokens: Some(15),
+                ..Default::default()
+            },
+        );
+        business.request_id = "business".to_string();
+
+        let mut health_check = business.clone();
+        health_check.request_id = "health".to_string();
+        health_check.status_code = 599;
+        health_check.is_health_check = true;
+        health_check.input_tokens = Some(100);
+        health_check.output_tokens = Some(50);
+        health_check.total_tokens = Some(150);
+
+        let mut store = UsageStore::default();
+        store.push(business);
+        store.push(health_check);
+
+        let business_rollup = store.rollup();
+        assert_eq!(business_rollup.requests, 1);
+        assert_eq!(business_rollup.successes, 1);
+        assert_eq!(business_rollup.failures, 0);
+        assert_eq!(business_rollup.total_tokens, 15);
+        assert_eq!(
+            store.rollup_filtered(&UsageStatsFilter::default()).requests,
+            1
+        );
+
+        let health_rollup = store.rollup_filtered(&UsageStatsFilter {
+            is_health_check: Some(true),
+            ..UsageStatsFilter::default()
+        });
+        assert_eq!(health_rollup.requests, 1);
+        assert_eq!(health_rollup.failures, 1);
+        assert_eq!(health_rollup.total_tokens, 150);
+    }
+
+    #[test]
     fn usage_stats_share_one_filter_fixture() {
         let mut codex = UsageLog::new(
             AppKind::Codex,
@@ -2810,7 +2888,6 @@ mod tests {
                 "actualModel": "gpt-5.5",
                 "actualModelSource": "response",
                 "pricingModel": pricing_model,
-                "isHealthCheck": false,
                 "stats": {
                     "rollup": {
                         "requests": requests,

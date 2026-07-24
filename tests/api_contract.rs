@@ -32,6 +32,7 @@ use cc_switch_server::cli::Cli;
 use cc_switch_server::domain::accounts::store::{
     AccountQuota, AccountRefreshUpdate, UpsertAccountInput,
 };
+use cc_switch_server::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
 use cc_switch_server::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
 };
@@ -254,31 +255,47 @@ async fn share_router_runtime_reports_health_for_requested_share_binding() {
         .await
         .unwrap();
 
-    let mut bound_log = UsageLog::new(
-        AppKind::Codex,
-        "provider-bound".to_string(),
-        "Bound Provider".to_string(),
-        ProviderType::Codex,
-        599,
-        250,
-        UsageModelMetadata {
-            model: Some("gpt-5.5".to_string()),
-            requested_model: Some("gpt-5.5".to_string()),
-            ..Default::default()
-        },
-        TokenUsage::default(),
-    );
-    bound_log.apply_context(UsageLogContext {
-        share_id: Some("share-runtime-health".to_string()),
-        data_source: Some("cc-switch-scheduled".to_string()),
-        is_health_check: true,
-        is_streaming: true,
-        stream_status: Some("failed".to_string()),
-        ..Default::default()
-    });
-    bound_log.error_message = Some("upstream connection timed out".to_string());
-    bound_log.created_at_ms = 1_783_917_271_880;
-    state.push_usage_log(bound_log).await.unwrap();
+    let provider = providers_snapshot(&state)
+        .await
+        .providers
+        .into_iter()
+        .find(|provider| provider.provider.id == "provider-bound")
+        .unwrap();
+    let runtime_fingerprint = state
+        .provider_runtime_plan(AppKind::Codex, "provider-bound")
+        .await
+        .unwrap()
+        .runtime_fingerprint
+        .clone();
+    let checked_at_ms = cc_switch_server::infra::time::now_ms();
+    for (checked_at_ms, source) in [
+        (
+            checked_at_ms.saturating_sub(
+                cc_switch_server::domain::health::PROVIDER_HEALTH_TRANSIENT_CONFIRM_AFTER_MS,
+            ),
+            "cc-switch-scheduled",
+        ),
+        (checked_at_ms, "cc-switch-scheduled-confirmation"),
+    ] {
+        state
+            .record_provider_health_observation(ProviderHealthObservation {
+                app: AppKind::Codex,
+                provider_id: provider.provider.id.clone(),
+                provider_revision: provider.resource.revision,
+                runtime_fingerprint: runtime_fingerprint.clone(),
+                status: ProviderHealthStatus::Unhealthy,
+                checked_at_ms,
+                source: source.to_string(),
+                status_code: Some(599),
+                latency_ms: Some(250),
+                model: Some("gpt-5.5".to_string()),
+                error_category: Some("timeout".to_string()),
+                error_message: Some("upstream connection timed out".to_string()),
+                transient_failure: true,
+            })
+            .await
+            .unwrap();
+    }
 
     let app = app_router(state);
     let response = app
@@ -300,8 +317,11 @@ async fn share_router_runtime_reports_health_for_requested_share_binding() {
     assert_eq!(results[0]["providerId"], "provider-bound");
     assert_eq!(results[0]["providerName"], "Bound Provider");
     assert_eq!(results[0]["status"], "failed");
-    assert_eq!(results[0]["checkedAt"], 1_783_917_271_i64);
-    assert_eq!(results[0]["source"], "cc-switch-scheduled");
+    assert_eq!(
+        results[0]["checkedAt"],
+        i64::try_from(checked_at_ms / 1000).unwrap()
+    );
+    assert_eq!(results[0]["source"], "cc-switch-scheduled-confirmation");
     assert_eq!(results[0]["errorMessage"], "upstream connection timed out");
 }
 

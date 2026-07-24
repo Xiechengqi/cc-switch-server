@@ -2482,10 +2482,19 @@
   },
   "health": {
     "operational": "正常",
-    "degraded": "降级",
+    "degraded": "响应较慢",
     "failed": "失败",
     "unavailable": "异常",
-    "failedRequests": "失败请求 {{count}} 次"
+    "unknown": "待检测",
+    "unsupported": "暂不支持检测",
+    "failedRequests": "失败请求 {{count}} 次",
+    "checkedAt": "检测时间：{{value}}",
+    "notChecked": "尚未检测",
+    "source": "来源：{{value}}",
+    "model": "模型：{{value}}",
+    "latency": "延迟：{{value}} ms",
+    "statusCode": "HTTP：{{value}}",
+    "confirmationPending": "等待二次确认"
   },
   "proxy": {
     "panel": {

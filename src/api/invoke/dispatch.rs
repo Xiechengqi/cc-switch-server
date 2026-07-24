@@ -598,8 +598,17 @@ async fn web_invoke_dispatch(
         }
         "get_provider_health" => {
             let app = web_arg_app_type(&args)?;
-            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
-            Ok(web_provider_health_json(state, app, &provider_id).await?)
+            if let Some(provider_id) = args
+                .get("providerId")
+                .or_else(|| args.get("provider_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Ok(web_provider_health_json(state, app, provider_id).await?)
+            } else {
+                Ok(web_provider_health_list_json(state, app).await)
+            }
         }
         "list_shares" | "export_all_shares" => {
             let config = state.config_snapshot().await;
@@ -1494,24 +1503,32 @@ async fn web_invoke_dispatch(
         }
         "model_test_provider" => {
             let stored = web_resolve_stored_provider(state, &args).await?;
-            let execution =
-                resolve_provider_execution_by_key(state, stored.app, &stored.provider.id).await?;
             let config = web_stream_check_config(state).await;
-            let response = test_provider_inner(
+            let probe = crate::api::provider_health_scheduler::probe_provider_and_record(
                 state,
-                execution,
-                &TestProviderQuery {
-                    app: stored.app,
-                    network: Some(true),
-                    timeout_ms: Some(config.timeout_secs.saturating_mul(1000)),
-                    model: None,
-                    stream: Some(true),
-                },
+                &stored,
+                &config,
+                "cc-switch-manual",
             )
-            .await?;
-            Ok(json!(map_provider_test_to_stream_check_result(
-                &response, &config,
-            )))
+            .await
+            .map_err(ApiError::internal)?;
+            if let Err(error) =
+                crate::api::provider_health_scheduler::project_recorded_probe_to_active_shares(
+                    state,
+                    &stored,
+                    &probe,
+                    "cc-switch-manual",
+                )
+                .await
+            {
+                tracing::warn!(
+                    app = stored.app.as_str(),
+                    provider_id = %stored.provider.id,
+                    error = %error,
+                    "failed to project manual Provider health result to Shares"
+                );
+            }
+            Ok(json!(probe.result))
         }
         "model_test_all_providers" => {
             let app = web_arg_app_type(&args)?;
@@ -1535,75 +1552,31 @@ async fn web_invoke_dispatch(
                 {
                     continue;
                 }
-                let execution =
-                    match resolve_provider_execution_by_key(state, stored.app, &stored.provider.id)
-                        .await
-                    {
-                        Ok(execution) => execution,
-                        Err(error) => {
-                            results.push((
-                                stored.provider.id.clone(),
-                                crate::domain::stream_check::StreamCheckResult {
-                                    status: crate::domain::stream_check::HealthStatus::Failed,
-                                    success: false,
-                                    provider_revision: Some(stored.resource.revision),
-                                    message: error.message,
-                                    response_time_ms: None,
-                                    http_status: None,
-                                    tested_at: chrono::Utc::now().timestamp(),
-                                    retry_count: 0,
-                                    error_category: Some("invalidConfig".to_string()),
-                                    model_used: String::new(),
-                                    input_tokens: 0,
-                                    output_tokens: 0,
-                                    cache_read_tokens: 0,
-                                    cache_creation_tokens: 0,
-                                },
-                            ));
-                            continue;
-                        }
-                    };
-                let response = test_provider_inner(
+                let probe = crate::api::provider_health_scheduler::probe_provider_and_record(
                     state,
-                    execution,
-                    &TestProviderQuery {
-                        app: stored.app,
-                        network: Some(true),
-                        timeout_ms: Some(config.timeout_secs.saturating_mul(1000)),
-                        model: None,
-                        stream: Some(true),
-                    },
+                    &stored,
+                    &config,
+                    "cc-switch-manual",
                 )
                 .await
-                .unwrap_or_else(|error| {
-                    let message = error.message.clone();
-                    TestProviderResponse {
-                        ok: false,
-                        outcome: ProviderOperationOutcome::InvalidConfig,
-                        driver_id: "unknown".to_string(),
-                        runtime_fingerprint: String::new(),
-                        provider_id: stored.provider.id.clone(),
-                        app: stored.app,
-                        provider_type: stored.provider_type,
-                        provider_revision: stored.resource.revision,
-                        adapter: "unknown",
-                        support: proxy::adapters::AdapterSupport::Planned,
-                        endpoint: String::new(),
-                        model: String::new(),
-                        stream: true,
-                        header_names: Vec::new(),
-                        network_checked: true,
-                        network_status_code: None,
-                        network_latency_ms: None,
-                        network_stream_completed: None,
-                        network_error: Some(message.clone()),
-                        message,
-                    }
-                });
-                results.push((
-                    stored.provider.id,
-                    map_provider_test_to_stream_check_result(&response, &config),
-                ));
+                .map_err(ApiError::internal)?;
+                if let Err(error) =
+                    crate::api::provider_health_scheduler::project_recorded_probe_to_active_shares(
+                        state,
+                        &stored,
+                        &probe,
+                        "cc-switch-manual",
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        app = stored.app.as_str(),
+                        provider_id = %stored.provider.id,
+                        error = %error,
+                        "failed to project manual Provider health result to Shares"
+                    );
+                }
+                results.push((stored.provider.id, probe.result));
             }
             Ok(json!(results))
         }

@@ -22,6 +22,7 @@ import { useProvidersQuery } from "@/lib/query";
 import { useProxyStatus, useProxyTakeoverStatus } from "@/lib/query/proxy";
 import { useServerProviderActions } from "@/server/providers/useServerProviderActions";
 import { useOauthQuotaRefreshBridge } from "@/hooks/useOauthQuotaRefreshBridge";
+import { useProviderHealthRefreshBridge } from "@/hooks/useProviderHealthRefreshBridge";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { deepClone } from "@/utils/deepClone";
@@ -94,6 +95,7 @@ export default function ServerApp({
 }: ServerAppProps = {}) {
   const { t } = useTranslation();
   useOauthQuotaRefreshBridge();
+  useProviderHealthRefreshBridge();
   const [activeApp, setActiveApp] = useState<CoreProviderApp>(getInitialApp);
   const [currentView, setCurrentView] = useState<View>(() =>
     getInitialView(enableWebTerminal),

@@ -14,32 +14,125 @@ pub(in crate::api) async fn web_provider_health_json(
     app: AppKind,
     provider_id: &str,
 ) -> Result<Value, ApiError> {
-    let provider = state
-        .providers
-        .read()
-        .await
+    let providers = state.providers.read().await;
+    let provider = providers
         .providers
         .iter()
         .find(|provider| provider.app == app && provider.provider.id == provider_id)
-        .cloned()
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let plan = providers.runtime_plan(app, provider_id);
     let usage = state.usage.read().await;
-    let health = crate::domain::health::provider_health(&provider, &usage);
-    let last_request_at = health.last_request_at_ms.map(|value| value.to_string());
-    let last_was_success = health
-        .last_status_code
-        .is_some_and(|status| (200..400).contains(&status));
-    Ok(json!({
-        "provider_id": provider_id,
-        "app_type": app.as_str(),
-        "is_healthy": health.healthy,
-        "consecutive_failures": if health.healthy { 0 } else { health.failures },
-        "last_success_at": last_was_success.then(|| last_request_at.clone()).flatten(),
-        "last_failure_at": (!last_was_success).then(|| last_request_at.clone()).flatten(),
+    let health = crate::domain::health::provider_health_for_plan(provider, &usage, plan.as_deref());
+    Ok(web_provider_health_value(&health))
+}
+
+pub(in crate::api) async fn web_provider_health_list_json(
+    state: &ServerState,
+    app: AppKind,
+) -> Value {
+    let providers = state.providers.read().await;
+    let usage = state.usage.read().await;
+    Value::Array(
+        providers
+            .providers
+            .iter()
+            .filter(|provider| provider.app == app)
+            .map(|provider| {
+                let plan = providers.runtime_plan(app, &provider.provider.id);
+                let health = crate::domain::health::provider_health_for_plan(
+                    provider,
+                    &usage,
+                    plan.as_deref(),
+                );
+                web_provider_health_value(&health)
+            })
+            .collect(),
+    )
+}
+
+fn web_provider_health_value(health: &crate::domain::health::ProviderHealth) -> Value {
+    use crate::domain::health::ProviderHealthStatus;
+
+    let checked_at = health.checked_at_ms.map(|value| value.to_string());
+    let successful = matches!(
+        health.status,
+        ProviderHealthStatus::Healthy | ProviderHealthStatus::Degraded
+    );
+    let failed = health.status == ProviderHealthStatus::Unhealthy;
+    json!({
+        "provider_id": health.provider_id,
+        "app_type": health.app.as_str(),
+        "status": health.status,
+        "probe_support": health.probe_support,
+        "available": health.available,
+        "is_healthy": successful,
+        "consecutive_successes": health.consecutive_successes,
+        "consecutive_failures": health.consecutive_failures,
+        "confirmation_pending": health.confirmation_pending,
+        "last_success_at": successful.then(|| checked_at.clone()).flatten(),
+        "last_failure_at": failed.then(|| checked_at.clone()).flatten(),
         "last_error": health.reason,
-        "updated_at": last_request_at
-            .unwrap_or_else(|| "0".to_string()),
-    }))
+        "updated_at": checked_at.clone().unwrap_or_else(|| "0".to_string()),
+        "checked_at": checked_at,
+        "stale_at": health.stale_at_ms.map(|value| value.to_string()),
+        "source": health.source,
+        "latency_ms": health.probe_latency_ms,
+        "model": health.model,
+        "status_code": health.last_status_code,
+        "error_category": health.error_category,
+    })
+}
+
+#[cfg(test)]
+mod provider_health_response_tests {
+    use super::*;
+    use crate::domain::health::{ProviderHealth, ProviderHealthStatus, ProviderProbeSupport};
+
+    fn health(status: ProviderHealthStatus) -> ProviderHealth {
+        ProviderHealth {
+            provider_id: "p1".to_string(),
+            app: AppKind::Codex,
+            requests: 0,
+            successes: 0,
+            failures: 0,
+            success_rate: None,
+            avg_latency_ms: None,
+            last_status_code: None,
+            last_request_at_ms: None,
+            healthy: status != ProviderHealthStatus::Unhealthy,
+            available: true,
+            status,
+            probe_support: ProviderProbeSupport::Supported,
+            checked_at_ms: None,
+            stale_at_ms: None,
+            source: None,
+            probe_latency_ms: None,
+            model: None,
+            error_category: None,
+            consecutive_successes: 0,
+            consecutive_failures: 0,
+            confirmation_pending: false,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn unknown_health_is_not_fabricated_as_normal() {
+        let value = web_provider_health_value(&health(ProviderHealthStatus::Unknown));
+        assert_eq!(value["status"], "unknown");
+        assert_eq!(value["is_healthy"], false);
+        assert_eq!(value["available"], true);
+        assert_eq!(value["updated_at"], "0");
+    }
+
+    #[test]
+    fn unsupported_probe_capability_is_explicit() {
+        let mut health = health(ProviderHealthStatus::Unknown);
+        health.probe_support = ProviderProbeSupport::Unsupported;
+        let value = web_provider_health_value(&health);
+        assert_eq!(value["probe_support"], "unsupported");
+        assert_eq!(value["status"], "unknown");
+    }
 }
 
 pub(in crate::api) async fn web_resolve_stored_provider(
@@ -110,14 +203,35 @@ pub(in crate::api) fn map_provider_test_to_stream_check_result(
         model_used: response.model.clone(),
         tested_at: chrono::Utc::now().timestamp(),
         retry_count: 0,
-        error_category: response
-            .network_status_code
-            .and_then(|status| (status == 404).then_some("modelNotFound".to_string())),
+        error_category: provider_test_error_category(response),
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
     }
+}
+
+fn provider_test_error_category(response: &TestProviderResponse) -> Option<String> {
+    if response.network_stream_completed == Some(false) {
+        return Some("streamIncomplete".to_string());
+    }
+    if response.network_status_code == Some(404) {
+        return Some("modelNotFound".to_string());
+    }
+    let category = match response.outcome {
+        ProviderOperationOutcome::Success => return None,
+        ProviderOperationOutcome::Unsupported => "unsupported",
+        ProviderOperationOutcome::InvalidConfig => "invalidConfig",
+        ProviderOperationOutcome::MissingCredential => "missingCredential",
+        ProviderOperationOutcome::Auth => "auth",
+        ProviderOperationOutcome::RateLimit => "rateLimit",
+        ProviderOperationOutcome::Quota => "quotaExceeded",
+        ProviderOperationOutcome::Timeout => "timeout",
+        ProviderOperationOutcome::Network => "network",
+        ProviderOperationOutcome::Upstream => "upstream",
+        ProviderOperationOutcome::Protocol => "protocol",
+    };
+    Some(category.to_string())
 }
 
 pub(in crate::api) async fn web_fetch_models_for_config(
@@ -1678,7 +1792,8 @@ pub(in crate::api) fn web_request_logs_json(usage: &UsageStore, args: &Value) ->
         .clamp(1, MAX_PAGE_SIZE);
 
     let matches = |log: &&UsageLog| {
-        from_ms.is_none_or(|from| log.created_at_ms >= from)
+        !log.is_health_check
+            && from_ms.is_none_or(|from| log.created_at_ms >= from)
             && to_ms.is_none_or(|to| log.created_at_ms <= to)
             && app_type
                 .as_deref()
