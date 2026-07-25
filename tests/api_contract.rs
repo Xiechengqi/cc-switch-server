@@ -761,6 +761,75 @@ async fn auth_routes_cover_password_api_token_and_email_paths() {
 }
 
 #[tokio::test]
+async fn account_capabilities_expose_structured_login_flows_and_derived_legacy_flags() {
+    let response = app_router(test_state())
+        .oneshot(json_request(
+            Method::GET,
+            "/api/accounts/capabilities",
+            json!(null),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let capabilities = body["capabilities"].as_array().unwrap();
+
+    for capability in capabilities {
+        let flows = capability["loginFlows"].as_array().unwrap();
+        assert_eq!(
+            capability["supportsStartLogin"].as_bool(),
+            Some(!flows.is_empty()),
+            "supportsStartLogin must be derived from loginFlows for {}",
+            capability["providerType"]
+        );
+        assert_eq!(
+            capability["supportsCallback"].as_bool(),
+            Some(
+                flows
+                    .iter()
+                    .any(|flow| flow["supportsCallback"].as_bool() == Some(true))
+            ),
+            "supportsCallback must be derived from loginFlows for {}",
+            capability["providerType"]
+        );
+    }
+
+    let capability_for = |provider_type: &str| {
+        capabilities
+            .iter()
+            .find(|capability| capability["providerType"].as_str() == Some(provider_type))
+            .unwrap_or_else(|| panic!("missing account capability for {provider_type}"))
+    };
+    let flow_kinds = |capability: &Value| {
+        capability["loginFlows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|flow| flow["kind"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        flow_kinds(capability_for("claude_oauth")),
+        ["browser_oauth", "cli_manual_callback"].map(str::to_string)
+    );
+    assert_eq!(
+        flow_kinds(capability_for("codex_oauth")),
+        ["browser_oauth", "device_code", "cli_manual_callback"].map(str::to_string)
+    );
+    let codex_device = capability_for("codex_oauth")["loginFlows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|flow| flow["kind"] == "device_code")
+        .unwrap();
+    assert_eq!(codex_device["supportsCallback"], false);
+    assert_eq!(codex_device["supportsPoll"], true);
+    assert_eq!(codex_device["supportsCancel"], true);
+}
+
+#[tokio::test]
 async fn oauth_login_cancel_is_authenticated_idempotent_and_terminal() {
     let state = test_state();
     let app = app_router(state);

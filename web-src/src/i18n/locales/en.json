@@ -1416,6 +1416,7 @@
     "cliUnavailableInRemoteWeb": "CLI OAuth is available only on loopback or the configured HTTPS Client URL. Use Device Code here.",
     "waitingForManualCallback": "Complete authorization, then submit the callback URL from the browser address bar",
     "callbackUrl": "Callback URL",
+    "callbackUrlPlaceholder": "http://localhost:1455/auth/callback?code=...&state=...",
     "submitCallback": "Submit",
     "imageGeneration": "Image generation",
     "imageGenerationDescription": "Enable OpenAI-compatible /v1/images/generations through the ChatGPT Codex backend.",
@@ -3390,7 +3391,8 @@
     },
     "usage": {
       "title": "Request settings",
-      "customUserAgent": "Custom User-Agent"
+      "customUserAgent": "Custom User-Agent",
+      "customUserAgentPlaceholder": "custom-client/1.0"
     },
     "legacy": {
       "title": "Compatibility status",

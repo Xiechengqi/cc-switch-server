@@ -1341,6 +1341,7 @@
     "cliUnavailableInRemoteWeb": "CLI OAuth は loopback または設定済みの HTTPS Client URL でのみ利用できます。ここでは Device Code を使用してください。",
     "waitingForManualCallback": "認証完了後、ブラウザのアドレスバーに表示されたコールバック URL を送信してください",
     "callbackUrl": "コールバック URL",
+    "callbackUrlPlaceholder": "http://localhost:1455/auth/callback?code=...&state=...",
     "submitCallback": "送信",
     "imageGeneration": "画像生成",
     "imageGenerationDescription": "ChatGPT Codex バックエンドで OpenAI 互換の /v1/images/generations を有効にします。",
@@ -3313,7 +3314,8 @@
     },
     "usage": {
       "title": "リクエスト設定",
-      "customUserAgent": "カスタム User-Agent"
+      "customUserAgent": "カスタム User-Agent",
+      "customUserAgentPlaceholder": "custom-client/1.0"
     },
     "legacy": {
       "title": "互換性ステータス",

@@ -14,6 +14,7 @@ const ANTIGRAVITY_CLIENT_METADATA_PLATFORM: i32 = 2;
 const ANTIGRAVITY_UPDATER_USER_AGENT: &str = "electron-builder";
 const ANTIGRAVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 const ANTIGRAVITY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.38.2";
 
 static ANTIGRAVITY_VERSION: OnceLock<RwLock<String>> = OnceLock::new();
 static ANTIGRAVITY_UPDATER_STARTED: OnceLock<()> = OnceLock::new();

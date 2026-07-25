@@ -65,7 +65,7 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
         ManagedIdentityFamily::Cursor => set_user_agent(headers, "connect-es/1.6.1".to_string()),
         ManagedIdentityFamily::Copilot => set_user_agent(
             headers,
-            crate::clients::oauth::copilot_device::COPILOT_USER_AGENT.to_string(),
+            crate::provider_identity::COPILOT_USER_AGENT.to_string(),
         ),
         ManagedIdentityFamily::Deepseek => {
             set_user_agent(headers, "DeepSeek/2.0.4 Android/35".to_string())
@@ -200,7 +200,7 @@ mod tests {
             ),
             (
                 ManagedIdentityFamily::Copilot,
-                crate::clients::oauth::copilot_device::COPILOT_USER_AGENT.to_string(),
+                crate::provider_identity::COPILOT_USER_AGENT.to_string(),
             ),
             (
                 ManagedIdentityFamily::Deepseek,

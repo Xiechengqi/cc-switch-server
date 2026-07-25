@@ -1,0 +1,32 @@
+{
+  "id": "reasoning-authenticated-roundtrip",
+  "category": "reasoning",
+  "envelopePrefix": "ccswitch-server-reasoning-v1:",
+  "openAiItem": {
+    "id": "rs_contract",
+    "type": "reasoning",
+    "summary": [
+      {
+        "type": "summary_text",
+        "text": "first"
+      },
+      {
+        "type": "reasoning_text",
+        "text": " second"
+      }
+    ],
+    "content": [
+      {
+        "type": "text",
+        "text": " third"
+      }
+    ],
+    "encrypted_content": "provider-opaque-contract"
+  },
+  "expectedThinking": "first second third",
+  "anthropicBlock": {
+    "type": "thinking",
+    "thinking": "native thought",
+    "signature": "anthropic-contract-signature"
+  }
+}

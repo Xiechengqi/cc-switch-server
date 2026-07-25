@@ -1,0 +1,96 @@
+{
+  "id": "anthropic-request-normalization",
+  "category": "request_normalization",
+  "input": {
+    "model": "claude-sonnet-4-6",
+    "instructions": "base policy",
+    "max_output_tokens": 2048,
+    "temperature": 0.2,
+    "parallel_tool_calls": false,
+    "tool_choice": {
+      "type": "function",
+      "name": "lookup"
+    },
+    "tools": [
+      {
+        "type": "function",
+        "name": "lookup",
+        "parameters": {
+          "type": "object"
+        }
+      }
+    ],
+    "input": [
+      {
+        "role": "developer",
+        "content": "developer policy"
+      },
+      {
+        "role": "user",
+        "content": "run both"
+      },
+      {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "lookup",
+        "arguments": "{\"query\":\"one\"}"
+      },
+      {
+        "type": "function_call",
+        "call_id": "call_2",
+        "name": "lookup",
+        "arguments": "{\"query\":\"two\"}"
+      },
+      {
+        "role": "user",
+        "content": "summarize"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": "one"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_2",
+        "output": "two"
+      }
+    ]
+  },
+  "expected": {
+    "system": "base policy\n\ndeveloper policy",
+    "maxTokens": 2048,
+    "roles": [
+      "user",
+      "assistant",
+      "user"
+    ],
+    "toolUseIds": [
+      "call_1",
+      "call_2"
+    ],
+    "toolResultIds": [
+      "call_1",
+      "call_2"
+    ],
+    "trailingText": "summarize",
+    "toolChoiceType": "tool",
+    "disableParallelToolUse": true
+  },
+  "invalidArgumentsInput": {
+    "model": "claude-sonnet-4-6",
+    "input": [
+      {
+        "type": "function_call",
+        "call_id": "call_bad",
+        "name": "lookup",
+        "arguments": "{broken"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_bad",
+        "output": "unused"
+      }
+    ]
+  }
+}

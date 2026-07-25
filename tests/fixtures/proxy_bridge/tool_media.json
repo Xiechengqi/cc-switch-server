@@ -1,0 +1,138 @@
+{
+  "id": "tool-result-native-media",
+  "category": "tool_media",
+  "scope": "all_supported",
+  "output": {
+    "stdout": "ok",
+    "parts": [
+      {
+        "type": "image",
+        "source": {
+          "type": "base64",
+          "media_type": "image/png",
+          "data": "aGVsbG8="
+        },
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "type": "document",
+        "source": {
+          "type": "base64",
+          "media_type": "application/pdf",
+          "data": "cGRm"
+        },
+        "title": "report.pdf"
+      },
+      {
+        "type": "input_audio",
+        "input_audio": {
+          "data": "YXVkaW8=",
+          "format": "wav"
+        }
+      }
+    ]
+  },
+  "expected": {
+    "sanitized": {
+      "stdout": "ok",
+      "parts": [
+        {
+          "type": "text",
+          "text": "[cc-switch-server: tool result media moved to native content]",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        },
+        {
+          "type": "text",
+          "text": "[cc-switch-server: tool result media moved to native content]"
+        },
+        {
+          "type": "input_text",
+          "text": "[cc-switch-server: tool result media moved to native content]"
+        }
+      ]
+    },
+    "chatParts": [
+      {
+        "type": "image_url",
+        "image_url": {
+          "url": "data:image/png;base64,aGVsbG8="
+        }
+      },
+      {
+        "type": "file",
+          "file": {
+          "file_data": "data:application/pdf;base64,cGRm",
+          "filename": "report.pdf"
+        }
+      },
+      {
+        "type": "input_audio",
+        "input_audio": {
+          "data": "YXVkaW8=",
+          "format": "wav"
+        }
+      }
+    ],
+    "responsesParts": [
+      {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,aGVsbG8="
+      },
+      {
+        "type": "input_file",
+        "file_data": "data:application/pdf;base64,cGRm",
+        "filename": "report.pdf"
+      },
+      {
+        "type": "input_audio",
+        "input_audio": {
+          "data": "YXVkaW8=",
+          "format": "wav"
+        }
+      }
+    ],
+    "anthropicBlocks": [
+      {
+        "type": "image",
+        "source": {
+          "type": "base64",
+          "media_type": "image/png",
+          "data": "aGVsbG8="
+        }
+      },
+      {
+        "type": "document",
+        "source": {
+          "type": "base64",
+          "media_type": "application/pdf",
+          "data": "cGRm"
+        },
+        "title": "report.pdf"
+      }
+    ],
+    "geminiParts": [
+      {
+        "inlineData": {
+          "mimeType": "image/png",
+          "data": "aGVsbG8="
+        }
+      },
+      {
+        "inlineData": {
+          "mimeType": "application/pdf",
+          "data": "cGRm"
+        }
+      },
+      {
+        "inlineData": {
+          "mimeType": "audio/wav",
+          "data": "YXVkaW8="
+        }
+      }
+    ]
+  }
+}

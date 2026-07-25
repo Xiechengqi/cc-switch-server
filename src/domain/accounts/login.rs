@@ -15,6 +15,7 @@ use crate::domain::accounts::oauth::{
 use crate::domain::providers::model::ProviderType;
 
 const LOGIN_SESSION_TTL_MS: i64 = 5 * 60 * 1000;
+const EXPIRED_SESSION_RETENTION_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Default)]
 pub struct OAuthLoginStore {
@@ -373,10 +374,6 @@ impl OAuthLoginStore {
             .get_mut(&session_key)
             .ok_or(OAuthLoginError::NotFound)?;
         ensure_principal(session, access)?;
-        if session.expires_at_ms <= now_ms {
-            session.status = OAuthLoginStatus::Expired;
-            return Err(OAuthLoginError::Expired);
-        }
         if expected_provider_type.is_some_and(|expected| expected != session.provider_type) {
             return Err(OAuthLoginError::ProviderMismatch);
         }
@@ -400,6 +397,9 @@ impl OAuthLoginStore {
         }
         if session.status == OAuthLoginStatus::TokenExchangeStarted {
             return Err(OAuthLoginError::AlreadyConsumed);
+        }
+        if session.status == OAuthLoginStatus::Expired {
+            return Err(OAuthLoginError::Expired);
         }
         if execute_token_exchange && !provider_token_exchange_available(session.provider_type) {
             return Err(OAuthLoginError::Unsupported(format!(
@@ -507,6 +507,7 @@ impl OAuthLoginStore {
             OAuthLoginStatus::TokenExchangeStarted => {
                 session.status = OAuthLoginStatus::TokenExchanged;
                 session.completed_account_id = Some(account_id.to_string());
+                clear_session_secrets(session);
                 Ok(())
             }
             OAuthLoginStatus::TokenExchanged
@@ -587,16 +588,13 @@ impl OAuthLoginStore {
                 .map(OAuthLoginAccess::Principal)
                 .unwrap_or(OAuthLoginAccess::Unbound),
         )?;
-        if session.expires_at_ms <= now_ms {
-            session.status = OAuthLoginStatus::Expired;
-            return Err(OAuthLoginError::Expired);
-        }
         if expected_provider_type.is_some_and(|expected| expected != session.provider_type) {
             return Err(OAuthLoginError::ProviderMismatch);
         }
         match session.status {
             OAuthLoginStatus::Pending | OAuthLoginStatus::TokenRequestPreviewed => {
                 session.status = OAuthLoginStatus::Cancelled;
+                clear_session_secrets(session);
             }
             OAuthLoginStatus::Cancelled => {}
             OAuthLoginStatus::TokenExchangeStarted | OAuthLoginStatus::TokenExchanged => {
@@ -645,8 +643,7 @@ impl OAuthLoginStore {
             .get_mut(&session_key)
             .ok_or(OAuthLoginError::NotFound)?;
         ensure_principal(session, OAuthLoginAccess::Principal(principal_id))?;
-        if session.expires_at_ms <= now_ms {
-            session.status = OAuthLoginStatus::Expired;
+        if session.status == OAuthLoginStatus::Expired {
             return Err(OAuthLoginError::Expired);
         }
         Ok(session.provider_type)
@@ -671,14 +668,14 @@ impl OAuthLoginStore {
                 .map(OAuthLoginAccess::Principal)
                 .unwrap_or(OAuthLoginAccess::Unbound),
         )?;
-        if session.expires_at_ms <= now_ms {
-            return Err(OAuthLoginError::Expired);
-        }
         if session.status == OAuthLoginStatus::TokenExchanged {
             return Ok(OAuthSessionPollState::Completed);
         }
         if session.status == OAuthLoginStatus::Cancelled {
             return Err(OAuthLoginError::Cancelled);
+        }
+        if session.status == OAuthLoginStatus::Expired {
+            return Err(OAuthLoginError::Expired);
         }
         match session.flow {
             OAuthAuthorizeFlow::CursorDeepControl => {
@@ -735,9 +732,27 @@ impl OAuthLoginStore {
     }
 
     fn cleanup_expired(&mut self, now_ms: i64) {
-        self.sessions
-            .retain(|_, session| session.expires_at_ms > now_ms);
+        self.sessions.retain(|_, session| {
+            if session.expires_at_ms <= now_ms
+                && matches!(
+                    session.status,
+                    OAuthLoginStatus::Pending | OAuthLoginStatus::TokenRequestPreviewed
+                )
+            {
+                session.status = OAuthLoginStatus::Expired;
+                clear_session_secrets(session);
+            }
+            session
+                .expires_at_ms
+                .saturating_add(EXPIRED_SESSION_RETENTION_MS)
+                > now_ms
+        });
     }
+}
+
+fn clear_session_secrets(session: &mut OAuthLoginSession) {
+    session.code_verifier.clear();
+    session.authorization_code = None;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1154,9 +1169,25 @@ mod tests {
             )
             .expect_err("expired");
 
+        assert!(matches!(error, OAuthLoginError::Expired));
         assert!(matches!(
-            error,
-            OAuthLoginError::NotFound | OAuthLoginError::Expired
+            store.cancel(Some(&login.session_id), Some(&login.state), 302_001),
+            Err(OAuthLoginError::Expired)
+        ));
+        assert!(matches!(
+            store.poll_state_by_oauth_state(&login.state, 302_002),
+            Err(OAuthLoginError::Expired)
+        ));
+
+        assert!(matches!(
+            store.finish(
+                Some(&login.session_id),
+                Some(&login.state),
+                Some("auth-code"),
+                false,
+                601_000,
+            ),
+            Err(OAuthLoginError::NotFound)
         ));
     }
 
@@ -1234,6 +1265,61 @@ mod tests {
     }
 
     #[test]
+    fn exchange_started_session_survives_expiry_cleanup_until_completion() {
+        let mut store = OAuthLoginStore::default();
+        let login = store
+            .start(
+                ProviderType::CodexOAuth,
+                Some("http://localhost:15721/api/accounts/login/callback".to_string()),
+                1_000,
+            )
+            .expect("login");
+
+        store
+            .finish(
+                Some(&login.session_id),
+                Some(&login.state),
+                Some("auth-code"),
+                true,
+                300_000,
+            )
+            .expect("begin exchange");
+        store
+            .start(
+                ProviderType::ClaudeOAuth,
+                Some("http://localhost:15721/api/accounts/login/callback".to_string()),
+                302_000,
+            )
+            .expect("trigger concurrent cleanup");
+
+        assert!(matches!(
+            store.poll_state_by_oauth_state(&login.state, 302_001),
+            Ok(OAuthSessionPollState::Pending)
+        ));
+        assert!(matches!(
+            store.cancel(Some(&login.session_id), Some(&login.state), 302_002),
+            Err(OAuthLoginError::AlreadyConsumed)
+        ));
+        store
+            .mark_exchanged(&login.session_id, "account-1")
+            .expect("complete exchange after cleanup");
+
+        let completed = store
+            .finish(
+                Some(&login.session_id),
+                Some(&login.state),
+                None,
+                false,
+                302_003,
+            )
+            .expect("completed exchange remains observable");
+        assert_eq!(completed.status, OAuthLoginStatus::TokenExchanged);
+        let session = store.sessions.get(&login.session_id).expect("session");
+        assert!(session.code_verifier.is_empty());
+        assert!(session.authorization_code.is_none());
+    }
+
+    #[test]
     fn oauth_session_cancel_is_idempotent_and_terminal() {
         let mut store = OAuthLoginStore::default();
         let login = store
@@ -1265,6 +1351,33 @@ mod tests {
         assert!(matches!(
             store.poll_state_by_oauth_state(&login.state, 2_003),
             Err(OAuthLoginError::Cancelled)
+        ));
+
+        store
+            .start(
+                ProviderType::CodexOAuth,
+                Some("http://localhost:15721/api/accounts/login/callback".to_string()),
+                302_000,
+            )
+            .expect("trigger cleanup after original ttl");
+        let cancelled_after_ttl = store
+            .cancel(Some(&login.session_id), Some(&login.state), 302_001)
+            .expect("cancelled terminal state survives original ttl");
+        assert_eq!(cancelled_after_ttl.status, OAuthLoginStatus::Cancelled);
+        let session = store.sessions.get(&login.session_id).expect("session");
+        assert!(session.code_verifier.is_empty());
+        assert!(session.authorization_code.is_none());
+
+        store
+            .start(
+                ProviderType::CodexOAuth,
+                Some("http://localhost:15721/api/accounts/login/callback".to_string()),
+                601_000,
+            )
+            .expect("trigger retention cleanup");
+        assert!(matches!(
+            store.cancel(Some(&login.session_id), Some(&login.state), 601_001),
+            Err(OAuthLoginError::NotFound)
         ));
     }
 

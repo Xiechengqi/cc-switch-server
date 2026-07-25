@@ -514,7 +514,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                   type="url"
                   value={callbackUrl}
                   onChange={(event) => setCallbackUrl(event.target.value)}
-                  placeholder="http://localhost:1455/auth/callback?code=...&state=..."
+                  placeholder={t("codexOauth.callbackUrlPlaceholder")}
                   autoComplete="off"
                   spellCheck={false}
                 />

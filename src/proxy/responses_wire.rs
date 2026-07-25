@@ -16,10 +16,17 @@ fn encode_json_event(value: &Value) -> Option<String> {
         "response.output_item.added" => encode_output_item_event(value),
         "response.output_item.done" => encode_output_item_event(value),
         "response.output_text.delta" => encode_output_text_delta(value),
+        "response.reasoning_summary_text.delta"
+        | "response.reasoning_text.delta"
+        | "response.reasoning.delta" => encode_indexed_delta(value),
         "response.function_call_arguments.delta" => encode_function_call_delta(value),
+        "response.function_call_arguments.done" => encode_function_call_value(value, "arguments"),
         "response.custom_tool_call_input.delta" => encode_custom_tool_call_delta(value),
         "response.custom_tool_call_input.done" => encode_custom_tool_call_done(value),
         "response.completed" => encode_response_completed(value),
+        event if event.starts_with("response.") || event == "error" => {
+            serde_json::to_string(value).ok()
+        }
         _ => None,
     }
 }
@@ -61,6 +68,38 @@ fn encode_function_call_delta(value: &Value) -> Option<String> {
         fields.push(format!("\"item_id\":{}", json_string(item_id)?));
     }
     fields.push(format!("\"output_index\":{output_index}"));
+    fields.push(format!("\"delta\":{delta}"));
+    Some(format!("{{{}}}", fields.join(",")))
+}
+
+fn encode_function_call_value(value: &Value, field: &str) -> Option<String> {
+    let event_type = json_string(value.get("type")?)?;
+    let output_index = integer_or_zero(value.get("output_index"));
+    let payload = json_string(value.get(field).unwrap_or(&Value::String(String::new())))?;
+    let mut fields = vec![format!("\"type\":{event_type}")];
+    if let Some(item_id) = value.get("item_id") {
+        fields.push(format!("\"item_id\":{}", json_string(item_id)?));
+    }
+    fields.push(format!("\"output_index\":{output_index}"));
+    fields.push(format!("\"{field}\":{payload}"));
+    Some(format!("{{{}}}", fields.join(",")))
+}
+
+fn encode_indexed_delta(value: &Value) -> Option<String> {
+    let event_type = json_string(value.get("type")?)?;
+    let output_index = integer_or_zero(value.get("output_index"));
+    let delta = json_string(value.get("delta").unwrap_or(&Value::String(String::new())))?;
+    let mut fields = vec![format!("\"type\":{event_type}")];
+    if let Some(item_id) = value.get("item_id") {
+        fields.push(format!("\"item_id\":{}", json_string(item_id)?));
+    }
+    fields.push(format!("\"output_index\":{output_index}"));
+    if let Some(summary_index) = value.get("summary_index") {
+        fields.push(format!(
+            "\"summary_index\":{}",
+            integer_or_zero(Some(summary_index))
+        ));
+    }
     fields.push(format!("\"delta\":{delta}"));
     Some(format!("{{{}}}", fields.join(",")))
 }

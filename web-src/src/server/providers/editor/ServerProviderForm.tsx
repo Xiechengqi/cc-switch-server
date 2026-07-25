@@ -2285,7 +2285,9 @@ export function ServerProviderForm({
             <Label>{t("serverProviderForm.usage.customUserAgent")}</Label>
             <Input
               value={state.customUserAgent}
-              placeholder="custom-client/1.0"
+              placeholder={t(
+                "serverProviderForm.usage.customUserAgentPlaceholder",
+              )}
               onChange={(event) =>
                 setState((current) => ({
                   ...current,

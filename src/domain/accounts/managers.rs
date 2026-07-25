@@ -9,8 +9,9 @@ use serde_json::{Map, Value};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::domain::accounts::oauth::{
-    build_refresh_request, oauth_provider_spec, token_expires_soon, OAuthHttpRequest,
-    OAuthProfileStrategy, OAuthQuotaStrategy, OAuthSupportStage,
+    build_refresh_request, oauth_provider_spec, provider_login_request_shape_available,
+    token_expires_soon, OAuthHttpRequest, OAuthProfileStrategy, OAuthQuotaStrategy,
+    OAuthSupportStage,
 };
 use crate::domain::accounts::store::{Account, AccountQuota, AccountStore, UpsertAccountInput};
 use crate::domain::accounts::subscription_expiry::{
@@ -27,7 +28,25 @@ pub enum AccountManagerSupport {
     Planned,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountLoginFlowKind {
+    #[serde(rename = "browser_oauth")]
+    BrowserOAuth,
+    DeviceCode,
+    CliManualCallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginFlowCapability {
+    pub kind: AccountLoginFlowKind,
+    pub supports_callback: bool,
+    pub supports_poll: bool,
+    pub supports_cancel: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountManagerCapability {
     pub provider_type: ProviderType,
@@ -36,6 +55,7 @@ pub struct AccountManagerCapability {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocking_reason: Option<&'static str>,
+    pub login_flows: Vec<AccountLoginFlowCapability>,
     pub supports_start_login: bool,
     pub supports_callback: bool,
     pub supports_refresh: bool,
@@ -493,6 +513,9 @@ fn account_provider_types() -> [ProviderType; 15] {
 
 fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
     let oauth_spec = crate::domain::accounts::oauth::oauth_provider_spec(provider_type);
+    let login_flows = login_flows_for(provider_type);
+    let supports_start_login = !login_flows.is_empty();
+    let supports_callback = login_flows.iter().any(|flow| flow.supports_callback);
     let supports_refresh_plan = oauth_spec.is_some_and(|spec| !spec.token_urls.is_empty());
     let supports_native_refresh = oauth_spec
         .is_some_and(|spec| !spec.token_urls.is_empty() && spec.server_native_refresh_enabled());
@@ -519,22 +542,29 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
             "manual_token_store"
         },
         support: AccountManagerSupport::ManualTokenStore,
-        status: if supports_native_refresh {
+        status: if supports_start_login && supports_native_refresh {
+            "native_login_refresh"
+        } else if supports_start_login {
+            "native_login"
+        } else if supports_native_refresh {
             "manual_import_native_refresh"
         } else if native_oauth_planned {
             "manual_import_only"
         } else {
             "manual_api_key_available"
         },
-        blocking_reason: if supports_native_refresh {
+        blocking_reason: if supports_start_login {
+            None
+        } else if supports_native_refresh {
             Some("native browser login/callback is disabled; import refresh credentials first")
         } else {
             native_oauth_planned.then_some(
                 "native oauth/login/refresh requires real credentials and has not been enabled",
             )
         },
-        supports_start_login: false,
-        supports_callback: false,
+        login_flows,
+        supports_start_login,
+        supports_callback,
         supports_refresh: supports_native_refresh,
         supports_quota,
         supports_refresh_plan,
@@ -545,6 +575,47 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
         quota_strategy: oauth_spec.map(|spec| spec.quota_strategy),
         subscription_expiry_capability: subscription_expiry_capability(provider_type),
     }
+}
+
+fn login_flows_for(provider_type: ProviderType) -> Vec<AccountLoginFlowCapability> {
+    let mut flows = Vec::new();
+    if provider_login_request_shape_available(provider_type) {
+        flows.push(AccountLoginFlowCapability {
+            kind: AccountLoginFlowKind::BrowserOAuth,
+            supports_callback: true,
+            supports_poll: true,
+            supports_cancel: true,
+        });
+    }
+    if matches!(
+        provider_type,
+        ProviderType::CodexOAuth
+            | ProviderType::GitHubCopilot
+            | ProviderType::KiroOAuth
+            | ProviderType::GrokOAuth
+    ) {
+        flows.push(AccountLoginFlowCapability {
+            kind: AccountLoginFlowKind::DeviceCode,
+            supports_callback: false,
+            supports_poll: true,
+            supports_cancel: matches!(
+                provider_type,
+                ProviderType::CodexOAuth | ProviderType::GrokOAuth
+            ),
+        });
+    }
+    if matches!(
+        provider_type,
+        ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+    ) {
+        flows.push(AccountLoginFlowCapability {
+            kind: AccountLoginFlowKind::CliManualCallback,
+            supports_callback: true,
+            supports_poll: true,
+            supports_cancel: true,
+        });
+    }
+    flows
 }
 
 fn account_import_template_for(provider_type: ProviderType) -> AccountImportTemplate {
@@ -719,12 +790,15 @@ mod tests {
     }
 
     #[test]
-    fn account_capabilities_claim_refresh_without_browser_login() {
+    fn account_capabilities_report_native_login_and_refresh_independently() {
         let capability = capability_for(ProviderType::CodexOAuth);
         assert_eq!(capability.support, AccountManagerSupport::ManualTokenStore);
-        assert_eq!(capability.status, "manual_import_native_refresh");
-        assert!(capability.blocking_reason.is_some());
-        assert!(!capability.supports_start_login);
+        assert_eq!(capability.manager, "manual_token_store_with_native_refresh");
+        assert_eq!(capability.status, "native_login_refresh");
+        assert!(capability.blocking_reason.is_none());
+        assert!(capability.supports_start_login);
+        assert!(capability.supports_callback);
+        assert_eq!(capability.login_flows.len(), 3);
         assert!(capability.supports_refresh);
         assert!(capability.supports_import);
         assert!(capability.supports_delete);
@@ -763,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn long_tail_account_capabilities_remain_explicit_manual_token_store() {
+    fn long_tail_account_capabilities_keep_manual_storage_and_report_real_login_flows() {
         let provider_types = [
             ProviderType::CursorApiKey,
             ProviderType::CursorOAuth,
@@ -783,8 +857,15 @@ mod tests {
             assert_eq!(capability.provider_type, provider_type);
             assert_eq!(capability.support, AccountManagerSupport::ManualTokenStore);
             assert!(!capability.status.is_empty());
-            assert!(!capability.supports_start_login);
-            assert!(!capability.supports_callback);
+            let expected_login = matches!(
+                provider_type,
+                ProviderType::CursorOAuth
+                    | ProviderType::GitHubCopilot
+                    | ProviderType::KiroOAuth
+                    | ProviderType::AntigravityOAuth
+                    | ProviderType::AgyOAuth
+            );
+            assert_eq!(capability.supports_start_login, expected_login);
             if matches!(
                 provider_type,
                 ProviderType::CursorOAuth | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
@@ -810,7 +891,7 @@ mod tests {
             codex.quota_strategy,
             Some(OAuthQuotaStrategy::ProviderSnapshot)
         );
-        assert!(!codex.supports_start_login);
+        assert!(codex.supports_start_login);
         assert!(codex.supports_refresh);
 
         let ollama = capability_for(ProviderType::OllamaCloud);

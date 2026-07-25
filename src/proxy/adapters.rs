@@ -105,6 +105,7 @@ pub struct AdapterRequest {
     pub actual_model_source: Option<String>,
     pub stream_requested: bool,
     pub custom_tool_names: BTreeSet<String>,
+    pub(crate) responses_tool_context: transforms::ResponsesToolContext,
     pub claude_tool_name_map: BTreeMap<String, String>,
 }
 
@@ -167,7 +168,7 @@ impl ProviderAdapter for GenericForwardingAdapter {
             body,
             stored,
             route,
-            &BTreeSet::new(),
+            &transforms::ResponsesToolContext::default(),
         ))
     }
 
@@ -181,7 +182,7 @@ impl ProviderAdapter for GenericForwardingAdapter {
             chunk,
             stored,
             route,
-            &BTreeSet::new(),
+            &transforms::ResponsesToolContext::default(),
         ))
     }
 
@@ -216,7 +217,8 @@ impl GenericForwardingAdapter {
         route: Option<ProxyRoute>,
         copilot_metadata: Option<&CopilotRequestMetadata>,
     ) -> Result<AdapterRequest, ProxyError> {
-        let custom_tool_names = transforms::responses_custom_tool_names_from_bytes(&body);
+        let responses_tool_context = transforms::responses_tool_context_from_bytes(&body);
+        let custom_tool_names = responses_tool_context.custom_tool_names();
         let downstream_stream_requested = is_stream_requested(&body);
         let cache_config = cache_injection_config(stored);
         let thinking_config = thinking_pipeline_config(stored);
@@ -246,8 +248,8 @@ impl GenericForwardingAdapter {
                 upstream_headers,
             )
         } else {
-            let body = transform_body_for_upstream(body, stored, route)?;
             let (body, model) = apply_request_preprocessors(body, stored, route);
+            let body = transform_body_for_upstream(body, stored, route)?;
             (body, model, Vec::new())
         };
         let body = maybe_apply_request_governance(body, stored, &governance_config)?;
@@ -267,6 +269,7 @@ impl GenericForwardingAdapter {
             stream_requested,
             upstream_headers,
             custom_tool_names,
+            responses_tool_context,
             claude_tool_name_map: Default::default(),
         })
     }
@@ -347,7 +350,7 @@ impl GenericForwardingAdapter {
             body,
             stored,
             route,
-            &request.custom_tool_names,
+            &request.responses_tool_context,
         ))
     }
 
@@ -356,13 +359,13 @@ impl GenericForwardingAdapter {
         chunk: Bytes,
         stored: &StoredProvider,
         route: ProxyRoute,
-        custom_tool_names: &BTreeSet<String>,
+        responses_tool_context: &transforms::ResponsesToolContext,
     ) -> Result<Bytes, ProxyError> {
         Ok(transform_stream_event_for_downstream(
             chunk,
             stored,
             route,
-            custom_tool_names,
+            responses_tool_context,
         ))
     }
 }
@@ -437,7 +440,8 @@ pub(super) fn cursor_agentservice_request(
     let downstream_stream_requested =
         is_stream_requested(&body) || route_implies_stream(route, gemini_path);
     let governance_config = request_governance_config(stored);
-    let custom_tool_names = transforms::responses_custom_tool_names_from_bytes(&body);
+    let responses_tool_context = transforms::responses_tool_context_from_bytes(&body);
+    let custom_tool_names = responses_tool_context.custom_tool_names();
     let (body, model) = apply_request_preprocessors(body, stored, Some(route));
     let body = maybe_apply_request_governance(body, stored, &governance_config)?;
     let stream_requested = downstream_stream_requested || is_stream_requested(&body);
@@ -454,6 +458,7 @@ pub(super) fn cursor_agentservice_request(
         actual_model_source: model.actual_model_source,
         stream_requested,
         custom_tool_names,
+        responses_tool_context,
         claude_tool_name_map: Default::default(),
     })
 }
@@ -1004,7 +1009,7 @@ fn transform_response_for_downstream(
     body: Bytes,
     stored: &StoredProvider,
     route: ProxyRoute,
-    custom_tool_names: &BTreeSet<String>,
+    responses_tool_context: &transforms::ResponsesToolContext,
 ) -> Bytes {
     let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &[]) else {
         return body;
@@ -1031,7 +1036,10 @@ fn transform_response_for_downstream(
             transforms::gemini_response_to_anthropic(&input)
         }
         (UpstreamFormat::AnthropicMessages, UpstreamFormat::OpenAiResponses) => {
-            transforms::anthropic_response_to_openai_responses(&input)
+            transforms::anthropic_response_to_openai_responses_with_tool_context(
+                &input,
+                responses_tool_context,
+            )
         }
         (UpstreamFormat::AnthropicMessages, UpstreamFormat::OpenAiChat) => {
             transforms::anthropic_response_to_openai_chat(&input)
@@ -1040,17 +1048,21 @@ fn transform_response_for_downstream(
             transforms::openai_responses_response_to_chat(&input)
         }
         (UpstreamFormat::OpenAiChat, UpstreamFormat::OpenAiResponses) => {
-            transforms::openai_chat_response_to_responses_with_custom_tools(
+            transforms::openai_chat_response_to_responses_with_tool_context(
                 &input,
-                custom_tool_names,
+                responses_tool_context,
             )
         }
         (UpstreamFormat::AnthropicMessages, UpstreamFormat::GeminiNative) => {
             transforms::anthropic_response_to_gemini(&input)
         }
         (UpstreamFormat::GeminiNative, UpstreamFormat::OpenAiResponses) => {
-            transforms::gemini_response_to_anthropic(&input)
-                .and_then(|value| transforms::anthropic_response_to_openai_responses(&value))
+            transforms::gemini_response_to_anthropic(&input).and_then(|value| {
+                transforms::anthropic_response_to_openai_responses_with_tool_context(
+                    &value,
+                    responses_tool_context,
+                )
+            })
         }
         (UpstreamFormat::GeminiNative, UpstreamFormat::OpenAiChat) => {
             transforms::gemini_response_to_anthropic(&input)
@@ -1087,7 +1099,7 @@ fn transform_stream_event_for_downstream(
     chunk: Bytes,
     stored: &StoredProvider,
     route: ProxyRoute,
-    custom_tool_names: &BTreeSet<String>,
+    responses_tool_context: &transforms::ResponsesToolContext,
 ) -> Bytes {
     let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &[]) else {
         return chunk;
@@ -1118,7 +1130,7 @@ fn transform_stream_event_for_downstream(
             upstream_format,
             downstream_format,
             &value,
-            custom_tool_names,
+            responses_tool_context,
         );
         if frames.is_empty() {
             continue;
@@ -1138,7 +1150,7 @@ pub(super) fn transform_stream_value(
     upstream_format: UpstreamFormat,
     downstream_format: UpstreamFormat,
     value: &Value,
-    custom_tool_names: &BTreeSet<String>,
+    responses_tool_context: &transforms::ResponsesToolContext,
 ) -> Vec<transforms::StreamFrame> {
     match (upstream_format, downstream_format) {
         (UpstreamFormat::OpenAiResponses, UpstreamFormat::AnthropicMessages) => {
@@ -1160,7 +1172,10 @@ pub(super) fn transform_stream_value(
             transforms::openai_responses_stream_to_chat(value)
         }
         (UpstreamFormat::OpenAiChat, UpstreamFormat::OpenAiResponses) => {
-            transforms::openai_chat_stream_to_responses_with_custom_tools(value, custom_tool_names)
+            transforms::openai_chat_stream_to_responses_with_tool_context(
+                value,
+                responses_tool_context,
+            )
         }
         (UpstreamFormat::AnthropicMessages, UpstreamFormat::GeminiNative) => {
             transforms::anthropic_stream_to_gemini(value)
@@ -1232,10 +1247,10 @@ pub(super) fn encode_stream_frames(frames: &[transforms::StreamFrame]) -> String
 }
 
 fn looks_like_error_response(value: &Value) -> bool {
-    value.get("error").is_some()
-        || value.get("errors").is_some()
-        || value.get("error_message").is_some()
-        || value.get("errorMessage").is_some()
+    ["error", "errors", "error_message", "errorMessage"]
+        .into_iter()
+        .filter_map(|key| value.get(key))
+        .any(super::response_semantics::error_value_is_substantive)
 }
 
 pub(super) fn upstream_format_for_route(
@@ -3325,6 +3340,27 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn response_error_detection_ignores_empty_placeholders() {
+        for value in [
+            json!({"error": null}),
+            json!({"error": {}}),
+            json!({"errors": []}),
+            json!({"error_message": ""}),
+            json!({"errorMessage": false}),
+        ] {
+            assert!(!looks_like_error_response(&value), "value={value}");
+        }
+
+        for value in [
+            json!({"error": {"message": "failed"}}),
+            json!({"errors": ["failed"]}),
+            json!({"error_message": "failed"}),
+        ] {
+            assert!(looks_like_error_response(&value), "value={value}");
+        }
+    }
+
     struct AdapterContract<'a> {
         app: AppKind,
         provider_type: ProviderType,
@@ -4593,10 +4629,16 @@ mod tests {
             )
             .unwrap();
         let value: Value = serde_json::from_slice(&request.body).unwrap();
+        let assistant = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
 
         assert_eq!(
-            value
-                .pointer("/messages/0/content/0/cache_control/ttl")
+            assistant
+                .pointer("/content/0/cache_control/ttl")
                 .and_then(Value::as_str),
             Some("1h")
         );
@@ -4645,7 +4687,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_to_claude_reasoning_uses_mapped_model_without_optimizer() {
+        let adapter = adapter_for(AppKind::Codex, ProviderType::Claude);
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::Claude,
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                    "ANTHROPIC_API_KEY": "secret"
+                },
+                "modelMapping": {"upstreamModel": "anthropic.claude-sonnet-4-6-20250514-v1:0"}
+            }),
+        );
+
+        let request = adapter
+            .transform_request(
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.5","max_output_tokens":4096,"reasoning":{"effort":"high","summary":"auto"},"input":"ping"}"#,
+                ),
+                &stored,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(
+            value.get("model").and_then(Value::as_str),
+            Some("anthropic.claude-sonnet-4-6-20250514-v1:0")
+        );
+        assert_eq!(value["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(value["output_config"], json!({"effort": "high"}));
+        assert!(value.pointer("/thinking/summary").is_none());
+    }
+
+    #[test]
     fn codex_to_claude_applies_thinking_optimizer_after_transform() {
+        let expected_max_tokens = 8192;
         let adapter = adapter_for(AppKind::Codex, ProviderType::Claude);
         let stored = stored_provider(
             AppKind::Codex,
@@ -4678,7 +4755,11 @@ mod tests {
             value
                 .pointer("/thinking/budget_tokens")
                 .and_then(Value::as_u64),
-            Some(16_383)
+            Some(expected_max_tokens - 1)
+        );
+        assert_eq!(
+            value.get("max_tokens").and_then(Value::as_u64),
+            Some(expected_max_tokens)
         );
         assert!(value["anthropic_beta"]
             .as_array()
@@ -5018,6 +5099,7 @@ mod tests {
             body["messages"][0]["content"],
             json!([{"type": "text", "text": "hello"}])
         );
+        assert_eq!(body["max_tokens"], 64);
         assert!(body.get("input").is_none());
     }
 
@@ -5706,6 +5788,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: true,
             custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
         };
         let plan =
@@ -5775,6 +5858,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
         };
 
@@ -5860,6 +5944,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
         };
         let signed =
@@ -5968,6 +6053,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
         };
 

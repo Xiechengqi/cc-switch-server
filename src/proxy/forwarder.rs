@@ -35,7 +35,7 @@ use crate::state::{
     ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
 };
 
-use super::adapters::{self, ProviderAdapter};
+use super::adapters::{self, ProviderAdapter, UpstreamFormat};
 use super::claude_oauth::ClaudeBodyRetryStage;
 use super::cursor;
 use super::deepseek;
@@ -44,6 +44,10 @@ use super::provider_ops::{ProviderExecution, ProviderOperation};
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy, decode_response_body_for_proxy,
     ResponseDecodeResult,
+};
+use super::response_semantics::{
+    self, FailureOrigin, ResponsesSseInspector, SemanticFailure, SemanticObservation,
+    SemanticTerminal,
 };
 use super::router::{
     account_concurrency_for_provider, ensure_provider_account_does_not_need_relogin,
@@ -66,6 +70,8 @@ const DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_CONNECTIONS: usize = 64;
 const DEFAULT_CODEX_WEBSOCKET_CACHE_IDLE_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_AGE_MS: u64 = 55 * 60 * 1000;
 const MAX_CODEX_HTTP_FALLBACK_SSE_EVENT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_RESPONSES_SEMANTIC_PRELUDE_MESSAGES: usize = 32;
+const MAX_RESPONSES_SEMANTIC_PRELUDE_BYTES: usize = 1024 * 1024;
 
 type ResponsesUpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -989,23 +995,49 @@ async fn forward_with_attempt(
             let mut pending_chunk = None;
             let mut sse_error_detector = claude_sse_error_detector_for(&stored, route);
             let mut sse_error_outcome_recorded = false;
-            if sse_error_detector.is_some() {
+            let inspect_responses_semantics = status.is_success()
+                && response_semantics::semantic_guard_enabled()
+                && adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
+                    == Some(UpstreamFormat::OpenAiResponses);
+            let mut semantic_provider_outcome_recorded = false;
+            if sse_error_detector.is_some() || inspect_responses_semantics {
                 let mut prelude = Vec::new();
                 let mut detected_error = None;
+                let mut semantic_inspector =
+                    inspect_responses_semantics.then(ResponsesSseInspector::default);
+                let mut semantic_decision = None;
+                let mut semantic_protocol_error = None;
+                let semantic_commit_deadline = inspect_responses_semantics
+                    .then_some(timeouts.first_byte)
+                    .flatten()
+                    .map(|timeout| tokio::time::Instant::now() + timeout);
                 let first_chunk = loop {
-                    let (timeout, kind) = if prelude.is_empty() {
-                        (timeouts.first_byte, StreamTimeoutKind::FirstByte)
-                    } else {
-                        (timeouts.idle, StreamTimeoutKind::Idle)
-                    };
-                    let next = match timeout {
-                        Some(timeout) => {
-                            match tokio::time::timeout(timeout, inner.try_next()).await {
-                                Ok(result) => result.map_err(StreamReadError::Upstream),
-                                Err(_) => Err(StreamReadError::Timeout { kind, timeout }),
-                            }
+                    let next = if let Some(deadline) = semantic_commit_deadline {
+                        let timeout = timeouts
+                            .first_byte
+                            .expect("a semantic commit deadline requires a first-byte timeout");
+                        match tokio::time::timeout_at(deadline, inner.try_next()).await {
+                            Ok(result) => result.map_err(StreamReadError::Upstream),
+                            Err(_) => Err(StreamReadError::Timeout {
+                                kind: StreamTimeoutKind::FirstByte,
+                                timeout,
+                            }),
                         }
-                        None => inner.try_next().await.map_err(StreamReadError::Upstream),
+                    } else {
+                        let (timeout, kind) = if prelude.is_empty() {
+                            (timeouts.first_byte, StreamTimeoutKind::FirstByte)
+                        } else {
+                            (timeouts.idle, StreamTimeoutKind::Idle)
+                        };
+                        match timeout {
+                            Some(timeout) => {
+                                match tokio::time::timeout(timeout, inner.try_next()).await {
+                                    Ok(result) => result.map_err(StreamReadError::Upstream),
+                                    Err(_) => Err(StreamReadError::Timeout { kind, timeout }),
+                                }
+                            }
+                            None => inner.try_next().await.map_err(StreamReadError::Upstream),
+                        }
                     };
                     match next {
                         Ok(Some(chunk)) => {
@@ -1013,16 +1045,80 @@ async fn forward_with_attempt(
                             detected_error = sse_error_detector
                                 .as_mut()
                                 .and_then(|detector| detector.push(&chunk));
+                            if let Some(inspector) = semantic_inspector.as_mut() {
+                                match inspector.push(&chunk) {
+                                    Ok(observations) => {
+                                        for observation in &observations {
+                                            crate::metrics::record_proxy_semantic_guard(
+                                                "http_stream_prime",
+                                                observation.metric_kind(),
+                                            );
+                                        }
+                                        semantic_decision =
+                                            semantic_prelude_decision(&observations);
+                                    }
+                                    Err(error) => {
+                                        crate::metrics::record_proxy_semantic_guard(
+                                            "http_stream_prime",
+                                            "protocol_error",
+                                        );
+                                        semantic_protocol_error = Some(error.to_string());
+                                    }
+                                }
+                            }
+                            let prelude_limit = if inspect_responses_semantics {
+                                1024 * 1024
+                            } else {
+                                64 * 1024
+                            };
+                            if prelude.len() >= prelude_limit
+                                && semantic_decision.is_none()
+                                && semantic_protocol_error.is_none()
+                                && inspect_responses_semantics
+                            {
+                                semantic_protocol_error = Some(
+                                    "Responses semantic prelude exceeded 1 MiB before business output"
+                                        .to_string(),
+                                );
+                            }
                             let ready = detected_error.is_some()
-                                || sse_error_detector
-                                    .as_ref()
-                                    .is_some_and(ClaudeSseErrorDetector::prelude_ready)
-                                || prelude.len() >= 64 * 1024;
+                                || semantic_decision.is_some()
+                                || semantic_protocol_error.is_some()
+                                || (!inspect_responses_semantics
+                                    && (sse_error_detector
+                                        .as_ref()
+                                        .is_some_and(ClaudeSseErrorDetector::prelude_ready)
+                                        || prelude.len() >= prelude_limit));
                             if ready {
                                 break Ok(Some(Bytes::from(prelude)));
                             }
                         }
-                        Ok(None) => break Ok((!prelude.is_empty()).then(|| Bytes::from(prelude))),
+                        Ok(None) => {
+                            if semantic_decision.is_none() {
+                                if let Some(inspector) = semantic_inspector.as_mut() {
+                                    match inspector.finish() {
+                                        Ok(observations) => {
+                                            for observation in &observations {
+                                                crate::metrics::record_proxy_semantic_guard(
+                                                    "http_stream_prime",
+                                                    observation.metric_kind(),
+                                                );
+                                            }
+                                            semantic_decision =
+                                                semantic_prelude_decision(&observations);
+                                        }
+                                        Err(error) => {
+                                            crate::metrics::record_proxy_semantic_guard(
+                                                "http_stream_prime",
+                                                "protocol_error",
+                                            );
+                                            semantic_protocol_error = Some(error.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            break Ok((!prelude.is_empty()).then(|| Bytes::from(prelude)));
+                        }
                         Err(error) => break Err(error),
                     }
                 };
@@ -1072,10 +1168,88 @@ async fn forward_with_attempt(
                                 }
                             }
                         }
+                        if let Some(error) = semantic_protocol_error {
+                            record_provider_outcome(
+                                &state,
+                                &stored,
+                                ProviderOutcome::Failure { status_code: 502 },
+                            )
+                            .await;
+                            if !request_is_provider_pinned(&headers, &request_context) {
+                                if let Some(next_attempt) = next_provider_failover(
+                                    &state,
+                                    route,
+                                    &attempt_context,
+                                    &execution,
+                                    "responses_stream_protocol_error",
+                                )
+                                .await
+                                {
+                                    attempt_context = next_attempt;
+                                    drop(account_in_flight_guard);
+                                    drop(share_invocation_guard);
+                                    continue 'attempt;
+                                }
+                            }
+                            return Err(ProxyError::bad_gateway(error));
+                        }
+                        if let Some(SemanticObservation::Failure(failure)) = &semantic_decision {
+                            if failure.origin == FailureOrigin::Provider {
+                                record_provider_outcome(
+                                    &state,
+                                    &stored,
+                                    ProviderOutcome::Failure { status_code: 502 },
+                                )
+                                .await;
+                                semantic_provider_outcome_recorded = true;
+                                if !request_is_provider_pinned(&headers, &request_context) {
+                                    if let Some(next_attempt) = next_provider_failover(
+                                        &state,
+                                        route,
+                                        &attempt_context,
+                                        &execution,
+                                        "responses_stream_semantic_failure",
+                                    )
+                                    .await
+                                    {
+                                        attempt_context = next_attempt;
+                                        drop(account_in_flight_guard);
+                                        drop(share_invocation_guard);
+                                        continue 'attempt;
+                                    }
+                                }
+                            }
+                        }
                         pending_chunk = Some(chunk);
                         sse_error_detector = claude_sse_error_detector_for(&stored, route);
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if let Some(error) = semantic_protocol_error {
+                            record_provider_outcome(
+                                &state,
+                                &stored,
+                                ProviderOutcome::Failure { status_code: 502 },
+                            )
+                            .await;
+                            if !request_is_provider_pinned(&headers, &request_context) {
+                                if let Some(next_attempt) = next_provider_failover(
+                                    &state,
+                                    route,
+                                    &attempt_context,
+                                    &execution,
+                                    "responses_stream_protocol_eof",
+                                )
+                                .await
+                                {
+                                    attempt_context = next_attempt;
+                                    drop(account_in_flight_guard);
+                                    drop(share_invocation_guard);
+                                    continue 'attempt;
+                                }
+                            }
+                            return Err(ProxyError::bad_gateway(error));
+                        }
+                    }
                     Err(error) => {
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
                             .await;
@@ -1143,7 +1317,7 @@ async fn forward_with_attempt(
                 stream_transform: super::stream_transforms::StreamEventTransformer::new(
                     &stored,
                     route,
-                    adapter_request.custom_tool_names.clone(),
+                    adapter_request.responses_tool_context.clone(),
                 ),
                 claude_tool_name_stream_patcher:
                     super::claude_oauth::ClaudeToolNameStreamPatcher::new(
@@ -1153,6 +1327,9 @@ async fn forward_with_attempt(
                 pending_chunk,
                 sse_error_detector,
                 sse_error_outcome_recorded,
+                responses_semantics: inspect_responses_semantics
+                    .then(ResponsesSseInspector::default),
+                semantic_provider_outcome_recorded,
                 terminal_frame_sent: false,
                 interrupted_update_armed,
                 _account_in_flight_guard: account_in_flight_guard,
@@ -1163,7 +1340,14 @@ async fn forward_with_attempt(
                     return Ok(None);
                 }
 
-                let next_chunk = if let Some(chunk) = stream_state.pending_chunk.take() {
+                let semantic_terminal_seen = stream_state
+                    .responses_semantics
+                    .as_ref()
+                    .and_then(ResponsesSseInspector::terminal)
+                    .is_some();
+                let next_chunk = if semantic_terminal_seen {
+                    Ok(None)
+                } else if let Some(chunk) = stream_state.pending_chunk.take() {
                     Ok(Some(chunk))
                 } else {
                     let timeout_kind = stream_state.next_timeout_kind();
@@ -1188,10 +1372,42 @@ async fn forward_with_attempt(
 
                 match next_chunk {
                     Ok(Some(chunk)) => {
-                        stream_state.received_any_chunk = true;
                         let chunk = stream_state.codex_completed_output_patcher.push(chunk);
                         let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
                         stream_state.usage.push(&chunk);
+                        let (saw_business_output, committed_output) = if let Some(inspector) =
+                            stream_state.responses_semantics.as_mut()
+                        {
+                            let observations = match inspector.push(&chunk) {
+                                Ok(observations) => observations,
+                                Err(error) => {
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "http_stream",
+                                        "protocol_error",
+                                    );
+                                    return stream_state
+                                        .terminate_transform_error(ProxyError::bad_gateway(error))
+                                        .await;
+                                }
+                            };
+                            for observation in &observations {
+                                crate::metrics::record_proxy_semantic_guard(
+                                    "http_stream",
+                                    observation.metric_kind(),
+                                );
+                            }
+                            (
+                                observations
+                                    .iter()
+                                    .any(SemanticObservation::counts_as_business_output),
+                                observations
+                                    .iter()
+                                    .any(SemanticObservation::commits_downstream),
+                            )
+                        } else {
+                            (!chunk.is_empty(), !chunk.is_empty())
+                        };
+                        stream_state.received_any_chunk |= committed_output;
                         if !stream_state.sse_error_outcome_recorded {
                             let sse_error_outcome = stream_state
                                 .sse_error_detector
@@ -1208,7 +1424,7 @@ async fn forward_with_attempt(
                                 stream_state.sse_error_outcome_recorded = true;
                             }
                         }
-                        if stream_state.first_token_ms.is_none() && !chunk.is_empty() {
+                        if stream_state.first_token_ms.is_none() && saw_business_output {
                             let first_token_ms = stream_state.started.elapsed().as_millis();
                             stream_state.first_token_ms = Some(first_token_ms);
                             update_stream_usage(
@@ -1252,7 +1468,42 @@ async fn forward_with_attempt(
                         };
                         if !chunk.is_empty() {
                             stream_state.usage.push(&chunk);
-                            if stream_state.first_token_ms.is_none() {
+                            let (saw_business_output, committed_output) = if let Some(inspector) =
+                                stream_state.responses_semantics.as_mut()
+                            {
+                                let observations = match inspector.push(&chunk) {
+                                    Ok(observations) => observations,
+                                    Err(error) => {
+                                        crate::metrics::record_proxy_semantic_guard(
+                                            "http_stream",
+                                            "protocol_error",
+                                        );
+                                        return stream_state
+                                            .terminate_transform_error(ProxyError::bad_gateway(
+                                                error,
+                                            ))
+                                            .await;
+                                    }
+                                };
+                                for observation in &observations {
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "http_stream",
+                                        observation.metric_kind(),
+                                    );
+                                }
+                                (
+                                    observations
+                                        .iter()
+                                        .any(SemanticObservation::counts_as_business_output),
+                                    observations
+                                        .iter()
+                                        .any(SemanticObservation::commits_downstream),
+                                )
+                            } else {
+                                (true, true)
+                            };
+                            stream_state.received_any_chunk |= committed_output;
+                            if stream_state.first_token_ms.is_none() && saw_business_output {
                                 let first_token_ms = stream_state.started.elapsed().as_millis();
                                 stream_state.first_token_ms = Some(first_token_ms);
                                 update_stream_usage(
@@ -1288,6 +1539,26 @@ async fn forward_with_attempt(
                                 .push(transformed);
                             return Ok(Some((transformed, stream_state)));
                         }
+                        if let Some(inspector) = stream_state.responses_semantics.as_mut() {
+                            let observations = match inspector.finish() {
+                                Ok(observations) => observations,
+                                Err(error) => {
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "http_stream",
+                                        "protocol_error",
+                                    );
+                                    return stream_state
+                                        .terminate_transform_error(ProxyError::bad_gateway(error))
+                                        .await;
+                                }
+                            };
+                            for observation in &observations {
+                                crate::metrics::record_proxy_semantic_guard(
+                                    "http_stream",
+                                    observation.metric_kind(),
+                                );
+                            }
+                        }
                         let transform_tail = match stream_state.stream_transform.finish() {
                             Ok(tail) => tail,
                             Err(error) => {
@@ -1311,6 +1582,15 @@ async fn forward_with_attempt(
                         if !custom_tail.is_empty() {
                             return Ok(Some((custom_tail, stream_state)));
                         }
+                        let semantic_terminal = stream_state
+                            .responses_semantics
+                            .as_ref()
+                            .and_then(ResponsesSseInspector::terminal)
+                            .cloned();
+                        let stream_status = semantic_terminal
+                            .as_ref()
+                            .map(SemanticTerminal::stream_status)
+                            .unwrap_or("completed");
                         let usage = std::mem::take(&mut stream_state.usage).finish();
                         update_stream_usage(
                             &stream_state.state,
@@ -1320,7 +1600,7 @@ async fn forward_with_attempt(
                             stream_state.started.elapsed().as_millis(),
                             stream_state.first_token_ms,
                             usage,
-                            Some("completed"),
+                            Some(stream_status),
                         )
                         .await;
                         record_share_invocation_result(
@@ -1330,13 +1610,29 @@ async fn forward_with_attempt(
                             usage,
                         )
                         .await;
-                        if !stream_state.sse_error_outcome_recorded {
-                            record_provider_outcome(
-                                &stream_state.state,
-                                &stream_state.stored,
-                                provider_outcome_from_status(stream_state.status_code),
-                            )
-                            .await;
+                        match semantic_terminal {
+                            Some(SemanticTerminal::Failure(failure))
+                                if failure.origin == FailureOrigin::Provider =>
+                            {
+                                if !stream_state.semantic_provider_outcome_recorded {
+                                    record_provider_outcome(
+                                        &stream_state.state,
+                                        &stream_state.stored,
+                                        ProviderOutcome::Failure { status_code: 502 },
+                                    )
+                                    .await;
+                                }
+                            }
+                            Some(SemanticTerminal::Failure(_)) => {}
+                            _ if !stream_state.sse_error_outcome_recorded => {
+                                record_provider_outcome(
+                                    &stream_state.state,
+                                    &stream_state.stored,
+                                    provider_outcome_from_status(stream_state.status_code),
+                                )
+                                .await;
+                            }
+                            _ => {}
                         }
                         stream_state
                             .interrupted_update_armed
@@ -1453,6 +1749,73 @@ async fn forward_with_attempt(
         if version_gate_rewritten {
             preserve_content_encoding = false;
         }
+        let mut semantic_provider_outcome_recorded = false;
+        let semantic_observation = if status.is_success()
+            && response_semantics::semantic_guard_enabled()
+            && adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
+                == Some(UpstreamFormat::OpenAiResponses)
+        {
+            let observation = match response_semantics::classify_json_document(&bytes) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    crate::metrics::record_proxy_semantic_guard("http_document", "protocol_error");
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        ProviderOutcome::Failure { status_code: 502 },
+                    )
+                    .await;
+                    if !request_is_provider_pinned(&headers, &request_context) {
+                        if let Some(next_attempt) = next_provider_failover(
+                            &state,
+                            route,
+                            &attempt_context,
+                            &execution,
+                            "responses_document_protocol_error",
+                        )
+                        .await
+                        {
+                            attempt_context = next_attempt;
+                            drop(account_in_flight_guard);
+                            drop(share_invocation_guard);
+                            continue 'attempt;
+                        }
+                    }
+                    return Err(ProxyError::bad_gateway(error));
+                }
+            };
+            crate::metrics::record_proxy_semantic_guard("http_document", observation.metric_kind());
+            if let SemanticObservation::Failure(failure) = &observation {
+                if failure.origin == FailureOrigin::Provider {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        ProviderOutcome::Failure { status_code: 502 },
+                    )
+                    .await;
+                    semantic_provider_outcome_recorded = true;
+                    if !request_is_provider_pinned(&headers, &request_context) {
+                        if let Some(next_attempt) = next_provider_failover(
+                            &state,
+                            route,
+                            &attempt_context,
+                            &execution,
+                            "responses_document_semantic_failure",
+                        )
+                        .await
+                        {
+                            attempt_context = next_attempt;
+                            drop(account_in_flight_guard);
+                            drop(share_invocation_guard);
+                            continue 'attempt;
+                        }
+                    }
+                }
+            }
+            Some(observation)
+        } else {
+            None
+        };
         let usage = if route == ProxyRoute::ClaudeCountTokens {
             TokenUsage::default()
         } else {
@@ -1490,7 +1853,25 @@ async fn forward_with_attempt(
             )
             .await;
         }
-        record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
+        match semantic_observation {
+            Some(SemanticObservation::Failure(failure))
+                if failure.origin == FailureOrigin::Provider =>
+            {
+                if !semantic_provider_outcome_recorded {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        ProviderOutcome::Failure { status_code: 502 },
+                    )
+                    .await;
+                }
+            }
+            Some(SemanticObservation::Failure(_)) => {}
+            _ => {
+                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
+                    .await;
+            }
+        }
 
         let mut response = Response::new(Body::from(bytes));
         *response.status_mut() = status;
@@ -2001,6 +2382,7 @@ async fn forward_codex_images_generations(
             actual_model_source: Some("codex_image_generation_bridge".to_string()),
             stream_requested: true,
             custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
         };
         execution.enforce_model_policy(&mut adapter_request)?;
@@ -2649,6 +3031,8 @@ async fn bridge_responses_websocket(
     let mut downstream = downstream;
     let mut response_in_flight = false;
     let mut emitted_business_event = false;
+    let mut pending_lifecycle_messages = Vec::new();
+    let mut semantic_provider_outcome_recorded = false;
     let mut active_response_body = None;
     let mut auth_refresh_attempted = false;
     let mut refresh_target_before_connect = false;
@@ -2694,6 +3078,8 @@ async fn bridge_responses_websocket(
                         .transpose()?;
                     response_in_flight = true;
                     emitted_business_event = false;
+                    pending_lifecycle_messages.clear();
+                    semantic_provider_outcome_recorded = false;
                     auth_refresh_attempted = false;
                     // A provider is excluded only for the active response. A later
                     // response may retry it after its cooldown or transient failure.
@@ -2748,6 +3134,7 @@ async fn bridge_responses_websocket(
                                         "response.create body is unavailable for HTTP fallback",
                                     )
                                 })?;
+                                pending_lifecycle_messages.clear();
                                 let outcome = run_codex_websocket_http_fallback(
                                     &mut downstream,
                                     state,
@@ -2802,6 +3189,7 @@ async fn bridge_responses_websocket(
                         } else {
                             "send_failure"
                         };
+                        pending_lifecycle_messages.clear();
                         let outcome = run_codex_websocket_http_fallback(
                             &mut downstream,
                             state,
@@ -2826,7 +3214,27 @@ async fn bridge_responses_websocket(
                         refresh_target_before_connect = true;
                         continue;
                     }
-                    return Err(ProxyError::bad_gateway(error.to_string()));
+                    let error = ProxyError::bad_gateway(error.to_string());
+                    if response_in_flight {
+                        let error_body = websocket_stream_error_body(
+                            error.client_message(),
+                            "upstream_stream_transport_error",
+                        );
+                        return terminate_responses_websocket_with_error(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            state,
+                            &execution,
+                            &mut pending_lifecycle_messages,
+                            error,
+                            Some("transport_error"),
+                            error_body,
+                            Some(ProviderOutcome::NetworkFailure),
+                        )
+                        .await;
+                    }
+                    return Err(error);
                 }
                 if starts_response {
                     upstream_read_deadline = first_byte_timeout
@@ -2847,6 +3255,7 @@ async fn bridge_responses_websocket(
                                     "response.create body is unavailable for HTTP fallback",
                                 )
                             })?;
+                            pending_lifecycle_messages.clear();
                             let outcome = run_codex_websocket_http_fallback(
                                 &mut downstream,
                                 state,
@@ -2872,20 +3281,31 @@ async fn bridge_responses_websocket(
                             refresh_target_before_connect = true;
                             continue;
                         }
-                        record_provider_outcome(
-                            state,
-                            &execution.runtime_stored_view(),
-                            ProviderOutcome::NetworkFailure,
-                        )
-                        .await;
-                        return Err(ProxyError {
+                        let error = ProxyError {
                             status: StatusCode::GATEWAY_TIMEOUT,
                             message: if emitted_business_event {
                                 "responses websocket stream idle timeout".to_string()
                             } else {
                                 "responses websocket first byte timeout".to_string()
                             },
-                        });
+                        };
+                        let error_body = websocket_stream_error_body(
+                            error.client_message(),
+                            "upstream_stream_timeout",
+                        );
+                        return terminate_responses_websocket_with_error(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            state,
+                            &execution,
+                            &mut pending_lifecycle_messages,
+                            error,
+                            Some("transport_error"),
+                            error_body,
+                            Some(ProviderOutcome::NetworkFailure),
+                        )
+                        .await;
                     }
                 };
                 let Some(message) = upstream_message else {
@@ -2904,6 +3324,7 @@ async fn bridge_responses_websocket(
                         } else {
                             "closed_before_event"
                         };
+                        pending_lifecycle_messages.clear();
                         let outcome = run_codex_websocket_http_fallback(
                             &mut downstream,
                             state,
@@ -2929,14 +3350,21 @@ async fn bridge_responses_websocket(
                         continue;
                     }
                     if response_in_flight {
-                        return Err(ProxyError::bad_gateway(
-                            "upstream websocket closed before a terminal response event",
-                        ));
+                        return terminate_responses_websocket_without_terminal(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            state,
+                            &execution,
+                            &mut pending_lifecycle_messages,
+                            None,
+                        )
+                        .await;
                     }
                     refresh_target_before_connect = true;
                     continue;
                 };
-                let mut message = match message {
+                let message = match message {
                     Ok(message) => message,
                     Err(error)
                         if matches!(mode, ResponsesWebsocketMode::Codex)
@@ -2952,6 +3380,7 @@ async fn bridge_responses_websocket(
                                 "response.create body is unavailable for HTTP fallback",
                             )
                         })?;
+                        pending_lifecycle_messages.clear();
                         let outcome = run_codex_websocket_http_fallback(
                             &mut downstream,
                             state,
@@ -2978,18 +3407,56 @@ async fn bridge_responses_websocket(
                     }
                     Err(error) if websocket_message_too_big(&error) => {
                         let body = websocket_message_too_big_error_body();
-                        let _ = downstream.send(AxumWsMessage::Text(body.clone())).await;
-                        return Err(ProxyError {
+                        let error = ProxyError {
                             status: StatusCode::PAYLOAD_TOO_LARGE,
-                            message: body,
-                        });
+                            message: "upstream websocket message too big".to_string(),
+                        };
+                        if response_in_flight {
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("transport_error"),
+                                body,
+                                Some(ProviderOutcome::Failure { status_code: 413 }),
+                            )
+                            .await;
+                        }
+                        let _ = downstream.send(AxumWsMessage::Text(body)).await;
+                        return Err(error);
                     }
                     Err(error) if websocket_expected_reset(&error) && !response_in_flight => {
                         let _closed_entry = entry.take();
                         refresh_target_before_connect = true;
                         continue;
                     }
-                    Err(error) => return Err(ProxyError::bad_gateway(error.to_string())),
+                    Err(error) => {
+                        let error = ProxyError::bad_gateway(error.to_string());
+                        if response_in_flight {
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                "upstream_stream_transport_error",
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("transport_error"),
+                                error_body,
+                                Some(ProviderOutcome::NetworkFailure),
+                            )
+                            .await;
+                        }
+                        return Err(error);
+                    }
                 };
                 let upstream_closed = matches!(message, TungsteniteMessage::Close(_));
                 if upstream_closed {
@@ -3008,6 +3475,7 @@ async fn bridge_responses_websocket(
                                 "response.create body is unavailable for HTTP fallback",
                             )
                         })?;
+                        pending_lifecycle_messages.clear();
                         let outcome = run_codex_websocket_http_fallback(
                             &mut downstream,
                             state,
@@ -3036,31 +3504,283 @@ async fn bridge_responses_websocket(
                         refresh_target_before_connect = true;
                         continue;
                     }
+                    return terminate_responses_websocket_without_terminal(
+                        &mut downstream,
+                        &mut output_patcher,
+                        mode,
+                        state,
+                        &execution,
+                        &mut pending_lifecycle_messages,
+                        Some(&message),
+                    )
+                    .await;
                 }
-                if responses_websocket_response_is_terminal(&message) {
+                let semantic_observation = if response_in_flight {
+                    match classify_responses_websocket_message(&message) {
+                        Ok(observation) => observation,
+                        Err(error) => {
+                            crate::metrics::record_proxy_semantic_guard(
+                                "websocket",
+                                "protocol_error",
+                            );
+                            let mut provider_outcome_recorded = false;
+                            if matches!(mode, ResponsesWebsocketMode::Codex)
+                                && !emitted_business_event
+                            {
+                                let failed = execution.runtime_stored_view();
+                                record_provider_outcome(
+                                    state,
+                                    &failed,
+                                    ProviderOutcome::Failure { status_code: 502 },
+                                )
+                                .await;
+                                provider_outcome_recorded = true;
+                                let _failed_entry = entry.take();
+                                if !provider_pinned
+                                    && switch_to_ready_codex_provider(
+                                        state,
+                                        &mut execution,
+                                        &mut _account_in_flight_guard,
+                                        &mut excluded_provider_ids,
+                                        codex_oauth_websocket_failover_provider,
+                                        "websocket_semantic_protocol_error",
+                                    )
+                                    .await
+                                {
+                                    pending_lifecycle_messages.clear();
+                                    output_patcher.clear();
+                                    let body = active_response_body.as_ref().ok_or_else(|| {
+                                        ProxyError::bad_request(
+                                            "response.create body is unavailable for HTTP fallback",
+                                        )
+                                    })?;
+                                    let outcome = run_codex_websocket_http_fallback(
+                                        &mut downstream,
+                                        state,
+                                        &mut execution,
+                                        body,
+                                        grok_session_id.as_deref(),
+                                        first_byte_timeout,
+                                        stream_idle_timeout,
+                                        "semantic_protocol_error",
+                                        &mut auth_refresh_attempted,
+                                        &mut _account_in_flight_guard,
+                                        provider_pinned,
+                                        &mut excluded_provider_ids,
+                                        &mut output_patcher,
+                                    )
+                                    .await?;
+                                    if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                        return Ok(());
+                                    }
+                                    response_in_flight = false;
+                                    active_response_body = None;
+                                    upstream_read_deadline = None;
+                                    refresh_target_before_connect = true;
+                                    continue;
+                                }
+                            }
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                "upstream_protocol_error",
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                None,
+                                error_body,
+                                (!provider_outcome_recorded)
+                                    .then_some(ProviderOutcome::Failure { status_code: 502 }),
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(observation) = &semantic_observation {
+                    crate::metrics::record_proxy_semantic_guard(
+                        "websocket",
+                        observation.metric_kind(),
+                    );
+                }
+                if matches!(semantic_observation, Some(SemanticObservation::Lifecycle))
+                    && !emitted_business_event
+                {
+                    let buffered_bytes = pending_lifecycle_messages
+                        .iter()
+                        .map(websocket_message_payload_len)
+                        .sum::<usize>()
+                        .saturating_add(websocket_message_payload_len(&message));
+                    if pending_lifecycle_messages.len()
+                        >= MAX_RESPONSES_SEMANTIC_PRELUDE_MESSAGES
+                        || buffered_bytes > MAX_RESPONSES_SEMANTIC_PRELUDE_BYTES
+                    {
+                        let error = ProxyError::bad_gateway(
+                            "Responses websocket lifecycle prelude exceeded its bound",
+                        );
+                        let error_body = websocket_stream_error_body(
+                            error.client_message(),
+                            "upstream_protocol_error",
+                        );
+                        return terminate_responses_websocket_with_error(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            state,
+                            &execution,
+                            &mut pending_lifecycle_messages,
+                            error,
+                            Some("protocol_error"),
+                            error_body,
+                            Some(ProviderOutcome::Failure { status_code: 502 }),
+                        )
+                        .await;
+                    }
+                    pending_lifecycle_messages.push(message);
+                    continue;
+                }
+                if let Some(SemanticObservation::Failure(failure)) = &semantic_observation {
+                    if failure.origin == FailureOrigin::Provider && !emitted_business_event {
+                        let failed = execution.runtime_stored_view();
+                        if !semantic_provider_outcome_recorded {
+                            record_provider_outcome(
+                                state,
+                                &failed,
+                                ProviderOutcome::Failure { status_code: 502 },
+                            )
+                            .await;
+                            semantic_provider_outcome_recorded = true;
+                        }
+                        let _failed_entry = entry.take();
+                        if matches!(mode, ResponsesWebsocketMode::Codex)
+                            && !provider_pinned
+                            && switch_to_ready_codex_provider(
+                                state,
+                                &mut execution,
+                                &mut _account_in_flight_guard,
+                                &mut excluded_provider_ids,
+                                codex_oauth_websocket_failover_provider,
+                                "websocket_semantic_failure",
+                            )
+                            .await
+                        {
+                            pending_lifecycle_messages.clear();
+                            output_patcher.clear();
+                            let body = active_response_body.as_ref().ok_or_else(|| {
+                                ProxyError::bad_request(
+                                    "response.create body is unavailable for HTTP fallback",
+                                )
+                            })?;
+                            let outcome = run_codex_websocket_http_fallback(
+                                &mut downstream,
+                                state,
+                                &mut execution,
+                                body,
+                                grok_session_id.as_deref(),
+                                first_byte_timeout,
+                                stream_idle_timeout,
+                                "semantic_failure",
+                                &mut auth_refresh_attempted,
+                                &mut _account_in_flight_guard,
+                                provider_pinned,
+                                &mut excluded_provider_ids,
+                                &mut output_patcher,
+                            )
+                            .await?;
+                            if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                return Ok(());
+                            }
+                            response_in_flight = false;
+                            active_response_body = None;
+                            upstream_read_deadline = None;
+                            refresh_target_before_connect = true;
+                            continue;
+                        }
+                    }
+                }
+
+                for pending in pending_lifecycle_messages.drain(..) {
+                    if send_responses_websocket_message(
+                        &mut downstream,
+                        &mut output_patcher,
+                        mode,
+                        pending,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                }
+                let semantic_terminal = match &semantic_observation {
+                    Some(SemanticObservation::SuccessTerminal) => Some(SemanticTerminal::Success),
+                    Some(SemanticObservation::IncompleteTerminal) => {
+                        Some(SemanticTerminal::Incomplete)
+                    }
+                    Some(SemanticObservation::Failure(failure)) => {
+                        Some(SemanticTerminal::Failure(failure.clone()))
+                    }
+                    Some(SemanticObservation::Lifecycle | SemanticObservation::Business) | None => {
+                        None
+                    }
+                };
+                let terminal = semantic_terminal.is_some()
+                    || (semantic_observation.is_none()
+                        && responses_websocket_response_is_terminal(&message));
+                if terminal {
                     response_in_flight = false;
                     active_response_body = None;
                     upstream_read_deadline = None;
-                } else if response_in_flight
-                    && matches!(message, TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_))
+                    match semantic_terminal {
+                        Some(SemanticTerminal::Failure(failure))
+                            if failure.origin == FailureOrigin::Provider =>
+                        {
+                            if !semantic_provider_outcome_recorded {
+                                record_provider_outcome(
+                                    state,
+                                    &execution.runtime_stored_view(),
+                                    ProviderOutcome::Failure { status_code: 502 },
+                                )
+                                .await;
+                            }
+                        }
+                        Some(SemanticTerminal::Failure(_)) => {}
+                        Some(SemanticTerminal::Success | SemanticTerminal::Incomplete) => {
+                            record_provider_outcome(
+                                state,
+                                &execution.runtime_stored_view(),
+                                ProviderOutcome::Success { status_code: 200 },
+                            )
+                            .await;
+                        }
+                        None => {}
+                    }
+                } else if semantic_observation
+                    .as_ref()
+                    .is_some_and(SemanticObservation::counts_as_business_output)
+                    || (semantic_observation.is_none()
+                        && response_in_flight
+                        && matches!(
+                            message,
+                            TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_)
+                        ))
                 {
+                    emitted_business_event = true;
                     upstream_read_deadline = stream_idle_timeout
                         .map(|timeout| tokio::time::Instant::now() + timeout);
                 }
-                if matches!(mode, ResponsesWebsocketMode::Codex) {
-                    output_patcher.patch_message(&mut message);
-                }
-                if matches!(message, TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_)) {
-                    emitted_business_event = true;
-                }
-                let Some(message) = tungstenite_message_to_axum_ws(message) else {
-                    continue;
-                };
-                let closes = matches!(message, AxumWsMessage::Close(_));
-                downstream
-                    .send(message)
-                    .await
-                    .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                let closes = send_responses_websocket_message(
+                    &mut downstream,
+                    &mut output_patcher,
+                    mode,
+                    message,
+                )
+                .await?;
                 if closes || upstream_closed {
                     return Ok(());
                 }
@@ -3359,6 +4079,32 @@ enum CodexHttpFallbackOutcome {
     DownstreamClosed,
 }
 
+enum CodexHttpRelayOutcome {
+    Completed(SemanticTerminal),
+    DownstreamClosed,
+    ProviderFailureBeforeCommit {
+        failure: SemanticFailure,
+        replay_payloads: Vec<String>,
+    },
+    Interrupted {
+        error: ProxyError,
+        committed_business_event: bool,
+        replay_payloads: Vec<String>,
+    },
+}
+
+enum CodexHttpRelayEventOutcome {
+    Continue,
+    Terminal(SemanticTerminal),
+    ProviderFailureBeforeCommit(SemanticFailure),
+}
+
+enum CodexHttpRelayFailure {
+    Upstream(ProxyError),
+    Client(ProxyError),
+    DownstreamClosed,
+}
+
 struct PreparedCodexHttpFallbackTarget {
     http_client: reqwest::Client,
     url: String,
@@ -3393,8 +4139,42 @@ async fn run_codex_websocket_http_fallback(
             {
                 Ok(target) => target,
                 Err(error) => {
-                    crate::metrics::record_codex_websocket_fallback(source, "error");
-                    return Err(error);
+                    if error.status.is_server_error() {
+                        record_provider_outcome(
+                            state,
+                            &stored,
+                            ProviderOutcome::Failure {
+                                status_code: error.status.as_u16(),
+                            },
+                        )
+                        .await;
+                        if switch_codex_http_fallback_provider(
+                            state,
+                            execution,
+                            account_in_flight_guard,
+                            excluded_provider_ids,
+                            provider_pinned,
+                            auth_refresh_attempted,
+                            output_patcher,
+                            "websocket_http_fallback_target_error",
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                    }
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        Vec::new(),
+                        error,
+                        "upstream_target_error",
+                        Some("protocol_error"),
+                    )
+                    .await;
                 }
             };
         let mut request = target
@@ -3418,13 +4198,50 @@ async fn run_codex_websocket_http_fallback(
             Ok(Ok(upstream)) => upstream,
             Ok(Err(error)) => {
                 record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                crate::metrics::record_codex_websocket_fallback(source, "error");
-                return Err(ProxyError::bad_gateway(error));
+                if switch_codex_http_fallback_provider(
+                    state,
+                    execution,
+                    account_in_flight_guard,
+                    excluded_provider_ids,
+                    provider_pinned,
+                    auth_refresh_attempted,
+                    output_patcher,
+                    "websocket_http_fallback_send_error",
+                )
+                .await
+                {
+                    continue;
+                }
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    Vec::new(),
+                    ProxyError::bad_gateway(error),
+                    "upstream_stream_transport_error",
+                    Some("transport_error"),
+                )
+                .await;
             }
             Err(_) => {
                 record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                crate::metrics::record_codex_websocket_fallback(source, "error");
-                return Err(ProxyError {
+                if switch_codex_http_fallback_provider(
+                    state,
+                    execution,
+                    account_in_flight_guard,
+                    excluded_provider_ids,
+                    provider_pinned,
+                    auth_refresh_attempted,
+                    output_patcher,
+                    "websocket_http_fallback_send_timeout",
+                )
+                .await
+                {
+                    continue;
+                }
+                let error = ProxyError {
                     status: StatusCode::GATEWAY_TIMEOUT,
                     message: format!(
                         "Codex HTTP fallback first event timeout after {}ms",
@@ -3432,17 +4249,62 @@ async fn run_codex_websocket_http_fallback(
                             .expect("a deadline exists only when the timeout is enabled")
                             .as_millis()
                     ),
-                });
+                };
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    Vec::new(),
+                    error,
+                    "upstream_stream_timeout",
+                    Some("transport_error"),
+                )
+                .await;
             }
         };
         let status = upstream.status();
         if status == StatusCode::UNAUTHORIZED && !*auth_refresh_attempted {
             let Some((provider_type, account_id)) = execution.managed_account_target() else {
-                crate::metrics::record_codex_websocket_fallback(source, "error");
-                return Err(ProxyError {
+                let error = ProxyError {
                     status,
                     message: "Codex HTTP fallback upstream rejected authentication".to_string(),
-                });
+                };
+                record_provider_outcome(
+                    state,
+                    &stored,
+                    ProviderOutcome::Failure {
+                        status_code: status.as_u16(),
+                    },
+                )
+                .await;
+                if switch_codex_http_fallback_provider(
+                    state,
+                    execution,
+                    account_in_flight_guard,
+                    excluded_provider_ids,
+                    provider_pinned,
+                    auth_refresh_attempted,
+                    output_patcher,
+                    "websocket_http_fallback_unmanaged_unauthorized",
+                )
+                .await
+                {
+                    continue;
+                }
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    Vec::new(),
+                    error,
+                    "upstream_auth_error",
+                    None,
+                )
+                .await;
             };
             drop(upstream);
             let refresh_result = state
@@ -3455,22 +4317,41 @@ async fn run_codex_websocket_http_fallback(
                     "websocket_http_fallback_refresh_failed",
                 )
                 .await;
-                if !provider_pinned
-                    && switch_to_ready_codex_provider(
-                        state,
-                        execution,
-                        account_in_flight_guard,
-                        excluded_provider_ids,
-                        codex_oauth_websocket_failover_provider,
-                        "websocket_http_fallback_refresh_failed",
-                    )
-                    .await
+                let error = managed_account_refresh_error_to_proxy_error(error);
+                record_provider_outcome(
+                    state,
+                    &stored,
+                    ProviderOutcome::Failure {
+                        status_code: error.status.as_u16(),
+                    },
+                )
+                .await;
+                if switch_codex_http_fallback_provider(
+                    state,
+                    execution,
+                    account_in_flight_guard,
+                    excluded_provider_ids,
+                    provider_pinned,
+                    auth_refresh_attempted,
+                    output_patcher,
+                    "websocket_http_fallback_refresh_failed",
+                )
+                .await
                 {
-                    *auth_refresh_attempted = false;
                     continue;
                 }
-                crate::metrics::record_codex_websocket_fallback(source, "error");
-                return Err(managed_account_refresh_error_to_proxy_error(error));
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    Vec::new(),
+                    error,
+                    "upstream_auth_refresh_error",
+                    None,
+                )
+                .await;
             }
             *auth_refresh_attempted = true;
             record_forward_retry(
@@ -3487,16 +4368,17 @@ async fn run_codex_websocket_http_fallback(
                 "websocket_http_fallback_unauthorized_after_refresh",
             )
             .await;
-            if !provider_pinned
-                && switch_to_ready_codex_provider(
-                    state,
-                    execution,
-                    account_in_flight_guard,
-                    excluded_provider_ids,
-                    codex_oauth_websocket_failover_provider,
-                    "websocket_http_fallback_unauthorized_after_refresh",
-                )
-                .await
+            if switch_codex_http_fallback_provider(
+                state,
+                execution,
+                account_in_flight_guard,
+                excluded_provider_ids,
+                provider_pinned,
+                auth_refresh_attempted,
+                output_patcher,
+                "websocket_http_fallback_unauthorized_after_refresh",
+            )
+            .await
             {
                 record_provider_outcome(
                     state,
@@ -3504,32 +4386,63 @@ async fn run_codex_websocket_http_fallback(
                     provider_outcome_from_status(status.as_u16()),
                 )
                 .await;
-                *auth_refresh_attempted = false;
                 drop(upstream);
                 continue;
             }
         }
         if !status.is_success() {
             let response_headers = upstream.headers().clone();
-            let body = match first_event_deadline {
+            let body_result = match first_event_deadline {
                 Some(deadline) => match tokio::time::timeout_at(deadline, upstream.bytes()).await {
-                    Ok(body) => body.unwrap_or_default(),
-                    Err(_) => {
-                        record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure)
-                            .await;
-                        crate::metrics::record_codex_websocket_fallback(source, "error");
-                        return Err(ProxyError {
-                            status: StatusCode::GATEWAY_TIMEOUT,
-                            message: format!(
-                                "Codex HTTP fallback first event timeout after {}ms",
-                                first_event_timeout
-                                    .expect("a deadline exists only when the timeout is enabled")
-                                    .as_millis()
-                            ),
-                        });
-                    }
+                    Ok(body) => body.map_err(ProxyError::bad_gateway),
+                    Err(_) => Err(ProxyError {
+                        status: StatusCode::GATEWAY_TIMEOUT,
+                        message: format!(
+                            "Codex HTTP fallback first event timeout after {}ms",
+                            first_event_timeout
+                                .expect("a deadline exists only when the timeout is enabled")
+                                .as_millis()
+                        ),
+                    }),
                 },
-                None => upstream.bytes().await.unwrap_or_default(),
+                None => upstream.bytes().await.map_err(ProxyError::bad_gateway),
+            };
+            let body = match body_result {
+                Ok(body) => body,
+                Err(error) => {
+                    record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
+                    if switch_codex_http_fallback_provider(
+                        state,
+                        execution,
+                        account_in_flight_guard,
+                        excluded_provider_ids,
+                        provider_pinned,
+                        auth_refresh_attempted,
+                        output_patcher,
+                        "websocket_http_fallback_error_body_read",
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    let code = if error.status == StatusCode::GATEWAY_TIMEOUT {
+                        "upstream_stream_timeout"
+                    } else {
+                        "upstream_stream_transport_error"
+                    };
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        Vec::new(),
+                        error,
+                        code,
+                        Some("transport_error"),
+                    )
+                    .await;
+                }
             };
             maybe_mark_upstream_rate_limited(state, execution, status, &response_headers, &body)
                 .await;
@@ -3539,14 +4452,40 @@ async fn run_codex_websocket_http_fallback(
                 provider_outcome_from_status(status.as_u16()),
             )
             .await;
-            crate::metrics::record_codex_websocket_fallback(source, "error");
-            return Err(ProxyError {
+            if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+                && switch_codex_http_fallback_provider(
+                    state,
+                    execution,
+                    account_in_flight_guard,
+                    excluded_provider_ids,
+                    provider_pinned,
+                    auth_refresh_attempted,
+                    output_patcher,
+                    "websocket_http_fallback_retryable_status",
+                )
+                .await
+            {
+                continue;
+            }
+            let error = ProxyError {
                 status,
                 message: format!(
                     "Codex HTTP fallback upstream returned HTTP {}",
                     status.as_u16()
                 ),
-            });
+            };
+            return terminate_codex_http_fallback_with_error(
+                downstream,
+                state,
+                execution,
+                output_patcher,
+                source,
+                Vec::new(),
+                error,
+                "upstream_http_error",
+                None,
+            )
+            .await;
         }
 
         match relay_codex_http_fallback_stream(
@@ -3559,23 +4498,182 @@ async fn run_codex_websocket_http_fallback(
         )
         .await
         {
-            Ok(outcome) => {
+            Ok(CodexHttpRelayOutcome::Completed(terminal)) => {
+                match terminal {
+                    SemanticTerminal::Failure(failure)
+                        if failure.origin == FailureOrigin::Provider =>
+                    {
+                        record_provider_outcome(
+                            state,
+                            &stored,
+                            ProviderOutcome::Failure { status_code: 502 },
+                        )
+                        .await;
+                    }
+                    SemanticTerminal::Failure(_) => {}
+                    SemanticTerminal::Success | SemanticTerminal::Incomplete => {
+                        record_provider_outcome(
+                            state,
+                            &stored,
+                            ProviderOutcome::Success { status_code: 200 },
+                        )
+                        .await;
+                    }
+                }
+                crate::metrics::record_codex_websocket_fallback(source, "success");
+                return Ok(CodexHttpFallbackOutcome::Completed);
+            }
+            Ok(CodexHttpRelayOutcome::DownstreamClosed) => {
+                crate::metrics::record_codex_websocket_fallback(source, "success");
+                return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+            }
+            Ok(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
+                failure,
+                replay_payloads,
+            }) => {
                 record_provider_outcome(
                     state,
                     &stored,
-                    ProviderOutcome::Success { status_code: 200 },
+                    ProviderOutcome::Failure { status_code: 502 },
                 )
                 .await;
-                crate::metrics::record_codex_websocket_fallback(source, "success");
-                return Ok(outcome);
+                if switch_codex_http_fallback_provider(
+                    state,
+                    execution,
+                    account_in_flight_guard,
+                    excluded_provider_ids,
+                    provider_pinned,
+                    auth_refresh_attempted,
+                    output_patcher,
+                    "websocket_http_fallback_semantic_failure",
+                )
+                .await
+                {
+                    continue;
+                }
+                tracing::debug!(
+                    error = %failure.display_message(),
+                    "forwarding Responses semantic failure after HTTP fallback failover exhausted"
+                );
+                for payload in replay_payloads {
+                    relay_codex_http_fallback_event(downstream, output_patcher, payload).await?;
+                }
+                crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
+                return Ok(CodexHttpFallbackOutcome::Completed);
+            }
+            Ok(CodexHttpRelayOutcome::Interrupted {
+                error,
+                committed_business_event,
+                replay_payloads,
+            }) => {
+                record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
+                if !committed_business_event
+                    && switch_codex_http_fallback_provider(
+                        state,
+                        execution,
+                        account_in_flight_guard,
+                        excluded_provider_ids,
+                        provider_pinned,
+                        auth_refresh_attempted,
+                        output_patcher,
+                        "websocket_http_fallback_stream_interrupted",
+                    )
+                    .await
+                {
+                    continue;
+                }
+                let error_code = if error.status == StatusCode::GATEWAY_TIMEOUT {
+                    "upstream_stream_timeout"
+                } else if error.status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "upstream_stream_too_large"
+                } else {
+                    "upstream_stream_error"
+                };
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    replay_payloads,
+                    error,
+                    error_code,
+                    Some("transport_error"),
+                )
+                .await;
             }
             Err(error) => {
-                record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
                 crate::metrics::record_codex_websocket_fallback(source, "error");
                 return Err(error);
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn switch_codex_http_fallback_provider(
+    state: &ServerState,
+    execution: &mut ProviderExecution,
+    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
+    excluded_provider_ids: &mut BTreeSet<String>,
+    provider_pinned: bool,
+    auth_refresh_attempted: &mut bool,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+    reason: &'static str,
+) -> bool {
+    if provider_pinned
+        || !switch_to_ready_codex_provider(
+            state,
+            execution,
+            account_in_flight_guard,
+            excluded_provider_ids,
+            codex_oauth_websocket_failover_provider,
+            reason,
+        )
+        .await
+    {
+        return false;
+    }
+    *auth_refresh_attempted = false;
+    output_patcher.clear();
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn terminate_codex_http_fallback_with_error(
+    downstream: &mut WebSocket,
+    state: &ServerState,
+    execution: &ProviderExecution,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+    source: &'static str,
+    replay_payloads: Vec<String>,
+    error: ProxyError,
+    error_code: &'static str,
+    metric_kind: Option<&'static str>,
+) -> Result<CodexHttpFallbackOutcome, ProxyError> {
+    crate::metrics::record_codex_websocket_fallback(source, "error");
+    if let Some(metric_kind) = metric_kind {
+        crate::metrics::record_proxy_semantic_guard("websocket_http_fallback", metric_kind);
+    }
+    let error_body = websocket_stream_error_body(error.client_message(), error_code);
+    let mut pending_messages = replay_payloads
+        .into_iter()
+        .map(TungsteniteMessage::Text)
+        .collect();
+    terminate_responses_websocket_with_error(
+        downstream,
+        output_patcher,
+        ResponsesWebsocketMode::Codex,
+        state,
+        execution,
+        &mut pending_messages,
+        error,
+        None,
+        error_body,
+        None,
+    )
+    .await
+    .map(|()| CodexHttpFallbackOutcome::Completed)
 }
 
 async fn prepare_codex_http_fallback_target(
@@ -3664,89 +4762,305 @@ async fn relay_codex_http_fallback_stream(
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     output_patcher: &mut CodexWebsocketOutputPatcher,
-) -> Result<CodexHttpFallbackOutcome, ProxyError> {
+) -> Result<CodexHttpRelayOutcome, ProxyError> {
     let mut upstream = upstream.bytes_stream();
     let mut decoder = CodexHttpFallbackSseDecoder::default();
-    let mut first_event_seen = false;
+    let mut committed_business_event = false;
+    let mut pending_lifecycle_payloads = Vec::new();
     let mut deadline = first_event_deadline;
 
-    loop {
-        let current_deadline = deadline;
-        let waiting_for_first_event = !first_event_seen;
-        let upstream_next = async {
-            if let Some(deadline) = current_deadline {
-                tokio::time::timeout_at(deadline, upstream.try_next())
-                    .await
-                    .map_err(|_| ProxyError {
-                        status: StatusCode::GATEWAY_TIMEOUT,
-                        message: if waiting_for_first_event {
-                            format!(
-                                "Codex HTTP fallback first event timeout after {}ms",
-                                first_event_timeout
-                                    .expect("a first-event deadline has a configured timeout")
-                                    .as_millis()
-                            )
-                        } else {
-                            "Codex HTTP fallback stream idle timeout".to_string()
-                        },
-                    })?
-                    .map_err(ProxyError::bad_gateway)
-            } else {
-                upstream.try_next().await.map_err(ProxyError::bad_gateway)
-            }
-        };
-        tokio::pin!(upstream_next);
+    let relay_result: Result<CodexHttpRelayOutcome, CodexHttpRelayFailure> = async {
+        loop {
+            let current_deadline = deadline;
+            let waiting_for_first_event = !committed_business_event;
+            let upstream_next = async {
+                if let Some(deadline) = current_deadline {
+                    tokio::time::timeout_at(deadline, upstream.try_next())
+                        .await
+                        .map_err(|_| {
+                            CodexHttpRelayFailure::Upstream(ProxyError {
+                                status: StatusCode::GATEWAY_TIMEOUT,
+                                message: if waiting_for_first_event {
+                                    format!(
+                                        "Codex HTTP fallback first event timeout after {}ms",
+                                        first_event_timeout
+                                            .expect(
+                                                "a first-event deadline has a configured timeout",
+                                            )
+                                            .as_millis()
+                                    )
+                                } else {
+                                    "Codex HTTP fallback stream idle timeout".to_string()
+                                },
+                            })
+                        })?
+                        .map_err(|error| {
+                            CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(error))
+                        })
+                } else {
+                    upstream.try_next().await.map_err(|error| {
+                        CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(error))
+                    })
+                }
+            };
+            tokio::pin!(upstream_next);
 
-        let next_chunk = tokio::select! {
-            downstream_message = downstream.next() => {
-                let Some(message) = downstream_message else {
-                    return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
-                };
-                let message = message
-                    .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
-                match message {
-                    AxumWsMessage::Close(_) => {
-                        return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+            let next_chunk = tokio::select! {
+                downstream_message = downstream.next() => {
+                    let Some(message) = downstream_message else {
+                        return Ok(CodexHttpRelayOutcome::DownstreamClosed);
+                    };
+                    let Ok(message) = message else {
+                        return Ok(CodexHttpRelayOutcome::DownstreamClosed);
+                    };
+                    match message {
+                        AxumWsMessage::Close(_) => {
+                            return Ok(CodexHttpRelayOutcome::DownstreamClosed);
+                        }
+                        AxumWsMessage::Ping(bytes) => {
+                            if downstream.send(AxumWsMessage::Pong(bytes)).await.is_err() {
+                                return Ok(CodexHttpRelayOutcome::DownstreamClosed);
+                            }
+                        }
+                        AxumWsMessage::Pong(_) => {}
+                        AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {
+                            return Err(CodexHttpRelayFailure::Client(ProxyError::bad_request(
+                                "responses websocket received a request while HTTP fallback was in flight",
+                            )));
+                        }
                     }
-                    AxumWsMessage::Ping(bytes) => {
-                        downstream
-                            .send(AxumWsMessage::Pong(bytes))
-                            .await
-                            .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
-                    }
-                    AxumWsMessage::Pong(_) => {}
-                    AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {
-                        return Err(ProxyError::bad_request(
-                            "responses websocket received a request while HTTP fallback was in flight",
-                        ));
-                    }
+                    continue;
                 }
-                continue;
-            }
-            chunk = &mut upstream_next => chunk?,
-        };
+                chunk = &mut upstream_next => chunk?,
+            };
 
-        match next_chunk {
-            Some(chunk) => {
-                for payload in decoder.push(&chunk)? {
-                    if relay_codex_http_fallback_event(downstream, output_patcher, payload).await? {
-                        return Ok(CodexHttpFallbackOutcome::Completed);
+            match next_chunk {
+                Some(chunk) => {
+                    let payloads = decoder
+                        .push(&chunk)
+                        .map_err(CodexHttpRelayFailure::Upstream)?;
+                    if let Some(outcome) = relay_codex_http_fallback_payloads(
+                        downstream,
+                        output_patcher,
+                        payloads,
+                        &mut pending_lifecycle_payloads,
+                        &mut committed_business_event,
+                    )
+                    .await?
+                    {
+                        return Ok(outcome);
                     }
-                    first_event_seen = true;
-                    deadline = idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
-                }
-            }
-            None => {
-                for payload in decoder.finish()? {
-                    if relay_codex_http_fallback_event(downstream, output_patcher, payload).await? {
-                        return Ok(CodexHttpFallbackOutcome::Completed);
+                    if committed_business_event {
+                        deadline =
+                            idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
                     }
                 }
-                return Err(ProxyError::bad_gateway(
-                    "Codex HTTP fallback stream ended before a terminal response event",
-                ));
+                None => {
+                    let payloads = decoder
+                        .finish()
+                        .map_err(CodexHttpRelayFailure::Upstream)?;
+                    if let Some(outcome) = relay_codex_http_fallback_payloads(
+                        downstream,
+                        output_patcher,
+                        payloads,
+                        &mut pending_lifecycle_payloads,
+                        &mut committed_business_event,
+                    )
+                    .await?
+                    {
+                        return Ok(outcome);
+                    }
+                    return Err(CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(
+                        "Codex HTTP fallback stream ended before a terminal response event",
+                    )));
+                }
             }
         }
+    }
+    .await;
+
+    match relay_result {
+        Ok(outcome) => Ok(outcome),
+        Err(CodexHttpRelayFailure::Upstream(error)) => Ok(CodexHttpRelayOutcome::Interrupted {
+            error,
+            committed_business_event,
+            replay_payloads: pending_lifecycle_payloads,
+        }),
+        Err(CodexHttpRelayFailure::Client(error)) => Err(error),
+        Err(CodexHttpRelayFailure::DownstreamClosed) => Ok(CodexHttpRelayOutcome::DownstreamClosed),
+    }
+}
+
+async fn relay_codex_http_fallback_payloads(
+    downstream: &mut WebSocket,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+    payloads: Vec<String>,
+    pending_lifecycle_payloads: &mut Vec<String>,
+    committed_business_event: &mut bool,
+) -> Result<Option<CodexHttpRelayOutcome>, CodexHttpRelayFailure> {
+    if !*committed_business_event {
+        if let Some((failure_index, failure)) =
+            codex_http_fallback_batch_provider_failure(&payloads)
+                .map_err(CodexHttpRelayFailure::Upstream)?
+        {
+            crate::metrics::record_proxy_semantic_guard(
+                "websocket_http_fallback",
+                "provider_failure",
+            );
+            for payload in payloads.into_iter().take(failure_index + 1) {
+                buffer_codex_http_fallback_semantic_prelude(pending_lifecycle_payloads, payload)
+                    .map_err(CodexHttpRelayFailure::Upstream)?;
+            }
+            return Ok(Some(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
+                failure,
+                replay_payloads: std::mem::take(pending_lifecycle_payloads),
+            }));
+        }
+    }
+
+    for payload in payloads {
+        match relay_codex_http_fallback_semantic_event(
+            downstream,
+            output_patcher,
+            payload,
+            pending_lifecycle_payloads,
+            committed_business_event,
+        )
+        .await?
+        {
+            CodexHttpRelayEventOutcome::Continue => {}
+            CodexHttpRelayEventOutcome::Terminal(terminal) => {
+                return Ok(Some(CodexHttpRelayOutcome::Completed(terminal)));
+            }
+            CodexHttpRelayEventOutcome::ProviderFailureBeforeCommit(failure) => {
+                return Ok(Some(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
+                    failure,
+                    replay_payloads: std::mem::take(pending_lifecycle_payloads),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn codex_http_fallback_batch_provider_failure(
+    payloads: &[String],
+) -> Result<Option<(usize, SemanticFailure)>, ProxyError> {
+    if !response_semantics::semantic_guard_enabled() {
+        return Ok(None);
+    }
+    for (index, payload) in payloads.iter().enumerate() {
+        let value = serde_json::from_str::<Value>(payload).map_err(|error| {
+            ProxyError::bad_gateway(format!("invalid Responses event: {error}"))
+        })?;
+        match response_semantics::classify_value(&value) {
+            SemanticObservation::Failure(failure) if failure.origin == FailureOrigin::Provider => {
+                return Ok(Some((index, failure)));
+            }
+            SemanticObservation::SuccessTerminal
+            | SemanticObservation::IncompleteTerminal
+            | SemanticObservation::Failure(_) => return Ok(None),
+            SemanticObservation::Lifecycle | SemanticObservation::Business => {}
+        }
+    }
+    Ok(None)
+}
+
+async fn relay_codex_http_fallback_semantic_event(
+    downstream: &mut WebSocket,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+    payload: String,
+    pending_lifecycle_payloads: &mut Vec<String>,
+    committed_business_event: &mut bool,
+) -> Result<CodexHttpRelayEventOutcome, CodexHttpRelayFailure> {
+    if !response_semantics::semantic_guard_enabled() {
+        let terminal = responses_payload_terminal(&payload);
+        relay_codex_http_fallback_event(downstream, output_patcher, payload)
+            .await
+            .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
+        *committed_business_event = true;
+        return Ok(terminal
+            .map(CodexHttpRelayEventOutcome::Terminal)
+            .unwrap_or(CodexHttpRelayEventOutcome::Continue));
+    }
+
+    let value = serde_json::from_str::<Value>(&payload).map_err(|error| {
+        CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(format!(
+            "invalid Responses event: {error}"
+        )))
+    })?;
+    let observation = response_semantics::classify_value(&value);
+    crate::metrics::record_proxy_semantic_guard(
+        "websocket_http_fallback",
+        observation.metric_kind(),
+    );
+    if matches!(observation, SemanticObservation::Lifecycle) && !*committed_business_event {
+        buffer_codex_http_fallback_semantic_prelude(pending_lifecycle_payloads, payload)
+            .map_err(CodexHttpRelayFailure::Upstream)?;
+        return Ok(CodexHttpRelayEventOutcome::Continue);
+    }
+    if let SemanticObservation::Failure(failure) = &observation {
+        if failure.origin == FailureOrigin::Provider && !*committed_business_event {
+            buffer_codex_http_fallback_semantic_prelude(pending_lifecycle_payloads, payload)
+                .map_err(CodexHttpRelayFailure::Upstream)?;
+            return Ok(CodexHttpRelayEventOutcome::ProviderFailureBeforeCommit(
+                failure.clone(),
+            ));
+        }
+    }
+
+    for pending in pending_lifecycle_payloads.drain(..) {
+        relay_codex_http_fallback_event(downstream, output_patcher, pending)
+            .await
+            .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
+    }
+    relay_codex_http_fallback_event(downstream, output_patcher, payload)
+        .await
+        .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
+    *committed_business_event |= observation.counts_as_business_output();
+    Ok(match observation {
+        SemanticObservation::SuccessTerminal => {
+            CodexHttpRelayEventOutcome::Terminal(SemanticTerminal::Success)
+        }
+        SemanticObservation::IncompleteTerminal => {
+            CodexHttpRelayEventOutcome::Terminal(SemanticTerminal::Incomplete)
+        }
+        SemanticObservation::Failure(failure) => {
+            CodexHttpRelayEventOutcome::Terminal(SemanticTerminal::Failure(failure))
+        }
+        SemanticObservation::Lifecycle | SemanticObservation::Business => {
+            CodexHttpRelayEventOutcome::Continue
+        }
+    })
+}
+
+fn buffer_codex_http_fallback_semantic_prelude(
+    pending: &mut Vec<String>,
+    payload: String,
+) -> Result<(), ProxyError> {
+    let buffered_bytes = pending
+        .iter()
+        .map(String::len)
+        .sum::<usize>()
+        .saturating_add(payload.len());
+    if pending.len() >= MAX_RESPONSES_SEMANTIC_PRELUDE_MESSAGES
+        || buffered_bytes > MAX_RESPONSES_SEMANTIC_PRELUDE_BYTES
+    {
+        return Err(ProxyError::bad_gateway(
+            "Responses HTTP fallback lifecycle prelude exceeded its bound",
+        ));
+    }
+    pending.push(payload);
+    Ok(())
+}
+
+fn responses_payload_terminal(payload: &str) -> Option<SemanticTerminal> {
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    match response_semantics::classify_value(&value) {
+        SemanticObservation::SuccessTerminal => Some(SemanticTerminal::Success),
+        SemanticObservation::IncompleteTerminal => Some(SemanticTerminal::Incomplete),
+        SemanticObservation::Failure(failure) => Some(SemanticTerminal::Failure(failure)),
+        SemanticObservation::Lifecycle | SemanticObservation::Business => None,
     }
 }
 
@@ -3898,6 +5212,162 @@ fn websocket_message_json_type(message: &TungsteniteMessage) -> Option<String> {
         .get("type")?
         .as_str()
         .map(str::to_string)
+}
+
+fn classify_responses_websocket_message(
+    message: &TungsteniteMessage,
+) -> Result<Option<SemanticObservation>, ProxyError> {
+    if !response_semantics::semantic_guard_enabled() {
+        return Ok(None);
+    }
+    let bytes = match message {
+        TungsteniteMessage::Text(text) => text.as_bytes(),
+        TungsteniteMessage::Binary(bytes) => bytes.as_slice(),
+        _ => return Ok(None),
+    };
+    response_semantics::classify_json_document(bytes)
+        .map(Some)
+        .map_err(ProxyError::bad_gateway)
+}
+
+fn semantic_prelude_decision(observations: &[SemanticObservation]) -> Option<SemanticObservation> {
+    observations
+        .iter()
+        .find(|observation| {
+            matches!(
+                observation,
+                SemanticObservation::Failure(SemanticFailure {
+                    origin: FailureOrigin::Provider,
+                    ..
+                })
+            )
+        })
+        .or_else(|| {
+            observations
+                .iter()
+                .find(|observation| observation.commits_downstream())
+        })
+        .cloned()
+}
+
+fn websocket_message_payload_len(message: &TungsteniteMessage) -> usize {
+    match message {
+        TungsteniteMessage::Text(text) => text.len(),
+        TungsteniteMessage::Binary(bytes) => bytes.len(),
+        _ => 0,
+    }
+}
+
+async fn send_responses_websocket_message(
+    downstream: &mut WebSocket,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+    mode: ResponsesWebsocketMode,
+    mut message: TungsteniteMessage,
+) -> Result<bool, ProxyError> {
+    if matches!(mode, ResponsesWebsocketMode::Codex) {
+        output_patcher.patch_message(&mut message);
+    }
+    let Some(message) = tungstenite_message_to_axum_ws(message) else {
+        return Ok(false);
+    };
+    let closes = matches!(message, AxumWsMessage::Close(_));
+    downstream
+        .send(message)
+        .await
+        .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+    Ok(closes)
+}
+
+async fn terminate_responses_websocket_without_terminal(
+    downstream: &mut WebSocket,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+    mode: ResponsesWebsocketMode,
+    state: &ServerState,
+    execution: &ProviderExecution,
+    pending_lifecycle_messages: &mut Vec<TungsteniteMessage>,
+    close_message: Option<&TungsteniteMessage>,
+) -> Result<(), ProxyError> {
+    const MESSAGE: &str = "upstream websocket closed before a terminal response event";
+    let size_error = close_message.is_some_and(websocket_close_is_size);
+    let error = if size_error {
+        ProxyError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "upstream websocket message too big".to_string(),
+        }
+    } else {
+        ProxyError::bad_gateway(MESSAGE)
+    };
+    let error_body = if size_error {
+        websocket_message_too_big_error_body()
+    } else {
+        websocket_missing_terminal_error_body()
+    };
+    let outcome = if size_error {
+        ProviderOutcome::Failure { status_code: 413 }
+    } else {
+        ProviderOutcome::Failure { status_code: 502 }
+    };
+    terminate_responses_websocket_with_error(
+        downstream,
+        output_patcher,
+        mode,
+        state,
+        execution,
+        pending_lifecycle_messages,
+        error,
+        Some("missing_terminal"),
+        error_body,
+        Some(outcome),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn terminate_responses_websocket_with_error(
+    downstream: &mut WebSocket,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+    mode: ResponsesWebsocketMode,
+    state: &ServerState,
+    execution: &ProviderExecution,
+    pending_lifecycle_messages: &mut Vec<TungsteniteMessage>,
+    error: ProxyError,
+    metric_kind: Option<&'static str>,
+    error_body: String,
+    provider_outcome: Option<ProviderOutcome>,
+) -> Result<(), ProxyError> {
+    if let Some(metric_kind) = metric_kind {
+        crate::metrics::record_proxy_semantic_guard("websocket", metric_kind);
+    }
+    if let Some(outcome) = provider_outcome {
+        record_provider_outcome(state, &execution.runtime_stored_view(), outcome).await;
+    }
+
+    for pending in pending_lifecycle_messages.drain(..) {
+        if send_responses_websocket_message(downstream, output_patcher, mode, pending).await? {
+            return Ok(());
+        }
+    }
+    if send_responses_websocket_message(
+        downstream,
+        output_patcher,
+        mode,
+        TungsteniteMessage::Text(error_body),
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let _ = send_responses_websocket_message(
+        downstream,
+        output_patcher,
+        mode,
+        TungsteniteMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: CloseCode::Error,
+            reason: "upstream response ended without terminal event".into(),
+        })),
+    )
+    .await?;
+    Err(error)
 }
 
 async fn responses_websocket_connect_error(
@@ -4177,6 +5647,13 @@ fn websocket_close_fallback_source(
     })
 }
 
+fn websocket_close_is_size(message: &TungsteniteMessage) -> bool {
+    matches!(
+        message,
+        TungsteniteMessage::Close(Some(frame)) if frame.code == CloseCode::Size
+    )
+}
+
 fn websocket_expected_reset(error: &TungsteniteError) -> bool {
     match error {
         TungsteniteError::ConnectionClosed
@@ -4194,6 +5671,25 @@ fn websocket_message_too_big_error_body() -> String {
             "message": "upstream websocket message too big",
             "type": "invalid_request_error",
             "code": "message_too_big"
+        }
+    })
+    .to_string()
+}
+
+fn websocket_missing_terminal_error_body() -> String {
+    websocket_stream_error_body(
+        "upstream websocket closed before a terminal response event",
+        "upstream_closed_before_terminal",
+    )
+}
+
+fn websocket_stream_error_body(message: &str, code: &str) -> String {
+    json!({
+        "type": "error",
+        "error": {
+            "message": message,
+            "type": "upstream_error",
+            "code": code
         }
     })
     .to_string()
@@ -4403,6 +5899,7 @@ async fn forward_claude_deepseek(
         actual_model_source: model_selection.actual_model_source.clone(),
         stream_requested: false,
         custom_tool_names: Default::default(),
+        responses_tool_context: Default::default(),
         claude_tool_name_map: Default::default(),
     };
     execution.enforce_model_policy(&mut runtime_request)?;
@@ -4649,6 +6146,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         actual_model_source: model_selection.actual_model_source.clone(),
         stream_requested: false,
         custom_tool_names: Default::default(),
+        responses_tool_context: Default::default(),
         claude_tool_name_map: Default::default(),
     };
     execution.enforce_model_policy(&mut runtime_request)?;
@@ -6446,6 +7944,8 @@ struct StreamForwardState {
     pending_chunk: Option<Bytes>,
     sse_error_detector: Option<ClaudeSseErrorDetector>,
     sse_error_outcome_recorded: bool,
+    responses_semantics: Option<ResponsesSseInspector>,
+    semantic_provider_outcome_recorded: bool,
     terminal_frame_sent: bool,
     interrupted_update_armed: Arc<AtomicBool>,
     _account_in_flight_guard: Option<AccountInFlightGuard>,
@@ -8835,7 +10335,7 @@ mod tests {
             .cloned()
             .map(|stored| ProviderExecution::from_store(&providers, stored).unwrap())
             .collect::<Vec<_>>();
-        *state.providers.write().await = providers;
+        state.replace_provider_store_for_test(providers).await;
         executions
     }
 
@@ -8968,6 +10468,13 @@ mod tests {
     }
 
     async fn send_test_bridge_request(address: std::net::SocketAddr, input: &str) -> Vec<Value> {
+        send_test_bridge_request_with_close(address, input).await.0
+    }
+
+    async fn send_test_bridge_request_with_close(
+        address: std::net::SocketAddr,
+        input: &str,
+    ) -> (Vec<Value>, Option<CloseCode>) {
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/bridge"))
             .await
             .unwrap();
@@ -8983,6 +10490,7 @@ mod tests {
             .await
             .unwrap();
         let mut events = Vec::new();
+        let mut close_code = None;
         loop {
             let message = match tokio::time::timeout(Duration::from_secs(2), socket.next()).await {
                 Ok(Some(Ok(message))) => message,
@@ -9006,12 +10514,65 @@ mod tests {
                         events.push(value);
                     }
                 }
-                TungsteniteMessage::Close(_) => break,
+                TungsteniteMessage::Close(frame) => {
+                    close_code = frame.map(|frame| frame.code);
+                    break;
+                }
                 _ => {}
             }
         }
         let _ = socket.close(None).await;
-        events
+        (events, close_code)
+    }
+
+    async fn run_codex_http_fallback_failover_case(
+        case: &str,
+        behavior: TestCodexWebSocketBehavior,
+        first_event_timeout: Option<Duration>,
+        idle_timeout: Option<Duration>,
+    ) -> (
+        Vec<Value>,
+        Option<CloseCode>,
+        TestCodexUpstream,
+        TestCodexUpstream,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let primary_name = format!("{case}-primary");
+        let fallback_name = format!("{case}-fallback");
+        let primary = spawn_test_codex_upstream(behavior).await;
+        let fallback = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let state = forwarder_test_state(&format!("codex-ws-{case}"));
+        insert_static_codex_test_account(&state, &primary_name, "primary-token").await;
+        insert_static_codex_test_account(&state, &fallback_name, "fallback-token").await;
+        let mut executions = install_codex_test_provider_set(
+            &state,
+            vec![
+                TestCodexProviderSpec {
+                    name: primary_name,
+                    endpoint: format!("http://{}", primary.address),
+                    websocket_url: Some(format!("ws://{}/ws", primary.address)),
+                },
+                TestCodexProviderSpec {
+                    name: fallback_name,
+                    endpoint: format!("http://{}", fallback.address),
+                    websocket_url: Some(format!("ws://{}/ws", fallback.address)),
+                },
+            ],
+        )
+        .await;
+        let execution = executions.remove(0);
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
+            state,
+            execution,
+            format!("ws://{}/ws", primary.address),
+            None,
+            &format!("{case}-session"),
+            first_event_timeout,
+            idle_timeout,
+        )
+        .await;
+        let (events, close_code) = send_test_bridge_request_with_close(bridge_address, case).await;
+        (events, close_code, primary, fallback, bridge_server)
     }
 
     async fn wait_for_cached_responses_websocket(pool_key: &str) {
@@ -9059,7 +10620,17 @@ mod tests {
         CloseSize,
         CloseSizeThenDelayHttpFirstEvent,
         CloseSizeThenStallHttpErrorBody,
+        CloseSizeThenHttpBusinessThenEof,
+        CloseSizeThenHttpBusinessThenStall,
+        CloseSizeThenHttpMalformed,
+        CloseSizeThenHttpBusinessThenProviderFailure,
+        CloseSizeThenHttpRateLimited,
+        CloseSizeThenHttpServerError,
         EmitThenCloseSize,
+        EmitBusinessThenCloseSize,
+        EmitBusinessThenCloseNormal,
+        CloseSizeThenHttpProviderFailure,
+        CloseSizeThenHttpClientFailure,
         Silent,
     }
 
@@ -9104,7 +10675,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             "use": "sig"
         }))
         .unwrap();
-        crate::clients::oauth::openai_jwks::install_test_jwk(jwk).await;
+        crate::state::install_openai_test_jwk(jwk).await;
 
         let now = chrono::Utc::now().timestamp();
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
@@ -9289,7 +10860,15 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                                     }
                                     TestCodexWebSocketBehavior::CloseSize
                                     | TestCodexWebSocketBehavior::CloseSizeThenDelayHttpFirstEvent
-                                    | TestCodexWebSocketBehavior::CloseSizeThenStallHttpErrorBody => {
+                                    | TestCodexWebSocketBehavior::CloseSizeThenStallHttpErrorBody
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenEof
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenStall
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpMalformed
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenProviderFailure
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpRateLimited
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpServerError
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpProviderFailure
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpClientFailure => {
                                         let _ = socket
                                             .send(AxumWsMessage::Close(Some(
                                                 axum::extract::ws::CloseFrame {
@@ -9318,6 +10897,42 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                                                 axum::extract::ws::CloseFrame {
                                                     code: 1009,
                                                     reason: "message too big".into(),
+                                                },
+                                            )))
+                                            .await;
+                                        break;
+                                    }
+                                    TestCodexWebSocketBehavior::EmitBusinessThenCloseSize
+                                    | TestCodexWebSocketBehavior::EmitBusinessThenCloseNormal => {
+                                        for event in [
+                                            json!({
+                                                "type": "response.created",
+                                                "response": {
+                                                    "id": "resp-committed",
+                                                    "status": "in_progress"
+                                                }
+                                            }),
+                                            json!({
+                                                "type": "response.output_text.delta",
+                                                "delta": "committed"
+                                            }),
+                                        ] {
+                                            let _ = socket
+                                                .send(AxumWsMessage::Text(event.to_string()))
+                                                .await;
+                                        }
+                                        let _ = socket
+                                            .send(AxumWsMessage::Close(Some(
+                                                axum::extract::ws::CloseFrame {
+                                                    code: if matches!(
+                                                        behavior,
+                                                        TestCodexWebSocketBehavior::EmitBusinessThenCloseNormal
+                                                    ) {
+                                                        1000
+                                                    } else {
+                                                        1009
+                                                    },
+                                                    reason: "upstream closed".into(),
                                                 },
                                             )))
                                             .await;
@@ -9358,6 +10973,29 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\",\"status\":\"completed\",\"output\":[]}}\n\n",
                             "data: [DONE]\n\n"
                         );
+                        let provider_failure_sse = concat!(
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-provider-failed\",\"status\":\"in_progress\"}}\n\n",
+                            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-provider-failed\",\"status\":\"failed\",\"error\":{\"type\":\"server_error\",\"message\":\"busy\"}}}\n\n",
+                            "data: [DONE]\n\n"
+                        );
+                        let client_failure_sse = concat!(
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-client-failed\",\"status\":\"in_progress\"}}\n\n",
+                            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-client-failed\",\"status\":\"failed\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad tool\"}}}\n\n",
+                            "data: [DONE]\n\n"
+                        );
+                        let business_without_terminal_sse = concat!(
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-interrupted\",\"status\":\"in_progress\"}}\n\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"committed-http\"}\n\n"
+                        );
+                        let malformed_sse = concat!(
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-malformed\",\"status\":\"in_progress\"}}\n\n",
+                            "data: {not-json}\n\n"
+                        );
+                        let business_then_provider_failure_sse = concat!(
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-batch-failed\",\"status\":\"in_progress\"}}\n\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"discard-me\"}\n\n",
+                            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-batch-failed\",\"status\":\"failed\",\"error\":{\"type\":\"server_error\",\"message\":\"busy\"}}}\n\n"
+                        );
                         let (status, body) = match behavior {
                             TestCodexWebSocketBehavior::CloseSizeThenDelayHttpFirstEvent => (
                                 StatusCode::OK,
@@ -9375,6 +11013,44 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                                     std::convert::Infallible,
                                 >>()),
                             ),
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenEof => (
+                                StatusCode::OK,
+                                Body::from(business_without_terminal_sse),
+                            ),
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenStall => (
+                                StatusCode::OK,
+                                Body::from_stream(
+                                    futures_util::stream::once(async move {
+                                        Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                                            business_without_terminal_sse.as_bytes(),
+                                        ))
+                                    })
+                                    .chain(futures_util::stream::pending::<Result<
+                                        Bytes,
+                                        std::convert::Infallible,
+                                    >>()),
+                                ),
+                            ),
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpMalformed => {
+                                (StatusCode::OK, Body::from(malformed_sse))
+                            }
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenProviderFailure => {
+                                (StatusCode::OK, Body::from(business_then_provider_failure_sse))
+                            }
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpRateLimited => (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Body::from(r#"{\"error\":{\"message\":\"rate limited\"}}"#),
+                            ),
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpServerError => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Body::from(r#"{\"error\":{\"message\":\"unavailable\"}}"#),
+                            ),
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpProviderFailure => {
+                                (StatusCode::OK, Body::from(provider_failure_sse))
+                            }
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpClientFailure => {
+                                (StatusCode::OK, Body::from(client_failure_sse))
+                            }
                             _ => (StatusCode::OK, Body::from(sse)),
                         };
                         let mut response = Response::new(body);
@@ -10556,6 +12232,85 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         assert_eq!(timeouts.idle, None);
     }
 
+    #[tokio::test]
+    async fn responses_lifecycle_events_do_not_extend_first_semantic_event_deadline() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(|| async move {
+                let events = futures_util::stream::unfold(0_u8, |index| async move {
+                    if index >= 5 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    let event = if index < 4 {
+                        json!({
+                            "type": "response.created",
+                            "response": {
+                                "id": format!("resp-lifecycle-{index}"),
+                                "status": "in_progress"
+                            }
+                        })
+                    } else {
+                        json!({
+                            "type": "response.output_text.delta",
+                            "delta": "too late"
+                        })
+                    };
+                    Some((
+                        Ok::<_, std::convert::Infallible>(Bytes::from(format!(
+                            "data: {event}\n\n"
+                        ))),
+                        index + 1,
+                    ))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(events))
+                    .unwrap()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (state, mut execution) =
+            codex_bridge_test_context("codex-semantic-deadline", format!("http://{address}")).await;
+        let plan = std::sync::Arc::make_mut(&mut execution.plan);
+        plan.transport_policy.stream_first_byte_timeout_ms = Some(100);
+        plan.transport_policy.stream_idle_timeout_ms = Some(500);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(350),
+            forward_with_attempt(
+                state,
+                ProxyRoute::CodexResponses,
+                None,
+                headers,
+                Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+                ForwardAttemptContext {
+                    execution: Some(execution),
+                    ..ForwardAttemptContext::default()
+                },
+            ),
+        )
+        .await
+        .expect("the absolute first semantic event deadline must terminate priming");
+        let error = match result {
+            Ok(_) => panic!("lifecycle events must not satisfy the semantic commit deadline"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(error.message.contains("first byte timeout"));
+
+        server.abort();
+    }
+
     #[test]
     fn stream_terminal_error_frames_match_client_protocols() {
         let responses = stream_terminal_error_frame(ProxyRoute::CodexResponses, "boom", 504)
@@ -10746,6 +12501,97 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[test]
+    fn semantic_prelude_prioritizes_provider_failure_in_same_batch() {
+        let failure = SemanticFailure {
+            origin: FailureOrigin::Provider,
+            code: "server_error".to_string(),
+            message: "busy".to_string(),
+        };
+
+        assert_eq!(
+            semantic_prelude_decision(&[
+                SemanticObservation::Lifecycle,
+                SemanticObservation::Business,
+                SemanticObservation::Failure(failure.clone()),
+            ]),
+            Some(SemanticObservation::Failure(failure))
+        );
+    }
+
+    #[test]
+    fn codex_http_fallback_detects_provider_failure_after_same_batch_business() {
+        let payloads = vec![
+            json!({"type": "response.output_text.delta", "delta": "discard"}).to_string(),
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"type": "server_error", "message": "busy"}
+                }
+            })
+            .to_string(),
+        ];
+
+        let (index, failure) = codex_http_fallback_batch_provider_failure(&payloads)
+            .unwrap()
+            .expect("provider failure");
+        assert_eq!(index, 1);
+        assert_eq!(failure.origin, FailureOrigin::Provider);
+    }
+
+    #[test]
+    fn codex_http_fallback_ignores_events_after_same_batch_terminal() {
+        let payloads = vec![
+            json!({
+                "type": "response.completed",
+                "response": {"status": "completed", "output": []}
+            })
+            .to_string(),
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"type": "server_error", "message": "late"}
+                }
+            })
+            .to_string(),
+        ];
+
+        assert!(codex_http_fallback_batch_provider_failure(&payloads)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn codex_http_fallback_semantic_prelude_enforces_message_bound() {
+        let mut pending = Vec::new();
+        for _ in 0..MAX_RESPONSES_SEMANTIC_PRELUDE_MESSAGES {
+            buffer_codex_http_fallback_semantic_prelude(&mut pending, "x".to_string()).unwrap();
+        }
+        assert_eq!(pending.len(), MAX_RESPONSES_SEMANTIC_PRELUDE_MESSAGES);
+
+        let error =
+            buffer_codex_http_fallback_semantic_prelude(&mut pending, "x".to_string()).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("lifecycle prelude exceeded"));
+    }
+
+    #[test]
+    fn codex_http_fallback_semantic_prelude_enforces_byte_bound() {
+        let mut pending = Vec::new();
+        buffer_codex_http_fallback_semantic_prelude(
+            &mut pending,
+            "x".repeat(MAX_RESPONSES_SEMANTIC_PRELUDE_BYTES),
+        )
+        .unwrap();
+
+        let error =
+            buffer_codex_http_fallback_semantic_prelude(&mut pending, "x".to_string()).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("lifecycle prelude exceeded"));
+    }
+
+    #[test]
     fn websocket_fallback_rejects_policy_close_but_accepts_size_and_transport_close() {
         let close = |code| {
             TungsteniteMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
@@ -10912,7 +12758,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             "text/event-stream",
             concat!(
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-refreshed-sse\"}}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-refreshed-sse\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-refreshed-sse\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
                 "data: [DONE]\n\n"
             )
             .to_string(),
@@ -11605,11 +13451,18 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         )
         .await;
 
-        let events = send_test_bridge_request(bridge_address, "delayed first event").await;
-        assert!(
-            events.is_empty(),
-            "the delayed SSE event must not be relayed"
-        );
+        let (events, close_code) =
+            send_test_bridge_request_with_close(bridge_address, "delayed first event").await;
+        assert!(events.iter().any(|event| {
+            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_stream_timeout")
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("response.output_text.delta" | "response.completed")
+            )
+        }));
+        assert_eq!(close_code, Some(CloseCode::Error));
         assert_eq!(
             upstream
                 .websocket_requests
@@ -11646,13 +13499,16 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         )
         .await;
 
-        let events = tokio::time::timeout(
+        let (events, close_code) = tokio::time::timeout(
             Duration::from_millis(500),
-            send_test_bridge_request(bridge_address, "stalled error body"),
+            send_test_bridge_request_with_close(bridge_address, "stalled error body"),
         )
         .await
         .expect("the HTTP error body must not outlive the first-event deadline");
-        assert!(events.is_empty(), "an HTTP error must not emit SSE events");
+        assert!(events.iter().any(|event| {
+            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_stream_timeout")
+        }));
+        assert_eq!(close_code, Some(CloseCode::Error));
         assert_eq!(
             upstream
                 .websocket_requests
@@ -11762,9 +13618,49 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_websocket_does_not_fallback_after_business_event_is_emitted() {
+    async fn codex_websocket_lifecycle_event_does_not_commit_before_http_fallback() {
         let upstream =
             spawn_test_codex_upstream(TestCodexWebSocketBehavior::EmitThenCloseSize).await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) = codex_bridge_test_context("ws-lifecycle", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "lifecycle-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "retry lifecycle").await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(
+                    |event| event.get("type").and_then(Value::as_str) == Some("response.created")
+                )
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_does_not_fallback_after_business_event_is_emitted() {
+        let upstream =
+            spawn_test_codex_upstream(TestCodexWebSocketBehavior::EmitBusinessThenCloseSize).await;
         let endpoint = format!("http://{}", upstream.address);
         let (state, execution) = codex_bridge_test_context("ws-committed", endpoint).await;
         let (bridge_address, bridge_server) = spawn_test_responses_bridge(
@@ -11789,6 +13685,361 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
 
         bridge_server.abort();
         upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_normal_close_without_terminal_reports_failure_without_replay() {
+        let upstream =
+            spawn_test_codex_upstream(TestCodexWebSocketBehavior::EmitBusinessThenCloseNormal)
+                .await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) = codex_bridge_test_context("ws-missing-terminal", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "missing-terminal-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "no silent success").await;
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
+        }));
+        assert!(events.iter().any(|event| {
+            event.pointer("/error/code").and_then(Value::as_str)
+                == Some("upstream_closed_before_terminal")
+        }));
+        assert!(!events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(
+            upstream
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_provider_failure_switches_before_commit() {
+        let primary_name = "ws-semantic-primary";
+        let fallback_name = "ws-semantic-fallback";
+        let primary =
+            spawn_test_codex_upstream(TestCodexWebSocketBehavior::CloseSizeThenHttpProviderFailure)
+                .await;
+        let fallback = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let state = forwarder_test_state("codex-ws-semantic-provider-failover");
+        insert_static_codex_test_account(&state, primary_name, "primary-token").await;
+        insert_static_codex_test_account(&state, fallback_name, "fallback-token").await;
+        let mut executions = install_codex_test_provider_set(
+            &state,
+            vec![
+                TestCodexProviderSpec {
+                    name: primary_name.to_string(),
+                    endpoint: format!("http://{}", primary.address),
+                    websocket_url: Some(format!("ws://{}/ws", primary.address)),
+                },
+                TestCodexProviderSpec {
+                    name: fallback_name.to_string(),
+                    endpoint: format!("http://{}", fallback.address),
+                    websocket_url: Some(format!("ws://{}/ws", fallback.address)),
+                },
+            ],
+        )
+        .await;
+        let execution = executions.remove(0);
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", primary.address),
+            None,
+            "semantic-provider-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "provider failover").await;
+        assert!(!events.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-provider-failed")
+        }));
+        assert!(events.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(
+            primary
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fallback
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        bridge_server.abort();
+        primary.server.abort();
+        fallback.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_client_failure_is_not_failed_over() {
+        let primary_name = "ws-client-primary";
+        let fallback_name = "ws-client-fallback";
+        let primary =
+            spawn_test_codex_upstream(TestCodexWebSocketBehavior::CloseSizeThenHttpClientFailure)
+                .await;
+        let fallback = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let state = forwarder_test_state("codex-ws-semantic-client-error");
+        insert_static_codex_test_account(&state, primary_name, "primary-token").await;
+        insert_static_codex_test_account(&state, fallback_name, "fallback-token").await;
+        let mut executions = install_codex_test_provider_set(
+            &state,
+            vec![
+                TestCodexProviderSpec {
+                    name: primary_name.to_string(),
+                    endpoint: format!("http://{}", primary.address),
+                    websocket_url: Some(format!("ws://{}/ws", primary.address)),
+                },
+                TestCodexProviderSpec {
+                    name: fallback_name.to_string(),
+                    endpoint: format!("http://{}", fallback.address),
+                    websocket_url: Some(format!("ws://{}/ws", fallback.address)),
+                },
+            ],
+        )
+        .await;
+        let execution = executions.remove(0);
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state,
+            execution,
+            format!("ws://{}/ws", primary.address),
+            None,
+            "semantic-client-session",
+        )
+        .await;
+
+        let events = send_test_bridge_request(bridge_address, "client error").await;
+        assert!(events.iter().any(|event| {
+            event
+                .pointer("/response/error/type")
+                .and_then(Value::as_str)
+                == Some("invalid_request_error")
+        }));
+        assert_eq!(
+            primary
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fallback
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        bridge_server.abort();
+        primary.server.abort();
+        fallback.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_eof_after_business_reports_error_without_failover() {
+        let (events, close_code, primary, fallback, bridge_server) =
+            run_codex_http_fallback_failover_case(
+                "fallback-eof-after-business",
+                TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenEof,
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(1)),
+            )
+            .await;
+
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
+                && event.get("delta").and_then(Value::as_str) == Some("committed-http")
+        }));
+        assert!(events.iter().any(|event| {
+            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_stream_error")
+        }));
+        assert!(!events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(close_code, Some(CloseCode::Error));
+        assert_eq!(
+            primary
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fallback
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        bridge_server.abort();
+        primary.server.abort();
+        fallback.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_idle_timeout_after_business_does_not_failover() {
+        let (events, close_code, primary, fallback, bridge_server) =
+            run_codex_http_fallback_failover_case(
+                "fallback-idle-after-business",
+                TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenStall,
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_millis(50)),
+            )
+            .await;
+
+        assert!(events
+            .iter()
+            .any(|event| { event.get("delta").and_then(Value::as_str) == Some("committed-http") }));
+        assert!(events.iter().any(|event| {
+            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_stream_timeout")
+        }));
+        assert_eq!(close_code, Some(CloseCode::Error));
+        assert_eq!(
+            primary
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fallback
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        bridge_server.abort();
+        primary.server.abort();
+        fallback.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_malformed_event_switches_before_commit() {
+        let (events, _, primary, fallback, bridge_server) = run_codex_http_fallback_failover_case(
+            "fallback-malformed",
+            TestCodexWebSocketBehavior::CloseSizeThenHttpMalformed,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+
+        assert!(!events.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-malformed")
+        }));
+        assert!(events.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(
+            primary
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fallback
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        bridge_server.abort();
+        primary.server.abort();
+        fallback.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_same_batch_provider_failure_preempts_business() {
+        let (events, _, primary, fallback, bridge_server) = run_codex_http_fallback_failover_case(
+            "fallback-batch-provider-failure",
+            TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenProviderFailure,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+
+        assert!(!events.iter().any(|event| {
+            event.get("delta").and_then(Value::as_str) == Some("discard-me")
+                || event.pointer("/response/id").and_then(Value::as_str)
+                    == Some("resp-batch-failed")
+        }));
+        assert!(events.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(
+            primary
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fallback
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        bridge_server.abort();
+        primary.server.abort();
+        fallback.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_retryable_status_switches_before_commit() {
+        for (case, behavior) in [
+            (
+                "fallback-rate-limit",
+                TestCodexWebSocketBehavior::CloseSizeThenHttpRateLimited,
+            ),
+            (
+                "fallback-server-error",
+                TestCodexWebSocketBehavior::CloseSizeThenHttpServerError,
+            ),
+        ] {
+            let (events, _, primary, fallback, bridge_server) =
+                run_codex_http_fallback_failover_case(
+                    case,
+                    behavior,
+                    Some(Duration::from_secs(1)),
+                    Some(Duration::from_secs(1)),
+                )
+                .await;
+
+            assert!(events.iter().any(|event| {
+                event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+                    && event.get("type").and_then(Value::as_str) == Some("response.completed")
+            }));
+            assert_eq!(
+                primary
+                    .http_requests
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                fallback
+                    .http_requests
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+
+            bridge_server.abort();
+            primary.server.abort();
+            fallback.server.abort();
+        }
     }
 
     #[test]
@@ -12026,5 +14277,64 @@ data: {"type":"response.completed","response":{"id":"resp_1","output":[]}}
         assert!(output.contains("\"input\":\"pwd\""));
         assert!(output.contains("response.output_item.done"));
         assert!(output.contains("\"output\":[{\"id\":\"ctc_call_1\""));
+    }
+
+    #[test]
+    fn stateful_chat_responses_pipeline_emits_custom_tool_completion_once() {
+        let stored = stored_provider(AppKind::Codex, ProviderType::Nvidia, json!({}), None);
+        let mut transformer = crate::proxy::stream_transforms::StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::CodexResponses,
+            BTreeSet::from(["exec".to_string()]),
+        );
+        let upstream = Bytes::from_static(
+            br#"data: {"id":"chatcmpl_pipeline","model":"chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_exec","function":{"name":"exec","arguments":"{\"input\":\"pwd\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_pipeline","model":"chat","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#,
+        );
+        let transformed = transformer.push(upstream).unwrap();
+        let transformed = join_bytes(transformed, transformer.finish().unwrap());
+        let mut patcher = CodexCustomToolStreamPatcher::default();
+        let output = join_bytes(patcher.push(transformed), patcher.finish());
+        let output = String::from_utf8(output.to_vec()).unwrap();
+        let events = output
+            .split("\n\n")
+            .filter_map(first_sse_data_payload)
+            .filter(|payload| payload.starts_with('{'))
+            .map(|payload| serde_json::from_str::<Value>(payload).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(!output.contains("cc_switch_custom_bridge"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.custom_tool_call_input.delta")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.custom_tool_call_input.done")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.output_item.done")
+                .count(),
+            1
+        );
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(completed["response"]["output"].as_array().unwrap().len(), 1);
+        assert_eq!(completed["response"]["output"][0]["input"], "pwd");
     }
 }

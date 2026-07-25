@@ -91,11 +91,38 @@ fn optimize_thinking(body: &mut Value) {
     append_beta(body, "interleaved-thinking-2025-05-14");
 }
 
-fn uses_adaptive_thinking(model: &str) -> bool {
-    let normalized = model.replace('.', "-");
-    ["opus-4-8", "opus-4-7", "opus-4-6", "sonnet-4-6"]
+pub(super) fn uses_adaptive_thinking(model: &str) -> bool {
+    let normalized = normalize_model_name(model);
+    [
+        "fable-5",
+        "mythos-5",
+        "mythos-preview",
+        "sonnet-5",
+        "opus-4-8",
+        "opus-4-7",
+        "opus-4-6",
+        "sonnet-4-6",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+pub(super) fn adaptive_thinking_is_default(model: &str) -> bool {
+    let normalized = normalize_model_name(model);
+    ["fable-5", "mythos-5", "mythos-preview", "sonnet-5"]
         .iter()
         .any(|needle| normalized.contains(needle))
+}
+
+pub(super) fn thinking_cannot_be_disabled(model: &str) -> bool {
+    let normalized = normalize_model_name(model);
+    ["fable-5", "mythos-5"]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+}
+
+fn normalize_model_name(model: &str) -> String {
+    model.trim().to_ascii_lowercase().replace(['.', '_'], "-")
 }
 
 fn append_beta(body: &mut Value, beta: &str) {
@@ -244,6 +271,8 @@ mod tests {
             "anthropic/claude-opus-4.8",
             "anthropic.claude-opus-4-6-20250514-v1:0",
             "anthropic.claude-sonnet-4-6-20250514-v1:0",
+            "anthropic_claude-sonnet-5",
+            "claude-mythos-preview",
         ] {
             let mut body = json!({
                 "model": model,
@@ -258,6 +287,14 @@ mod tests {
             assert_eq!(body["output_config"]["effort"], "max");
             assert!(body.get("anthropic_beta").is_none());
         }
+    }
+
+    #[test]
+    fn adaptive_model_capabilities_match_current_anthropic_contract() {
+        assert!(adaptive_thinking_is_default("anthropic.claude-sonnet-5"));
+        assert!(thinking_cannot_be_disabled("claude-fable-5"));
+        assert!(!thinking_cannot_be_disabled("claude-sonnet-5"));
+        assert!(!adaptive_thinking_is_default("claude-opus-4-8"));
     }
 
     #[test]

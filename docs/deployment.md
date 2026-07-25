@@ -15,6 +15,7 @@ scripts/static-checks.sh
 ```bash
 node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
+node scripts/audit/audit-proxy-bridge-contract.mjs --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
 scripts/audit/validate-local.sh
@@ -30,6 +31,7 @@ cargo fmt --check
 cargo check
 node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
+node scripts/audit/audit-proxy-bridge-contract.mjs --check
 cargo test
 ```
 
@@ -161,6 +163,21 @@ scripts/smoke/router-market-smoke.sh
 ## TLS/反代
 
 建议外层使用 Caddy/Nginx/Cloudflare Tunnel 终止 TLS，再反代到 `127.0.0.1:15721` 或内网地址。`router` tunnel 暴露的 public URL 与本机管理入口可以并存，但生产管理入口必须使用强密码和最小暴露面。
+
+## OAuth/代理桥接运维
+
+`/api/accounts/capabilities` 的 `loginFlows` 是 OAuth 登录方式的权威能力列表；旧客户端可继续读取由它派生的 `supportsStartLogin` 和 `supportsCallback`。Claude OAuth 支持 browser/CLI manual callback，OpenAI OAuth 还支持 device code。该接口只描述 Server 已实现的控制面能力，不代表真实账号、上游配额或 Router callback 已完成验收。
+
+跨协议 reasoning envelope 使用 accounts 根密钥经 HKDF 派生的独立 HMAC-SHA256 key。轮换 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 会同时改变该验证 key；旧请求历史中的 Server envelope 将按 fail-closed 处理，不能把这一行为改成接受未认证 opaque 内容。tool schema、tool-result media、reasoning、Anthropic 请求合法化、stream lifecycle 和 Responses 失败语义的可执行基线位于 `assets/contract/proxy-bridge-protocol.json` 与 `tests/fixtures/proxy_bridge/`。
+
+Responses JSON、SSE、WebSocket 和 WS→HTTP fallback 共享下游提交边界。`response.created` 等 lifecycle 事件不会提交响应、不会记录首 token，也不会延长 `STREAM_FIRST_BYTE_TIMEOUT_MS`；首个业务或终态事件之后才切换到 `STREAM_IDLE_TIMEOUT_MS`。Provider-origin 失败仅可在提交前 failover，client validation 失败原样返回，`response.incomplete` 按有效部分终态处理。
+
+事故回滚只设置 `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 并重启服务；默认值为开启。回滚会关闭 Responses 语义分类/提交门禁，但不会关闭 HMAC reasoning envelope 验证。观察 `/metrics`：
+
+- `cc_switch_proxy_semantic_guard_total{surface,observation}`：`lifecycle`、`business`、`success_terminal`、`incomplete_terminal`、`client_failure`、`provider_failure`、`protocol_error`。
+- `cc_switch_reasoning_bridge_total{direction,outcome}`：reasoning envelope encode/decode 成功、过大、MAC 或 envelope 校验失败。
+
+真实 Claude/OpenAI OAuth、ChatGPT upstream、Router callback、Market 和 Share grant 仍按 `docs/real-acceptance-runbook.md` 提供输入后执行；离线 fixture、mock 和 readiness 不能标记这些项目真实通过。
 
 ## 数据目录
 

@@ -1,0 +1,82 @@
+{
+  "id": "semantic-failure-origin",
+  "category": "failure_origin",
+  "cases": [
+    {
+      "name": "client_validation",
+      "input": {
+        "type": "response.failed",
+        "response": {
+          "status": "failed",
+          "error": {
+            "type": "invalid_request_error",
+            "message": "bad tool schema"
+          }
+        }
+      },
+      "expected": {
+        "origin": "client",
+        "code": "invalid_request_error",
+        "metricKind": "client_failure",
+        "commitsDownstream": true,
+        "eligibleForPreCommitFailover": false
+      }
+    },
+    {
+      "name": "provider_failure",
+      "input": {
+        "type": "response.failed",
+        "response": {
+          "status": "failed",
+          "error": {
+            "type": "server_error",
+            "message": "provider busy"
+          }
+        }
+      },
+      "expected": {
+        "origin": "provider",
+        "code": "server_error",
+        "metricKind": "provider_failure",
+        "commitsDownstream": true,
+        "eligibleForPreCommitFailover": true
+      }
+    },
+    {
+      "name": "root_level_client_code",
+      "input": {
+        "type": "error",
+        "code": "invalid_request_error",
+        "message": "invalid input"
+      },
+      "expected": {
+        "origin": "client",
+        "code": "invalid_request_error",
+        "metricKind": "client_failure",
+        "commitsDownstream": true,
+        "eligibleForPreCommitFailover": false
+      }
+    },
+    {
+      "name": "content_policy_rejection",
+      "input": {
+        "type": "response.failed",
+        "response": {
+          "status": "failed",
+          "error": {
+            "type": "content_filter_error",
+            "code": "content_filter",
+            "message": "request blocked by content policy"
+          }
+        }
+      },
+      "expected": {
+        "origin": "client",
+        "code": "content_filter",
+        "metricKind": "client_failure",
+        "commitsDownstream": true,
+        "eligibleForPreCommitFailover": false
+      }
+    }
+  ]
+}

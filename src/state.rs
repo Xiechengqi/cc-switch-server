@@ -84,6 +84,11 @@ const SETUP_COMPLETION_RETRY_BASE_MS: i64 = 30_000;
 const SETUP_COMPLETION_RETRY_MAX_MS: i64 = 30 * 60_000;
 const MAX_PROVIDER_IMPORT_ITEMS: usize = 256;
 
+#[cfg(test)]
+pub(crate) async fn install_openai_test_jwk(jwk: jsonwebtoken::jwk::Jwk) {
+    crate::clients::oauth::openai_jwks::install_test_jwk(jwk).await;
+}
+
 struct PreparedProviderImport {
     candidate: ProviderStore,
     preview: ProviderImportPreview,
@@ -2198,6 +2203,9 @@ impl ServerStateInner {
         }
         let mut providers = ProviderStore::load_runtime_or_default(&config_dir)?;
         let accounts = AccountStore::load_or_default(&config_dir)?;
+        let reasoning_root_key = crate::infra::credentials::load_or_create_root_key(&config_dir)
+            .context("resolve proxy reasoning bridge root key")?;
+        crate::proxy::reasoning_bridge::initialize(&reasoning_root_key.key)?;
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
@@ -2827,6 +2835,8 @@ impl ServerStateInner {
     async fn reload_persistent_stores_under_provider_commit(&self) -> anyhow::Result<()> {
         let config = ServerConfig::load_or_default(&self.config_dir)?;
         let http_client = build_http_client()?;
+        let reasoning_root_key = crate::infra::credentials::load_root_key(&self.config_dir)
+            .context("resolve proxy reasoning bridge root key")?;
         let mut providers = ProviderStore::load_runtime_or_default(&self.config_dir)?;
         let accounts = AccountStore::load_or_default(&self.config_dir)?;
         providers
@@ -2844,6 +2854,7 @@ impl ServerStateInner {
         *self.usage.write().await = usage;
         *self.shares.write().await = shares;
         *self.ui_settings.write().await = ui_settings;
+        crate::proxy::reasoning_bridge::rotate(&reasoning_root_key.key)?;
         self.tunnels.reload_statuses().await?;
         Ok(())
     }
@@ -3429,6 +3440,11 @@ impl ServerStateInner {
         })
         .await?
         .map_err(|never| match never {})
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn replace_provider_store_for_test(&self, providers: ProviderStore) {
+        *self.providers.write().await = providers;
     }
 
     #[cfg(test)]

@@ -143,6 +143,24 @@ pub fn record_stream_transform_protocol_error(kind: &'static str) {
     .increment(1);
 }
 
+pub fn record_reasoning_bridge(direction: &'static str, outcome: &'static str) {
+    metrics::counter!(
+        "cc_switch_reasoning_bridge_total",
+        "direction" => direction,
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+pub fn record_proxy_semantic_guard(surface: &'static str, observation: &'static str) {
+    metrics::counter!(
+        "cc_switch_proxy_semantic_guard_total",
+        "surface" => surface,
+        "observation" => observation
+    )
+    .increment(1);
+}
+
 fn describe() {
     metrics::describe_gauge!(
         "cc_switch_account_inflight",
@@ -195,6 +213,14 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_stream_transform_protocol_error_total",
         "Bounded cross-protocol stream transform errors"
+    );
+    metrics::describe_counter!(
+        "cc_switch_reasoning_bridge_total",
+        "Authenticated cross-protocol reasoning envelope operations"
+    );
+    metrics::describe_counter!(
+        "cc_switch_proxy_semantic_guard_total",
+        "Bounded Responses semantic classifications at downstream commit boundaries"
     );
 }
 

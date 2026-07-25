@@ -4,7 +4,9 @@ use std::io::Read;
 use axum::http::{HeaderMap, HeaderValue};
 use bytes::Bytes;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
-use serde_json::{Map, Value};
+use serde_json::Value;
+
+use super::tool_media::{replace_media_with_text, ToolMediaScope};
 
 use super::ProxyError;
 
@@ -272,69 +274,19 @@ fn modality_value_contains_image(value: &Value) -> bool {
     }
 }
 
-fn replace_image_blocks(value: &mut Value) {
-    if let Some(messages) = value.get_mut("messages") {
-        replace_images_in_message_list(messages);
-    }
-    if let Some(input) = value.get_mut("input") {
-        replace_images_in_content_value(input);
-    }
-    if let Some(content) = value.get_mut("content") {
-        replace_images_in_content_value(content);
-    }
-}
-
-fn replace_images_in_message_list(value: &mut Value) {
-    let Value::Array(messages) = value else {
+fn replace_image_blocks(body: &mut Value) {
+    let Some(body) = body.as_object_mut() else {
         return;
     };
-    for message in messages {
-        if let Some(content) = message.get_mut("content") {
-            replace_images_in_content_value(content);
+    for key in ["messages", "input", "content"] {
+        if let Some(content) = body.get_mut(key) {
+            replace_media_with_text(
+                content,
+                ToolMediaScope::ImagesOnly,
+                UNSUPPORTED_IMAGE_MARKER,
+            );
         }
     }
-}
-
-fn replace_images_in_content_value(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            if let Some(replacement) = image_block_replacement(object) {
-                *value = replacement;
-                return;
-            }
-            if let Some(content) = object.get_mut("content") {
-                replace_images_in_content_value(content);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                replace_images_in_content_value(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn image_block_replacement(object: &Map<String, Value>) -> Option<Value> {
-    let block_type = object.get("type").and_then(Value::as_str)?;
-    let replacement_type = match block_type {
-        "image" | "image_url" => "text",
-        "input_image" => "input_text",
-        _ => return None,
-    };
-    let mut replacement = Map::new();
-    replacement.insert(
-        "type".to_string(),
-        Value::String(replacement_type.to_string()),
-    );
-    replacement.insert(
-        "text".to_string(),
-        Value::String(UNSUPPORTED_IMAGE_MARKER.to_string()),
-    );
-    if let Some(cache_control) = object.get("cache_control") {
-        replacement.insert("cache_control".to_string(), cache_control.clone());
-    }
-    Some(Value::Object(replacement))
 }
 
 fn is_known_text_only_model(model: &str) -> bool {
@@ -510,7 +462,17 @@ mod tests {
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "image"}
+                        "kind": {
+                            "type": "object",
+                            "default": {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AA=="}
+                            },
+                            "examples": [{
+                                "type": "input_image",
+                                "image_url": "data:image/png;base64,BB=="
+                            }]
+                        }
                     }
                 }
             }],
@@ -554,7 +516,17 @@ mod tests {
         assert_eq!(
             body.pointer("/tools/0/input_schema/properties/kind/type")
                 .and_then(Value::as_str),
-            Some("image")
+            Some("object")
+        );
+        assert_eq!(
+            body.pointer("/tools/0/input_schema/properties/kind/default/type")
+                .and_then(Value::as_str),
+            Some("image_url")
+        );
+        assert_eq!(
+            body.pointer("/tools/0/input_schema/properties/kind/examples/0/type")
+                .and_then(Value::as_str),
+            Some("input_image")
         );
     }
 
@@ -618,6 +590,38 @@ mod tests {
         assert_eq!(
             enabled
                 .pointer("/input/0/content/0/text")
+                .and_then(Value::as_str),
+            Some(UNSUPPORTED_IMAGE_MARKER)
+        );
+    }
+
+    #[test]
+    fn text_only_governance_replaces_images_after_bounded_extraction_budget() {
+        let mut content = (0..5_000)
+            .map(|index| json!({"type": "text", "text": index.to_string()}))
+            .collect::<Vec<_>>();
+        content.push(json!({
+            "type": "input_image",
+            "image_url": "data:image/png;base64,AA=="
+        }));
+        let image_index = content.len() - 1;
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "input": [{"role": "user", "content": content}]
+        });
+        let settings = json!({
+            "models": [{"id": "deepseek-v4-pro", "supportsImage": false}]
+        });
+
+        govern_request_body(&mut body, &settings, &governance_config());
+
+        assert_eq!(
+            body.pointer(&format!("/input/0/content/{image_index}/type"))
+                .and_then(Value::as_str),
+            Some("input_text")
+        );
+        assert_eq!(
+            body.pointer(&format!("/input/0/content/{image_index}/text"))
                 .and_then(Value::as_str),
             Some(UNSUPPORTED_IMAGE_MARKER)
         );

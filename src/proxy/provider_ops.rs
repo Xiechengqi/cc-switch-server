@@ -1154,6 +1154,7 @@ mod tests {
             actual_model_source: None,
             stream_requested: false,
             custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
         };
 
@@ -1328,6 +1329,7 @@ mod tests {
             actual_model_source: Some("request".to_string()),
             stream_requested: false,
             custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
         };
 
@@ -1355,6 +1357,7 @@ mod tests {
             actual_model_source: Some("request".to_string()),
             stream_requested: false,
             custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
         };
         assert!(normalize_native_claude_context_1m_model(&mut entity_model).unwrap());

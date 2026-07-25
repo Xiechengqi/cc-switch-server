@@ -145,6 +145,7 @@ export interface AccountManagerCapability {
   support: string;
   status: string;
   blockingReason?: string | null;
+  loginFlows: AccountLoginFlowCapability[];
   supportsStartLogin: boolean;
   supportsCallback: boolean;
   supportsRefresh: boolean;
@@ -155,6 +156,13 @@ export interface AccountManagerCapability {
   serverNativeStage?: string | null;
   profileStrategy?: string | null;
   quotaStrategy?: string | null;
+}
+
+export interface AccountLoginFlowCapability {
+  kind: "browser_oauth" | "device_code" | "cli_manual_callback";
+  supportsCallback: boolean;
+  supportsPoll: boolean;
+  supportsCancel: boolean;
 }
 
 export interface AccountImportTemplate {

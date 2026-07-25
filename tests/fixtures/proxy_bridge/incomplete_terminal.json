@@ -1,0 +1,24 @@
+{
+  "id": "incomplete-valid-terminal",
+  "category": "incomplete_terminal",
+  "documents": [
+    {
+      "type": "response.incomplete",
+      "response": {
+        "id": "resp_partial_event",
+        "status": "incomplete",
+        "output": []
+      }
+    },
+    {
+      "id": "resp_partial_document",
+      "status": "incomplete",
+      "output": []
+    }
+  ],
+  "sse": "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_partial_stream\",\"status\":\"incomplete\",\"output\":[]}}\n\ndata: [DONE]\n\n",
+  "expected": {
+    "metricKind": "incomplete_terminal",
+    "streamStatus": "incomplete"
+  }
+}

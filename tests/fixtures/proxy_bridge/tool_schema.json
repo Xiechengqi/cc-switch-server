@@ -1,0 +1,57 @@
+{
+  "id": "tool-schema-root-object",
+  "category": "tool_schema",
+  "cases": [
+    {
+      "name": "missing_parameters",
+      "input": {},
+      "expected": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "non_object_parameters",
+      "input": {
+        "parameters": ["invalid"]
+      },
+      "expected": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "preserve_schema_keywords",
+      "input": {
+        "parameters": {
+          "type": "string",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                }
+              }
+            }
+          ],
+          "required": ["id"]
+        }
+      },
+      "expected": {
+        "type": "object",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "required": ["id"]
+      }
+    }
+  ]
+}

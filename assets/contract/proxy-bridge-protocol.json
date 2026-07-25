@@ -1,0 +1,104 @@
+{
+  "format": "cc-switch-server-proxy-bridge-protocol",
+  "schemaVersion": 1,
+  "reasoningEnvelope": {
+    "prefix": "ccswitch-server-reasoning-v1:",
+    "authentication": "hmac_sha256",
+    "keyDerivation": "hkdf_sha256_from_accounts_root_key",
+    "maxPayloadBytes": 2097152,
+    "tamperPolicy": "fail_closed"
+  },
+  "semanticGuard": {
+    "enabledByDefault": true,
+    "rollbackEnvironmentVariable": "CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED",
+    "downstreamCommitBoundary": "first_business_or_terminal_event",
+    "lifecycleCommitsDownstream": false,
+    "providerFailureFailoverBoundary": "before_downstream_commit",
+    "clientFailurePolicy": "forward_without_provider_penalty",
+    "incompletePolicy": "valid_partial_terminal"
+  },
+  "requiredCategories": [
+    "tool_schema",
+    "tool_media",
+    "reasoning",
+    "request_normalization",
+    "streaming_lifecycle",
+    "failure_origin",
+    "incomplete_terminal"
+  ],
+  "cases": [
+    {
+      "id": "tool-schema-root-object",
+      "category": "tool_schema",
+      "fixture": "tests/fixtures/proxy_bridge/tool_schema.json",
+      "owner": "src/proxy/tool_schema.rs",
+      "assertions": [
+        "missing and invalid function parameters become an object schema",
+        "existing schema keywords survive root normalization"
+      ]
+    },
+    {
+      "id": "tool-result-native-media",
+      "category": "tool_media",
+      "fixture": "tests/fixtures/proxy_bridge/tool_media.json",
+      "owner": "src/proxy/tool_media.rs",
+      "assertions": [
+        "tool-result media is removed from textual payloads",
+        "image, document, and audio are emitted in native target protocol shapes"
+      ]
+    },
+    {
+      "id": "reasoning-authenticated-roundtrip",
+      "category": "reasoning",
+      "fixture": "tests/fixtures/proxy_bridge/reasoning.json",
+      "owner": "src/proxy/reasoning_bridge.rs",
+      "assertions": [
+        "OpenAI opaque reasoning round-trips through Anthropic blocks",
+        "Anthropic signed thinking round-trips separately",
+        "tampered envelopes fail closed"
+      ]
+    },
+    {
+      "id": "anthropic-request-normalization",
+      "category": "request_normalization",
+      "fixture": "tests/fixtures/proxy_bridge/request_normalization.json",
+      "owner": "src/proxy/transforms.rs",
+      "assertions": [
+        "Anthropic requests receive required controls and system precedence",
+        "only complete adjacent tool turns survive history cleanup",
+        "malformed completed function arguments fail as client requests"
+      ]
+    },
+    {
+      "id": "streaming-lifecycle-ordering",
+      "category": "streaming_lifecycle",
+      "fixture": "tests/fixtures/proxy_bridge/streaming_lifecycle.json",
+      "owner": "src/proxy/stream_transforms.rs",
+      "assertions": [
+        "parallel tools receive dense downstream indexes",
+        "packed arguments are emitted once",
+        "terminal lifecycle is ordered and complete"
+      ]
+    },
+    {
+      "id": "semantic-failure-origin",
+      "category": "failure_origin",
+      "fixture": "tests/fixtures/proxy_bridge/failure_origin.json",
+      "owner": "src/proxy/response_semantics.rs",
+      "assertions": [
+        "client validation failures are not provider failures",
+        "provider failures remain eligible for pre-commit failover"
+      ]
+    },
+    {
+      "id": "incomplete-valid-terminal",
+      "category": "incomplete_terminal",
+      "fixture": "tests/fixtures/proxy_bridge/incomplete_terminal.json",
+      "owner": "src/proxy/response_semantics.rs",
+      "assertions": [
+        "incomplete documents are valid partial terminals",
+        "incomplete SSE satisfies terminal enforcement"
+      ]
+    }
+  ]
+}

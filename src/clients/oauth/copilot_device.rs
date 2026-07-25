@@ -6,13 +6,13 @@ use serde_json::{json, Value};
 
 use crate::domain::accounts::store::UpsertAccountInput;
 use crate::domain::providers::model::ProviderType;
+pub use crate::provider_identity::COPILOT_USER_AGENT;
 
 const GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const GITHUB_CLIENT_ID_GHES: &str = "Ov23li8tweQw6odWQebz";
 const DEFAULT_GITHUB_DOMAIN: &str = "github.com";
 pub const COPILOT_EDITOR_VERSION: &str = "vscode/1.110.1";
 pub const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.38.2";
-pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.38.2";
 pub const COPILOT_API_VERSION: &str = "2025-10-01";
 
 fn default_github_domain() -> String {

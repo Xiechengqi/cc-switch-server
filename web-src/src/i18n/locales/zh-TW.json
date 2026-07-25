@@ -1300,6 +1300,7 @@
     "cliUnavailableInRemoteWeb": "CLI OAuth 僅可透過本機 loopback 或已設定的 HTTPS Client URL 使用，請改用 Device Code",
     "waitingForManualCallback": "完成授權後，提交瀏覽器網址列中的回呼 URL",
     "callbackUrl": "回呼 URL",
+    "callbackUrlPlaceholder": "http://localhost:1455/auth/callback?code=...&state=...",
     "submitCallback": "提交",
     "imageGeneration": "生成圖片",
     "imageGenerationDescription": "透過 ChatGPT Codex 後端啟用 OpenAI 相容的 /v1/images/generations 介面。",
@@ -2954,7 +2955,8 @@
     },
     "usage": {
       "title": "請求設定",
-      "customUserAgent": "自訂 User-Agent"
+      "customUserAgent": "自訂 User-Agent",
+      "customUserAgentPlaceholder": "custom-client/1.0"
     },
     "legacy": {
       "title": "相容狀態",

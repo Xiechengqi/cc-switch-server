@@ -23,6 +23,7 @@ need_var() {
 }
 
 echo "== local release checks =="
+node scripts/audit/audit-proxy-bridge-contract.mjs --check || FAILURES=$((FAILURES + 1))
 if [[ "$RUN_TESTS" == "1" ]]; then
   cargo fmt --check || FAILURES=$((FAILURES + 1))
   cargo test || FAILURES=$((FAILURES + 1))
