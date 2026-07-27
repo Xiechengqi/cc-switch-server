@@ -184,6 +184,13 @@ pub async fn refresh_account_quota(
         }
     };
 
+    if crate::domain::accounts::store::account_refresh_replaces_auth_identity(account, &update) {
+        return Err(QuotaRefreshFailure::bad_request(format!(
+            "{} quota refresh returned a different subscription identity; re-login as a new account",
+            account.provider_type.as_str()
+        )));
+    }
+
     Ok(QuotaRefreshResult::Updated {
         update,
         message: "quota refreshed from upstream provider".to_string(),
@@ -394,7 +401,8 @@ async fn refresh_codex_quota(
         })
     });
 
-    let tiers = codex_tiers_from_rate_limit(usage.rate_limit);
+    let mut tiers = codex_tiers_from_rate_limit(usage.rate_limit);
+    tiers.extend(codex_review_tiers_from_usage(&body));
 
     let quota = AccountQuota {
         success: true,
@@ -2122,6 +2130,7 @@ fn update_from_quota(
 fn quota_percent_from_tiers(tiers: &[AccountQuotaTier]) -> Option<f64> {
     tiers
         .iter()
+        .filter(|tier| !tier.name.starts_with("review_"))
         .filter_map(|tier| tier.utilization)
         .filter(|value| value.is_finite())
         .map(|value| (value * 100.0).clamp(0.0, 10_000.0))
@@ -2147,12 +2156,100 @@ fn codex_tiers_from_rate_limit(rate_limit: Option<CodexRateLimit>) -> Vec<Accoun
                 used: None,
                 limit: None,
                 unit: Some("percent".to_string()),
-                resets_at: window.reset_at.map(|value| value.saturating_mul(1000)),
+                resets_at: window.reset_at.and_then(codex_reset_at_ms),
             });
         }
     }
     sort_codex_quota_tiers(&mut tiers);
     tiers
+}
+
+fn codex_review_tiers_from_usage(body: &Value) -> Vec<AccountQuotaTier> {
+    let Some(rate_limit) = explicit_codex_review_rate_limit(body) else {
+        return Vec::new();
+    };
+    normalize_codex_rate_windows(rate_limit.primary_window, rate_limit.secondary_window)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, window)| {
+            let utilization = codex_window_used_fraction(&window)?;
+            let name = match codex_window_role(window.limit_window_seconds) {
+                CodexWindowRole::Session => "review_session",
+                CodexWindowRole::Weekly => "review_weekly",
+                CodexWindowRole::Monthly => "review_monthly",
+                CodexWindowRole::Unknown if index == 0 => "review_session",
+                CodexWindowRole::Unknown => "review_weekly",
+            };
+            Some(AccountQuotaTier {
+                name: name.to_string(),
+                label: None,
+                utilization: Some(utilization),
+                used: None,
+                limit: None,
+                unit: Some("percent".to_string()),
+                resets_at: window.reset_at.and_then(codex_reset_at_ms),
+            })
+        })
+        .collect()
+}
+
+fn explicit_codex_review_rate_limit(body: &Value) -> Option<CodexRateLimit> {
+    let direct = ["code_review_rate_limit", "review_rate_limit"]
+        .into_iter()
+        .filter_map(|field| body.get(field));
+    let by_limit_id = body
+        .get("rate_limits_by_limit_id")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|limits| {
+            ["code_review", "codex_review", "review"]
+                .into_iter()
+                .filter_map(|id| limits.get(id))
+        });
+    let additional = body
+        .get("additional_rate_limits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            ["limit_name", "metered_feature", "id"]
+                .into_iter()
+                .filter_map(|field| entry.get(field).and_then(Value::as_str))
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .any(|id| matches!(id.as_str(), "code_review" | "codex_review" | "review"))
+        });
+
+    direct
+        .chain(by_limit_id)
+        .chain(additional)
+        .find_map(parse_codex_rate_limit_candidate)
+}
+
+fn parse_codex_rate_limit_candidate(candidate: &Value) -> Option<CodexRateLimit> {
+    let candidate = candidate
+        .get("rate_limit")
+        .filter(|value| value.is_object())
+        .unwrap_or(candidate);
+    let parsed = serde_json::from_value::<CodexRateLimit>(candidate.clone()).ok()?;
+    parsed
+        .primary_window
+        .as_ref()
+        .into_iter()
+        .chain(parsed.secondary_window.as_ref())
+        .any(|window| codex_window_used_fraction(window).is_some())
+        .then_some(parsed)
+}
+
+fn codex_reset_at_ms(value: i64) -> Option<i64> {
+    if value <= 0 {
+        return None;
+    }
+    Some(if value >= 1_000_000_000_000 {
+        value
+    } else {
+        value.saturating_mul(1000)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3614,15 +3711,21 @@ struct CodexRateLimit {
     allowed: Option<bool>,
     #[serde(default)]
     limit_reached: Option<bool>,
+    #[serde(default, alias = "primary")]
     primary_window: Option<CodexRateLimitWindow>,
+    #[serde(default, alias = "secondary")]
     secondary_window: Option<CodexRateLimitWindow>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CodexRateLimitWindow {
+    #[serde(default, alias = "percent_used")]
     used_percent: Option<f64>,
+    #[serde(default)]
     limit_window_seconds: Option<i64>,
+    #[serde(default)]
     reset_after_seconds: Option<i64>,
+    #[serde(default, alias = "resets_at", alias = "resetAt")]
     reset_at: Option<i64>,
 }
 
@@ -4313,6 +4416,178 @@ mod tests {
         assert_eq!(tiers[0].utilization, Some(0.04));
         assert_eq!(tiers[1].name, "seven_day");
         assert_eq!(tiers[1].utilization, Some(0.36));
+    }
+
+    #[test]
+    fn codex_review_quota_uses_only_explicit_review_fields() {
+        let direct = json!({
+            "code_review_rate_limit": {
+                "primary_window": {
+                    "used_percent": 25.0,
+                    "limit_window_seconds": 18_000,
+                    "reset_at": 1
+                },
+                "secondary_window": {
+                    "used_percent": 75.0,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": 2
+                }
+            }
+        });
+        let tiers = codex_review_tiers_from_usage(&direct);
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].name, "review_session");
+        assert_eq!(tiers[0].utilization, Some(0.25));
+        assert_eq!(tiers[1].name, "review_weekly");
+        assert_eq!(tiers[1].utilization, Some(0.75));
+
+        let by_id = json!({
+            "rate_limits_by_limit_id": {
+                "codex_review": {
+                    "rate_limit": {
+                        "primary_window": {"used_percent": 40.0}
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            codex_review_tiers_from_usage(&by_id)[0].utilization,
+            Some(0.4)
+        );
+    }
+
+    #[test]
+    fn codex_review_quota_rejects_fuzzy_additional_limit_ids() {
+        let fuzzy = json!({
+            "additional_rate_limits": [{
+                "id": "pull_request_review_preview",
+                "primary_window": {"used_percent": 90.0}
+            }]
+        });
+        assert!(codex_review_tiers_from_usage(&fuzzy).is_empty());
+
+        let exact = json!({
+            "additional_rate_limits": [{
+                "metered_feature": "review",
+                "primary_window": {"used_percent": 10.0}
+            }]
+        });
+        assert_eq!(
+            codex_review_tiers_from_usage(&exact)[0].name,
+            "review_session"
+        );
+
+        let exact_in_later_field = json!({
+            "additional_rate_limits": [{
+                "limit_name": "unrelated",
+                "id": "code_review",
+                "primary_window": {"used_percent": 15.0}
+            }]
+        });
+        assert_eq!(
+            codex_review_tiers_from_usage(&exact_in_later_field)[0].utilization,
+            Some(0.15)
+        );
+
+        let malformed_direct_with_valid_fallback = json!({
+            "code_review_rate_limit": "malformed",
+            "rate_limits_by_limit_id": {
+                "review": {
+                    "primary_window": {"used_percent": 20.0}
+                }
+            }
+        });
+        assert_eq!(
+            codex_review_tiers_from_usage(&malformed_direct_with_valid_fallback)[0].utilization,
+            Some(0.2)
+        );
+
+        let empty_direct_with_valid_fallback = json!({
+            "code_review_rate_limit": {"primary_window": {}},
+            "rate_limits_by_limit_id": {
+                "review": {
+                    "primary_window": {"used_percent": 22.0}
+                }
+            }
+        });
+        assert_eq!(
+            codex_review_tiers_from_usage(&empty_direct_with_valid_fallback)[0].utilization,
+            Some(0.22)
+        );
+
+        let malformed_first_id_with_valid_later_id = json!({
+            "rate_limits_by_limit_id": {
+                "code_review": "malformed",
+                "codex_review": {
+                    "primary": {
+                        "percent_used": 30.0,
+                        "resets_at": 3
+                    }
+                }
+            }
+        });
+        let tiers = codex_review_tiers_from_usage(&malformed_first_id_with_valid_later_id);
+        assert_eq!(tiers[0].utilization, Some(0.3));
+        assert_eq!(tiers[0].resets_at, Some(3_000));
+
+        let malformed_first_additional_with_valid_later_entry = json!({
+            "additional_rate_limits": [
+                {"id": "review", "rate_limit": "malformed"},
+                {
+                    "id": "code_review",
+                    "rate_limit": {
+                        "secondary": {
+                            "percent_used": 35.0,
+                            "limit_window_seconds": 604_800,
+                            "resetAt": 4
+                        }
+                    }
+                }
+            ]
+        });
+        let tiers =
+            codex_review_tiers_from_usage(&malformed_first_additional_with_valid_later_entry);
+        assert_eq!(tiers[0].name, "review_weekly");
+        assert_eq!(tiers[0].utilization, Some(0.35));
+        assert_eq!(tiers[0].resets_at, Some(4_000));
+
+        let millisecond_reset = json!({
+            "review_rate_limit": {
+                "primary_window": {
+                    "used_percent": 45.0,
+                    "resetAt": 1_800_000_000_000_i64
+                }
+            }
+        });
+        assert_eq!(
+            codex_review_tiers_from_usage(&millisecond_reset)[0].resets_at,
+            Some(1_800_000_000_000)
+        );
+    }
+
+    #[test]
+    fn account_quota_percent_ignores_review_tiers() {
+        let tiers = vec![
+            AccountQuotaTier {
+                name: "five_hour".to_string(),
+                label: None,
+                utilization: Some(0.2),
+                used: None,
+                limit: None,
+                unit: Some("percent".to_string()),
+                resets_at: None,
+            },
+            AccountQuotaTier {
+                name: "review_weekly".to_string(),
+                label: None,
+                utilization: Some(0.9),
+                used: None,
+                limit: None,
+                unit: Some("percent".to_string()),
+                resets_at: None,
+            },
+        ];
+        assert_eq!(quota_percent_from_tiers(&tiers), Some(20.0));
     }
 
     #[test]

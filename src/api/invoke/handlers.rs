@@ -961,10 +961,13 @@ pub(in crate::api) async fn web_save_provider_share(
         .cloned()
         .ok_or_else(|| ApiError::not_found("share not found"))?;
     if current.config_revision != expected_config_revision {
-        return Err(ApiError::conflict(format!(
-            "Share changed since this editor was opened (expected revision {}, current revision {})",
-            expected_config_revision, current.config_revision
-        )));
+        return Err(ApiError::conflict_code(
+            "cc_switch_share_revision_conflict",
+            format!(
+                "Share changed since this editor was opened (expected revision {}, current revision {})",
+                expected_config_revision, current.config_revision
+            ),
+        ));
     }
     let subdomain_changed = current.tunnel_subdomain.as_deref() != Some(subdomain.as_str());
     let was_running = current.enabled && current.status == "active";
@@ -1001,6 +1004,7 @@ pub(in crate::api) async fn web_save_provider_share(
         .replace_configured_share(candidate.clone())
         .map_err(map_share_patch_error)?;
 
+    let mut remote_subdomain_claimed = false;
     if subdomain_changed {
         let config = state.config.read().await.clone();
         if config.has_registered_router_identity() {
@@ -1014,21 +1018,78 @@ pub(in crate::api) async fn web_save_provider_share(
                 Some(&usage),
             );
             let http_client = state.http_client().await;
-            crate::clients::router::client::claim_share_subdomain(
+            if let Err(error) = crate::clients::router::client::claim_share_subdomain(
                 &http_client,
                 &config,
                 descriptor,
             )
             .await
-            .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+            {
+                if let Err(reconcile_error) =
+                    crate::state::reconcile_router_share_after_failed_claim(state, &share_id).await
+                {
+                    tracing::warn!(
+                        share_id,
+                        error = %reconcile_error,
+                        "Router Share reconciliation after an uncertain subdomain claim failed"
+                    );
+                }
+                return Err(ApiError::bad_gateway(error.to_string()));
+            }
+            remote_subdomain_claimed = true;
         }
     }
 
-    let saved = state
-        .try_mutate_shares_immediate(|store| store.replace_configured_share(candidate))
+    let saved = match state
+        .try_mutate_shares_immediate(|store| {
+            let current = store
+                .get(&share_id)
+                .ok_or_else(|| ApiError::not_found("share not found"))?;
+            if current.config_revision != expected_config_revision {
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_revision_conflict",
+                    format!(
+                        "Share changed since this editor was opened (expected revision {}, current revision {})",
+                        expected_config_revision, current.config_revision
+                    ),
+                ));
+            }
+            store
+                .replace_configured_share(candidate)
+                .map_err(map_share_patch_error)
+        })
         .await
-        .map_err(ApiError::internal)?
-        .map_err(map_share_patch_error)?;
+    {
+        Ok(Ok(saved)) => saved,
+        Ok(Err(error)) => {
+            if remote_subdomain_claimed {
+                if let Err(reconcile_error) =
+                    crate::state::reconcile_router_share_after_failed_claim(state, &share_id).await
+                {
+                    tracing::warn!(
+                        share_id,
+                        error = %reconcile_error,
+                        "Router Share reconciliation after a rejected local save failed"
+                    );
+                }
+            }
+            return Err(error);
+        }
+        Err(error) => {
+            if remote_subdomain_claimed {
+                if let Err(reconcile_error) =
+                    crate::state::reconcile_router_share_after_failed_claim(state, &share_id).await
+                {
+                    tracing::warn!(
+                        share_id,
+                        error = %reconcile_error,
+                        "Router Share reconciliation after a failed local save failed"
+                    );
+                }
+            }
+            return Err(ApiError::internal(error));
+        }
+    };
     if subdomain_changed && was_running {
         crate::state::force_reconnect_share_tunnel(
             state.clone(),
@@ -2700,7 +2761,7 @@ pub(in crate::api) async fn web_managed_auth_set_default_account(
             Ok(default_changed)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     if default_changed {
         state
             .refresh_account_subscription_metadata(provider_type, None)
@@ -2828,33 +2889,45 @@ pub(in crate::api) async fn web_managed_auth_set_workspace(
     }
     let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
     let workspace_id = web_arg_string_any(args, &["workspaceId", "workspace_id"])?;
-    // Serialize workspace changes with token/quota refreshes for the same
-    // account. Otherwise an in-flight workspace A response could be persisted
-    // after workspace B has cleared the old cache.
-    let _refresh_guard = state
-        .account_refresh_locks
-        .lock(ProviderType::CodexOAuth, &account_id)
-        .await;
-    let (account_before_workspace_change, account) = state
-        .try_mutate_accounts_immediate(|store| {
-            let before = store
-                .accounts
-                .iter()
-                .find(|account| {
-                    account.id == account_id && account.provider_type == ProviderType::CodexOAuth
-                })
-                .cloned()
-                .ok_or_else(|| "codex account not found".to_string())?;
-            let account = store.select_codex_workspace(&account_id, &workspace_id)?;
-            Ok::<_, String>((before, account))
-        })
+    if let Some(share_id) = web_optional_string_any(args, &["shareId", "share_id"]) {
+        let expected_config_revision = web_optional_i64(
+            args,
+            &["expectedConfigRevision", "expected_config_revision"],
+        )
+        .and_then(|revision| u64::try_from(revision).ok())
+        .ok_or_else(|| ApiError::bad_request("expectedConfigRevision is required"))?;
+        let result = state
+            .rebind_codex_workspace_for_share_command(
+                &share_id,
+                &account_id,
+                &workspace_id,
+                expected_config_revision,
+            )
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(map_codex_workspace_rebind_error)?;
+        crate::state::stop_share_tunnel(&state, &share_id).await;
+        if result.identity_changed {
+            spawn_share_upsert_sync(state.clone(), result.share.clone());
+            emit_share_event(
+                &state,
+                "share.changed",
+                &result.share,
+                "codex_workspace_rebound",
+            );
+        }
+        return Ok(map_managed_auth_account(
+            &result.account,
+            managed_auth_provider_label(ProviderType::CodexOAuth),
+            None,
+        ));
+    }
+
+    let account = state
+        .select_codex_workspace_command(&account_id, &workspace_id)
         .await
         .map_err(ApiError::internal)?
-        .map_err(ApiError::bad_request)?;
-    state
-        .refresh_account_runtime_metadata_if_changed(&account_before_workspace_change, &account)
-        .await
-        .map_err(ApiError::internal)?;
+        .map_err(map_codex_workspace_rebind_error)?;
     Ok(map_managed_auth_account(
         &account,
         managed_auth_provider_label(ProviderType::CodexOAuth),

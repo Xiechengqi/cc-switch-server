@@ -49,7 +49,7 @@ pub(in crate::api) async fn import_shares(
         .clone()
         .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?;
     let reference_guard = state.lock_reference_mutations().await;
-    {
+    let (providers, accounts) = {
         let providers = state.providers.read().await;
         for share in &input.shares {
             validate_share_provider_reference(
@@ -59,7 +59,8 @@ pub(in crate::api) async fn import_shares(
                 share.provider_type,
             )?;
         }
-    }
+        (providers.clone(), state.accounts.read().await.clone())
+    };
     let mut imported_store = ShareStore {
         shares: std::mem::take(&mut input.shares),
         ..ShareStore::default()
@@ -70,9 +71,25 @@ pub(in crate::api) async fn import_shares(
         .len();
     input.shares = imported_store.shares;
     let imported = state
-        .mutate_shares_immediate(|store| store.import_shares(input.shares))
+        .try_mutate_shares_immediate(|store| {
+            let mut candidate = store.clone();
+            let imported = candidate
+                .import_shares(input.shares)
+                .map_err(map_share_patch_error)?;
+            crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
+                &providers,
+                &accounts,
+                store,
+                &providers,
+                &accounts,
+                &candidate,
+            )
+            .map_err(map_subscription_binding_error)?;
+            *store = candidate;
+            Ok::<_, ApiError>(imported)
+        })
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)??;
     drop(reference_guard);
     state.emit_event(
         ServerEvent::new("share.imported", "share").message(format!("imported {imported} shares")),
@@ -105,7 +122,7 @@ pub(in crate::api) async fn upsert_share(
             .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?,
     );
     let reference_guard = state.lock_reference_mutations().await;
-    {
+    let (providers, accounts) = {
         let providers = state.providers.read().await;
         validate_share_provider_reference(
             &providers,
@@ -113,7 +130,8 @@ pub(in crate::api) async fn upsert_share(
             &input.provider_id,
             input.provider_type,
         )?;
-    }
+        (providers.clone(), state.accounts.read().await.clone())
+    };
     let previous = {
         let shares = state.shares.read().await;
         input
@@ -130,23 +148,67 @@ pub(in crate::api) async fn upsert_share(
     };
     match (previous.as_ref(), expected_config_revision) {
         (Some(previous), Some(expected)) if previous.config_revision != expected => {
-            return Err(ApiError::conflict(format!(
-                "Share changed since this editor was opened (expected revision {expected}, current revision {})",
-                previous.config_revision
-            )));
+            return Err(ApiError::conflict_code(
+                "cc_switch_share_revision_conflict",
+                format!(
+                    "Share changed since this editor was opened (expected revision {expected}, current revision {})",
+                    previous.config_revision
+                ),
+            ));
         }
         (None, Some(_)) => {
-            return Err(ApiError::conflict(
+            return Err(ApiError::conflict_code(
+                "cc_switch_share_revision_conflict",
                 "cannot apply expectedConfigRevision to a new Share",
             ));
         }
         _ => {}
     }
     let share = state
-        .mutate_shares_immediate(|store| store.upsert(input))
+        .try_mutate_shares_immediate(|store| {
+            let current = input
+                .id
+                .as_deref()
+                .and_then(|id| store.get(id))
+                .or_else(|| {
+                    store.shares.iter().find(|share| {
+                        share.app == input.app && share.provider_id == input.provider_id
+                    })
+                });
+            match (current, expected_config_revision) {
+                (Some(current), Some(expected)) if current.config_revision != expected => {
+                    return Err(ApiError::conflict_code(
+                        "cc_switch_share_revision_conflict",
+                        format!(
+                            "Share changed since this editor was opened (expected revision {expected}, current revision {})",
+                            current.config_revision
+                        ),
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(ApiError::conflict_code(
+                        "cc_switch_share_revision_conflict",
+                        "cannot apply expectedConfigRevision to a new Share",
+                    ));
+                }
+                _ => {}
+            }
+            let mut candidate = store.clone();
+            let share = candidate.upsert(input).map_err(map_share_patch_error)?;
+            crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
+                &providers,
+                &accounts,
+                store,
+                &providers,
+                &accounts,
+                &candidate,
+            )
+            .map_err(map_subscription_binding_error)?;
+            *store = candidate;
+            Ok::<_, ApiError>(share)
+        })
         .await
-        .map_err(ApiError::internal)?
-        .map_err(map_share_patch_error)?;
+        .map_err(ApiError::internal)??;
     drop(reference_guard);
     spawn_share_upsert_sync(state.clone(), share.clone());
     let was_running = previous
@@ -195,6 +257,117 @@ fn validate_share_provider_reference(
     Ok(())
 }
 
+pub(in crate::api) async fn update_share_binding(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateShareBindingRequest>,
+) -> Result<Json<UpsertShareResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let reference_guard = state.lock_reference_mutations().await;
+    let (providers, accounts, usage, app) = {
+        let providers = state.providers.read().await;
+        let accounts = state.accounts.read().await;
+        let usage = state.usage.read().await;
+        let shares = state.shares.read().await;
+        let share = shares
+            .get(&id)
+            .ok_or_else(|| ApiError::not_found("share not found"))?;
+        validate_share_provider_reference(
+            &providers,
+            share.app,
+            &input.provider_id,
+            input.provider_type,
+        )?;
+        (
+            providers.clone(),
+            accounts.clone(),
+            usage.clone(),
+            share.app,
+        )
+    };
+
+    let share = state
+        .try_mutate_shares_immediate(|store| {
+            let current = store
+                .get(&id)
+                .ok_or_else(|| ApiError::not_found("share not found"))?;
+            if current.config_revision != input.expected_config_revision {
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_revision_conflict",
+                    format!(
+                        "Share changed since this binding operation was opened (expected revision {}, current revision {})",
+                        input.expected_config_revision, current.config_revision
+                    ),
+                ));
+            }
+
+            let mut candidate = store.clone();
+            candidate
+                .update_binding(
+                    &id,
+                    ShareBinding {
+                        app,
+                        provider_id: input.provider_id.clone(),
+                        provider_type: input.provider_type,
+                    },
+                )
+                .map_err(|error| match error {
+                    crate::domain::sharing::shares::ShareUpdateError::NotFound => {
+                        ApiError::not_found("share not found")
+                    }
+                    crate::domain::sharing::shares::ShareUpdateError::MustBePaused => {
+                        ApiError::conflict_code(
+                            "cc_switch_share_must_be_paused",
+                            "share must be paused before updating binding",
+                        )
+                    }
+                    crate::domain::sharing::shares::ShareUpdateError::InvalidApp => {
+                        ApiError::bad_request("share binding app must match share.app")
+                    }
+                    crate::domain::sharing::shares::ShareUpdateError::ProviderAlreadyShared => {
+                        ApiError::conflict_code(
+                            "cc_switch_provider_already_shared",
+                            "provider already has an active share",
+                        )
+                    }
+                })?;
+            let provider_keys = std::collections::BTreeSet::from([(
+                app,
+                input.provider_id.clone(),
+            )]);
+            candidate.refresh_runtime_snapshots_for_providers(
+                &provider_keys,
+                &providers,
+                Some(&accounts),
+                &usage,
+            );
+            crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
+                &providers,
+                &accounts,
+                store,
+                &providers,
+                &accounts,
+                &candidate,
+            )
+            .map_err(map_subscription_binding_error)?;
+            let share = candidate
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("share not found"))?;
+            *store = candidate;
+            Ok::<_, ApiError>(share)
+        })
+        .await
+        .map_err(ApiError::internal)??;
+    drop(reference_guard);
+
+    crate::state::stop_share_tunnel(&state, &share.id).await;
+    spawn_share_upsert_sync(state.clone(), share.clone());
+    emit_share_event(&state, "share.changed", &share, "binding_updated");
+    Ok(Json(UpsertShareResponse { ok: true, share }))
+}
+
 pub(in crate::api) async fn share_connect_info(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -232,6 +405,20 @@ pub(in crate::api) async fn update_share_subdomain(
         .get(&id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("share not found"))?;
+    if input
+        .expected_config_revision
+        .is_some_and(|expected| expected != current.config_revision)
+    {
+        return Err(ApiError::conflict_code(
+            "cc_switch_share_revision_conflict",
+            format!(
+                "Share changed since this editor was opened (expected revision {}, current revision {})",
+                input.expected_config_revision.unwrap_or_default(),
+                current.config_revision
+            ),
+        ));
+    }
+    let expected_config_revision = current.config_revision;
     let mut candidate = current.clone();
     candidate.tunnel_subdomain = Some(subdomain.clone());
     let descriptor = descriptor_for_share_with_accounts_and_usage(
@@ -243,19 +430,73 @@ pub(in crate::api) async fn update_share_subdomain(
     let mut remote_claimed = false;
     if config.has_registered_router_identity() {
         let http_client = state.http_client().await;
-        crate::clients::router::client::claim_share_subdomain(&http_client, &config, descriptor)
-            .await
-            .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+        if let Err(error) =
+            crate::clients::router::client::claim_share_subdomain(&http_client, &config, descriptor)
+                .await
+        {
+            if let Err(reconcile_error) =
+                crate::state::reconcile_router_share_after_failed_claim(&state, &id).await
+            {
+                tracing::warn!(
+                    share_id = %id,
+                    error = %reconcile_error,
+                    "Router Share reconciliation after an uncertain subdomain claim failed"
+                );
+            }
+            return Err(ApiError::bad_gateway(error.to_string()));
+        }
         remote_claimed = true;
     }
-    let share = state
-        .mutate_shares_immediate(|store| {
+    let share = match state
+        .try_mutate_shares_immediate(|store| {
+            let current = store
+                .get(&id)
+                .ok_or_else(|| ApiError::not_found("share not found"))?;
+            if current.config_revision != expected_config_revision {
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_revision_conflict",
+                    format!(
+                        "Share changed during the subdomain claim (expected revision {}, current revision {})",
+                        expected_config_revision, current.config_revision
+                    ),
+                ));
+            }
             store
                 .update_subdomain(&id, subdomain)
                 .map_err(map_share_patch_error)
         })
         .await
-        .map_err(ApiError::internal)??;
+    {
+        Ok(Ok(share)) => share,
+        Ok(Err(error)) => {
+            if remote_claimed {
+                if let Err(reconcile_error) =
+                    crate::state::reconcile_router_share_after_failed_claim(&state, &id).await
+                {
+                    tracing::warn!(
+                        share_id = %id,
+                        error = %reconcile_error,
+                        "Router Share reconciliation after a rejected local subdomain update failed"
+                    );
+                }
+            }
+            return Err(error);
+        }
+        Err(error) => {
+            if remote_claimed {
+                if let Err(reconcile_error) =
+                    crate::state::reconcile_router_share_after_failed_claim(&state, &id).await
+                {
+                    tracing::warn!(
+                        share_id = %id,
+                        error = %reconcile_error,
+                        "Router Share reconciliation after a failed local subdomain save failed"
+                    );
+                }
+            }
+            return Err(ApiError::internal(error));
+        }
+    };
     spawn_share_upsert_sync(state.clone(), share.clone());
     crate::state::force_reconnect_share_tunnel(
         state.clone(),

@@ -1687,11 +1687,24 @@ async fn web_invoke_dispatch(
             let payload = web_payload(&args, &["params", "input"]);
             let share_id = web_arg_share_id(payload)?;
             let subdomain = web_arg_string_any(payload, &["subdomain"])?;
+            let expected_config_revision = web_optional_i64(
+                payload,
+                &["expectedConfigRevision", "expected_config_revision"],
+            )
+            .map(|revision| {
+                u64::try_from(revision).map_err(|_| {
+                    ApiError::bad_request("expectedConfigRevision must be non-negative")
+                })
+            })
+            .transpose()?;
             let response = update_share_subdomain(
                 State(state.clone()),
                 headers.clone(),
                 Path(share_id),
-                Json(UpdateShareSubdomainRequest { subdomain }),
+                Json(UpdateShareSubdomainRequest {
+                    subdomain,
+                    expected_config_revision,
+                }),
             )
             .await?
             .0;

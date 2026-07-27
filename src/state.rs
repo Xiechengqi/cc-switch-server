@@ -83,6 +83,9 @@ const ROUTER_SHARE_SYNC_BATCH_SIZE: usize = 100;
 const SETUP_COMPLETION_RETRY_BASE_MS: i64 = 30_000;
 const SETUP_COMPLETION_RETRY_MAX_MS: i64 = 30 * 60_000;
 const MAX_PROVIDER_IMPORT_ITEMS: usize = 256;
+const CODEX_WORKSPACE_REBIND_TRANSACTION_SCHEMA: u32 = 1;
+const CODEX_WORKSPACE_REBIND_TRANSACTION_FILE: &str = ".codex-workspace-rebind-transaction.json";
+const CODEX_WORKSPACE_REBIND_STAGE_DIRECTORY: &str = ".codex-workspace-rebind-stage";
 
 #[cfg(test)]
 pub(crate) async fn install_openai_test_jwk(jwk: jsonwebtoken::jwk::Jwk) {
@@ -98,6 +101,29 @@ struct PreparedProviderIdentityChange {
     candidate: ProviderStore,
     preview: ProviderIdentityChangePreview,
     stored: StoredProvider,
+}
+
+pub(crate) struct CodexWorkspaceRebindResult {
+    pub(crate) account: Account,
+    pub(crate) share: Share,
+    pub(crate) identity_changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexWorkspaceRebindTransactionManifest {
+    schema_version: u32,
+    providers: CodexWorkspaceRebindTransactionFile,
+    accounts: CodexWorkspaceRebindTransactionFile,
+    shares: CodexWorkspaceRebindTransactionFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexWorkspaceRebindTransactionFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_sha256: Option<String>,
+    staged_sha256: String,
 }
 
 struct AdoptProviderProfileInput {
@@ -194,7 +220,8 @@ pub struct ServerStateInner {
     pub(crate) config: RwLock<ServerConfig>,
     pub(crate) providers: RwLock<ProviderStore>,
     provider_commits: AsyncMutex<()>,
-    reference_mutations: AsyncMutex<()>,
+    codex_workspace_rebind_transactions: AsyncMutex<()>,
+    reference_mutations: Arc<AsyncMutex<()>>,
     provider_import_preview_key: [u8; 32],
     #[cfg(test)]
     provider_commit_delay_ms: std::sync::atomic::AtomicU64,
@@ -374,42 +401,287 @@ fn remove_obsolete_model_pricing_file(config_dir: &Path) -> anyhow::Result<()> {
     }
 }
 
+fn codex_workspace_rebind_transaction_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(CODEX_WORKSPACE_REBIND_TRANSACTION_FILE)
+}
+
+fn codex_workspace_rebind_stage_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(CODEX_WORKSPACE_REBIND_STAGE_DIRECTORY)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    hex::encode(digest.finalize())
+}
+
+fn optional_file_sha256(path: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(sha256_bytes(&bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {} for digest", path.display())),
+    }
+}
+
+fn workspace_rebind_transaction_file(
+    live_path: &Path,
+    staged_path: &Path,
+) -> anyhow::Result<CodexWorkspaceRebindTransactionFile> {
+    Ok(CodexWorkspaceRebindTransactionFile {
+        base_sha256: optional_file_sha256(live_path)?,
+        staged_sha256: optional_file_sha256(staged_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "staged workspace rebind file is missing: {}",
+                staged_path.display()
+            )
+        })?,
+    })
+}
+
+fn remove_codex_workspace_rebind_stage(stage_dir: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_dir_all(stage_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("remove workspace rebind stage {}", stage_dir.display())),
+    }
+}
+
+fn prepare_codex_workspace_rebind_transaction(
+    config_dir: &Path,
+    current_accounts: &AccountStore,
+    current_providers: &ProviderStore,
+    current_shares: &ShareStore,
+    accounts: &AccountStore,
+    providers: &ProviderStore,
+    shares: &ShareStore,
+) -> anyhow::Result<()> {
+    let marker_path = codex_workspace_rebind_transaction_path(config_dir);
+    let stage_dir = codex_workspace_rebind_stage_path(config_dir);
+    if marker_path.exists() {
+        anyhow::bail!(
+            "a Codex workspace rebind transaction is pending recovery: {}",
+            marker_path.display()
+        );
+    }
+    remove_codex_workspace_rebind_stage(&stage_dir)?;
+    std::fs::create_dir_all(&stage_dir)
+        .with_context(|| format!("create workspace rebind stage {}", stage_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stage_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", stage_dir.display()))?;
+    }
+
+    let result = (|| -> anyhow::Result<()> {
+        let live_key = crate::domain::accounts::store::accounts_key_path(config_dir);
+        let staged_key = crate::domain::accounts::store::accounts_key_path(&stage_dir);
+        std::fs::copy(&live_key, &staged_key).with_context(|| {
+            format!(
+                "copy workspace rebind encryption key {} to {}",
+                live_key.display(),
+                staged_key.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged_key, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 0600 {}", staged_key.display()))?;
+        }
+
+        providers.save(&stage_dir)?;
+        accounts.save(&stage_dir)?;
+        shares.save(&stage_dir)?;
+
+        let staged_accounts = AccountStore::load_or_default(&stage_dir)
+            .context("validate staged workspace rebind accounts")?;
+        let mut staged_providers = ProviderStore::load_runtime_or_default(&stage_dir)
+            .context("validate staged workspace rebind Providers")?;
+        staged_providers
+            .rebuild_runtime_index(&staged_accounts)
+            .context("compile staged workspace rebind Provider runtime index")?;
+        let staged_shares = ShareStore::load_or_default(&stage_dir)
+            .context("validate staged workspace rebind Shares")?;
+        crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
+            current_providers,
+            current_accounts,
+            current_shares,
+            &staged_providers,
+            &staged_accounts,
+            &staged_shares,
+        )
+        .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))
+        .context("validate staged workspace rebind subscription graph")?;
+
+        let manifest = CodexWorkspaceRebindTransactionManifest {
+            schema_version: CODEX_WORKSPACE_REBIND_TRANSACTION_SCHEMA,
+            providers: workspace_rebind_transaction_file(
+                &crate::domain::providers::store::providers_path(config_dir),
+                &crate::domain::providers::store::providers_path(&stage_dir),
+            )?,
+            accounts: workspace_rebind_transaction_file(
+                &crate::domain::accounts::store::accounts_path(config_dir),
+                &crate::domain::accounts::store::accounts_path(&stage_dir),
+            )?,
+            shares: workspace_rebind_transaction_file(
+                &crate::domain::sharing::shares::shares_path(config_dir),
+                &crate::domain::sharing::shares::shares_path(&stage_dir),
+            )?,
+        };
+        if let Err(error) = crate::infra::storage::write_json_pretty(&marker_path, &manifest) {
+            let disk_matches = std::fs::read_to_string(&marker_path)
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+                .as_ref()
+                == Some(&manifest);
+            if !disk_matches {
+                let _ = std::fs::remove_file(&marker_path);
+                let _ = crate::infra::storage::sync_directory(config_dir);
+                return Err(error).context("persist workspace rebind transaction marker");
+            }
+            tracing::warn!(
+                %error,
+                "workspace rebind transaction marker reached its commit point despite a persistence error"
+            );
+        }
+        Ok(())
+    })();
+
+    if result.is_err() && !marker_path.exists() {
+        let _ = remove_codex_workspace_rebind_stage(&stage_dir);
+    }
+    result
+}
+
+fn apply_codex_workspace_rebind_transaction(config_dir: &Path) -> anyhow::Result<bool> {
+    let marker_path = codex_workspace_rebind_transaction_path(config_dir);
+    let stage_dir = codex_workspace_rebind_stage_path(config_dir);
+    if !marker_path.exists() {
+        if stage_dir.exists() {
+            remove_codex_workspace_rebind_stage(&stage_dir)?;
+            crate::infra::storage::sync_directory(config_dir)?;
+        }
+        return Ok(false);
+    }
+
+    let manifest: CodexWorkspaceRebindTransactionManifest = serde_json::from_str(
+        &std::fs::read_to_string(&marker_path)
+            .with_context(|| format!("read {}", marker_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", marker_path.display()))?;
+    if manifest.schema_version != CODEX_WORKSPACE_REBIND_TRANSACTION_SCHEMA {
+        anyhow::bail!(
+            "unsupported Codex workspace rebind transaction schema {}",
+            manifest.schema_version
+        );
+    }
+
+    let entries = [
+        (
+            "providers.json",
+            &manifest.providers,
+            crate::domain::providers::store::providers_path(config_dir),
+        ),
+        (
+            "accounts.json",
+            &manifest.accounts,
+            crate::domain::accounts::store::accounts_path(config_dir),
+        ),
+        (
+            "shares.json",
+            &manifest.shares,
+            crate::domain::sharing::shares::shares_path(config_dir),
+        ),
+    ];
+    let mut writes = Vec::with_capacity(entries.len());
+    for (file_name, expected, target_path) in entries {
+        let staged_path = stage_dir.join(file_name);
+        let content = std::fs::read(&staged_path)
+            .with_context(|| format!("read staged transaction file {}", staged_path.display()))?;
+        let staged_sha256 = sha256_bytes(&content);
+        if staged_sha256 != expected.staged_sha256 {
+            anyhow::bail!("staged workspace rebind file digest mismatch: {file_name}");
+        }
+        let current_sha256 = optional_file_sha256(&target_path)?;
+        if current_sha256.as_deref() == Some(expected.staged_sha256.as_str()) {
+            continue;
+        }
+        if current_sha256 != expected.base_sha256 {
+            anyhow::bail!(
+                "workspace rebind recovery found an unexpected live version of {file_name}"
+            );
+        }
+        writes.push((target_path, content));
+    }
+
+    for (target_path, content) in writes {
+        crate::infra::storage::write_bytes_atomic(&target_path, &content)
+            .with_context(|| format!("apply workspace rebind file {}", target_path.display()))?;
+    }
+
+    std::fs::remove_file(&marker_path)
+        .with_context(|| format!("remove transaction marker {}", marker_path.display()))?;
+    crate::infra::storage::sync_directory(config_dir)?;
+    if let Err(error) = remove_codex_workspace_rebind_stage(&stage_dir) {
+        tracing::warn!(%error, "committed workspace rebind stage cleanup remains pending");
+    } else if let Err(error) = crate::infra::storage::sync_directory(config_dir) {
+        tracing::warn!(%error, "workspace rebind stage cleanup directory sync failed");
+    }
+    Ok(true)
+}
+
 fn validate_server_backup_restore_stage(
     config_dir: &Path,
     stage_dir: &Path,
     manifest: &crate::infra::backup::BackupManifest,
 ) -> anyhow::Result<()> {
     let includes = |name: &str| manifest.files.iter().any(|file| file.file_name == name);
-    if includes("providers.json") && !includes("accounts.json") {
-        let current_accounts = crate::domain::accounts::store::accounts_path(config_dir);
-        if current_accounts.exists() {
-            std::fs::copy(&current_accounts, stage_dir.join("accounts.json")).with_context(
-                || {
+    let validates_subscription_references = [
+        "accounts.json",
+        "accounts.key",
+        "providers.json",
+        "shares.json",
+    ]
+    .into_iter()
+    .any(includes);
+    if validates_subscription_references {
+        for (file_name, current_path) in [
+            (
+                "accounts.json",
+                crate::domain::accounts::store::accounts_path(config_dir),
+            ),
+            (
+                "accounts.key",
+                crate::domain::accounts::store::accounts_key_path(config_dir),
+            ),
+            (
+                "providers.json",
+                crate::domain::providers::store::providers_path(config_dir),
+            ),
+            (
+                "shares.json",
+                crate::domain::sharing::shares::shares_path(config_dir),
+            ),
+        ] {
+            if !includes(file_name) && current_path.exists() {
+                std::fs::copy(&current_path, stage_dir.join(file_name)).with_context(|| {
                     format!(
-                        "stage current accounts dependency {}",
-                        current_accounts.display()
+                        "stage current {file_name} dependency {}",
+                        current_path.display()
                     )
-                },
-            )?;
-        }
-    }
-    if (includes("accounts.json") || includes("providers.json")) && !includes("accounts.key") {
-        let current_key = crate::domain::accounts::store::accounts_key_path(config_dir);
-        if current_key.exists() {
-            std::fs::copy(&current_key, stage_dir.join("accounts.key"))
-                .with_context(|| format!("stage current account key {}", current_key.display()))?;
+                })?;
+            }
         }
     }
 
-    let staged_accounts =
-        if includes("accounts.json") || includes("accounts.key") || includes("providers.json") {
-            Some(
-                AccountStore::load_or_default(stage_dir)
-                    .context("validate staged accounts and encryption key")?,
-            )
-        } else {
-            None
-        };
+    let staged_accounts = validates_subscription_references
+        .then(|| {
+            AccountStore::load_or_default(stage_dir)
+                .context("validate staged accounts and encryption key")
+        })
+        .transpose()?;
 
     if includes("server.json") {
         ServerConfig::load_or_default(stage_dir).context("validate staged server.json")?;
@@ -418,7 +690,7 @@ fn validate_server_backup_restore_stage(
         crate::clients::router::email_auth::load_state(stage_dir)
             .context("validate staged email-auth.json")?;
     }
-    if includes("providers.json") {
+    let staged_providers = if validates_subscription_references {
         let mut providers =
             ProviderStore::load_or_default(stage_dir).context("validate staged providers.json")?;
         if providers.storage_status().format
@@ -447,7 +719,10 @@ fn validate_server_backup_restore_stage(
                     )
                 })?;
         }
-    }
+        Some(providers)
+    } else {
+        None
+    };
     if includes("accounts.json") || includes("accounts.key") {
         if includes("accounts.key") {
             let encoded = std::fs::read_to_string(stage_dir.join("accounts.key"))
@@ -466,8 +741,19 @@ fn validate_server_backup_restore_stage(
         crate::domain::health::ProviderHealthStore::load_or_default(stage_dir)
             .context("validate staged provider-health.json")?;
     }
-    if includes("shares.json") {
-        ShareStore::load_or_default(stage_dir).context("validate staged shares.json")?;
+    let staged_shares = validates_subscription_references
+        .then(|| ShareStore::load_or_default(stage_dir).context("validate staged shares.json"))
+        .transpose()?;
+    if let (Some(providers), Some(accounts), Some(shares)) = (
+        staged_providers.as_ref(),
+        staged_accounts.as_ref(),
+        staged_shares.as_ref(),
+    ) {
+        crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
+            providers, accounts, shares,
+        )
+        .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))
+        .context("validate staged subscription reference graph")?;
     }
     if includes("tunnels.json") {
         crate::clients::router::tunnel::validate_tunnel_store(stage_dir)
@@ -1089,6 +1375,21 @@ fn apply_provider_write_drafts(
     Ok((stored, any_changed))
 }
 
+fn validate_ordinary_provider_subscription_change(
+    current: &ProviderStore,
+    candidate: &ProviderStore,
+    accounts: &AccountStore,
+    shares: &ShareStore,
+) -> Result<(), ProviderCommandError> {
+    crate::domain::sharing::subscription_identity::validate_ordinary_subscription_reference_change(
+        current, candidate, accounts, shares,
+    )
+    .map_err(|error| ProviderCommandError::Conflict {
+        code: error.code(),
+        message: error.to_string(),
+    })
+}
+
 fn validate_and_resolve_provider_binding(
     candidate: &mut StoredProvider,
     existing: Option<&StoredProvider>,
@@ -1295,6 +1596,8 @@ fn provider_account_id(stored: &StoredProvider) -> Option<&str> {
         .as_ref()
         .and_then(|meta| meta.auth_binding.as_ref())
         .and_then(|binding| binding.account_id.as_deref())
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
 }
 
 fn provider_auth_identity_generation(stored: &StoredProvider) -> Option<u64> {
@@ -2189,6 +2492,11 @@ impl ServerStateInner {
         std::fs::create_dir_all(&config_dir)
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
         let data_directory_lock = crate::infra::storage::acquire_data_directory_lock(&config_dir)?;
+        if apply_codex_workspace_rebind_transaction(&config_dir)
+            .context("recover pending Codex workspace rebind transaction during startup")?
+        {
+            tracing::warn!("completed a pending Codex workspace rebind transaction during startup");
+        }
 
         let provider_coverage = ProviderCoverage::load_embedded()?;
         let config = ServerConfig::load_or_default(&config_dir)?;
@@ -2212,6 +2520,17 @@ impl ServerStateInner {
         let usage = UsageStore::load_or_default(&config_dir)?;
         remove_obsolete_model_pricing_file(&config_dir)?;
         let mut shares = ShareStore::load_or_default(&config_dir)?;
+        for error in
+            crate::domain::sharing::subscription_identity::subscription_reference_graph_errors(
+                &providers, &accounts, &shares,
+            )
+        {
+            tracing::error!(
+                code = error.code(),
+                %error,
+                "subscription binding integrity check failed; affected Shares will remain fail-closed"
+            );
+        }
         let mut shares_changed = false;
         if let Some(owner_email) = config.owner.email.as_deref() {
             let migrated = shares
@@ -2262,7 +2581,8 @@ impl ServerStateInner {
             config: RwLock::new(config),
             providers: RwLock::new(providers),
             provider_commits: AsyncMutex::new(()),
-            reference_mutations: AsyncMutex::new(()),
+            codex_workspace_rebind_transactions: AsyncMutex::new(()),
+            reference_mutations: Arc::new(AsyncMutex::new(())),
             provider_import_preview_key,
             #[cfg(test)]
             provider_commit_delay_ms: std::sync::atomic::AtomicU64::new(0),
@@ -2827,12 +3147,34 @@ impl ServerStateInner {
         Ok(())
     }
 
+    fn recover_pending_codex_workspace_rebind_transaction(
+        &self,
+        operation: &'static str,
+    ) -> anyhow::Result<()> {
+        if apply_codex_workspace_rebind_transaction(&self.config_dir)
+            .with_context(|| format!("recover pending Codex workspace rebind before {operation}"))?
+        {
+            tracing::warn!(
+                operation,
+                "completed a pending Codex workspace rebind transaction before persistent write"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn reload_persistent_stores(&self) -> anyhow::Result<()> {
+        let _references = self.reference_mutations.lock().await;
         let _provider_commit = self.provider_commits.lock().await;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.reload_persistent_stores_under_provider_commit().await
     }
 
     async fn reload_persistent_stores_under_provider_commit(&self) -> anyhow::Result<()> {
+        if apply_codex_workspace_rebind_transaction(&self.config_dir)
+            .context("recover pending Codex workspace rebind transaction before reload")?
+        {
+            tracing::warn!("completed a pending Codex workspace rebind transaction before reload");
+        }
         let config = ServerConfig::load_or_default(&self.config_dir)?;
         let http_client = build_http_client()?;
         let reasoning_root_key = crate::infra::credentials::load_root_key(&self.config_dir)
@@ -2846,6 +3188,11 @@ impl ServerStateInner {
         remove_obsolete_model_pricing_file(&self.config_dir)?;
         let shares = ShareStore::load_or_default(&self.config_dir)?;
         let ui_settings = UiSettingsStore::load_or_default(&self.config_dir)?;
+        crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
+            &providers, &accounts, &shares,
+        )
+        .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))
+        .context("validate subscription reference graph before reload")?;
 
         *self.http_client.write().await = http_client;
         *self.config.write().await = config;
@@ -2878,7 +3225,16 @@ impl ServerStateInner {
         &self,
         backup_id: String,
     ) -> anyhow::Result<crate::infra::backup::BackupRestoreResult> {
+        let _references = self.reference_mutations.lock().await;
         let _provider_commit = self.provider_commits.lock().await;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        if apply_codex_workspace_rebind_transaction(&self.config_dir)
+            .context("recover pending Codex workspace rebind transaction before restore")?
+        {
+            tracing::warn!(
+                "completed a pending Codex workspace rebind transaction before backup restore"
+            );
+        }
         let config_dir = self.config_dir.clone();
         let result = tokio::task::spawn_blocking(move || {
             crate::infra::backup::restore_backup_with_validator(
@@ -3007,7 +3363,7 @@ impl ServerStateInner {
         provider_id: String,
         expected_revision: u64,
     ) -> anyhow::Result<Result<bool, ProviderCommandError>> {
-        let _references = self.reference_mutations.lock().await;
+        let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let preview = match self.provider_reference_preview(app, &provider_id).await {
             Ok(preview) => preview,
             Err(error) => return Ok(Err(error)),
@@ -3035,7 +3391,7 @@ impl ServerStateInner {
                 ),
             }));
         }
-        self.try_mutate_providers_immediate_if_changed(move |providers| {
+        self.commit_provider_change_under_reference_guard(reference_guard, move |providers| {
             let Some(stored) = providers
                 .providers
                 .iter()
@@ -3115,10 +3471,18 @@ impl ServerStateInner {
         self: &Arc<Self>,
         drafts: Vec<ProviderWriteDraft>,
     ) -> anyhow::Result<Result<Vec<StoredProvider>, ProviderCommandError>> {
-        let _references = self.reference_mutations.lock().await;
+        let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
-        self.try_mutate_providers_immediate_if_changed(move |store| {
-            apply_provider_write_drafts(store, drafts, &accounts)
+        let shares = self.shares.read().await.clone();
+        self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
+            let current = store.clone();
+            let result = apply_provider_write_drafts(store, drafts, &accounts)?;
+            if result.1 {
+                validate_ordinary_provider_subscription_change(
+                    &current, store, &accounts, &shares,
+                )?;
+            }
+            Ok(result)
         })
         .await
     }
@@ -3143,10 +3507,11 @@ impl ServerStateInner {
         drafts: Vec<ProviderWriteDraft>,
         expected_preview_token: String,
     ) -> anyhow::Result<Result<ProviderImportPreview, ProviderCommandError>> {
-        let _references = self.reference_mutations.lock().await;
+        let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
         let preview_key = self.provider_import_preview_key;
-        self.commit_provider_change(move |store| {
+        self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
             let prepared = prepare_provider_import(store, drafts, &preview_key, &accounts)?;
             if expected_preview_token.trim().is_empty()
                 || prepared.preview.preview_token != expected_preview_token
@@ -3158,6 +3523,14 @@ impl ServerStateInner {
                 });
             }
             let changed = prepared.preview.create_count + prepared.preview.update_count > 0;
+            if changed {
+                validate_ordinary_provider_subscription_change(
+                    store,
+                    &prepared.candidate,
+                    &accounts,
+                    &shares,
+                )?;
+            }
             *store = prepared.candidate;
             Ok((prepared.preview, changed))
         })
@@ -3201,8 +3574,9 @@ impl ServerStateInner {
         expected_preview_token: String,
     ) -> anyhow::Result<Result<(ProviderIdentityChangePreview, StoredProvider), ProviderCommandError>>
     {
-        let _references = self.reference_mutations.lock().await;
+        let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
         let preview_key = self.provider_import_preview_key;
         let input = AdoptProviderProfileInput {
             app,
@@ -3211,11 +3585,17 @@ impl ServerStateInner {
             profile_id,
             account_id,
         };
-        self.commit_provider_change(move |store| {
+        self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
             let prepared = prepare_adopt_provider_profile(store, &accounts, &preview_key, &input)?;
             validate_provider_action_preview_token(
                 &prepared.preview.preview_token,
                 &expected_preview_token,
+            )?;
+            validate_ordinary_provider_subscription_change(
+                store,
+                &prepared.candidate,
+                &accounts,
+                &shares,
             )?;
             *store = prepared.candidate;
             Ok(((prepared.preview, prepared.stored), true))
@@ -3261,8 +3641,9 @@ impl ServerStateInner {
         expected_preview_token: String,
     ) -> anyhow::Result<Result<(ProviderIdentityChangePreview, StoredProvider), ProviderCommandError>>
     {
-        let _references = self.reference_mutations.lock().await;
+        let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
         let preview_key = self.provider_import_preview_key;
         let input = RebindCustomProviderInput {
             app,
@@ -3271,11 +3652,17 @@ impl ServerStateInner {
             custom_binding,
             credential_patches,
         };
-        self.commit_provider_change(move |store| {
+        self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
             let prepared = prepare_rebind_custom_provider(store, &accounts, &preview_key, &input)?;
             validate_provider_action_preview_token(
                 &prepared.preview.preview_token,
                 &expected_preview_token,
+            )?;
+            validate_ordinary_provider_subscription_change(
+                store,
+                &prepared.candidate,
+                &accounts,
+                &shares,
             )?;
             *store = prepared.candidate;
             Ok(((prepared.preview, prepared.stored), true))
@@ -3324,10 +3711,11 @@ impl ServerStateInner {
         expected_preview_token: String,
     ) -> anyhow::Result<Result<(ProviderIdentityChangePreview, StoredProvider), ProviderCommandError>>
     {
-        let _references = self.reference_mutations.lock().await;
+        let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
         let preview_key = self.provider_import_preview_key;
-        self.commit_provider_change(move |store| {
+        self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
             let prepared = prepare_clone_provider_as_custom(
                 store,
                 &accounts,
@@ -3343,6 +3731,12 @@ impl ServerStateInner {
             validate_provider_action_preview_token(
                 &prepared.preview.preview_token,
                 &expected_preview_token,
+            )?;
+            validate_ordinary_provider_subscription_change(
+                store,
+                &prepared.candidate,
+                &accounts,
+                &shares,
             )?;
             *store = prepared.candidate;
             Ok(((prepared.preview, prepared.stored), true))
@@ -3367,10 +3761,12 @@ impl ServerStateInner {
         expected_preview_token: String,
     ) -> anyhow::Result<Result<(ProviderAccountBindingMigrationPreview, usize), ProviderCommandError>>
     {
-        let _references = self.reference_mutations.lock().await;
+        let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
         let preview_key = self.provider_import_preview_key;
-        self.commit_provider_change(move |store| {
+        self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
+            let current = store.clone();
             let preview =
                 prepare_account_binding_migration_preview(store, &accounts, &preview_key)?;
             validate_provider_action_preview_token(
@@ -3419,13 +3815,18 @@ impl ServerStateInner {
                 stored.resource.revision = stored.resource.revision.saturating_add(1);
                 applied += 1;
             }
+            if applied > 0 {
+                validate_ordinary_provider_subscription_change(
+                    &current, store, &accounts, &shares,
+                )?;
+            }
             Ok(((preview, applied), applied > 0))
         })
         .await
     }
 
-    pub(crate) async fn lock_reference_mutations(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.reference_mutations.lock().await
+    pub(crate) async fn lock_reference_mutations(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.reference_mutations.clone().lock_owned().await
     }
 
     pub async fn mutate_providers_immediate<R>(
@@ -3533,9 +3934,39 @@ impl ServerStateInner {
         R: Send + 'static,
         E: Send + 'static,
     {
+        self.commit_provider_change_with_reference_guard(None, mutate)
+            .await
+    }
+
+    async fn commit_provider_change_under_reference_guard<R, E>(
+        self: &Arc<Self>,
+        reference_guard: tokio::sync::OwnedMutexGuard<()>,
+        mutate: impl FnOnce(&mut ProviderStore) -> Result<(R, bool), E> + Send + 'static,
+    ) -> anyhow::Result<Result<R, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.commit_provider_change_with_reference_guard(Some(reference_guard), mutate)
+            .await
+    }
+
+    async fn commit_provider_change_with_reference_guard<R, E>(
+        self: &Arc<Self>,
+        reference_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+        mutate: impl FnOnce(&mut ProviderStore) -> Result<(R, bool), E> + Send + 'static,
+    ) -> anyhow::Result<Result<R, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
         let state = Arc::clone(self);
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
+            let _references = match reference_guard {
+                Some(reference_guard) => reference_guard,
+                None => state.reference_mutations.clone().lock_owned().await,
+            };
             let result = state.commit_provider_change_owned(mutate).await;
             let _ = result_tx.send(result);
         });
@@ -3553,6 +3984,8 @@ impl ServerStateInner {
         E: Send + 'static,
     {
         let _commit = self.provider_commits.lock().await;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Provider commit")?;
         let current = self.providers.read().await.clone();
         let mut candidate = current
             .materialized_clone()
@@ -3566,6 +3999,11 @@ impl ServerStateInner {
         }
         candidate.validate_for_commit()?;
         let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
+        crate::domain::sharing::subscription_identity::validate_ordinary_subscription_reference_change(
+            &current, &candidate, &accounts, &shares,
+        )
+        .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))?;
         candidate
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index before commit")?;
@@ -3653,6 +4091,8 @@ impl ServerStateInner {
     }
 
     pub async fn save_accounts(&self) -> anyhow::Result<()> {
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Accounts save")?;
         self.accounts.read().await.save(&self.config_dir)
     }
 
@@ -3691,20 +4131,500 @@ impl ServerStateInner {
         &self,
         mutate: impl FnOnce(&mut AccountStore) -> R,
     ) -> anyhow::Result<R> {
-        let result = self.mutate_accounts(mutate).await;
-        self.save_accounts().await?;
-        Ok(result)
+        let _references = self.reference_mutations.lock().await;
+        self.mutate_accounts_immediate_under_reference_guard(mutate)
+            .await
     }
 
     pub async fn try_mutate_accounts_immediate<R, E>(
         &self,
         mutate: impl FnOnce(&mut AccountStore) -> Result<R, E>,
     ) -> anyhow::Result<Result<R, E>> {
-        let result = self.mutate_accounts(mutate).await;
-        if result.is_ok() {
-            self.save_accounts().await?;
+        let _references = self.reference_mutations.lock().await;
+        self.try_mutate_accounts_immediate_under_reference_guard(mutate)
+            .await
+    }
+
+    pub(crate) async fn mutate_accounts_immediate_under_reference_guard<R>(
+        &self,
+        mutate: impl FnOnce(&mut AccountStore) -> R,
+    ) -> anyhow::Result<R> {
+        self.try_mutate_accounts_immediate_under_reference_guard(|accounts| {
+            Ok::<_, std::convert::Infallible>(mutate(accounts))
+        })
+        .await?
+        .map_err(|never| match never {})
+    }
+
+    pub(crate) async fn try_mutate_accounts_immediate_under_reference_guard<R, E>(
+        &self,
+        mutate: impl FnOnce(&mut AccountStore) -> Result<R, E>,
+    ) -> anyhow::Result<Result<R, E>> {
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Accounts commit")?;
+
+        let providers = self.providers.read().await;
+        let mut accounts = self.accounts.write().await;
+        let shares = self.shares.read().await;
+        let current = accounts.clone();
+        let mut candidate = current.clone();
+        let result = match mutate(&mut candidate) {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        crate::domain::sharing::subscription_identity::validate_ordinary_account_subscription_change(
+            &providers,
+            &current,
+            &candidate,
+            &shares,
+        )
+        .map_err(anyhow::Error::new)?;
+
+        if let Err(error) = candidate.save(&self.config_dir) {
+            let disk_matches = AccountStore::load_or_default(&self.config_dir)
+                .ok()
+                .and_then(|store| serde_json::to_value(store).ok())
+                .zip(serde_json::to_value(&candidate).ok())
+                .is_some_and(|(disk, expected)| disk == expected);
+            if !disk_matches {
+                return Err(error);
+            }
+            tracing::warn!(
+                %error,
+                "accounts file reached the commit point despite a persistence error; reconciled live state"
+            );
         }
-        Ok(result)
+        *accounts = candidate;
+        Ok(Ok(result))
+    }
+
+    pub(crate) async fn select_codex_workspace_command(
+        self: &Arc<Self>,
+        account_id: &str,
+        workspace_id: &str,
+    ) -> anyhow::Result<
+        Result<Account, crate::domain::sharing::subscription_identity::CodexWorkspaceRebindError>,
+    > {
+        let state = Arc::clone(self);
+        let account_id = account_id.to_string();
+        let workspace_id = workspace_id.to_string();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = state
+                .select_codex_workspace_owned(account_id, workspace_id)
+                .await;
+            let _ = result_tx.send(result);
+        });
+        result_rx
+            .await
+            .context("Codex workspace selection coordinator stopped before reporting a result")?
+    }
+
+    async fn select_codex_workspace_owned(
+        self: &Arc<Self>,
+        account_id: String,
+        workspace_id: String,
+    ) -> anyhow::Result<
+        Result<Account, crate::domain::sharing::subscription_identity::CodexWorkspaceRebindError>,
+    > {
+        use crate::domain::sharing::subscription_identity::{
+            validate_subscription_reference_graph_transition, CodexWorkspaceRebindError,
+        };
+
+        let account_id = account_id.as_str();
+        let workspace_id = workspace_id.as_str();
+        let _refresh = self
+            .account_refresh_locks
+            .lock(ProviderType::CodexOAuth, account_id)
+            .await;
+        let _references = self.reference_mutations.lock().await;
+        let _provider_commit = self.provider_commits.lock().await;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Codex workspace selection")?;
+
+        let mut providers = self.providers.write().await;
+        let mut accounts = self.accounts.write().await;
+        let mut shares = self.shares.write().await;
+
+        let share_ids = crate::domain::sharing::subscription_identity::share_ids_for_account(
+            account_id, &providers, &shares,
+        );
+        if !share_ids.is_empty() {
+            return Ok(Err(CodexWorkspaceRebindError::AccountInUse { share_ids }));
+        }
+        let Some(previous_identity_generation) = accounts
+            .accounts
+            .iter()
+            .find(|account| {
+                account.id == account_id && account.provider_type == ProviderType::CodexOAuth
+            })
+            .map(|account| account.auth_identity_generation)
+        else {
+            return Ok(Err(CodexWorkspaceRebindError::AccountNotFound(
+                account_id.to_string(),
+            )));
+        };
+
+        let mut candidate_accounts = accounts.clone();
+        let updated_account =
+            match candidate_accounts.select_codex_workspace(account_id, workspace_id) {
+                Ok(account) => account,
+                Err(error) => return Ok(Err(CodexWorkspaceRebindError::InvalidWorkspace(error))),
+            };
+        let mut candidate_providers = providers
+            .materialized_clone()
+            .context("materialize Provider credentials for Codex workspace selection")?;
+        let mut providers_changed = false;
+        let identity_changed =
+            previous_identity_generation != updated_account.auth_identity_generation;
+        for provider in &mut candidate_providers.providers {
+            if provider.provider_type != ProviderType::CodexOAuth
+                || provider_account_id(provider) != Some(account_id)
+            {
+                continue;
+            }
+            let binding = provider
+                .provider
+                .meta
+                .as_mut()
+                .and_then(|meta| meta.auth_binding.as_mut())
+                .expect("Provider account id came from its auth binding");
+            let binding_changed =
+                binding.auth_identity_generation != Some(updated_account.auth_identity_generation);
+            if !binding_changed && !identity_changed {
+                continue;
+            }
+            binding.auth_identity_generation = Some(updated_account.auth_identity_generation);
+            provider.resource.revision = provider.resource.revision.saturating_add(1);
+            providers_changed = true;
+        }
+
+        if !providers_changed {
+            if let Err(error) = candidate_accounts.save(&self.config_dir) {
+                let disk_matches = AccountStore::load_or_default(&self.config_dir)
+                    .ok()
+                    .and_then(|store| serde_json::to_value(store).ok())
+                    .zip(serde_json::to_value(&candidate_accounts).ok())
+                    .is_some_and(|(disk, expected)| disk == expected);
+                if !disk_matches {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    %error,
+                    "Codex workspace selection reached the commit point despite a persistence error; reconciled live state"
+                );
+            }
+            *accounts = candidate_accounts;
+            self.emit_oauth_quota_updated_event(&updated_account, true);
+            return Ok(Ok(updated_account));
+        }
+
+        let candidate_shares = shares.clone();
+        if let Err(error) = validate_subscription_reference_graph_transition(
+            &providers,
+            &accounts,
+            &shares,
+            &candidate_providers,
+            &candidate_accounts,
+            &candidate_shares,
+        ) {
+            return Ok(Err(error.into()));
+        }
+        candidate_providers.validate_for_commit()?;
+        candidate_providers
+            .rebuild_runtime_index(&candidate_accounts)
+            .context("compile Provider runtime index for Codex workspace selection")?;
+        candidate_providers
+            .seal_for_commit(&self.config_dir)
+            .context("seal Provider credentials for Codex workspace selection")?;
+        candidate_providers
+            .rebuild_runtime_index(&candidate_accounts)
+            .context("compile sealed Provider runtime index for Codex workspace selection")?;
+
+        prepare_codex_workspace_rebind_transaction(
+            &self.config_dir,
+            &accounts,
+            &providers,
+            &shares,
+            &candidate_accounts,
+            &candidate_providers,
+            &candidate_shares,
+        )?;
+        if let Err(error) = apply_codex_workspace_rebind_transaction(&self.config_dir) {
+            tracing::error!(
+                %error,
+                marker = %codex_workspace_rebind_transaction_path(&self.config_dir).display(),
+                "Codex workspace selection is committed but its file application remains pending"
+            );
+        }
+        *providers = candidate_providers;
+        *accounts = candidate_accounts;
+        *shares = candidate_shares;
+        self.emit_oauth_quota_updated_event(&updated_account, true);
+        Ok(Ok(updated_account))
+    }
+
+    pub(crate) async fn rebind_codex_workspace_for_share_command(
+        self: &Arc<Self>,
+        share_id: &str,
+        account_id: &str,
+        workspace_id: &str,
+        expected_config_revision: u64,
+    ) -> anyhow::Result<
+        Result<
+            CodexWorkspaceRebindResult,
+            crate::domain::sharing::subscription_identity::CodexWorkspaceRebindError,
+        >,
+    > {
+        let state = Arc::clone(self);
+        let share_id = share_id.to_string();
+        let account_id = account_id.to_string();
+        let workspace_id = workspace_id.to_string();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = state
+                .rebind_codex_workspace_for_share_owned(
+                    share_id,
+                    account_id,
+                    workspace_id,
+                    expected_config_revision,
+                )
+                .await;
+            let _ = result_tx.send(result);
+        });
+        result_rx
+            .await
+            .context("Codex workspace rebind coordinator stopped before reporting a result")?
+    }
+
+    async fn rebind_codex_workspace_for_share_owned(
+        self: &Arc<Self>,
+        share_id: String,
+        account_id: String,
+        workspace_id: String,
+        expected_config_revision: u64,
+    ) -> anyhow::Result<
+        Result<
+            CodexWorkspaceRebindResult,
+            crate::domain::sharing::subscription_identity::CodexWorkspaceRebindError,
+        >,
+    > {
+        use crate::domain::sharing::subscription_identity::{
+            validate_share_subscription_binding, validate_subscription_reference_graph_transition,
+            CodexWorkspaceRebindError,
+        };
+
+        let share_id = share_id.as_str();
+        let account_id = account_id.as_str();
+        let workspace_id = workspace_id.as_str();
+        let _refresh = self
+            .account_refresh_locks
+            .lock(ProviderType::CodexOAuth, account_id)
+            .await;
+        let _references = self.reference_mutations.lock().await;
+        let _provider_commit = self.provider_commits.lock().await;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Codex workspace rebind")?;
+
+        let mut providers = self.providers.write().await;
+        let mut accounts = self.accounts.write().await;
+        let usage = self.usage.read().await;
+        let mut shares = self.shares.write().await;
+
+        let current_share = match shares.get(share_id).cloned() {
+            Some(share) => share,
+            None => {
+                return Ok(Err(CodexWorkspaceRebindError::ShareNotFound(
+                    share_id.to_string(),
+                )))
+            }
+        };
+        if current_share.config_revision != expected_config_revision {
+            return Ok(Err(CodexWorkspaceRebindError::RevisionConflict {
+                expected_revision: expected_config_revision,
+                current_revision: current_share.config_revision,
+            }));
+        }
+        if current_share.status != "paused" {
+            return Ok(Err(CodexWorkspaceRebindError::MustBePaused));
+        }
+        if current_share.app != AppKind::Codex
+            || current_share.provider_type != ProviderType::CodexOAuth
+            || current_share.bindings.len() != 1
+        {
+            return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch));
+        }
+        let account_exists = accounts.accounts.iter().any(|account| {
+            account.id == account_id && account.provider_type == ProviderType::CodexOAuth
+        });
+        if !account_exists {
+            return Ok(Err(CodexWorkspaceRebindError::AccountNotFound(
+                account_id.to_string(),
+            )));
+        }
+        let Some(current_provider) = providers.providers.iter().find(|provider| {
+            provider.app == current_share.app
+                && provider.provider.id == current_share.provider_id
+                && provider.provider_type == ProviderType::CodexOAuth
+        }) else {
+            return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch));
+        };
+        if provider_account_id(current_provider) != Some(account_id) {
+            return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch));
+        }
+        let current_identity =
+            match validate_share_subscription_binding(share_id, &providers, &accounts, &shares) {
+                Ok(Some(identity)) => identity,
+                Ok(None) => return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch)),
+                Err(error) => return Ok(Err(error.into())),
+            };
+
+        let mut candidate_accounts = accounts.clone();
+        let updated_account =
+            match candidate_accounts.select_codex_workspace(account_id, workspace_id) {
+                Ok(account) => account,
+                Err(error) => return Ok(Err(CodexWorkspaceRebindError::InvalidWorkspace(error))),
+            };
+        let mut candidate_providers = providers
+            .materialized_clone()
+            .context("materialize Provider credentials for Codex workspace rebind")?;
+        let candidate_provider = candidate_providers
+            .providers
+            .iter_mut()
+            .find(|provider| {
+                provider.app == current_share.app
+                    && provider.provider.id == current_share.provider_id
+                    && provider.provider_type == ProviderType::CodexOAuth
+            })
+            .expect("validated Codex Share Provider exists in candidate store");
+        let Some(binding) = candidate_provider
+            .provider
+            .meta
+            .as_mut()
+            .and_then(|meta| meta.auth_binding.as_mut())
+        else {
+            return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch));
+        };
+        binding.auth_identity_generation = Some(updated_account.auth_identity_generation);
+
+        let next_identity = match crate::domain::sharing::subscription_identity::resolve_provider_subscription_identity(
+            candidate_provider,
+            &candidate_accounts,
+        ) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch)),
+            Err(error) => return Ok(Err(error.into())),
+        };
+        let identity_changed = current_identity != next_identity;
+        if identity_changed {
+            candidate_provider.resource.revision =
+                candidate_provider.resource.revision.saturating_add(1);
+        }
+
+        let mut candidate_shares = shares.clone();
+        let updated_share = if identity_changed {
+            match candidate_shares.record_subscription_identity_rebind(
+                share_id,
+                current_identity.fingerprint(),
+                next_identity.fingerprint(),
+            ) {
+                Ok(share) => share,
+                Err(crate::domain::sharing::shares::ShareUpdateError::NotFound) => {
+                    return Ok(Err(CodexWorkspaceRebindError::ShareNotFound(
+                        share_id.to_string(),
+                    )))
+                }
+                Err(crate::domain::sharing::shares::ShareUpdateError::MustBePaused) => {
+                    return Ok(Err(CodexWorkspaceRebindError::MustBePaused))
+                }
+                Err(_) => return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch)),
+            }
+        } else {
+            current_share.clone()
+        };
+        if identity_changed {
+            let provider_keys =
+                BTreeSet::from([(current_share.app, current_share.provider_id.clone())]);
+            candidate_shares.refresh_runtime_snapshots_for_providers(
+                &provider_keys,
+                &candidate_providers,
+                Some(&candidate_accounts),
+                &usage,
+            );
+        }
+        if let Err(error) = validate_subscription_reference_graph_transition(
+            &providers,
+            &accounts,
+            &shares,
+            &candidate_providers,
+            &candidate_accounts,
+            &candidate_shares,
+        ) {
+            return Ok(Err(error.into()));
+        }
+
+        if !identity_changed {
+            if let Err(error) = candidate_accounts.save(&self.config_dir) {
+                let disk_matches = AccountStore::load_or_default(&self.config_dir)
+                    .ok()
+                    .and_then(|store| serde_json::to_value(store).ok())
+                    .zip(serde_json::to_value(&candidate_accounts).ok())
+                    .is_some_and(|(disk, expected)| disk == expected);
+                if !disk_matches {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    %error,
+                    "Codex workspace selection reached the commit point despite a persistence error; reconciled live state"
+                );
+            }
+            *accounts = candidate_accounts;
+            self.emit_oauth_quota_updated_event(&updated_account, true);
+            return Ok(Ok(CodexWorkspaceRebindResult {
+                account: updated_account,
+                share: current_share,
+                identity_changed: false,
+            }));
+        }
+
+        candidate_providers.validate_for_commit()?;
+        candidate_providers
+            .rebuild_runtime_index(&candidate_accounts)
+            .context("compile Provider runtime index for Codex workspace rebind")?;
+        candidate_providers
+            .seal_for_commit(&self.config_dir)
+            .context("seal Provider credentials for Codex workspace rebind")?;
+        candidate_providers
+            .rebuild_runtime_index(&candidate_accounts)
+            .context("compile sealed Provider runtime index for Codex workspace rebind")?;
+
+        prepare_codex_workspace_rebind_transaction(
+            &self.config_dir,
+            &accounts,
+            &providers,
+            &shares,
+            &candidate_accounts,
+            &candidate_providers,
+            &candidate_shares,
+        )?;
+        if let Err(error) = apply_codex_workspace_rebind_transaction(&self.config_dir) {
+            tracing::error!(
+                %error,
+                marker = %codex_workspace_rebind_transaction_path(&self.config_dir).display(),
+                "Codex workspace rebind is committed but its file application remains pending"
+            );
+        }
+        *providers = candidate_providers;
+        *accounts = candidate_accounts;
+        *shares = candidate_shares;
+
+        let share = shares.get(share_id).cloned().unwrap_or(updated_share);
+        self.emit_oauth_quota_updated_event(&updated_account, true);
+        Ok(Ok(CodexWorkspaceRebindResult {
+            account: updated_account,
+            share,
+            identity_changed,
+        }))
     }
 
     pub async fn set_manual_subscription_expiry_and_sync(
@@ -4140,6 +5060,8 @@ impl ServerStateInner {
     }
 
     pub async fn save_shares(&self) -> anyhow::Result<()> {
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Shares save")?;
         self.shares.read().await.save(&self.config_dir)
     }
 
@@ -4674,20 +5596,39 @@ impl ServerStateInner {
         &self,
         mutate: impl FnOnce(&mut ShareStore) -> R,
     ) -> anyhow::Result<R> {
-        let result = self.mutate_shares(mutate).await;
-        self.save_shares().await?;
-        Ok(result)
+        self.try_mutate_shares_immediate(|shares| Ok::<_, std::convert::Infallible>(mutate(shares)))
+            .await?
+            .map_err(|never| match never {})
     }
 
     pub async fn try_mutate_shares_immediate<R, E>(
         &self,
         mutate: impl FnOnce(&mut ShareStore) -> Result<R, E>,
     ) -> anyhow::Result<Result<R, E>> {
-        let result = self.mutate_shares(mutate).await;
-        if result.is_ok() {
-            self.save_shares().await?;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Shares commit")?;
+        let mut shares = self.shares.write().await;
+        let mut candidate = shares.clone();
+        let result = match mutate(&mut candidate) {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        if let Err(error) = candidate.save(&self.config_dir) {
+            let disk_matches = ShareStore::load_or_default(&self.config_dir)
+                .ok()
+                .and_then(|store| serde_json::to_value(store).ok())
+                .zip(serde_json::to_value(&candidate).ok())
+                .is_some_and(|(disk, expected)| disk == expected);
+            if !disk_matches {
+                return Err(error);
+            }
+            tracing::warn!(
+                %error,
+                "shares file reached the commit point despite a persistence error; reconciled live state"
+            );
         }
-        Ok(result)
+        *shares = candidate;
+        Ok(Ok(result))
     }
 
     pub async fn mutate_shares_debounced<R>(
@@ -4738,28 +5679,6 @@ impl ServerStateInner {
             save_shares_debounced(self);
         }
         result
-    }
-
-    pub async fn mutate_share<R>(
-        &self,
-        share_id: &str,
-        mutate: impl FnOnce(&mut Share) -> R,
-    ) -> Option<R> {
-        self.mutate_shares(|store| {
-            store
-                .shares
-                .iter_mut()
-                .find(|share| share.id == share_id)
-                .map(mutate)
-        })
-        .await
-    }
-
-    pub async fn replace_shares(&self, shares: Vec<Share>) {
-        self.mutate_shares(|store| {
-            store.replace_shares(shares);
-        })
-        .await;
     }
 
     pub async fn save_ui_settings(&self) -> anyhow::Result<()> {
@@ -5987,13 +6906,38 @@ pub async fn ensure_share_tunnel_running(state: ServerState, share_id: &str) {
 }
 
 pub async fn ensure_share_tunnel_running_for(state: ServerState, share_id: &str, reason: &str) {
-    let share = {
+    let (share, binding_error) = {
+        let providers = state.providers.read().await;
+        let accounts = state.accounts.read().await;
         let shares = state.shares.read().await;
-        shares.get(share_id).cloned()
+        let share = shares.get(share_id).cloned();
+        let binding_error = share.as_ref().and_then(|_| {
+            crate::domain::sharing::subscription_identity::validate_share_subscription_binding(
+                share_id, &providers, &accounts, &shares,
+            )
+            .err()
+        });
+        (share, binding_error)
     };
     let Some(share) = share else {
         return;
     };
+    if let Some(error) = binding_error {
+        tracing::error!(
+            share_id,
+            code = error.code(),
+            %error,
+            "refusing to start Share tunnel with an invalid subscription binding"
+        );
+        state
+            .tunnels
+            .stop(
+                &tunnel::share_tunnel_key(share_id),
+                "subscription_binding_invalid",
+            )
+            .await;
+        return;
+    }
     if !should_restore_share_tunnel(&share) {
         return;
     }
@@ -6600,6 +7544,14 @@ async fn sync_one_share_to_router_locked(
     state: &ServerState,
     share_id: &str,
 ) -> anyhow::Result<()> {
+    sync_one_share_to_router_locked_with_policy(state, share_id, false).await
+}
+
+async fn sync_one_share_to_router_locked_with_policy(
+    state: &ServerState,
+    share_id: &str,
+    force: bool,
+) -> anyhow::Result<()> {
     let config = state.config_snapshot().await;
     if !config.has_registered_router_identity() {
         anyhow::bail!("router installation is not registered");
@@ -6615,8 +7567,12 @@ async fn sync_one_share_to_router_locked(
         };
         let _ = share;
     }
-    let operations =
-        build_router_share_upsert_ops(state, &BTreeSet::from([share_id.to_string()])).await?;
+    let operations = build_router_share_upsert_ops_with_policy(
+        state,
+        &BTreeSet::from([share_id.to_string()]),
+        force,
+    )
+    .await?;
     if operations.is_empty() {
         return Ok(());
     }
@@ -6638,6 +7594,36 @@ async fn sync_one_share_to_router_locked(
         }
     }
     result.map(|_| ())
+}
+
+pub(crate) async fn reconcile_router_share_after_failed_claim(
+    state: &ServerState,
+    share_id: &str,
+) -> anyhow::Result<()> {
+    let (current_exists, pending_deletes) = {
+        let store = state.shares.read().await;
+        (
+            store.get(share_id).is_some(),
+            store
+                .pending_router_deletes
+                .iter()
+                .filter(|tombstone| tombstone.share_id == share_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    if !pending_deletes.is_empty() {
+        retry_router_share_deletes(state, &pending_deletes)
+            .await
+            .map(|_| ())
+    } else if current_exists {
+        let _sync = state.lock_router_share_sync().await;
+        sync_one_share_to_router_locked_with_policy(state, share_id, true).await
+    } else {
+        anyhow::bail!(
+            "cannot reconcile Router Share {share_id}: no current Share or pending delete"
+        )
+    }
 }
 
 pub(crate) async fn sync_shares_to_router(
@@ -10930,6 +11916,545 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_codex_workspace_rebind_survives_caller_cancellation() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let account: crate::domain::accounts::store::UpsertAccountInput =
+                    serde_json::from_value(json!({
+                        "id": "workspace-cancel-account",
+                        "providerType": "codex_oauth",
+                        "profile": {
+                            "verifiedOpenAiClaims": {
+                                "subject": "workspace-cancel-subject",
+                                "chatgpt_account_id": "workspace-default",
+                                "organizations": [{
+                                    "id": "workspace-team",
+                                    "name": "Workspace Team"
+                                }]
+                            },
+                            "selectedChatgptAccountId": "workspace-default"
+                        }
+                    }))
+                    .unwrap();
+                accounts.upsert(account)
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(|providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "workspace-cancel-provider".to_string(),
+                        name: "Workspace cancel provider".to_string(),
+                        settings_config: json!({}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("codex_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account".to_string()),
+                                auth_provider: Some("codex_oauth".to_string()),
+                                account_id: Some("workspace-cancel-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..ProviderMeta::default()
+                        }),
+                        extra: BTreeMap::new(),
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        let share = state
+            .mutate_shares_immediate(|shares| {
+                let mut input =
+                    router_sync_share_input("workspace-cancel-share", "workspace-cancel-provider");
+                input.provider_type = ProviderType::CodexOAuth;
+                input.enabled = Some(false);
+                input.status = Some("paused".to_string());
+                shares.upsert(input).unwrap()
+            })
+            .await
+            .unwrap();
+
+        let references = state.reference_mutations.lock().await;
+        let worker_state = state.clone();
+        let caller = tokio::spawn(async move {
+            worker_state
+                .rebind_codex_workspace_for_share_command(
+                    "workspace-cancel-share",
+                    "workspace-cancel-account",
+                    "workspace-team",
+                    share.config_revision,
+                )
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        caller.abort();
+        assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+        drop(references);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let completed = state
+                    .accounts
+                    .read()
+                    .await
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == "workspace-cancel-account")
+                    .is_some_and(|account| account.auth_identity_generation == 2);
+                if completed {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let accounts = state.accounts.read().await.clone();
+        let providers = state.providers.read().await.clone();
+        let shares = state.shares.read().await.clone();
+        let account = accounts
+            .accounts
+            .iter()
+            .find(|account| account.id == "workspace-cancel-account")
+            .unwrap();
+        assert_eq!(
+            account
+                .profile
+                .as_ref()
+                .and_then(|profile| profile["selectedChatgptAccountId"].as_str()),
+            Some("workspace-team")
+        );
+        let provider = providers
+            .providers
+            .iter()
+            .find(|provider| provider.provider.id == "workspace-cancel-provider")
+            .unwrap();
+        assert_eq!(
+            provider
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.auth_identity_generation),
+            Some(2)
+        );
+        let share = shares.get("workspace-cancel-share").unwrap();
+        assert_eq!(
+            share
+                .binding_history
+                .last()
+                .and_then(|history| history.change_kind.as_deref()),
+            Some("subscription_identity")
+        );
+        crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
+            &providers, &accounts, &shares,
+        )
+        .unwrap();
+
+        let disk_accounts = AccountStore::load_or_default(&config_dir).unwrap();
+        let mut disk_providers = ProviderStore::load_runtime_or_default(&config_dir).unwrap();
+        disk_providers
+            .rebuild_runtime_index(&disk_accounts)
+            .unwrap();
+        let disk_shares = ShareStore::load_or_default(&config_dir).unwrap();
+        crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
+            &disk_providers,
+            &disk_accounts,
+            &disk_shares,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(disk_accounts).unwrap(),
+            serde_json::to_value(accounts).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(disk_providers).unwrap(),
+            serde_json::to_value(providers).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(disk_shares).unwrap(),
+            serde_json::to_value(shares).unwrap()
+        );
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_unshared_codex_workspace_selection_survives_caller_cancellation() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let account: crate::domain::accounts::store::UpsertAccountInput =
+                    serde_json::from_value(json!({
+                        "id": "workspace-unshared-cancel-account",
+                        "providerType": "codex_oauth",
+                        "profile": {
+                            "verifiedOpenAiClaims": {
+                                "subject": "workspace-unshared-cancel-subject",
+                                "chatgpt_account_id": "workspace-default",
+                                "organizations": [{
+                                    "id": "workspace-team",
+                                    "name": "Workspace Team"
+                                }]
+                            },
+                            "selectedChatgptAccountId": "workspace-default"
+                        }
+                    }))
+                    .unwrap();
+                accounts.upsert(account)
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(|providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "workspace-unshared-cancel-provider".to_string(),
+                        name: "Workspace unshared cancel provider".to_string(),
+                        settings_config: json!({}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("codex_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account".to_string()),
+                                auth_provider: Some("codex_oauth".to_string()),
+                                account_id: Some("workspace-unshared-cancel-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..ProviderMeta::default()
+                        }),
+                        extra: BTreeMap::new(),
+                    },
+                )
+            })
+            .await
+            .unwrap();
+
+        let references = state.reference_mutations.lock().await;
+        let worker_state = state.clone();
+        let caller = tokio::spawn(async move {
+            worker_state
+                .select_codex_workspace_command(
+                    "workspace-unshared-cancel-account",
+                    "workspace-team",
+                )
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        caller.abort();
+        assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+        drop(references);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let completed = state
+                    .accounts
+                    .read()
+                    .await
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == "workspace-unshared-cancel-account")
+                    .is_some_and(|account| account.auth_identity_generation == 2);
+                if completed {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let accounts = state.accounts.read().await.clone();
+        let providers = state.providers.read().await.clone();
+        let account = accounts
+            .accounts
+            .iter()
+            .find(|account| account.id == "workspace-unshared-cancel-account")
+            .unwrap();
+        assert_eq!(account.auth_identity_generation, 2);
+        let provider = providers
+            .providers
+            .iter()
+            .find(|provider| provider.provider.id == "workspace-unshared-cancel-provider")
+            .unwrap();
+        assert_eq!(
+            provider_auth_identity_generation(provider),
+            Some(account.auth_identity_generation)
+        );
+        let plan = providers
+            .runtime_plan(AppKind::Codex, "workspace-unshared-cancel-provider")
+            .unwrap();
+        assert!(matches!(
+            &plan.auth_ref,
+            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 2,
+            } if account_id == "workspace-unshared-cancel-account"
+        ));
+
+        let disk_accounts = AccountStore::load_or_default(&config_dir).unwrap();
+        let mut disk_providers = ProviderStore::load_runtime_or_default(&config_dir).unwrap();
+        disk_providers
+            .rebuild_runtime_index(&disk_accounts)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(disk_accounts).unwrap(),
+            serde_json::to_value(accounts).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(disk_providers).unwrap(),
+            serde_json::to_value(providers).unwrap()
+        );
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_workspace_selection_waits_for_refresh_before_locking_references() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let account: crate::domain::accounts::store::UpsertAccountInput =
+                    serde_json::from_value(json!({
+                        "id": "workspace-lock-order-account",
+                        "providerType": "codex_oauth",
+                        "profile": {
+                            "verifiedOpenAiClaims": {
+                                "subject": "workspace-lock-order-subject",
+                                "chatgpt_account_id": "workspace-default",
+                                "organizations": [{
+                                    "id": "workspace-team",
+                                    "name": "Workspace Team"
+                                }]
+                            },
+                            "selectedChatgptAccountId": "workspace-default"
+                        }
+                    }))
+                    .unwrap();
+                accounts.upsert(account)
+            })
+            .await
+            .unwrap();
+
+        let refresh_guard = state
+            .account_refresh_locks
+            .lock(ProviderType::CodexOAuth, "workspace-lock-order-account")
+            .await;
+        let worker_state = state.clone();
+        let mut selection = tokio::spawn(async move {
+            worker_state
+                .select_codex_workspace_command("workspace-lock-order-account", "workspace-team")
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            state.mutate_accounts_immediate(|accounts| {
+                let account: crate::domain::accounts::store::UpsertAccountInput =
+                    serde_json::from_value(json!({
+                        "id": "workspace-lock-order-unrelated-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "unrelated-token"
+                    }))
+                    .unwrap();
+                accounts.upsert(account)
+            }),
+        )
+        .await
+        .expect("workspace selection must not hold the reference mutation lock while waiting")
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut selection)
+                .await
+                .is_err()
+        );
+
+        drop(refresh_guard);
+        let result = tokio::time::timeout(Duration::from_secs(2), selection)
+            .await
+            .expect("workspace selection did not resume after refresh lock release")
+            .expect("workspace selection task failed")
+            .expect("workspace selection coordinator failed");
+        let account = result.expect("workspace selection was rejected");
+        assert_eq!(account.auth_identity_generation, 2);
+        assert_eq!(
+            account
+                .profile
+                .as_ref()
+                .and_then(|profile| profile["selectedChatgptAccountId"].as_str()),
+            Some("workspace-team")
+        );
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_account_commit_rejects_identity_replacement_for_a_share() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let account: crate::domain::accounts::store::UpsertAccountInput =
+                    serde_json::from_value(json!({
+                        "id": "identity-guard-account",
+                        "providerType": "codex_oauth",
+                        "accessToken": "access-a",
+                        "profile": {
+                            "verifiedOpenAiClaims": {
+                                "subject": "identity-guard-subject-a",
+                                "chatgpt_account_id": "identity-guard-workspace-a",
+                                "organizations": [{"id": "identity-guard-workspace-a"}]
+                            },
+                            "selectedChatgptAccountId": "identity-guard-workspace-a"
+                        }
+                    }))
+                    .unwrap();
+                accounts.upsert(account)
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(|providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "identity-guard-provider".to_string(),
+                        name: "Identity guard provider".to_string(),
+                        settings_config: json!({}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("codex_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account".to_string()),
+                                auth_provider: Some("codex_oauth".to_string()),
+                                account_id: Some("identity-guard-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..ProviderMeta::default()
+                        }),
+                        extra: BTreeMap::new(),
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_shares_immediate(|shares| {
+                let mut input =
+                    router_sync_share_input("identity-guard-share", "identity-guard-provider");
+                input.provider_type = ProviderType::CodexOAuth;
+                shares.upsert(input).unwrap()
+            })
+            .await
+            .unwrap();
+
+        let error = state
+            .mutate_accounts_immediate(|accounts| {
+                let replacement: crate::domain::accounts::store::UpsertAccountInput =
+                    serde_json::from_value(json!({
+                        "id": "identity-guard-account",
+                        "providerType": "codex_oauth",
+                        "accessToken": "access-b",
+                        "profile": {
+                            "verifiedOpenAiClaims": {
+                                "subject": "identity-guard-subject-b",
+                                "chatgpt_account_id": "identity-guard-workspace-b",
+                                "organizations": [{"id": "identity-guard-workspace-b"}]
+                            },
+                            "selectedChatgptAccountId": "identity-guard-workspace-b"
+                        }
+                    }))
+                    .unwrap();
+                accounts.upsert(replacement)
+            })
+            .await
+            .unwrap_err();
+        let binding = error
+            .downcast_ref::<crate::domain::sharing::subscription_identity::SubscriptionBindingError>()
+            .unwrap();
+        assert_eq!(binding.code(), "cc_switch_account_identity_in_use");
+
+        let live = state
+            .find_account_by_id("identity-guard-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::domain::accounts::store::verified_openai_subject(&live).as_deref(),
+            Some("identity-guard-subject-a")
+        );
+        assert_eq!(live.auth_identity_generation, 1);
+        let persisted = AccountStore::load_or_default(&config_dir).unwrap();
+        let persisted = persisted
+            .accounts
+            .iter()
+            .find(|account| account.id == "identity-guard-account")
+            .unwrap();
+        assert_eq!(
+            crate::domain::accounts::store::verified_openai_subject(persisted).as_deref(),
+            Some("identity-guard-subject-a")
+        );
+        {
+            let providers = state.providers.read().await;
+            let accounts = state.accounts.read().await;
+            let shares = state.shares.read().await;
+            crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
+                &providers, &accounts, &shares,
+            )
+            .unwrap();
+        }
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn generic_provider_commit_waits_for_reference_mutations() {
+        let state = test_state();
+        let reference_guard = state.lock_reference_mutations().await;
+        let worker_state = state.clone();
+        let mut commit = tokio::spawn(async move {
+            worker_state
+                .mutate_providers_immediate(|providers| {
+                    providers.upsert(
+                        AppKind::Codex,
+                        test_provider("provider-reference-guard", "Reference guard"),
+                    )
+                })
+                .await
+                .unwrap();
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut commit)
+            .await
+            .is_err());
+        assert!(state
+            .providers_snapshot()
+            .await
+            .providers
+            .iter()
+            .all(|stored| stored.provider.id != "provider-reference-guard"));
+
+        drop(reference_guard);
+        commit.await.unwrap();
+        assert!(state
+            .providers_snapshot()
+            .await
+            .providers
+            .iter()
+            .any(|stored| stored.provider.id == "provider-reference-guard"));
+    }
+
+    #[tokio::test]
     async fn concurrent_provider_commands_clone_after_commit_lock_and_keep_both_updates() {
         let state = test_state();
         state
@@ -11123,6 +12648,296 @@ mod tests {
                 .to_string()
                 .contains("staged accounts.key must decode to exactly 32 bytes"),
             "{error:#}"
+        );
+
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_invalid_subscription_graph_without_swapping_live_state() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        assert!(state.shares.read().await.shares.is_empty());
+
+        let mut invalid = ShareStore::default();
+        invalid
+            .upsert(router_sync_share_input(
+                "reload-invalid-share",
+                "missing-provider",
+            ))
+            .unwrap();
+        invalid.save(&config_dir).unwrap();
+
+        let error = state.reload_persistent_stores().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("validate subscription reference graph before reload"),
+            "{error:#}"
+        );
+        assert!(state.shares.read().await.shares.is_empty());
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_rolls_forward_partial_codex_workspace_rebind_transaction() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+
+        let current_accounts = state.accounts.read().await.clone();
+        let mut accounts = current_accounts.clone();
+        let account: crate::domain::accounts::store::UpsertAccountInput =
+            serde_json::from_value(json!({
+                "id": "transaction-account",
+                "providerType": "codex_oauth",
+                "profile": {
+                    "verifiedOpenAiClaims": {
+                        "subject": "transaction-subject",
+                        "chatgpt_account_id": "transaction-workspace",
+                        "organizations": [{
+                            "id": "transaction-workspace",
+                            "name": "Transaction Workspace"
+                        }]
+                    },
+                    "selectedChatgptAccountId": "transaction-workspace"
+                }
+            }))
+            .unwrap();
+        accounts.upsert(account);
+
+        let current_providers = state.providers.read().await.clone();
+        let mut providers = current_providers.materialized_clone().unwrap();
+        providers.upsert(
+            AppKind::Codex,
+            Provider {
+                id: "transaction-provider".to_string(),
+                name: "Transaction Provider".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("codex_oauth".to_string()),
+                    auth_binding: Some(AuthBinding {
+                        source: Some("account".to_string()),
+                        auth_provider: Some("codex_oauth".to_string()),
+                        account_id: Some("transaction-account".to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..ProviderMeta::default()
+                }),
+                extra: BTreeMap::new(),
+            },
+        );
+        providers.validate_for_commit().unwrap();
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        providers.seal_for_commit(&config_dir).unwrap();
+        providers.rebuild_runtime_index(&accounts).unwrap();
+
+        let current_shares = state.shares.read().await.clone();
+        let mut shares = current_shares.clone();
+        let mut input = router_sync_share_input("transaction-share", "transaction-provider");
+        input.provider_type = ProviderType::CodexOAuth;
+        shares.upsert(input).unwrap();
+        prepare_codex_workspace_rebind_transaction(
+            &config_dir,
+            &current_accounts,
+            &current_providers,
+            &current_shares,
+            &accounts,
+            &providers,
+            &shares,
+        )
+        .unwrap();
+
+        let staged_provider = fs::read(crate::domain::providers::store::providers_path(
+            &codex_workspace_rebind_stage_path(&config_dir),
+        ))
+        .unwrap();
+        crate::infra::storage::write_bytes_atomic(
+            &crate::domain::providers::store::providers_path(&config_dir),
+            &staged_provider,
+        )
+        .unwrap();
+        assert!(codex_workspace_rebind_transaction_path(&config_dir).exists());
+        drop(state);
+
+        let recovered = test_state_at(config_dir.clone());
+        assert!(!codex_workspace_rebind_transaction_path(&config_dir).exists());
+        assert!(!codex_workspace_rebind_stage_path(&config_dir).exists());
+        assert_eq!(recovered.accounts.read().await.accounts.len(), 1);
+        assert_eq!(recovered.providers.read().await.providers.len(), 1);
+        assert_eq!(recovered.shares.read().await.shares.len(), 1);
+        let recovered_providers = recovered.providers.read().await.clone();
+        let recovered_accounts = recovered.accounts.read().await.clone();
+        let recovered_shares = recovered.shares.read().await.clone();
+        crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
+            &recovered_providers,
+            &recovered_accounts,
+            &recovered_shares,
+        )
+        .unwrap();
+
+        drop(recovered);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_save_rolls_forward_committed_workspace_transaction_first() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let current_accounts = state.accounts.read().await.clone();
+        let current_providers = state.providers.read().await.clone();
+        let current_shares = state.shares.read().await.clone();
+
+        let mut candidate_accounts = current_accounts.clone();
+        let account: crate::domain::accounts::store::UpsertAccountInput =
+            serde_json::from_value(json!({
+                "id": "pending-transaction-account",
+                "providerType": "codex_oauth",
+                "profile": {
+                    "verifiedOpenAiClaims": {
+                        "subject": "pending-transaction-subject",
+                        "chatgpt_account_id": "pending-transaction-workspace",
+                        "organizations": [{
+                            "id": "pending-transaction-workspace",
+                            "name": "Pending Transaction Workspace"
+                        }]
+                    }
+                }
+            }))
+            .unwrap();
+        candidate_accounts.upsert(account);
+        let mut candidate_providers = current_providers.materialized_clone().unwrap();
+        candidate_providers.validate_for_commit().unwrap();
+        candidate_providers
+            .rebuild_runtime_index(&candidate_accounts)
+            .unwrap();
+        candidate_providers.seal_for_commit(&config_dir).unwrap();
+        candidate_providers
+            .rebuild_runtime_index(&candidate_accounts)
+            .unwrap();
+
+        prepare_codex_workspace_rebind_transaction(
+            &config_dir,
+            &current_accounts,
+            &current_providers,
+            &current_shares,
+            &candidate_accounts,
+            &candidate_providers,
+            &current_shares,
+        )
+        .unwrap();
+        *state.providers.write().await = candidate_providers;
+        *state.accounts.write().await = candidate_accounts;
+
+        state.save_accounts().await.unwrap();
+
+        assert!(!codex_workspace_rebind_transaction_path(&config_dir).exists());
+        assert!(!codex_workspace_rebind_stage_path(&config_dir).exists());
+        let persisted = AccountStore::load_or_default(&config_dir).unwrap();
+        assert!(persisted
+            .accounts
+            .iter()
+            .any(|account| account.id == "pending-transaction-account"));
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn restore_validator_rejects_staged_current_subscription_conflict() {
+        let config_dir = provider_restore_test_dir("subscription-reference-composition");
+        let stage_dir = config_dir.join("restore-stage");
+        fs::create_dir_all(&stage_dir).unwrap();
+
+        let mut accounts = AccountStore::default();
+        for account_id in ["restore-account-a", "restore-account-b"] {
+            let input: crate::domain::accounts::store::UpsertAccountInput =
+                serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": "codex_oauth",
+                    "profile": {
+                        "verifiedOpenAiClaims": {
+                            "subject": "restore-shared-subject",
+                            "chatgpt_account_id": "restore-workspace",
+                            "organizations": [{
+                                "id": "restore-workspace",
+                                "name": "Restore Workspace"
+                            }]
+                        },
+                        "selectedChatgptAccountId": "restore-workspace"
+                    }
+                }))
+                .unwrap();
+            accounts.upsert(input);
+        }
+        accounts.save(&config_dir).unwrap();
+
+        let mut providers = ProviderStore::default();
+        for (provider_id, account_id) in [
+            ("restore-provider-a", "restore-account-a"),
+            ("restore-provider-b", "restore-account-b"),
+        ] {
+            providers.upsert(
+                AppKind::Codex,
+                Provider {
+                    id: provider_id.to_string(),
+                    name: provider_id.to_string(),
+                    settings_config: json!({}),
+                    category: None,
+                    meta: Some(ProviderMeta {
+                        provider_type: Some("codex_oauth".to_string()),
+                        auth_binding: Some(AuthBinding {
+                            source: Some("account".to_string()),
+                            auth_provider: Some("codex_oauth".to_string()),
+                            account_id: Some(account_id.to_string()),
+                            auth_identity_generation: Some(1),
+                        }),
+                        ..ProviderMeta::default()
+                    }),
+                    extra: BTreeMap::new(),
+                },
+            );
+        }
+        providers.save(&config_dir).unwrap();
+
+        let mut current_shares = ShareStore::default();
+        let mut first = router_sync_share_input("restore-share-a", "restore-provider-a");
+        first.provider_type = ProviderType::CodexOAuth;
+        current_shares.upsert(first).unwrap();
+        current_shares.save(&config_dir).unwrap();
+
+        let mut staged_shares = current_shares.clone();
+        let mut second = router_sync_share_input("restore-share-b", "restore-provider-b");
+        second.provider_type = ProviderType::CodexOAuth;
+        staged_shares.upsert(second).unwrap();
+        staged_shares.save(&stage_dir).unwrap();
+        let staged_size = fs::metadata(crate::domain::sharing::shares::shares_path(&stage_dir))
+            .unwrap()
+            .len();
+        let manifest = crate::infra::backup::BackupManifest {
+            id: "backup-subscription-composition".to_string(),
+            created_at_ms: 1,
+            reason: None,
+            files: vec![crate::infra::backup::BackupFile {
+                file_name: "shares.json".to_string(),
+                size_bytes: staged_size,
+            }],
+        };
+
+        let error =
+            validate_server_backup_restore_stage(&config_dir, &stage_dir, &manifest).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cc_switch_subscription_identity_conflict"),
+            "{error:#}"
+        );
+        assert_eq!(
+            ShareStore::load_or_default(&config_dir)
+                .unwrap()
+                .shares
+                .len(),
+            1
         );
 
         fs::remove_dir_all(config_dir).unwrap();

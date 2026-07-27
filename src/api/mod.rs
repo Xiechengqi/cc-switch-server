@@ -38,8 +38,9 @@ pub use control::{
 pub(in crate::api) use debug::*;
 pub use error::ApiError;
 pub(crate) use error::{
-    map_codex_device_error, map_copilot_device_error, map_email_auth_error, map_grok_device_error,
-    map_kiro_device_error, map_share_patch_error, map_web_auth_error, ErrorResponse,
+    map_account_write_error, map_codex_device_error, map_codex_workspace_rebind_error,
+    map_copilot_device_error, map_email_auth_error, map_grok_device_error, map_kiro_device_error,
+    map_share_patch_error, map_subscription_binding_error, map_web_auth_error, ErrorResponse,
 };
 pub(in crate::api) use events::*;
 pub(in crate::api) use invoke::dispatch::web_invoke_compat;
@@ -362,6 +363,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/shares/:id", delete(delete_share))
         .route("/api/shares/:id/connect-info", get(share_connect_info))
         .route("/api/shares/:id/subdomain", post(update_share_subdomain))
+        .route("/api/shares/:id/binding", post(update_share_binding))
         .route("/api/shares/:id/pause", post(pause_share))
         .route("/api/shares/:id/resume", post(resume_share))
         .route("/api/shares/:id/tunnel/start", post(start_share_tunnel))

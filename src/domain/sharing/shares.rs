@@ -273,7 +273,7 @@ pub struct ShareAcl {
     pub market_access_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareBinding {
     pub app: AppKind,
@@ -287,6 +287,12 @@ pub struct ShareBindingHistory {
     pub app: AppKind,
     pub previous_provider_id: Option<String>,
     pub next_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_subscription_identity_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_subscription_identity_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<String>,
     pub changed_at_ms: u128,
 }
 
@@ -394,6 +400,21 @@ impl ShareStore {
                 .find(|item| item.app == app && item.provider_id == provider_id)
                 .map(|item| item.id.clone())
         });
+        if let Some(existing) = existing_id
+            .as_deref()
+            .and_then(|id| self.shares.iter().find(|share| share.id == id))
+        {
+            let binding_changed = existing.app != input.app
+                || existing.provider_id != input.provider_id
+                || existing.provider_type != input.provider_type
+                || existing.bindings.len() != 1
+                || existing.bindings[0].app != input.bindings[0].app
+                || existing.bindings[0].provider_id != input.bindings[0].provider_id
+                || existing.bindings[0].provider_type != input.bindings[0].provider_type;
+            if binding_changed {
+                return Err(SharePatchError::BindingImmutable);
+            }
+        }
         let owner_email = input.owner_email.clone();
         let tunnel_subdomain = input.tunnel_subdomain.clone().or_else(|| {
             existing_id
@@ -934,12 +955,42 @@ impl ShareStore {
             app: binding.app,
             previous_provider_id,
             next_provider_id: Some(binding.provider_id),
+            previous_subscription_identity_fingerprint: None,
+            next_subscription_identity_fingerprint: None,
+            change_kind: Some("provider_binding".to_string()),
             changed_at_ms: now_ms(),
         });
 
         mark_share_config_pending(share);
 
         Some(share.clone()).ok_or(ShareUpdateError::NotFound)
+    }
+
+    pub fn record_subscription_identity_rebind(
+        &mut self,
+        share_id: &str,
+        previous_fingerprint: String,
+        next_fingerprint: String,
+    ) -> Result<Share, ShareUpdateError> {
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|item| item.id == share_id)
+            .ok_or(ShareUpdateError::NotFound)?;
+        if share.status != "paused" {
+            return Err(ShareUpdateError::MustBePaused);
+        }
+        share.binding_history.push(ShareBindingHistory {
+            app: share.app,
+            previous_provider_id: Some(share.provider_id.clone()),
+            next_provider_id: Some(share.provider_id.clone()),
+            previous_subscription_identity_fingerprint: Some(previous_fingerprint),
+            next_subscription_identity_fingerprint: Some(next_fingerprint),
+            change_kind: Some("subscription_identity".to_string()),
+            changed_at_ms: now_ms(),
+        });
+        mark_share_config_pending(share);
+        Ok(share.clone())
     }
 
     pub fn replace_acl(&mut self, share_id: &str, acl: ShareAcl) -> Option<Share> {
@@ -1237,29 +1288,53 @@ impl ShareStore {
         Ok(share.clone())
     }
 
-    pub fn import_shares(&mut self, shares: Vec<Share>) -> usize {
+    pub fn import_shares(&mut self, shares: Vec<Share>) -> Result<usize, SharePatchError> {
+        let mut candidate = self.clone();
         let mut imported = 0;
         for mut share in shares {
-            if self.cancel_pending_router_delete(&share.id) {
+            crate::domain::sharing::invariants::validate_share_import(&share)?;
+            if let Some(existing) = candidate.shares.iter().find(|item| item.id == share.id) {
+                if existing.app != share.app
+                    || existing.provider_id != share.provider_id
+                    || existing.provider_type != share.provider_type
+                    || existing.bindings != share.bindings
+                {
+                    return Err(SharePatchError::BindingImmutable);
+                }
+            }
+            if candidate.cancel_pending_router_delete(&share.id) {
                 mark_share_config_pending(&mut share);
             }
-            if let Some(existing) = self.shares.iter_mut().find(|item| item.id == share.id) {
+            if let Some(existing) = candidate.shares.iter_mut().find(|item| item.id == share.id) {
                 *existing = share;
             } else {
-                self.shares.push(share);
+                candidate.shares.push(share);
             }
             imported += 1;
         }
-        imported
-    }
-
-    pub fn replace_shares(&mut self, mut shares: Vec<Share>) {
-        for share in &mut shares {
-            if self.cancel_pending_router_delete(&share.id) {
-                mark_share_config_pending(share);
+        for (index, share) in candidate.shares.iter().enumerate() {
+            if share.status == "deleted" {
+                continue;
+            }
+            if candidate
+                .shares
+                .iter()
+                .enumerate()
+                .any(|(other_index, other)| {
+                    other_index != index
+                        && other.status != "deleted"
+                        && other.app == share.app
+                        && other.provider_id == share.provider_id
+                })
+            {
+                return Err(SharePatchError::Invalid(format!(
+                    "provider already has share {}",
+                    share.provider_id
+                )));
             }
         }
-        self.shares = shares;
+        *self = candidate;
+        Ok(imported)
     }
 
     pub fn replace_configured_share(&mut self, candidate: Share) -> Result<Share, SharePatchError> {
@@ -1269,6 +1344,14 @@ impl ShareStore {
             .iter()
             .position(|share| share.id == candidate.id)
             .ok_or(SharePatchError::NotFound)?;
+        let current = &self.shares[index];
+        if current.app != candidate.app
+            || current.provider_id != candidate.provider_id
+            || current.provider_type != candidate.provider_type
+            || current.bindings != candidate.bindings
+        {
+            return Err(SharePatchError::BindingImmutable);
+        }
         if self.shares.iter().enumerate().any(|(other_index, share)| {
             other_index != index
                 && share.status != "deleted"
@@ -1696,6 +1779,7 @@ impl std::error::Error for ShareUpdateError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharePatchError {
     NotFound,
+    BindingImmutable,
     Invalid(String),
 }
 
@@ -1703,6 +1787,9 @@ impl std::fmt::Display for SharePatchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => formatter.write_str("share not found"),
+            Self::BindingImmutable => formatter.write_str(
+                "share binding is immutable in ordinary upsert/import; pause the Share and use the binding endpoint",
+            ),
             Self::Invalid(message) => formatter.write_str(message),
         }
     }
@@ -2956,6 +3043,56 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_upsert_and_import_cannot_change_binding() {
+        let mut store = ShareStore::default();
+        let original = store.upsert(codex_share_input("s1")).unwrap();
+
+        let mut rebound = codex_share_input("s1");
+        rebound.provider_id = "p2".to_string();
+        let error = store.upsert(rebound).unwrap_err();
+        assert_eq!(error, SharePatchError::BindingImmutable);
+        assert_eq!(store.get("s1").unwrap().provider_id, "p1");
+
+        let mut metadata_update = original.clone();
+        metadata_update.description = Some("must remain atomic".to_string());
+        let mut imported_rebind = original;
+        imported_rebind.provider_id = "p2".to_string();
+        imported_rebind.bindings[0].provider_id = "p2".to_string();
+        let error = store
+            .import_shares(vec![metadata_update, imported_rebind])
+            .unwrap_err();
+        assert_eq!(error, SharePatchError::BindingImmutable);
+        assert_eq!(store.get("s1").unwrap().provider_id, "p1");
+        assert!(store.get("s1").unwrap().description.is_none());
+    }
+
+    #[test]
+    fn stale_full_share_replacement_cannot_restore_an_old_binding() {
+        let mut store = ShareStore::default();
+        let mut stale = store.upsert(codex_share_input("s1")).unwrap();
+        stale.description = Some("stale settings update".to_string());
+
+        store.pause("s1").unwrap();
+        store
+            .update_binding(
+                "s1",
+                ShareBinding {
+                    app: AppKind::Codex,
+                    provider_id: "p2".to_string(),
+                    provider_type: ProviderType::OpenRouter,
+                },
+            )
+            .unwrap();
+
+        let error = store.replace_configured_share(stale).unwrap_err();
+        assert_eq!(error, SharePatchError::BindingImmutable);
+        let current = store.get("s1").unwrap();
+        assert_eq!(current.provider_id, "p2");
+        assert_eq!(current.provider_type, ProviderType::OpenRouter);
+        assert!(current.description.is_none());
+    }
+
+    #[test]
     fn imports_and_replaces_acl() {
         let mut store = ShareStore::default();
         let share = Share {
@@ -2987,7 +3124,11 @@ mod tests {
             official_price_percent: None,
             auto_start: false,
             description: None,
-            bindings: Vec::new(),
+            bindings: vec![ShareBinding {
+                app: AppKind::Claude,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Claude,
+            }],
             binding_history: Vec::new(),
             runtime_snapshot: None,
             market_grant: None,
@@ -3003,7 +3144,7 @@ mod tests {
             router_synced_descriptor_fingerprint: None,
             user_grants: BTreeMap::new(),
         };
-        assert_eq!(store.import_shares(vec![share]), 1);
+        assert_eq!(store.import_shares(vec![share]).unwrap(), 1);
         let updated = store
             .replace_acl(
                 "s1",

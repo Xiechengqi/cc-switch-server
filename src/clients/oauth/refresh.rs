@@ -331,6 +331,18 @@ async fn execute_native_account_refresh_inner(
                 Some(verified.canonical_claims),
             );
         }
+        if crate::domain::accounts::store::account_refresh_replaces_auth_identity(account, &update)
+        {
+            return Err(AccountRefreshFailure {
+                status_code: 409,
+                message: format!(
+                    "{} OAuth refresh returned a different subscription identity; re-login as a new account",
+                    account.provider_type.as_str()
+                ),
+                kind: OAuthErrorKind::InvalidGrant,
+                retryable: false,
+            });
+        }
 
         return Ok(update);
     }

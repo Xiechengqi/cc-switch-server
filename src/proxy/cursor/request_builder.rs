@@ -9,7 +9,6 @@
 
 use super::agent_proto::{anthropic_tools_to_mcp_defs, openai_tools_to_mcp_defs, McpToolDef};
 use super::image::ImageRef;
-use base64::Engine;
 use bytes::Bytes;
 use serde_json::{json, Value};
 
@@ -282,20 +281,12 @@ fn anthropic_image_to_ref(block: &Value) -> Option<ImageRef> {
             let media_type = source
                 .get("media_type")
                 .and_then(Value::as_str)
-                .unwrap_or("image/png")
-                .to_string();
-            let data = source.get("data").and_then(Value::as_str)?;
-            let decoded =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data.trim())
-                    .ok()?;
-            Some(ImageRef::Inline {
-                mime: media_type,
-                data: Bytes::from(decoded),
-            })
+                .unwrap_or("image/png");
+            inline_base64_image_ref(media_type, source.get("data").and_then(Value::as_str)?)
         }
         "url" => {
             let url = source.get("url").and_then(Value::as_str)?;
-            if url.starts_with("data:") {
+            if crate::proxy::remote_image::is_data_image_uri(url) {
                 Some(ImageRef::DataUri(url.to_string()))
             } else {
                 Some(ImageRef::HttpUrl(url.to_string()))
@@ -461,11 +452,24 @@ fn openai_content_parts(v: &Value) -> (String, Vec<ImageRef>) {
 }
 
 fn push_image_ref(url: &str, out: &mut Vec<ImageRef>) {
-    if url.starts_with("data:") {
+    if crate::proxy::remote_image::is_data_image_uri(url) {
         out.push(ImageRef::DataUri(url.to_string()));
-    } else if url.starts_with("http://") || url.starts_with("https://") {
+    } else if crate::proxy::remote_image::is_http_image_url(url) {
         out.push(ImageRef::HttpUrl(url.to_string()));
     }
+}
+
+fn inline_base64_image_ref(mime: &str, data: &str) -> Option<ImageRef> {
+    let data = data.trim();
+    let max_encoded_bytes = (super::image::MAX_IMAGE_BYTES.saturating_add(2) / 3).saturating_mul(4);
+    if data.len() > max_encoded_bytes {
+        return None;
+    }
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).ok()?;
+    Some(ImageRef::Inline {
+        mime: mime.to_string(),
+        data: Bytes::from(decoded),
+    })
 }
 
 // ─── OpenAI Responses ──────────────────────────────────────────────────────
@@ -750,16 +754,9 @@ fn gemini_inline_image(part: &Value) -> Option<ImageRef> {
         .get("mimeType")
         .or_else(|| data.get("mime_type"))
         .and_then(Value::as_str)
-        .unwrap_or("image/png")
-        .to_string();
+        .unwrap_or("image/png");
     let raw = data.get("data").and_then(Value::as_str)?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(raw.trim())
-        .ok()?;
-    Some(ImageRef::Inline {
-        mime,
-        data: Bytes::from(decoded),
-    })
+    inline_base64_image_ref(mime, raw)
 }
 
 fn gemini_file_image(part: &Value) -> Option<ImageRef> {
@@ -768,9 +765,9 @@ fn gemini_file_image(part: &Value) -> Option<ImageRef> {
         .get("fileUri")
         .or_else(|| data.get("file_uri"))
         .and_then(Value::as_str)?;
-    if uri.starts_with("data:") {
+    if crate::proxy::remote_image::is_data_image_uri(uri) {
         Some(ImageRef::DataUri(uri.to_string()))
-    } else if uri.starts_with("http://") || uri.starts_with("https://") {
+    } else if crate::proxy::remote_image::is_http_image_url(uri) {
         Some(ImageRef::HttpUrl(uri.to_string()))
     } else {
         None
@@ -1188,6 +1185,23 @@ mod tests {
             ImageRef::HttpUrl(u) => assert_eq!(u, "https://example.com/x.png"),
             _ => panic!("expected HttpUrl"),
         }
+    }
+
+    #[test]
+    fn image_url_classification_accepts_case_insensitive_schemes() {
+        let mut images = Vec::new();
+        push_image_ref("HTTPS://example.com/x.png", &mut images);
+        push_image_ref("DATA:image/png;base64,iVBORw0KGgo=", &mut images);
+        assert!(matches!(images.first(), Some(ImageRef::HttpUrl(_))));
+        assert!(matches!(images.get(1), Some(ImageRef::DataUri(_))));
+    }
+
+    #[test]
+    fn inline_base64_image_rejects_oversized_payload_before_decoding() {
+        let max_encoded_bytes =
+            (crate::proxy::cursor::image::MAX_IMAGE_BYTES.saturating_add(2) / 3).saturating_mul(4);
+        let payload = "A".repeat(max_encoded_bytes + 1);
+        assert!(inline_base64_image_ref("image/png", &payload).is_none());
     }
 
     #[test]

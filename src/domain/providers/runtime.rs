@@ -432,6 +432,13 @@ fn runtime_auth_ref(
     warnings: &mut Vec<String>,
 ) -> RuntimeAuthRef {
     let Some(profile) = profile else {
+        if matches!(
+            stored.provider_type,
+            ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+        ) && provider_account_id(stored).is_some()
+        {
+            return managed_account_auth_ref(stored, accounts, stored.provider_type, warnings);
+        }
         return RuntimeAuthRef::Legacy {
             account_id: provider_account_id(stored).map(str::to_string),
             credential_generation: stored.resource.credential_generation,
@@ -440,43 +447,7 @@ fn runtime_auth_ref(
     match &profile.credential_policy {
         CredentialPolicy::ManagedAccount {
             account_provider_type,
-        } => {
-            let Some(account_id) = provider_account_id(stored) else {
-                warnings.push("managed Provider has no fixed accountId".to_string());
-                return RuntimeAuthRef::Missing;
-            };
-            let Some(expected_generation) = provider_auth_identity_generation(stored) else {
-                warnings.push("managed Provider has no auth identity generation".to_string());
-                return RuntimeAuthRef::Missing;
-            };
-            let Some(account) = accounts
-                .accounts
-                .iter()
-                .find(|account| account.id == account_id)
-            else {
-                warnings.push(format!("bound account {account_id} does not exist"));
-                return RuntimeAuthRef::Missing;
-            };
-            if account.provider_type != *account_provider_type {
-                warnings.push(format!(
-                    "bound account {account_id} has providerType {}, expected {}",
-                    account.provider_type.as_str(),
-                    account_provider_type.as_str()
-                ));
-                return RuntimeAuthRef::Missing;
-            }
-            if account.auth_identity_generation != expected_generation {
-                warnings.push(format!(
-                    "bound account {account_id} identity generation is stale"
-                ));
-                return RuntimeAuthRef::Missing;
-            }
-            RuntimeAuthRef::ManagedAccount {
-                account_id: account_id.to_string(),
-                expected_provider_type: *account_provider_type,
-                auth_identity_generation: expected_generation,
-            }
-        }
+        } => managed_account_auth_ref(stored, accounts, *account_provider_type, warnings),
         CredentialPolicy::StaticSecret { slots, auth_scheme } => {
             let summary = redact_provider(&stored.provider).1;
             if !summary.configured {
@@ -531,6 +502,72 @@ fn runtime_auth_ref(
             credential_generation: stored.resource.credential_generation,
         },
     }
+}
+
+fn managed_account_auth_ref(
+    stored: &StoredProvider,
+    accounts: &AccountStore,
+    account_provider_type: ProviderType,
+    warnings: &mut Vec<String>,
+) -> RuntimeAuthRef {
+    let Some(account_id) = provider_account_id(stored) else {
+        warnings.push("managed Provider has no fixed accountId".to_string());
+        return RuntimeAuthRef::Missing;
+    };
+    let Some(expected_generation) = provider_auth_identity_generation(stored) else {
+        warnings.push("managed Provider has no auth identity generation".to_string());
+        return RuntimeAuthRef::Missing;
+    };
+    let Some(account) = accounts
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+    else {
+        warnings.push(format!("bound account {account_id} does not exist"));
+        return RuntimeAuthRef::Missing;
+    };
+    if account.provider_type != account_provider_type {
+        warnings.push(format!(
+            "bound account {account_id} has providerType {}, expected {}",
+            account.provider_type.as_str(),
+            account_provider_type.as_str()
+        ));
+        return RuntimeAuthRef::Missing;
+    }
+    if account.auth_identity_generation != expected_generation {
+        warnings.push(format!(
+            "bound account {account_id} identity generation is stale"
+        ));
+        return RuntimeAuthRef::Missing;
+    }
+    RuntimeAuthRef::ManagedAccount {
+        account_id: account_id.to_string(),
+        expected_provider_type: account_provider_type,
+        auth_identity_generation: expected_generation,
+    }
+}
+
+pub fn has_authoritative_subscription_oauth_binding(stored: &StoredProvider) -> bool {
+    if provider_account_id(stored).is_none()
+        || !matches!(
+            stored.provider_type,
+            ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+        )
+    {
+        return false;
+    }
+    let Some(profile_id) = stored.resource.profile_id.as_ref() else {
+        return true;
+    };
+    profile_by_id(profile_id.as_str()).is_some_and(|profile| {
+        profile.app == stored.app
+            && matches!(
+                &profile.credential_policy,
+                CredentialPolicy::ManagedAccount {
+                    account_provider_type
+                } if *account_provider_type == stored.provider_type
+            )
+    })
 }
 
 fn normalized_slots(declared: &[String], discovered: &[String]) -> Vec<String> {
@@ -1034,6 +1071,49 @@ mod tests {
             RuntimeConfigurationState::NeedsAttention
         );
         assert_eq!(changed_identity.auth_ref, RuntimeAuthRef::Missing);
+    }
+
+    #[test]
+    fn bound_legacy_subscription_oauth_uses_managed_auth_even_with_a_static_secret() {
+        let mut stored = provider("codex.openai_oauth", ProviderType::CodexOAuth);
+        stored.resource.profile_id = None;
+        stored.resource.profile_schema_revision = None;
+        stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("legacy-secret");
+        stored.provider.meta.as_mut().unwrap().auth_binding = Some(AuthBinding {
+            source: Some("account".to_string()),
+            auth_provider: Some("codex_oauth".to_string()),
+            account_id: Some("account-1".to_string()),
+            auth_identity_generation: Some(3),
+        });
+        let account = serde_json::from_value(json!({
+            "id": "account-1",
+            "providerType": "codex_oauth",
+            "authIdentityGeneration": 3,
+            "accessToken": "managed-access-token"
+        }))
+        .unwrap();
+
+        let plan = compile_runtime_plan(
+            &stored,
+            &AccountStore {
+                accounts: vec![account],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.configuration_state,
+            RuntimeConfigurationState::LegacyCompat
+        );
+        assert_eq!(
+            plan.auth_ref,
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "account-1".to_string(),
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 3,
+            }
+        );
+        assert!(has_authoritative_subscription_oauth_binding(&stored));
     }
 
     #[test]

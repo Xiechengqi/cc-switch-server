@@ -74,6 +74,13 @@ pub fn write_bytes_atomic(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     write_bytes_atomic_with_hook(path, content, |_| Ok(()))
 }
 
+pub fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("open dir {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync dir {}", path.display()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtomicWriteStage {
     Serialize,
@@ -123,10 +130,7 @@ pub(crate) fn write_bytes_atomic_with_hook(
         })?;
         before_stage(AtomicWriteStage::SyncDirectory)?;
         if let Some(parent) = path.parent() {
-            fs::File::open(parent)
-                .with_context(|| format!("open dir {} for sync", parent.display()))?
-                .sync_all()
-                .with_context(|| format!("sync dir {}", parent.display()))?;
+            sync_directory(parent)?;
         }
         Ok(())
     })();

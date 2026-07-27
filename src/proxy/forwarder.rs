@@ -50,11 +50,11 @@ use super::response_semantics::{
     SemanticTerminal,
 };
 use super::router::{
-    account_concurrency_for_provider, ensure_provider_account_does_not_need_relogin,
-    ensure_provider_account_usage_available, provider_supports_claude_count_tokens,
-    select_failover_provider, select_failover_provider_matching,
-    select_provider_for_claude_count_tokens, select_provider_for_codex_image_generation,
-    select_provider_with_account_inflight, ProxyRoute,
+    account_concurrency_for_provider, codex_image_generation_provider,
+    ensure_provider_account_does_not_need_relogin, ensure_provider_account_usage_available,
+    provider_supports_claude_count_tokens, select_failover_provider,
+    select_failover_provider_matching, select_provider_for_claude_count_tokens,
+    select_provider_for_codex_image_generation, select_provider_with_account_inflight, ProxyRoute,
 };
 use super::streaming::{ClaudeSseErrorDetector, StreamUsageAccumulator};
 use super::usage::{log_usage, update_stream_usage};
@@ -489,6 +489,8 @@ async fn forward_with_attempt(
                     codex_image_tool_strip_policy(&stored),
                 )?;
             }
+            adapter_request.body =
+                super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
         }
         execution.enforce_model_policy(&mut adapter_request)?;
         let grok_contract = if execution.driver_is("oauth.grok_responses") {
@@ -2153,11 +2155,10 @@ pub async fn forward_images_generations(
         current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
     let (execution, account_in_flight_guard) =
         if let Some(share_id) = request_context.share_id.as_deref() {
-            let (execution, _share_name) = select_share_execution(
+            let (execution, _share_name) = select_share_image_generation_execution(
                 &providers,
                 &shares,
                 &accounts_for_selection,
-                AppKind::Codex,
                 share_id,
             )?;
             let snapshot = state.account_in_flight.snapshot();
@@ -3065,6 +3066,11 @@ async fn bridge_responses_websocket(
                     single_upstream_model.as_deref(),
                 ) else {
                     break;
+                };
+                let message = if matches!(mode, ResponsesWebsocketMode::Codex) {
+                    prepare_codex_responses_websocket_request(message).await?
+                } else {
+                    message
                 };
                 let starts_response = responses_websocket_request_starts_response(&message);
                 if starts_response {
@@ -4696,6 +4702,8 @@ async fn prepare_codex_http_fallback_target(
         session_id,
         codex_image_tool_strip_policy(&stored),
     )?;
+    adapter_request.body =
+        super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
     adapter_request.stream_requested = true;
     execution.enforce_model_policy(&mut adapter_request)?;
     execution.finalize_request(&mut adapter_request)?;
@@ -4753,6 +4761,58 @@ fn responses_websocket_http_body(message: &TungsteniteMessage) -> Result<Value, 
     };
     object.remove("type");
     Ok(value)
+}
+
+async fn prepare_codex_responses_websocket_request(
+    message: TungsteniteMessage,
+) -> Result<TungsteniteMessage, ProxyError> {
+    if websocket_message_json_type(&message).as_deref() != Some("response.create") {
+        return Ok(message);
+    }
+    let binary = matches!(message, TungsteniteMessage::Binary(_));
+    let bytes = match &message {
+        TungsteniteMessage::Text(text) => text.as_bytes(),
+        TungsteniteMessage::Binary(bytes) => bytes.as_slice(),
+        _ => return Ok(message),
+    };
+    let mut frame = serde_json::from_slice::<Value>(bytes).map_err(|error| {
+        ProxyError::bad_request(format!("invalid response.create JSON: {error}"))
+    })?;
+    let target = if frame.get("response").is_some() {
+        frame
+            .get_mut("response")
+            .filter(|response| response.is_object())
+            .ok_or_else(|| ProxyError::bad_request("response.create.response must be an object"))?
+    } else {
+        &mut frame
+    };
+    sanitize_codex_oauth_request_body(target);
+    strip_codex_oauth_unsupported_responses_fields(target);
+    let target_body = serde_json::to_vec(target)
+        .map(Bytes::from)
+        .map_err(|error| {
+            ProxyError::bad_request(format!("encode response.create body: {error}"))
+        })?;
+    *target = serde_json::from_slice(
+        &super::remote_image::inline_codex_remote_images(&target_body).await?,
+    )
+    .map_err(|error| {
+        ProxyError::bad_request(format!("decode prepared response.create body: {error}"))
+    })?;
+
+    if binary {
+        serde_json::to_vec(&frame)
+            .map(TungsteniteMessage::Binary)
+            .map_err(|error| {
+                ProxyError::bad_request(format!("encode response.create frame: {error}"))
+            })
+    } else {
+        serde_json::to_string(&frame)
+            .map(TungsteniteMessage::Text)
+            .map_err(|error| {
+                ProxyError::bad_request(format!("encode response.create frame: {error}"))
+            })
+    }
 }
 
 async fn relay_codex_http_fallback_stream(
@@ -7671,7 +7731,10 @@ fn append_codex_oauth_session_headers(
 }
 
 const CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS: &[&str] = &[
+    "max_tokens",
+    "max_completion_tokens",
     "max_output_tokens",
+    "reasoning_effort",
     "temperature",
     "top_p",
     "frequency_penalty",
@@ -7685,7 +7748,13 @@ const CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS: &[&str] = &[
     "seed",
     "stream_options",
     "user",
+    "prompt_cache_retention",
+    "metadata",
+    "safety_identifier",
+    "previous_response_id",
 ];
+
+const CODEX_OAUTH_SERVER_ITEM_ID_PREFIXES: &[&str] = &["rs_", "fc_", "resp_", "msg_"];
 
 fn normalize_codex_oauth_responses_body_bytes(
     body: &Bytes,
@@ -7715,6 +7784,8 @@ fn normalize_codex_oauth_compact_body_bytes(body: &Bytes) -> Result<Bytes, Proxy
         object.remove("store");
         object.remove("prompt_cache_key");
     }
+    sanitize_codex_oauth_request_body(&mut value);
+    strip_codex_oauth_unsupported_responses_fields(&mut value);
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|error| ProxyError {
@@ -7759,14 +7830,7 @@ fn normalize_codex_oauth_responses_body(
         .map(str::to_string);
     body["store"] = Value::Bool(false);
     body["stream"] = Value::Bool(true);
-
-    if let (Some(model), Some(effort)) = (
-        model.as_deref(),
-        body.pointer("/reasoning/effort").and_then(Value::as_str),
-    ) {
-        let normalized = super::codex_models::normalize_reasoning_effort(model, effort);
-        body["reasoning"]["effort"] = Value::String(normalized);
-    }
+    sanitize_codex_oauth_request_body(&mut body);
 
     if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
         for item in items {
@@ -7824,13 +7888,267 @@ fn normalize_codex_oauth_responses_body(
         body["parallel_tool_calls"] = Value::Bool(false);
     }
 
-    if let Some(obj) = body.as_object_mut() {
-        for field in CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS {
-            obj.remove(*field);
+    strip_codex_oauth_unsupported_responses_fields(&mut body);
+
+    body
+}
+
+fn sanitize_codex_oauth_request_body(body: &mut Value) {
+    normalize_codex_oauth_reasoning_effort(body);
+
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        input.retain(|item| {
+            !item.as_str().is_some_and(is_codex_oauth_server_item_id)
+                && item.get("type").and_then(Value::as_str) != Some("item_reference")
+        });
+        for item in input {
+            let has_server_item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(is_codex_oauth_server_item_id);
+            if has_server_item_id {
+                if let Some(object) = item.as_object_mut() {
+                    object.remove("id");
+                }
+            }
+            let message_type = item.get("type").and_then(Value::as_str);
+            if matches!(message_type, None | Some("message"))
+                && item.get("role").and_then(Value::as_str) == Some("system")
+            {
+                item["role"] = Value::String("developer".to_string());
+            }
         }
     }
 
-    body
+    let mut valid_function_names = BTreeSet::new();
+    let mut valid_namespace_functions = BTreeSet::new();
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        let mut normalized_tools = Vec::with_capacity(tools.len());
+        for tool in std::mem::take(tools) {
+            let Some(object) = tool.as_object() else {
+                continue;
+            };
+            match object.get("type").and_then(Value::as_str) {
+                Some("function") => {
+                    let Some((tool, name)) = normalize_codex_function_tool(object) else {
+                        continue;
+                    };
+                    valid_function_names.insert(name);
+                    normalized_tools.push(tool);
+                }
+                Some("namespace") => {
+                    let namespace = object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string);
+                    if let Some(namespace_tools) = object.get("tools").and_then(Value::as_array) {
+                        for namespace_tool in namespace_tools {
+                            let Some(name) = namespace_tool
+                                .get("name")
+                                .and_then(normalized_codex_tool_name)
+                            else {
+                                continue;
+                            };
+                            valid_function_names.insert(name.clone());
+                            if let Some(namespace) = namespace.as_ref() {
+                                valid_namespace_functions.insert((namespace.clone(), name.clone()));
+                            }
+                        }
+                    }
+                    normalized_tools.push(tool);
+                }
+                Some("custom") => normalized_tools.push(tool),
+                Some(tool_type) if codex_oauth_hosted_tool_type(tool_type) => {
+                    normalized_tools.push(tool);
+                }
+                _ => {}
+            }
+        }
+        *tools = normalized_tools;
+    }
+
+    let normalized_tool_choice = body.get("tool_choice").and_then(|choice| match choice {
+        Value::String(value) if matches!(value.as_str(), "auto" | "none" | "required") => {
+            Some(choice.clone())
+        }
+        Value::Object(object) => {
+            let choice_type = object.get("type").and_then(Value::as_str)?.trim();
+            if choice_type.is_empty() {
+                return None;
+            }
+            if matches!(choice_type, "function" | "custom") {
+                let name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        object
+                            .get("function")
+                            .and_then(|function| function.get("name"))
+                            .and_then(Value::as_str)
+                    })?
+                    .trim();
+                if name.is_empty() {
+                    return None;
+                }
+                let name = name.chars().take(128).collect::<String>();
+                if choice_type == "function" {
+                    let namespace = object
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|namespace| !namespace.is_empty());
+                    let valid = namespace.map_or_else(
+                        || valid_function_names.contains(&name),
+                        |namespace| {
+                            valid_namespace_functions
+                                .contains(&(namespace.to_string(), name.clone()))
+                        },
+                    );
+                    if !valid {
+                        return None;
+                    }
+                    let mut normalized = serde_json::Map::new();
+                    normalized.insert("type".to_string(), Value::String(choice_type.to_string()));
+                    normalized.insert("name".to_string(), Value::String(name));
+                    if let Some(namespace) = namespace {
+                        normalized.insert(
+                            "namespace".to_string(),
+                            Value::String(namespace.to_string()),
+                        );
+                    }
+                    return Some(Value::Object(normalized));
+                }
+                return Some(serde_json::json!({"type": choice_type, "name": name}));
+            }
+            Some(choice.clone())
+        }
+        _ => None,
+    });
+    if body.get("tool_choice").is_some() {
+        if let Some(choice) = normalized_tool_choice {
+            body["tool_choice"] = choice;
+        } else if let Some(object) = body.as_object_mut() {
+            object.remove("tool_choice");
+        }
+    }
+}
+
+fn normalize_codex_oauth_reasoning_effort(body: &mut Value) {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let effort = body
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("reasoning_effort").and_then(Value::as_str))
+        .map(str::to_string);
+
+    if let Some(effort) = effort.as_deref() {
+        let normalized = model.as_deref().map_or_else(
+            || effort.to_string(),
+            |model| super::codex_models::normalize_reasoning_effort(model, effort),
+        );
+        if !body.get("reasoning").is_some_and(Value::is_object) {
+            body["reasoning"] = Value::Object(serde_json::Map::new());
+        }
+        body["reasoning"]["effort"] = Value::String(normalized);
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("reasoning_effort");
+    }
+}
+
+fn is_codex_oauth_server_item_id(id: &str) -> bool {
+    CODEX_OAUTH_SERVER_ITEM_ID_PREFIXES
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
+fn strip_codex_oauth_unsupported_responses_fields(body: &mut Value) {
+    if let Some(object) = body.as_object_mut() {
+        for field in CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS {
+            object.remove(*field);
+        }
+    }
+}
+
+fn normalize_codex_function_tool(
+    object: &serde_json::Map<String, Value>,
+) -> Option<(Value, String)> {
+    let nested = object.get("function").and_then(Value::as_object);
+    let name = object
+        .get("name")
+        .and_then(normalized_codex_tool_name)
+        .or_else(|| {
+            nested
+                .and_then(|function| function.get("name"))
+                .and_then(normalized_codex_tool_name)
+        })?;
+    let description = object
+        .get("description")
+        .filter(|value| value.is_string())
+        .or_else(|| {
+            nested
+                .and_then(|function| function.get("description"))
+                .filter(|value| value.is_string())
+        });
+    let parameters = object
+        .get("parameters")
+        .filter(|value| value.is_object())
+        .or_else(|| {
+            nested
+                .and_then(|function| function.get("parameters"))
+                .filter(|value| value.is_object())
+        })
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+    let strict = object
+        .get("strict")
+        .filter(|value| value.is_boolean())
+        .or_else(|| {
+            nested
+                .and_then(|function| function.get("strict"))
+                .filter(|value| value.is_boolean())
+        });
+
+    let mut normalized = serde_json::Map::new();
+    normalized.insert("type".to_string(), Value::String("function".to_string()));
+    normalized.insert("name".to_string(), Value::String(name.clone()));
+    if let Some(description) = description {
+        normalized.insert("description".to_string(), description.clone());
+    }
+    normalized.insert("parameters".to_string(), parameters);
+    if let Some(strict) = strict {
+        normalized.insert("strict".to_string(), strict.clone());
+    }
+    Some((Value::Object(normalized), name))
+}
+
+fn normalized_codex_tool_name(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.chars().take(128).collect())
+}
+
+fn codex_oauth_hosted_tool_type(tool_type: &str) -> bool {
+    matches!(
+        tool_type,
+        "image_generation"
+            | "web_search"
+            | "web_search_preview"
+            | "file_search"
+            | "computer"
+            | "computer_use_preview"
+            | "code_interpreter"
+            | "mcp"
+            | "local_shell"
+            | "tool_search"
+    )
 }
 
 fn codex_image_tool_strip_policy(stored: &StoredProvider) -> CodexImageToolStripPolicy {
@@ -7878,7 +8196,23 @@ fn strip_codex_image_generation_tools(body: &mut Value) -> bool {
             }
         }
     }
+    if body
+        .get("tool_choice")
+        .is_some_and(is_codex_image_generation_tool_choice)
+    {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("tool_choice");
+            stripped = true;
+        }
+    }
     stripped
+}
+
+fn is_codex_image_generation_tool_choice(choice: &Value) -> bool {
+    choice
+        .as_str()
+        .is_some_and(|choice| matches!(choice, "image_generation" | "image_gen"))
+        || is_codex_image_generation_tool(choice)
 }
 
 fn is_codex_image_generation_tool(tool: &Value) -> bool {
@@ -8856,12 +9190,34 @@ fn select_share_execution(
     app: AppKind,
     share_id: &str,
 ) -> Result<(ProviderExecution, Option<String>), ProxyError> {
+    crate::domain::sharing::subscription_identity::validate_share_subscription_binding(
+        share_id, providers, accounts, shares,
+    )
+    .map_err(|error| ProxyError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: format!("[{}] {error}", error.code()),
+    })?;
     let (stored, share_name) = select_share_provider(providers, shares, app, share_id)?;
     ensure_provider_account_does_not_need_relogin(&stored, accounts)?;
     ensure_provider_account_usage_available(&stored, accounts, current_time_ms())?;
     let execution = ProviderExecution::from_store(providers, stored)?;
     execution.ensure_operation_supported(ProviderOperation::Forward)?;
     Ok((execution, share_name))
+}
+
+fn select_share_image_generation_execution(
+    providers: &ProviderStore,
+    shares: &ShareStore,
+    accounts: &AccountStore,
+    share_id: &str,
+) -> Result<(ProviderExecution, Option<String>), ProxyError> {
+    let selection = select_share_execution(providers, shares, accounts, AppKind::Codex, share_id)?;
+    if !codex_image_generation_provider(&selection.0.stored) {
+        return Err(ProxyError::bad_request(
+            "image generation requires a grok_oauth provider or codex_oauth provider with image generation enabled",
+        ));
+    }
+    Ok(selection)
 }
 
 fn model_metadata(request: &adapters::AdapterRequest) -> UsageModelMetadata {
@@ -9365,7 +9721,7 @@ mod tests {
                     api_key: None,
                     extra_headers: None,
                     scopes: Vec::new(),
-                    profile: None,
+                    profile: Some(json!({"accountUUID": "legacy-principal"})),
                     raw: Some(json!({"testOAuthTokenUrl": token_url})),
                     subscription_level: None,
                     entitlement_status: None,
@@ -9399,7 +9755,7 @@ mod tests {
                                 source: Some("account_store".to_string()),
                                 auth_provider: Some("claude_oauth".to_string()),
                                 account_id: Some("legacy-refresh-account".to_string()),
-                                auth_identity_generation: None,
+                                auth_identity_generation: Some(1),
                             }),
                             ..Default::default()
                         }),
@@ -9675,7 +10031,7 @@ mod tests {
                                     source: Some("account_store".to_string()),
                                     auth_provider: Some("claude_oauth".to_string()),
                                     account_id: Some(format!("unauthorized-{kind}-account")),
-                                    auth_identity_generation: None,
+                                    auth_identity_generation: Some(1),
                                 }),
                                 ..Default::default()
                             }),
@@ -9876,7 +10232,7 @@ mod tests {
                     api_key: None,
                     extra_headers: None,
                     scopes: Vec::new(),
-                    profile: None,
+                    profile: Some(json!({"accountUUID": "rejected-principal"})),
                     raw: Some(json!({"testOAuthTokenUrl": token_url})),
                     subscription_level: None,
                     entitlement_status: None,
@@ -9911,7 +10267,7 @@ mod tests {
                                 source: Some("account_store".to_string()),
                                 auth_provider: Some("claude_oauth".to_string()),
                                 account_id: Some("auth-failover-account".to_string()),
-                                auth_identity_generation: None,
+                                auth_identity_generation: Some(1),
                             }),
                             ..Default::default()
                         }),
@@ -10006,7 +10362,10 @@ mod tests {
                     .find(|account| account.id == "auth-failover-account")
                     .expect("managed account");
                 account.rate_limited_until = None;
-                account.raw = Some(json!({"testOAuthTokenUrl": pinned_token_url}));
+                account.raw = Some(json!({
+                    "testOAuthTokenUrl": pinned_token_url,
+                    "account": {"uuid": "rejected-principal"}
+                }));
             })
             .await
             .unwrap();
@@ -10064,7 +10423,7 @@ mod tests {
                         source: Some("account_store".to_string()),
                         auth_provider: Some(provider_type.as_str().to_string()),
                         account_id: Some(account_id.to_string()),
-                        auth_identity_generation: None,
+                        auth_identity_generation: Some(1),
                     }),
                     provider_type: Some(provider_type.as_str().to_string()),
                     ..ProviderMeta::default()
@@ -10075,6 +10434,74 @@ mod tests {
             provider_type_id: provider_type.as_str().to_string(),
             resource: Default::default(),
         }
+    }
+
+    fn share_image_generation_fixture(
+        provider_type: ProviderType,
+        codex_image_generation_enabled: Option<bool>,
+    ) -> (ProviderStore, ShareStore, AccountStore) {
+        let account_id = format!("{}-share-image-account", provider_type.as_str());
+        let provider_id = format!("{}-share-image-provider", provider_type.as_str());
+        let share_id = format!("{}-share-image", provider_type.as_str());
+        let profile = if provider_type == ProviderType::CodexOAuth {
+            json!({
+                "verifiedOpenAiClaims": {
+                    "subject": "share-image-subject",
+                    "chatgpt_account_id": "share-image-workspace"
+                },
+                "workspaces": [{
+                    "id": "share-image-workspace",
+                    "name": "Share Image Workspace"
+                }]
+            })
+        } else {
+            Value::Null
+        };
+        let mut accounts = AccountStore::default();
+        accounts.upsert(
+            serde_json::from_value(json!({
+                "id": account_id,
+                "providerType": provider_type.as_str(),
+                "accessToken": "share-image-access-token",
+                "profile": profile
+            }))
+            .unwrap(),
+        );
+
+        let mut provider =
+            stored_provider(AppKind::Codex, provider_type, json!({}), Some(&account_id));
+        provider.provider.id = provider_id.clone();
+        provider
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .codex_image_generation_enabled = codex_image_generation_enabled;
+        let mut providers = ProviderStore {
+            providers: vec![provider],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+
+        let share = serde_json::from_value(json!({
+            "id": share_id,
+            "app": "codex",
+            "providerId": provider_id,
+            "providerType": provider_type.as_str(),
+            "enabled": true,
+            "status": "active",
+            "bindings": [{
+                "app": "codex",
+                "providerId": provider_id,
+                "providerType": provider_type.as_str()
+            }]
+        }))
+        .unwrap();
+        let shares = ShareStore {
+            shares: vec![share],
+            ..ShareStore::default()
+        };
+        (providers, shares, accounts)
     }
 
     async fn test_responses_upstream_socket(
@@ -10223,6 +10650,10 @@ mod tests {
             extra_headers: None,
             scopes: Vec::new(),
             profile: Some(json!({
+                "verifiedOpenAiClaims": {
+                    "subject": format!("subject-{name}-workspace"),
+                    "chatgpt_account_id": format!("{name}-workspace")
+                },
                 "codexWorkspaceProvenance": {
                     "workspaceId": format!("{name}-workspace"),
                     "source": "test_fixture"
@@ -10358,8 +10789,12 @@ mod tests {
                     extra_headers: None,
                     scopes: Vec::new(),
                     profile: Some(json!({
+                        "verifiedOpenAiClaims": {
+                            "subject": format!("subject-{workspace_id}"),
+                            "chatgpt_account_id": workspace_id.clone()
+                        },
                         "codexWorkspaceProvenance": {
-                            "workspaceId": workspace_id,
+                            "workspaceId": workspace_id.clone(),
                             "source": "test_fixture"
                         }
                     })),
@@ -11140,6 +11575,10 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                     extra_headers: None,
                     scopes: Vec::new(),
                     profile: Some(json!({
+                        "verifiedOpenAiClaims": {
+                            "subject": format!("subject-{workspace_id}"),
+                            "chatgpt_account_id": workspace_id.clone()
+                        },
                         "codexWorkspaceProvenance": {
                             "workspaceId": workspace_id,
                             "source": "test_fixture"
@@ -11242,12 +11681,21 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
 
     #[test]
     fn share_execution_rejects_explicit_account_usage_block() {
-        let provider = stored_provider(
+        let mut provider = stored_provider(
             AppKind::Codex,
             ProviderType::CodexOAuth,
             json!({}),
             Some("share-account"),
         );
+        provider
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .auth_binding
+            .as_mut()
+            .unwrap()
+            .auth_identity_generation = Some(1);
         let provider_id = provider.provider.id.clone();
         let providers = ProviderStore {
             providers: vec![provider],
@@ -11259,7 +11707,12 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             "providerId": provider_id,
             "providerType": "codex_oauth",
             "enabled": true,
-            "status": "active"
+            "status": "active",
+            "bindings": [{
+                "app": "codex",
+                "providerId": provider_id,
+                "providerType": "codex_oauth"
+            }]
         }))
         .unwrap();
         let shares = ShareStore {
@@ -11271,6 +11724,16 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             serde_json::from_value(json!({
                 "id": "share-account",
                 "providerType": "codex_oauth",
+                "profile": {
+                    "verifiedOpenAiClaims": {
+                        "subject": "share-account-subject",
+                        "chatgpt_account_id": "share-account-workspace"
+                    },
+                    "workspaces": [{
+                        "id": "share-account-workspace",
+                        "name": "Share Account Workspace"
+                    }]
+                },
                 "rateLimitedUntil": current_time_ms() + 60_000
             }))
             .unwrap(),
@@ -11287,6 +11750,43 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
 
         assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
         assert!(error.message.contains("rate_limited"));
+    }
+
+    #[test]
+    fn share_image_generation_honors_provider_capability() {
+        let (providers, shares, accounts) =
+            share_image_generation_fixture(ProviderType::CodexOAuth, None);
+        let error = select_share_image_generation_execution(
+            &providers,
+            &shares,
+            &accounts,
+            "codex_oauth-share-image",
+        )
+        .expect_err("Codex image generation must be disabled by default for a Share");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("image generation enabled"));
+
+        let (providers, shares, accounts) =
+            share_image_generation_fixture(ProviderType::CodexOAuth, Some(true));
+        let (execution, _) = select_share_image_generation_execution(
+            &providers,
+            &shares,
+            &accounts,
+            "codex_oauth-share-image",
+        )
+        .expect("an explicitly enabled Codex Provider must support Share image generation");
+        assert_eq!(execution.stored.provider_type, ProviderType::CodexOAuth);
+
+        let (providers, shares, accounts) =
+            share_image_generation_fixture(ProviderType::GrokOAuth, None);
+        let (execution, _) = select_share_image_generation_execution(
+            &providers,
+            &shares,
+            &accounts,
+            "grok_oauth-share-image",
+        )
+        .expect("Grok Share image generation must remain enabled");
+        assert_eq!(execution.stored.provider_type, ProviderType::GrokOAuth);
     }
 
     #[test]
@@ -11664,7 +12164,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         );
         assert_eq!(normalized.pointer("/reasoning/effort"), Some(&json!("max")));
         assert!(normalized.pointer("/input/0/id").is_none());
-        assert_eq!(normalized.pointer("/input/1/id"), Some(&json!("msg_valid")));
+        assert!(normalized.pointer("/input/1/id").is_none());
         assert_eq!(normalized.pointer("/input/2/id"), Some(&json!("item_call")));
     }
 
@@ -11677,6 +12177,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                     {"type": "image_generation"},
                     {"type": "function", "name": "lookup"}
                 ],
+                "tool_choice": {"type": "image_generation"},
                 "input": [{
                     "type": "additional_tools",
                     "tools": [
@@ -11689,6 +12190,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             CodexImageToolStripPolicy::Always,
         );
         assert_eq!(normalized.pointer("/tools/0/name"), Some(&json!("lookup")));
+        assert!(normalized.get("tool_choice").is_none());
         assert_eq!(
             normalized.pointer("/input/0/tools/0/name"),
             Some(&json!("edit"))
@@ -11755,13 +12257,233 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         let body = json!({
             "model": "gpt-5",
             "input": [],
+            "max_tokens": 128,
+            "max_completion_tokens": 128,
             "max_output_tokens": 128,
-            "temperature": 0.2
+            "reasoning_effort": "high",
+            "temperature": 0.2,
+            "prompt_cache_retention": "24h",
+            "metadata": {"source": "cursor"},
+            "safety_identifier": "droid-user",
+            "previous_response_id": "resp_previous"
         });
         let normalized =
             normalize_codex_oauth_responses_body(body, None, CodexImageToolStripPolicy::Never);
-        assert!(normalized.get("max_output_tokens").is_none());
-        assert!(normalized.get("temperature").is_none());
+        for field in [
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "reasoning_effort",
+            "temperature",
+            "prompt_cache_retention",
+            "metadata",
+            "safety_identifier",
+            "previous_response_id",
+        ] {
+            assert!(normalized.get(field).is_none(), "field {field} survived");
+        }
+        assert_eq!(
+            normalized.pointer("/reasoning/effort"),
+            Some(&json!("high"))
+        );
+    }
+
+    #[test]
+    fn codex_oauth_request_sanitizer_normalizes_proven_incompatible_shapes() {
+        let normalized = normalize_codex_oauth_responses_body(
+            json!({
+                "model": "gpt-5.1-codex",
+                "input": [
+                    "resp_stored_response",
+                    "plain user input",
+                    {"type": "item_reference", "id": "item_1"},
+                    {"type": "message", "id": "msg_stored_message", "role": "system", "content": "be precise"},
+                    {"type": "message", "id": "client-message", "role": "user", "content": "hello"},
+                    {"type": "function_call", "id": "fc_stored_call", "name": "lookup"},
+                    {"type": "reasoning", "id": "rs_stored_reasoning", "summary": []}
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "lookup a value",
+                        "parameters": {"type": "object"},
+                        "strict": true
+                    }
+                }],
+                "tool_choice": {"type": "function", "function": {"name": "lookup"}}
+            }),
+            None,
+            CodexImageToolStripPolicy::Never,
+        );
+
+        assert_eq!(normalized["input"].as_array().unwrap().len(), 5);
+        assert_eq!(normalized["input"][0], "plain user input");
+        assert_eq!(normalized["input"][1]["role"], "developer");
+        assert!(normalized["input"][1].get("id").is_none());
+        assert!(normalized["input"][2].get("id").is_none());
+        assert!(normalized["input"][3].get("id").is_none());
+        assert!(normalized["input"][4].get("id").is_none());
+        assert_eq!(normalized["tools"][0]["name"], "lookup");
+        assert!(normalized["tools"][0].get("function").is_none());
+        assert_eq!(
+            normalized["tool_choice"],
+            json!({"type": "function", "name": "lookup"})
+        );
+    }
+
+    #[test]
+    fn codex_oauth_request_sanitizer_removes_invalid_tool_choice() {
+        let mut body = json!({"tool_choice": {"type": "function", "function": {}}});
+        sanitize_codex_oauth_request_body(&mut body);
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn codex_oauth_request_sanitizer_removes_unknown_function_tool_choice() {
+        let mut body = json!({
+            "tools": [{"type": "function", "name": "known", "parameters": {"type": "object"}}],
+            "tool_choice": {"type": "function", "name": "unknown"}
+        });
+        sanitize_codex_oauth_request_body(&mut body);
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn codex_oauth_request_sanitizer_filters_malformed_and_unsupported_tools() {
+        let mut body = json!({
+            "tools": [
+                null,
+                "invalid",
+                {"type": "function", "parameters": {"type": "object"}},
+                {"type": "unsupported_hosted_tool"},
+                {"type": "web_search_preview"},
+                {"type": "custom", "name": "exec", "format": {"type": "text"}},
+                {"type": "function", "function": {"name": "lookup"}}
+            ]
+        });
+
+        sanitize_codex_oauth_request_body(&mut body);
+
+        assert_eq!(body["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(body["tools"][0]["type"], "web_search_preview");
+        assert_eq!(body["tools"][1]["type"], "custom");
+        assert_eq!(body["tools"][2]["name"], "lookup");
+        assert_eq!(
+            body["tools"][2]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+        assert!(body["tools"][2].get("function").is_none());
+    }
+
+    #[test]
+    fn codex_oauth_request_sanitizer_preserves_namespace_tool_choice() {
+        let mut body = json!({
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp_files",
+                "tools": [{"name": "read"}]
+            }],
+            "tool_choice": {
+                "type": "function",
+                "name": "read",
+                "namespace": "mcp_files"
+            }
+        });
+
+        sanitize_codex_oauth_request_body(&mut body);
+
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "name": "read", "namespace": "mcp_files"})
+        );
+    }
+
+    #[test]
+    fn codex_oauth_request_sanitizer_converts_untyped_system_messages() {
+        let mut body = json!({
+            "input": [{"role": "system", "content": "be precise"}],
+            "reasoning_effort": "high"
+        });
+        sanitize_codex_oauth_request_body(&mut body);
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("high")));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_request_uses_the_same_sanitizer() {
+        let prepared = prepare_codex_responses_websocket_request(TungsteniteMessage::Text(
+            json!({
+                "type": "response.create",
+                "response": {
+                    "model": "gpt-5.5",
+                    "input": [
+                        "msg_stored_message",
+                        {"type": "item_reference", "id": "item_1"},
+                        {"type": "message", "id": "msg_stored_message", "role": "system", "content": "be precise"}
+                    ],
+                    "previous_response_id": "resp_previous",
+                    "reasoning_effort": "max",
+                    "metadata": {"source": "cursor"},
+                    "tools": [{
+                        "type": "function",
+                        "function": {"name": "lookup", "parameters": {"type": "object"}}
+                    }]
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        let TungsteniteMessage::Text(prepared) = prepared else {
+            panic!("prepared request must remain a text frame");
+        };
+        let prepared: Value = serde_json::from_str(&prepared).unwrap();
+        assert_eq!(prepared["response"]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(prepared["response"]["input"][0]["role"], "developer");
+        assert!(prepared["response"]["input"][0].get("id").is_none());
+        assert!(prepared["response"].get("previous_response_id").is_none());
+        assert!(prepared["response"].get("metadata").is_none());
+        assert_eq!(
+            prepared["response"].pointer("/reasoning/effort"),
+            Some(&json!("xhigh"))
+        );
+        assert_eq!(prepared["response"]["tools"][0]["name"], "lookup");
+        assert!(prepared["response"]["tools"][0].get("function").is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_request_enforces_remote_image_count_before_fetching() {
+        let content = (0..=crate::proxy::remote_image::MAX_IMAGES_PER_REQUEST)
+            .map(|index| {
+                json!({
+                    "type": "input_image",
+                    "image_url": format!("https://example.com/{index}.png")
+                })
+            })
+            .collect::<Vec<_>>();
+        let error = prepare_codex_responses_websocket_request(TungsteniteMessage::Text(
+            json!({
+                "type": "response.create",
+                "response": {"input": [{"type": "message", "content": content}]}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("image limit"));
+    }
+
+    #[test]
+    fn share_requests_always_pin_their_provider() {
+        let headers = HeaderMap::new();
+        let context = UsageLogContext {
+            share_id: Some("share-one-account".to_string()),
+            ..UsageLogContext::default()
+        };
+        assert!(request_is_provider_pinned(&headers, &context));
     }
 
     #[test]
@@ -11781,7 +12503,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     #[test]
     fn codex_compact_body_signal_promotes_and_strips_stream_fields() {
         let body = Bytes::from_static(
-            br#"{"model":"gpt-5.5","stream":true,"store":true,"prompt_cache_key":"pck","input":[{"type":"message","role":"user"},{"type":"compaction_trigger"}]}"#,
+            br#"{"model":"gpt-5.5","stream":true,"store":true,"prompt_cache_key":"pck","temperature":0.2,"max_output_tokens":128,"input":[{"type":"message","role":"user"},{"type":"compaction_trigger"}]}"#,
         );
         assert!(codex_responses_body_has_compaction_trigger(&body));
         let normalized = normalize_codex_oauth_compact_body_bytes(&body).unwrap();
@@ -11789,6 +12511,8 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert!(value.get("stream").is_none());
         assert!(value.get("store").is_none());
         assert!(value.get("prompt_cache_key").is_none());
+        assert!(value.get("temperature").is_none());
+        assert!(value.get("max_output_tokens").is_none());
         assert_eq!(
             codex_compact_url("https://chatgpt.com/backend-api/codex/responses"),
             "https://chatgpt.com/backend-api/codex/responses/compact"

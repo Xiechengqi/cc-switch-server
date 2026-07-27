@@ -873,6 +873,7 @@ const fn initial_auth_identity_generation() -> u64 {
 struct AccountAuthIdentitySnapshot {
     provider_type: ProviderType,
     principal: Option<AccountPrincipal>,
+    codex_workspace_id: Option<String>,
     fallback_email: Option<String>,
 }
 
@@ -930,6 +931,9 @@ fn account_auth_identity_snapshot(account: &Account) -> AccountAuthIdentitySnaps
     AccountAuthIdentitySnapshot {
         provider_type: account.provider_type,
         principal: strongest_account_principal(account),
+        codex_workspace_id: (account.provider_type == ProviderType::CodexOAuth)
+            .then(|| effective_codex_workspace_id(account))
+            .flatten(),
         fallback_email: normalized_identity_email(account.email.as_deref()),
     }
 }
@@ -939,6 +943,11 @@ fn account_auth_identity_changed(
     current: &AccountAuthIdentitySnapshot,
 ) -> bool {
     if previous.provider_type != current.provider_type {
+        return true;
+    }
+    if previous.provider_type == ProviderType::CodexOAuth
+        && previous.codex_workspace_id != current.codex_workspace_id
+    {
         return true;
     }
     match (&previous.principal, &current.principal) {
@@ -952,9 +961,46 @@ fn account_auth_identity_changed(
     }
 }
 
+pub fn account_refresh_replaces_auth_identity(
+    account: &Account,
+    update: &AccountRefreshUpdate,
+) -> bool {
+    let previous = account_auth_identity_snapshot(account);
+    let mut candidate_store = AccountStore {
+        accounts: vec![account.clone()],
+    };
+    let candidate = candidate_store
+        .mark_refresh_success(&account.id, update.clone())
+        .expect("candidate refresh account exists");
+    let candidate = account_auth_identity_snapshot(&candidate);
+
+    if previous.provider_type != candidate.provider_type {
+        return true;
+    }
+    if identity_component_replaced(&previous.principal, &candidate.principal) {
+        return true;
+    }
+    if previous.provider_type == ProviderType::CodexOAuth
+        && identity_component_replaced(&previous.codex_workspace_id, &candidate.codex_workspace_id)
+    {
+        return true;
+    }
+    previous.principal.is_none()
+        && candidate.principal.is_none()
+        && identity_component_replaced(&previous.fallback_email, &candidate.fallback_email)
+}
+
+fn identity_component_replaced<T: PartialEq>(previous: &Option<T>, candidate: &Option<T>) -> bool {
+    match (previous, candidate) {
+        (Some(previous), Some(candidate)) => previous != candidate,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 fn strongest_account_principal(account: &Account) -> Option<AccountPrincipal> {
     if account.provider_type == ProviderType::CodexOAuth {
-        if let Some(value) = account_principal_value(account, &["/verifiedOpenAiClaims/subject"]) {
+        if let Some(value) = verified_openai_subject(account) {
             return Some(AccountPrincipal {
                 kind: "openai_subject",
                 value,
@@ -962,21 +1008,7 @@ fn strongest_account_principal(account: &Account) -> Option<AccountPrincipal> {
         }
     }
     if account.provider_type == ProviderType::ClaudeOAuth {
-        const CLAUDE_ACCOUNT_UUID_POINTERS: &[&str] = &[
-            "/accountUUID",
-            "/account_uuid",
-            "/account/uuid",
-            "/oauth_account/account_uuid",
-            "/token/account/uuid",
-            "/token/accountUUID",
-            "/profile/accountUUID",
-            "/profile/account_uuid",
-            "/profileRaw/accountUUID",
-            "/profileRaw/account_uuid",
-            "/profileRaw/account/uuid",
-            "/raw/account/uuid",
-        ];
-        if let Some(value) = account_principal_value(account, CLAUDE_ACCOUNT_UUID_POINTERS) {
+        if let Some(value) = claude_account_uuid(account) {
             return Some(AccountPrincipal {
                 kind: "claude_account_uuid",
                 value,
@@ -1014,15 +1046,35 @@ fn strongest_account_principal(account: &Account) -> Option<AccountPrincipal> {
             return Some(AccountPrincipal { kind, value });
         }
     }
-    if account.provider_type == ProviderType::CodexOAuth {
-        if let Some(value) = effective_codex_workspace_id(account) {
-            return Some(AccountPrincipal {
-                kind: "codex_workspace_id",
-                value,
-            });
-        }
-    }
     None
+}
+
+const CLAUDE_ACCOUNT_UUID_POINTERS: &[&str] = &[
+    "/accountUUID",
+    "/account_uuid",
+    "/account/uuid",
+    "/oauth_account/account_uuid",
+    "/token/account/uuid",
+    "/token/accountUUID",
+    "/profile/accountUUID",
+    "/profile/account_uuid",
+    "/profileRaw/accountUUID",
+    "/profileRaw/account_uuid",
+    "/profileRaw/account/uuid",
+    "/raw/account/uuid",
+];
+
+pub fn verified_openai_subject(account: &Account) -> Option<String> {
+    (account.provider_type == ProviderType::CodexOAuth)
+        .then(|| account_principal_value(account, &["/verifiedOpenAiClaims/subject"]))
+        .flatten()
+}
+
+pub fn claude_account_uuid(account: &Account) -> Option<String> {
+    (account.provider_type == ProviderType::ClaudeOAuth)
+        .then(|| account_principal_value(account, CLAUDE_ACCOUNT_UUID_POINTERS))
+        .flatten()
+        .map(|value| value.to_ascii_lowercase())
 }
 
 fn account_principal_value(account: &Account, pointers: &[&str]) -> Option<String> {
@@ -2024,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_identity_generation_prefers_verified_subject_over_workspace() {
+    fn codex_identity_generation_includes_verified_subject_and_workspace() {
         let mut store = AccountStore::default();
         let mut input = fixture_input(ProviderType::CodexOAuth);
         input.id = Some("codex-subject-account".to_string());
@@ -2058,7 +2110,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(moved_workspace.auth_identity_generation, 1);
+        assert_eq!(moved_workspace.auth_identity_generation, 2);
 
         let replaced_subject = store
             .mark_refresh_success(
@@ -2075,7 +2127,91 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(replaced_subject.auth_identity_generation, 2);
+        assert_eq!(replaced_subject.auth_identity_generation, 3);
+    }
+
+    #[test]
+    fn refresh_identity_replacement_detection_allows_enrichment_but_rejects_switches() {
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("claude-refresh-identity".to_string());
+        input.email = Some("owner@example.com".to_string());
+        input.profile = Some(json!({
+            "accountUUID": "claude-account-a",
+            "plan": "max"
+        }));
+        let account = AccountStore::default().upsert(input);
+
+        assert!(!account_refresh_replaces_auth_identity(
+            &account,
+            &AccountRefreshUpdate {
+                profile: Some(json!({
+                    "accountUUID": "CLAUDE-ACCOUNT-A",
+                    "plan": "max-20x"
+                })),
+                ..Default::default()
+            }
+        ));
+        assert!(account_refresh_replaces_auth_identity(
+            &account,
+            &AccountRefreshUpdate {
+                profile: Some(json!({
+                    "accountUUID": "claude-account-b",
+                    "plan": "max"
+                })),
+                ..Default::default()
+            }
+        ));
+
+        let mut unverified_input = fixture_input(ProviderType::ClaudeOAuth);
+        unverified_input.id = Some("claude-refresh-enrichment".to_string());
+        unverified_input.email = Some("owner@example.com".to_string());
+        unverified_input.profile = Some(json!({"plan": "pro"}));
+        let unverified = AccountStore::default().upsert(unverified_input);
+        assert!(!account_refresh_replaces_auth_identity(
+            &unverified,
+            &AccountRefreshUpdate {
+                profile: Some(json!({
+                    "accountUUID": "claude-account-a",
+                    "plan": "pro"
+                })),
+                ..Default::default()
+            }
+        ));
+
+        let mut codex_input = fixture_input(ProviderType::CodexOAuth);
+        codex_input.id = Some("codex-refresh-enrichment".to_string());
+        codex_input.profile = Some(json!({
+            "verifiedOpenAiClaims": {
+                "chatgpt_account_id": "workspace-a",
+                "organizations": [{"id": "workspace-a"}]
+            },
+            "selectedChatgptAccountId": "workspace-a"
+        }));
+        let codex = AccountStore::default().upsert(codex_input);
+        let codex_enrichment = AccountRefreshUpdate {
+            profile: Some(json!({
+                "verifiedOpenAiClaims": {
+                    "subject": "subject-a",
+                    "chatgpt_account_id": "workspace-a",
+                    "organizations": [{"id": "workspace-a"}]
+                },
+                "selectedChatgptAccountId": "workspace-a"
+            })),
+            ..Default::default()
+        };
+        assert!(!account_refresh_replaces_auth_identity(
+            &codex,
+            &codex_enrichment
+        ));
+        let enriched = AccountStore {
+            accounts: vec![codex.clone()],
+        }
+        .mark_refresh_success(&codex.id, codex_enrichment)
+        .unwrap();
+        assert_eq!(
+            enriched.auth_identity_generation,
+            codex.auth_identity_generation
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::domain::providers::model::AppKind;
+use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::sharing::shares::{Share, ShareAcl, ShareMarketGrantStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -31,6 +31,14 @@ pub(in crate::api) struct UpsertShareResponse {
     pub(in crate::api) share: Share,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct UpdateShareBindingRequest {
+    pub(in crate::api) provider_id: String,
+    pub(in crate::api) provider_type: ProviderType,
+    pub(in crate::api) expected_config_revision: u64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct ShareConnectInfoResponse {
@@ -55,6 +63,8 @@ pub(in crate::api) struct ShareConnectSnippet {
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct UpdateShareSubdomainRequest {
     pub(in crate::api) subdomain: String,
+    #[serde(default)]
+    pub(in crate::api) expected_config_revision: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

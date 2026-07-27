@@ -928,6 +928,7 @@ async fn oauth_login_cancel_is_authenticated_idempotent_and_terminal() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let response = app
+        .clone()
         .oneshot(json_request(
             Method::POST,
             "/web-api/invoke/auth_cancel_login",
@@ -4210,14 +4211,31 @@ async fn router_log_retry_syncs_canonical_uuid_request_ids() {
 
 #[tokio::test]
 async fn provider_share_settings_are_saved_atomically() {
+    let claim_count = Arc::new(AtomicUsize::new(0));
+    let claim_started = Arc::new(tokio::sync::Notify::new());
+    let claim_release = Arc::new(tokio::sync::Notify::new());
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let router_addr = listener.local_addr().unwrap();
+    let route_claim_count = claim_count.clone();
+    let route_claim_started = claim_started.clone();
+    let route_claim_release = claim_release.clone();
     let router = Router::new()
         .route(
             "/v1/shares/claim-subdomain",
-            post(|| async { StatusCode::OK }),
+            post(move || {
+                let claim_count = route_claim_count.clone();
+                let claim_started = route_claim_started.clone();
+                let claim_release = route_claim_release.clone();
+                async move {
+                    if claim_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                        claim_started.notify_one();
+                        claim_release.notified().await;
+                    }
+                    StatusCode::OK
+                }
+            }),
         )
         .route("/v1/shares/batch-sync", post(|| async { StatusCode::OK }));
     tokio::spawn(async move {
@@ -4238,12 +4256,15 @@ async fn provider_share_settings_are_saved_atomically() {
 
     let mut input = test_share_input("share-provider-save", "provider-save", ProviderType::Codex);
     input.tunnel_subdomain = Some("before-save".to_string());
+    input.enabled = Some(false);
+    input.status = Some("paused".to_string());
     let current = state
         .mutate_shares_immediate(|store| store.upsert(input).unwrap())
         .await
         .unwrap();
 
     let response = app
+        .clone()
         .oneshot(json_request(
             Method::POST,
             "/web-api/invoke/save_provider_share",
@@ -4323,6 +4344,190 @@ async fn provider_share_settings_are_saved_atomically() {
         stored.for_sale_official_price_percent_by_app.get("codex"),
         Some(&80)
     );
+    assert_eq!(stored.router_synced_revision, stored.config_revision);
+    assert!(stored.router_last_sync_error.is_none());
+
+    let saved_revision = saved["configRevision"].as_u64().unwrap();
+    let pending_app = app.clone();
+    let pending_token = token.clone();
+    let pending_save = tokio::spawn(async move {
+        pending_app
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/save_provider_share",
+                json!({
+                    "params": {
+                        "shareId": "share-provider-save",
+                        "expectedConfigRevision": saved_revision,
+                        "subdomain": "stale-save",
+                        "description": "stale editor",
+                        "forSale": "No",
+                        "saleMarketKind": "token",
+                        "marketAccessMode": "selected",
+                        "sharedWithEmails": [],
+                        "accessByApp": {},
+                        "appSettings": {},
+                        "forSaleOfficialPricePercentByApp": {},
+                        "tokenLimit": -1,
+                        "parallelLimit": -1,
+                        "expiresAt": "2031-01-01T00:00:00Z"
+                    }
+                }),
+                Some(&pending_token),
+            ))
+            .await
+            .unwrap()
+    });
+    claim_started.notified().await;
+    state
+        .try_mutate_shares_immediate(|store| {
+            store.apply_settings_patch(
+                "share-provider-save",
+                cc_switch_server::domain::sharing::router_contract::ShareSettingsPatch {
+                    description: Some(Some("concurrent editor wins".to_string())),
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    claim_release.notify_one();
+
+    let stale = pending_save.await.unwrap();
+    let stale_status = stale.status();
+    let stale_body = json_body(stale).await;
+    assert_eq!(
+        stale_status,
+        StatusCode::CONFLICT,
+        "response body: {stale_body}"
+    );
+    assert_eq!(stale_body["code"], "cc_switch_share_revision_conflict");
+    let stored = state
+        .mutate_shares(|store| store.get("share-provider-save").cloned())
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.description.as_deref(),
+        Some("concurrent editor wins")
+    );
+    assert_eq!(stored.tunnel_subdomain.as_deref(), Some("after-save"));
+    assert_eq!(stored.router_synced_revision, stored.config_revision);
+    assert!(stored.router_last_sync_error.is_none());
+}
+
+#[tokio::test]
+async fn share_subdomain_update_compensates_a_claim_lost_to_a_concurrent_edit() {
+    let claim_started = Arc::new(tokio::sync::Notify::new());
+    let claim_release = Arc::new(tokio::sync::Notify::new());
+    let batch_sync_count = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let route_claim_started = claim_started.clone();
+    let route_claim_release = claim_release.clone();
+    let route_batch_sync_count = batch_sync_count.clone();
+    let router = Router::new()
+        .route(
+            "/v1/shares/claim-subdomain",
+            post(move || {
+                let claim_started = route_claim_started.clone();
+                let claim_release = route_claim_release.clone();
+                async move {
+                    claim_started.notify_one();
+                    claim_release.notified().await;
+                    StatusCode::OK
+                }
+            }),
+        )
+        .route(
+            "/v1/shares/batch-sync",
+            post(move || {
+                let batch_sync_count = route_batch_sync_count.clone();
+                async move {
+                    batch_sync_count.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config_snapshot().await;
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-subdomain-cas".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+
+    let mut input = test_share_input(
+        "share-subdomain-cas",
+        "provider-subdomain-cas",
+        ProviderType::Codex,
+    );
+    input.tunnel_subdomain = Some("before-subdomain-cas".to_string());
+    input.enabled = Some(false);
+    input.status = Some("paused".to_string());
+    let current = state
+        .mutate_shares_immediate(|store| store.upsert(input).unwrap())
+        .await
+        .unwrap();
+
+    let pending_app = app.clone();
+    let pending_token = token.clone();
+    let pending_update = tokio::spawn(async move {
+        pending_app
+            .oneshot(json_request(
+                Method::POST,
+                "/api/shares/share-subdomain-cas/subdomain",
+                json!({
+                    "subdomain": "claimed-but-stale",
+                    "expectedConfigRevision": current.config_revision
+                }),
+                Some(&pending_token),
+            ))
+            .await
+            .unwrap()
+    });
+    claim_started.notified().await;
+    state
+        .try_mutate_shares_immediate(|store| {
+            store.apply_settings_patch(
+                "share-subdomain-cas",
+                cc_switch_server::domain::sharing::router_contract::ShareSettingsPatch {
+                    description: Some(Some("concurrent edit wins".to_string())),
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    claim_release.notify_one();
+
+    let response = pending_update.await.unwrap();
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::CONFLICT, "response body: {body}");
+    assert_eq!(body["code"], "cc_switch_share_revision_conflict");
+    let stored = state
+        .mutate_shares(|store| store.get("share-subdomain-cas").cloned())
+        .await
+        .unwrap();
+    assert_eq!(stored.description.as_deref(), Some("concurrent edit wins"));
+    assert_eq!(
+        stored.tunnel_subdomain.as_deref(),
+        Some("before-subdomain-cas")
+    );
+    assert_eq!(batch_sync_count.load(Ordering::SeqCst), 1);
     assert_eq!(stored.router_synced_revision, stored.config_revision);
     assert!(stored.router_last_sync_error.is_none());
 }
@@ -7370,92 +7575,53 @@ async fn managed_auth_manual_subscription_expiry_rejects_non_manual_accounts() {
 }
 
 #[tokio::test]
-async fn managed_auth_default_account_change_refreshes_only_unbound_provider_shares() {
+async fn oauth_share_requires_an_explicit_provider_account_binding() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
-    state
-        .mutate_accounts_immediate(|accounts| {
-            accounts.upsert(test_account_input(
-                "acct-claude-default-a",
-                ProviderType::ClaudeOAuth,
-            ));
-            accounts.upsert(test_account_input(
-                "acct-claude-default-b",
-                ProviderType::ClaudeOAuth,
-            ));
-        })
-        .await
-        .unwrap();
-    for (provider_id, account_id) in [
-        ("claude-unbound", None),
-        ("claude-explicit", Some("acct-claude-default-a")),
-    ] {
-        upsert_test_provider(
-            &state,
-            AppKind::Claude,
-            Provider {
-                id: provider_id.to_string(),
-                name: provider_id.to_string(),
-                settings_config: json!({}),
-                category: None,
-                meta: Some(ProviderMeta {
-                    provider_type: Some("claude_oauth".to_string()),
-                    auth_binding: account_id.map(|account_id| AuthBinding {
-                        source: Some("managed_account".to_string()),
-                        auth_provider: Some("claude_oauth".to_string()),
-                        account_id: Some(account_id.to_string()),
-                        auth_identity_generation: None,
-                    }),
-                    ..Default::default()
-                }),
-                extra: Default::default(),
-            },
-        )
-        .await;
-        let mut share_input = test_share_input(
-            &format!("share-{provider_id}"),
-            provider_id,
-            ProviderType::ClaudeOAuth,
-        );
-        share_input.app = AppKind::Claude;
-        state
-            .mutate_shares_immediate(|shares| shares.upsert(share_input).unwrap())
-            .await
-            .unwrap();
-    }
-    let (unbound_revision, explicit_revision) = state
-        .mutate_shares(|shares| {
-            (
-                shares.get("share-claude-unbound").unwrap().config_revision,
-                shares.get("share-claude-explicit").unwrap().config_revision,
-            )
-        })
-        .await;
+    upsert_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "claude-unbound".to_string(),
+            name: "claude-unbound".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("claude_oauth".to_string()),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
 
     let response = app
         .oneshot(json_request(
             Method::POST,
-            "/web-api/invoke/auth_set_default_account",
+            "/api/shares",
             json!({
-                "authProvider": "claude_oauth",
-                "accountId": "acct-claude-default-b"
+                "id": "share-claude-unbound",
+                "app": "claude",
+                "providerId": "claude-unbound",
+                "providerType": "claude_oauth",
+                "enabled": false,
+                "status": "paused"
             }),
             Some(&token),
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let (updated_unbound_revision, updated_explicit_revision) = state
-        .mutate_shares(|shares| {
-            (
-                shares.get("share-claude-unbound").unwrap().config_revision,
-                shares.get("share-claude-explicit").unwrap().config_revision,
-            )
-        })
-        .await;
-    assert!(updated_unbound_revision > unbound_revision);
-    assert_eq!(updated_explicit_revision, explicit_revision);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["code"],
+        "cc_switch_share_binding_integrity_failed"
+    );
+    assert!(
+        state
+            .mutate_shares(|shares| shares.get("share-claude-unbound").is_none())
+            .await
+    );
 }
 
 #[tokio::test]
@@ -7735,7 +7901,139 @@ async fn account_rate_limit_refreshes_share_once_per_block_transition() {
 }
 
 #[tokio::test]
-async fn codex_workspace_change_clears_subscription_expiry_and_refreshes_share() {
+async fn unshared_codex_workspace_selection_repins_every_bound_provider() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            let mut input =
+                test_account_input("acct-codex-workspace-unshared", ProviderType::CodexOAuth);
+            input.profile = Some(json!({
+                "verifiedOpenAiClaims": {
+                    "subject": "codex-workspace-unshared-owner",
+                    "chatgpt_account_id": "workspace-default",
+                    "organizations": [
+                        {"id": "workspace-team", "name": "Team"}
+                    ]
+                },
+                "selectedChatgptAccountId": "workspace-default"
+            }));
+            accounts.upsert(input);
+        })
+        .await
+        .unwrap();
+    for provider_id in [
+        "codex-workspace-unshared-primary",
+        "codex-workspace-unshared-secondary",
+    ] {
+        let auth_identity_generation = if provider_id == "codex-workspace-unshared-secondary" {
+            2
+        } else {
+            1
+        };
+        upsert_test_provider(
+            &state,
+            AppKind::Codex,
+            Provider {
+                id: provider_id.to_string(),
+                name: provider_id.to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("codex_oauth".to_string()),
+                    auth_binding: Some(AuthBinding {
+                        source: Some("managed_account".to_string()),
+                        auth_provider: Some("codex_oauth".to_string()),
+                        account_id: Some("acct-codex-workspace-unshared".to_string()),
+                        auth_identity_generation: Some(auth_identity_generation),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+        )
+        .await;
+    }
+    let before = providers_snapshot(&state).await;
+    assert!(matches!(
+        &state
+            .provider_runtime_plan(AppKind::Codex, "codex-workspace-unshared-secondary")
+            .await
+            .unwrap()
+            .auth_ref,
+        cc_switch_server::domain::providers::runtime::RuntimeAuthRef::Missing
+    ));
+    let before_revisions = before
+        .providers
+        .iter()
+        .map(|provider| (provider.provider.id.clone(), provider.resource.revision))
+        .collect::<BTreeMap<_, _>>();
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_workspace",
+            json!({
+                "authProvider": "codex_oauth",
+                "accountId": "acct-codex-workspace-unshared",
+                "workspaceId": "workspace-team"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let account = state
+        .find_account_by_id("acct-codex-workspace-unshared")
+        .await
+        .unwrap();
+    assert_eq!(account.auth_identity_generation, 2);
+    assert_eq!(
+        account
+            .profile
+            .as_ref()
+            .and_then(|profile| profile["selectedChatgptAccountId"].as_str()),
+        Some("workspace-team")
+    );
+    let providers = providers_snapshot(&state).await;
+    for provider_id in [
+        "codex-workspace-unshared-primary",
+        "codex-workspace-unshared-secondary",
+    ] {
+        let provider = providers
+            .providers
+            .iter()
+            .find(|provider| provider.provider.id == provider_id)
+            .unwrap();
+        assert_eq!(
+            provider
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.auth_identity_generation),
+            Some(2)
+        );
+        assert!(provider.resource.revision > before_revisions[provider_id]);
+        let plan = state
+            .provider_runtime_plan(AppKind::Codex, provider_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            &plan.auth_ref,
+            cc_switch_server::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 2,
+            } if account_id == "acct-codex-workspace-unshared"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn paused_share_codex_workspace_rebind_updates_identity_and_history() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
@@ -7745,6 +8043,7 @@ async fn codex_workspace_change_clears_subscription_expiry_and_refreshes_share()
                 test_account_input("acct-codex-workspace-expiry", ProviderType::CodexOAuth);
             input.profile = Some(json!({
                 "verifiedOpenAiClaims": {
+                    "subject": "codex-workspace-owner",
                     "chatgpt_account_id": "workspace-default",
                     "organizations": [
                         {"id": "workspace-team", "name": "Team"}
@@ -7780,7 +8079,7 @@ async fn codex_workspace_change_clears_subscription_expiry_and_refreshes_share()
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("codex_oauth".to_string()),
                     account_id: Some("acct-codex-workspace-expiry".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 ..Default::default()
             }),
@@ -7790,18 +8089,20 @@ async fn codex_workspace_change_clears_subscription_expiry_and_refreshes_share()
     .await;
     let share = state
         .mutate_shares_immediate(|shares| {
-            shares
-                .upsert(test_share_input(
-                    "share-codex-workspace-expiry",
-                    "codex-workspace-expiry-provider",
-                    ProviderType::CodexOAuth,
-                ))
-                .unwrap()
+            let mut input = test_share_input(
+                "share-codex-workspace-expiry",
+                "codex-workspace-expiry-provider",
+                ProviderType::CodexOAuth,
+            );
+            input.enabled = Some(false);
+            input.status = Some("paused".to_string());
+            shares.upsert(input).unwrap()
         })
         .await
         .unwrap();
 
-    let response = app
+    let ordinary = app
+        .clone()
         .oneshot(json_request(
             Method::POST,
             "/web-api/invoke/auth_set_workspace",
@@ -7814,18 +8115,309 @@ async fn codex_workspace_change_clears_subscription_expiry_and_refreshes_share()
         ))
         .await
         .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(ordinary).await["code"],
+        "cc_switch_codex_workspace_in_use"
+    );
+    assert_eq!(
+        state
+            .find_account_by_id("acct-codex-workspace-expiry")
+            .await
+            .unwrap()
+            .auth_identity_generation,
+        1
+    );
+    assert_eq!(
+        state
+            .mutate_shares(|shares| {
+                shares
+                    .get("share-codex-workspace-expiry")
+                    .unwrap()
+                    .config_revision
+            })
+            .await,
+        share.config_revision
+    );
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_set_workspace",
+            json!({
+                "authProvider": "codex_oauth",
+                "accountId": "acct-codex-workspace-expiry",
+                "workspaceId": "workspace-team",
+                "shareId": "share-codex-workspace-expiry",
+                "expectedConfigRevision": share.config_revision
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let account = json_body(response).await;
     assert!(account["subscriptionExpiry"]["effectiveExpiresAt"].is_null());
-    let updated_revision = state
-        .mutate_shares(|shares| {
-            shares
-                .get("share-codex-workspace-expiry")
-                .unwrap()
-                .config_revision
-        })
+    let updated_share = state
+        .mutate_shares(|shares| shares.get("share-codex-workspace-expiry").unwrap().clone())
         .await;
-    assert!(updated_revision > share.config_revision);
+    assert!(updated_share.config_revision > share.config_revision);
+    assert_eq!(updated_share.status, "paused");
+    assert_eq!(
+        updated_share
+            .binding_history
+            .last()
+            .and_then(|item| item.change_kind.as_deref()),
+        Some("subscription_identity")
+    );
+    let updated_account = state
+        .find_account_by_id("acct-codex-workspace-expiry")
+        .await
+        .unwrap();
+    assert_eq!(updated_account.auth_identity_generation, 2);
+    let providers = providers_snapshot(&state).await;
+    let provider = providers
+        .providers
+        .iter()
+        .find(|provider| provider.provider.id == "codex-workspace-expiry-provider")
+        .unwrap();
+    assert_eq!(
+        provider
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.auth_binding.as_ref())
+            .and_then(|binding| binding.auth_identity_generation),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn oauth_share_write_contracts_enforce_one_identity_and_control_rebinding() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    state
+        .mutate_accounts_immediate(|accounts| {
+            for (account_id, subject, workspace_id) in [
+                ("share-account-a", Some("shared-subject"), "workspace-one"),
+                ("share-account-b", Some("shared-subject"), "workspace-one"),
+                ("share-account-c", Some("distinct-subject"), "workspace-two"),
+                ("share-account-unverified", None, "workspace-unverified"),
+            ] {
+                let mut input = test_account_input(account_id, ProviderType::CodexOAuth);
+                let mut claims = json!({
+                    "chatgpt_account_id": workspace_id,
+                    "organizations": [{"id": workspace_id, "name": workspace_id}]
+                });
+                if let Some(subject) = subject {
+                    claims["subject"] = json!(subject);
+                }
+                input.profile = Some(json!({
+                    "verifiedOpenAiClaims": claims,
+                    "selectedChatgptAccountId": workspace_id
+                }));
+                accounts.upsert(input);
+            }
+        })
+        .await
+        .unwrap();
+
+    for (provider_id, account_id) in [
+        ("share-provider-a", "share-account-a"),
+        ("share-provider-b", "share-account-b"),
+        ("share-provider-c", "share-account-c"),
+        ("share-provider-unverified", "share-account-unverified"),
+    ] {
+        upsert_test_provider(
+            &state,
+            AppKind::Codex,
+            Provider {
+                id: provider_id.to_string(),
+                name: provider_id.to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("codex_oauth".to_string()),
+                    auth_binding: Some(AuthBinding {
+                        source: Some("managed_account".to_string()),
+                        auth_provider: Some("codex_oauth".to_string()),
+                        account_id: Some(account_id.to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+        )
+        .await;
+    }
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares",
+            json!({
+                "id": "oauth-share-a",
+                "app": "codex",
+                "providerId": "share-provider-a",
+                "providerType": "codex_oauth",
+                "enabled": false,
+                "status": "paused"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await["share"].clone();
+    let original_revision = created["configRevision"].as_u64().unwrap();
+
+    let duplicate = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares",
+            json!({
+                "id": "oauth-share-duplicate",
+                "app": "codex",
+                "providerId": "share-provider-b",
+                "providerType": "codex_oauth",
+                "enabled": false,
+                "status": "paused"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(duplicate).await["code"],
+        "cc_switch_subscription_identity_conflict"
+    );
+
+    let mut imported_duplicate = created.clone();
+    imported_duplicate["id"] = json!("oauth-share-import-duplicate");
+    imported_duplicate["providerId"] = json!("share-provider-b");
+    imported_duplicate["bindings"][0]["providerId"] = json!("share-provider-b");
+    imported_duplicate["tunnelSubdomain"] = json!("oauthimportduplicate");
+    let duplicate_import = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares/import",
+            json!({"shares": [imported_duplicate]}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(duplicate_import.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(duplicate_import).await["code"],
+        "cc_switch_subscription_identity_conflict"
+    );
+
+    let unverified = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares",
+            json!({
+                "id": "oauth-share-unverified",
+                "app": "codex",
+                "providerId": "share-provider-unverified",
+                "providerType": "codex_oauth",
+                "enabled": false,
+                "status": "paused"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unverified.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        json_body(unverified).await["code"],
+        "cc_switch_subscription_identity_unverified"
+    );
+
+    let ordinary_rebind = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares",
+            json!({
+                "id": "oauth-share-a",
+                "app": "codex",
+                "providerId": "share-provider-c",
+                "providerType": "codex_oauth",
+                "enabled": false,
+                "status": "paused",
+                "expectedConfigRevision": original_revision
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ordinary_rebind.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(ordinary_rebind).await["code"],
+        "cc_switch_share_binding_immutable"
+    );
+
+    let rebound = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares/oauth-share-a/binding",
+            json!({
+                "providerId": "share-provider-c",
+                "providerType": "codex_oauth",
+                "expectedConfigRevision": original_revision
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rebound.status(), StatusCode::OK);
+    let rebound = json_body(rebound).await["share"].clone();
+    assert_eq!(rebound["status"], "paused");
+    assert_eq!(rebound["providerId"], "share-provider-c");
+    assert_eq!(rebound["runtimeSnapshot"]["providerId"], "share-provider-c");
+    assert_eq!(
+        rebound["bindingHistory"]
+            .as_array()
+            .and_then(|history| history.last())
+            .and_then(|entry| entry["changeKind"].as_str()),
+        Some("provider_binding")
+    );
+
+    let stored_provider = providers_snapshot(&state)
+        .await
+        .providers
+        .into_iter()
+        .find(|provider| provider.provider.id == "share-provider-c")
+        .unwrap();
+    let mut provider = serde_json::to_value(&stored_provider.provider).unwrap();
+    provider["meta"]["authBinding"]["accountId"] = json!("share-account-a");
+    let provider_rebind = app
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/providers/share-provider-c?app=codex",
+            json!({
+                "provider": provider,
+                "expectedRevision": stored_provider.resource.revision
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(provider_rebind.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(provider_rebind).await["code"],
+        "cc_switch_provider_account_binding_in_use"
+    );
 }
 
 fn test_account_input(account_id: &str, provider_type: ProviderType) -> UpsertAccountInput {

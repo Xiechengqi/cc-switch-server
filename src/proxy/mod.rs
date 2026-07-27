@@ -15,6 +15,7 @@ pub(crate) mod kiro;
 mod outbound_identity;
 pub(crate) mod provider_ops;
 pub(crate) mod reasoning_bridge;
+mod remote_image;
 mod request_governance;
 mod response_semantics;
 mod responses_wire;

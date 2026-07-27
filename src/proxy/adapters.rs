@@ -2212,13 +2212,22 @@ fn apply_auth_headers(
         .as_ref()
         .and_then(|meta| meta.auth_binding.as_ref())
         .and_then(|binding| binding.account_id.as_deref());
-    let provider_secret = match app {
+    let configured_provider_secret = match app {
         AppKind::Claude => setting(
             provider,
             &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "API_KEY"],
         ),
         AppKind::Codex => super::codex_provider_api_key(provider),
         AppKind::Gemini => setting(provider, &["GEMINI_API_KEY", "GOOGLE_API_KEY", "API_KEY"]),
+    };
+    let provider_secret = if account_id.is_some()
+        && matches!(
+            stored.provider_type,
+            ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+        ) {
+        None
+    } else {
+        configured_provider_secret
     };
     let provider_secret_configured = provider_secret.is_some();
     if !provider_secret_configured
@@ -2234,6 +2243,21 @@ fn apply_auth_headers(
     let bound_account = (!provider_secret_configured)
         .then(|| accounts.find_for_provider(stored.provider_type, account_id))
         .flatten();
+    let expected_identity_generation = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.auth_identity_generation);
+    if let (Some(account), Some(expected_identity_generation)) =
+        (bound_account, expected_identity_generation)
+    {
+        if account.auth_identity_generation != expected_identity_generation {
+            return Err(ProxyError::conflict(format!(
+                "bound account {} identity changed; rebind the Provider",
+                account.id
+            )));
+        }
+    }
     let account_credential = if provider_secret.is_none() {
         let credential = manager_for(stored.provider_type).get_valid_token(
             accounts,
@@ -3402,7 +3426,7 @@ mod tests {
                 source: Some("account".to_string()),
                 auth_provider: Some("codex_oauth".to_string()),
                 account_id: Some(account_id.to_string()),
-                auth_identity_generation: None,
+                auth_identity_generation: Some(1),
             }),
             ..Default::default()
         });
@@ -5304,6 +5328,30 @@ mod tests {
 
         assert!(headers.contains(&("authorization", "Bearer access-token".to_string())));
         assert!(headers.contains(&("chatgpt-account-id", "chatgpt-account-1".to_string())));
+    }
+
+    #[test]
+    fn managed_account_headers_reject_stale_identity_generation() {
+        let stored = codex_oauth_stored_provider_with_account_binding("acct-1");
+        let mut account = codex_oauth_account(
+            "acct-1",
+            "new-identity-token",
+            json!({
+                "verifiedOpenAiClaims": {
+                    "chatgpt_account_id": "chatgpt-account-2"
+                }
+            }),
+        );
+        account.auth_identity_generation = 2;
+        let accounts = AccountStore {
+            accounts: vec![account],
+        };
+
+        let error = adapter_for(AppKind::Codex, ProviderType::CodexOAuth)
+            .build_headers(AppKind::Codex, &stored, &accounts)
+            .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert!(error.message.contains("identity changed"));
     }
 
     #[test]

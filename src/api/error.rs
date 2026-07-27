@@ -80,6 +80,16 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn unprocessable_code(code: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: error.into(),
+            code: Some(code),
+            error_type: None,
+            retryable: Some(false),
+        }
+    }
+
     pub(crate) fn provider_contract_mismatch(error: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -201,8 +211,59 @@ pub(crate) fn map_share_patch_error(
         crate::domain::sharing::shares::SharePatchError::NotFound => {
             ApiError::not_found("share not found")
         }
+        crate::domain::sharing::shares::SharePatchError::BindingImmutable => {
+            ApiError::conflict_code(
+                "cc_switch_share_binding_immutable",
+                "share binding is immutable in ordinary upsert/import; pause the Share and use the binding endpoint",
+            )
+        }
         crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
             ApiError::bad_request(message)
+        }
+    }
+}
+
+pub(crate) fn map_subscription_binding_error(
+    error: crate::domain::sharing::subscription_identity::SubscriptionBindingError,
+) -> ApiError {
+    if matches!(
+        error,
+        crate::domain::sharing::subscription_identity::SubscriptionBindingError::UnverifiedIdentity { .. }
+    ) {
+        ApiError::unprocessable_code(error.code(), error.to_string())
+    } else {
+        ApiError::conflict_code(error.code(), error.to_string())
+    }
+}
+
+pub(crate) fn map_account_write_error(error: anyhow::Error) -> ApiError {
+    if let Some(binding) = error
+        .downcast_ref::<crate::domain::sharing::subscription_identity::SubscriptionBindingError>(
+    ) {
+        return map_subscription_binding_error(binding.clone());
+    }
+    ApiError::internal(error)
+}
+
+pub(crate) fn map_codex_workspace_rebind_error(
+    error: crate::domain::sharing::subscription_identity::CodexWorkspaceRebindError,
+) -> ApiError {
+    use crate::domain::sharing::subscription_identity::CodexWorkspaceRebindError;
+
+    match error {
+        CodexWorkspaceRebindError::ShareNotFound(_)
+        | CodexWorkspaceRebindError::AccountNotFound(_) => ApiError::not_found(error.to_string()),
+        CodexWorkspaceRebindError::InvalidWorkspace(_) => {
+            ApiError::unprocessable_code(error.code(), error.to_string())
+        }
+        CodexWorkspaceRebindError::SubscriptionBinding(binding) => {
+            map_subscription_binding_error(binding)
+        }
+        CodexWorkspaceRebindError::RevisionConflict { .. }
+        | CodexWorkspaceRebindError::MustBePaused
+        | CodexWorkspaceRebindError::AccountBindingMismatch
+        | CodexWorkspaceRebindError::AccountInUse { .. } => {
+            ApiError::conflict_code(error.code(), error.to_string())
         }
     }
 }

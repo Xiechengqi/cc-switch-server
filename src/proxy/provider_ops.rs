@@ -183,10 +183,13 @@ impl ProviderExecution {
             RuntimeAuthRef::Legacy {
                 account_id: Some(account_id),
                 ..
-            } if provider_secret(&self.stored).is_none()
+            } if matches!(
+                self.stored.provider_type,
+                ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+            ) || (provider_secret(&self.stored).is_none()
                 && oauth_provider_spec(self.stored.provider_type).is_some_and(|spec| {
                     spec.server_native_refresh_enabled() && !spec.token_urls.is_empty()
-                }) =>
+                })) =>
             {
                 Some((self.stored.provider_type, Some(account_id.as_str())))
             }
@@ -1289,7 +1292,10 @@ mod tests {
 
         legacy.stored.provider.settings_config =
             json!({"env": {"ANTHROPIC_AUTH_TOKEN": "provider-secret"}});
-        assert_eq!(legacy.managed_account_target(), None);
+        assert_eq!(
+            legacy.managed_account_target(),
+            Some((ProviderType::ClaudeOAuth, Some("legacy-account")))
+        );
     }
 
     #[test]
@@ -1378,7 +1384,7 @@ mod tests {
                 auth_identity_generation: 1,
             },
             UpstreamProtocol::AnthropicMessages,
-            json!({}),
+            json!({"env": {"ANTHROPIC_AUTH_TOKEN": "stale-provider-secret"}}),
             0,
         );
         execution.stored.app = AppKind::Claude;
@@ -1463,6 +1469,13 @@ mod tests {
                 .count(),
             1
         );
+        assert!(prepared.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer typed-access-token"
+        }));
+        assert!(!prepared
+            .headers
+            .iter()
+            .any(|(_, value)| value.contains("stale-provider-secret")));
         assert!(prepared.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("anthropic-beta") && value.contains("context-1m")
         }));

@@ -318,7 +318,7 @@
       "support": "native",
       "implemented": true,
       "feature": "accounts",
-      "notes": "Selects a Codex ChatGPT Account-ID only from organizations verified in the account token claims."
+      "notes": "Selects a Codex ChatGPT Account-ID only from organizations verified in the account token claims. Accounts reserved by a Share require a paused Share plus shareId and expectedConfigRevision so Account, Provider binding generation, and Share history advance together."
     },
     {
       "name": "auth_start_login",

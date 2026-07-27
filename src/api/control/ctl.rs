@@ -36,6 +36,12 @@ pub(crate) async fn control_apply_share_settings(
                     crate::domain::sharing::shares::SharePatchError::NotFound => {
                         ApiError::not_found("share not found")
                     }
+                    crate::domain::sharing::shares::SharePatchError::BindingImmutable => {
+                        ApiError::conflict_code(
+                            "cc_switch_share_binding_immutable",
+                            error.to_string(),
+                        )
+                    }
                     crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
                         ApiError::bad_request(message)
                     }

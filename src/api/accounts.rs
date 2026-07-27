@@ -33,7 +33,7 @@ pub(in crate::api) async fn upsert_account(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     Ok(Json(UpsertAccountResponse {
         ok: true,
         account: account.into(),
@@ -72,7 +72,7 @@ pub(in crate::api) async fn import_claude_credentials(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     Ok(Json(ImportClaudeCredentialsResponse {
         ok: true,
         account: AccountLoginAccountSummary::from_account(&account),
@@ -93,7 +93,7 @@ pub(in crate::api) async fn import_grok_auth_json(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     Ok(Json(ImportGrokAuthJsonResponse {
         ok: true,
         account: AccountLoginAccountSummary::from_account(&account),
@@ -161,7 +161,7 @@ async fn import_kiro_upsert(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     Ok(Json(ImportKiroCredentialsResponse {
         ok: true,
         account: AccountLoginAccountSummary::from_account(&account),
@@ -214,7 +214,7 @@ pub(in crate::api) async fn import_cursor_local_auth(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     Ok(Json(ImportCursorLocalAuthResponse {
         ok: true,
         account: AccountLoginAccountSummary::from_account(&account),
@@ -1008,7 +1008,7 @@ pub(in crate::api) async fn poll_copilot_device_login(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     Ok(Json(PollCopilotDeviceLoginResponse {
         ok: true,
         pending: false,
@@ -1189,7 +1189,7 @@ pub(in crate::api) async fn poll_kiro_device_login(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     Ok(Json(PollKiroDeviceLoginResponse {
         ok: true,
         pending: false,
@@ -1344,7 +1344,7 @@ pub(in crate::api) async fn poll_codex_device_login(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     Ok(Json(PollCodexDeviceLoginResponse {
         ok: true,
         pending: false,
@@ -1503,7 +1503,7 @@ pub(in crate::api) async fn poll_grok_device_login(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     Ok(Json(PollGrokDeviceLoginResponse {
         ok: true,
         pending: false,
@@ -1820,7 +1820,7 @@ pub(in crate::api) async fn delete_account(
         ));
     }
     let (deleted, removed_account) = state
-        .try_mutate_accounts_immediate(|store| {
+        .try_mutate_accounts_immediate_under_reference_guard(|store| {
             let provider_type = store
                 .accounts
                 .iter()
@@ -1842,7 +1842,7 @@ pub(in crate::api) async fn delete_account(
             }
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     drop(reference_guard);
     if deleted {
         if let Some((provider_type, was_default)) = removed_account {
@@ -1942,7 +1942,7 @@ pub(in crate::api) async fn refresh_account(
                         store.mark_native_refresh_failure(&id, error.message.clone(), error.kind)
                     })
                     .await
-                    .map_err(ApiError::internal)?;
+                    .map_err(map_account_write_error)?;
                 if let Some(updated) = updated {
                     state
                         .refresh_account_runtime_metadata_if_changed(&existing, &updated)
@@ -1959,7 +1959,7 @@ pub(in crate::api) async fn refresh_account(
                     .ok_or_else(|| ApiError::not_found("account not found"))
             })
             .await
-            .map_err(ApiError::internal)??;
+            .map_err(map_account_write_error)??;
         state
             .refresh_account_runtime_metadata_if_changed(&existing, &account)
             .await
@@ -1977,7 +1977,7 @@ pub(in crate::api) async fn refresh_account(
                 .map_err(ApiError::bad_request)
         })
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(map_account_write_error)??;
     state
         .refresh_account_runtime_metadata_if_changed(&existing, &account)
         .await
@@ -2166,7 +2166,7 @@ pub(in crate::api) async fn account_quota(
                             )
                         })
                         .await
-                        .map_err(ApiError::internal)?;
+                        .map_err(map_account_write_error)?;
                     if let Some(updated) = updated {
                         state
                             .refresh_account_runtime_metadata_if_changed(
@@ -2186,7 +2186,7 @@ pub(in crate::api) async fn account_quota(
                     .ok_or_else(|| ApiError::not_found("account not found"))
             })
             .await
-            .map_err(ApiError::internal)??;
+            .map_err(map_account_write_error)??;
     }
 
     let http_client = state.http_client().await;
@@ -2209,7 +2209,7 @@ pub(in crate::api) async fn account_quota(
                         .ok_or_else(|| ApiError::not_found("account not found"))
                 })
                 .await
-                .map_err(ApiError::internal)??;
+                .map_err(map_account_write_error)??;
             state
                 .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &account)
                 .await
@@ -2261,7 +2261,7 @@ pub(in crate::api) async fn account_quota(
                     )
                 })
                 .await
-                .map_err(ApiError::internal)?;
+                .map_err(map_account_write_error)?;
             if let Some(updated) = updated {
                 state
                     .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &updated)

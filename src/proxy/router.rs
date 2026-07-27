@@ -535,7 +535,7 @@ fn account_concurrency_limit_error(provider: &StoredProvider) -> ProxyError {
     }
 }
 
-fn codex_image_generation_provider(provider: &StoredProvider) -> bool {
+pub(super) fn codex_image_generation_provider(provider: &StoredProvider) -> bool {
     match provider.provider_type {
         ProviderType::GrokOAuth => true,
         ProviderType::CodexOAuth => provider
@@ -653,7 +653,7 @@ mod tests {
                         source: Some("account_store".to_string()),
                         auth_provider: Some("codex_oauth".to_string()),
                         account_id: Some(account_id.to_string()),
-                        auth_identity_generation: None,
+                        auth_identity_generation: Some(1),
                     }),
                     ..ProviderMeta::default()
                 }),
@@ -686,7 +686,7 @@ mod tests {
                         source: Some("account_store".to_string()),
                         auth_provider: Some("claude_oauth".to_string()),
                         account_id: Some(account_id.to_string()),
-                        auth_identity_generation: None,
+                        auth_identity_generation: Some(1),
                     }),
                     ..ProviderMeta::default()
                 }),
@@ -787,7 +787,7 @@ mod tests {
                         source: Some("account_store".to_string()),
                         auth_provider: Some("cursor_oauth".to_string()),
                         account_id: Some(account_id.to_string()),
-                        auth_identity_generation: None,
+                        auth_identity_generation: Some(1),
                     }),
                     ..ProviderMeta::default()
                 }),
@@ -832,14 +832,47 @@ mod tests {
         ])
     }
 
-    fn runtime_store(providers: Vec<StoredProvider>) -> ProviderStore {
+    fn runtime_store(mut providers: Vec<StoredProvider>) -> ProviderStore {
+        let mut accounts = AccountStore::default();
+        for provider in &mut providers {
+            let Some(account_id) = provider
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.account_id.as_deref())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let generation = accounts
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .map(|account| account.auth_identity_generation)
+                .unwrap_or_else(|| {
+                    let input = match provider.provider_type {
+                        ProviderType::ClaudeOAuth => claude_oauth_account(&account_id),
+                        ProviderType::CodexOAuth => codex_oauth_account(&account_id, None),
+                        ProviderType::CursorOAuth => cursor_oauth_account(&account_id, None),
+                        _ => return 1,
+                    };
+                    accounts.upsert(input).auth_identity_generation
+                });
+            if let Some(binding) = provider
+                .provider
+                .meta
+                .as_mut()
+                .and_then(|meta| meta.auth_binding.as_mut())
+            {
+                binding.auth_identity_generation = Some(generation);
+            }
+        }
         let mut store = ProviderStore {
             providers,
             ..Default::default()
         };
-        store
-            .rebuild_runtime_index(&AccountStore::default())
-            .unwrap();
+        store.rebuild_runtime_index(&accounts).unwrap();
         store
     }
 
