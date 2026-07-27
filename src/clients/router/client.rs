@@ -11,9 +11,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
-use crate::domain::settings::config::{
-    PayoutProfileState, RouterIdentity, ServerConfig, UpgradePolicyConfig,
-};
+use crate::domain::settings::config::{RouterIdentity, ServerConfig, UpgradePolicyConfig};
 use crate::domain::sharing::router_contract::*;
 use crate::self_update::version::LatestReleaseMeta;
 
@@ -330,24 +328,6 @@ struct ClientTunnelUpdateRequest {
     nonce: String,
     signature: String,
     tunnel: ClientTunnelConfig,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InstallationPayoutProfileUpdateRequest {
-    protocol_epoch: &'static str,
-    installation_id: String,
-    timestamp_ms: i64,
-    nonce: String,
-    signature: String,
-    update: PayoutProfileState,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InstallationPayoutProfileUpdateResponse {
-    pub ok: bool,
-    pub revision: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1389,82 +1369,6 @@ pub async fn release_client_tunnel(
         },
     )
     .await
-}
-
-pub async fn push_payout_profile(
-    http: &reqwest::Client,
-    config: &ServerConfig,
-    update: PayoutProfileState,
-) -> anyhow::Result<InstallationPayoutProfileUpdateResponse> {
-    push_payout_profile_with_timeout(http, config, update, ROUTER_CONTROL_PLANE_SYNC_TIMEOUT).await
-}
-
-async fn push_payout_profile_with_timeout(
-    http: &reqwest::Client,
-    config: &ServerConfig,
-    update: PayoutProfileState,
-    timeout: Duration,
-) -> anyhow::Result<InstallationPayoutProfileUpdateResponse> {
-    tokio::time::timeout(timeout, push_payout_profile_request(http, config, update))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "router payout profile sync timed out after {}s",
-                timeout.as_secs_f64()
-            )
-        })?
-}
-
-async fn push_payout_profile_request(
-    http: &reqwest::Client,
-    config: &ServerConfig,
-    update: PayoutProfileState,
-) -> anyhow::Result<InstallationPayoutProfileUpdateResponse> {
-    let api_base = config
-        .router_api_base()
-        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
-        .trim_end_matches('/')
-        .to_string();
-    let identity = config
-        .registered_router_identity()
-        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
-    let timestamp_ms = now_ms();
-    let nonce = nonce();
-    let signature = sign_payload(
-        identity,
-        "update_installation_payout_profile",
-        &update,
-        timestamp_ms,
-        &nonce,
-    )?;
-    let revision = update.revision;
-    let request = InstallationPayoutProfileUpdateRequest {
-        protocol_epoch: PROTOCOL_EPOCH,
-        installation_id: identity.installation_id.clone(),
-        timestamp_ms,
-        nonce,
-        signature,
-        update,
-    };
-    let response = http
-        .put(format!("{api_base}/v1/installations/payout-profile"))
-        .json(&request)
-        .send()
-        .await
-        .context("send router payout profile update")?;
-    if response.status().is_success() {
-        let response = response
-            .json::<InstallationPayoutProfileUpdateResponse>()
-            .await
-            .context("parse router payout profile update response")?;
-        if !response.ok || response.revision != revision {
-            bail!("router payout profile update acknowledgement mismatch");
-        }
-        return Ok(response);
-    }
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    bail!("router payout profile update failed: {status}: {body}");
 }
 
 pub async fn issue_client_web_lease(
@@ -3924,39 +3828,6 @@ mod tests {
         .expect_err("a stalled prune error body must hit the total deadline");
 
         assert!(error.to_string().contains("share prune timed out"));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn payout_sync_has_one_total_http_timeout() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        });
-        let mut config = ServerConfig::empty();
-        config.router.url = Some(format!("http://{addr}"));
-        let mut identity = generate_identity_without_installation();
-        identity.installation_id = "inst-payout-sync-timeout".into();
-        config.router.identity = Some(identity);
-        let update = PayoutProfileState {
-            schema_version: crate::domain::settings::config::PAYOUT_PROFILE_SCHEMA_VERSION,
-            revision: 1,
-            profile: None,
-            updated_at_ms: 1,
-        };
-
-        let error = push_payout_profile_with_timeout(
-            &reqwest::Client::new(),
-            &config,
-            update,
-            Duration::from_millis(20),
-        )
-        .await
-        .expect_err("a stalled payout sync must hit the operation deadline");
-
-        assert!(error.to_string().contains("payout profile sync timed out"));
         server.abort();
     }
 

@@ -734,9 +734,6 @@ pub(in crate::api) async fn web_email_auth_change_owner_email(
             ));
         }
     }
-    if let Err(error) = crate::state::reconcile_payout_profile_to_router(state.clone()).await {
-        tracing::warn!(error = %error, "router payout profile reconcile after owner email change failed");
-    }
 
     Ok(crate::clients::router::email_auth::EmailAuthStatus {
         authenticated: false,
@@ -819,9 +816,6 @@ async fn bind_verified_email_session(
             .map_err(map_email_auth_error)?;
     crate::clients::router::email_auth::save_state(&state.config_dir, &email_state)
         .map_err(ApiError::internal)?;
-    if let Err(error) = crate::state::reconcile_payout_profile_to_router(state.clone()).await {
-        tracing::warn!(error = %error, "router payout profile reconcile after owner email verification failed");
-    }
     Ok(crate::clients::router::email_auth::EmailAuthStatus {
         authenticated: true,
         email: Some(email.to_string()),

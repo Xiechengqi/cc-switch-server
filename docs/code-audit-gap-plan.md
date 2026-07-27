@@ -1,6 +1,6 @@
 # 代码审计缺口修复计划（Phase X）
 
-> **来源**：2026-07-06 对外部 Provider/协议证据、Server（本仓库 @ `6fce8e4`）和 Router（`/data/projects/cc-switch-router`）的交叉审计。审计**不采信任何既有规划文档的状态标记**，全部结论来自协议证据与实测（`cargo test` 595 passed / typecheck / Router 契约逐条核对）。
+> **来源**：2026-07-06 对外部 Provider/协议证据、Server（本仓库 @ `6fce8e4`）和 Router（`cc-switch-router`）的交叉审计。审计**不采信任何既有规划文档的状态标记**，全部结论来自协议证据与实测（`cargo test` 595 passed / typecheck / Router 契约逐条核对）。
 > **定位约束**：Server 是独立 token 反代服务端；客户端专属功能（Skill/MCP/OpenClaw/Hermes/OMO/prompts/sessions/deeplink 等）维持排除，本计划不涉及。
 > **关联文档**：`assets/contract/web-runtime-contract.json`（Server 功能契约）、`UPSTREAM_IMPORT.md`（外部 Provider 审计台账）。
 > **后记（2026-07-22）**：Server 已删除模型成本计算、pricing store 和 provider 成本配置。下文 pricing 条目仅保留当时的审计与重构记录。

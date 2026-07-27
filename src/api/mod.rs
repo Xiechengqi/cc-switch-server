@@ -12,7 +12,6 @@ pub(in crate::api) mod events;
 pub(crate) mod invoke;
 pub(in crate::api) mod logs;
 pub(in crate::api) mod models;
-pub(in crate::api) mod payout;
 pub(in crate::api) mod provider_health_scheduler;
 pub(in crate::api) mod providers;
 pub(in crate::api) mod router;
@@ -47,7 +46,6 @@ pub(in crate::api) use invoke::dispatch::web_invoke_compat;
 pub(in crate::api) use invoke::handlers::*;
 pub(in crate::api) use logs::*;
 pub(in crate::api) use models::*;
-pub(in crate::api) use payout::*;
 pub(in crate::api) use providers::*;
 pub(in crate::api) use router::*;
 pub(in crate::api) use self_update::*;
@@ -147,6 +145,7 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
 pub fn app_router(state: ServerState) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/metrics", get(prometheus_metrics))
         .route("/version", get(version))
         .route("/_share-router/health", get(share_router_health))
@@ -183,6 +182,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/auth/email/verify-code", post(verify_email_login_code))
         .route("/api/auth/me", get(auth_me))
         .route("/api/auth/api-token", post(rotate_api_token))
+        .route("/api/auth/inference-token", post(rotate_inference_token))
         .route("/api/admin/version", get(admin_version))
         .route("/api/admin/restart", post(admin_restart))
         .route("/api/admin/rollback", post(admin_rollback))
@@ -196,16 +196,6 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/backup/:id/restore", post(restore_backup))
         .route("/api/backups/:id/restore", post(restore_backup))
         .route("/api/config", get(config_snapshot))
-        .route(
-            "/api/settings/payout-profile",
-            get(get_payout_profile)
-                .put(save_payout_profile)
-                .delete(clear_payout_profile),
-        )
-        .route(
-            "/.well-known/cc-switch/payout-profile",
-            get(public_payout_profile),
-        )
         .route("/api/providers", get(list_providers).post(create_provider))
         .route(
             "/api/providers/:id",
@@ -607,8 +597,8 @@ async fn verify_router_ingress(
         request.headers_mut().remove(name);
     }
 
-    let context = match (encoded, signature) {
-        (None, None) => return next.run(request).await,
+    let (context, router_verified) = match (encoded, signature) {
+        (None, None) => (None, false),
         (Some(encoded), Some(signature)) => {
             let config = state.config.read().await;
             let Some(identity) = config.registered_router_identity() else {
@@ -629,7 +619,7 @@ async fn verify_router_ingress(
                 &identity.installation_id,
                 chrono::Utc::now().timestamp_millis(),
             ) {
-                Ok(context) => context,
+                Ok(context) => (Some(context), true),
                 Err(error) => {
                     tracing::warn!(error = %error, "router ingress context rejected");
                     return StatusCode::UNAUTHORIZED.into_response();
@@ -639,6 +629,31 @@ async fn verify_router_ingress(
         _ => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
+    if is_claude_inference_path(request.uri().path()) && !router_verified {
+        if request.headers().contains_key(header::ORIGIN) {
+            return ApiError::forbidden(
+                "browser-originated direct inference requests are not allowed",
+            )
+            .into_response();
+        }
+        let config = state.config.read().await;
+        if !config.inference_token_configured() {
+            return ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "inference token is not configured; rotate one at /api/auth/inference-token",
+            )
+            .into_response();
+        }
+        let authorized =
+            inference_tokens(request.headers()).any(|token| config.verify_inference_token(token));
+        if !authorized {
+            return ApiError::unauthorized("missing or invalid inference token").into_response();
+        }
+    }
+
+    let Some(context) = context else {
+        return next.run(request).await;
+    };
     let headers = request.headers_mut();
     for (name, value) in [
         ("x-cc-switch-share-id", context.share_id.as_deref()),
@@ -677,6 +692,26 @@ async fn verify_router_ingress(
         }
     }
     next.run(request).await
+}
+
+fn is_claude_inference_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/messages"
+            | "/claude/v1/messages"
+            | "/v1/messages/count_tokens"
+            | "/claude/v1/messages/count_tokens"
+    )
+}
+
+fn inference_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+    bearer_token(headers).into_iter().chain(
+        headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    )
 }
 
 async fn embedded_web_asset(method: Method, uri: Uri) -> Response {
@@ -722,8 +757,11 @@ fn web_dist_missing_response() -> Response {
 }
 
 async fn health(State(state): State<ServerState>) -> Json<HealthResponse> {
+    let degraded = state.credential_persistence_degraded();
     Json(HealthResponse {
         ok: true,
+        status: if degraded { "degraded" } else { "healthy" },
+        credential_persistence_degraded: degraded,
         config_dir: state.config_dir.display().to_string(),
         web_dist_dir: state
             .web_dist_dir
@@ -732,6 +770,31 @@ async fn health(State(state): State<ServerState>) -> Json<HealthResponse> {
         embedded_web_assets: web_assets::asset_count(),
         unix_ms: now_ms(),
     })
+}
+
+async fn readiness(State(state): State<ServerState>) -> Response {
+    let mut reasons = Vec::new();
+    if state.credential_persistence_degraded() {
+        reasons.push("oauth_credential_persistence_degraded");
+    }
+    let config = state.config.read().await;
+    if config.is_setup_complete() && !config.inference_token_configured() {
+        reasons.push("inference_token_not_configured");
+    }
+    let ready = reasons.is_empty();
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(ReadinessResponse {
+            ok: ready,
+            status: if ready { "ready" } else { "degraded" },
+            reasons,
+        }),
+    )
+        .into_response()
 }
 
 async fn prometheus_metrics() -> impl IntoResponse {

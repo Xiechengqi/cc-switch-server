@@ -11,9 +11,10 @@ const files = {
   adapters: path.join(repoRoot, "src/proxy/adapters.rs"),
   forwarder: path.join(repoRoot, "src/proxy/forwarder.rs"),
  providerMatrix: path.join(repoRoot, "src/domain/providers/matrix.rs"),
- provider: path.join(repoRoot, "src/domain/providers/model.rs"),
- accountManagers: path.join(repoRoot, "src/domain/accounts/managers.rs"),
+  provider: path.join(repoRoot, "src/domain/providers/model.rs"),
+  accountManagers: path.join(repoRoot, "src/domain/accounts/managers.rs"),
   accountRefresh: path.join(repoRoot, "src/clients/oauth/refresh.rs"),
+  accountApi: path.join(repoRoot, "src/api/accounts.rs"),
   oauthClients: path.join(repoRoot, "src/domain/accounts/oauth.rs"),
   providerCard: path.join(repoRoot, "web-src/src/components/providers/ProviderCard.tsx"),
   providerMeta: path.join(repoRoot, "web-src/src/utils/providerMetaUtils.ts"),
@@ -147,6 +148,7 @@ function audit() {
   const provider = read(files.provider);
   const accountManagers = read(files.accountManagers);
   const accountRefresh = read(files.accountRefresh);
+  const accountApi = read(files.accountApi);
   const oauthClients = read(files.oauthClients);
   const providerCard = read(files.providerCard);
   const providerMeta = read(files.providerMeta);
@@ -293,10 +295,18 @@ function audit() {
   for (const marker of [
     "account_needs_native_refresh",
     "execute_native_account_refresh",
-    "profile refresh warning",
+    "oauth_endpoint_fallback_allowed",
+    "endpoint_fallback_safe",
+    "error.is_connect()",
+    "retry_after_ms",
   ]) {
     if (!accountRefresh.includes(marker)) {
       errors.push(`account refresh module no longer exposes marker: ${marker}`);
+    }
+  }
+  for (const marker of ["build_profile_request", "refresh_account_quota"]) {
+    if (!accountApi.includes(marker)) {
+      errors.push(`account API no longer keeps token refresh and profile/quota enrichment separate: ${marker}`);
     }
   }
   if (!forwarder.includes("managed account refresh failed")) {

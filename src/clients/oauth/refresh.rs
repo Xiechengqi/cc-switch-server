@@ -1,9 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use crate::domain::accounts::oauth::{
-    build_profile_request, build_refresh_request_for_token_url, classify_oauth_error,
-    merge_refresh_updates, oauth_provider_spec, refresh_update_from_profile_response,
+    build_refresh_request_for_token_url, classify_oauth_error, oauth_provider_spec,
     refresh_update_from_token_response, token_expires_soon, OAuthErrorClassification,
     OAuthErrorKind, OAuthHttpRequest, OAuthRequestBodyFormat, OAuthTokenResponse,
 };
@@ -19,54 +18,85 @@ const REFRESH_MAX_BACKOFF_MS: i64 = 5 * 60_000;
 #[derive(Debug, Clone)]
 pub struct AccountRefreshFailure {
     pub status_code: u16,
+    pub upstream_status: Option<u16>,
     pub message: String,
     pub kind: OAuthErrorKind,
     pub retryable: bool,
+    pub retry_after_ms: Option<i64>,
+    pub(crate) endpoint_fallback_safe: bool,
 }
 
 impl AccountRefreshFailure {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status_code: 400,
+            upstream_status: None,
             message: message.into(),
             kind: OAuthErrorKind::Unsupported,
             retryable: false,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
         }
     }
 
     pub fn bad_gateway(message: impl Into<String>) -> Self {
         Self {
             status_code: 502,
+            upstream_status: None,
             message: message.into(),
             kind: OAuthErrorKind::Network,
             retryable: true,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
+        }
+    }
+
+    fn request_failed(context: impl Into<String>, error: reqwest::Error) -> Self {
+        let endpoint_fallback_safe = error.is_connect();
+        Self {
+            status_code: 502,
+            upstream_status: None,
+            message: format!("{}: {error}", context.into()),
+            kind: OAuthErrorKind::Network,
+            retryable: true,
+            retry_after_ms: None,
+            endpoint_fallback_safe,
         }
     }
 
     pub fn authorization_pending(message: impl Into<String>) -> Self {
         Self {
             status_code: 409,
+            upstream_status: None,
             message: message.into(),
             kind: OAuthErrorKind::AuthorizationPending,
             retryable: true,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
         }
     }
 
     fn rate_limited(message: impl Into<String>) -> Self {
         Self {
             status_code: 429,
+            upstream_status: None,
             message: message.into(),
             kind: OAuthErrorKind::RateLimited,
             retryable: true,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
         }
     }
 
     pub(crate) fn parse(message: impl Into<String>) -> Self {
         Self {
             status_code: 502,
+            upstream_status: None,
             message: message.into(),
             kind: OAuthErrorKind::Parse,
             retryable: false,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
         }
     }
 
@@ -79,6 +109,7 @@ impl AccountRefreshFailure {
         let context = context.into();
         Self {
             status_code,
+            upstream_status,
             message: if context.is_empty() {
                 classification.message
             } else {
@@ -86,7 +117,14 @@ impl AccountRefreshFailure {
             },
             kind: classification.kind,
             retryable: classification.retryable,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
         }
+    }
+
+    fn with_retry_after(mut self, retry_after_ms: Option<i64>) -> Self {
+        self.retry_after_ms = retry_after_ms;
+        self
     }
 }
 
@@ -238,26 +276,38 @@ async fn execute_native_account_refresh_inner(
                 .map_err(|error| {
                     AccountRefreshFailure::from_classification(None, error, "OAuth refresh request")
                 })?;
-        let (status, body) = match execute_oauth_request(http, &request).await {
+        let response = match execute_oauth_request(http, &request).await {
             Ok(response) => response,
             Err(error) => {
-                last_error = Some(AccountRefreshFailure::bad_gateway(format!(
-                    "OAuth refresh request failed: {error}"
-                )));
-                continue;
+                let failure = AccountRefreshFailure::request_failed(
+                    format!("OAuth refresh request failed at {token_url}"),
+                    error,
+                );
+                let try_fallback = oauth_endpoint_fallback_allowed(&failure);
+                last_error = Some(failure);
+                if try_fallback {
+                    continue;
+                }
+                break;
             }
         };
-        if !status.is_success() {
-            let classified = classify_oauth_error(Some(status.as_u16()), &body);
-            last_error = Some(AccountRefreshFailure::from_classification(
-                Some(status.as_u16()),
+        if !response.status.is_success() {
+            let classified = classify_oauth_error(Some(response.status.as_u16()), &response.body);
+            let failure = AccountRefreshFailure::from_classification(
+                Some(response.status.as_u16()),
                 classified,
                 format!("OAuth refresh failed at {token_url}"),
-            ));
-            continue;
+            )
+            .with_retry_after(response.retry_after_ms());
+            let try_fallback = oauth_endpoint_fallback_allowed(&failure);
+            last_error = Some(failure);
+            if try_fallback {
+                continue;
+            }
+            break;
         }
 
-        let raw: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+        let raw: serde_json::Value = serde_json::from_str(&response.body).map_err(|error| {
             AccountRefreshFailure::parse(format!(
                 "OAuth refresh response is not valid JSON: {error}"
             ))
@@ -277,9 +327,12 @@ async fn execute_native_account_refresh_inner(
             .await
             .map_err(|error| AccountRefreshFailure {
                 status_code: 400,
+                upstream_status: None,
                 message: error.to_string(),
                 kind: OAuthErrorKind::InvalidGrant,
                 retryable: false,
+                retry_after_ms: None,
+                endpoint_fallback_safe: false,
             })?;
             ensure_openai_refresh_subject_matches(account, &verified.identity)?;
             Some(verified)
@@ -304,21 +357,6 @@ async fn execute_native_account_refresh_inner(
             )
         };
 
-        if let Some(profile_request) =
-            build_profile_request(account.provider_type, &token_response.access_token)
-        {
-            update = merge_refresh_updates(
-                update,
-                execute_optional_profile_refresh(
-                    http,
-                    account.provider_type,
-                    &profile_request,
-                    now_ms,
-                    quota_refresh_interval_ms,
-                )
-                .await,
-            );
-        }
         if let Some(verified) = verified_openai_identity {
             if verified.identity.email.is_some() {
                 update.email = verified.identity.email;
@@ -335,12 +373,15 @@ async fn execute_native_account_refresh_inner(
         {
             return Err(AccountRefreshFailure {
                 status_code: 409,
+                upstream_status: None,
                 message: format!(
                     "{} OAuth refresh returned a different subscription identity; re-login as a new account",
                     account.provider_type.as_str()
                 ),
                 kind: OAuthErrorKind::InvalidGrant,
                 retryable: false,
+                retry_after_ms: None,
+                endpoint_fallback_safe: false,
             });
         }
 
@@ -370,17 +411,23 @@ fn ensure_openai_refresh_subject_matches(
         .filter(|subject| !subject.is_empty())
         .ok_or_else(|| AccountRefreshFailure {
             status_code: 400,
+            upstream_status: None,
             message: "OpenAI OAuth refresh did not produce a verified subject".to_string(),
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
         })?;
 
     if existing_subject.is_some_and(|subject| subject != refreshed_subject) {
         return Err(AccountRefreshFailure {
             status_code: 400,
+            upstream_status: None,
             message: "OpenAI OAuth refresh subject does not match the existing account".to_string(),
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
         });
     }
     Ok(())
@@ -398,8 +445,8 @@ struct RefreshRecentSuccess {
     update: AccountRefreshUpdate,
 }
 
-fn refresh_locks() -> &'static StdMutex<HashMap<String, Arc<AsyncMutex<()>>>> {
-    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+fn refresh_locks() -> &'static StdMutex<HashMap<String, Weak<AsyncMutex<()>>>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>> = OnceLock::new();
     LOCKS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -417,10 +464,13 @@ fn refresh_lock(key: &str) -> Arc<AsyncMutex<()>> {
     let mut locks = refresh_locks()
         .lock()
         .expect("refresh lock registry poisoned");
-    locks
-        .entry(key.to_string())
-        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-        .clone()
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(key.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
 fn refresh_lock_key(account: &Account) -> Option<String> {
@@ -429,7 +479,13 @@ fn refresh_lock_key(account: &Account) -> Option<String> {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let digest = Sha256::digest(refresh_token.as_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update(account.provider_type.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(account.id.as_bytes());
+    hasher.update([0]);
+    hasher.update(refresh_token.as_bytes());
+    let digest = hasher.finalize();
     Some(format!(
         "{}:{}",
         account.provider_type.as_str(),
@@ -507,7 +563,9 @@ fn remember_refresh_failure(key: &str, now_ms: i64, error: &AccountRefreshFailur
         .get(key)
         .map(|state| state.next_delay_ms)
         .unwrap_or(REFRESH_INITIAL_BACKOFF_MS);
-    let delay = if error.kind == OAuthErrorKind::InvalidGrant {
+    let delay = if let Some(retry_after_ms) = error.retry_after_ms {
+        retry_after_ms.clamp(1_000, 24 * 60 * 60 * 1_000)
+    } else if error.kind == OAuthErrorKind::InvalidGrant {
         REFRESH_MAX_BACKOFF_MS
     } else {
         previous_delay.clamp(REFRESH_INITIAL_BACKOFF_MS, REFRESH_MAX_BACKOFF_MS)
@@ -546,7 +604,13 @@ pub async fn execute_oauth_token_request(
         match execute_single_oauth_token_request(http, provider_type, &request, &context).await {
             Ok(response) => return Ok(response),
             Err(error) if error.kind == OAuthErrorKind::AuthorizationPending => return Err(error),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                let try_fallback = oauth_endpoint_fallback_allowed(&error);
+                last_error = Some(error);
+                if !try_fallback {
+                    break;
+                }
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| {
@@ -563,18 +627,19 @@ pub async fn execute_oauth_json_request(
     context: impl Into<String>,
 ) -> Result<serde_json::Value, AccountRefreshFailure> {
     let context = context.into();
-    let (status, body) = execute_oauth_request(http, request)
+    let response = execute_oauth_request(http, request)
         .await
-        .map_err(|error| AccountRefreshFailure::bad_gateway(format!("{context}: {error}")))?;
-    if !status.is_success() {
-        let classified = classify_oauth_error(Some(status.as_u16()), &body);
+        .map_err(|error| AccountRefreshFailure::request_failed(context.clone(), error))?;
+    if !response.status.is_success() {
+        let classified = classify_oauth_error(Some(response.status.as_u16()), &response.body);
         return Err(AccountRefreshFailure::from_classification(
-            Some(status.as_u16()),
+            Some(response.status.as_u16()),
             classified,
             format!("{context} failed at {}", request.url),
-        ));
+        )
+        .with_retry_after(response.retry_after_ms()));
     }
-    serde_json::from_str(&body).map_err(|error| {
+    serde_json::from_str(&response.body).map_err(|error| {
         AccountRefreshFailure::parse(format!(
             "{context} response is not valid JSON for {}: {error}",
             provider_type.as_str()
@@ -588,24 +653,25 @@ async fn execute_single_oauth_token_request(
     request: &OAuthHttpRequest,
     context: &str,
 ) -> Result<(OAuthTokenResponse, serde_json::Value), AccountRefreshFailure> {
-    let (status, body) = execute_oauth_request(http, request)
+    let response = execute_oauth_request(http, request)
         .await
-        .map_err(|error| AccountRefreshFailure::bad_gateway(format!("{context}: {error}")))?;
-    if cursor_login_is_pending(provider_type, status, &body) {
+        .map_err(|error| AccountRefreshFailure::request_failed(context.to_string(), error))?;
+    if cursor_login_is_pending(provider_type, response.status, &response.body) {
         return Err(AccountRefreshFailure::authorization_pending(
             "cursor oauth authorization is still pending",
         ));
     }
-    if !status.is_success() {
-        let classified = classify_oauth_error(Some(status.as_u16()), &body);
+    if !response.status.is_success() {
+        let classified = classify_oauth_error(Some(response.status.as_u16()), &response.body);
         return Err(AccountRefreshFailure::from_classification(
-            Some(status.as_u16()),
+            Some(response.status.as_u16()),
             classified,
             format!("{context} failed at {}", request.url),
-        ));
+        )
+        .with_retry_after(response.retry_after_ms()));
     }
 
-    let raw: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+    let raw: serde_json::Value = serde_json::from_str(&response.body).map_err(|error| {
         AccountRefreshFailure::parse(format!("{context} response is not valid JSON: {error}"))
     })?;
     let token_response: OAuthTokenResponse =
@@ -698,51 +764,10 @@ fn cursor_login_is_pending(
             || (status.is_success() && body.trim().is_empty()))
 }
 
-async fn execute_optional_profile_refresh(
-    http: &reqwest::Client,
-    provider_type: ProviderType,
-    request: &OAuthHttpRequest,
-    now_ms: i64,
-    quota_refresh_interval_ms: i64,
-) -> AccountRefreshUpdate {
-    match execute_oauth_request(http, request).await {
-        Ok((status, body)) if status.is_success() => {
-            match serde_json::from_str::<serde_json::Value>(&body) {
-                Ok(profile_raw) => refresh_update_from_profile_response(
-                    provider_type,
-                    profile_raw,
-                    now_ms,
-                    quota_refresh_interval_ms,
-                ),
-                Err(error) => AccountRefreshUpdate {
-                    last_refresh_error: Some(format!(
-                        "profile refresh warning: response is not valid JSON: {error}"
-                    )),
-                    ..Default::default()
-                },
-            }
-        }
-        Ok((status, body)) => {
-            let classified = classify_oauth_error(Some(status.as_u16()), &body);
-            AccountRefreshUpdate {
-                last_refresh_error: Some(format!(
-                    "profile refresh warning at {}: {}",
-                    request.url, classified.message
-                )),
-                ..Default::default()
-            }
-        }
-        Err(error) => AccountRefreshUpdate {
-            last_refresh_error: Some(format!("profile refresh warning: {error}")),
-            ..Default::default()
-        },
-    }
-}
-
 async fn execute_oauth_request(
     http: &reqwest::Client,
     request: &OAuthHttpRequest,
-) -> Result<(reqwest::StatusCode, String), reqwest::Error> {
+) -> Result<OAuthHttpResponse, reqwest::Error> {
     let method = match request.method {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
@@ -760,8 +785,84 @@ async fn execute_oauth_request(
     }
     let response = builder.send().await?;
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response.text().await?;
-    Ok((status, body))
+    Ok(OAuthHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+struct OAuthHttpResponse {
+    status: reqwest::StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: String,
+}
+
+impl OAuthHttpResponse {
+    fn retry_after_ms(&self) -> Option<i64> {
+        parse_retry_after_ms(&self.headers)
+    }
+}
+
+fn oauth_endpoint_fallback_allowed(error: &AccountRefreshFailure) -> bool {
+    if matches!(
+        error.kind,
+        OAuthErrorKind::InvalidGrant
+            | OAuthErrorKind::AccessDenied
+            | OAuthErrorKind::RateLimited
+            | OAuthErrorKind::ExpiredToken
+            | OAuthErrorKind::AuthorizationPending
+    ) {
+        return false;
+    }
+    if error
+        .upstream_status
+        .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+        .is_some_and(|status| {
+            matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND
+                    | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    | reqwest::StatusCode::GONE
+                    | reqwest::StatusCode::NOT_IMPLEMENTED
+                    | reqwest::StatusCode::BAD_GATEWAY
+                    | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    | reqwest::StatusCode::GATEWAY_TIMEOUT
+            )
+        })
+    {
+        return true;
+    }
+    error.kind == OAuthErrorKind::Network && error.endpoint_fallback_safe
+}
+
+fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    const MAX_RETRY_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
+    if let Some(value) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+    {
+        return Some(value.clamp(0, MAX_RETRY_AFTER_MS));
+    }
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<i64>() {
+        return Some(seconds.saturating_mul(1_000).clamp(0, MAX_RETRY_AFTER_MS));
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    Some(
+        retry_at
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default()
+            .as_millis()
+            .min(MAX_RETRY_AFTER_MS as u128) as i64,
+    )
 }
 
 fn oauth_form_pairs(value: &serde_json::Value) -> Vec<(String, String)> {
@@ -807,6 +908,7 @@ mod tests {
 
     use axum::routing::post;
     use axum::{Json, Router};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -895,6 +997,21 @@ mod tests {
         let mut relogin = account(ProviderType::CodexOAuth, None, Some("refresh"), None);
         relogin.needs_relogin = true;
         assert!(!account_needs_native_refresh(&relogin, now_ms));
+    }
+
+    #[test]
+    fn refresh_singleflight_key_is_scoped_to_the_account_record() {
+        let first = account(
+            ProviderType::ClaudeOAuth,
+            Some("access"),
+            Some("shared-refresh-token"),
+            Some(1),
+        );
+        let mut second = first.clone();
+        second.id = "acct-2".to_string();
+
+        assert_ne!(refresh_lock_key(&first), refresh_lock_key(&second));
+        assert_eq!(refresh_lock_key(&first), refresh_lock_key(&first.clone()));
     }
 
     #[test]
@@ -1054,5 +1171,284 @@ mod tests {
             captured[0]["refresh_token"],
             serde_json::json!("original-refresh-token")
         );
+    }
+
+    #[test]
+    fn retry_after_headers_are_bounded_and_prefer_milliseconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "12".parse().unwrap());
+        assert_eq!(parse_retry_after_ms(&headers), Some(12_000));
+        headers.insert("retry-after-ms", "2500".parse().unwrap());
+        assert_eq!(parse_retry_after_ms(&headers), Some(2_500));
+        headers.insert("retry-after-ms", "999999999".parse().unwrap());
+        assert_eq!(parse_retry_after_ms(&headers), Some(24 * 60 * 60 * 1_000));
+    }
+
+    #[test]
+    fn deterministic_oauth_errors_never_enable_endpoint_fallback() {
+        for kind in [
+            OAuthErrorKind::InvalidGrant,
+            OAuthErrorKind::AccessDenied,
+            OAuthErrorKind::RateLimited,
+            OAuthErrorKind::ExpiredToken,
+        ] {
+            let error = AccountRefreshFailure {
+                status_code: 503,
+                upstream_status: Some(503),
+                message: "deterministic rejection".to_string(),
+                kind,
+                retryable: true,
+                retry_after_ms: None,
+                endpoint_fallback_safe: false,
+            };
+            assert!(!oauth_endpoint_fallback_allowed(&error), "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_refresh_rejection_does_not_try_fallback_endpoint() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let fallback_requests = Arc::new(AtomicUsize::new(0));
+        let fallback_requests_for_route = Arc::clone(&fallback_requests);
+        let upstream = Router::new()
+            .route(
+                "/invalid",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "invalid_grant",
+                            "error_description": "refresh token was rejected"
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/fallback",
+                post(move || {
+                    let requests = Arc::clone(&fallback_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "access_token": "must-not-be-used",
+                            "refresh_token": "must-not-be-used",
+                            "expires_in": 3600
+                        }))
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::ClaudeOAuth,
+            Some("expired"),
+            Some("deterministic-rejection-refresh"),
+            Some(1),
+        );
+        account.id = "deterministic-no-fallback".to_string();
+        let first = format!("http://{address}/invalid");
+        let second = format!("http://{address}/fallback");
+        let urls = [first.as_str(), second.as_str()];
+        let error = execute_native_account_refresh_with_token_urls(
+            &reqwest::Client::new(),
+            &account,
+            1_000_000,
+            60_000,
+            Some(&urls),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind, OAuthErrorKind::InvalidGrant);
+        assert_eq!(fallback_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_rate_limit_preserves_retry_after_and_stops_fallback() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let fallback_requests = Arc::new(AtomicUsize::new(0));
+        let fallback_requests_for_route = Arc::clone(&fallback_requests);
+        let upstream = Router::new()
+            .route(
+                "/limited",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after-ms", "2500")],
+                        Json(serde_json::json!({"error": "rate_limit_error"})),
+                    )
+                }),
+            )
+            .route(
+                "/fallback",
+                post(move || {
+                    let requests = Arc::clone(&fallback_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({"access_token": "unused"}))
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::ClaudeOAuth,
+            Some("expired"),
+            Some("rate-limit-refresh"),
+            Some(1),
+        );
+        account.id = "rate-limit-no-fallback".to_string();
+        let first = format!("http://{address}/limited");
+        let second = format!("http://{address}/fallback");
+        let urls = [first.as_str(), second.as_str()];
+        let error = execute_native_account_refresh_with_token_urls(
+            &reqwest::Client::new(),
+            &account,
+            2_000_000,
+            60_000,
+            Some(&urls),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind, OAuthErrorKind::RateLimited);
+        assert_eq!(error.retry_after_ms, Some(2_500));
+        assert_eq!(fallback_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_response_body_failure_does_not_try_fallback_endpoint() {
+        let broken_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let broken_address = broken_listener.local_addr().unwrap();
+        let broken_server = tokio::spawn(async move {
+            let (mut stream, _) = broken_listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = r#"{"access_token":"rotated-access","refresh_token":"rotated-refresh""#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:X}\r\n{body}\r\nZZ\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let fallback_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let fallback_address = fallback_listener.local_addr().unwrap();
+        let fallback_requests = Arc::new(AtomicUsize::new(0));
+        let fallback_requests_for_route = Arc::clone(&fallback_requests);
+        let fallback = Router::new().route(
+            "/fallback",
+            post(move || {
+                let requests = Arc::clone(&fallback_requests_for_route);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "access_token": "must-not-be-used",
+                        "refresh_token": "must-not-be-used",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let fallback_server =
+            tokio::spawn(async move { axum::serve(fallback_listener, fallback).await.unwrap() });
+
+        let mut account = account(
+            ProviderType::ClaudeOAuth,
+            Some("expired"),
+            Some("body-failure-refresh-token"),
+            Some(1),
+        );
+        account.id = "body-failure-no-fallback".to_string();
+        let first = format!("http://{broken_address}/token");
+        let second = format!("http://{fallback_address}/fallback");
+        let urls = [first.as_str(), second.as_str()];
+        let error = execute_native_account_refresh_with_token_urls(
+            &reqwest::Client::new(),
+            &account,
+            3_000_000,
+            60_000,
+            Some(&urls),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind, OAuthErrorKind::Network);
+        assert!(!error.endpoint_fallback_safe);
+        assert_eq!(fallback_requests.load(Ordering::SeqCst), 0);
+        broken_server.await.unwrap();
+        fallback_server.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_connect_failure_tries_fallback_endpoint() {
+        let unavailable_listener =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+        let unavailable_address = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+
+        let fallback_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let fallback_address = fallback_listener.local_addr().unwrap();
+        let fallback_requests = Arc::new(AtomicUsize::new(0));
+        let fallback_requests_for_route = Arc::clone(&fallback_requests);
+        let fallback = Router::new().route(
+            "/fallback",
+            post(move || {
+                let requests = Arc::clone(&fallback_requests_for_route);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "access_token": "fallback-access",
+                        "refresh_token": "fallback-refresh",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let fallback_server =
+            tokio::spawn(async move { axum::serve(fallback_listener, fallback).await.unwrap() });
+
+        let mut account = account(
+            ProviderType::ClaudeOAuth,
+            Some("expired"),
+            Some("connect-failure-refresh-token"),
+            Some(1),
+        );
+        account.id = "connect-failure-allows-fallback".to_string();
+        let first = format!("http://{unavailable_address}/token");
+        let second = format!("http://{fallback_address}/fallback");
+        let urls = [first.as_str(), second.as_str()];
+        let update = execute_native_account_refresh_with_token_urls(
+            &reqwest::Client::new(),
+            &account,
+            4_000_000,
+            60_000,
+            Some(&urls),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(update.access_token.as_deref(), Some("fallback-access"));
+        assert_eq!(fallback_requests.load(Ordering::SeqCst), 1);
+        fallback_server.abort();
     }
 }

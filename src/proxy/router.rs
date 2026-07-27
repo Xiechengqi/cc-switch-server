@@ -109,6 +109,46 @@ pub(super) fn select_provider_with_account_inflight(
     )
 }
 
+pub(super) fn select_exact_provider_with_account_inflight(
+    store: &ProviderStore,
+    accounts: &AccountStore,
+    app: AppKind,
+    headers: &HeaderMap,
+    current_provider_id: Option<&str>,
+    account_in_flight: &AccountInFlightSnapshot,
+) -> Result<ProviderRouteSelection, ProxyError> {
+    let current_provider_id = current_provider_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProxyError::not_found(format!(
+                "no current provider configured for {}",
+                app.as_str()
+            ))
+        })?;
+    if let Some(requested) = headers
+        .get("x-cc-provider-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if requested != current_provider_id {
+            return Err(ProxyError::bad_request(
+                "Claude direct inference is pinned to the configured current provider",
+            ));
+        }
+    }
+    let provider = store
+        .providers
+        .iter()
+        .find(|item| item.app == app && item.provider.id == current_provider_id)
+        .cloned()
+        .ok_or_else(|| {
+            ProxyError::not_found(format!("provider not found: {current_provider_id}"))
+        })?;
+    finalize_provider_selection(store, accounts, provider, Some(account_in_flight), now_ms())
+}
+
 pub(super) fn select_provider_for_claude_count_tokens(
     store: &ProviderStore,
     accounts: &AccountStore,
@@ -1044,6 +1084,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.execution.stored.provider.id, "p2");
+    }
+
+    #[test]
+    fn exact_claude_selection_never_switches_accounts() {
+        let store = runtime_store(vec![
+            claude_oauth_provider("p1", "acct-1", Some(1)),
+            claude_oauth_provider("p2", "acct-2", Some(1)),
+        ]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(claude_oauth_account("acct-1"));
+        accounts.upsert(claude_oauth_account("acct-2"));
+        let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
+        let _guard = tracker
+            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
+            .unwrap();
+
+        let error = select_exact_provider_with_account_inflight(
+            &store,
+            &accounts,
+            AppKind::Claude,
+            &HeaderMap::new(),
+            Some("p1"),
+            &tracker.snapshot(),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cc-provider-id", HeaderValue::from_static("p2"));
+        let error = select_exact_provider_with_account_inflight(
+            &store,
+            &accounts,
+            AppKind::Claude,
+            &headers,
+            Some("p1"),
+            &tracker.snapshot(),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]

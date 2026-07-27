@@ -1,6 +1,6 @@
 {
   "generatedAt": "2026-07-02T16:26:20.875Z",
-  "upstreamRoot": "/data/projects/cc-switch",
+  "upstreamRoot": "../cc-switch",
   "fields": [
     "settingsConfig",
     "meta",

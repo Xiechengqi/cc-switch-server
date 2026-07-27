@@ -55,6 +55,8 @@ pub struct SetupOutcome {
     pub session_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_token: Option<String>,
 }
 
 impl SetupOutcome {
@@ -74,6 +76,7 @@ impl SetupOutcome {
             message: "setup is already complete".to_string(),
             session_token: None,
             api_token: None,
+            inference_token: None,
         }
     }
 
@@ -85,6 +88,7 @@ impl SetupOutcome {
         message: impl Into<String>,
         session_token: Option<String>,
         api_token: Option<String>,
+        inference_token: Option<String>,
     ) -> Self {
         let mut warnings = warnings;
         if let Some(warning) = setup_completion_notification_warning(config) {
@@ -103,6 +107,7 @@ impl SetupOutcome {
             message: message.into(),
             session_token,
             api_token,
+            inference_token,
         }
     }
 }
@@ -150,6 +155,7 @@ pub async fn complete_setup(
     };
 
     let mut config = ServerConfig::from_setup(input).map_err(map_setup_error)?;
+    config.auth.inference_token_hash = state.config.read().await.auth.inference_token_hash.clone();
     config.setup_completion_notification = setup_completion_notification;
 
     if dry_run {
@@ -159,6 +165,7 @@ pub async fn complete_setup(
             Vec::new(),
             true,
             "setup validation succeeded",
+            None,
             None,
             None,
         ));
@@ -239,6 +246,17 @@ pub async fn complete_setup(
         api_token = Some(token);
     }
 
+    let inference_token = if state.config.read().await.inference_token_configured() {
+        None
+    } else {
+        let token = generate_session_token();
+        state
+            .set_inference_token(&token)
+            .await
+            .map_err(ApiError::internal)?;
+        Some(token)
+    };
+
     let message = if session_token.is_some() {
         "setup complete; session token issued".to_string()
     } else {
@@ -253,6 +271,7 @@ pub async fn complete_setup(
         message,
         session_token,
         api_token,
+        inference_token,
     ))
 }
 
@@ -585,6 +604,7 @@ mod tests {
             "setup complete",
             None,
             None,
+            None,
         );
 
         let json = serde_json::to_value(outcome).unwrap();
@@ -614,6 +634,7 @@ mod tests {
             Vec::new(),
             false,
             "setup complete",
+            None,
             None,
             None,
         );
@@ -650,6 +671,14 @@ mod tests {
             outcome.client_tunnel_claim_status.as_deref(),
             Some("skipped")
         );
+        let inference_token = outcome
+            .inference_token
+            .as_deref()
+            .expect("first setup must issue an inference token");
+        assert!(state
+            .config_snapshot()
+            .await
+            .verify_inference_token(inference_token));
         assert!(outcome.setup_completion_notification_status.is_none());
         assert!(state
             .config_snapshot()

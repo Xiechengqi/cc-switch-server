@@ -10,13 +10,13 @@
 
 当前 cc-switch 中 Claude、Codex、Gemini 三类 app 已支持的所有供应商类型，都必须进入 server 覆盖范围。
 
-供应商覆盖以这些来源为准：
+供应商覆盖以 Provider 基线仓库（`CC_SWITCH_PROVIDER_AUDIT_ROOT`，默认同级 `../cc-switch`）中以下五个权威来源为准，快照见 `assets/contract/upstream-provider-source-baseline.json`：
 
-- `/data/projects/cc-switch/src-tauri/src/proxy/providers/mod.rs`
-- `/data/projects/cc-switch/src/config/claudeProviderPresets.ts`
-- `/data/projects/cc-switch/src/config/codexProviderPresets.ts`
-- `/data/projects/cc-switch/src/config/geminiProviderPresets.ts`
-- `/data/projects/cc-switch/src/config/universalProviderPresets.ts`
+- `src-tauri/src/proxy/providers/mod.rs`
+- `src/config/claudeProviderPresets.ts`
+- `src/config/codexProviderPresets.ts`
+- `src/config/geminiProviderPresets.ts`
+- `src/config/universalProviderPresets.ts`
 
 ## 禁止默认迁移
 

@@ -62,8 +62,7 @@ use crate::domain::providers::registry::{
 use crate::domain::providers::store::{ProviderResourceMetadata, ProviderStore, StoredProvider};
 use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
-    PayoutProfile, PayoutProfileState, RouterIdentity, ServerConfig,
-    SetupCompletionNotificationStatus,
+    RouterIdentity, ServerConfig, SetupCompletionNotificationStatus,
 };
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::router_contract::{
@@ -247,6 +246,11 @@ pub struct ServerStateInner {
     router_share_sync: AsyncMutex<()>,
     setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
+    // Low bit marks degraded persistence; upper bits form a monotonic failure generation.
+    credential_persistence_state: std::sync::atomic::AtomicU64,
+    credential_persistence_retry_scheduled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    account_refresh_persist_failures: std::sync::atomic::AtomicU64,
     pub http_client: RwLock<reqwest::Client>,
     pub events: broadcast::Sender<ServerEvent>,
     pub tunnels: Arc<TunnelSupervisor>,
@@ -337,6 +341,20 @@ pub enum ManagedAccountRefreshError {
     Conflict { provider_type: ProviderType },
     NotFound,
     Refresh { status_code: u16, message: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum NativeRefreshCommitError {
+    #[error("OAuth credential state commit failed: {0:#}")]
+    State(#[source] anyhow::Error),
+    #[error("rotated OAuth credentials are live but could not be durably persisted: {0:#}")]
+    Persistence(#[source] anyhow::Error),
+}
+
+impl NativeRefreshCommitError {
+    pub(crate) fn is_persistence_degraded(&self) -> bool {
+        matches!(self, Self::Persistence(_))
+    }
 }
 
 #[derive(Debug)]
@@ -2608,6 +2626,10 @@ impl ServerStateInner {
             router_share_sync: AsyncMutex::new(()),
             setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
+            credential_persistence_state: std::sync::atomic::AtomicU64::new(0),
+            credential_persistence_retry_scheduled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            account_refresh_persist_failures: std::sync::atomic::AtomicU64::new(0),
             http_client: RwLock::new(http_client),
             events,
             tunnels,
@@ -2670,6 +2692,15 @@ impl ServerStateInner {
         let mut config = self.config.write().await;
         config.upgrade_policy = policy;
         config.save(&self.config_dir)?;
+        Ok(())
+    }
+
+    pub async fn set_inference_token(&self, token: &str) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        let mut next = config.clone();
+        next.set_inference_token(token)?;
+        next.save(&self.config_dir)?;
+        config.auth.inference_token_hash = next.auth.inference_token_hash;
         Ok(())
     }
 
@@ -2938,9 +2969,6 @@ impl ServerStateInner {
             tracing::warn!(%error, source, "router share reconcile after registration failed");
         }
         retry_pending_router_share_deletes(self.clone()).await;
-        if let Err(error) = reconcile_payout_profile_to_router(self.clone()).await {
-            tracing::warn!(%error, source, "router payout profile reconcile after registration failed");
-        }
         Ok(())
     }
 
@@ -3099,52 +3127,6 @@ impl ServerStateInner {
         let mut config = self.config.write().await;
         config.revoke_debug_token();
         config.save(&self.config_dir)
-    }
-
-    pub async fn update_owner_payout_profile(
-        &self,
-        profile: PayoutProfile,
-    ) -> anyhow::Result<PayoutProfileState> {
-        let mut config = self.config.write().await;
-        let state = config.update_owner_payout_profile(
-            profile,
-            crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
-        )?;
-        config.save(&self.config_dir)?;
-        Ok(state)
-    }
-
-    pub async fn clear_owner_payout_profile(&self) -> anyhow::Result<PayoutProfileState> {
-        let mut config = self.config.write().await;
-        let state = config
-            .clear_owner_payout_profile(crate::infra::time::now_ms().min(i64::MAX as u128) as i64)?;
-        config.save(&self.config_dir)?;
-        Ok(state)
-    }
-
-    pub async fn mark_payout_profile_sync_success(&self, revision: i64) -> anyhow::Result<()> {
-        let mut config = self.config.write().await;
-        if config.owner.payout_profile.revision == revision {
-            config.owner.payout_profile_sync.last_synced_revision = Some(revision);
-            config.owner.payout_profile_sync.last_synced_at_ms =
-                Some(crate::infra::time::now_ms().min(i64::MAX as u128) as i64);
-            config.owner.payout_profile_sync.last_error = None;
-            config.save(&self.config_dir)?;
-        }
-        Ok(())
-    }
-
-    pub async fn mark_payout_profile_sync_error(
-        &self,
-        revision: i64,
-        error: String,
-    ) -> anyhow::Result<()> {
-        let mut config = self.config.write().await;
-        if config.owner.payout_profile.revision == revision {
-            config.owner.payout_profile_sync.last_error = Some(error);
-            config.save(&self.config_dir)?;
-        }
-        Ok(())
     }
 
     fn recover_pending_codex_workspace_rebind_transaction(
@@ -4094,6 +4076,201 @@ impl ServerStateInner {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Accounts save")?;
         self.accounts.read().await.save(&self.config_dir)
+    }
+
+    pub fn credential_persistence_degraded(&self) -> bool {
+        self.credential_persistence_state
+            .load(std::sync::atomic::Ordering::Acquire)
+            & 1
+            != 0
+    }
+
+    fn mark_credential_persistence_degraded(&self) {
+        let mut current = self
+            .credential_persistence_state
+            .load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            let next = current.wrapping_add(2) | 1;
+            match self.credential_persistence_state.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        crate::metrics::set_credential_persistence_degraded(true);
+    }
+
+    fn clear_credential_persistence_degraded_if_unchanged(&self, observed: u64) -> bool {
+        if observed & 1 == 0 {
+            return !self.credential_persistence_degraded();
+        }
+        match self.credential_persistence_state.compare_exchange(
+            observed,
+            observed & !1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                crate::metrics::set_credential_persistence_degraded(false);
+                true
+            }
+            Err(actual) => actual & 1 == 0,
+        }
+    }
+
+    pub(crate) async fn commit_native_refresh_success(
+        self: &Arc<Self>,
+        account_id: &str,
+        update: AccountRefreshUpdate,
+    ) -> Result<Account, NativeRefreshCommitError> {
+        let _references = self.reference_mutations.lock().await;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("OAuth credential commit")
+            .map_err(NativeRefreshCommitError::State)?;
+
+        let providers = self.providers.read().await;
+        let mut accounts = self.accounts.write().await;
+        let shares = self.shares.read().await;
+        let current = accounts.clone();
+        let mut candidate = current.clone();
+        let updated = candidate
+            .mark_native_refresh_success(account_id, update)
+            .with_context(|| format!("managed account not found: {account_id}"))
+            .map_err(NativeRefreshCommitError::State)?;
+        crate::domain::sharing::subscription_identity::validate_ordinary_account_subscription_change(
+            &providers,
+            &current,
+            &candidate,
+            &shares,
+        )
+        .map_err(anyhow::Error::new)
+        .map_err(NativeRefreshCommitError::State)?;
+
+        let persistence_state_before_save = self
+            .credential_persistence_state
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        let persist_result = if self
+            .account_refresh_persist_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            Err(anyhow::anyhow!(
+                "injected OAuth credential persistence failure"
+            ))
+        } else {
+            candidate.save(&self.config_dir)
+        };
+        #[cfg(not(test))]
+        let persist_result = candidate.save(&self.config_dir);
+
+        // A rotating refresh token may already have invalidated the previous token.
+        // Keep the new credentials live even when durable storage is temporarily unavailable.
+        *accounts = candidate;
+        drop(shares);
+        drop(accounts);
+        drop(providers);
+        drop(_workspace_transaction);
+        drop(_references);
+
+        if let Err(error) = persist_result {
+            self.mark_credential_persistence_degraded();
+            self.schedule_credential_persistence_retry();
+            return Err(NativeRefreshCommitError::Persistence(error));
+        }
+
+        self.clear_credential_persistence_degraded_if_unchanged(persistence_state_before_save);
+        Ok(updated)
+    }
+
+    pub(crate) async fn commit_native_refresh_failure(
+        self: &Arc<Self>,
+        account_id: &str,
+        message: String,
+        kind: crate::domain::accounts::oauth::OAuthErrorKind,
+    ) -> anyhow::Result<Option<Account>> {
+        let account_id = account_id.to_string();
+        self.mutate_accounts_immediate(move |accounts| {
+            let message = accounts
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .map(|account| redact_account_error_for_log(account, &message))
+                .unwrap_or_else(|| crate::logging::redact_sensitive_text(&message));
+            accounts.mark_native_refresh_failure(&account_id, message, kind)
+        })
+        .await
+    }
+
+    fn schedule_credential_persistence_retry(self: &Arc<Self>) {
+        if self
+            .credential_persistence_retry_scheduled
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                sleep(delay).await;
+                if !state.credential_persistence_degraded() {
+                    if state.finish_credential_persistence_retry_or_reclaim() {
+                        delay = Duration::from_secs(1);
+                        continue;
+                    }
+                    return;
+                }
+                let observed = state
+                    .credential_persistence_state
+                    .load(std::sync::atomic::Ordering::Acquire);
+                match state.save_accounts().await {
+                    Ok(()) => {
+                        if state.clear_credential_persistence_degraded_if_unchanged(observed) {
+                            tracing::info!("durably persisted OAuth credentials after retry");
+                        }
+                        delay = Duration::from_secs(1);
+                        if !state.credential_persistence_degraded() {
+                            if state.finish_credential_persistence_retry_or_reclaim() {
+                                continue;
+                            }
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            retry_in_ms = delay.as_millis(),
+                            "OAuth credential persistence retry failed"
+                        );
+                        delay = delay.saturating_mul(2).min(Duration::from_secs(60));
+                    }
+                }
+            }
+        });
+    }
+
+    fn finish_credential_persistence_retry_or_reclaim(&self) -> bool {
+        self.credential_persistence_retry_scheduled
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.credential_persistence_degraded()
+            && !self
+                .credential_persistence_retry_scheduled
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    fn inject_account_refresh_persist_failures(&self, count: u64) {
+        self.account_refresh_persist_failures
+            .store(count, std::sync::atomic::Ordering::Release);
     }
 
     pub async fn accounts_snapshot(&self) -> AccountStore {
@@ -5130,15 +5307,28 @@ impl ServerStateInner {
         {
             Ok(update) => update,
             Err(error) => {
-                let updated = {
-                    let mut accounts = self.accounts.write().await;
-                    accounts.mark_native_refresh_failure(
-                        &account.id,
-                        error.message.clone(),
-                        error.kind,
-                    )
+                let diagnostic = redact_account_error_for_log(&account, &error.message);
+                tracing::warn!(
+                    account_id = %account.id,
+                    provider_type = %account.provider_type.as_str(),
+                    error_kind = ?error.kind,
+                    error = %diagnostic,
+                    "managed OAuth account refresh failed"
+                );
+                let updated = match self
+                    .commit_native_refresh_failure(&account.id, error.message.clone(), error.kind)
+                    .await
+                {
+                    Ok(updated) => updated,
+                    Err(persist_error) => {
+                        tracing::error!(
+                            account_id = %account.id,
+                            error = %persist_error,
+                            "persisting managed OAuth refresh failure state failed"
+                        );
+                        None
+                    }
                 };
-                save_accounts_debounced(self);
                 if let Some(updated) = updated {
                     if let Err(sync_error) = self
                         .refresh_account_runtime_metadata_if_changed(&account, &updated)
@@ -5153,18 +5343,53 @@ impl ServerStateInner {
                 }
                 return Err(ManagedAccountRefreshError::Refresh {
                     status_code: error.status_code,
-                    message: error.message,
+                    message: managed_account_refresh_public_message(error.kind).to_string(),
                 });
             }
         };
 
-        let updated = {
-            let mut accounts = self.accounts.write().await;
-            accounts
-                .mark_native_refresh_success(&account.id, update)
-                .ok_or(ManagedAccountRefreshError::NotFound)?
+        let updated = match self
+            .commit_native_refresh_success(&account.id, update)
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                if !error.is_persistence_degraded() {
+                    tracing::error!(
+                        account_id = %account.id,
+                        error = %error,
+                        "managed OAuth credential state commit failed"
+                    );
+                    return Err(ManagedAccountRefreshError::Refresh {
+                        status_code: 500,
+                        message: "managed OAuth credential state commit failed".to_string(),
+                    });
+                }
+                let updated = self.find_account_by_id(&account.id).await;
+                if let Some(updated) = updated.as_ref() {
+                    if let Err(sync_error) = self
+                        .refresh_account_runtime_metadata_if_changed(&account, updated)
+                        .await
+                    {
+                        tracing::warn!(
+                            account_id = %account.id,
+                            error = %sync_error,
+                            "degraded OAuth refresh Share descriptor sync remains pending"
+                        );
+                    }
+                }
+                tracing::error!(
+                    account_id = %account.id,
+                    error = %error,
+                    "managed OAuth refresh entered credential persistence degraded mode"
+                );
+                return Err(ManagedAccountRefreshError::Refresh {
+                    status_code: 503,
+                    message: "rotated credentials are live but durable persistence is degraded"
+                        .to_string(),
+                });
+            }
         };
-        save_accounts_debounced(self);
         if let Err(error) = self
             .refresh_account_runtime_metadata_if_changed(&account, &updated)
             .await
@@ -5975,9 +6200,6 @@ pub async fn restore_tunnels(state: ServerState) {
         if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
             tracing::warn!(error = %error, "fallback router share reconcile failed");
         }
-        if let Err(error) = reconcile_payout_profile_to_router(state.clone()).await {
-            tracing::warn!(error = %error, "fallback router payout profile reconcile failed");
-        }
     }
     retry_pending_router_share_deletes(state).await;
 }
@@ -6564,12 +6786,42 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
     match execute_native_account_refresh(&http_client, &account, now, interval_ms).await {
         Ok(update) => {
-            crate::metrics::record_warm_refresh(account.provider_type.as_str(), "success");
-            let updated = {
-                let mut store = state.accounts.write().await;
-                store.mark_native_refresh_success(&account.id, update)
+            let updated = match state
+                .commit_native_refresh_success(&account.id, update)
+                .await
+            {
+                Ok(updated) => {
+                    crate::metrics::record_warm_refresh(account.provider_type.as_str(), "success");
+                    Some(updated)
+                }
+                Err(error) => {
+                    crate::metrics::record_warm_refresh(
+                        account.provider_type.as_str(),
+                        if error.is_persistence_degraded() {
+                            "persistence_degraded"
+                        } else {
+                            "commit_failure"
+                        },
+                    );
+                    if error.is_persistence_degraded() {
+                        tracing::error!(
+                            account_id = %account.id,
+                            provider_type = %account.provider_type.as_str(),
+                            %error,
+                            "background OAuth refresh kept rotated credentials live but persistence is degraded"
+                        );
+                        state.find_account_by_id(&account.id).await
+                    } else {
+                        tracing::error!(
+                            account_id = %account.id,
+                            provider_type = %account.provider_type.as_str(),
+                            %error,
+                            "background OAuth credential state commit failed"
+                        );
+                        None
+                    }
+                }
             };
-            save_accounts_debounced(state);
             if let Some(updated) = updated {
                 if let Err(error) = state
                     .refresh_account_runtime_metadata_if_changed(&account, &updated)
@@ -6598,9 +6850,19 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                 error = %diagnostic,
                 "background OAuth token warm-refresh failed"
             );
-            let updated = {
-                let mut store = state.accounts.write().await;
-                store.mark_native_refresh_failure(&account.id, error.message, error.kind)
+            let updated = match state
+                .commit_native_refresh_failure(&account.id, error.message, error.kind)
+                .await
+            {
+                Ok(updated) => updated,
+                Err(persist_error) => {
+                    tracing::error!(
+                        account_id = %account.id,
+                        error = %persist_error,
+                        "persisting background OAuth refresh failure state failed"
+                    );
+                    None
+                }
             };
             if updated
                 .as_ref()
@@ -6612,7 +6874,6 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                     "managed OAuth account isolated after repeated invalid_grant refresh failures"
                 );
             }
-            save_accounts_debounced(state);
             if let Some(updated) = updated {
                 if let Err(error) = state
                     .refresh_account_runtime_metadata_if_changed(&account, &updated)
@@ -6641,6 +6902,27 @@ fn redact_account_error_for_log(account: &Account, message: &str) -> String {
             .chain(account.api_key.as_deref())
             .chain(account.extra_headers.values().map(String::as_str)),
     )
+}
+
+fn managed_account_refresh_public_message(
+    kind: crate::domain::accounts::oauth::OAuthErrorKind,
+) -> &'static str {
+    use crate::domain::accounts::oauth::OAuthErrorKind;
+
+    match kind {
+        OAuthErrorKind::AuthorizationPending => "OAuth authorization is still pending",
+        OAuthErrorKind::AccessDenied => "OAuth authorization was denied",
+        OAuthErrorKind::InvalidGrant | OAuthErrorKind::ExpiredToken => {
+            "OAuth credentials were rejected; sign in again"
+        }
+        OAuthErrorKind::MissingCredential => "OAuth credentials are incomplete",
+        OAuthErrorKind::RateLimited => "OAuth provider rate limited the request; retry later",
+        OAuthErrorKind::ProviderRejected => "OAuth provider rejected the request",
+        OAuthErrorKind::Network => "OAuth provider request failed",
+        OAuthErrorKind::Parse => "OAuth provider returned an invalid response",
+        OAuthErrorKind::Unsupported => "OAuth operation is not supported for this account",
+        OAuthErrorKind::Unknown => "OAuth request failed",
+    }
 }
 
 async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
@@ -6723,7 +7005,6 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
     let success_cooldown_ms = state.oauth_quota_refresh_interval_ms().await;
     let account_before_refresh = account.clone();
     let mut active_account = account;
-    let mut account_mutated = false;
     if account_needs_native_refresh(&active_account, now) {
         let http_client = state.http_client().await;
         let update = match execute_native_account_refresh(
@@ -6741,14 +7022,38 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
                 return;
             }
         };
-        active_account = {
-            let mut store = state.accounts.write().await;
-            match store.mark_native_refresh_success(&active_account.id, update) {
-                Some(account) => account,
-                None => return,
+        active_account = match state
+            .commit_native_refresh_success(&active_account.id, update)
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                if error.is_persistence_degraded() {
+                    tracing::error!(
+                        account_id = %active_account.id,
+                        %error,
+                        "quota refresh stopped because rotated OAuth credentials are not durable"
+                    );
+                } else {
+                    tracing::error!(
+                        account_id = %active_account.id,
+                        %error,
+                        "quota refresh stopped because OAuth credential state commit failed"
+                    );
+                }
+                return;
             }
         };
-        account_mutated = true;
+        if let Err(error) = state
+            .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &active_account)
+            .await
+        {
+            tracing::warn!(
+                account_id = %active_account.id,
+                %error,
+                "background OAuth refresh Share descriptor sync remains pending"
+            );
+        }
     }
 
     let http_client = state.http_client().await;
@@ -6783,24 +7088,7 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
             }
             emit_oauth_quota_updated(state, &account, true);
         }
-        Ok(QuotaRefreshResult::SkippedCooldown { .. }) => {
-            if account_mutated {
-                save_accounts_debounced(state);
-                if let Err(error) = state
-                    .refresh_account_runtime_metadata_if_changed(
-                        &account_before_refresh,
-                        &active_account,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        account_id = %active_account.id,
-                        %error,
-                        "background OAuth refresh Share descriptor sync remains pending"
-                    );
-                }
-            }
-        }
+        Ok(QuotaRefreshResult::SkippedCooldown { .. }) => {}
         Err(error) => {
             let mut update = AccountRefreshUpdate {
                 quota_next_refresh_at: error.next_refresh_at,
@@ -8151,34 +8439,6 @@ pub async fn reconcile_all_shares_to_router(state: ServerState) -> anyhow::Resul
     Ok(shares.len())
 }
 
-pub async fn reconcile_payout_profile_to_router(state: ServerState) -> anyhow::Result<()> {
-    let config = state.config_snapshot().await;
-    let payout_state = config.owner.payout_profile.clone();
-    if payout_state.revision <= 0 {
-        return Ok(());
-    }
-    let revision = payout_state.revision;
-    let result = async {
-        let http_client = state.http_client().await;
-        client::push_payout_profile(&http_client, &config, payout_state).await?;
-        anyhow::Ok(())
-    }
-    .await;
-    match result {
-        Ok(()) => {
-            state.mark_payout_profile_sync_success(revision).await?;
-            Ok(())
-        }
-        Err(error) => {
-            let message = error.to_string();
-            state
-                .mark_payout_profile_sync_error(revision, message.clone())
-                .await?;
-            Err(anyhow::anyhow!(message))
-        }
-    }
-}
-
 async fn share_edit_event_loop(state: ServerState) {
     loop {
         if let Err(error) = listen_for_share_edit_events_once(state.clone()).await {
@@ -8596,7 +8856,7 @@ mod tests {
 
     use crate::cli::Cli;
     use crate::clients::router::tunnel::TunnelRuntimeStatus;
-    use crate::domain::accounts::store::Account;
+    use crate::domain::accounts::store::{accounts_path, Account};
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AppKind, ProviderType};
     use crate::domain::providers::store::providers_path;
@@ -13131,6 +13391,202 @@ mod tests {
             log_capture,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn inference_token_update_preserves_concurrent_config_changes() {
+        let state = test_state();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let policy = crate::domain::settings::config::UpgradePolicyConfig {
+            delegate_upgrade_to_router_owner: false,
+            auto_upgrade_enabled: true,
+            auto_upgrade_check_interval_minutes: 15,
+        };
+
+        let policy_state = state.clone();
+        let policy_barrier = Arc::clone(&barrier);
+        let expected_policy = policy.clone();
+        let policy_task = tokio::spawn(async move {
+            policy_barrier.wait().await;
+            policy_state.set_upgrade_policy(policy).await.unwrap();
+        });
+
+        let token_state = state.clone();
+        let token_barrier = Arc::clone(&barrier);
+        let token_task = tokio::spawn(async move {
+            token_barrier.wait().await;
+            token_state
+                .set_inference_token("concurrent-inference-token-0123456789")
+                .await
+                .unwrap();
+        });
+
+        barrier.wait().await;
+        policy_task.await.unwrap();
+        token_task.await.unwrap();
+
+        let config = state.config_snapshot().await;
+        assert_eq!(
+            config.upgrade_policy.delegate_upgrade_to_router_owner,
+            expected_policy.delegate_upgrade_to_router_owner
+        );
+        assert_eq!(
+            config.upgrade_policy.auto_upgrade_enabled,
+            expected_policy.auto_upgrade_enabled
+        );
+        assert_eq!(
+            config.upgrade_policy.auto_upgrade_check_interval_minutes,
+            expected_policy.auto_upgrade_check_interval_minutes
+        );
+        assert!(config.verify_inference_token("concurrent-inference-token-0123456789"));
+
+        let persisted = ServerConfig::load_or_default(&state.config_dir).unwrap();
+        assert_eq!(
+            persisted.upgrade_policy.auto_upgrade_check_interval_minutes,
+            expected_policy.auto_upgrade_check_interval_minutes
+        );
+        assert!(persisted.verify_inference_token("concurrent-inference-token-0123456789"));
+    }
+
+    #[tokio::test]
+    async fn rotated_credentials_remain_live_and_retry_after_persistence_failure() {
+        let state = test_state();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                    id: Some("rotating-credential-account".to_string()),
+                    provider_type: ProviderType::ClaudeOAuth,
+                    email: None,
+                    access_token: Some("old-access".to_string()),
+                    refresh_token: Some("old-refresh".to_string()),
+                    id_token: None,
+                    token_type: Some("Bearer".to_string()),
+                    api_key: None,
+                    extra_headers: None,
+                    scopes: Vec::new(),
+                    profile: None,
+                    raw: None,
+                    subscription_level: None,
+                    entitlement_status: None,
+                    quota_percent: None,
+                    quota: None,
+                    quota_refreshed_at: None,
+                    quota_next_refresh_at: None,
+                    expires_at: Some(1),
+                    rate_limited_until: None,
+                    last_refresh_error: None,
+                })
+            })
+            .await
+            .unwrap();
+        state.inject_account_refresh_persist_failures(1);
+
+        let result = state
+            .commit_native_refresh_success(
+                "rotating-credential-account",
+                AccountRefreshUpdate {
+                    access_token: Some("new-access".to_string()),
+                    refresh_token: Some("new-refresh".to_string()),
+                    expires_at: Some(i64::MAX),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(NativeRefreshCommitError::Persistence(_))
+        ));
+        assert!(state.credential_persistence_degraded());
+        let live = state
+            .find_account_by_id("rotating-credential-account")
+            .await
+            .unwrap();
+        assert_eq!(live.access_token.as_deref(), Some("new-access"));
+        assert_eq!(live.refresh_token.as_deref(), Some("new-refresh"));
+
+        let disk_before_retry = AccountStore::load_or_default(&state.config_dir).unwrap();
+        let disk_before_retry = disk_before_retry
+            .find_for_provider(
+                ProviderType::ClaudeOAuth,
+                Some("rotating-credential-account"),
+            )
+            .unwrap();
+        assert_eq!(
+            disk_before_retry.refresh_token.as_deref(),
+            Some("old-refresh")
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.credential_persistence_degraded() {
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let disk_after_retry = AccountStore::load_or_default(&state.config_dir).unwrap();
+        let disk_after_retry = disk_after_retry
+            .find_for_provider(
+                ProviderType::ClaudeOAuth,
+                Some("rotating-credential-account"),
+            )
+            .unwrap();
+        assert_eq!(
+            disk_after_retry.refresh_token.as_deref(),
+            Some("new-refresh")
+        );
+
+        let failed = state
+            .commit_native_refresh_failure(
+                "rotating-credential-account",
+                "invalid_grant refresh_token=new-refresh".to_string(),
+                crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let diagnostic = failed.last_refresh_error.as_deref().unwrap();
+        assert!(!diagnostic.contains("new-refresh"));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!fs::read_to_string(accounts_path(&state.config_dir))
+            .unwrap()
+            .contains("new-refresh"));
+    }
+
+    #[tokio::test]
+    async fn refresh_commit_precondition_error_is_not_persistence_degraded() {
+        let state = test_state();
+
+        let result = state
+            .commit_native_refresh_success(
+                "missing-account",
+                AccountRefreshUpdate {
+                    access_token: Some("new-access".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(NativeRefreshCommitError::State(_))));
+        assert!(!state.credential_persistence_degraded());
+    }
+
+    #[test]
+    fn stale_persistence_success_cannot_clear_a_newer_failure_generation() {
+        let state = test_state();
+        state.mark_credential_persistence_degraded();
+        let stale_generation = state
+            .credential_persistence_state
+            .load(std::sync::atomic::Ordering::Acquire);
+        state.mark_credential_persistence_degraded();
+
+        assert!(!state.clear_credential_persistence_degraded_if_unchanged(stale_generation));
+        assert!(state.credential_persistence_degraded());
+
+        let current_generation = state
+            .credential_persistence_state
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert!(state.clear_credential_persistence_degraded_if_unchanged(current_generation));
+        assert!(!state.credential_persistence_degraded());
     }
 
     #[test]

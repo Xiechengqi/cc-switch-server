@@ -618,6 +618,7 @@ async fn response_json(
         let kind = classify_kiro_refresh_error(status, &body);
         return Err(AccountRefreshFailure {
             status_code: status.as_u16(),
+            upstream_status: Some(status.as_u16()),
             message: format!("{context} failed: {}", extract_error_message(&body)),
             kind,
             retryable: matches!(
@@ -626,6 +627,8 @@ async fn response_json(
                     | OAuthErrorKind::RateLimited
                     | OAuthErrorKind::ExpiredToken
             ) || status.is_server_error(),
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
         });
     }
     serde_json::from_str(&body).map_err(|error| {
@@ -928,6 +931,7 @@ fn kiro_device_failure(
 ) -> AccountRefreshFailure {
     AccountRefreshFailure {
         status_code: error.status.as_u16(),
+        upstream_status: Some(error.status.as_u16()),
         message: error.message,
         kind: if error.status == StatusCode::TOO_MANY_REQUESTS {
             OAuthErrorKind::RateLimited
@@ -937,6 +941,8 @@ fn kiro_device_failure(
             OAuthErrorKind::Network
         },
         retryable: error.status.is_server_error() || error.status == StatusCode::TOO_MANY_REQUESTS,
+        retry_after_ms: None,
+        endpoint_fallback_safe: false,
     }
 }
 

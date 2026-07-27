@@ -21,6 +21,7 @@ futures-util = "0.3"
 flate2 = "1"
 fs2 = "0.4"
 http = "1"
+httpdate = "1"
 http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }

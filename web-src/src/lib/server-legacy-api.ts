@@ -932,6 +932,7 @@ export async function bootstrapServerSetup(input: {
   ok: boolean;
   sessionToken?: string;
   apiToken?: string;
+  inferenceToken?: string;
   clientTunnelSubdomain?: string;
   clientTunnelClaimStatus?: string;
   setupCompletionNotificationStatus?:
@@ -959,6 +960,7 @@ export async function bootstrapServerSetup(input: {
 
 export type SetupCompletionResponse = {
   ok: boolean;
+  inferenceToken?: string;
   clientTunnelSubdomain?: string;
   clientTunnelClaimStatus?: string;
   setupCompletionNotificationStatus?:
@@ -1011,6 +1013,15 @@ export async function changeServerPassword(input: {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ currentPassword, newPassword }),
+  });
+}
+
+export async function rotateInferenceToken(): Promise<{
+  ok: boolean;
+  inferenceToken: string;
+}> {
+  return jsonFetch("/api/auth/inference-token", {
+    method: "POST",
   });
 }
 

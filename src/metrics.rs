@@ -16,6 +16,7 @@ pub fn init() -> anyhow::Result<()> {
         .context("install Prometheus metrics recorder")?;
     let _ = PROMETHEUS_HANDLE.set(handle);
     describe();
+    set_credential_persistence_degraded(false);
     Ok(())
 }
 
@@ -107,6 +108,14 @@ pub fn record_warm_refresh(provider_type: &str, result: &str) {
     .increment(1);
 }
 
+pub fn set_credential_persistence_degraded(degraded: bool) {
+    metrics::gauge!("cc_switch_credential_persistence_degraded").set(if degraded {
+        1.0
+    } else {
+        0.0
+    });
+}
+
 pub fn record_claude_cli_version_gate() {
     metrics::counter!("cc_switch_claude_cli_version_gate_total").increment(1);
 }
@@ -139,6 +148,14 @@ pub fn record_stream_transform_protocol_error(kind: &'static str) {
     metrics::counter!(
         "cc_switch_stream_transform_protocol_error_total",
         "kind" => kind
+    )
+    .increment(1);
+}
+
+pub fn record_stream_client_cancelled(app: &str) {
+    metrics::counter!(
+        "cc_switch_stream_client_cancelled_total",
+        "app" => app.to_string()
     )
     .increment(1);
 }
@@ -194,6 +211,10 @@ fn describe() {
         "cc_switch_account_warm_refresh_total",
         "Background managed-account token refresh results"
     );
+    metrics::describe_gauge!(
+        "cc_switch_credential_persistence_degraded",
+        "Whether rotated OAuth credentials are live but not durably persisted"
+    );
     metrics::describe_counter!(
         "cc_switch_claude_cli_version_gate_total",
         "Claude CLI version gate responses rewritten for administrators"
@@ -213,6 +234,10 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_stream_transform_protocol_error_total",
         "Bounded cross-protocol stream transform errors"
+    );
+    metrics::describe_counter!(
+        "cc_switch_stream_client_cancelled_total",
+        "Downstream cancellations that stopped an upstream stream"
     );
     metrics::describe_counter!(
         "cc_switch_reasoning_bridge_total",

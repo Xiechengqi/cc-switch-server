@@ -1,8 +1,18 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { KeyRound, Loader2, Mail, Shield } from "lucide-react";
+import { Copy, KeyRound, Loader2, Mail, Shield } from "lucide-react";
 
 import { AuthLanguageSwitcher } from "@/components/AuthLanguageSwitcher";
 import { AuthPasswordInput } from "@/components/AuthPasswordInput";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { ShareRouterSelector } from "@/components/share/ShareRouterSelector";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import {
@@ -15,6 +25,7 @@ import {
   verifyEmailLoginCode,
 } from "@/lib/server-legacy-api";
 import { DEFAULT_SHARE_ROUTER_DOMAIN } from "@/config/shareRegions";
+import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/lib/i18n";
 import { loginWithPassword, readCachedPassword, WebRuntimeContext, writeToken } from "@/lib/runtime";
 import {
@@ -53,6 +64,7 @@ async function saveSetupConfig(input: {
   clientTunnelSubdomain?: string;
 }): Promise<{
   claimStatus?: string;
+  inferenceToken?: string;
   warnings: string[];
 }> {
   const routerUrl = shareRouterUrlFromDomain(input.routerDomain);
@@ -65,6 +77,7 @@ async function saveSetupConfig(input: {
     });
     return {
       claimStatus: outcome.clientTunnelClaimStatus,
+      inferenceToken: outcome.inferenceToken,
       warnings: outcome.warnings ?? [],
     };
   } catch (error) {
@@ -98,6 +111,8 @@ export function LoginPanel({
     "idle" | "checking" | "available" | "unavailable"
   >("idle");
   const [subdomainHint, setSubdomainHint] = useState<string | null>(null);
+  const [setupInferenceToken, setSetupInferenceToken] = useState("");
+  const [setupTokenCopied, setSetupTokenCopied] = useState(false);
   const [routerReachable, setRouterReachable] = useState<boolean | null>(null);
   const [verificationCode, setVerificationCode] = useState("");
   const [apiToken, setApiToken] = useState("");
@@ -245,6 +260,11 @@ export function LoginPanel({
         if (notices.length > 0) {
           setSetupNotice(notices.join("\n"));
         }
+        if (setupOutcome.inferenceToken) {
+          setSetupInferenceToken(setupOutcome.inferenceToken);
+          setSetupTokenCopied(false);
+          return;
+        }
         await loginWithPassword(password);
         await onAuthenticated();
         return;
@@ -255,6 +275,29 @@ export function LoginPanel({
       setError(
         setupRequired ? formatSetupError(reason) : errorMessage(reason),
       );
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function copySetupInferenceToken() {
+    try {
+      await copyText(setupInferenceToken);
+      setSetupTokenCopied(true);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
+  async function continueAfterSetupToken() {
+    setError(null);
+    setBusy("password");
+    try {
+      await loginWithPassword(password);
+      await onAuthenticated();
+      setSetupInferenceToken("");
+    } catch (reason) {
+      setError(errorMessage(reason));
     } finally {
       setBusy(null);
     }
@@ -650,6 +693,67 @@ export function LoginPanel({
           </div>
         </form>
       </div>
+      <Dialog open={Boolean(setupInferenceToken)}>
+        <DialogContent
+          className="max-w-lg"
+          zIndex="top"
+          onEscapeKeyDown={(event) => event.preventDefault()}
+        >
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <KeyRound className="h-5 w-5 text-emerald-600" />
+              {t("server.auth.inferenceTokenTitle", {
+                defaultValue: "Claude 推理 Token",
+              })}
+            </DialogTitle>
+            <DialogDescription>
+              {t("server.auth.inferenceTokenOneTime", {
+                defaultValue: "此 Token 仅显示一次，请在进入控制台前妥善保存。",
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex min-w-0 items-center gap-2 px-6 py-5">
+            <Input
+              value={setupInferenceToken}
+              readOnly
+              autoComplete="off"
+              className="min-w-0 font-mono text-xs"
+              aria-label={t("server.auth.inferenceTokenTitle", {
+                defaultValue: "Claude 推理 Token",
+              })}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="shrink-0"
+              title={t("common.copy", { defaultValue: "复制" })}
+              onClick={() => void copySetupInferenceToken()}
+            >
+              <Copy className="h-4 w-4" />
+            </Button>
+          </div>
+          <DialogFooter>
+            <span className="mr-auto text-xs text-muted-foreground">
+              {setupTokenCopied
+                ? t("common.copied", { defaultValue: "已复制" })
+                : ""}
+            </span>
+            <Button
+              type="button"
+              disabled={busy !== null}
+              onClick={() => void continueAfterSetupToken()}
+            >
+              {busy === "password" ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : null}
+              {t("server.auth.continueToConsole", {
+                defaultValue: "我已保存，进入控制台",
+              })}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

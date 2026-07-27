@@ -36,6 +36,9 @@ use crate::state::{
 };
 
 use super::adapters::{self, ProviderAdapter, UpstreamFormat};
+use super::anthropic_semantics::{
+    self, AnthropicJsonObservation, AnthropicObservation, AnthropicSseInspector, AnthropicTerminal,
+};
 use super::claude_oauth::ClaudeBodyRetryStage;
 use super::cursor;
 use super::deepseek;
@@ -52,11 +55,11 @@ use super::response_semantics::{
 use super::router::{
     account_concurrency_for_provider, codex_image_generation_provider,
     ensure_provider_account_does_not_need_relogin, ensure_provider_account_usage_available,
-    provider_supports_claude_count_tokens, select_failover_provider,
-    select_failover_provider_matching, select_provider_for_claude_count_tokens,
+    provider_supports_claude_count_tokens, select_exact_provider_with_account_inflight,
+    select_failover_provider, select_failover_provider_matching,
     select_provider_for_codex_image_generation, select_provider_with_account_inflight, ProxyRoute,
 };
-use super::streaming::{ClaudeSseErrorDetector, StreamUsageAccumulator};
+use super::streaming::{ClaudeSseError, ClaudeSseErrorDetector, StreamUsageAccumulator};
 use super::usage::{log_usage, update_stream_usage};
 use super::{setting, ProxyError};
 
@@ -367,15 +370,26 @@ async fn forward_with_attempt(
                 (execution, guard)
             } else {
                 select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
-                    if route == ProxyRoute::ClaudeCountTokens {
-                        select_provider_for_claude_count_tokens(
+                    if matches!(
+                        route,
+                        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
+                    ) {
+                        let selection = select_exact_provider_with_account_inflight(
                             &providers,
                             &accounts_for_selection,
+                            app,
                             &headers,
                             configured_provider_id.as_deref(),
                             snapshot,
-                            request_context.session_id.as_deref(),
-                        )
+                        )?;
+                        if route == ProxyRoute::ClaudeCountTokens
+                            && !provider_supports_claude_count_tokens(&selection.execution.stored)
+                        {
+                            return Err(ProxyError::bad_request(
+                                "Claude count_tokens requires a native Anthropic provider",
+                            ));
+                        }
+                        Ok(selection)
                     } else {
                         select_provider_with_account_inflight(
                             &providers,
@@ -670,7 +684,11 @@ async fn forward_with_attempt(
                     &request_context,
                     &attempt_context,
                     &execution,
-                    "send_error",
+                    if error.is_connect() {
+                        "connect_error"
+                    } else {
+                        "send_error"
+                    },
                 )
                 .await
                 {
@@ -997,21 +1015,45 @@ async fn forward_with_attempt(
             let mut pending_chunk = None;
             let mut sse_error_detector = claude_sse_error_detector_for(&stored, route);
             let mut sse_error_outcome_recorded = false;
+            let upstream_format =
+                adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
+                    .unwrap_or_else(|| adapters::downstream_format_for_route(route));
             let inspect_responses_semantics = status.is_success()
                 && response_semantics::semantic_guard_enabled()
-                && adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
-                    == Some(UpstreamFormat::OpenAiResponses);
+                && upstream_format == UpstreamFormat::OpenAiResponses;
+            let inspect_anthropic_semantics = status.is_success()
+                && response_semantics::semantic_guard_enabled()
+                && route == ProxyRoute::ClaudeMessages
+                && upstream_format == UpstreamFormat::AnthropicMessages;
+            let mut responses_semantics =
+                inspect_responses_semantics.then(ResponsesSseInspector::default);
+            let mut anthropic_semantics =
+                inspect_anthropic_semantics.then(AnthropicSseInspector::default);
+            if inspect_anthropic_semantics {
+                sse_error_detector = None;
+            }
             let mut semantic_provider_outcome_recorded = false;
-            if sse_error_detector.is_some() || inspect_responses_semantics {
+            let mut pending_chunk_already_inspected = false;
+            let mut pending_chunk_saw_business_output = false;
+            let mut pending_chunk_committed_output = false;
+            if sse_error_detector.is_some()
+                || inspect_responses_semantics
+                || inspect_anthropic_semantics
+            {
                 let mut prelude = Vec::new();
                 let mut detected_error = None;
-                let mut semantic_inspector =
-                    inspect_responses_semantics.then(ResponsesSseInspector::default);
+                let mut detected_anthropic_error = None;
                 let mut semantic_decision = None;
                 let mut semantic_protocol_error = None;
+                let mut anthropic_event_ready = false;
                 let semantic_commit_deadline = inspect_responses_semantics
                     .then_some(timeouts.first_byte)
                     .flatten()
+                    .or_else(|| {
+                        inspect_anthropic_semantics
+                            .then_some(timeouts.first_byte)
+                            .flatten()
+                    })
                     .map(|timeout| tokio::time::Instant::now() + timeout);
                 let first_chunk = loop {
                     let next = if let Some(deadline) = semantic_commit_deadline {
@@ -1047,7 +1089,7 @@ async fn forward_with_attempt(
                             detected_error = sse_error_detector
                                 .as_mut()
                                 .and_then(|detector| detector.push(&chunk));
-                            if let Some(inspector) = semantic_inspector.as_mut() {
+                            if let Some(inspector) = responses_semantics.as_mut() {
                                 match inspector.push(&chunk) {
                                     Ok(observations) => {
                                         for observation in &observations {
@@ -1058,6 +1100,12 @@ async fn forward_with_attempt(
                                         }
                                         semantic_decision =
                                             semantic_prelude_decision(&observations);
+                                        pending_chunk_saw_business_output |= observations
+                                            .iter()
+                                            .any(SemanticObservation::counts_as_business_output);
+                                        pending_chunk_committed_output |= observations
+                                            .iter()
+                                            .any(SemanticObservation::commits_downstream);
                                     }
                                     Err(error) => {
                                         crate::metrics::record_proxy_semantic_guard(
@@ -1068,23 +1116,55 @@ async fn forward_with_attempt(
                                     }
                                 }
                             }
-                            let prelude_limit = if inspect_responses_semantics {
-                                1024 * 1024
-                            } else {
-                                64 * 1024
-                            };
+                            if let Some(inspector) = anthropic_semantics.as_mut() {
+                                match inspector.push(&chunk) {
+                                    Ok(observations) => {
+                                        for observation in &observations {
+                                            crate::metrics::record_proxy_semantic_guard(
+                                                "anthropic_stream_prime",
+                                                observation.metric_kind(),
+                                            );
+                                            if let AnthropicObservation::Error(error) = observation
+                                            {
+                                                detected_anthropic_error = Some(error.clone());
+                                            }
+                                        }
+                                        anthropic_event_ready |= !observations.is_empty();
+                                        pending_chunk_saw_business_output |= observations
+                                            .iter()
+                                            .any(AnthropicObservation::counts_as_business_output);
+                                        pending_chunk_committed_output |= observations
+                                            .iter()
+                                            .any(AnthropicObservation::commits_downstream);
+                                    }
+                                    Err(error) => {
+                                        crate::metrics::record_proxy_semantic_guard(
+                                            "anthropic_stream_prime",
+                                            "protocol_error",
+                                        );
+                                        semantic_protocol_error = Some(error.to_string());
+                                    }
+                                }
+                            }
+                            let prelude_limit =
+                                if inspect_responses_semantics || inspect_anthropic_semantics {
+                                    1024 * 1024
+                                } else {
+                                    64 * 1024
+                                };
                             if prelude.len() >= prelude_limit
                                 && semantic_decision.is_none()
                                 && semantic_protocol_error.is_none()
-                                && inspect_responses_semantics
+                                && (inspect_responses_semantics || inspect_anthropic_semantics)
                             {
                                 semantic_protocol_error = Some(
-                                    "Responses semantic prelude exceeded 1 MiB before business output"
+                                    "Upstream semantic prelude exceeded 1 MiB before a complete event"
                                         .to_string(),
                                 );
                             }
                             let ready = detected_error.is_some()
                                 || semantic_decision.is_some()
+                                || anthropic_event_ready
                                 || semantic_protocol_error.is_some()
                                 || (!inspect_responses_semantics
                                     && (sse_error_detector
@@ -1097,7 +1177,7 @@ async fn forward_with_attempt(
                         }
                         Ok(None) => {
                             if semantic_decision.is_none() {
-                                if let Some(inspector) = semantic_inspector.as_mut() {
+                                if let Some(inspector) = responses_semantics.as_mut() {
                                     match inspector.finish() {
                                         Ok(observations) => {
                                             for observation in &observations {
@@ -1119,6 +1199,15 @@ async fn forward_with_attempt(
                                     }
                                 }
                             }
+                            if let Some(inspector) = anthropic_semantics.as_mut() {
+                                if let Err(error) = inspector.finish() {
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "anthropic_stream_prime",
+                                        "protocol_error",
+                                    );
+                                    semantic_protocol_error = Some(error.to_string());
+                                }
+                            }
                             break Ok((!prelude.is_empty()).then(|| Bytes::from(prelude)));
                         }
                         Err(error) => break Err(error),
@@ -1126,7 +1215,12 @@ async fn forward_with_attempt(
                 };
                 match first_chunk {
                     Ok(Some(chunk)) => {
-                        let sse_error = detected_error;
+                        let sse_error = detected_anthropic_error
+                            .map(|error| ClaudeSseError {
+                                error_type: error.error_type,
+                                message: error.message,
+                            })
+                            .or(detected_error);
                         let sse_error_outcome = sse_error
                             .as_ref()
                             .and_then(|error| claude_sse_error_outcome(&error.error_type));
@@ -1223,7 +1317,11 @@ async fn forward_with_attempt(
                             }
                         }
                         pending_chunk = Some(chunk);
-                        sse_error_detector = claude_sse_error_detector_for(&stored, route);
+                        pending_chunk_already_inspected = true;
+                        if !inspect_responses_semantics && !inspect_anthropic_semantics {
+                            pending_chunk_saw_business_output = true;
+                            pending_chunk_committed_output = true;
+                        }
                     }
                     Ok(None) => {
                         if let Some(error) = semantic_protocol_error {
@@ -1327,10 +1425,13 @@ async fn forward_with_attempt(
                     ),
                 timeouts,
                 pending_chunk,
+                pending_chunk_already_inspected,
+                pending_chunk_saw_business_output,
+                pending_chunk_committed_output,
                 sse_error_detector,
                 sse_error_outcome_recorded,
-                responses_semantics: inspect_responses_semantics
-                    .then(ResponsesSseInspector::default),
+                responses_semantics,
+                anthropic_semantics,
                 semantic_provider_outcome_recorded,
                 terminal_frame_sent: false,
                 interrupted_update_armed,
@@ -1346,11 +1447,19 @@ async fn forward_with_attempt(
                     .responses_semantics
                     .as_ref()
                     .and_then(ResponsesSseInspector::terminal)
-                    .is_some();
-                let next_chunk = if semantic_terminal_seen {
-                    Ok(None)
-                } else if let Some(chunk) = stream_state.pending_chunk.take() {
+                    .is_some()
+                    || stream_state
+                        .anthropic_semantics
+                        .as_ref()
+                        .and_then(AnthropicSseInspector::terminal)
+                        .is_some();
+                let mut chunk_already_inspected = false;
+                let next_chunk = if let Some(chunk) = stream_state.pending_chunk.take() {
+                    chunk_already_inspected = stream_state.pending_chunk_already_inspected;
+                    stream_state.pending_chunk_already_inspected = false;
                     Ok(Some(chunk))
+                } else if semantic_terminal_seen {
+                    Ok(None)
                 } else {
                     let timeout_kind = stream_state.next_timeout_kind();
                     match stream_state.next_timeout() {
@@ -1377,40 +1486,96 @@ async fn forward_with_attempt(
                         let chunk = stream_state.codex_completed_output_patcher.push(chunk);
                         let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
                         stream_state.usage.push(&chunk);
-                        let (saw_business_output, committed_output) = if let Some(inspector) =
-                            stream_state.responses_semantics.as_mut()
-                        {
-                            let observations = match inspector.push(&chunk) {
-                                Ok(observations) => observations,
-                                Err(error) => {
+                        let (mut saw_business_output, mut committed_output) =
+                            if chunk_already_inspected {
+                                let saw_business = stream_state.pending_chunk_saw_business_output;
+                                let committed = stream_state.pending_chunk_committed_output;
+                                stream_state.pending_chunk_saw_business_output = false;
+                                stream_state.pending_chunk_committed_output = false;
+                                (saw_business, committed)
+                            } else if let Some(inspector) =
+                                stream_state.responses_semantics.as_mut()
+                            {
+                                let observations = match inspector.push(&chunk) {
+                                    Ok(observations) => observations,
+                                    Err(error) => {
+                                        crate::metrics::record_proxy_semantic_guard(
+                                            "http_stream",
+                                            "protocol_error",
+                                        );
+                                        return stream_state
+                                            .terminate_transform_error(ProxyError::bad_gateway(
+                                                error,
+                                            ))
+                                            .await;
+                                    }
+                                };
+                                for observation in &observations {
                                     crate::metrics::record_proxy_semantic_guard(
                                         "http_stream",
-                                        "protocol_error",
+                                        observation.metric_kind(),
                                     );
-                                    return stream_state
-                                        .terminate_transform_error(ProxyError::bad_gateway(error))
-                                        .await;
                                 }
+                                (
+                                    observations
+                                        .iter()
+                                        .any(SemanticObservation::counts_as_business_output),
+                                    observations
+                                        .iter()
+                                        .any(SemanticObservation::commits_downstream),
+                                )
+                            } else if stream_state.anthropic_semantics.is_some() {
+                                (false, false)
+                            } else {
+                                (!chunk.is_empty(), !chunk.is_empty())
                             };
-                            for observation in &observations {
-                                crate::metrics::record_proxy_semantic_guard(
-                                    "http_stream",
-                                    observation.metric_kind(),
-                                );
+                        if !chunk_already_inspected {
+                            if let Some(inspector) = stream_state.anthropic_semantics.as_mut() {
+                                let observations = match inspector.push(&chunk) {
+                                    Ok(observations) => observations,
+                                    Err(error) => {
+                                        crate::metrics::record_proxy_semantic_guard(
+                                            "anthropic_stream",
+                                            "protocol_error",
+                                        );
+                                        return stream_state
+                                            .terminate_transform_error(ProxyError::bad_gateway(
+                                                error,
+                                            ))
+                                            .await;
+                                    }
+                                };
+                                for observation in &observations {
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "anthropic_stream",
+                                        observation.metric_kind(),
+                                    );
+                                    if let AnthropicObservation::Error(error) = observation {
+                                        if !stream_state.sse_error_outcome_recorded {
+                                            if let Some(outcome) =
+                                                claude_sse_error_outcome(&error.error_type)
+                                            {
+                                                record_provider_outcome(
+                                                    &stream_state.state,
+                                                    &stream_state.stored,
+                                                    outcome,
+                                                )
+                                                .await;
+                                                stream_state.sse_error_outcome_recorded = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                saw_business_output |= observations
+                                    .iter()
+                                    .any(AnthropicObservation::counts_as_business_output);
+                                committed_output |= observations
+                                    .iter()
+                                    .any(AnthropicObservation::commits_downstream);
                             }
-                            (
-                                observations
-                                    .iter()
-                                    .any(SemanticObservation::counts_as_business_output),
-                                observations
-                                    .iter()
-                                    .any(SemanticObservation::commits_downstream),
-                            )
-                        } else {
-                            (!chunk.is_empty(), !chunk.is_empty())
-                        };
+                        }
                         stream_state.received_any_chunk |= committed_output;
-                        if !stream_state.sse_error_outcome_recorded {
+                        if !chunk_already_inspected && !stream_state.sse_error_outcome_recorded {
                             let sse_error_outcome = stream_state
                                 .sse_error_detector
                                 .as_mut()
@@ -1561,6 +1726,17 @@ async fn forward_with_attempt(
                                 );
                             }
                         }
+                        if let Some(inspector) = stream_state.anthropic_semantics.as_mut() {
+                            if let Err(error) = inspector.finish() {
+                                crate::metrics::record_proxy_semantic_guard(
+                                    "anthropic_stream",
+                                    "protocol_error",
+                                );
+                                return stream_state
+                                    .terminate_transform_error(ProxyError::bad_gateway(error))
+                                    .await;
+                            }
+                        }
                         let transform_tail = match stream_state.stream_transform.finish() {
                             Ok(tail) => tail,
                             Err(error) => {
@@ -1589,9 +1765,19 @@ async fn forward_with_attempt(
                             .as_ref()
                             .and_then(ResponsesSseInspector::terminal)
                             .cloned();
-                        let stream_status = semantic_terminal
+                        let anthropic_terminal = stream_state
+                            .anthropic_semantics
                             .as_ref()
-                            .map(SemanticTerminal::stream_status)
+                            .and_then(AnthropicSseInspector::terminal)
+                            .cloned();
+                        let stream_status = anthropic_terminal
+                            .as_ref()
+                            .map(AnthropicTerminal::stream_status)
+                            .or_else(|| {
+                                semantic_terminal
+                                    .as_ref()
+                                    .map(SemanticTerminal::stream_status)
+                            })
                             .unwrap_or("completed");
                         let usage = std::mem::take(&mut stream_state.usage).finish();
                         update_stream_usage(
@@ -1612,11 +1798,9 @@ async fn forward_with_attempt(
                             usage,
                         )
                         .await;
-                        match semantic_terminal {
-                            Some(SemanticTerminal::Failure(failure))
-                                if failure.origin == FailureOrigin::Provider =>
-                            {
-                                if !stream_state.semantic_provider_outcome_recorded {
+                        match anthropic_terminal {
+                            Some(AnthropicTerminal::Error(_)) => {
+                                if !stream_state.sse_error_outcome_recorded {
                                     record_provider_outcome(
                                         &stream_state.state,
                                         &stream_state.stored,
@@ -1625,16 +1809,30 @@ async fn forward_with_attempt(
                                     .await;
                                 }
                             }
-                            Some(SemanticTerminal::Failure(_)) => {}
-                            _ if !stream_state.sse_error_outcome_recorded => {
-                                record_provider_outcome(
-                                    &stream_state.state,
-                                    &stream_state.stored,
-                                    provider_outcome_from_status(stream_state.status_code),
-                                )
-                                .await;
-                            }
-                            _ => {}
+                            _ => match semantic_terminal {
+                                Some(SemanticTerminal::Failure(failure))
+                                    if failure.origin == FailureOrigin::Provider =>
+                                {
+                                    if !stream_state.semantic_provider_outcome_recorded {
+                                        record_provider_outcome(
+                                            &stream_state.state,
+                                            &stream_state.stored,
+                                            ProviderOutcome::Failure { status_code: 502 },
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Some(SemanticTerminal::Failure(_)) => {}
+                                _ if !stream_state.sse_error_outcome_recorded => {
+                                    record_provider_outcome(
+                                        &stream_state.state,
+                                        &stream_state.stored,
+                                        provider_outcome_from_status(stream_state.status_code),
+                                    )
+                                    .await;
+                                }
+                                _ => {}
+                            },
                         }
                         stream_state
                             .interrupted_update_armed
@@ -1751,11 +1949,54 @@ async fn forward_with_attempt(
         if version_gate_rewritten {
             preserve_content_encoding = false;
         }
+        let semantic_upstream_format =
+            adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
+                .unwrap_or_else(|| adapters::downstream_format_for_route(route));
         let mut semantic_provider_outcome_recorded = false;
+        let anthropic_json_observation = if status.is_success()
+            && response_semantics::semantic_guard_enabled()
+            && matches!(
+                route,
+                ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
+            )
+            && semantic_upstream_format == UpstreamFormat::AnthropicMessages
+        {
+            match anthropic_semantics::inspect_json_document(
+                &bytes,
+                route == ProxyRoute::ClaudeCountTokens,
+            ) {
+                Ok(observation) => {
+                    let metric = match &observation {
+                        AnthropicJsonObservation::Success => "success_terminal",
+                        AnthropicJsonObservation::Error(_) => "provider_error",
+                    };
+                    crate::metrics::record_proxy_semantic_guard("anthropic_document", metric);
+                    Some(observation)
+                }
+                Err(error) => {
+                    crate::metrics::record_proxy_semantic_guard(
+                        "anthropic_document",
+                        "protocol_error",
+                    );
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        ProviderOutcome::Failure { status_code: 502 },
+                    )
+                    .await;
+                    return Err(ProxyError::bad_gateway(error));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(AnthropicJsonObservation::Error(error)) = &anthropic_json_observation {
+            status = claude_semantic_error_status(&error.error_type);
+            status_code = status.as_u16();
+        }
         let semantic_observation = if status.is_success()
             && response_semantics::semantic_guard_enabled()
-            && adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
-                == Some(UpstreamFormat::OpenAiResponses)
+            && semantic_upstream_format == UpstreamFormat::OpenAiResponses
         {
             let observation = match response_semantics::classify_json_document(&bytes) {
                 Ok(observation) => observation,
@@ -1855,24 +2096,35 @@ async fn forward_with_attempt(
             )
             .await;
         }
-        match semantic_observation {
-            Some(SemanticObservation::Failure(failure))
-                if failure.origin == FailureOrigin::Provider =>
-            {
-                if !semantic_provider_outcome_recorded {
+        match anthropic_json_observation {
+            Some(AnthropicJsonObservation::Error(error)) => {
+                let outcome = claude_sse_error_outcome(&error.error_type)
+                    .unwrap_or(ProviderOutcome::Failure { status_code: 502 });
+                record_provider_outcome(&state, &stored, outcome).await;
+            }
+            _ => match semantic_observation {
+                Some(SemanticObservation::Failure(failure))
+                    if failure.origin == FailureOrigin::Provider =>
+                {
+                    if !semantic_provider_outcome_recorded {
+                        record_provider_outcome(
+                            &state,
+                            &stored,
+                            ProviderOutcome::Failure { status_code: 502 },
+                        )
+                        .await;
+                    }
+                }
+                Some(SemanticObservation::Failure(_)) => {}
+                _ => {
                     record_provider_outcome(
                         &state,
                         &stored,
-                        ProviderOutcome::Failure { status_code: 502 },
+                        provider_outcome_from_status(status_code),
                     )
                     .await;
                 }
-            }
-            Some(SemanticObservation::Failure(_)) => {}
-            _ => {
-                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
-                    .await;
-            }
+            },
         }
 
         let mut response = Response::new(Body::from(bytes));
@@ -6611,7 +6863,7 @@ impl Drop for ShareStreamInterruptGuard {
                 duration_ms,
                 first_token_ms,
                 usage,
-                Some("interrupted"),
+                Some("client_cancelled"),
             )
             .await;
             record_share_invocation_result(
@@ -6621,7 +6873,7 @@ impl Drop for ShareStreamInterruptGuard {
                 usage,
             )
             .await;
-            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            crate::metrics::record_stream_client_cancelled(stored.app.as_str());
         });
     }
 }
@@ -6973,6 +7225,19 @@ fn claude_sse_error_outcome(error_type: &str) -> Option<ProviderOutcome> {
     }
 }
 
+fn claude_semantic_error_status(error_type: &str) -> StatusCode {
+    match error_type {
+        "invalid_request_error" => StatusCode::BAD_REQUEST,
+        "authentication_error" => StatusCode::UNAUTHORIZED,
+        "permission_error" => StatusCode::FORBIDDEN,
+        "not_found_error" => StatusCode::NOT_FOUND,
+        "request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+        "overloaded_error" => StatusCode::from_u16(529).expect("529 is a valid status code"),
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
 fn share_usage_tokens(usage: TokenUsage) -> u64 {
     usage
         .total_tokens
@@ -7027,26 +7292,26 @@ async fn refresh_execution_managed_account_if_needed(
 }
 
 async fn next_claude_transport_attempt(
-    state: &ServerState,
+    _state: &ServerState,
     route: ProxyRoute,
-    headers: &HeaderMap,
-    request_context: &UsageLogContext,
+    _headers: &HeaderMap,
+    _request_context: &UsageLogContext,
     attempt_context: &ForwardAttemptContext,
     failed: &ProviderExecution,
     reason: &'static str,
 ) -> Option<ForwardAttemptContext> {
-    if !matches!(
-        route,
-        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
-    ) || !attempt_context.retry_allowed()
-    {
+    if !attempt_context.retry_allowed() {
         return None;
     }
-    if request_is_provider_pinned(headers, request_context) {
+    let replay_safe = route == ProxyRoute::ClaudeCountTokens
+        || (route == ProxyRoute::ClaudeMessages
+            && reason == "connect_error"
+            && attempt_context.attempt == 0);
+    if replay_safe {
         record_forward_retry(route, "transport", reason);
         return Some(attempt_context.next(failed, attempt_context.body_retry_stage));
     }
-    next_provider_failover(state, route, attempt_context, failed, reason).await
+    None
 }
 
 async fn next_unauthorized_attempt(
@@ -7132,7 +7397,7 @@ async fn next_provider_failover(
     failed: &ProviderExecution,
     reason: &'static str,
 ) -> Option<ForwardAttemptContext> {
-    if !attempt_context.retry_allowed() {
+    if route.app() == AppKind::Claude || !attempt_context.retry_allowed() {
         return None;
     }
     let mut excluded = attempt_context.excluded_provider_ids.clone();
@@ -7478,10 +7743,16 @@ fn managed_account_refresh_error_to_proxy_error(error: ManagedAccountRefreshErro
         ManagedAccountRefreshError::NotFound => ProxyError::not_found("managed account not found"),
         ManagedAccountRefreshError::Refresh {
             status_code,
-            message,
+            message: _,
         } => ProxyError {
             status: StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-            message: format!("managed account refresh failed: {message}"),
+            message: match status_code {
+                400 | 401 | 403 => {
+                    "managed account refresh was rejected; sign in again".to_string()
+                }
+                429 => "managed account refresh was rate limited; retry later".to_string(),
+                _ => "managed account refresh failed".to_string(),
+            },
         },
     }
 }
@@ -8276,9 +8547,13 @@ struct StreamForwardState {
     claude_tool_name_stream_patcher: super::claude_oauth::ClaudeToolNameStreamPatcher,
     timeouts: StreamTimeoutConfig,
     pending_chunk: Option<Bytes>,
+    pending_chunk_already_inspected: bool,
+    pending_chunk_saw_business_output: bool,
+    pending_chunk_committed_output: bool,
     sse_error_detector: Option<ClaudeSseErrorDetector>,
     sse_error_outcome_recorded: bool,
     responses_semantics: Option<ResponsesSseInspector>,
+    anthropic_semantics: Option<AnthropicSseInspector>,
     semantic_provider_outcome_recorded: bool,
     terminal_frame_sent: bool,
     interrupted_update_armed: Arc<AtomicBool>,
@@ -8991,7 +9266,7 @@ impl Drop for StreamForwardState {
                 duration_ms,
                 first_token_ms,
                 usage,
-                Some("interrupted"),
+                Some("client_cancelled"),
             )
             .await;
             record_share_invocation_result(
@@ -9001,7 +9276,7 @@ impl Drop for StreamForwardState {
                 usage,
             )
             .await;
-            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            crate::metrics::record_stream_client_cancelled(stored.app.as_str());
         });
     }
 }
@@ -10057,10 +10332,17 @@ mod tests {
             ("messages", ProxyRoute::ClaudeMessages),
             ("count", ProxyRoute::ClaudeCountTokens),
         ] {
+            let provider_id = format!("unauthorized-{kind}-provider");
+            state
+                .apply_ui_settings_patch_immediate(json!({
+                    "currentProviderClaude": provider_id.clone()
+                }))
+                .await
+                .unwrap();
             let mut headers = HeaderMap::new();
             headers.insert(
                 "x-cc-provider-id",
-                HeaderValue::from_str(&format!("unauthorized-{kind}-provider")).unwrap(),
+                HeaderValue::from_str(&provider_id).unwrap(),
             );
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             let response = forward(
@@ -10102,7 +10384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_unauthorized_after_refresh_fails_over_to_next_provider() {
+    async fn claude_unauthorized_after_refresh_stays_on_bound_account() {
         let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -10322,13 +10604,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap()["id"],
-            "msg-after-auth-failover"
+            serde_json::from_slice::<Value>(&body).unwrap()["type"],
+            "error"
         );
         assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
@@ -10340,11 +10622,12 @@ mod tests {
         );
         assert_eq!(
             fallback_requests.load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0,
+            "direct Claude inference must not cross providers after a rejected refresh"
         );
         let usage = state.usage_snapshot().await;
         assert_eq!(usage.logs.len(), 1);
-        assert_eq!(usage.logs[0].provider_id, "auth-failover-api-key");
+        assert_eq!(usage.logs[0].provider_id, "auth-failover-oauth");
         let failed_account = state
             .find_account_by_id("auth-failover-account")
             .await
@@ -10390,7 +10673,7 @@ mod tests {
         assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
             fallback_requests.load(std::sync::atomic::Ordering::SeqCst),
-            1,
+            0,
             "an explicitly pinned request must not cross providers"
         );
         assert_eq!(rejected_authorizations.lock().unwrap().len(), 4);
@@ -11975,18 +12258,19 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[test]
-    fn refresh_failures_keep_oauth_status_and_managed_account_context() {
+    fn refresh_failures_keep_status_without_exposing_provider_diagnostics() {
         let proxy_error =
             managed_account_refresh_error_to_proxy_error(ManagedAccountRefreshError::Refresh {
                 status_code: 429,
-                message: "rate limited by provider".to_string(),
+                message: "rate limited; refresh_token=oauth-secret".to_string(),
             });
 
         assert_eq!(proxy_error.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             proxy_error.message,
-            "managed account refresh failed: rate limited by provider"
+            "managed account refresh was rate limited; retry later"
         );
+        assert!(!proxy_error.message.contains("oauth-secret"));
     }
 
     #[test]

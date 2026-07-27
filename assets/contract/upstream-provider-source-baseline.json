@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "upstream": {
-    "repository": "/data/projects/cc-switch",
+    "repository": "../cc-switch",
     "commit": "b1dee0153da94316fb50416c679a11f74cc66f14"
   },
   "sources": [

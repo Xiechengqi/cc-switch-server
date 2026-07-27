@@ -345,38 +345,77 @@ pub(crate) async fn refresh_share_usage_item(
         match execute_native_account_refresh(&http_client, &active_account, now, interval_ms).await
         {
             Ok(update) => {
-                let updated = state
-                    .mutate_accounts_debounced(|accounts| {
-                        accounts.mark_native_refresh_success(&active_account.id, update)
-                    })
-                    .await;
-                if let Some(updated) = updated {
-                    active_account = updated;
+                match state
+                    .commit_native_refresh_success(&active_account.id, update)
+                    .await
+                {
+                    Ok(updated) => active_account = updated,
+                    Err(error) => {
+                        let persistence_degraded = error.is_persistence_degraded();
+                        if persistence_degraded {
+                            tracing::error!(
+                                account_id = %active_account.id,
+                                %error,
+                                "control OAuth refresh persistence degraded"
+                            );
+                        } else {
+                            tracing::error!(
+                                account_id = %active_account.id,
+                                %error,
+                                "control OAuth credential state commit failed"
+                            );
+                        }
+                        return ControlRefreshShareUsageItem {
+                            app: app.as_str().to_string(),
+                            provider_id: Some(provider_id),
+                            provider_name,
+                            auth_provider,
+                            account_id: Some(account_id),
+                            refreshed: false,
+                            error: Some(
+                                if persistence_degraded {
+                                    "credential_persistence_degraded"
+                                } else {
+                                    "credential_commit_failed"
+                                }
+                                .to_string(),
+                            ),
+                            message: None,
+                        };
+                    }
                 }
             }
             Err(error) => {
                 let public_error = oauth_error_public_message(error.kind).to_string();
                 let updated = state
-                    .mutate_accounts_debounced(|accounts| {
-                        accounts.mark_native_refresh_failure(
-                            &active_account.id,
-                            error.message.clone(),
-                            error.kind,
-                        )
-                    })
+                    .commit_native_refresh_failure(
+                        &active_account.id,
+                        error.message.clone(),
+                        error.kind,
+                    )
                     .await;
-                if let Some(updated) = updated {
-                    if let Err(sync_error) = state
-                        .refresh_account_runtime_metadata_if_changed(
-                            &account_before_refresh,
-                            &updated,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
+                match updated {
+                    Ok(Some(updated)) => {
+                        if let Err(sync_error) = state
+                            .refresh_account_runtime_metadata_if_changed(
+                                &account_before_refresh,
+                                &updated,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                account_id = %active_account.id,
+                                error = %sync_error,
+                                "control OAuth refresh failure Share descriptor sync remains pending"
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(persist_error) => {
+                        tracing::error!(
                             account_id = %active_account.id,
-                            error = %sync_error,
-                            "control OAuth refresh failure Share descriptor sync remains pending"
+                            error = %persist_error,
+                            "persisting control OAuth refresh failure state failed"
                         );
                     }
                 }

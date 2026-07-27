@@ -43,9 +43,9 @@ market or direct share URL
 - Cursor 三入口保持 AgentService planned；已移植协议、请求、事件、tool、h2、session、identity、image 前置层，并在显式 opt-in 下接入 Claude/Codex/Gemini AgentService driver。
 - GitHub Copilot 和 Kiro 已提供 device flow 静态导入路径；真实 token refresh、live models、usage 和 proxy 回归完成前仍保持 fallback/manual-import。
 - Codex 同时支持 Device OAuth 与官方 CLI PKCE OAuth；远程 HTTPS Client URL 可在浏览器 localhost 回调失败后，将完整 callback URL 提交回 Server 完成认证。浏览器和 device flow 的 start/poll/cancel 都绑定发起登录的管理员主体及短期有效期。Codex、Claude、Gemini、Ollama、Antigravity/Agy 等账号可执行 server-native refresh/profile/quota。
-- Managed OAuth Provider 必须显式绑定账号；自动路由按账号占用比例、quota/cooldown/concurrency 和 session affinity 选择候选，HTTP/SSE/Images/WebSocket 的首个 401 会在同账号强刷一次，仍失败才进入冷却或 Provider failover。
+- Managed OAuth Provider 必须显式绑定账号；Codex 等非 Claude 路由可按各自策略结合占用、quota/cooldown/concurrency 和 session affinity 选择候选。Claude 直连始终固定 `currentProviderClaude` 及其绑定账号，首个 401 只在同账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
 - Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接或首业务事件前的传输失败/超时可回退到同账号 HTTP/SSE，首事件后切换为空闲超时并且绝不透明重放。
-- 支持 router installation register、client tunnel、share tunnel、share batch sync、installation 级公开收款资料同步、direct share request log sync、pending share edit pull/ack/event 监听。
+- 支持 router installation register、client tunnel、share tunnel、share batch sync、direct share request log sync、pending share edit pull/ack/event 监听。
 - 支持 share-market grant add/revoke 通过 router pending edit 应用到 server share，并同步 per-app 授权展示状态。
 - usage log 记录 requestId、sessionId、source、provider、model、stream status、cache/usage detail，并提供 summary/trends/provider/model stats。
 - usage 仅统计 Token、请求状态和延迟，不计算模型成本或 USD 金额；账号 quota 调度阈值、Share Token 限额及 Token Market 售价仍按各自业务边界管理。
@@ -55,7 +55,7 @@ market or direct share URL
 
 ## Code Agent 反代支持
 
-`cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini CLI** 三类官方 CLI 客户端入口。Provider 桥接能力按 Server 自身的协议契约实现；外部仓库仅提供覆盖审计和行为验证证据。下表评分口径与同生态中 9router、CLIProxyAPI、OmniRoute、sub2api、cockpit-tools、cc-switch、composer-api 的静态分析一致（0–10 分，侧重协议覆盖、格式互译、认证多账号、健壮性与可运维性；对比来源见本地 `proxy/proxy.md`）。
+`cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini CLI** 三类官方 CLI 客户端入口。Provider 桥接能力按 Server 自身的协议契约实现，能力分级以静态 adapter contract 覆盖度与真实验收结果为准。
 
 ### 支持的客户端入口
 
@@ -74,30 +74,7 @@ market or direct share URL
 
 能力分级：`✅ Native` = 静态 adapter contract 已覆盖且属主线验收对象；`⚠️ Planned` = 转发/签名已接线但缺真实 non-stream/stream 验收；`⚠️ Fallback` = skeleton 或 manual import 路径；`❌` = 未实现。详见 [`docs/code-agent-regression-matrix.md`](docs/code-agent-regression-matrix.md)。
 
-### 与同类反代项目横向对比（0–10）
-
-| Code Agent | 9router | CLIProxyAPI | OmniRoute | sub2api | cockpit-tools | cc-switch | **cc-switch-server** | composer-api |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Claude Code | 8.5 | **9.5** | 9.0 | 8.0 | 6.5 | 9.0 | **8.5** | 0 |
-| Codex CLI | 7.5 | **9.8** | 8.5 | 9.0 | 7.0 | 9.2 | **9.0** | 0 |
-| Gemini CLI | 7.5 | **9.5** | 8.5 | 8.0 | 6.0 | 8.0 | **7.8** | 0 |
-| Antigravity | 6.5 | **9.5** | 8.5 | 9.0 | 7.5 | 6.0 | **5.5** | 0 |
-| Cursor | 8.0 | 0 | **9.5** | 2.5 | 4.5 | 9.0 | **8.5** | **9.2** |
-| GitHub Copilot | 8.0 | 0 | 8.5 | 0 | 5.0 | **8.5** | **7.5** | 0 |
-| Cline | **8.0** | 0 | 3.0 | 0 | 0 | 0 | **0** | 0 |
-| OpenCode | 8.0 | 0 | **9.5** | 0 | 3.0 | 5.5 | **2.5** | 2.0 |
-| Kiro | **9.0** | 0 | 8.5 | 0 | 5.0 | 8.5 | **7.5** | 0 |
-| Qoder | **8.0** | 0 | 7.5 | 0 | 5.0 | 0 | **0** | 0 |
-| Trae | 0 | 0 | **8.5** | 0 | 5.0 | 0 | **0** | 0 |
-| Windsurf | 0 | 0 | **7.0** | 0 | 5.0 | 0 | **0** | 0 |
-| Zed | 0 | 0 | 5.0 | 0 | 5.0 | 0 | **0** | 0 |
-| **平均（13 agents）** | 6.08 | 2.95 | 7.81 | 2.81 | 4.96 | 4.90 | **4.37** | 0.86 |
-| **核心 4（Claude/Codex/Gemini/Antigravity）均分** | 7.50 | **9.58** | 8.63 | 8.50 | 6.75 | 8.05 | **7.70** | 0 |
-| **IDE 体验类 4（Cursor/Copilot/Kiro/Qoder）均分** | 8.25 | 0 | 8.50 | 0.63 | 4.88 | 6.50 | **5.88** | 2.30 |
-
 > **cc-switch-server 的产品边界**：不依赖 Tauri 桌面运行时，**不提供 Claude Code 热切换**（需重启 CLI 使 provider 变更生效）；提供 Server-native OAuth、share/router 隧道、Web 管理面、remote usage 同步与多租户 share binding。Cursor/Kiro/Copilot/DeepSeek 等跨厂商后端桥由本仓库独立维护，capability 升级以 Server 契约和真实验收为 gate。
->
-> 其他项目分数摘自本地 `proxy` 目录静态分析（2026-07）；`cockpit-tools` 反代能力继承自内嵌 CLIProxyAPI sidecar，自身侧重账号管理 GUI。
 
 ### 供应商 × App 能力矩阵（摘要）
 
@@ -262,7 +239,6 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 1. 启动 server，打开 `http://server-host:15721` 完成 setup。
 2. Router URL 填 router API base，例如 `https://router.example.com`。
 3. setup 会同步执行 `register -> owner bind -> client tunnel claim`；子域名冲突会在初始化阶段直接报错。Router 不可达时允许完成本地 setup，但健康状态会提示隧道未注册。子域名留空时 server 会自动生成唯一名称。
-4. “设置 → 分享 → 收款信息”可配置一个公开 EVM 地址、USDC/USDT 及 BSC/Base/Arbitrum One 网络；本地保存独立成功，随后自动签名同步到 Router。公开资料可通过 `GET /.well-known/cc-switch/payout-profile` 获取，且仅表示 owner 自行声明，未验证钱包所有权。
 4. 添加 provider 或 account 后创建 share；未填写 share subdomain 时，server 会自动生成。
 5. 点击 share tunnel start 后，server 会 claim share subdomain、申请 `http` lease 并建立 SSH reverse tunnel。
 6. share descriptor 会在创建、修改、删除时自动同步，并在 client 启动或重新注册 router 后自动校准，无需人工全量同步。
@@ -304,7 +280,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 
 主要本地 store：
 
-- `server.json`：owner、公开收款资料及同步状态、password hash、router、client tunnel subdomain 和 installation identity。
+- `server.json`：owner、password hash、router、client tunnel subdomain 和 installation identity。
 - `providers.json`：Claude / Codex / Gemini 供应商配置（按应用维度管理）。
 - `accounts.json`：账号 token、profile、quota、raw snapshot；token 字段用 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 做 XChaCha20Poly1305 加密。
 - `accounts.key`：本机生成的根密钥；同时派生 Account token 与 S2 Provider credential 的独立密钥。备份/迁移时必须和 `accounts.json`、`providers.json` 一起保留。

@@ -1932,34 +1932,37 @@ pub(in crate::api) async fn refresh_account(
             .ok_or_else(|| ApiError::conflict("account refresh is already in progress"))?;
         let http_client = state.http_client().await;
         let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-        let update = match execute_native_account_refresh(&http_client, &existing, now, interval_ms)
-            .await
-        {
-            Ok(update) => update,
-            Err(error) => {
-                let updated = state
-                    .mutate_accounts_immediate(|store| {
-                        store.mark_native_refresh_failure(&id, error.message.clone(), error.kind)
-                    })
-                    .await
-                    .map_err(map_account_write_error)?;
-                if let Some(updated) = updated {
-                    state
-                        .refresh_account_runtime_metadata_if_changed(&existing, &updated)
+        let update =
+            match execute_native_account_refresh(&http_client, &existing, now, interval_ms).await {
+                Ok(update) => update,
+                Err(error) => {
+                    let updated = state
+                        .commit_native_refresh_failure(&id, error.message.clone(), error.kind)
                         .await
-                        .map_err(ApiError::internal)?;
+                        .map_err(map_account_write_error)?;
+                    if let Some(updated) = updated {
+                        state
+                            .refresh_account_runtime_metadata_if_changed(&existing, &updated)
+                            .await
+                            .map_err(ApiError::internal)?;
+                    }
+                    return Err(account_refresh_api_error(error));
                 }
-                return Err(account_refresh_api_error(error));
-            }
-        };
+            };
         let account = state
-            .try_mutate_accounts_immediate(|store| {
-                store
-                    .mark_native_refresh_success(&id, update)
-                    .ok_or_else(|| ApiError::not_found("account not found"))
-            })
+            .commit_native_refresh_success(&id, update)
             .await
-            .map_err(map_account_write_error)??;
+            .map_err(|error| {
+                if error.is_persistence_degraded() {
+                    tracing::error!(account_id = %id, %error, "manual OAuth refresh persistence degraded");
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "rotated OAuth credentials are live but durable persistence is degraded",
+                    )
+                } else {
+                    ApiError::internal(error)
+                }
+            })?;
         state
             .refresh_account_runtime_metadata_if_changed(&existing, &account)
             .await
@@ -2158,13 +2161,7 @@ pub(in crate::api) async fn account_quota(
                 Ok(update) => update,
                 Err(error) => {
                     let updated = state
-                        .mutate_accounts_immediate(|store| {
-                            store.mark_native_refresh_failure(
-                                &id,
-                                error.message.clone(),
-                                error.kind,
-                            )
-                        })
+                        .commit_native_refresh_failure(&id, error.message.clone(), error.kind)
                         .await
                         .map_err(map_account_write_error)?;
                     if let Some(updated) = updated {
@@ -2180,13 +2177,19 @@ pub(in crate::api) async fn account_quota(
                 }
             };
         active_account = state
-            .try_mutate_accounts_immediate(|store| {
-                store
-                    .mark_native_refresh_success(&id, update)
-                    .ok_or_else(|| ApiError::not_found("account not found"))
-            })
+            .commit_native_refresh_success(&id, update)
             .await
-            .map_err(map_account_write_error)??;
+            .map_err(|error| {
+                if error.is_persistence_degraded() {
+                    tracing::error!(account_id = %id, %error, "quota OAuth refresh persistence degraded");
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "rotated OAuth credentials are live but durable persistence is degraded",
+                    )
+                } else {
+                    ApiError::internal(error)
+                }
+            })?;
     }
 
     let http_client = state.http_client().await;
@@ -2364,9 +2367,12 @@ mod tests {
     fn account_refresh_api_error_does_not_expose_upstream_message() {
         let error = account_refresh_api_error(AccountRefreshFailure {
             status_code: 400,
+            upstream_status: Some(400),
             message: "invalid_grant refresh_token=refresh-secret".to_string(),
             kind: crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
             retryable: false,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
         });
 
         assert_eq!(

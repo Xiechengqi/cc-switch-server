@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Activity, Laptop, Network, WalletCards } from "lucide-react";
+import { Activity, Laptop, Network } from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { Label } from "@/components/ui/label";
@@ -13,10 +13,6 @@ import {
   ClientTunnelSettingsPanel,
   type ClientTunnelFormState,
 } from "@/components/settings/ClientTunnelSettingsPanel";
-import {
-  PayoutProfileSettingsPanel,
-  type PayoutProfileFormState,
-} from "@/components/settings/PayoutProfileSettingsPanel";
 import {
   formatShareHealthOverview,
   ShareHealthStatusPanel,
@@ -102,8 +98,6 @@ export function ShareSettingsTab({ onSaveStateChange }: ShareSettingsTabProps) {
   );
   const [clientFormState, setClientFormState] =
     useState<ClientTunnelFormState | null>(null);
-  const [payoutFormState, setPayoutFormState] =
-    useState<PayoutProfileFormState | null>(null);
 
   useEffect(() => {
     setRouterDomain(tunnelConfig.domain);
@@ -151,27 +145,21 @@ export function ShareSettingsTab({ onSaveStateChange }: ShareSettingsTabProps) {
     if (clientFormState?.dirty && clientFormState.canSave) {
       tasks.push(clientFormState.save());
     }
-    if (payoutFormState?.dirty && payoutFormState.canSave) {
-      tasks.push(Promise.resolve(payoutFormState.save()));
-    }
     await Promise.all(tasks);
   }, [
     clientFormState,
     handleSaveRouter,
-    payoutFormState,
     routerDirty,
     t,
   ]);
 
   const canSave =
     routerDirty ||
-    (clientFormState?.dirty === true && clientFormState.canSave) ||
-    (payoutFormState?.dirty === true && payoutFormState.canSave);
+    (clientFormState?.dirty === true && clientFormState.canSave);
 
   const isSaving =
     configureTunnelMutation.isPending ||
-    clientFormState?.isSaving === true ||
-    payoutFormState?.isSaving === true;
+    clientFormState?.isSaving === true;
 
   useEffect(() => {
     if (!onSaveStateChange) return;
@@ -207,22 +195,6 @@ export function ShareSettingsTab({ onSaveStateChange }: ShareSettingsTabProps) {
             embedded
             hideSaveButton
             onFormStateChange={setClientFormState}
-          />
-        </ShareSettingsAccordionItem>
-
-        <ShareSettingsAccordionItem
-          value="payout"
-          icon={<WalletCards className="h-5 w-5 text-amber-500" />}
-          title={t("settings.share.sections.payout.title", {
-            defaultValue: "收款信息",
-          })}
-          description={t("settings.share.sections.payout.description", {
-            defaultValue: "配置公开的 EVM 收款地址、Token 与支持网络。",
-          })}
-        >
-          <PayoutProfileSettingsPanel
-            hideSaveButton
-            onFormStateChange={setPayoutFormState}
           />
         </ShareSettingsAccordionItem>
 
