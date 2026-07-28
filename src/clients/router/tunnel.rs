@@ -48,6 +48,9 @@ const TUNNELS_FILE_NAME: &str = "tunnels.json";
 const LEASE_RENEW_MIN_DELAY: Duration = Duration::from_secs(5);
 const LEASE_RENEW_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 const LEASE_ISSUE_TIMEOUT: Duration = Duration::from_secs(15);
+/// First N lease-issue failures are expected during install/startup races; log as
+/// info so provision UIs do not paint recoverable retries as hard failures.
+const LEASE_ISSUE_SOFT_FAILURE_LIMIT: u32 = 3;
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const SSH_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
@@ -597,6 +600,7 @@ async fn run_tunnel_actor(
 ) {
     let mut retry_cap = INITIAL_RECONNECT_BACKOFF;
     let mut rotation_id = new_rotation_id();
+    let mut consecutive_lease_failures: u32 = 0;
     loop {
         if actor_generation_is_stale(&statuses, &key, generation).await {
             tracing::debug!(
@@ -635,7 +639,10 @@ async fn run_tunnel_actor(
             expected_generation: router_active_generation,
         };
         let lease = match tokio::time::timeout(LEASE_ISSUE_TIMEOUT, lease_fn(lease_request)).await {
-            Ok(Ok(lease)) => lease,
+            Ok(Ok(lease)) => {
+                consecutive_lease_failures = 0;
+                lease
+            }
             Ok(Err(error)) => {
                 let error_message = error.to_string();
                 let previous_router_generation = router_generation;
@@ -672,13 +679,15 @@ async fn run_tunnel_actor(
                     },
                 )
                 .await;
-                tracing::warn!(
-                    tunnel_key = %key,
-                    tunnel_kind = %kind,
+                consecutive_lease_failures = consecutive_lease_failures.saturating_add(1);
+                log_lease_issue_retry(
+                    &key,
+                    &kind,
                     generation,
-                    reason = %reason,
-                    error = %error,
-                    "tunnel lease attempt failed"
+                    &reason,
+                    consecutive_lease_failures,
+                    Some(&error),
+                    None,
                 );
                 sleep_with_full_jitter(retry_cap).await;
                 retry_cap = next_backoff(retry_cap);
@@ -707,13 +716,15 @@ async fn run_tunnel_actor(
                     },
                 )
                 .await;
-                tracing::warn!(
-                    tunnel_key = %key,
-                    tunnel_kind = %kind,
+                consecutive_lease_failures = consecutive_lease_failures.saturating_add(1);
+                log_lease_issue_retry(
+                    &key,
+                    &kind,
                     generation,
-                    reason = %reason,
-                    timeout_seconds = LEASE_ISSUE_TIMEOUT.as_secs(),
-                    "tunnel lease attempt timed out"
+                    &reason,
+                    consecutive_lease_failures,
+                    None,
+                    Some(LEASE_ISSUE_TIMEOUT.as_secs()),
                 );
                 sleep_with_full_jitter(retry_cap).await;
                 retry_cap = next_backoff(retry_cap);
@@ -1350,6 +1361,76 @@ where
 
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_RECONNECT_BACKOFF)
+}
+
+fn log_lease_issue_retry(
+    key: &str,
+    kind: &str,
+    generation: u64,
+    reason: &str,
+    consecutive_failures: u32,
+    error: Option<&anyhow::Error>,
+    timeout_seconds: Option<u64>,
+) {
+    if consecutive_failures <= LEASE_ISSUE_SOFT_FAILURE_LIMIT {
+        match (error, timeout_seconds) {
+            (Some(error), _) => tracing::info!(
+                tunnel_key = %key,
+                tunnel_kind = %kind,
+                generation,
+                reason = %reason,
+                attempt = consecutive_failures,
+                error = %error,
+                "tunnel lease attempt deferred; retrying"
+            ),
+            (_, Some(timeout_seconds)) => tracing::info!(
+                tunnel_key = %key,
+                tunnel_kind = %kind,
+                generation,
+                reason = %reason,
+                attempt = consecutive_failures,
+                timeout_seconds,
+                "tunnel lease attempt deferred; retrying"
+            ),
+            _ => tracing::info!(
+                tunnel_key = %key,
+                tunnel_kind = %kind,
+                generation,
+                reason = %reason,
+                attempt = consecutive_failures,
+                "tunnel lease attempt deferred; retrying"
+            ),
+        }
+        return;
+    }
+    match (error, timeout_seconds) {
+        (Some(error), _) => tracing::warn!(
+            tunnel_key = %key,
+            tunnel_kind = %kind,
+            generation,
+            reason = %reason,
+            attempt = consecutive_failures,
+            error = %error,
+            "tunnel lease still failing after retries"
+        ),
+        (_, Some(timeout_seconds)) => tracing::warn!(
+            tunnel_key = %key,
+            tunnel_kind = %kind,
+            generation,
+            reason = %reason,
+            attempt = consecutive_failures,
+            timeout_seconds,
+            "tunnel lease still timing out after retries"
+        ),
+        _ => tracing::warn!(
+            tunnel_key = %key,
+            tunnel_kind = %kind,
+            generation,
+            reason = %reason,
+            attempt = consecutive_failures,
+            "tunnel lease still failing after retries"
+        ),
+    }
 }
 
 fn lease_issue_message_requires_new_rotation(message: &str) -> bool {
