@@ -43,7 +43,7 @@ AD3 已将本页矩阵固化为 `docs/code-agent-regression-matrix.json`。`scri
 
 | 调用来源 | 必填环境变量 | 验收点 |
 | --- | --- | --- |
-| local share binding | `SERVER_URL`、`CC_SWITCH_SERVER_TOKEN`、`SHARE_ID` | server 能按 `X-CC-Switch-Share-Id` 命中 binding |
+| local share binding | `SERVER_URL`、`CC_SWITCH_INFERENCE_TOKEN`、`SHARE_ID` | inference token 通过且 server 能按 `X-CC-Switch-Share-Id` 命中 binding |
 | direct public share URL | `DIRECT_SHARE_URL`、`ROUTER_API_TOKEN` | router auth 通过，server/router log 不重复 |
 | market API URL | `MARKET_API_URL`、`ROUTER_API_TOKEN` | market -> router -> server -> provider 调度成功 |
 

@@ -10,6 +10,7 @@ WARNINGS=0
 SKELETON_TOTAL=0
 OAUTH_NATIVE_READY=false
 OAUTH_GATE_STATUS="unknown"
+GROK_GATE_STATUS="unknown"
 
 pass() { echo "[PASS] $*"; }
 warn() { WARNINGS=$((WARNINGS + 1)); echo "[WARN] $*"; }
@@ -63,6 +64,30 @@ check_any_var() {
   warn "$label blocked; set at least one of $(join_missing "$@")"
 }
 
+check_grok_external_gate() {
+  local missing=()
+  local var
+  for var in GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_PROVIDER_ID; do
+    if ! env_present "$var"; then
+      missing+=("$var")
+    fi
+  done
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    GROK_GATE_STATUS="inputs-ready"
+    echo "[EXTERNAL-READY] Grok OAuth inputs present; live smoke has not run"
+  else
+    GROK_GATE_STATUS="blocked-inputs"
+    echo "[EXTERNAL-BLOCKED] Grok OAuth live smoke missing $(join_missing "${missing[@]}")"
+  fi
+  for var in GROK_OAUTH_CALLBACK_URL GROK_OAUTH_REFRESH_TOKEN_FIXTURE GROK_OAUTH_AUTH_JSON_FIXTURE CC_SWITCH_GROK_MODEL CC_SWITCH_GROK_MEDIA_SMOKE; do
+    if env_present "$var"; then
+      echo "[EXTERNAL-SET] $var"
+    else
+      echo "[EXTERNAL-OPTIONAL] $var is not set"
+    fi
+  done
+}
+
 echo "== local fixtures =="
 if [[ "$RUN_LOCAL_TESTS" == "1" ]]; then
   cargo test core::account_managers:: --quiet
@@ -113,6 +138,7 @@ check_required_vars "AB6 Gemini OAuth" GEMINI_OAUTH_TEST_ACCOUNT GEMINI_OAUTH_CA
 check_any_var "AB6 Gemini refresh/import fixture" GEMINI_OAUTH_REFRESH_TOKEN_FIXTURE GEMINI_OAUTH_REFRESH_TOKEN GEMINI_CLI_CREDENTIALS_FIXTURE
 check_required_vars "AB6 Antigravity/Agy OAuth" ANTIGRAVITY_OAUTH_TEST_ACCOUNT ANTIGRAVITY_OAUTH_CALLBACK_URL
 check_any_var "AB6 Antigravity/Agy refresh/import fixture" ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE
+check_grok_external_gate
 check_required_vars "AB7 Cursor OAuth" CURSOR_OAUTH_TEST_ACCOUNT CURSOR_OAUTH_CALLBACK_URL
 check_any_var "AB7 Cursor credential fixture" CURSOR_OAUTH_REFRESH_TOKEN_FIXTURE CURSOR_API_KEY_FIXTURE
 check_required_vars "AB7 GitHub Copilot device flow" GITHUB_COPILOT_TEST_ACCOUNT
@@ -125,11 +151,12 @@ if [[ "$FAILURES" -gt 0 ]]; then
   OAUTH_GATE_STATUS="fail"
 fi
 echo "failures=${FAILURES} warnings=${WARNINGS}"
-echo "oauthNativeReady=${OAUTH_NATIVE_READY} oauthGateStatus=${OAUTH_GATE_STATUS} skeletonTotal=${SKELETON_TOTAL}"
+echo "oauthNativeReady=${OAUTH_NATIVE_READY} oauthGateStatus=${OAUTH_GATE_STATUS} grokGateStatus=${GROK_GATE_STATUS} skeletonTotal=${SKELETON_TOTAL}"
 if [[ -n "$EVIDENCE_FILE" ]]; then
   EVIDENCE_STAGE="${EVIDENCE_STAGE:-AB5-AB7-oauth-readiness}" \
   EVIDENCE_STATUS="$([[ "$FAILURES" -eq 0 ]] && echo pass || echo fail)" \
   OAUTH_NATIVE_READY="$OAUTH_NATIVE_READY" OAUTH_GATE_STATUS="$OAUTH_GATE_STATUS" \
+  GROK_GATE_STATUS="$GROK_GATE_STATUS" \
   CURSOR_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \
   COPILOT_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \
   KIRO_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \

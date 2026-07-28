@@ -2,6 +2,8 @@ pub mod codex_device;
 pub(crate) mod codex_reset_credits;
 pub mod copilot_device;
 pub mod grok_device;
+pub mod grok_jwks;
+pub mod grok_models;
 pub mod kiro;
 pub mod kiro_device;
 pub mod openai_jwks;

@@ -22,7 +22,9 @@ use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::domain::accounts::store::AccountStore;
+use crate::domain::accounts::store::{
+    grok_account_capability_enabled, AccountStore, GrokAccountCapability,
+};
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
 use crate::domain::providers::current_provider;
 use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
@@ -32,7 +34,7 @@ use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadat
 use crate::infra::time::now_ms as current_time_ms;
 use crate::state::{
     AccountInFlightGuard, AccountInFlightSnapshot, CopilotUpstreamAuthError, DeepSeekUpstreamError,
-    ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
+    GrokMediaSessionBinding, ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
 };
 
 use super::adapters::{self, ProviderAdapter, UpstreamFormat};
@@ -45,8 +47,9 @@ use super::deepseek;
 use super::kiro;
 use super::provider_ops::{ProviderExecution, ProviderOperation};
 use super::request_governance::{
-    content_encoding_value, decode_request_body_for_proxy, decode_response_body_for_proxy,
-    ResponseDecodeResult,
+    content_encoding_value, decode_request_body_for_proxy,
+    decode_request_body_for_proxy_with_limit, decode_response_body_for_proxy,
+    decode_response_body_for_proxy_with_limit, ResponseDecodeResult,
 };
 use super::response_semantics::{
     self, FailureOrigin, ResponsesSseInspector, SemanticFailure, SemanticObservation,
@@ -227,6 +230,7 @@ struct ForwardAttemptContext {
     execution: Option<ProviderExecution>,
     auth_refresh_attempted: bool,
     excluded_provider_ids: BTreeSet<String>,
+    grok_session_id: Option<String>,
 }
 
 impl Default for ForwardAttemptContext {
@@ -238,6 +242,7 @@ impl Default for ForwardAttemptContext {
             execution: None,
             auth_refresh_attempted: false,
             excluded_provider_ids: BTreeSet::new(),
+            grok_session_id: None,
         }
     }
 }
@@ -406,6 +411,7 @@ async fn forward_with_attempt(
             }
         };
         let stored = execution.runtime_stored_view();
+        ensure_grok_credential_persistence_available(&state, &execution)?;
         validate_codex_allowed_client(
             &stored,
             route,
@@ -508,19 +514,23 @@ async fn forward_with_attempt(
         }
         execution.enforce_model_policy(&mut adapter_request)?;
         let grok_contract = if execution.driver_is("oauth.grok_responses") {
-            let cli_profile = grok_cli_profile(app, &stored);
-            let tenant_scope = grok_tenant_scope(&request_context, &stored);
+            let cli_profile = grok_cli_profile(&execution);
+            let preserved_session_id = attempt_context.grok_session_id.as_deref();
+            let tenant_scope = preserved_session_id
+                .is_none()
+                .then(|| grok_tenant_scope(&request_context, &stored))
+                .flatten();
             let contract = super::grok::apply_forward_contract(
                 &mut adapter_request.body,
                 &headers,
                 route,
                 request_context.session_id.as_deref(),
+                preserved_session_id,
                 tenant_scope.as_deref(),
                 cli_profile,
             )?;
-            if request_context.session_id.is_none() {
-                request_context.session_id = contract.session_id.clone();
-            }
+            attempt_context.grok_session_id = contract.session_id.clone();
+            request_context.session_id = contract.session_id.clone();
             if adapter_request.actual_model.as_deref() != Some(contract.actual_model.as_str()) {
                 adapter_request.actual_model_source = Some("grok_model_normalization".to_string());
             }
@@ -550,11 +560,13 @@ async fn forward_with_attempt(
                     prepared.headers,
                 )
             } else {
-                execution.enforce_model_policy(&mut adapter_request)?;
+                if !execution.driver_is("oauth.grok_responses") {
+                    execution.enforce_model_policy(&mut adapter_request)?;
+                }
                 execution.finalize_request(&mut adapter_request)?;
                 let mut url = execution.resolve_endpoint(route, gemini_path, &adapter_request)?;
                 if execution.driver_is("oauth.grok_responses") {
-                    url = super::grok::chat_upstream_url(&url, grok_cli_profile(app, &stored));
+                    url = super::grok::chat_upstream_url(&url, grok_cli_profile(&execution));
                 }
                 if execution.driver_is("oauth.openai_codex")
                     && route == ProxyRoute::CodexResponses
@@ -1946,7 +1958,10 @@ async fn forward_with_attempt(
         let (rewritten, version_gate_rewritten) =
             maybe_rewrite_claude_cli_version_gate_body(status, &stored, route, bytes);
         bytes = rewritten;
-        if version_gate_rewritten {
+        let (rewritten, grok_version_gate_rewritten) =
+            maybe_rewrite_grok_cli_version_gate_body(status, &stored, bytes);
+        bytes = rewritten;
+        if version_gate_rewritten || grok_version_gate_rewritten {
             preserve_content_encoding = false;
         }
         let semantic_upstream_format =
@@ -2200,10 +2215,15 @@ pub async fn forward_codex_responses_ws(
     };
     drop(providers);
     let stored = execution.runtime_stored_view();
+    ensure_grok_credential_persistence_available(&state, &execution)?;
     if !execution.driver_is("oauth.openai_codex") && !execution.driver_is("oauth.grok_responses") {
         return Err(ProxyError::bad_request(
             "responses websocket is only available for codex_oauth or grok_oauth providers",
         ));
+    }
+    if execution.driver_is("oauth.grok_responses") {
+        ensure_grok_account_capability(&state, &execution, GrokAccountCapability::Websocket)
+            .await?;
     }
     if !codex_websocket_enabled(&stored) {
         return Err(ProxyError {
@@ -2232,9 +2252,19 @@ pub async fn forward_codex_responses_ws(
     } else {
         ResponsesWebsocketMode::Codex
     };
-    let target =
-        prepare_responses_websocket_target(&state, &execution, ws_mode, session_id.as_deref())
-            .await?;
+    let grok_turn_index = if matches!(ws_mode, ResponsesWebsocketMode::Grok) {
+        super::grok::turn_index_from_headers(&headers)
+    } else {
+        None
+    };
+    let target = prepare_responses_websocket_target(
+        &state,
+        &execution,
+        ws_mode,
+        session_id.as_deref(),
+        grok_turn_index,
+    )
+    .await?;
     let websocket_upstream_model = match &execution.plan.model_policy {
         crate::domain::providers::runtime::RuntimeModelPolicy::Single { upstream_model } => {
             Some(upstream_model.clone())
@@ -2261,6 +2291,7 @@ pub async fn forward_codex_responses_ws(
                 pool_key: target.pool_key,
                 mode: ws_mode,
                 grok_session_id: session_id,
+                grok_turn_index,
                 single_upstream_model: websocket_upstream_model,
                 state: &state_for_share,
                 execution,
@@ -2300,7 +2331,12 @@ pub async fn forward_grok_media(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
-    let body = decode_request_body_for_proxy(&headers, body)?;
+    super::grok::validate_media_request(&method, &upstream_path)?;
+    let body = decode_request_body_for_proxy_with_limit(
+        &headers,
+        body,
+        super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+    )?;
     let mut request_context = request_context_from_headers(&headers);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
@@ -2314,13 +2350,13 @@ pub async fn forward_grok_media(
     } else {
         None
     };
+    let sticky_media_binding = super::grok::sticky_media_session_key(&upstream_path, &body)
+        .and_then(|session_key| state.grok_media_session_binding(&session_key));
     let mut selection_headers = headers.clone();
-    if let Some(session_key) = super::grok::sticky_media_session_key(&upstream_path, &body) {
+    if let Some(binding) = sticky_media_binding.as_ref() {
         if selection_headers.get("x-cc-provider-id").is_none() {
-            if let Some(binding) = state.grok_media_session_binding(&session_key) {
-                if let Ok(value) = HeaderValue::from_str(&binding.provider_id) {
-                    selection_headers.insert(HeaderName::from_static("x-cc-provider-id"), value);
-                }
+            if let Ok(value) = HeaderValue::from_str(&binding.provider_id) {
+                selection_headers.insert(HeaderName::from_static("x-cc-provider-id"), value);
             }
         }
     }
@@ -2370,6 +2406,7 @@ pub async fn forward_grok_media(
         upstream_path,
         headers,
         body,
+        sticky_media_binding,
         request_context.share_id,
         request_context.user_email,
         account_in_flight_guard,
@@ -2383,7 +2420,11 @@ pub async fn forward_images_generations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
-    let body = decode_request_body_for_proxy(&headers, body)?;
+    let body = decode_request_body_for_proxy_with_limit(
+        &headers,
+        body,
+        super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+    )?;
     let mut request_context = request_context_from_headers(&headers);
     request_context.session_id =
         session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
@@ -2444,6 +2485,7 @@ pub async fn forward_images_generations(
             "/images/generations".to_string(),
             headers,
             body,
+            None,
             request_context.share_id,
             request_context.user_email,
             account_in_flight_guard,
@@ -2476,29 +2518,29 @@ async fn forward_grok_media_with_execution(
     upstream_path: String,
     headers: HeaderMap,
     body: Bytes,
+    sticky_media_binding: Option<GrokMediaSessionBinding>,
     share_id: Option<String>,
     user_email: Option<String>,
     _account_in_flight_guard: Option<AccountInFlightGuard>,
     _share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
     let stored = execution.runtime_stored_view();
-    refresh_execution_managed_account_if_needed(&state, &execution).await?;
-    let accounts = state.accounts_snapshot().await;
-    let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
-    let mut target_headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
-    if let Some(session_id) =
-        super::grok::sticky_media_session_key(&upstream_path, &body).or_else(|| {
-            optional_header(&headers, "x-grok-conv-id").filter(|value| !value.trim().is_empty())
-        })
-    {
-        replace_or_push_header(&mut target_headers, "x-grok-conv-id", session_id);
+    if let Some(binding) = sticky_media_binding.as_ref() {
+        ensure_grok_media_session_binding(&execution, binding)?;
     }
-    replace_or_push_header(
-        &mut target_headers,
-        "accept",
-        "application/json, text/event-stream".to_string(),
-    );
-    let mut target_headers = owned_headers(target_headers);
+    ensure_grok_credential_persistence_available(&state, &execution)?;
+    let capability = grok_media_capability(&method, &upstream_path);
+    ensure_grok_account_capability(&state, &execution, capability).await?;
+    refresh_execution_managed_account_if_needed(&state, &execution).await?;
+    let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
+    let media_session_id = optional_header(&headers, "x-grok-conv-id")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|session_id| {
+            let tenant_scope =
+                grok_tenant_scope_parts(share_id.as_deref(), user_email.as_deref(), &stored);
+            super::grok::namespace_session_id(tenant_scope.as_deref(), &session_id)
+        });
     let (body, content_type) = if upstream_path.contains("/images/edits") {
         (
             super::grok::image_edit_body(&headers, body)?,
@@ -2512,33 +2554,90 @@ async fn forward_grok_media_with_execution(
                 .unwrap_or_else(|| "application/json".to_string()),
         )
     };
-    let mut url = super::join_url(&execution.plan.endpoint, &upstream_path);
-    let materialized_auth = execution.materialize_auth(&accounts)?;
-    execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
-    apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
-    execution.finalize_outbound_identity(&mut target_headers)?;
     let http_client = forward_http_client(&state, &stored).await?;
-    let mut request = http_client
-        .request(method.clone(), &url)
-        .header(CONTENT_TYPE, content_type);
-    for (name, value) in &target_headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
-    if method != Method::GET {
-        request = request.body(body);
-    }
-    request = request.timeout(execution.request_timeout());
     let started = Instant::now();
-    let upstream = request.send().await.map_err(|error| {
-        tokio::spawn({
-            let state = state.clone();
-            let stored = stored.clone();
-            async move {
-                record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-            }
-        });
-        ProxyError::bad_gateway(error)
-    })?;
+    let mut auth_refresh_attempted = false;
+    let mut upstream = loop {
+        ensure_grok_credential_persistence_available(&state, &execution)?;
+        let accounts = state.accounts_snapshot().await;
+        let mut target_headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
+        if let Some(session_id) = media_session_id.as_deref() {
+            replace_or_push_header(
+                &mut target_headers,
+                "x-grok-conv-id",
+                session_id.to_string(),
+            );
+        }
+        replace_or_push_header(
+            &mut target_headers,
+            "accept",
+            "application/json, text/event-stream".to_string(),
+        );
+        let mut target_headers = owned_headers(target_headers);
+        super::grok::apply_cli_identity_headers(
+            &mut target_headers,
+            super::grok::turn_index_from_headers(&headers),
+        );
+        let mut url = super::join_url(&execution.plan.endpoint, &upstream_path);
+        let materialized_auth = execution.materialize_auth(&accounts)?;
+        execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
+        apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
+        execution.finalize_outbound_identity(&mut target_headers)?;
+
+        let mut request = http_client
+            .request(method.clone(), &url)
+            .header(CONTENT_TYPE, content_type.as_str());
+        for (name, value) in &target_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        if method != Method::GET {
+            request = request.body(body.clone());
+        }
+        request = request.timeout(execution.request_timeout());
+        let upstream = request.send().await.map_err(|error| {
+            tokio::spawn({
+                let state = state.clone();
+                let stored = stored.clone();
+                async move {
+                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                }
+            });
+            ProxyError::bad_gateway(error)
+        })?;
+        if upstream.status() != StatusCode::UNAUTHORIZED || auth_refresh_attempted {
+            break upstream;
+        }
+        let Some((provider_type, account_id)) = execution.managed_account_target() else {
+            break upstream;
+        };
+        drop(upstream);
+        if let Err(error) = state
+            .refresh_managed_account_now(provider_type, Some(account_id))
+            .await
+        {
+            mark_managed_account_auth_cooldown(
+                &state,
+                &execution,
+                "grok_media_forced_refresh_failed",
+            )
+            .await;
+            return Err(managed_account_refresh_error_to_proxy_error(error));
+        }
+        auth_refresh_attempted = true;
+        record_forward_retry(
+            ProxyRoute::CodexResponses,
+            "auth",
+            "grok_media_unauthorized",
+        );
+    };
+    if upstream.status() == StatusCode::UNAUTHORIZED && auth_refresh_attempted {
+        mark_managed_account_auth_cooldown(
+            &state,
+            &execution,
+            "grok_media_unauthorized_after_refresh",
+        )
+        .await;
+    }
     let status = upstream.status();
     let status_code = status.as_u16();
     let mut response_headers = upstream.headers().clone();
@@ -2550,9 +2649,23 @@ async fn forward_grok_media_with_execution(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let content_encoding = content_encoding_value(&response_headers);
-    let bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
-    let decoded = decode_response_body_for_proxy(&response_headers, bytes);
-    let response_body = decoded.body;
+    let bytes = crate::infra::http::read_response_body_limited(
+        &mut upstream,
+        super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
+    )
+    .await
+    .map_err(ProxyError::bad_gateway)?;
+    let decoded = decode_response_body_for_proxy_with_limit(
+        &response_headers,
+        bytes,
+        super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
+    )?;
+    let mut preserve_content_encoding = decoded.preserve_content_encoding;
+    let (response_body, version_gate_rewritten) =
+        maybe_rewrite_grok_cli_version_gate_body(status, &stored, decoded.body);
+    if version_gate_rewritten {
+        preserve_content_encoding = false;
+    }
     maybe_mark_upstream_rate_limited(
         &state,
         &execution,
@@ -2571,6 +2684,9 @@ async fn forward_grok_media_with_execution(
             );
         }
     }
+    if status.is_success() {
+        record_grok_capability_evidence(&state, &execution, capability).await;
+    }
     record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
     record_share_invocation_result(
         &state,
@@ -2586,7 +2702,7 @@ async fn forward_grok_media_with_execution(
             response.headers_mut().insert(CONTENT_TYPE, value);
         }
     }
-    if decoded.preserve_content_encoding {
+    if preserve_content_encoding {
         if let Some(value) = content_encoding {
             response.headers_mut().insert(CONTENT_ENCODING, value);
         }
@@ -2599,6 +2715,24 @@ async fn forward_grok_media_with_execution(
         "grok media request completed"
     );
     Ok(response)
+}
+
+fn ensure_grok_media_session_binding(
+    execution: &ProviderExecution,
+    binding: &GrokMediaSessionBinding,
+) -> Result<(), ProxyError> {
+    let account_matches = binding.account_id.as_deref().is_some_and(|account_id| {
+        execution
+            .managed_account_id()
+            .is_some_and(|current| current == account_id)
+    });
+    if binding.provider_id == execution.stored.provider.id && account_matches {
+        return Ok(());
+    }
+    Err(ProxyError {
+        status: StatusCode::CONFLICT,
+        message: "Grok media session is bound to a different Provider or OAuth account".to_string(),
+    })
 }
 
 async fn forward_codex_images_generations(
@@ -2660,7 +2794,7 @@ async fn forward_codex_images_generations(
                 if let Some((provider_type, account_id)) = execution.managed_account_target() {
                     drop(upstream);
                     let refresh_result = state
-                        .refresh_managed_account_now(provider_type, account_id)
+                        .refresh_managed_account_now(provider_type, Some(account_id))
                         .await;
                     if let Err(error) = refresh_result {
                         mark_managed_account_auth_cooldown(
@@ -3149,7 +3283,7 @@ fn codex_image_mime_type(output_format: Option<&str>) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponsesWebsocketMode {
     Codex,
     Grok,
@@ -3164,6 +3298,7 @@ struct ResponsesWebsocketBridgeOptions<'a> {
     pool_key: Option<String>,
     mode: ResponsesWebsocketMode,
     grok_session_id: Option<String>,
+    grok_turn_index: Option<u64>,
     single_upstream_model: Option<String>,
     state: &'a ServerState,
     execution: ProviderExecution,
@@ -3182,7 +3317,9 @@ async fn prepare_responses_websocket_target(
     execution: &ProviderExecution,
     mode: ResponsesWebsocketMode,
     session_id: Option<&str>,
+    grok_turn_index: Option<u64>,
 ) -> Result<PreparedResponsesWebSocketTarget, ProxyError> {
+    ensure_grok_credential_persistence_available(state, execution)?;
     let stored = execution.runtime_stored_view();
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(stored.app, stored.provider_type);
@@ -3194,8 +3331,11 @@ async fn prepare_responses_websocket_target(
         replace_or_push_header(&mut headers, "x-grok-conv-id", session_id.to_string());
     }
     let mut headers = owned_headers(headers);
+    if matches!(mode, ResponsesWebsocketMode::Grok) {
+        super::grok::apply_cli_identity_headers(&mut headers, grok_turn_index);
+    }
     let mut ws_url = if matches!(mode, ResponsesWebsocketMode::Grok) {
-        super::grok::websocket_url().to_string()
+        grok_responses_websocket_url(execution)
     } else {
         codex_responses_websocket_url(execution)
     };
@@ -3228,6 +3368,19 @@ fn codex_responses_websocket_url(_execution: &ProviderExecution) -> String {
         return url.to_string();
     }
     "wss://chatgpt.com/backend-api/codex/responses".to_string()
+}
+
+fn grok_responses_websocket_url(_execution: &ProviderExecution) -> String {
+    #[cfg(test)]
+    if let Some(url) = _execution
+        .plan
+        .driver_options
+        .get("testGrokWebsocketUrl")
+        .and_then(Value::as_str)
+    {
+        return url.to_string();
+    }
+    super::grok::websocket_url().to_string()
 }
 
 fn responses_websocket_pool_key(
@@ -3272,6 +3425,7 @@ async fn bridge_responses_websocket(
         mut pool_key,
         mode,
         grok_session_id,
+        grok_turn_index,
         single_upstream_model,
         state,
         mut execution,
@@ -3331,9 +3485,7 @@ async fn bridge_responses_websocket(
                             "responses websocket received response.create while a response is in flight",
                         ));
                     }
-                    active_response_body = matches!(mode, ResponsesWebsocketMode::Codex)
-                        .then(|| responses_websocket_http_body(&message))
-                        .transpose()?;
+                    active_response_body = Some(responses_websocket_http_body(&message)?);
                     response_in_flight = true;
                     emitted_business_event = false;
                     pending_lifecycle_messages.clear();
@@ -3350,6 +3502,7 @@ async fn bridge_responses_websocket(
                                 &execution,
                                 mode,
                                 grok_session_id.as_deref(),
+                                grok_turn_index,
                             )
                             .await?;
                             headers = target.headers;
@@ -3381,10 +3534,7 @@ async fn bridge_responses_websocket(
                                 entry_was_cached = false;
                             }
                             Err(failure) => {
-                                let Some(source) = failure
-                                    .fallback_source
-                                    .filter(|_| matches!(mode, ResponsesWebsocketMode::Codex))
-                                else {
+                                let Some(source) = failure.fallback_source else {
                                     return Err(failure.error);
                                 };
                                 let body = active_response_body.as_ref().ok_or_else(|| {
@@ -3399,6 +3549,7 @@ async fn bridge_responses_websocket(
                                     &mut execution,
                                     body,
                                     grok_session_id.as_deref(),
+                                    grok_turn_index,
                                     first_byte_timeout,
                                     stream_idle_timeout,
                                     source,
@@ -3433,10 +3584,7 @@ async fn bridge_responses_websocket(
                     .await;
                 if let Err(error) = send_result {
                     let _failed_entry = entry.take();
-                    if matches!(mode, ResponsesWebsocketMode::Codex)
-                        && response_in_flight
-                        && !emitted_business_event
-                    {
+                    if response_in_flight && !emitted_business_event {
                         let body = active_response_body.as_ref().ok_or_else(|| {
                             ProxyError::bad_request(
                                 "response.create body is unavailable for HTTP fallback",
@@ -3454,6 +3602,7 @@ async fn bridge_responses_websocket(
                             &mut execution,
                             body,
                             grok_session_id.as_deref(),
+                            grok_turn_index,
                             first_byte_timeout,
                             stream_idle_timeout,
                             source,
@@ -3504,10 +3653,7 @@ async fn bridge_responses_websocket(
                     ResponsesWebsocketRead::Message(message) => message,
                     ResponsesWebsocketRead::TimedOut => {
                         let _timed_out_entry = entry.take();
-                        if matches!(mode, ResponsesWebsocketMode::Codex)
-                            && response_in_flight
-                            && !emitted_business_event
-                        {
+                        if response_in_flight && !emitted_business_event {
                             let body = active_response_body.as_ref().ok_or_else(|| {
                                 ProxyError::bad_request(
                                     "response.create body is unavailable for HTTP fallback",
@@ -3520,6 +3666,7 @@ async fn bridge_responses_websocket(
                                 &mut execution,
                                 body,
                                 grok_session_id.as_deref(),
+                                grok_turn_index,
                                 first_byte_timeout,
                                 stream_idle_timeout,
                                 "first_byte_timeout",
@@ -3568,10 +3715,7 @@ async fn bridge_responses_websocket(
                 };
                 let Some(message) = upstream_message else {
                     let _closed_entry = entry.take();
-                    if matches!(mode, ResponsesWebsocketMode::Codex)
-                        && response_in_flight
-                        && !emitted_business_event
-                    {
+                    if response_in_flight && !emitted_business_event {
                         let body = active_response_body.as_ref().ok_or_else(|| {
                             ProxyError::bad_request(
                                 "response.create body is unavailable for HTTP fallback",
@@ -3589,6 +3733,7 @@ async fn bridge_responses_websocket(
                             &mut execution,
                             body,
                             grok_session_id.as_deref(),
+                            grok_turn_index,
                             first_byte_timeout,
                             stream_idle_timeout,
                             source,
@@ -3625,8 +3770,7 @@ async fn bridge_responses_websocket(
                 let message = match message {
                     Ok(message) => message,
                     Err(error)
-                        if matches!(mode, ResponsesWebsocketMode::Codex)
-                            && response_in_flight
+                        if response_in_flight
                             && !emitted_business_event
                             && websocket_read_fallback_source(&error, entry_was_cached).is_some() =>
                     {
@@ -3645,6 +3789,7 @@ async fn bridge_responses_websocket(
                             &mut execution,
                             body,
                             grok_session_id.as_deref(),
+                            grok_turn_index,
                             first_byte_timeout,
                             stream_idle_timeout,
                             source,
@@ -3723,11 +3868,9 @@ async fn bridge_responses_websocket(
                         entry_was_cached,
                     );
                     let _closed_entry = entry.take();
-                    if let Some(source) = fallback_source.filter(|_| {
-                        matches!(mode, ResponsesWebsocketMode::Codex)
-                            && response_in_flight
-                            && !emitted_business_event
-                    }) {
+                    if let Some(source) = fallback_source
+                        .filter(|_| response_in_flight && !emitted_business_event)
+                    {
                         let body = active_response_body.as_ref().ok_or_else(|| {
                             ProxyError::bad_request(
                                 "response.create body is unavailable for HTTP fallback",
@@ -3740,6 +3883,7 @@ async fn bridge_responses_websocket(
                             &mut execution,
                             body,
                             grok_session_id.as_deref(),
+                            grok_turn_index,
                             first_byte_timeout,
                             stream_idle_timeout,
                             source,
@@ -3782,9 +3926,7 @@ async fn bridge_responses_websocket(
                                 "protocol_error",
                             );
                             let mut provider_outcome_recorded = false;
-                            if matches!(mode, ResponsesWebsocketMode::Codex)
-                                && !emitted_business_event
-                            {
+                            if !emitted_business_event {
                                 let failed = execution.runtime_stored_view();
                                 record_provider_outcome(
                                     state,
@@ -3794,8 +3936,12 @@ async fn bridge_responses_websocket(
                                 .await;
                                 provider_outcome_recorded = true;
                                 let _failed_entry = entry.take();
-                                if !provider_pinned
-                                    && switch_to_ready_codex_provider(
+                                let fallback_ready = if matches!(
+                                    mode,
+                                    ResponsesWebsocketMode::Codex
+                                ) {
+                                    !provider_pinned
+                                        && switch_to_ready_codex_provider(
                                         state,
                                         &mut execution,
                                         &mut _account_in_flight_guard,
@@ -3803,8 +3949,11 @@ async fn bridge_responses_websocket(
                                         codex_oauth_websocket_failover_provider,
                                         "websocket_semantic_protocol_error",
                                     )
-                                    .await
-                                {
+                                        .await
+                                } else {
+                                    true
+                                };
+                                if fallback_ready {
                                     pending_lifecycle_messages.clear();
                                     output_patcher.clear();
                                     let body = active_response_body.as_ref().ok_or_else(|| {
@@ -3818,6 +3967,7 @@ async fn bridge_responses_websocket(
                                         &mut execution,
                                         body,
                                         grok_session_id.as_deref(),
+                                        grok_turn_index,
                                         first_byte_timeout,
                                         stream_idle_timeout,
                                         "semantic_protocol_error",
@@ -3916,18 +4066,21 @@ async fn bridge_responses_websocket(
                             semantic_provider_outcome_recorded = true;
                         }
                         let _failed_entry = entry.take();
-                        if matches!(mode, ResponsesWebsocketMode::Codex)
-                            && !provider_pinned
-                            && switch_to_ready_codex_provider(
-                                state,
-                                &mut execution,
-                                &mut _account_in_flight_guard,
-                                &mut excluded_provider_ids,
-                                codex_oauth_websocket_failover_provider,
-                                "websocket_semantic_failure",
-                            )
-                            .await
-                        {
+                        let fallback_ready = if matches!(mode, ResponsesWebsocketMode::Codex) {
+                            !provider_pinned
+                                && switch_to_ready_codex_provider(
+                                    state,
+                                    &mut execution,
+                                    &mut _account_in_flight_guard,
+                                    &mut excluded_provider_ids,
+                                    codex_oauth_websocket_failover_provider,
+                                    "websocket_semantic_failure",
+                                )
+                                .await
+                        } else {
+                            true
+                        };
+                        if fallback_ready {
                             pending_lifecycle_messages.clear();
                             output_patcher.clear();
                             let body = active_response_body.as_ref().ok_or_else(|| {
@@ -3941,6 +4094,7 @@ async fn bridge_responses_websocket(
                                 &mut execution,
                                 body,
                                 grok_session_id.as_deref(),
+                                grok_turn_index,
                                 first_byte_timeout,
                                 stream_idle_timeout,
                                 "semantic_failure",
@@ -4110,6 +4264,13 @@ struct ResponsesWebsocketConnectFailure {
     fallback_source: Option<&'static str>,
 }
 
+fn grok_turn_index_from_headers(headers: &[(String, String)]) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-grok-turn-idx"))
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+}
+
 #[allow(clippy::too_many_arguments)] // The connect loop updates one authenticated WS target in place.
 async fn connect_responses_websocket(
     state: &ServerState,
@@ -4150,31 +4311,37 @@ async fn connect_responses_websocket(
             );
         }
 
-        let connect = tokio_tungstenite::connect_async(request);
+        let connect = crate::infra::http::connect_websocket(request);
         let connect_result = match tokio::time::timeout(connect_timeout, connect).await {
             Ok(result) => result,
             Err(_) => {
                 return Err(ResponsesWebsocketConnectFailure {
                     error: ProxyError {
                         status: StatusCode::GATEWAY_TIMEOUT,
-                        message: "codex websocket connect timeout".to_string(),
+                        message: "responses websocket connect timeout".to_string(),
                     },
-                    fallback_source: matches!(mode, ResponsesWebsocketMode::Codex)
-                        .then_some("connect_timeout"),
+                    fallback_source: Some("connect_timeout"),
                 })
             }
         };
         match connect_result {
             Ok((upstream, _)) => {
+                if matches!(mode, ResponsesWebsocketMode::Grok) {
+                    record_grok_capability_evidence(
+                        state,
+                        execution,
+                        GrokAccountCapability::Websocket,
+                    )
+                    .await;
+                }
                 return Ok(CachedResponsesWebSocket {
                     socket: upstream,
                     created_at: Instant::now(),
                     last_used_at: Instant::now(),
-                })
+                });
             }
             Err(error)
-                if matches!(mode, ResponsesWebsocketMode::Codex)
-                    && !*auth_refresh_attempted
+                if !*auth_refresh_attempted
                     && responses_websocket_http_error(&error)
                         .is_some_and(|(status, _, _)| status == StatusCode::UNAUTHORIZED) =>
             {
@@ -4185,7 +4352,7 @@ async fn connect_responses_websocket(
                     });
                 };
                 let refresh_result = state
-                    .refresh_managed_account_now(provider_type, account_id)
+                    .refresh_managed_account_now(provider_type, Some(account_id))
                     .await;
                 if let Err(error) = refresh_result {
                     mark_managed_account_auth_cooldown(
@@ -4194,7 +4361,8 @@ async fn connect_responses_websocket(
                         "websocket_forced_refresh_failed",
                     )
                     .await;
-                    if !provider_pinned
+                    if matches!(mode, ResponsesWebsocketMode::Codex)
+                        && !provider_pinned
                         && switch_codex_websocket_provider(
                             state,
                             execution,
@@ -4224,12 +4392,22 @@ async fn connect_responses_websocket(
                 }
                 *auth_refresh_attempted = true;
                 record_forward_retry(ProxyRoute::CodexResponses, "auth", "websocket_unauthorized");
-                let target = prepare_responses_websocket_target(state, execution, mode, session_id)
-                    .await
-                    .map_err(|error| ResponsesWebsocketConnectFailure {
-                        error,
-                        fallback_source: None,
-                    })?;
+                let target = prepare_responses_websocket_target(
+                    state,
+                    execution,
+                    mode,
+                    session_id,
+                    if matches!(mode, ResponsesWebsocketMode::Grok) {
+                        grok_turn_index_from_headers(headers)
+                    } else {
+                        None
+                    },
+                )
+                .await
+                .map_err(|error| ResponsesWebsocketConnectFailure {
+                    error,
+                    fallback_source: None,
+                })?;
                 *headers = target.headers;
                 *ws_url = target.ws_url;
                 *pool_key = target.pool_key;
@@ -4237,17 +4415,15 @@ async fn connect_responses_websocket(
             Err(error) => {
                 let fallback_source = websocket_connect_fallback_source(mode, &error);
                 let error = responses_websocket_connect_error(state, execution, error).await;
-                if matches!(mode, ResponsesWebsocketMode::Codex)
-                    && error.status == StatusCode::UNAUTHORIZED
-                    && *auth_refresh_attempted
-                {
+                if error.status == StatusCode::UNAUTHORIZED && *auth_refresh_attempted {
                     mark_managed_account_auth_cooldown(
                         state,
                         execution,
                         "websocket_unauthorized_after_refresh",
                     )
                     .await;
-                    if !provider_pinned
+                    if matches!(mode, ResponsesWebsocketMode::Codex)
+                        && !provider_pinned
                         && switch_codex_websocket_provider(
                             state,
                             execution,
@@ -4309,6 +4485,7 @@ async fn switch_codex_websocket_provider(
         execution,
         ResponsesWebsocketMode::Codex,
         session_id,
+        None,
     )
     .await?;
     *headers = target.headers;
@@ -4318,12 +4495,9 @@ async fn switch_codex_websocket_provider(
 }
 
 fn websocket_connect_fallback_source(
-    mode: ResponsesWebsocketMode,
+    _mode: ResponsesWebsocketMode,
     error: &TungsteniteError,
 ) -> Option<&'static str> {
-    if !matches!(mode, ResponsesWebsocketMode::Codex) {
-        return None;
-    }
     match responses_websocket_http_error(error) {
         Some((status, _, _)) if status.is_server_error() => Some("handshake_server_error"),
         Some(_) => None,
@@ -4377,6 +4551,7 @@ async fn run_codex_websocket_http_fallback(
     execution: &mut ProviderExecution,
     response_body: &Value,
     session_id: Option<&str>,
+    grok_turn_index: Option<u64>,
     first_event_timeout: Option<Duration>,
     stream_idle_timeout: Option<Duration>,
     source: &'static str,
@@ -4391,50 +4566,55 @@ async fn run_codex_websocket_http_fallback(
 
     loop {
         let stored = execution.runtime_stored_view();
-        let target =
-            match prepare_codex_http_fallback_target(state, execution, response_body, session_id)
-                .await
-            {
-                Ok(target) => target,
-                Err(error) => {
-                    if error.status.is_server_error() {
-                        record_provider_outcome(
-                            state,
-                            &stored,
-                            ProviderOutcome::Failure {
-                                status_code: error.status.as_u16(),
-                            },
-                        )
-                        .await;
-                        if switch_codex_http_fallback_provider(
-                            state,
-                            execution,
-                            account_in_flight_guard,
-                            excluded_provider_ids,
-                            provider_pinned,
-                            auth_refresh_attempted,
-                            output_patcher,
-                            "websocket_http_fallback_target_error",
-                        )
-                        .await
-                        {
-                            continue;
-                        }
-                    }
-                    return terminate_codex_http_fallback_with_error(
-                        downstream,
+        let target = match prepare_codex_http_fallback_target(
+            state,
+            execution,
+            response_body,
+            session_id,
+            grok_turn_index,
+        )
+        .await
+        {
+            Ok(target) => target,
+            Err(error) => {
+                if error.status.is_server_error() {
+                    record_provider_outcome(
                         state,
-                        execution,
-                        output_patcher,
-                        source,
-                        Vec::new(),
-                        error,
-                        "upstream_target_error",
-                        Some("protocol_error"),
+                        &stored,
+                        ProviderOutcome::Failure {
+                            status_code: error.status.as_u16(),
+                        },
                     )
                     .await;
+                    if switch_codex_http_fallback_provider(
+                        state,
+                        execution,
+                        account_in_flight_guard,
+                        excluded_provider_ids,
+                        provider_pinned,
+                        auth_refresh_attempted,
+                        output_patcher,
+                        "websocket_http_fallback_target_error",
+                    )
+                    .await
+                    {
+                        continue;
+                    }
                 }
-            };
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    Vec::new(),
+                    error,
+                    "upstream_target_error",
+                    Some("protocol_error"),
+                )
+                .await;
+            }
+        };
         let mut request = target
             .http_client
             .post(&target.url)
@@ -4502,7 +4682,7 @@ async fn run_codex_websocket_http_fallback(
                 let error = ProxyError {
                     status: StatusCode::GATEWAY_TIMEOUT,
                     message: format!(
-                        "Codex HTTP fallback first event timeout after {}ms",
+                        "Responses HTTP fallback first event timeout after {}ms",
                         first_event_timeout
                             .expect("a deadline exists only when the timeout is enabled")
                             .as_millis()
@@ -4527,7 +4707,7 @@ async fn run_codex_websocket_http_fallback(
             let Some((provider_type, account_id)) = execution.managed_account_target() else {
                 let error = ProxyError {
                     status,
-                    message: "Codex HTTP fallback upstream rejected authentication".to_string(),
+                    message: "Responses HTTP fallback upstream rejected authentication".to_string(),
                 };
                 record_provider_outcome(
                     state,
@@ -4566,7 +4746,7 @@ async fn run_codex_websocket_http_fallback(
             };
             drop(upstream);
             let refresh_result = state
-                .refresh_managed_account_now(provider_type, account_id)
+                .refresh_managed_account_now(provider_type, Some(account_id))
                 .await;
             if let Err(error) = refresh_result {
                 mark_managed_account_auth_cooldown(
@@ -4656,7 +4836,7 @@ async fn run_codex_websocket_http_fallback(
                     Err(_) => Err(ProxyError {
                         status: StatusCode::GATEWAY_TIMEOUT,
                         message: format!(
-                            "Codex HTTP fallback first event timeout after {}ms",
+                            "Responses HTTP fallback first event timeout after {}ms",
                             first_event_timeout
                                 .expect("a deadline exists only when the timeout is enabled")
                                 .as_millis()
@@ -4725,13 +4905,18 @@ async fn run_codex_websocket_http_fallback(
             {
                 continue;
             }
-            let error = ProxyError {
-                status,
-                message: format!(
-                    "Codex HTTP fallback upstream returned HTTP {}",
+            let message = if execution.driver_is("oauth.grok_responses")
+                && is_grok_cli_version_gate_message(&upstream_error_message(&body))
+            {
+                record_grok_cli_version_gate(&stored, "websocket_http_fallback");
+                grok_cli_version_gate_admin_message()
+            } else {
+                format!(
+                    "Responses HTTP fallback upstream returned HTTP {}",
                     status.as_u16()
-                ),
+                )
             };
+            let error = ProxyError { status, message };
             return terminate_codex_http_fallback_with_error(
                 downstream,
                 state,
@@ -4879,7 +5064,8 @@ async fn switch_codex_http_fallback_provider(
     output_patcher: &mut CodexWebsocketOutputPatcher,
     reason: &'static str,
 ) -> bool {
-    if provider_pinned
+    if execution.driver_is("oauth.grok_responses")
+        || provider_pinned
         || !switch_to_ready_codex_provider(
             state,
             execution,
@@ -4918,10 +5104,15 @@ async fn terminate_codex_http_fallback_with_error(
         .into_iter()
         .map(TungsteniteMessage::Text)
         .collect();
+    let mode = if execution.driver_is("oauth.grok_responses") {
+        ResponsesWebsocketMode::Grok
+    } else {
+        ResponsesWebsocketMode::Codex
+    };
     terminate_responses_websocket_with_error(
         downstream,
         output_patcher,
-        ResponsesWebsocketMode::Codex,
+        mode,
         state,
         execution,
         &mut pending_messages,
@@ -4939,8 +5130,10 @@ async fn prepare_codex_http_fallback_target(
     execution: &ProviderExecution,
     response_body: &Value,
     session_id: Option<&str>,
+    grok_turn_index: Option<u64>,
 ) -> Result<PreparedCodexHttpFallbackTarget, ProxyError> {
     let stored = execution.runtime_stored_view();
+    let grok = execution.driver_is("oauth.grok_responses");
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
     let body = serde_json::to_vec(response_body)
         .map(Bytes::from)
@@ -4949,24 +5142,56 @@ async fn prepare_codex_http_fallback_target(
         })?;
     let mut adapter_request =
         adapter.transform_request_for_route(body, &stored, ProxyRoute::CodexResponses, None)?;
-    adapter_request.body = normalize_codex_oauth_responses_body_bytes(
-        &adapter_request.body,
-        session_id,
-        codex_image_tool_strip_policy(&stored),
-    )?;
-    adapter_request.body =
-        super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
+    if !grok {
+        adapter_request.body = normalize_codex_oauth_responses_body_bytes(
+            &adapter_request.body,
+            session_id,
+            codex_image_tool_strip_policy(&stored),
+        )?;
+        adapter_request.body =
+            super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
+    }
     adapter_request.stream_requested = true;
     execution.enforce_model_policy(&mut adapter_request)?;
+    let grok_contract = if grok {
+        let mut contract = super::grok::apply_forward_contract(
+            &mut adapter_request.body,
+            &HeaderMap::new(),
+            ProxyRoute::CodexResponses,
+            None,
+            session_id,
+            None,
+            grok_cli_profile(execution),
+        )?;
+        super::grok::set_forward_contract_turn_index(&mut contract, grok_turn_index);
+        adapter_request.model = Some(contract.actual_model.clone());
+        adapter_request.actual_model = Some(contract.actual_model.clone());
+        Some(contract)
+    } else {
+        None
+    };
+    if !grok {
+        execution.enforce_model_policy(&mut adapter_request)?;
+    }
     execution.finalize_request(&mut adapter_request)?;
     let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, &adapter_request)?;
+    if grok {
+        url = super::grok::chat_upstream_url(&url, grok_cli_profile(execution));
+    }
 
     refresh_execution_managed_account_if_needed(state, execution).await?;
+    ensure_grok_credential_persistence_available(state, execution)?;
     let accounts = state.accounts_snapshot().await;
     let mut headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
     headers.extend(adapter_request.upstream_headers.iter().cloned());
-    append_codex_oauth_session_headers(&mut headers, session_id);
-    crate::codex_identity::finalize_headers(&mut headers);
+    if let Some(contract) = grok_contract {
+        for (name, value) in contract.headers {
+            replace_or_push_header(&mut headers, name, value);
+        }
+    } else {
+        append_codex_oauth_session_headers(&mut headers, session_id);
+        crate::codex_identity::finalize_headers(&mut headers);
+    }
     let mut headers = owned_headers(headers);
     let materialized_auth = execution.materialize_auth(&accounts)?;
     execution.apply_auth(&mut headers, &mut url, materialized_auth.as_ref())?;
@@ -4996,7 +5221,7 @@ fn responses_websocket_http_body(message: &TungsteniteMessage) -> Result<Value, 
     })?;
     if value.get("type").and_then(Value::as_str) != Some("response.create") {
         return Err(ProxyError::bad_request(
-            "Codex HTTP fallback requires a response.create frame",
+            "Responses HTTP fallback requires a response.create frame",
         ));
     }
     if value.get("response").is_some() {
@@ -5094,7 +5319,7 @@ async fn relay_codex_http_fallback_stream(
                                 status: StatusCode::GATEWAY_TIMEOUT,
                                 message: if waiting_for_first_event {
                                     format!(
-                                        "Codex HTTP fallback first event timeout after {}ms",
+                                        "Responses HTTP fallback first event timeout after {}ms",
                                         first_event_timeout
                                             .expect(
                                                 "a first-event deadline has a configured timeout",
@@ -5102,7 +5327,7 @@ async fn relay_codex_http_fallback_stream(
                                             .as_millis()
                                     )
                                 } else {
-                                    "Codex HTTP fallback stream idle timeout".to_string()
+                                    "Responses HTTP fallback stream idle timeout".to_string()
                                 },
                             })
                         })?
@@ -5183,7 +5408,7 @@ async fn relay_codex_http_fallback_stream(
                         return Ok(outcome);
                     }
                     return Err(CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(
-                        "Codex HTTP fallback stream ended before a terminal response event",
+                        "Responses HTTP fallback stream ended before a terminal response event",
                     )));
                 }
             }
@@ -5453,7 +5678,7 @@ impl CodexHttpFallbackSseDecoder {
 fn codex_http_fallback_sse_event_too_large() -> ProxyError {
     ProxyError {
         status: StatusCode::PAYLOAD_TOO_LARGE,
-        message: "Codex HTTP fallback SSE event exceeded 128 MiB".to_string(),
+        message: "Responses HTTP fallback SSE event exceeded 128 MiB".to_string(),
     }
 }
 
@@ -5688,9 +5913,21 @@ async fn responses_websocket_connect_error(
     error: TungsteniteError,
 ) -> ProxyError {
     let Some((status, headers, body)) = responses_websocket_http_error(&error) else {
-        return ProxyError::bad_gateway(format!("codex websocket connect: {error}"));
+        return ProxyError::bad_gateway(format!("responses websocket connect: {error}"));
     };
     maybe_mark_upstream_rate_limited(state, execution, status, &headers, &body).await;
+    if execution.driver_is("oauth.grok_responses") {
+        let stored = execution.runtime_stored_view();
+        maybe_update_grok_entitlement(state, &stored, &headers).await;
+        maybe_mark_grok_cooldown(state, &stored, status, &headers).await;
+        if is_grok_cli_version_gate_message(&upstream_error_message(&body)) {
+            record_grok_cli_version_gate(&stored, "websocket_handshake");
+            return ProxyError {
+                status,
+                message: grok_cli_version_gate_admin_message(),
+            };
+        }
+    }
     ProxyError {
         status,
         message: format!(
@@ -6021,7 +6258,7 @@ async fn maybe_mark_upstream_rate_limited(
         return;
     };
     let Some(account_id) = state
-        .find_account_for_provider(provider_type, requested_account_id)
+        .find_account_for_provider(provider_type, Some(requested_account_id))
         .await
         .map(|account| account.id)
     else {
@@ -6046,7 +6283,7 @@ async fn mark_managed_account_auth_cooldown(
         return;
     };
     let Some(account_id) = state
-        .find_account_for_provider(provider_type, requested_account_id)
+        .find_account_for_provider(provider_type, Some(requested_account_id))
         .await
         .map(|account| account.id)
     else {
@@ -6964,13 +7201,13 @@ fn acquire_account_in_flight(
 }
 
 fn account_concurrency_proxy_error(stored: &StoredProvider) -> ProxyError {
-    ProxyError {
-        status: StatusCode::TOO_MANY_REQUESTS,
-        message: format!(
+    ProxyError::rate_limited(
+        format!(
             "provider {} account concurrency limit has been reached",
             stored.provider.id
         ),
-    }
+        1,
+    )
 }
 
 async fn validate_and_acquire_share_invocation(
@@ -7026,9 +7263,13 @@ fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyE
         | ShareRejectReason::UserExpired
         | ShareRejectReason::UserExhausted => StatusCode::FORBIDDEN,
     };
-    ProxyError {
-        status,
-        message: rejection.formatted_message(),
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        ProxyError::rate_limited(rejection.formatted_message(), 1)
+    } else {
+        ProxyError {
+            status,
+            message: rejection.formatted_message(),
+        }
     }
 }
 
@@ -7107,9 +7348,66 @@ fn maybe_rewrite_claude_cli_version_gate_body(
     crate::metrics::record_claude_cli_version_gate();
 
     let admin_message = claude_cli_version_gate_admin_message();
-    let bytes = rewrite_error_message_body(&body, &admin_message)
+    let bytes = rewrite_error_message_body(&body, &admin_message, "claude_code_version_gate")
         .unwrap_or_else(|| Bytes::from(admin_message));
     (bytes, true)
+}
+
+fn maybe_rewrite_grok_cli_version_gate_body(
+    status: StatusCode,
+    stored: &StoredProvider,
+    body: Bytes,
+) -> (Bytes, bool) {
+    if stored.provider_type != ProviderType::GrokOAuth
+        || !(status.is_client_error() || status.is_server_error())
+    {
+        return (body, false);
+    }
+    let upstream_message = upstream_error_message(&body);
+    if !is_grok_cli_version_gate_message(&upstream_message) {
+        return (body, false);
+    }
+
+    record_grok_cli_version_gate(stored, "http");
+    let admin_message = grok_cli_version_gate_admin_message();
+    let bytes = rewrite_error_message_body(&body, &admin_message, "grok_cli_version_gate")
+        .unwrap_or_else(|| Bytes::from(admin_message));
+    (bytes, true)
+}
+
+fn is_grok_cli_version_gate_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("x-grok-client-version")
+        || message.contains("grok-shell@latest")
+        || ((message.contains("grok") || message.contains("client version"))
+            && [
+                "out of date",
+                "outdated",
+                "too old",
+                "minimum version",
+                "unsupported version",
+                "please update",
+                "please upgrade",
+            ]
+            .iter()
+            .any(|marker| message.contains(marker)))
+}
+
+fn record_grok_cli_version_gate(stored: &StoredProvider, transport: &'static str) {
+    tracing::error!(
+        provider_id = %stored.provider.id,
+        cli_version = %crate::domain::grok_cli::grok_cli_version(),
+        transport,
+        "Grok OAuth upstream rejected the advertised Grok CLI version; set CC_SWITCH_GROK_CLI_VERSION or CC_SWITCH_GROK_CLI_USER_AGENT to a currently accepted value"
+    );
+    crate::metrics::record_grok_cli_version_gate();
+}
+
+fn grok_cli_version_gate_admin_message() -> String {
+    format!(
+        "Grok OAuth upstream rejected the advertised Grok CLI version (currently {}). cc-switch-server admin: bump CC_SWITCH_GROK_CLI_VERSION or CC_SWITCH_GROK_CLI_USER_AGENT to a currently accepted Grok CLI identity.",
+        crate::domain::grok_cli::grok_cli_version()
+    )
 }
 
 fn is_claude_cli_version_gate_message(message: &str) -> bool {
@@ -7130,7 +7428,7 @@ fn claude_cli_version_gate_admin_message() -> String {
     )
 }
 
-fn rewrite_error_message_body(body: &[u8], message: &str) -> Option<Bytes> {
+fn rewrite_error_message_body(body: &[u8], message: &str, error_type: &str) -> Option<Bytes> {
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
     let mut replaced = false;
     if let Some(existing) = value.pointer_mut("/error/message") {
@@ -7144,7 +7442,7 @@ fn rewrite_error_message_body(body: &[u8], message: &str) -> Option<Bytes> {
     if !replaced {
         value = json!({
             "error": {
-                "type": "claude_code_version_gate",
+                "type": error_type,
                 "message": message,
             }
         });
@@ -7286,9 +7584,85 @@ async fn refresh_execution_managed_account_if_needed(
         return Ok(());
     };
     state
-        .refresh_managed_account_if_needed(provider_type, account_id)
+        .refresh_managed_account_if_needed(provider_type, Some(account_id))
         .await
-        .map_err(managed_account_refresh_error_to_proxy_error)
+        .map_err(managed_account_refresh_error_to_proxy_error)?;
+    ensure_grok_credential_persistence_available(state, execution)
+}
+
+fn ensure_grok_credential_persistence_available(
+    state: &ServerState,
+    execution: &ProviderExecution,
+) -> Result<(), ProxyError> {
+    if execution.driver_is("oauth.grok_responses") && state.credential_persistence_degraded() {
+        return Err(ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Grok OAuth credentials are waiting for durable persistence".to_string(),
+        });
+    }
+    Ok(())
+}
+
+async fn ensure_grok_account_capability(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    capability: GrokAccountCapability,
+) -> Result<(), ProxyError> {
+    let Some((ProviderType::GrokOAuth, account_id)) = execution.managed_account_target() else {
+        return Err(ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Grok OAuth capability requires a bound managed account".to_string(),
+        });
+    };
+    let account = state
+        .find_account_for_provider(ProviderType::GrokOAuth, Some(account_id))
+        .await
+        .ok_or_else(|| ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Grok OAuth capability account is unavailable".to_string(),
+        })?;
+    if grok_account_capability_enabled(&account, capability) {
+        return Ok(());
+    }
+    Err(ProxyError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: format!(
+            "Grok OAuth {} capability is unverified; explicitly enable it with CC_SWITCH_GROK_OAUTH_CAPABILITIES or persist successful probe evidence",
+            capability.as_str()
+        ),
+    })
+}
+
+fn grok_media_capability(method: &Method, upstream_path: &str) -> GrokAccountCapability {
+    if upstream_path.contains("/images/edits") {
+        GrokAccountCapability::ImageEdit
+    } else if upstream_path.contains("/videos/")
+        || (method == Method::POST && upstream_path.contains("/videos"))
+    {
+        GrokAccountCapability::VideoGeneration
+    } else {
+        GrokAccountCapability::ImageGeneration
+    }
+}
+
+async fn record_grok_capability_evidence(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    capability: GrokAccountCapability,
+) {
+    let Some((ProviderType::GrokOAuth, account_id)) = execution.managed_account_target() else {
+        return;
+    };
+    if let Err(error) = state
+        .record_grok_capability_evidence(account_id, capability, "upstream_success")
+        .await
+    {
+        tracing::warn!(
+            capability = capability.as_str(),
+            error = %error,
+            "persist Grok OAuth capability evidence failed"
+        );
+    }
 }
 
 async fn next_claude_transport_attempt(
@@ -7332,7 +7706,7 @@ async fn next_unauthorized_attempt(
             return Ok(None);
         };
         if let Err(error) = state
-            .refresh_managed_account_now(provider_type, account_id)
+            .refresh_managed_account_now(provider_type, Some(account_id))
             .await
         {
             mark_managed_account_auth_cooldown(state, execution, "forced_refresh_failed").await;
@@ -7398,6 +7772,9 @@ async fn next_provider_failover(
     reason: &'static str,
 ) -> Option<ForwardAttemptContext> {
     if route.app() == AppKind::Claude || !attempt_context.retry_allowed() {
+        return None;
+    }
+    if failed.driver_is("oauth.grok_responses") {
         return None;
     }
     let mut excluded = attempt_context.excluded_provider_ids.clone();
@@ -7553,6 +7930,9 @@ fn request_is_provider_pinned(headers: &HeaderMap, request_context: &UsageLogCon
 }
 
 fn supports_forced_auth_refresh(route: ProxyRoute, execution: &ProviderExecution) -> bool {
+    if execution.driver_is("oauth.grok_responses") {
+        return true;
+    }
     match route {
         ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens => {
             execution.driver_is("oauth.claude_messages")
@@ -7580,18 +7960,34 @@ fn managed_account_id(stored: &StoredProvider) -> Option<&str> {
         .and_then(|binding| binding.account_id.as_deref())
 }
 
-fn grok_cli_profile(app: AppKind, stored: &StoredProvider) -> bool {
-    stored.provider_type == ProviderType::GrokOAuth && !provider_secret_configured(app, stored)
+fn grok_cli_profile(execution: &ProviderExecution) -> bool {
+    execution.driver_is("oauth.grok_responses")
+        && matches!(
+            execution.managed_account_target(),
+            Some((ProviderType::GrokOAuth, _))
+        )
 }
 
 fn grok_tenant_scope(context: &UsageLogContext, stored: &StoredProvider) -> Option<String> {
+    grok_tenant_scope_parts(
+        context.share_id.as_deref(),
+        context.user_email.as_deref(),
+        stored,
+    )
+}
+
+fn grok_tenant_scope_parts(
+    share_id: Option<&str>,
+    user_email: Option<&str>,
+    stored: &StoredProvider,
+) -> Option<String> {
     if stored.provider_type != ProviderType::GrokOAuth {
         return None;
     }
     Some(format!(
         "share={}|user={}|provider={}|account={}",
-        context.share_id.as_deref().unwrap_or("direct"),
-        context.user_email.as_deref().unwrap_or("anonymous"),
+        share_id.unwrap_or("direct"),
+        user_email.unwrap_or("anonymous"),
         stored.provider.id,
         managed_account_id(stored).unwrap_or("provider-secret")
     ))
@@ -7744,16 +8140,27 @@ fn managed_account_refresh_error_to_proxy_error(error: ManagedAccountRefreshErro
         ManagedAccountRefreshError::Refresh {
             status_code,
             message: _,
-        } => ProxyError {
-            status: StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-            message: match status_code {
+            retry_after_ms,
+        } => {
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            let message = match status_code {
                 400 | 401 | 403 => {
                     "managed account refresh was rejected; sign in again".to_string()
                 }
                 429 => "managed account refresh was rate limited; retry later".to_string(),
                 _ => "managed account refresh failed".to_string(),
-            },
-        },
+            };
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let seconds = retry_after_ms
+                    .and_then(|value| u64::try_from(value.max(0)).ok())
+                    .unwrap_or(1_000)
+                    .saturating_add(999)
+                    / 1_000;
+                ProxyError::rate_limited(message, seconds.max(1))
+            } else {
+                ProxyError { status, message }
+            }
+        }
     }
 }
 
@@ -7860,6 +8267,21 @@ fn account_header_override_blocked(name: &str, provider_type: ProviderType) -> b
                 | "anthropic-dangerous-direct-browser-access"
                 | "x-claude-code-session-id"
         ) || normalized.starts_with("x-stainless-"))
+    {
+        return true;
+    }
+    if provider_type == ProviderType::GrokOAuth
+        && matches!(
+            normalized.as_str(),
+            "x-xai-token-auth"
+                | "x-grok-client-identifier"
+                | "x-grok-client-version"
+                | "x-grok-client-surface"
+                | "x-authenticateresponse"
+                | "x-grok-conv-id"
+                | "x-grok-cache-identity"
+                | "x-grok-turn-idx"
+        )
     {
         return true;
     }
@@ -10827,6 +11249,154 @@ mod tests {
         .unwrap()
     }
 
+    async fn install_grok_test_execution(
+        state: &ServerState,
+        name: &str,
+        endpoint: String,
+        websocket_url: Option<String>,
+        access_token: &str,
+        refresh_url: Option<String>,
+        capabilities: &[GrokAccountCapability],
+    ) -> ProviderExecution {
+        let account_id = format!("{name}-account");
+        let provider_id = format!("{name}-provider");
+        let mut capability_evidence = serde_json::Map::new();
+        for capability in capabilities {
+            capability_evidence.insert(
+                capability.as_str().to_string(),
+                json!({
+                    "status": "supported",
+                    "source": "test_fixture",
+                    "observedAtMs": 1
+                }),
+            );
+        }
+        let account_id_for_state = account_id.clone();
+        let name_for_state = name.to_string();
+        let access_token = access_token.to_string();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id_for_state,
+                        "providerType": "grok_oauth",
+                        "email": format!("{name_for_state}@example.com"),
+                        "accessToken": access_token,
+                        "refreshToken": "grok-test-refresh-token",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "verifiedGrokClaims": {
+                                "subject": format!("subject-{name_for_state}"),
+                                "email": format!("{name_for_state}@example.com")
+                            },
+                            "grokCapabilities": Value::Object(capability_evidence)
+                        },
+                        "raw": {"testOAuthTokenUrl": refresh_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+
+        let mut stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::GrokOAuth,
+            json!({}),
+            Some(&account_id),
+        );
+        stored.provider.id = provider_id;
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let mut plan = providers
+            .runtime_plan(AppKind::Codex, &stored.provider.id)
+            .unwrap()
+            .as_ref()
+            .clone();
+        plan.endpoint = endpoint;
+        plan.runtime_fingerprint = format!("{name}-grok-test-runtime");
+        if let Some(websocket_url) = websocket_url {
+            plan.driver_options.insert(
+                "testGrokWebsocketUrl".to_string(),
+                Value::String(websocket_url),
+            );
+        }
+        std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
+        let execution = ProviderExecution::from_store(&providers, stored).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        execution
+    }
+
+    async fn spawn_test_grok_responses_bridge(
+        state: ServerState,
+        execution: ProviderExecution,
+        session_id: &str,
+        turn_index: Option<u64>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let session_id = session_id.to_string();
+        let target = prepare_responses_websocket_target(
+            &state,
+            &execution,
+            ResponsesWebsocketMode::Grok,
+            Some(&session_id),
+            turn_index,
+        )
+        .await
+        .unwrap();
+        let app = axum::Router::new().route(
+            "/bridge",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let state = state.clone();
+                let execution = execution.clone();
+                let session_id = session_id.clone();
+                let target_headers = target.headers.clone();
+                let target_url = target.ws_url.clone();
+                async move {
+                    let accounts = state.accounts_snapshot().await;
+                    let snapshot = state.account_in_flight.snapshot();
+                    let account_in_flight_guard =
+                        acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)
+                            .expect("Grok websocket account lease");
+                    ws.on_upgrade(move |socket| async move {
+                        let _ = bridge_responses_websocket(
+                            socket,
+                            ResponsesWebsocketBridgeOptions {
+                                headers: target_headers,
+                                connect_timeout: Duration::from_secs(1),
+                                first_byte_timeout: Some(Duration::from_secs(1)),
+                                stream_idle_timeout: Some(Duration::from_secs(1)),
+                                ws_url: target_url,
+                                pool_key: None,
+                                mode: ResponsesWebsocketMode::Grok,
+                                grok_session_id: Some(session_id),
+                                grok_turn_index: turn_index,
+                                single_upstream_model: Some("grok-4.5".to_string()),
+                                state: &state,
+                                execution,
+                                account_in_flight_guard,
+                                provider_pinned: false,
+                            },
+                        )
+                        .await;
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, server)
+    }
+
     #[tokio::test]
     async fn kiro_stream_holds_account_lease_until_response_body_is_dropped() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -11136,6 +11706,7 @@ mod tests {
             &execution,
             ResponsesWebsocketMode::Codex,
             Some(&session_id),
+            None,
         )
         .await
         .unwrap();
@@ -11167,6 +11738,7 @@ mod tests {
                                 pool_key,
                                 mode: ResponsesWebsocketMode::Codex,
                                 grok_session_id: Some(session_id),
+                                grok_turn_index: None,
                                 single_upstream_model: None,
                                 state: &state,
                                 execution,
@@ -12179,6 +12751,49 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[test]
+    fn grok_oauth_account_headers_cannot_override_cli_contract() {
+        for name in [
+            "x-xai-token-auth",
+            "X-Grok-Client-Identifier",
+            "x-grok-client-version",
+            "x-grok-client-surface",
+            "x-authenticateresponse",
+            "x-grok-conv-id",
+            "x-grok-cache-identity",
+            "x-grok-turn-idx",
+        ] {
+            assert!(account_header_override_blocked(
+                name,
+                ProviderType::GrokOAuth
+            ));
+        }
+        assert!(!account_header_override_blocked(
+            "x-enterprise-sso",
+            ProviderType::GrokOAuth
+        ));
+    }
+
+    #[test]
+    fn grok_media_conversation_scope_separates_shares_and_users() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::GrokOAuth,
+            json!({}),
+            Some("grok-account"),
+        );
+        let first_scope =
+            grok_tenant_scope_parts(Some("share-a"), Some("user-a@example.com"), &stored).unwrap();
+        let second_scope =
+            grok_tenant_scope_parts(Some("share-a"), Some("user-b@example.com"), &stored).unwrap();
+
+        let first = super::super::grok::namespace_session_id(Some(&first_scope), "client-session");
+        let second =
+            super::super::grok::namespace_session_id(Some(&second_scope), "client-session");
+        assert_ne!(first, "client-session");
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn account_header_overrides_merge_custom_headers_and_reject_controlled_names() {
         let mut accounts = AccountStore::default();
         accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
@@ -12263,11 +12878,12 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             managed_account_refresh_error_to_proxy_error(ManagedAccountRefreshError::Refresh {
                 status_code: 429,
                 message: "rate limited; refresh_token=oauth-secret".to_string(),
+                retry_after_ms: Some(5_000),
             });
 
         assert_eq!(proxy_error.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            proxy_error.message,
+            proxy_error.client_message(),
             "managed account refresh was rate limited; retry later"
         );
         assert!(!proxy_error.message.contains("oauth-secret"));
@@ -12290,9 +12906,10 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert_eq!(expired.message, "Share has expired. [Expired]");
         assert_eq!(parallel.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            parallel.message,
+            parallel.client_message(),
             "Share parallel limit has been reached. [ParallelLimit]"
         );
+        assert_eq!(parallel.retry_after_seconds(), Some(1));
     }
 
     #[test]
@@ -12407,6 +13024,44 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert!(message.contains("cc-switch-server admin"));
         assert!(message.contains("CC_SWITCH_CLI_UA_VERSION"));
         assert!(!message.contains("npm update -g"));
+    }
+
+    #[test]
+    fn grok_version_gate_error_is_rewritten_for_admin() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::GrokOAuth,
+            json!({}),
+            Some("acct-1"),
+        );
+        let body = Bytes::from_static(
+            br#"{"error":{"type":"invalid_request_error","message":"grok client version is too old; please update"}}"#,
+        );
+
+        let (rewritten, changed) =
+            maybe_rewrite_grok_cli_version_gate_body(StatusCode::BAD_REQUEST, &stored, body);
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+        let message = value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap();
+
+        assert!(changed);
+        assert!(message.contains("cc-switch-server admin"));
+        assert!(message.contains("CC_SWITCH_GROK_CLI_VERSION"));
+        assert!(!message.contains("please update"));
+
+        let (rewritten, changed) = maybe_rewrite_grok_cli_version_gate_body(
+            StatusCode::BAD_REQUEST,
+            &stored,
+            Bytes::from_static(br#"{"error":"x-grok-client-version is unsupported"}"#),
+        );
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert!(changed);
+        assert_eq!(
+            value.pointer("/error/type").and_then(Value::as_str),
+            Some("grok_cli_version_gate")
+        );
     }
 
     #[test]
@@ -13387,6 +14042,41 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(headers.get("retry-after").unwrap(), "30");
         assert_eq!(body, br#"{"error":"rate_limited"}"#);
+    }
+
+    #[tokio::test]
+    async fn grok_websocket_handshake_updates_entitlement_and_cooldown() {
+        let state = forwarder_test_state("grok-ws-handshake-state");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-ws-handshake-state",
+            super::super::grok::default_base_url().to_string(),
+            None,
+            "grok-ws-handshake-access",
+            None,
+            &[GrokAccountCapability::Websocket],
+        )
+        .await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        let before = crate::infra::time::now_ms() as i64;
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(403)
+            .header("xai-subscription-tier", "supergrok")
+            .header("xai-entitlement-status", "blocked")
+            .body(Some(br#"{"error":"subscription blocked"}"#.to_vec()))
+            .unwrap();
+
+        let error =
+            responses_websocket_connect_error(&state, &execution, TungsteniteError::Http(response))
+                .await;
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert_eq!(account.subscription_level.as_deref(), Some("supergrok"));
+        assert_eq!(account.entitlement_status.as_deref(), Some("blocked"));
+        assert!(account
+            .rate_limited_until
+            .is_some_and(|until| until >= before + 30 * 60_000));
     }
 
     #[test]
@@ -15050,6 +15740,862 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         }
     }
 
+    #[tokio::test]
+    async fn managed_grok_cli_profile_ignores_a_stale_provider_secret() {
+        let state = forwarder_test_state("grok-managed-profile");
+        let mut execution = install_grok_test_execution(
+            &state,
+            "grok-managed-profile",
+            super::super::grok::default_base_url().to_string(),
+            None,
+            "grok-managed-access",
+            None,
+            &[],
+        )
+        .await;
+        execution.stored.provider.settings_config =
+            json!({"env": {"OPENAI_API_KEY": "stale-provider-secret"}});
+
+        assert!(grok_cli_profile(&execution));
+        assert_eq!(
+            super::super::grok::chat_upstream_url(
+                "https://api.x.ai/v1/responses",
+                grok_cli_profile(&execution),
+            ),
+            "https://cli-chat-proxy.grok.com/v1/responses",
+        );
+
+        let mut direct_plan = execution.plan.as_ref().clone();
+        direct_plan.auth_ref =
+            crate::domain::providers::runtime::RuntimeAuthRef::StaticCredential {
+                auth_scheme: crate::domain::providers::registry::AuthScheme::Bearer,
+                slots: vec!["/settingsConfig/env/OPENAI_API_KEY".to_string()],
+                credential_generation: 0,
+            };
+        execution.plan = std::sync::Arc::new(direct_plan);
+        assert!(!grok_cli_profile(&execution));
+    }
+
+    #[tokio::test]
+    async fn grok_refresh_and_websocket_target_fail_closed_after_concurrent_persistence_loss() {
+        let state = forwarder_test_state("grok-refresh-degraded-window");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-refresh-degraded-window",
+            super::super::grok::default_base_url().to_string(),
+            None,
+            "grok-before-rotation",
+            None,
+            &[GrokAccountCapability::Websocket],
+        )
+        .await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        let snapshot = state.find_account_by_id(&account_id).await.unwrap();
+        state.inject_account_refresh_persist_failures(1);
+        let commit = state
+            .commit_native_refresh_success(
+                &snapshot,
+                crate::domain::accounts::store::AccountRefreshUpdate {
+                    access_token: Some("grok-live-but-not-durable".to_string()),
+                    refresh_token: Some("grok-rotated-not-durable".to_string()),
+                    expires_at: Some(i64::MAX / 2),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(commit.is_err());
+        assert!(state.credential_persistence_degraded());
+
+        let refresh_error = refresh_execution_managed_account_if_needed(&state, &execution)
+            .await
+            .unwrap_err();
+        assert_eq!(refresh_error.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let target_error = match prepare_responses_websocket_target(
+            &state,
+            &execution,
+            ResponsesWebsocketMode::Grok,
+            Some("degraded-session"),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("degraded Grok websocket target must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(target_error.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn grok_http_single_model_alias_is_normalized_in_the_upstream_body() {
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let observation = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observation_for_route = std::sync::Arc::clone(&observation);
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let observation = std::sync::Arc::clone(&observation_for_route);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    *observation.lock().unwrap() = Some((
+                        body.get("model")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        body.get("prompt_cache_key")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        headers
+                            .get("x-grok-conv-id")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    ));
+                    axum::Json(json!({
+                        "id": "resp-grok-model-alias",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-http-model-alias");
+        let mut execution = install_grok_test_execution(
+            &state,
+            "grok-http-model-alias",
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-model-alias-access",
+            None,
+            &[],
+        )
+        .await;
+        let mut providers = state.providers.read().await.clone();
+        let mut plan = providers
+            .runtime_plan(AppKind::Codex, &execution.stored.provider.id)
+            .unwrap()
+            .as_ref()
+            .clone();
+        plan.model_policy = crate::domain::providers::runtime::RuntimeModelPolicy::Single {
+            upstream_model: "grok-composer".to_string(),
+        };
+        execution.plan = std::sync::Arc::new(plan.clone());
+        std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
+        state.replace_provider_store_for_test(providers).await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-provider-id",
+            HeaderValue::from_str(&execution.stored.provider.id).unwrap(),
+        );
+        headers.insert("x-session-id", HeaderValue::from_static("client-session"));
+        let response = forward(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"client-model","input":"ping","prompt_cache_key":"client-controlled"}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (model, prompt_cache_key, conversation_id) =
+            observation.lock().unwrap().clone().unwrap();
+        assert_eq!(model, "grok-composer-2.5-fast");
+        assert_ne!(prompt_cache_key, "client-controlled");
+        assert!(!prompt_cache_key.is_empty());
+        assert_eq!(prompt_cache_key, conversation_id);
+
+        let fallback = prepare_codex_http_fallback_target(
+            &state,
+            &execution,
+            &json!({
+                "model": "client-model",
+                "input": "fallback",
+                "prompt_cache_key": "client-controlled"
+            }),
+            Some("fallback-session"),
+            Some(9),
+        )
+        .await
+        .unwrap();
+        let fallback_body: Value = serde_json::from_slice(&fallback.body).unwrap();
+        assert_eq!(fallback_body["model"], "grok-composer-2.5-fast");
+        assert_eq!(fallback_body["prompt_cache_key"], "fallback-session");
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_http_sse_401_refresh_reuses_authorization_context_and_client_turn() {
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "access_token": "grok-http-refreshed-access",
+                        "refresh_token": "grok-http-rotated-refresh",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let token_server = tokio::spawn(async move {
+            axum::serve(token_listener, token_app).await.unwrap();
+        });
+
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let observations = std::sync::Arc::clone(&observations_for_route);
+                async move {
+                    let streaming = serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .and_then(|body| body.get("stream").and_then(Value::as_bool))
+                        .unwrap_or(false);
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    let authorization = header("authorization");
+                    observations.lock().unwrap().push((
+                        authorization.clone(),
+                        header("x-grok-conv-id"),
+                        header("x-grok-turn-idx"),
+                    ));
+                    if authorization == "Bearer grok-http-old-access" {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({"error": {"type": "authentication_error"}}).to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    if streaming {
+                        let sse = concat!(
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-grok-http\",\"status\":\"in_progress\"}}\n\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-grok-http\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                            "data: [DONE]\n\n"
+                        );
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(sse))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "id": "resp-grok-json",
+                                    "object": "response",
+                                    "status": "completed",
+                                    "output": [],
+                                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-http-401");
+        let provider_name = "grok-http-401";
+        let token_url = format!("http://{token_address}/token");
+        let execution = install_grok_test_execution(
+            &state,
+            provider_name,
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-http-old-access",
+            Some(token_url.clone()),
+            &[],
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-provider-id",
+            HeaderValue::from_str(&execution.stored.provider.id).unwrap(),
+        );
+        headers.insert("session_id", HeaderValue::from_static("client-session-17"));
+        headers.insert("x-grok-turn-idx", HeaderValue::from_static("17"));
+        let response = forward(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"grok","input":"ping","stream":true,"store":false}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                let account = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == account_id)
+                    .unwrap();
+                account.access_token = Some("grok-http-old-access".to_string());
+                account.expires_at = Some(i64::MAX / 2);
+                account.raw = Some(json!({"testOAuthTokenUrl": token_url}));
+            })
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-provider-id",
+            HeaderValue::from_str(&execution.stored.provider.id).unwrap(),
+        );
+        headers.insert("session_id", HeaderValue::from_static("client-session-17"));
+        headers.insert("x-grok-turn-idx", HeaderValue::from_static("17"));
+        let response = forward(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"grok","input":"ping","stream":false,"store":false}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["status"],
+            "completed"
+        );
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 4);
+        assert_eq!(observations[0].0, "Bearer grok-http-old-access");
+        assert_eq!(observations[1].0, "Bearer grok-http-refreshed-access");
+        assert_eq!(observations[2].0, "Bearer grok-http-old-access");
+        assert_eq!(observations[3].0, "Bearer grok-http-refreshed-access");
+        for pair in observations.chunks_exact(2) {
+            assert!(!pair[0].1.is_empty());
+            assert_eq!(pair[0].1, pair[1].1);
+            assert_eq!(pair[0].2, "17");
+            assert_eq!(pair[0].2, pair[1].2);
+        }
+        token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_media_is_fail_closed_then_refreshes_once_with_persisted_evidence() {
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "access_token": "grok-media-refreshed-access",
+                        "refresh_token": "grok-media-rotated-refresh",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let token_server = tokio::spawn(async move {
+            axum::serve(token_listener, token_app).await.unwrap();
+        });
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let identities = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let identities_for_route = std::sync::Arc::clone(&identities);
+        let upstream_app = axum::Router::new().route(
+            "/v1/images/generations",
+            axum::routing::post(move |headers: HeaderMap| {
+                let identities = std::sync::Arc::clone(&identities_for_route);
+                async move {
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    let authorization = header("authorization");
+                    identities.lock().unwrap().push((
+                        authorization.clone(),
+                        header("x-xai-token-auth"),
+                        header("x-grok-client-identifier"),
+                        header("x-grok-client-version"),
+                        header("x-authenticateresponse"),
+                    ));
+                    if authorization == "Bearer grok-media-old-access" {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .body(Body::from("unauthorized"))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"data":[{"url":"https://example.test/image.png"}]}"#,
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-media-401");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-media-401",
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-media-old-access",
+            Some(format!("http://{token_address}/token")),
+            &[],
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-provider-id",
+            HeaderValue::from_str(&execution.stored.provider.id).unwrap(),
+        );
+        let body = Bytes::from_static(br#"{"model":"grok-4.5","prompt":"draw"}"#);
+        let blocked = forward_grok_media(
+            state.clone(),
+            Method::POST,
+            "/images/generations".to_string(),
+            headers.clone(),
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(blocked.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(identities.lock().unwrap().is_empty());
+
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        assert!(state
+            .record_grok_capability_evidence(
+                &account_id,
+                GrokAccountCapability::ImageGeneration,
+                "mock_probe_success",
+            )
+            .await
+            .unwrap());
+        let first = forward_grok_media(
+            state.clone(),
+            Method::POST,
+            "/images/generations".to_string(),
+            headers.clone(),
+            body.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = forward_grok_media(
+            state.clone(),
+            Method::POST,
+            "/images/generations".to_string(),
+            headers,
+            body,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let identities = identities.lock().unwrap().clone();
+        assert_eq!(
+            identities
+                .iter()
+                .map(|identity| identity.0.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Bearer grok-media-old-access",
+                "Bearer grok-media-refreshed-access",
+                "Bearer grok-media-refreshed-access"
+            ]
+        );
+        for identity in identities.iter() {
+            assert_eq!(identity.1, crate::domain::grok_cli::GROK_CLI_TOKEN_AUTH);
+            assert_eq!(
+                identity.2,
+                crate::domain::grok_cli::GROK_CLI_CLIENT_IDENTIFIER
+            );
+            assert!(!identity.3.is_empty());
+            assert_eq!(identity.4, "authenticate-response");
+        }
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert!(
+            crate::domain::accounts::store::grok_account_capability_evidence_present(
+                &account,
+                GrokAccountCapability::ImageGeneration,
+            )
+        );
+        token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_video_status_rejects_provider_or_account_binding_drift() {
+        let observed_conversation_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let observed_for_route = std::sync::Arc::clone(&observed_conversation_id);
+        let upstream = axum::Router::new().route(
+            "/v1/videos/request-1",
+            axum::routing::get(move |headers: HeaderMap| {
+                let observed = std::sync::Arc::clone(&observed_for_route);
+                async move {
+                    *observed.lock().unwrap() = headers
+                        .get("x-grok-conv-id")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    axum::Json(json!({"status": "pending"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = listener.local_addr().unwrap();
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = forwarder_test_state("grok-video-sticky-binding");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-video-sticky-binding",
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-video-access",
+            None,
+            &[GrokAccountCapability::VideoGeneration],
+        )
+        .await;
+        let provider_id = execution.stored.provider.id.clone();
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-provider-id",
+            HeaderValue::from_str(&provider_id).unwrap(),
+        );
+
+        state.remember_grok_media_session(
+            "grok-video:request-1".to_string(),
+            "different-provider".to_string(),
+            Some(account_id.clone()),
+            60_000,
+        );
+        let provider_drift = forward_grok_media(
+            state.clone(),
+            Method::GET,
+            "/videos/request-1".to_string(),
+            headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(provider_drift.status, StatusCode::CONFLICT);
+
+        state.remember_grok_media_session(
+            "grok-video:request-1".to_string(),
+            provider_id.clone(),
+            Some("different-account".to_string()),
+            60_000,
+        );
+        let account_drift = forward_grok_media(
+            state.clone(),
+            Method::GET,
+            "/videos/request-1".to_string(),
+            headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(account_drift.status, StatusCode::CONFLICT);
+
+        ensure_grok_media_session_binding(
+            &execution,
+            &GrokMediaSessionBinding {
+                provider_id,
+                account_id: Some(account_id),
+                expires_at_ms: i64::MAX,
+            },
+        )
+        .unwrap();
+
+        state.remember_grok_media_session(
+            "grok-video:request-1".to_string(),
+            execution.stored.provider.id.clone(),
+            execution.managed_account_id().map(str::to_string),
+            60_000,
+        );
+        let response = forward_grok_media(
+            state,
+            Method::GET,
+            "/videos/request-1".to_string(),
+            headers,
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*observed_conversation_id.lock().unwrap(), None);
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_websocket_401_and_http_fallback_keep_one_identity_and_turn() {
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "access_token": "grok-ws-refreshed-access",
+                        "refresh_token": "grok-ws-rotated-refresh",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let token_server = tokio::spawn(async move {
+            axum::serve(token_listener, token_app).await.unwrap();
+        });
+
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let websocket_observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http_observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let websocket_for_route = std::sync::Arc::clone(&websocket_observations);
+        let http_for_route = std::sync::Arc::clone(&http_observations);
+        let upstream_app = axum::Router::new()
+            .route(
+                "/ws",
+                axum::routing::get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
+                    let observations = std::sync::Arc::clone(&websocket_for_route);
+                    async move {
+                        let header = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string()
+                        };
+                        let authorization = header("authorization");
+                        observations.lock().unwrap().push((
+                            authorization.clone(),
+                            header("x-grok-conv-id"),
+                            header("x-grok-turn-idx"),
+                        ));
+                        if authorization == "Bearer grok-ws-old-access" {
+                            return Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(Body::from("unauthorized"))
+                                .unwrap();
+                        }
+                        ws.on_upgrade(|mut socket| async move {
+                            if let Some(Ok(_)) = socket.recv().await {
+                                let _ = socket
+                                    .send(AxumWsMessage::Close(Some(
+                                        axum::extract::ws::CloseFrame {
+                                            code: 1009,
+                                            reason: "fallback".into(),
+                                        },
+                                    )))
+                                    .await;
+                            }
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let observations = std::sync::Arc::clone(&http_for_route);
+                    async move {
+                        let header = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string()
+                        };
+                        observations.lock().unwrap().push((
+                            header("authorization"),
+                            header("x-grok-conv-id"),
+                            header("x-grok-turn-idx"),
+                        ));
+                        let sse = concat!(
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-grok-fallback\",\"status\":\"in_progress\"}}\n\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fallback\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-grok-fallback\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                            "data: [DONE]\n\n"
+                        );
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(sse))
+                            .unwrap()
+                    }
+                }),
+            );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-ws-401-fallback");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-ws-401-fallback",
+            format!("http://{upstream_address}/v1"),
+            Some(format!("ws://{upstream_address}/ws")),
+            "grok-ws-old-access",
+            Some(format!("http://{token_address}/token")),
+            &[GrokAccountCapability::Websocket],
+        )
+        .await;
+        let (bridge_address, bridge_server) =
+            spawn_test_grok_responses_bridge(state, execution, "grok-ws-session", Some(23)).await;
+        let events = send_test_bridge_request(bridge_address, "grok fallback").await;
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let websocket = websocket_observations.lock().unwrap();
+        assert_eq!(websocket.len(), 2);
+        assert_eq!(websocket[0].0, "Bearer grok-ws-old-access");
+        assert_eq!(websocket[1].0, "Bearer grok-ws-refreshed-access");
+        assert_eq!(websocket[0].1, "grok-ws-session");
+        assert_eq!(websocket[0].1, websocket[1].1);
+        assert_eq!(websocket[0].2, "23");
+        assert_eq!(websocket[0].2, websocket[1].2);
+        drop(websocket);
+        let http = http_observations.lock().unwrap();
+        assert_eq!(http.len(), 1);
+        assert_eq!(http[0].0, "Bearer grok-ws-refreshed-access");
+        assert_eq!(http[0].1, "grok-ws-session");
+        assert_eq!(http[0].2, "23");
+        bridge_server.abort();
+        token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_execution_never_enters_generic_provider_failover() {
+        let state = forwarder_test_state("grok-no-provider-failover");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-no-provider-failover",
+            "http://127.0.0.1:9/v1".to_string(),
+            None,
+            "grok-no-failover-access",
+            None,
+            &[],
+        )
+        .await;
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = state.providers.read().await.clone();
+        let mut fallback = stored_provider(
+            AppKind::Codex,
+            ProviderType::Codex,
+            json!({
+                "env": {
+                    "OPENAI_API_KEY": "fallback-key",
+                    "OPENAI_BASE_URL": "http://127.0.0.1:9/v1"
+                }
+            }),
+            None,
+        );
+        fallback.provider.id = "available-generic-fallback".to_string();
+        providers.providers.push(fallback);
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let mut excluded = BTreeSet::new();
+        excluded.insert(execution.stored.provider.id.clone());
+        assert!(select_failover_provider(
+            &providers,
+            &accounts,
+            ProxyRoute::CodexResponses,
+            &state.account_in_flight.snapshot(),
+            &excluded,
+        )
+        .is_some());
+        state.replace_provider_store_for_test(providers).await;
+
+        assert!(next_provider_failover(
+            &state,
+            ProxyRoute::CodexResponses,
+            &ForwardAttemptContext::default(),
+            &execution,
+            "test_failure",
+        )
+        .await
+        .is_none());
+    }
+
     #[test]
     fn grok_websocket_single_model_matches_http_routing_policy() {
         for requested in [Some("gpt-5.5"), Some("grok-4.3"), Some("grok"), None] {
@@ -15075,6 +16621,49 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             assert_eq!(
                 value.pointer("/response/model").and_then(Value::as_str),
                 Some("grok-4.5")
+            );
+        }
+    }
+
+    #[test]
+    fn grok_websocket_session_is_fixed_for_the_connection_lifecycle() {
+        let messages = [
+            json!({
+                "type": "response.create",
+                "response": {
+                    "model": "client-model",
+                    "input": "first",
+                    "prompt_cache_key": "client-first"
+                }
+            }),
+            json!({
+                "type": "response.create",
+                "response": {
+                    "model": "client-model",
+                    "input": "second",
+                    "prompt_cache_key": "client-second"
+                }
+            }),
+        ];
+
+        for message in messages {
+            let transformed = transform_responses_websocket_request(
+                &message.to_string(),
+                ResponsesWebsocketMode::Grok,
+                Some("handshake-session"),
+                Some("grok-composer"),
+            )
+            .unwrap();
+            let value: Value = serde_json::from_str(&transformed).unwrap();
+            assert_eq!(
+                value
+                    .pointer("/response/prompt_cache_key")
+                    .and_then(Value::as_str),
+                Some("handshake-session")
+            );
+            assert_eq!(
+                value.pointer("/response/model").and_then(Value::as_str),
+                Some("grok-composer-2.5-fast")
             );
         }
     }

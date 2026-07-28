@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use crate::domain::accounts::oauth::{
-    build_refresh_request_for_token_url, classify_oauth_error, oauth_provider_spec,
-    refresh_update_from_token_response, token_expires_soon, OAuthErrorClassification,
-    OAuthErrorKind, OAuthHttpRequest, OAuthRequestBodyFormat, OAuthTokenResponse,
+    build_refresh_request, build_refresh_request_for_token_url, classify_oauth_error,
+    oauth_provider_spec, refresh_update_from_token_response, token_expires_soon,
+    OAuthErrorClassification, OAuthErrorKind, OAuthHttpRequest, OAuthRequestBodyFormat,
+    OAuthTokenResponse,
 };
 use crate::domain::accounts::store::{Account, AccountRefreshUpdate};
 use crate::domain::providers::model::ProviderType;
@@ -14,6 +15,8 @@ use tokio::sync::Mutex as AsyncMutex;
 const REFRESH_RECENT_SUCCESS_TTL_MS: i64 = 10_000;
 const REFRESH_INITIAL_BACKOFF_MS: i64 = 5_000;
 const REFRESH_MAX_BACKOFF_MS: i64 = 5 * 60_000;
+const MAX_OAUTH_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const OAUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct AccountRefreshFailure {
@@ -51,14 +54,25 @@ impl AccountRefreshFailure {
         }
     }
 
-    fn request_failed(context: impl Into<String>, error: reqwest::Error) -> Self {
+    fn request_failed(
+        context: impl Into<String>,
+        error: crate::infra::http::BoundedResponseBodyError,
+    ) -> Self {
         let endpoint_fallback_safe = error.is_connect();
+        let (kind, retryable) = match &error {
+            crate::infra::http::BoundedResponseBodyError::TooLarge { .. } => {
+                (OAuthErrorKind::Parse, false)
+            }
+            crate::infra::http::BoundedResponseBodyError::Request(_) => {
+                (OAuthErrorKind::Network, true)
+            }
+        };
         Self {
             status_code: 502,
             upstream_status: None,
             message: format!("{}: {error}", context.into()),
-            kind: OAuthErrorKind::Network,
-            retryable: true,
+            kind,
+            retryable,
             retry_after_ms: None,
             endpoint_fallback_safe,
         }
@@ -269,8 +283,27 @@ async fn execute_native_account_refresh_inner(
         )));
     }
 
+    let effective_token_urls = match token_urls {
+        Some(token_urls) => token_urls
+            .iter()
+            .map(|url| (*url).to_string())
+            .collect::<Vec<_>>(),
+        None if account.provider_type == ProviderType::GrokOAuth => vec![
+            build_refresh_request(account.provider_type, account)
+                .map_err(|error| {
+                    AccountRefreshFailure::from_classification(None, error, "OAuth refresh request")
+                })?
+                .url,
+        ],
+        None => spec
+            .token_urls
+            .iter()
+            .map(|url| (*url).to_string())
+            .collect(),
+    };
+
     let mut last_error = None;
-    for token_url in token_urls.unwrap_or(spec.token_urls) {
+    for token_url in &effective_token_urls {
         let request =
             build_refresh_request_for_token_url(account.provider_type, account, token_url)
                 .map_err(|error| {
@@ -339,8 +372,44 @@ async fn execute_native_account_refresh_inner(
         } else {
             None
         };
+        let verified_grok_identity = if account.provider_type == ProviderType::GrokOAuth {
+            if let Some(id_token) = token_response
+                .id_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            {
+                let verified =
+                    crate::clients::oauth::grok_jwks::verify_grok_id_token(http, id_token, None)
+                        .await
+                        .map_err(|error| AccountRefreshFailure {
+                            status_code: 400,
+                            upstream_status: None,
+                            message: error.to_string(),
+                            kind: OAuthErrorKind::InvalidGrant,
+                            retryable: false,
+                            retry_after_ms: None,
+                            endpoint_fallback_safe: false,
+                        })?;
+                ensure_grok_refresh_subject_matches(account, &verified.identity)?;
+                Some(verified)
+            } else {
+                require_existing_verified_grok_subject(account)?;
+                None
+            }
+        } else {
+            None
+        };
         let mut update = if let Some(verified) = verified_openai_identity.as_ref() {
             crate::domain::accounts::oauth::refresh_update_from_verified_openai_token_response(
+                &token_response,
+                raw,
+                &verified.identity,
+                now_ms,
+                quota_refresh_interval_ms,
+            )
+        } else if let Some(verified) = verified_grok_identity.as_ref() {
+            crate::domain::accounts::oauth::refresh_update_from_verified_grok_token_response(
                 &token_response,
                 raw,
                 &verified.identity,
@@ -365,6 +434,18 @@ async fn execute_native_account_refresh_inner(
                 update.subscription_level = verified.identity.plan_type;
             }
             crate::domain::accounts::store::set_verified_openai_claims(
+                &mut update.profile,
+                Some(verified.canonical_claims),
+            );
+        }
+        if let Some(verified) = verified_grok_identity {
+            if verified.identity.email.is_some() {
+                update.email = verified.identity.email;
+            }
+            if verified.identity.plan_type.is_some() {
+                update.subscription_level = verified.identity.plan_type;
+            }
+            crate::domain::accounts::store::set_verified_grok_claims(
                 &mut update.profile,
                 Some(verified.canonical_claims),
             );
@@ -424,6 +505,55 @@ fn ensure_openai_refresh_subject_matches(
             status_code: 400,
             upstream_status: None,
             message: "OpenAI OAuth refresh subject does not match the existing account".to_string(),
+            kind: OAuthErrorKind::InvalidGrant,
+            retryable: false,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
+        });
+    }
+    Ok(())
+}
+
+fn require_existing_verified_grok_subject(
+    account: &Account,
+) -> Result<String, AccountRefreshFailure> {
+    crate::domain::accounts::store::verified_grok_subject(account).ok_or_else(|| {
+        AccountRefreshFailure {
+            status_code: 400,
+            upstream_status: None,
+            message: "Grok OAuth account has no verified subject; sign in again".to_string(),
+            kind: OAuthErrorKind::InvalidGrant,
+            retryable: false,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
+        }
+    })
+}
+
+fn ensure_grok_refresh_subject_matches(
+    account: &Account,
+    refreshed_identity: &crate::domain::accounts::oauth::OAuthIdentity,
+) -> Result<(), AccountRefreshFailure> {
+    let existing_subject = require_existing_verified_grok_subject(account)?;
+    let refreshed_subject = refreshed_identity
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+        .ok_or_else(|| AccountRefreshFailure {
+            status_code: 400,
+            upstream_status: None,
+            message: "Grok OAuth refresh did not produce a verified subject".to_string(),
+            kind: OAuthErrorKind::InvalidGrant,
+            retryable: false,
+            retry_after_ms: None,
+            endpoint_fallback_safe: false,
+        })?;
+    if existing_subject != refreshed_subject {
+        return Err(AccountRefreshFailure {
+            status_code: 409,
+            upstream_status: None,
+            message: "Grok OAuth refresh subject does not match the existing account".to_string(),
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
@@ -767,13 +897,15 @@ fn cursor_login_is_pending(
 async fn execute_oauth_request(
     http: &reqwest::Client,
     request: &OAuthHttpRequest,
-) -> Result<OAuthHttpResponse, reqwest::Error> {
+) -> Result<OAuthHttpResponse, crate::infra::http::BoundedResponseBodyError> {
     let method = match request.method {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
         _ => reqwest::Method::POST,
     };
-    let mut builder = http.request(method, &request.url);
+    let mut builder = http
+        .request(method, &request.url)
+        .timeout(OAUTH_REQUEST_TIMEOUT);
     for (name, value) in &request.headers {
         builder = builder.header(name, value);
     }
@@ -783,10 +915,15 @@ async fn execute_oauth_request(
             OAuthRequestBodyFormat::Json => builder.json(&request.body),
         };
     }
-    let response = builder.send().await?;
+    let mut response = builder.send().await?;
     let status = response.status();
     let headers = response.headers().clone();
-    let body = response.text().await?;
+    let body = crate::infra::http::read_response_body_limited(
+        &mut response,
+        MAX_OAUTH_RESPONSE_BODY_BYTES,
+    )
+    .await?;
+    let body = String::from_utf8_lossy(&body).into_owned();
     Ok(OAuthHttpResponse {
         status,
         headers,
@@ -960,6 +1097,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn oauth_response_body_limit_is_enforced_before_json_parsing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        MAX_OAUTH_RESPONSE_BODY_BYTES + 1
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let error = execute_oauth_token_request(
+            &reqwest::Client::new(),
+            ProviderType::GrokOAuth,
+            &request(&format!("http://{address}/token")),
+            "Grok OAuth test",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status_code, 502);
+        assert_eq!(error.kind, OAuthErrorKind::Parse);
+        assert!(!error.retryable);
+        assert!(error.message.contains("response body exceeds"));
+        assert!(!error.endpoint_fallback_safe);
+        server.await.unwrap();
+    }
+
     #[test]
     fn native_refresh_decision_requires_refresh_token_and_expired_or_missing_access() {
         let now_ms = 1_000_000;
@@ -1041,6 +1213,39 @@ mod tests {
 
         existing.profile = None;
         ensure_openai_refresh_subject_matches(&existing, &switched).unwrap();
+    }
+
+    #[test]
+    fn grok_refresh_requires_and_preserves_the_verified_subject() {
+        let mut existing = account(
+            ProviderType::GrokOAuth,
+            Some("access"),
+            Some("refresh"),
+            None,
+        );
+        assert!(require_existing_verified_grok_subject(&existing).is_err());
+
+        existing.profile = Some(serde_json::json!({
+            "verifiedGrokClaims": {"subject": "subject-a"}
+        }));
+        assert_eq!(
+            require_existing_verified_grok_subject(&existing).unwrap(),
+            "subject-a"
+        );
+        let matching = crate::domain::accounts::oauth::OAuthIdentity {
+            subject: Some("subject-a".to_string()),
+            ..Default::default()
+        };
+        ensure_grok_refresh_subject_matches(&existing, &matching).unwrap();
+
+        let switched = crate::domain::accounts::oauth::OAuthIdentity {
+            subject: Some("subject-b".to_string()),
+            ..Default::default()
+        };
+        let error = ensure_grok_refresh_subject_matches(&existing, &switched).unwrap_err();
+        assert_eq!(error.status_code, 409);
+        assert_eq!(error.kind, OAuthErrorKind::InvalidGrant);
+        assert!(!error.retryable);
     }
 
     #[test]
@@ -1450,5 +1655,112 @@ mod tests {
         assert_eq!(update.access_token.as_deref(), Some("fallback-access"));
         assert_eq!(fallback_requests.load(Ordering::SeqCst), 1);
         fallback_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_refresh_accepts_missing_id_token_but_verifies_any_replacement() {
+        crate::clients::oauth::grok_jwks::tests::install_test_key().await;
+        let signed_id_token = crate::clients::oauth::grok_jwks::tests::signed_token(
+            "b1a00492-073a-47ea-816f-4c329264a828",
+            "refresh-nonce",
+            chrono::Utc::now().timestamp() + 3_600,
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let signed_for_route = signed_id_token.clone();
+        let upstream = Router::new()
+            .route(
+                "/without-id",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "access_token": "grok-access-without-id",
+                        "refresh_token": "grok-refresh-without-id",
+                        "expires_in": 3600
+                    }))
+                }),
+            )
+            .route(
+                "/with-id",
+                post(move || {
+                    let id_token = signed_for_route.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "access_token": "grok-access-with-id",
+                            "refresh_token": "grok-refresh-with-id",
+                            "id_token": id_token,
+                            "expires_in": 3600
+                        }))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut existing = account(
+            ProviderType::GrokOAuth,
+            Some("expired-grok-access"),
+            Some("original-grok-refresh"),
+            Some(1),
+        );
+        existing.id = "grok-refresh-without-id-account".to_string();
+        existing.profile = Some(serde_json::json!({
+            "verifiedGrokClaims": {
+                "subject": "xai-user-123",
+                "email": "verified@example.com"
+            }
+        }));
+        let without_url = format!("http://{address}/without-id");
+        let without_urls = [without_url.as_str()];
+        let without_id = execute_native_account_refresh_with_token_urls(
+            &reqwest::Client::new(),
+            &existing,
+            5_000_000,
+            60_000,
+            Some(&without_urls),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            without_id.access_token.as_deref(),
+            Some("grok-access-without-id")
+        );
+        assert!(without_id.id_token.is_none());
+        let mut store = crate::domain::accounts::store::AccountStore {
+            accounts: vec![existing.clone()],
+        };
+        let refreshed = store
+            .mark_refresh_success(&existing.id, without_id)
+            .unwrap();
+        assert_eq!(
+            crate::domain::accounts::store::verified_grok_subject(&refreshed).as_deref(),
+            Some("xai-user-123")
+        );
+
+        existing.id = "grok-refresh-with-id-account".to_string();
+        existing.refresh_token = Some("original-grok-refresh-with-id".to_string());
+        let with_url = format!("http://{address}/with-id");
+        let with_urls = [with_url.as_str()];
+        let with_id = execute_native_account_refresh_with_token_urls(
+            &reqwest::Client::new(),
+            &existing,
+            6_000_000,
+            60_000,
+            Some(&with_urls),
+        )
+        .await
+        .unwrap();
+        assert_eq!(with_id.id_token.as_deref(), Some(signed_id_token.as_str()));
+        assert_eq!(
+            with_id
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.pointer("/verifiedGrokClaims/subject"))
+                .and_then(serde_json::Value::as_str),
+            Some("xai-user-123")
+        );
+        server.abort();
     }
 }

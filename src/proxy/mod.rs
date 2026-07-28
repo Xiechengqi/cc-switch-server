@@ -37,6 +37,9 @@ pub use forwarder::forward_grok_media;
 pub use forwarder::forward_images_generations;
 pub use router::ProxyRoute;
 
+pub const MEDIA_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+pub const MEDIA_RESPONSE_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
 pub(super) const MAX_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 
 pub(super) fn bounded_upstream_rate_limit_until(now_ms: i64, until_ms: i64) -> i64 {
@@ -67,6 +70,7 @@ impl std::error::Error for ProxyError {}
 impl ProxyError {
     const TOOL_JSON_INVALID_PREFIX: &'static str = "[TOOL_JSON_INVALID] ";
     const TOOL_JSON_INCOMPLETE_PREFIX: &'static str = "[TOOL_JSON_INCOMPLETE] ";
+    const RETRY_AFTER_PREFIX: &'static str = "[CC_RETRY_AFTER_SECONDS=";
 
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self {
@@ -96,6 +100,17 @@ impl ProxyError {
         }
     }
 
+    pub(super) fn rate_limited(message: impl Into<String>, retry_after_seconds: u64) -> Self {
+        Self {
+            status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "{}{retry_after_seconds}]{}",
+                Self::RETRY_AFTER_PREFIX,
+                message.into()
+            ),
+        }
+    }
+
     pub(super) fn kiro_tool_json(error: kiro::KiroToolJsonError) -> Self {
         Self {
             status: axum::http::StatusCode::BAD_GATEWAY,
@@ -104,17 +119,32 @@ impl ProxyError {
     }
 
     pub fn client_message(&self) -> &str {
-        self.message
+        let message = self.message_without_retry_metadata();
+        message
             .strip_prefix(Self::TOOL_JSON_INVALID_PREFIX)
-            .or_else(|| self.message.strip_prefix(Self::TOOL_JSON_INCOMPLETE_PREFIX))
+            .or_else(|| message.strip_prefix(Self::TOOL_JSON_INCOMPLETE_PREFIX))
+            .unwrap_or(message)
+    }
+
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        let encoded = self.message.strip_prefix(Self::RETRY_AFTER_PREFIX)?;
+        let (seconds, _) = encoded.split_once(']')?;
+        seconds.parse::<u64>().ok()
+    }
+
+    fn message_without_retry_metadata(&self) -> &str {
+        self.message
+            .strip_prefix(Self::RETRY_AFTER_PREFIX)
+            .and_then(|encoded| encoded.split_once(']').map(|(_, message)| message))
             .unwrap_or(&self.message)
     }
 
     pub fn error_code(&self) -> &'static str {
-        if self.message.starts_with(Self::TOOL_JSON_INVALID_PREFIX) {
+        let message = self.message_without_retry_metadata();
+        if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX) {
             return "TOOL_JSON_INVALID";
         }
-        if self.message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX) {
+        if message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX) {
             return "TOOL_JSON_INCOMPLETE";
         }
         match self.status {
@@ -136,8 +166,9 @@ impl ProxyError {
     }
 
     pub fn error_type(&self) -> &'static str {
-        if self.message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
-            || self.message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
+        let message = self.message_without_retry_metadata();
+        if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
+            || message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
         {
             return "upstream_tool_json_error";
         }
@@ -158,8 +189,9 @@ impl ProxyError {
     }
 
     pub fn retryable(&self) -> bool {
-        if self.message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
-            || self.message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
+        let message = self.message_without_retry_metadata();
+        if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
+            || message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
         {
             return false;
         }

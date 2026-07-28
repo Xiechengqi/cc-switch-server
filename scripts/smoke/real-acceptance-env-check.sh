@@ -5,6 +5,7 @@ STRICT="${STRICT:-0}"
 STAGE="${STAGE:-all}"
 EVIDENCE_FILE="${EVIDENCE_FILE:-}"
 FAILED_GROUPS=0
+EXTERNAL_BLOCKED_GROUPS=0
 
 normalize_stage() {
   local value
@@ -96,6 +97,25 @@ check_optional() {
     echo "[SET] ${name}"
   else
     echo "[OPTIONAL] ${name} is not set"
+  fi
+}
+
+check_external_group() {
+  local label="$1"
+  shift
+  local missing=()
+  local name
+  for name in "$@"; do
+    if ! is_set "$name"; then
+      missing+=("$name")
+    fi
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    echo "[EXTERNAL-READY] ${label}: inputs present; real validation has not run"
+  else
+    EXTERNAL_BLOCKED_GROUPS=$((EXTERNAL_BLOCKED_GROUPS + 1))
+    echo "[EXTERNAL-BLOCKED] ${label}: missing $(join_missing "${missing[@]}")"
   fi
 }
 
@@ -193,6 +213,14 @@ if should_run "AB6"; then
   check_optional GEMINI_CLI_CREDENTIALS_FIXTURE
   check_group "AB6 Antigravity/Agy OAuth real account" ANTIGRAVITY_OAUTH_TEST_ACCOUNT ANTIGRAVITY_OAUTH_CALLBACK_URL
   check_optional ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE
+  echo "== AB6 Grok OAuth external gate =="
+  check_external_group "AB6 Grok OAuth single-account smoke" GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_PROVIDER_ID
+  check_optional GROK_OAUTH_CALLBACK_URL
+  check_optional GROK_OAUTH_REFRESH_TOKEN_FIXTURE
+  check_optional GROK_OAUTH_AUTH_JSON_FIXTURE
+  check_optional CC_SWITCH_GROK_MODEL
+  check_optional CC_SWITCH_GROK_MEDIA_SMOKE
+  echo "[INFO] Grok input readiness is external evidence only; run scripts/smoke/grok-oauth-real.mjs before claiming live acceptance."
 fi
 
 if should_run "AB7"; then
@@ -218,9 +246,12 @@ fi
 
 echo "== summary =="
 echo "blocked_groups=${FAILED_GROUPS}"
+echo "external_blocked_groups=${EXTERNAL_BLOCKED_GROUPS}"
 
 if [[ -n "$EVIDENCE_FILE" ]]; then
   BLOCKED_GROUPS="$FAILED_GROUPS" \
+  EXTERNAL_BLOCKED_GROUPS="$EXTERNAL_BLOCKED_GROUPS" \
+  GROK_GATE_STATUS="$([[ "$EXTERNAL_BLOCKED_GROUPS" -eq 0 ]] && echo inputs-ready || echo blocked-inputs)" \
   EVIDENCE_STAGE="${EVIDENCE_STAGE:-${STAGE}-env-check}" \
   EVIDENCE_STATUS="$([[ "$FAILED_GROUPS" -eq 0 ]] && echo ready || echo blocked)" \
     node scripts/smoke/write-acceptance-evidence.mjs --out "$EVIDENCE_FILE"

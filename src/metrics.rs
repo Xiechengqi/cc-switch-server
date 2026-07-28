@@ -120,6 +120,18 @@ pub fn record_claude_cli_version_gate() {
     metrics::counter!("cc_switch_claude_cli_version_gate_total").increment(1);
 }
 
+pub fn record_grok_cli_version_gate() {
+    metrics::counter!("cc_switch_grok_cli_version_gate_total").increment(1);
+}
+
+pub fn record_grok_model_catalog(source: &'static str) {
+    metrics::counter!(
+        "cc_switch_grok_model_catalog_total",
+        "source" => source
+    )
+    .increment(1);
+}
+
 pub fn record_claude_bootstrap(result: &str) {
     metrics::counter!(
         "cc_switch_claude_bootstrap_total",
@@ -218,6 +230,14 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_claude_cli_version_gate_total",
         "Claude CLI version gate responses rewritten for administrators"
+    );
+    metrics::describe_counter!(
+        "cc_switch_grok_cli_version_gate_total",
+        "Grok CLI version gate responses rewritten for administrators"
+    );
+    metrics::describe_counter!(
+        "cc_switch_grok_model_catalog_total",
+        "Grok model catalog responses by bounded source classification"
     );
     metrics::describe_counter!(
         "cc_switch_claude_bootstrap_total",

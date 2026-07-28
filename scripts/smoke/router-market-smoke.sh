@@ -6,6 +6,7 @@ set -euo pipefail
 #
 # Optional:
 #   SERVER_URL              cc-switch-server base URL. Default: http://127.0.0.1:15721
+#   CC_SWITCH_INFERENCE_TOKEN Dedicated token for the optional local share inference probe.
 #   SHARE_ID                Local server share id for direct binding probe.
 #   DIRECT_SHARE_URL        Public direct share tunnel URL, without trailing /v1/responses.
 #   MARKET_API_URL          Market API URL, without trailing /v1/responses.
@@ -23,6 +24,7 @@ set -euo pipefail
 SERVER_URL="${SERVER_URL:-http://127.0.0.1:15721}"
 MARKET_URL="${MARKET_URL:-}"
 API_TOKEN="${CC_SWITCH_SERVER_TOKEN:-}"
+INFERENCE_TOKEN="${CC_SWITCH_INFERENCE_TOKEN:-}"
 SHARE_ID="${SHARE_ID:-}"
 DIRECT_SHARE_URL="${DIRECT_SHARE_URL:-}"
 MARKET_API_URL="${MARKET_API_URL:-}"
@@ -50,6 +52,10 @@ if [[ -z "$API_TOKEN" ]]; then
 fi
 
 auth_header=(-H "Authorization: Bearer $API_TOKEN")
+inference_auth_header=()
+if [[ -n "$INFERENCE_TOKEN" ]]; then
+  inference_auth_header=(-H "x-api-key: $INFERENCE_TOKEN")
+fi
 router_auth_header=()
 if [[ -n "$ROUTER_API_TOKEN" ]]; then
   case "$ROUTER_API_TOKEN_HEADER" in
@@ -270,11 +276,12 @@ fetch_required "shares before probes" "$SERVER_URL/api/shares" "${auth_header[@]
 echo "== share runtime snapshot refresh =="
 post_optional "share runtime snapshot refresh" "$SERVER_URL/api/shares/runtime-snapshot" "${auth_header[@]}"
 
-if [[ -n "$SHARE_ID" ]]; then
+if [[ -n "$SHARE_ID" && -n "$INFERENCE_TOKEN" ]]; then
   echo "== direct share codex probe =="
   direct_local_payload="$(probe_payload "ping" 0)"
   direct_status="$(curl -sS -o /tmp/cc-switch-server-direct-share.out -w "%{http_code}" \
     -H "Content-Type: application/json" \
+    "${inference_auth_header[@]}" \
     -H "X-CC-Switch-Share-Id: $SHARE_ID" \
     -H "X-CC-Switch-Data-Source: direct" \
     -d "$direct_local_payload" \
@@ -289,7 +296,7 @@ if [[ -n "$SHARE_ID" ]]; then
     warn "direct share local probe did not return an HTTP status"
   fi
 else
-  warn "SHARE_ID not set; skipped local direct share binding probe"
+  warn "SHARE_ID or CC_SWITCH_INFERENCE_TOKEN not set; skipped local direct share binding probe"
 fi
 
 if [[ -n "$DIRECT_SHARE_URL" ]]; then

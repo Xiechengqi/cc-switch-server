@@ -365,8 +365,9 @@ fn select_provider_with_optional_filter(
         })
         .cloned()
         .ok_or_else(|| ProxyError::not_found(format!("provider not found: {provider_id}")))?;
-    let automatic_managed_selection =
-        explicit_provider_id.is_none() && bound_account_for_provider(&provider, accounts).is_some();
+    let automatic_managed_selection = explicit_provider_id.is_none()
+        && provider.provider_type != ProviderType::GrokOAuth
+        && bound_account_for_provider(&provider, accounts).is_some();
     if let Some(account_in_flight) = account_in_flight.filter(|_| automatic_managed_selection) {
         if let Some(selection) = select_managed_provider_candidate(
             store,
@@ -566,13 +567,13 @@ fn json_u32(value: &serde_json::Value) -> Option<u32> {
 }
 
 fn account_concurrency_limit_error(provider: &StoredProvider) -> ProxyError {
-    ProxyError {
-        status: axum::http::StatusCode::TOO_MANY_REQUESTS,
-        message: format!(
+    ProxyError::rate_limited(
+        format!(
             "provider {} account concurrency limit has been reached",
             provider.provider.id
         ),
-    }
+        1,
+    )
 }
 
 pub(super) fn codex_image_generation_provider(provider: &StoredProvider) -> bool {
@@ -594,16 +595,20 @@ pub(super) fn ensure_provider_account_usage_available(
     now_ms: u128,
 ) -> Result<(), ProxyError> {
     if let Some(block) = provider_account_usage_block(provider, accounts, now_ms) {
-        return Err(ProxyError {
-            status: axum::http::StatusCode::TOO_MANY_REQUESTS,
-            message: format!(
+        let retry_after_seconds = u64::try_from(block.until_ms.saturating_sub(now_ms as i64))
+            .unwrap_or(u64::MAX)
+            .saturating_add(999)
+            / 1_000;
+        return Err(ProxyError::rate_limited(
+            format!(
                 "provider {} account is {}: {} until {}",
                 provider.provider.id,
                 block.kind.availability(),
                 block.reason,
                 block.until_ms,
             ),
-        });
+            retry_after_seconds.max(1),
+        ));
     }
     Ok(())
 }
@@ -705,6 +710,21 @@ mod tests {
         }
     }
 
+    fn grok_oauth_provider(id: &str, account_id: &str, max_concurrent: u32) -> StoredProvider {
+        let mut provider = codex_oauth_provider(id, account_id);
+        provider.provider_type = ProviderType::GrokOAuth;
+        provider.provider_type_id = ProviderType::GrokOAuth.as_str().to_string();
+        provider.provider.settings_config["ACCOUNT_MAX_CONCURRENT"] = json!(max_concurrent);
+        provider
+            .provider
+            .meta
+            .as_mut()
+            .and_then(|meta| meta.auth_binding.as_mut())
+            .unwrap()
+            .auth_provider = Some(ProviderType::GrokOAuth.as_str().to_string());
+        provider
+    }
+
     fn claude_oauth_provider(
         id: &str,
         account_id: &str,
@@ -788,6 +808,17 @@ mod tests {
             rate_limited_until,
             last_refresh_error: None,
         }
+    }
+
+    fn grok_oauth_account(id: &str) -> UpsertAccountInput {
+        let mut account = codex_oauth_account(id, None);
+        account.provider_type = ProviderType::GrokOAuth;
+        account.profile = Some(json!({
+            "verifiedGrokClaims": {
+                "subject": id
+            }
+        }));
+        account
     }
 
     fn exhausted_codex_oauth_account(id: &str, now_ms: i64) -> UpsertAccountInput {
@@ -894,6 +925,7 @@ mod tests {
                     let input = match provider.provider_type {
                         ProviderType::ClaudeOAuth => claude_oauth_account(&account_id),
                         ProviderType::CodexOAuth => codex_oauth_account(&account_id, None),
+                        ProviderType::GrokOAuth => grok_oauth_account(&account_id),
                         ProviderType::CursorOAuth => cursor_oauth_account(&account_id, None),
                         _ => return 1,
                     };
@@ -1084,6 +1116,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.execution.stored.provider.id, "p2");
+    }
+
+    #[test]
+    fn grok_current_provider_at_concurrency_limit_never_selects_another_account() {
+        let store = runtime_store(vec![
+            grok_oauth_provider("grok-current", "grok-acct-current", 1),
+            grok_oauth_provider("grok-other", "grok-acct-other", 1),
+        ]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(grok_oauth_account("grok-acct-current"));
+        accounts.upsert(grok_oauth_account("grok-acct-other"));
+        let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
+        let _guard = tracker
+            .try_acquire(ProviderType::GrokOAuth, "grok-acct-current", 1)
+            .unwrap();
+
+        let error = select_provider_with_account_inflight(
+            &store,
+            &accounts,
+            AppKind::Codex,
+            &HeaderMap::new(),
+            Some("grok-current"),
+            &tracker.snapshot(),
+            Some("grok-session"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.message.contains("grok-current"));
+    }
+
+    #[test]
+    fn grok_current_provider_remains_selected_when_another_account_is_less_busy() {
+        let store = runtime_store(vec![
+            grok_oauth_provider("grok-current", "grok-acct-current", 8),
+            grok_oauth_provider("grok-other", "grok-acct-other", 8),
+        ]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(grok_oauth_account("grok-acct-current"));
+        accounts.upsert(grok_oauth_account("grok-acct-other"));
+        let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
+        let _guard = tracker
+            .try_acquire(ProviderType::GrokOAuth, "grok-acct-current", 8)
+            .unwrap();
+
+        let selected = select_provider_with_account_inflight(
+            &store,
+            &accounts,
+            AppKind::Codex,
+            &HeaderMap::new(),
+            Some("grok-current"),
+            &tracker.snapshot(),
+            Some("grok-session"),
+        )
+        .unwrap();
+
+        assert_eq!(selected.execution.stored.provider.id, "grok-current");
     }
 
     #[test]

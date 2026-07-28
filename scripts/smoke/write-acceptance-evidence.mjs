@@ -88,6 +88,7 @@ const evidence = {
     codex: redactEmail(env("CODEX_OAUTH_TEST_ACCOUNT")),
     claude: redactEmail(env("CLAUDE_OAUTH_TEST_ACCOUNT")),
     gemini: redactEmail(env("GEMINI_OAUTH_TEST_ACCOUNT")),
+    grok: redactEmail(env("GROK_OAUTH_TEST_ACCOUNT")),
     cursor: redactEmail(env("CURSOR_OAUTH_TEST_ACCOUNT")),
     antigravity: redactEmail(env("ANTIGRAVITY_OAUTH_TEST_ACCOUNT")),
     githubCopilot: redactEmail(env("GITHUB_COPILOT_TEST_ACCOUNT")),
@@ -112,6 +113,9 @@ const evidence = {
         env("GEMINI_OAUTH_REFRESH_TOKEN") ||
         env("GEMINI_CLI_CREDENTIALS_FIXTURE")
     ),
+    grok: Boolean(
+      env("GROK_OAUTH_REFRESH_TOKEN_FIXTURE") || env("GROK_OAUTH_AUTH_JSON_FIXTURE")
+    ),
     cursor: Boolean(env("CURSOR_OAUTH_REFRESH_TOKEN_FIXTURE") || env("CURSOR_API_KEY_FIXTURE")),
     antigravity: Boolean(env("ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE")),
     githubCopilot: Boolean(env("GITHUB_COPILOT_TOKEN_FIXTURE")),
@@ -135,6 +139,7 @@ const evidence = {
     failures: env("FAILURES"),
     warnings: env("WARNINGS"),
     blockedGroups: env("BLOCKED_GROUPS"),
+    externalBlockedGroups: env("EXTERNAL_BLOCKED_GROUPS"),
     directNoAuthStatus: env("DIRECT_NOAUTH_STATUS"),
     directPublicStatus: env("DIRECT_PUBLIC_STATUS"),
     directPublicStreamStatus: env("DIRECT_PUBLIC_STREAM_STATUS"),
@@ -172,6 +177,12 @@ const evidence = {
     matrixSkeleton: env("MATRIX_SKELETON"),
     oauthNativeReady: env("OAUTH_NATIVE_READY"),
     oauthGateStatus: env("OAUTH_GATE_STATUS"),
+    grokGateStatus: env("GROK_GATE_STATUS"),
+    grokReadyStatus: env("GROK_READY_STATUS"),
+    grokModelsStatus: env("GROK_MODELS_STATUS"),
+    grokJsonStatus: env("GROK_JSON_STATUS"),
+    grokStreamStatus: env("GROK_STREAM_STATUS"),
+    grokMediaStatus: env("GROK_MEDIA_STATUS"),
     cursorGateStatus: env("CURSOR_GATE_STATUS"),
     copilotGateStatus: env("COPILOT_GATE_STATUS"),
     kiroGateStatus: env("KIRO_GATE_STATUS"),

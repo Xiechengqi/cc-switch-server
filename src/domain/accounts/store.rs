@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::Context;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,8 @@ use crate::domain::accounts::subscription_expiry::{
 use crate::domain::providers::model::ProviderType;
 
 const ACCOUNTS_FILE_NAME: &str = "accounts.json";
-const ENCRYPTED_PREFIX: &str = "ccenc:v1:";
+const ENCRYPTED_V1_PREFIX: &str = "ccenc:v1:";
+const ENCRYPTED_V2_PREFIX: &str = "ccenc:v2:";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -305,7 +306,88 @@ pub struct CodexWorkspace {
 }
 
 const VERIFIED_OPENAI_CLAIMS_KEY: &str = "verifiedOpenAiClaims";
+const VERIFIED_GROK_CLAIMS_KEY: &str = "verifiedGrokClaims";
 const CODEX_WORKSPACE_PROVENANCE_KEY: &str = "codexWorkspaceProvenance";
+const GROK_CAPABILITIES_KEY: &str = "grokCapabilities";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrokAccountCapability {
+    Websocket,
+    ImageGeneration,
+    ImageEdit,
+    VideoGeneration,
+}
+
+impl GrokAccountCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Websocket => "websocket",
+            Self::ImageGeneration => "image_generation",
+            Self::ImageEdit => "image_edit",
+            Self::VideoGeneration => "video_generation",
+        }
+    }
+}
+
+pub fn grok_account_capability_enabled(
+    account: &Account,
+    capability: GrokAccountCapability,
+) -> bool {
+    if account.provider_type != ProviderType::GrokOAuth {
+        return false;
+    }
+    if configured_grok_capabilities().contains(capability.as_str()) {
+        return true;
+    }
+    grok_account_capability_evidence_present(account, capability)
+}
+
+pub fn grok_account_capability_evidence_present(
+    account: &Account,
+    capability: GrokAccountCapability,
+) -> bool {
+    if account.provider_type != ProviderType::GrokOAuth {
+        return false;
+    }
+    account
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.get(GROK_CAPABILITIES_KEY))
+        .and_then(|capabilities| capabilities.get(capability.as_str()))
+        .and_then(|evidence| evidence.get("status"))
+        .and_then(Value::as_str)
+        == Some("supported")
+}
+
+fn configured_grok_capabilities() -> std::collections::BTreeSet<String> {
+    parse_grok_capability_config(
+        &std::env::var("CC_SWITCH_GROK_OAUTH_CAPABILITIES").unwrap_or_default(),
+    )
+}
+
+fn parse_grok_capability_config(raw: &str) -> std::collections::BTreeSet<String> {
+    let known = [
+        GrokAccountCapability::Websocket.as_str(),
+        GrokAccountCapability::ImageGeneration.as_str(),
+        GrokAccountCapability::ImageEdit.as_str(),
+        GrokAccountCapability::VideoGeneration.as_str(),
+    ];
+    let requested = raw
+        .split([',', ';', ' '])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    if requested.contains("all") {
+        return known.into_iter().map(str::to_string).collect();
+    }
+    known
+        .into_iter()
+        .filter(|capability| requested.contains(*capability))
+        .map(str::to_string)
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,6 +407,20 @@ pub fn set_verified_openai_claims(profile: &mut Option<Value>, claims: Option<Va
     object.remove(VERIFIED_OPENAI_CLAIMS_KEY);
     if let Some(claims) = claims {
         object.insert(VERIFIED_OPENAI_CLAIMS_KEY.to_string(), claims);
+    }
+}
+
+pub fn set_verified_grok_claims(profile: &mut Option<Value>, claims: Option<Value>) {
+    if !profile.as_ref().is_some_and(Value::is_object) {
+        *profile = Some(Value::Object(Map::new()));
+    }
+    let object = profile
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("Grok profile was normalized to an object");
+    object.remove(VERIFIED_GROK_CLAIMS_KEY);
+    if let Some(claims) = claims {
+        object.insert(VERIFIED_GROK_CLAIMS_KEY.to_string(), claims);
     }
 }
 
@@ -373,8 +469,9 @@ impl AccountStore {
         let mut value: Value = serde_json::from_str(&content)
             .with_context(|| format!("parse accounts {}", path.display()))?;
         if account_store_has_encrypted_fields(&value) {
-            let key = load_accounts_key(config_dir)?;
-            decrypt_account_store_value(&mut value, &key)
+            let root_key = load_accounts_key(config_dir)?;
+            let account_key = crate::infra::credentials::derive_account_key(&root_key)?;
+            decrypt_account_store_value(&mut value, &root_key, &account_key)
                 .with_context(|| format!("decrypt accounts {}", path.display()))?;
         }
         serde_json::from_value(value).with_context(|| format!("parse accounts {}", path.display()))
@@ -384,9 +481,10 @@ impl AccountStore {
         fs::create_dir_all(config_dir)
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
         let path = accounts_path(config_dir);
-        let key = load_or_create_accounts_key(config_dir)?;
+        let root_key = load_or_create_accounts_key(config_dir)?;
+        let account_key = crate::infra::credentials::derive_account_key(&root_key)?;
         let mut value = serde_json::to_value(self).context("serialize accounts")?;
-        encrypt_account_store_value(&mut value, &key)
+        encrypt_account_store_value(&mut value, &account_key)
             .with_context(|| format!("encrypt accounts {}", path.display()))?;
         crate::infra::storage::write_json_pretty(&path, &value)
             .with_context(|| format!("write accounts {}", path.display()))
@@ -445,6 +543,10 @@ impl AccountStore {
             if account.provider_type == ProviderType::CodexOAuth {
                 if let Some(profile) = account.profile.as_mut() {
                     preserve_codex_profile_selection(existing.profile.as_ref(), profile);
+                }
+            } else if account.provider_type == ProviderType::GrokOAuth {
+                if let Some(profile) = account.profile.as_mut() {
+                    preserve_grok_profile_state(existing.profile.as_ref(), profile);
                 }
             }
             advance_account_generations(&previous, &mut account);
@@ -701,8 +803,14 @@ impl AccountStore {
             account.scopes = value;
         }
         if let Some(mut value) = update.profile {
-            if account.provider_type == ProviderType::CodexOAuth {
-                preserve_codex_profile_state(account.profile.as_ref(), &mut value);
+            match account.provider_type {
+                ProviderType::CodexOAuth => {
+                    preserve_codex_profile_state(account.profile.as_ref(), &mut value)
+                }
+                ProviderType::GrokOAuth => {
+                    preserve_grok_profile_state(account.profile.as_ref(), &mut value)
+                }
+                _ => {}
             }
             account.profile = Some(value);
         }
@@ -799,6 +907,59 @@ impl AccountStore {
             account.profile = Some(profile);
         }
         Some(account.clone())
+    }
+
+    pub fn record_grok_capability_evidence(
+        &mut self,
+        account_id: &str,
+        capability: GrokAccountCapability,
+        source: &str,
+        observed_at_ms: i64,
+    ) -> bool {
+        let Some(account) = self.accounts.iter_mut().find(|account| {
+            account.id == account_id && account.provider_type == ProviderType::GrokOAuth
+        }) else {
+            return false;
+        };
+        if account
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.get(GROK_CAPABILITIES_KEY))
+            .and_then(|capabilities| capabilities.get(capability.as_str()))
+            .and_then(|evidence| evidence.get("status"))
+            .and_then(Value::as_str)
+            == Some("supported")
+        {
+            return false;
+        }
+
+        let profile = account
+            .profile
+            .get_or_insert_with(|| Value::Object(Map::new()));
+        if !profile.is_object() {
+            *profile = Value::Object(Map::new());
+        }
+        let profile = profile
+            .as_object_mut()
+            .expect("Grok profile was normalized to an object");
+        let capabilities = profile
+            .entry(GROK_CAPABILITIES_KEY.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !capabilities.is_object() {
+            *capabilities = Value::Object(Map::new());
+        }
+        capabilities
+            .as_object_mut()
+            .expect("Grok capabilities were normalized to an object")
+            .insert(
+                capability.as_str().to_string(),
+                serde_json::json!({
+                    "status": "supported",
+                    "source": source,
+                    "observedAtMs": observed_at_ms,
+                }),
+            );
+        true
     }
 
     pub fn mark_refresh_failure(&mut self, account_id: &str, error: String) -> Option<Account> {
@@ -1007,6 +1168,12 @@ fn strongest_account_principal(account: &Account) -> Option<AccountPrincipal> {
             });
         }
     }
+    if account.provider_type == ProviderType::GrokOAuth {
+        return verified_grok_subject(account).map(|value| AccountPrincipal {
+            kind: "xai_subject",
+            value,
+        });
+    }
     if account.provider_type == ProviderType::ClaudeOAuth {
         if let Some(value) = claude_account_uuid(account) {
             return Some(AccountPrincipal {
@@ -1070,6 +1237,12 @@ pub fn verified_openai_subject(account: &Account) -> Option<String> {
         .flatten()
 }
 
+pub fn verified_grok_subject(account: &Account) -> Option<String> {
+    (account.provider_type == ProviderType::GrokOAuth)
+        .then(|| account_principal_value(account, &["/verifiedGrokClaims/subject"]))
+        .flatten()
+}
+
 pub fn claude_account_uuid(account: &Account) -> Option<String> {
     (account.provider_type == ProviderType::ClaudeOAuth)
         .then(|| account_principal_value(account, CLAUDE_ACCOUNT_UUID_POINTERS))
@@ -1125,6 +1298,17 @@ fn account_token_snapshot(account: &Account) -> AccountTokenSnapshot {
         expires_at: account.expires_at,
         nested_secret_fingerprint: account.raw.as_ref().and_then(nested_secret_fingerprint),
     }
+}
+
+/// Returns true only while the credential state used to start an OAuth refresh is
+/// still authoritative. The token values are compared in memory but are never
+/// included in diagnostics.
+pub fn native_refresh_snapshot_matches(current: &Account, expected: &Account) -> bool {
+    current.id == expected.id
+        && current.provider_type == expected.provider_type
+        && current.auth_identity_generation == expected.auth_identity_generation
+        && current.token_refresh_generation == expected.token_refresh_generation
+        && account_token_snapshot(current) == account_token_snapshot(expected)
 }
 
 fn normalized_secret(value: Option<&str>) -> Option<String> {
@@ -1378,6 +1562,22 @@ fn preserve_codex_profile_state(existing: Option<&Value>, incoming: &mut Value) 
     }
 }
 
+fn preserve_grok_profile_state(existing: Option<&Value>, incoming: &mut Value) {
+    let (Some(existing), Some(incoming)) = (
+        existing.and_then(Value::as_object),
+        incoming.as_object_mut(),
+    ) else {
+        return;
+    };
+    for key in [VERIFIED_GROK_CLAIMS_KEY, GROK_CAPABILITIES_KEY] {
+        if !incoming.contains_key(key) {
+            if let Some(value) = existing.get(key) {
+                incoming.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+}
+
 fn preserve_codex_profile_selection(existing: Option<&Value>, incoming: &mut Value) {
     let (Some(existing), Some(incoming)) = (
         existing.and_then(Value::as_object),
@@ -1479,10 +1679,7 @@ fn account_store_has_encrypted_fields(value: &Value) -> bool {
 fn value_has_encrypted_secret(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(field, value)| {
-            (account_secret_field(field)
-                && value
-                    .as_str()
-                    .is_some_and(|value| value.starts_with(ENCRYPTED_PREFIX)))
+            (account_secret_field(field) && value.as_str().is_some_and(encrypted_account_secret))
                 || (account_extra_headers_field(field)
                     && extra_headers_have_encrypted_secret(value))
                 || value_has_encrypted_secret(value)
@@ -1494,60 +1691,95 @@ fn value_has_encrypted_secret(value: &Value) -> bool {
 
 fn extra_headers_have_encrypted_secret(value: &Value) -> bool {
     value.as_object().is_some_and(|headers| {
-        headers.values().any(|value| {
-            value
-                .as_str()
-                .is_some_and(|value| value.starts_with(ENCRYPTED_PREFIX))
-        })
+        headers
+            .values()
+            .any(|value| value.as_str().is_some_and(encrypted_account_secret))
     })
 }
 
 fn encrypt_account_store_value(value: &mut Value, key: &[u8; 32]) -> anyhow::Result<()> {
-    transform_account_secret_fields(value, |plain| encrypt_secret(plain, key))
+    transform_account_secret_fields(value, |plain, path, context| {
+        encrypt_secret_v2(plain, key, path, context)
+    })
 }
 
-fn decrypt_account_store_value(value: &mut Value, key: &[u8; 32]) -> anyhow::Result<()> {
-    transform_account_secret_fields(value, |cipher| decrypt_secret(cipher, key))
+fn decrypt_account_store_value(
+    value: &mut Value,
+    root_key: &[u8; 32],
+    account_key: &[u8; 32],
+) -> anyhow::Result<()> {
+    transform_account_secret_fields(value, |ciphertext, path, context| {
+        decrypt_secret(ciphertext, root_key, account_key, path, context)
+    })
+}
+
+#[derive(Debug)]
+struct AccountSecretContext {
+    provider_type: String,
+    account_id: String,
 }
 
 fn transform_account_secret_fields(
     value: &mut Value,
-    transform: impl Fn(&str) -> anyhow::Result<String>,
+    transform: impl Fn(&str, &str, &AccountSecretContext) -> anyhow::Result<String>,
 ) -> anyhow::Result<()> {
     let Some(accounts) = value.get_mut("accounts").and_then(Value::as_array_mut) else {
         return Ok(());
     };
     for account in accounts {
-        transform_secret_fields(account, &transform)?;
+        let context = AccountSecretContext {
+            provider_type: account
+                .get("providerType")
+                .or_else(|| account.get("provider_type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            account_id: account
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        };
+        transform_secret_fields(account, "", &context, &transform)?;
     }
     Ok(())
 }
 
 fn transform_secret_fields(
     value: &mut Value,
-    transform: &impl Fn(&str) -> anyhow::Result<String>,
+    path: &str,
+    context: &AccountSecretContext,
+    transform: &impl Fn(&str, &str, &AccountSecretContext) -> anyhow::Result<String>,
 ) -> anyhow::Result<()> {
     match value {
         Value::Object(object) => {
             for (field, value) in object {
+                let field_path = json_pointer_child(path, field);
                 if account_extra_headers_field(field) {
-                    transform_extra_header_values(value, transform)?;
+                    transform_extra_header_values(value, &field_path, context, transform)?;
                 } else if account_secret_field(field) {
                     if let Value::String(secret) = value {
                         if !secret.trim().is_empty() {
-                            *secret = transform(secret)?;
+                            *secret = transform(secret, &field_path, context)?;
                         }
                     } else {
-                        transform_secret_fields(value, transform)?;
+                        transform_secret_fields(value, &field_path, context, transform)?;
                     }
                 } else {
-                    transform_secret_fields(value, transform)?;
+                    transform_secret_fields(value, &field_path, context, transform)?;
                 }
             }
         }
         Value::Array(values) => {
-            for value in values {
-                transform_secret_fields(value, transform)?;
+            for (index, value) in values.iter_mut().enumerate() {
+                transform_secret_fields(
+                    value,
+                    &json_pointer_child(path, &index.to_string()),
+                    context,
+                    transform,
+                )?;
             }
         }
         _ => {}
@@ -1603,44 +1835,74 @@ fn compact_account_field(field: &str) -> String {
 
 fn transform_extra_header_values(
     value: &mut Value,
-    transform: &impl Fn(&str) -> anyhow::Result<String>,
+    path: &str,
+    context: &AccountSecretContext,
+    transform: &impl Fn(&str, &str, &AccountSecretContext) -> anyhow::Result<String>,
 ) -> anyhow::Result<()> {
     let Value::Object(headers) = value else {
         return Ok(());
     };
-    for value in headers.values_mut() {
+    for (name, value) in headers {
+        let header_path = json_pointer_child(path, name);
         if let Value::String(secret) = value {
             if !secret.trim().is_empty() {
-                *secret = transform(secret)?;
+                *secret = transform(secret, &header_path, context)?;
             }
         } else {
-            transform_secret_fields(value, transform)?;
+            transform_secret_fields(value, &header_path, context, transform)?;
         }
     }
     Ok(())
 }
 
-fn encrypt_secret(plain: &str, key: &[u8; 32]) -> anyhow::Result<String> {
-    if plain.starts_with(ENCRYPTED_PREFIX) {
-        return Ok(plain.to_string());
-    }
+fn encrypt_secret_v2(
+    plain: &str,
+    key: &[u8; 32],
+    path: &str,
+    context: &AccountSecretContext,
+) -> anyhow::Result<String> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut nonce);
+    let aad = account_secret_aad(context, path)?;
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), plain.as_bytes())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plain.as_bytes(),
+                aad: &aad,
+            },
+        )
         .map_err(|_| anyhow::anyhow!("encrypt account secret"))?;
     Ok(format!(
-        "{ENCRYPTED_PREFIX}{}.{}",
+        "{ENCRYPTED_V2_PREFIX}{}.{}",
         URL_SAFE_NO_PAD.encode(nonce),
         URL_SAFE_NO_PAD.encode(ciphertext)
     ))
 }
 
-fn decrypt_secret(ciphertext: &str, key: &[u8; 32]) -> anyhow::Result<String> {
-    let Some(encoded) = ciphertext.strip_prefix(ENCRYPTED_PREFIX) else {
+fn decrypt_secret(
+    ciphertext: &str,
+    root_key: &[u8; 32],
+    account_key: &[u8; 32],
+    path: &str,
+    context: &AccountSecretContext,
+) -> anyhow::Result<String> {
+    if let Some(encoded) = ciphertext.strip_prefix(ENCRYPTED_V2_PREFIX) {
+        let aad = account_secret_aad(context, path)?;
+        return decrypt_secret_payload(encoded, account_key, Some(&aad));
+    }
+    let Some(encoded) = ciphertext.strip_prefix(ENCRYPTED_V1_PREFIX) else {
         return Ok(ciphertext.to_string());
     };
+    decrypt_secret_payload(encoded, root_key, None)
+}
+
+fn decrypt_secret_payload(
+    encoded: &str,
+    key: &[u8; 32],
+    aad: Option<&[u8]>,
+) -> anyhow::Result<String> {
     let (nonce, body) = encoded
         .split_once('.')
         .ok_or_else(|| anyhow::anyhow!("invalid encrypted account secret"))?;
@@ -1651,9 +1913,53 @@ fn decrypt_secret(ciphertext: &str, key: &[u8; 32]) -> anyhow::Result<String> {
         .map_err(|_| anyhow::anyhow!("invalid encrypted account secret nonce"))?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     let plain = cipher
-        .decrypt(XNonce::from_slice(&nonce), body.as_ref())
+        .decrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: body.as_ref(),
+                aad: aad.unwrap_or_default(),
+            },
+        )
         .map_err(|_| anyhow::anyhow!("decrypt account secret"))?;
     String::from_utf8(plain).context("account secret is not utf-8")
+}
+
+fn encrypted_account_secret(value: &str) -> bool {
+    value.starts_with(ENCRYPTED_V1_PREFIX) || value.starts_with(ENCRYPTED_V2_PREFIX)
+}
+
+fn account_secret_aad(context: &AccountSecretContext, path: &str) -> anyhow::Result<Vec<u8>> {
+    if context.provider_type.is_empty() || context.account_id.is_empty() || path.is_empty() {
+        anyhow::bail!("encrypted account secret is missing identity or field path");
+    }
+    let mut aad = b"cc-switch-server/account-secret/v2\0".to_vec();
+    for component in [&context.provider_type, &context.account_id, path] {
+        let length = u32::try_from(component.len())
+            .map_err(|_| anyhow::anyhow!("account secret AAD component is too large"))?;
+        aad.extend_from_slice(&length.to_be_bytes());
+        aad.extend_from_slice(component.as_bytes());
+    }
+    Ok(aad)
+}
+
+fn json_pointer_child(parent: &str, segment: &str) -> String {
+    let segment = segment.replace('~', "~0").replace('/', "~1");
+    format!("{parent}/{segment}")
+}
+
+#[cfg(test)]
+fn encrypt_secret_v1(plain: &str, key: &[u8; 32]) -> anyhow::Result<String> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let mut nonce = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), plain.as_bytes())
+        .map_err(|_| anyhow::anyhow!("encrypt legacy account secret"))?;
+    Ok(format!(
+        "{ENCRYPTED_V1_PREFIX}{}.{}",
+        URL_SAFE_NO_PAD.encode(nonce),
+        URL_SAFE_NO_PAD.encode(ciphertext)
+    ))
 }
 
 fn generate_account_id() -> String {
@@ -3120,6 +3426,99 @@ mod tests {
     }
 
     #[test]
+    fn grok_capabilities_are_fail_closed_and_persist_only_supported_evidence() {
+        assert!(parse_grok_capability_config("").is_empty());
+        assert_eq!(
+            parse_grok_capability_config("websocket, image_edit,unknown"),
+            ["image_edit".to_string(), "websocket".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(parse_grok_capability_config("all").len(), 4);
+
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::GrokOAuth);
+        input.id = Some("grok-capability-account".to_string());
+        store.upsert(input);
+        assert!(!grok_account_capability_evidence_present(
+            &store.accounts[0],
+            GrokAccountCapability::Websocket
+        ));
+
+        assert!(store.record_grok_capability_evidence(
+            "grok-capability-account",
+            GrokAccountCapability::Websocket,
+            "upstream_success",
+            1_234,
+        ));
+        assert!(!store.record_grok_capability_evidence(
+            "grok-capability-account",
+            GrokAccountCapability::Websocket,
+            "upstream_success",
+            9_999,
+        ));
+        let account = &store.accounts[0];
+        assert!(grok_account_capability_evidence_present(
+            account,
+            GrokAccountCapability::Websocket
+        ));
+        assert_eq!(
+            account
+                .profile
+                .as_ref()
+                .and_then(|profile| { profile.pointer("/grokCapabilities/websocket/observedAtMs") })
+                .and_then(Value::as_i64),
+            Some(1_234)
+        );
+    }
+
+    #[test]
+    fn grok_relogin_preserves_capability_evidence() {
+        let mut store = AccountStore::default();
+        let mut initial = fixture_input(ProviderType::GrokOAuth);
+        initial.id = Some("grok-relogin-account".to_string());
+        initial.profile = Some(json!({
+            "verifiedGrokClaims": {
+                "subject": "grok-subject",
+                "email": "before@example.com"
+            },
+            "grokCapabilities": {
+                "websocket": {
+                    "status": "supported",
+                    "source": "upstream_success",
+                    "observedAtMs": 1_234
+                }
+            }
+        }));
+        store.upsert(initial);
+
+        let mut relogin = fixture_input(ProviderType::GrokOAuth);
+        relogin.id = Some("grok-relogin-account".to_string());
+        relogin.access_token = Some("new-login-access".to_string());
+        relogin.profile = Some(json!({
+            "verifiedGrokClaims": {
+                "subject": "grok-subject",
+                "email": "after@example.com"
+            }
+        }));
+        let account = store.upsert(relogin);
+
+        assert_eq!(account.access_token.as_deref(), Some("new-login-access"));
+        assert_eq!(
+            account
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.pointer("/verifiedGrokClaims/email"))
+                .and_then(Value::as_str),
+            Some("after@example.com")
+        );
+        assert!(grok_account_capability_evidence_present(
+            &account,
+            GrokAccountCapability::Websocket
+        ));
+    }
+
+    #[test]
     fn save_encrypts_account_secret_fields_and_load_decrypts_them() {
         let config_dir = std::env::temp_dir().join(format!(
             "cc-switch-server-account-store-test-{}",
@@ -3176,7 +3575,8 @@ mod tests {
         assert!(!content.contains("copilot-token-secret"));
         assert!(!content.contains("grok-key-secret"));
         assert!(!content.contains("extra-header-secret"));
-        assert!(content.contains(ENCRYPTED_PREFIX));
+        assert!(content.contains(ENCRYPTED_V2_PREFIX));
+        assert!(!content.contains(ENCRYPTED_V1_PREFIX));
         assert!(accounts_key_path(&config_dir).exists());
 
         let loaded = AccountStore::load_or_default(&config_dir).expect("load");
@@ -3250,5 +3650,114 @@ mod tests {
         assert!(!accounts_key_path(&config_dir).exists());
 
         let _ = fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn legacy_v1_accounts_are_read_and_migrated_on_save() {
+        let config_dir = account_store_test_dir("v1-migration");
+        fs::create_dir_all(&config_dir).expect("tempdir");
+        let root_key = load_or_create_accounts_key(&config_dir).expect("root key");
+        let encrypted = encrypt_secret_v1("legacy-access-secret", &root_key).expect("encrypt v1");
+        let value = json!({
+            "accounts": [{
+                "id": "legacy-account",
+                "providerType": "grok_oauth",
+                "accessToken": encrypted
+            }]
+        });
+        fs::write(
+            accounts_path(&config_dir),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let store = AccountStore::load_or_default(&config_dir).expect("load v1");
+        assert_eq!(
+            store.accounts[0].access_token.as_deref(),
+            Some("legacy-access-secret")
+        );
+        store.save(&config_dir).expect("migrate to v2");
+        let persisted = fs::read_to_string(accounts_path(&config_dir)).unwrap();
+        assert!(persisted.contains(ENCRYPTED_V2_PREFIX));
+        assert!(!persisted.contains(ENCRYPTED_V1_PREFIX));
+
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn v2_aad_rejects_cross_account_and_cross_field_ciphertext_swaps() {
+        let config_dir = account_store_test_dir("v2-aad-swap");
+        fs::create_dir_all(&config_dir).expect("tempdir");
+        let mut store = AccountStore::default();
+        for (id, access, refresh) in [
+            ("account-a", "access-a", "refresh-a"),
+            ("account-b", "access-b", "refresh-b"),
+        ] {
+            let mut input = fixture_input(ProviderType::GrokOAuth);
+            input.id = Some(id.to_string());
+            input.access_token = Some(access.to_string());
+            input.refresh_token = Some(refresh.to_string());
+            store.upsert(input);
+        }
+        store.save(&config_dir).expect("save v2");
+        let original: Value = serde_json::from_slice(
+            &fs::read(accounts_path(&config_dir)).expect("read encrypted accounts"),
+        )
+        .unwrap();
+
+        let mut cross_account = original.clone();
+        let account_a_access = cross_account
+            .pointer("/accounts/0/accessToken")
+            .cloned()
+            .unwrap();
+        let account_b_access = cross_account
+            .pointer("/accounts/1/accessToken")
+            .cloned()
+            .unwrap();
+        *cross_account
+            .pointer_mut("/accounts/0/accessToken")
+            .unwrap() = account_b_access;
+        *cross_account
+            .pointer_mut("/accounts/1/accessToken")
+            .unwrap() = account_a_access;
+        write_account_store_test_value(&config_dir, &cross_account);
+        let error = AccountStore::load_or_default(&config_dir).expect_err("account swap");
+        assert!(format!("{error:#}").contains("decrypt account secret"));
+
+        let mut cross_field = original;
+        let access = cross_field
+            .pointer("/accounts/0/accessToken")
+            .cloned()
+            .unwrap();
+        let refresh = cross_field
+            .pointer("/accounts/0/refreshToken")
+            .cloned()
+            .unwrap();
+        *cross_field.pointer_mut("/accounts/0/accessToken").unwrap() = refresh;
+        *cross_field.pointer_mut("/accounts/0/refreshToken").unwrap() = access;
+        write_account_store_test_value(&config_dir, &cross_field);
+        let error = AccountStore::load_or_default(&config_dir).expect_err("field swap");
+        assert!(format!("{error:#}").contains("decrypt account secret"));
+
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    fn account_store_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cc-switch-server-account-store-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn write_account_store_test_value(config_dir: &Path, value: &Value) {
+        fs::write(
+            accounts_path(config_dir),
+            serde_json::to_vec_pretty(value).unwrap(),
+        )
+        .unwrap();
     }
 }

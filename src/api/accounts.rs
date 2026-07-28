@@ -24,7 +24,7 @@ pub(in crate::api) async fn upsert_account(
     Json(mut input): Json<UpsertAccountInput>,
 ) -> Result<Json<UpsertAccountResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    verify_and_mark_codex_account_input(&state, &mut input, false).await?;
+    verify_and_mark_managed_account_input(&state, &mut input, false).await?;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             let manager = manager_for(input.provider_type);
@@ -85,7 +85,7 @@ pub(in crate::api) async fn import_grok_auth_json(
     Json(input): Json<ImportGrokAuthJsonRequest>,
 ) -> Result<Json<ImportGrokAuthJsonResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let upsert = upsert_input_from_grok_auth_json(input.auth_json)?;
+    let upsert = upsert_input_from_grok_auth_json(&state, input.auth_json).await?;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             manager_for(ProviderType::GrokOAuth)
@@ -233,16 +233,16 @@ pub(in crate::api) async fn start_account_login(
     if input.provider_type == ProviderType::CodexOAuth {
         crate::api::invoke::handlers::require_secure_manual_cli_origin(&state, &headers).await?;
     }
-    let redirect_uri = if input.provider_type == ProviderType::CodexOAuth {
-        Some(crate::domain::accounts::oauth::CODEX_CLI_REDIRECT_URI.to_string())
-    } else {
-        input.redirect_uri.or_else(|| {
-            if input.provider_type == ProviderType::GrokOAuth {
-                Some(crate::domain::accounts::oauth::XAI_LOOPBACK_REDIRECT_URI.to_string())
-            } else {
-                Some(default_account_login_redirect_uri(&state))
-            }
-        })
+    let redirect_uri = match input.provider_type {
+        ProviderType::CodexOAuth => {
+            Some(crate::domain::accounts::oauth::CODEX_CLI_REDIRECT_URI.to_string())
+        }
+        ProviderType::GrokOAuth => {
+            Some(crate::domain::accounts::oauth::XAI_LOOPBACK_REDIRECT_URI.to_string())
+        }
+        _ => input
+            .redirect_uri
+            .or_else(|| Some(default_account_login_redirect_uri(&state))),
     };
     let principal_id = principal.oauth_binding_id();
     let login = state
@@ -542,7 +542,10 @@ fn upsert_input_from_claude_credentials(
     })
 }
 
-fn upsert_input_from_grok_auth_json(auth_json: Value) -> Result<UpsertAccountInput, ApiError> {
+async fn upsert_input_from_grok_auth_json(
+    state: &ServerState,
+    auth_json: Value,
+) -> Result<UpsertAccountInput, ApiError> {
     let entry = grok_auth_json_entry(&auth_json).ok_or_else(|| {
         ApiError::bad_request(
             "Grok auth import requires a ~/.grok/auth.json entry with key/access_token or refresh_token",
@@ -573,88 +576,50 @@ fn upsert_input_from_grok_auth_json(auth_json: Value) -> Result<UpsertAccountInp
             "Grok auth import requires key/accessToken/access_token or refreshToken/refresh_token",
         ));
     }
-    let id_token = first_json_string(entry, &["/idToken", "/id_token"]);
-    let identity = id_token
-        .as_deref()
-        .and_then(identity_from_jwt)
-        .or_else(|| access_token.as_deref().and_then(identity_from_jwt));
-    let account_id = first_json_string(entry, &["/id", "/accountId", "/account_id", "/sub"])
-        .or_else(|| identity.as_ref().and_then(|item| item.account_id.clone()))
-        .unwrap_or_else(|| {
-            stable_grok_import_account_id(access_token.as_deref(), refresh_token.as_deref())
-        });
-    let email = first_json_string(
-        entry,
-        &[
-            "/email",
-            "/preferredUsername",
-            "/preferred_username",
-            "/profile/email",
-        ],
+    let id_token = first_json_string(entry, &["/idToken", "/id_token"])
+        .ok_or_else(|| ApiError::bad_request("Grok auth import requires a signed id_token"))?;
+    let verified = crate::clients::oauth::grok_jwks::verify_grok_id_token(
+        &state.http_client().await,
+        &id_token,
+        None,
     )
-    .or_else(|| identity.as_ref().and_then(|item| item.email.clone()));
-    let subscription_level = first_json_string(
-        entry,
-        &[
-            "/tier",
-            "/subscriptionTier",
-            "/subscription_tier",
-            "/profile/tier",
-        ],
-    )
-    .or_else(|| identity.as_ref().and_then(|item| item.plan_type.clone()));
-    let entitlement_status = first_json_string(
-        entry,
-        &[
-            "/entitlementStatus",
-            "/entitlement_status",
-            "/profile/entitlementStatus",
-            "/profile/entitlement_status",
-        ],
-    );
+    .await
+    .map_err(ApiError::bad_request)?;
     let expires_at = normalize_oauth_expires_at(first_json_i64(
         entry,
         &["/expiresAt", "/expires_at", "/expires"],
     ));
-    Ok(UpsertAccountInput {
-        id: Some(account_id),
-        provider_type: ProviderType::GrokOAuth,
-        email: email.clone(),
-        access_token,
+    let scope = first_json_string(entry, &["/scope", "/scopes"]);
+    let now = now_ms() as i64;
+    let tokens = crate::domain::accounts::oauth::OAuthTokenResponse {
+        access_token: access_token.unwrap_or_default(),
         refresh_token,
-        id_token,
+        id_token: Some(id_token),
         token_type: first_json_string(entry, &["/tokenType", "/token_type"])
             .or_else(|| Some("Bearer".to_string())),
-        api_key: None,
-        extra_headers: None,
-        scopes: first_json_string(entry, &["/scope", "/scopes"])
-            .map(|scope| scope.split_whitespace().map(str::to_string).collect())
-            .unwrap_or_default(),
-        profile: Some(json!({
-            "providerType": ProviderType::GrokOAuth.as_str(),
-            "source": "grok_auth_json_import",
-            "accountId": identity.as_ref().and_then(|item| item.account_id.clone()),
-            "email": email,
-            "planType": subscription_level.clone(),
-            "entitlementStatus": entitlement_status.clone(),
-            "poid": identity.as_ref().and_then(|item| item.poid.clone()),
-            "organizations": identity.as_ref().and_then(|item| item.organizations.clone()),
-        })),
-        raw: Some(json!({
-            "source": "grok_auth_json_import",
-            "importedAtMs": now_ms(),
-            "entry": entry,
-        })),
-        subscription_level,
-        entitlement_status,
-        quota_percent: None,
-        quota: None,
-        quota_refreshed_at: None,
-        quota_next_refresh_at: None,
-        expires_at,
-        rate_limited_until: None,
-        last_refresh_error: None,
-    })
+        scope,
+        expires_in: expires_at
+            .map(|expires_at| expires_at.saturating_sub(now).saturating_add(999) / 1_000),
+        extra: Value::Null,
+    };
+    let mut raw = entry.clone();
+    if let Some(object) = raw.as_object_mut() {
+        object.insert("importedBy".to_string(), json!("grok_auth_json_import"));
+        object.insert("importedAtMs".to_string(), json!(now));
+    }
+    let mut input = crate::domain::accounts::oauth::upsert_input_from_verified_grok_token_response(
+        &tokens,
+        raw,
+        &verified.identity,
+        now,
+    )
+    .map_err(|error| ApiError::bad_request(error.message))?;
+    input.expires_at = expires_at.or(input.expires_at);
+    crate::domain::accounts::store::set_verified_grok_claims(
+        &mut input.profile,
+        Some(verified.canonical_claims),
+    );
+    Ok(input)
 }
 
 fn grok_auth_json_entry(value: &Value) -> Option<&Value> {
@@ -728,20 +693,6 @@ fn stable_import_account_id(access_token: Option<&str>, refresh_token: Option<&s
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("claude-oauth-{suffix}")
-}
-
-fn stable_grok_import_account_id(
-    access_token: Option<&str>,
-    refresh_token: Option<&str>,
-) -> String {
-    let seed = refresh_token.or(access_token).unwrap_or("grok-oauth");
-    let digest = Sha256::digest(seed.as_bytes());
-    let suffix = digest
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("grok-oauth-{suffix}")
 }
 
 fn device_flow_expires_at(now_ms: i64, expires_in_secs: u64) -> i64 {
@@ -1259,7 +1210,8 @@ pub(in crate::api) async fn poll_codex_device_login(
             {
                 Ok(mut result) => {
                     if let Some(account_input) = result.account_input.as_mut() {
-                        match verify_and_mark_codex_account_input(&state, account_input, true).await
+                        match verify_and_mark_managed_account_input(&state, account_input, true)
+                            .await
                         {
                             Ok(()) => {}
                             Err(error) => {
@@ -1439,8 +1391,9 @@ pub(in crate::api) async fn poll_grok_device_login(
             .await
             {
                 Ok(result) => {
+                    let completed_at = now_ms() as i64;
                     if !state
-                        .finish_grok_device_poll(&input.device_code, result.clone())
+                        .finish_grok_device_poll(&input.device_code, result.clone(), completed_at)
                         .await
                     {
                         return Err(ApiError::unauthorized(
@@ -1450,12 +1403,13 @@ pub(in crate::api) async fn poll_grok_device_login(
                     result
                 }
                 Err(error) => {
+                    let completed_at = now_ms() as i64;
                     let terminal = matches!(
                         error.status,
                         StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
                     );
                     state
-                        .fail_grok_device_poll(&input.device_code, terminal)
+                        .fail_grok_device_poll(&input.device_code, terminal, completed_at)
                         .await;
                     if terminal {
                         state
@@ -1463,7 +1417,7 @@ pub(in crate::api) async fn poll_grok_device_login(
                                 ProviderType::GrokOAuth,
                                 &input.device_code,
                                 &principal_id,
-                                now,
+                                completed_at,
                             )
                             .await;
                     }
@@ -1477,6 +1431,15 @@ pub(in crate::api) async fn poll_grok_device_login(
                 pending: true,
                 message: "poll_in_progress".to_string(),
                 retry_after_secs: Some(1),
+                account: None,
+            }));
+        }
+        crate::clients::oauth::grok_device::GrokDevicePollLease::Wait(retry_after_secs) => {
+            return Ok(Json(PollGrokDeviceLoginResponse {
+                ok: true,
+                pending: true,
+                message: "poll_interval_not_elapsed".to_string(),
+                retry_after_secs: Some(retry_after_secs.max(1)),
                 account: None,
             }));
         }
@@ -1495,6 +1458,28 @@ pub(in crate::api) async fn poll_grok_device_login(
         .account_input
         .clone()
         .ok_or_else(|| ApiError::bad_gateway("grok device flow completed without account"))?;
+    let account = persist_completed_grok_device_login(
+        &state,
+        &input.device_code,
+        &principal_id,
+        account_input,
+    )
+    .await?;
+    Ok(Json(PollGrokDeviceLoginResponse {
+        ok: true,
+        pending: false,
+        message: result.message,
+        retry_after_secs: None,
+        account: Some(AccountLoginAccountSummary::from_account(&account)),
+    }))
+}
+
+async fn persist_completed_grok_device_login(
+    state: &ServerState,
+    device_code: &str,
+    principal_id: &str,
+    account_input: UpsertAccountInput,
+) -> Result<Account, ApiError> {
     let provider_type = account_input.provider_type;
     let account = state
         .try_mutate_accounts_immediate(|store| {
@@ -1504,13 +1489,16 @@ pub(in crate::api) async fn poll_grok_device_login(
         })
         .await
         .map_err(map_account_write_error)??;
-    Ok(Json(PollGrokDeviceLoginResponse {
-        ok: true,
-        pending: false,
-        message: result.message,
-        retry_after_secs: None,
-        account: Some(AccountLoginAccountSummary::from_account(&account)),
-    }))
+    state.remove_grok_device_flow(device_code).await;
+    state
+        .remove_device_flow_principal(
+            ProviderType::GrokOAuth,
+            device_code,
+            principal_id,
+            now_ms() as i64,
+        )
+        .await;
+    Ok(account)
 }
 
 pub(in crate::api) async fn cancel_grok_device_login(
@@ -1579,6 +1567,29 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
     } else {
         None
     };
+    let verified_grok_identity = if finish.provider_type == ProviderType::GrokOAuth {
+        let Some(id_token) = token_response.id_token.as_deref() else {
+            mark_account_login_exchange_failed(state, &finish.session_id).await;
+            return Err(ApiError::bad_request(
+                "Grok OAuth token response is missing id_token",
+            ));
+        };
+        match crate::clients::oauth::grok_jwks::verify_grok_id_token(
+            &http_client,
+            id_token,
+            Some(&finish.state),
+        )
+        .await
+        {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                mark_account_login_exchange_failed(state, &finish.session_id).await;
+                return Err(ApiError::bad_request(error));
+            }
+        }
+    } else {
+        None
+    };
     let verified_openai_subject = verified_openai_identity
         .as_ref()
         .and_then(|verified| verified.identity.subject.clone());
@@ -1606,6 +1617,15 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
             now_ms() as i64,
             interval_ms,
         )
+    } else if let Some(verified) = verified_grok_identity.as_ref() {
+        upsert_input_from_verified_grok_login_response(
+            &token_response,
+            raw,
+            profile_raw,
+            &verified.identity,
+            now_ms() as i64,
+            interval_ms,
+        )
     } else {
         upsert_input_from_login_response(
             finish.provider_type,
@@ -1625,6 +1645,9 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
     };
     if let Some(verified) = verified_openai_identity {
         apply_verified_codex_identity(&mut input, verified, true);
+    }
+    if let Some(verified) = verified_grok_identity {
+        apply_verified_grok_identity(&mut input, verified);
     }
 
     let account_result = match state
@@ -1667,27 +1690,43 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
     Ok(AccountLoginAccountSummary::from_account(&account))
 }
 
-async fn verify_and_mark_codex_account_input(
+async fn verify_and_mark_managed_account_input(
     state: &ServerState,
     input: &mut UpsertAccountInput,
     replace_account_record_id: bool,
 ) -> Result<(), ApiError> {
-    if input.provider_type != ProviderType::CodexOAuth {
-        return Ok(());
+    match input.provider_type {
+        ProviderType::CodexOAuth => {
+            crate::domain::accounts::store::clear_codex_workspace_provenance(&mut input.profile);
+            let access_token = input
+                .access_token
+                .as_deref()
+                .ok_or_else(|| ApiError::bad_request("Codex OAuth access_token is required"))?;
+            let verified = crate::clients::oauth::openai_jwks::verify_openai_identity_tokens(
+                &state.http_client().await,
+                input.id_token.as_deref(),
+                access_token,
+            )
+            .await
+            .map_err(ApiError::bad_request)?;
+            apply_verified_codex_identity(input, verified, replace_account_record_id);
+        }
+        ProviderType::GrokOAuth => {
+            let id_token = input
+                .id_token
+                .as_deref()
+                .ok_or_else(|| ApiError::bad_request("Grok OAuth id_token is required"))?;
+            let verified = crate::clients::oauth::grok_jwks::verify_grok_id_token(
+                &state.http_client().await,
+                id_token,
+                None,
+            )
+            .await
+            .map_err(ApiError::bad_request)?;
+            apply_verified_grok_identity(input, verified);
+        }
+        _ => {}
     }
-    crate::domain::accounts::store::clear_codex_workspace_provenance(&mut input.profile);
-    let access_token = input
-        .access_token
-        .as_deref()
-        .ok_or_else(|| ApiError::bad_request("Codex OAuth access_token is required"))?;
-    let verified = crate::clients::oauth::openai_jwks::verify_openai_identity_tokens(
-        &state.http_client().await,
-        input.id_token.as_deref(),
-        access_token,
-    )
-    .await
-    .map_err(ApiError::bad_request)?;
-    apply_verified_codex_identity(input, verified, replace_account_record_id);
     Ok(())
 }
 
@@ -1710,6 +1749,27 @@ fn apply_verified_codex_identity(
         input.subscription_level = verified.identity.plan_type;
     }
     crate::domain::accounts::store::set_verified_openai_claims(
+        &mut input.profile,
+        Some(verified.canonical_claims),
+    );
+}
+
+fn apply_verified_grok_identity(
+    input: &mut UpsertAccountInput,
+    verified: crate::clients::oauth::grok_jwks::VerifiedGrokIdentity,
+) {
+    input.id = verified
+        .identity
+        .subject
+        .as_deref()
+        .and_then(crate::domain::accounts::oauth::grok_account_record_id_from_subject);
+    if verified.identity.email.is_some() {
+        input.email = verified.identity.email;
+    }
+    if verified.identity.plan_type.is_some() {
+        input.subscription_level = verified.identity.plan_type;
+    }
+    crate::domain::accounts::store::set_verified_grok_claims(
         &mut input.profile,
         Some(verified.canonical_claims),
     );
@@ -1919,7 +1979,7 @@ pub(in crate::api) async fn refresh_account(
     Path(id): Path<String>,
 ) -> Result<Json<UpsertAccountResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let existing = state
+    let mut existing = state
         .find_account_by_id(&id)
         .await
         .ok_or_else(|| ApiError::not_found("account not found"))?;
@@ -1930,6 +1990,11 @@ pub(in crate::api) async fn refresh_account(
             .account_refresh_locks
             .try_lock(existing.provider_type, &existing.id)
             .ok_or_else(|| ApiError::conflict("account refresh is already in progress"))?;
+        existing = state
+            .find_account_by_id(&id)
+            .await
+            .filter(|account| account.provider_type == existing.provider_type)
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
         let http_client = state.http_client().await;
         let interval_ms = state.oauth_quota_refresh_interval_ms().await;
         let update =
@@ -1937,7 +2002,7 @@ pub(in crate::api) async fn refresh_account(
                 Ok(update) => update,
                 Err(error) => {
                     let updated = state
-                        .commit_native_refresh_failure(&id, error.message.clone(), error.kind)
+                        .commit_native_refresh_failure(&existing, error.message.clone(), error.kind)
                         .await
                         .map_err(map_account_write_error)?;
                     if let Some(updated) = updated {
@@ -1950,7 +2015,7 @@ pub(in crate::api) async fn refresh_account(
                 }
             };
         let account = state
-            .commit_native_refresh_success(&id, update)
+            .commit_native_refresh_success(&existing, update)
             .await
             .map_err(|error| {
                 if error.is_persistence_degraded() {
@@ -1996,6 +2061,7 @@ pub(in crate::api) fn account_refresh_api_error(error: AccountRefreshFailure) ->
         StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
         oauth_error_public_message(error.kind),
     )
+    .with_retry_after_ms(error.retry_after_ms)
 }
 
 pub(in crate::api) async fn account_refresh_plan(
@@ -2161,7 +2227,11 @@ pub(in crate::api) async fn account_quota(
                 Ok(update) => update,
                 Err(error) => {
                     let updated = state
-                        .commit_native_refresh_failure(&id, error.message.clone(), error.kind)
+                        .commit_native_refresh_failure(
+                            &active_account,
+                            error.message.clone(),
+                            error.kind,
+                        )
                         .await
                         .map_err(map_account_write_error)?;
                     if let Some(updated) = updated {
@@ -2177,7 +2247,7 @@ pub(in crate::api) async fn account_quota(
                 }
             };
         active_account = state
-            .commit_native_refresh_success(&id, update)
+            .commit_native_refresh_success(&active_account, update)
             .await
             .map_err(|error| {
                 if error.is_persistence_degraded() {
@@ -2359,9 +2429,34 @@ pub(in crate::api) fn is_oauth_secret_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::domain::accounts::oauth::{OAuthHttpRequest, OAuthRequestBodyFormat};
+
+    fn account_api_test_state(name: &str) -> ServerState {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(
+                    std::env::temp_dir()
+                        .join(format!("cc-switch-server-account-api-{name}-{nanos}")),
+                ),
+                web_dist_dir: None,
+                log_level: "warn".to_string(),
+                command: None,
+            },
+            std::sync::Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn account_refresh_api_error_does_not_expose_upstream_message() {
@@ -2380,6 +2475,211 @@ mod tests {
             "OAuth credentials were rejected; sign in again"
         );
         assert!(!error.message.contains("refresh-secret"));
+    }
+
+    #[tokio::test]
+    async fn grok_auth_json_rejects_missing_or_unsigned_id_token() {
+        let state = account_api_test_state("grok-auth-json-signature");
+        let missing =
+            upsert_input_from_grok_auth_json(&state, json!({"access_token": "access-without-id"}))
+                .await
+                .unwrap_err();
+        assert!(missing.message.contains("signed id_token"));
+
+        let unsigned = upsert_input_from_grok_auth_json(
+            &state,
+            json!({
+                "access_token": "access-with-unsigned-id",
+                "id_token": "eyJhbGciOiJub25lIiwia2lkIjoieCJ9.eyJleHAiOjQxMDI0NDQ4MDB9."
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(unsigned.message.contains("RS256"));
+    }
+
+    #[tokio::test]
+    async fn grok_exchange_missing_id_token_restores_the_login_for_retry() {
+        let state = account_api_test_state("grok-exchange-missing-id-token");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..read]);
+                if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"access_token":"grok-access","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let login = state
+            .mutate_oauth_logins(|store| {
+                store.start(
+                    ProviderType::GrokOAuth,
+                    Some(crate::domain::accounts::oauth::XAI_LOOPBACK_REDIRECT_URI.to_string()),
+                    1_000,
+                )
+            })
+            .await
+            .unwrap();
+        let mut finish = state
+            .mutate_oauth_logins(|store| {
+                store.finish(
+                    Some(&login.session_id),
+                    Some(&login.state),
+                    Some("authorization-code"),
+                    true,
+                    2_000,
+                )
+            })
+            .await
+            .unwrap();
+        finish.token_request.as_mut().unwrap().url = format!("http://{address}/token");
+
+        let error = execute_account_login_token_exchange(&state, &mut finish)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("missing id_token"));
+        server.await.unwrap();
+
+        let poll_state = state
+            .mutate_oauth_logins(|store| store.poll_state_by_oauth_state(&login.state, 2_001))
+            .await
+            .unwrap();
+        assert_eq!(poll_state, OAuthSessionPollState::Ready);
+    }
+
+    #[tokio::test]
+    async fn completed_grok_device_login_forgets_flow_and_principal_after_persisting() {
+        let state = account_api_test_state("grok-device-complete-cleanup");
+        let device_code = "grok-device-complete";
+        let principal_id = "owner:admin";
+        state
+            .insert_grok_device_flow(
+                device_code.to_string(),
+                crate::clients::oauth::grok_device::PendingGrokDeviceFlow {
+                    expires_at_ms: i64::MAX,
+                    interval: 5,
+                },
+                0,
+            )
+            .await;
+        state
+            .bind_device_flow_principal(
+                ProviderType::GrokOAuth,
+                device_code.to_string(),
+                principal_id.to_string(),
+                i64::MAX,
+                0,
+            )
+            .await;
+
+        let account = persist_completed_grok_device_login(
+            &state,
+            device_code,
+            principal_id,
+            serde_json::from_value(json!({
+                "id": "grok-device-account",
+                "providerType": "grok_oauth",
+                "accessToken": "grok-device-access",
+                "refreshToken": "grok-device-refresh",
+                "profile": {
+                    "verifiedGrokClaims": {"subject": "grok-device-subject"}
+                }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(account.id, "grok-device-account");
+        assert!(state
+            .begin_grok_device_poll(device_code, crate::infra::time::now_ms() as i64)
+            .await
+            .is_none());
+        assert!(
+            !state
+                .device_flow_is_owned_by(
+                    ProviderType::GrokOAuth,
+                    device_code,
+                    principal_id,
+                    crate::infra::time::now_ms() as i64,
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_grok_device_account_persist_keeps_flow_retryable() {
+        let state = account_api_test_state("grok-device-persist-retry");
+        let device_code = "grok-device-retry";
+        let principal_id = "owner:admin";
+        state
+            .insert_grok_device_flow(
+                device_code.to_string(),
+                crate::clients::oauth::grok_device::PendingGrokDeviceFlow {
+                    expires_at_ms: i64::MAX,
+                    interval: 5,
+                },
+                0,
+            )
+            .await;
+        state
+            .bind_device_flow_principal(
+                ProviderType::GrokOAuth,
+                device_code.to_string(),
+                principal_id.to_string(),
+                i64::MAX,
+                0,
+            )
+            .await;
+        let config_dir = state.config_dir.clone();
+        std::fs::remove_dir_all(&config_dir).unwrap();
+        std::fs::write(&config_dir, b"block account persistence").unwrap();
+
+        let result = persist_completed_grok_device_login(
+            &state,
+            device_code,
+            principal_id,
+            serde_json::from_value(json!({
+                "id": "grok-device-retry-account",
+                "providerType": "grok_oauth",
+                "accessToken": "grok-device-access",
+                "refreshToken": "grok-device-refresh",
+                "profile": {
+                    "verifiedGrokClaims": {"subject": "grok-device-retry-subject"}
+                }
+            }))
+            .unwrap(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            state.begin_grok_device_poll(device_code, 1).await,
+            Some(crate::clients::oauth::grok_device::GrokDevicePollLease::Ready(_))
+        ));
+        assert!(
+            state
+                .device_flow_is_owned_by(ProviderType::GrokOAuth, device_code, principal_id, 1)
+                .await
+        );
+        assert!(state
+            .find_account_by_id("grok-device-retry-account")
+            .await
+            .is_none());
+
+        drop(state);
+        std::fs::remove_file(config_dir).unwrap();
     }
 
     #[test]

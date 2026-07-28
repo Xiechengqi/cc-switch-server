@@ -1,24 +1,23 @@
 #![allow(clippy::items_after_test_module)]
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use bytes::Bytes;
 use rand::RngCore;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{ProxyError, ProxyRoute};
 use crate::domain::grok_cli::{
-    GROK_CLI_BASE_URL, GROK_CLI_CLIENT_IDENTIFIER, GROK_CLI_TOKEN_AUTH, GROK_CLI_USER_AGENT,
-    GROK_CLI_VERSION,
+    grok_cli_user_agent, grok_cli_version, GROK_CLI_BASE_URL, GROK_CLI_CLIENT_IDENTIFIER,
+    GROK_CLI_TOKEN_AUTH,
 };
 use crate::domain::providers::model_routing::DEFAULT_GROK_MODEL;
 
 const GROK_API_BASE: &str = "https://api.x.ai/v1";
 const GROK_WS_URL: &str = "wss://api.x.ai/v1/responses";
-static GROK_TURN_IDX: AtomicU64 = AtomicU64::new(1);
+const GROK_VIDEO_REQUEST_ID_MAX_LEN: usize = 128;
 
 pub(super) struct GrokForwardContract {
     pub session_id: Option<String>,
@@ -26,11 +25,60 @@ pub(super) struct GrokForwardContract {
     pub actual_model: String,
 }
 
+pub(super) fn set_forward_contract_turn_index(
+    contract: &mut GrokForwardContract,
+    turn_index: Option<u64>,
+) {
+    contract
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("x-grok-turn-idx"));
+    if let Some(turn_index) = turn_index {
+        contract
+            .headers
+            .push(("x-grok-turn-idx", turn_index.to_string()));
+    }
+}
+
+pub(super) fn apply_cli_identity_headers(
+    headers: &mut Vec<(String, String)>,
+    turn_index: Option<u64>,
+) {
+    for (name, value) in [
+        ("user-agent", grok_cli_user_agent()),
+        ("x-xai-token-auth", GROK_CLI_TOKEN_AUTH.to_string()),
+        (
+            "x-grok-client-identifier",
+            GROK_CLI_CLIENT_IDENTIFIER.to_string(),
+        ),
+        ("x-grok-client-version", grok_cli_version()),
+        (
+            "x-authenticateresponse",
+            "authenticate-response".to_string(),
+        ),
+    ] {
+        headers.retain(|(candidate, _)| !candidate.eq_ignore_ascii_case(name));
+        headers.push((name.to_string(), value));
+    }
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("x-grok-turn-idx"));
+    if let Some(turn_index) = turn_index {
+        headers.push(("x-grok-turn-idx".to_string(), turn_index.to_string()));
+    }
+}
+
+pub(super) fn turn_index_from_headers(headers: &HeaderMap) -> Option<u64> {
+    let value = header_string(headers, "x-grok-turn-idx")?;
+    if value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u64>().ok()
+}
+
 pub(super) fn apply_forward_contract(
     body: &mut Bytes,
     downstream_headers: &HeaderMap,
     route: ProxyRoute,
     downstream_session_id: Option<&str>,
+    preserved_session_id: Option<&str>,
     tenant_scope: Option<&str>,
     cli_profile: bool,
 ) -> Result<GrokForwardContract, ProxyError> {
@@ -39,10 +87,13 @@ pub(super) fn apply_forward_contract(
     let session_id = grok_session_id(
         downstream_headers,
         downstream_session_id,
+        preserved_session_id,
         &model,
         tenant_scope,
     );
-    if let Some(session_id) = session_id.as_deref() {
+    if route == ProxyRoute::CodexResponsesCompact {
+        remove_prompt_cache_key(body)?;
+    } else if let Some(session_id) = session_id.as_deref() {
         inject_prompt_cache_key(body, session_id)?;
     }
     let free_cache_identity = if cli_profile && route != ProxyRoute::CodexResponsesCompact {
@@ -55,7 +106,7 @@ pub(super) fn apply_forward_contract(
         (
             "user-agent",
             if cli_profile {
-                GROK_CLI_USER_AGENT.to_string()
+                grok_cli_user_agent()
             } else {
                 "cc-switch-server-grok/1.0".to_string()
             },
@@ -67,15 +118,14 @@ pub(super) fn apply_forward_contract(
             "x-grok-client-identifier",
             GROK_CLI_CLIENT_IDENTIFIER.to_string(),
         ));
-        headers.push(("x-grok-client-version", GROK_CLI_VERSION.to_string()));
+        headers.push(("x-grok-client-version", grok_cli_version()));
         headers.push((
             "x-authenticateresponse",
             "authenticate-response".to_string(),
         ));
-        headers.push((
-            "x-grok-turn-idx",
-            GROK_TURN_IDX.fetch_add(1, Ordering::Relaxed).to_string(),
-        ));
+        if let Some(turn_index) = turn_index_from_headers(downstream_headers) {
+            headers.push(("x-grok-turn-idx", turn_index.to_string()));
+        }
     }
     if let Some(openai_beta) = header_string(downstream_headers, "openai-beta") {
         headers.push(("openai-beta", openai_beta));
@@ -121,6 +171,34 @@ pub(super) fn upstream_media_url(path: &str) -> String {
     format!("{GROK_API_BASE}/{path}")
 }
 
+pub(super) fn validate_media_request(method: &Method, path: &str) -> Result<(), ProxyError> {
+    let valid = if *method == Method::POST {
+        matches!(
+            path,
+            "/images/generations" | "/images/edits" | "/videos/generations"
+        )
+    } else if *method == Method::GET {
+        path.strip_prefix("/videos/")
+            .is_some_and(valid_video_request_id)
+    } else {
+        false
+    };
+    if valid {
+        return Ok(());
+    }
+    Err(ProxyError::bad_request(
+        "unsupported or invalid Grok media request path",
+    ))
+}
+
+fn valid_video_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= GROK_VIDEO_REQUEST_ID_MAX_LEN
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 pub(super) fn patch_grok_request_body(
     body: &mut Bytes,
     route: ProxyRoute,
@@ -143,9 +221,23 @@ pub(super) fn inject_prompt_cache_key(
         ProxyError::bad_request(format!("Grok request body must be valid JSON: {error}"))
     })?;
     if let Some(object) = value.as_object_mut() {
-        object
-            .entry("prompt_cache_key".to_string())
-            .or_insert_with(|| Value::String(session_id.to_string()));
+        object.insert(
+            "prompt_cache_key".to_string(),
+            Value::String(session_id.to_string()),
+        );
+    }
+    *body = serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::bad_request(format!("Grok request encode failed: {error}")))?;
+    Ok(())
+}
+
+fn remove_prompt_cache_key(body: &mut Bytes) -> Result<(), ProxyError> {
+    let mut value = serde_json::from_slice::<Value>(body).map_err(|error| {
+        ProxyError::bad_request(format!("Grok request body must be valid JSON: {error}"))
+    })?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("prompt_cache_key");
     }
     *body = serde_json::to_vec(&value)
         .map(Bytes::from)
@@ -467,6 +559,7 @@ pub(super) fn sticky_media_session_key(path: &str, body: &[u8]) -> Option<String
             .as_ref()
             .and_then(|value| value.get("request_id"))
             .and_then(Value::as_str)
+            .filter(|request_id| valid_video_request_id(request_id))
         {
             return Some(format!("grok-video:{request_id}"));
         }
@@ -486,22 +579,22 @@ pub(super) fn video_session_key_from_response(body: &[u8]) -> Option<String> {
     ]
     .into_iter()
     .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-    .map(str::trim)
-    .filter(|request_id| !request_id.is_empty())
+    .filter(|request_id| valid_video_request_id(request_id))
     .map(|request_id| format!("grok-video:{request_id}"))
 }
 
-pub(super) fn ws_request_body(mut value: Value, session_id: Option<&str>) -> Value {
-    patch_grok_request_value(&mut value, ProxyRoute::CodexResponses);
+fn normalize_ws_response_body(value: &mut Value, session_id: Option<&str>) {
+    patch_grok_request_value(value, ProxyRoute::CodexResponses);
     if let Some(session_id) = session_id {
         if let Some(object) = value.as_object_mut() {
-            object
-                .entry("prompt_cache_key".to_string())
-                .or_insert_with(|| Value::String(session_id.to_string()));
+            object.insert(
+                "prompt_cache_key".to_string(),
+                Value::String(session_id.to_string()),
+            );
         }
     }
-    remove_recursive(&mut value, "stream_options");
-    remove_recursive(&mut value, "background");
+    remove_recursive(value, "stream_options");
+    remove_recursive(value, "background");
     if let Some(object) = value.as_object_mut() {
         object.remove("stream");
         object.insert("store".to_string(), Value::Bool(true));
@@ -509,6 +602,10 @@ pub(super) fn ws_request_body(mut value: Value, session_id: Option<&str>) -> Val
             object.remove("instructions");
         }
     }
+}
+
+pub(super) fn ws_request_body(mut value: Value, session_id: Option<&str>) -> Value {
+    normalize_ws_response_body(&mut value, session_id);
     json!({
         "type": "response.create",
         "response": value,
@@ -525,13 +622,14 @@ pub(super) fn ws_message_body(mut value: Value, session_id: Option<&str>) -> Val
         .is_some_and(|event_type| event_type == "response.create")
     {
         if let Some(response) = value.get_mut("response") {
-            patch_grok_request_value(response, ProxyRoute::CodexResponses);
-            if let Some(session_id) = session_id {
-                if let Some(object) = response.as_object_mut() {
-                    object
-                        .entry("prompt_cache_key".to_string())
-                        .or_insert_with(|| Value::String(session_id.to_string()));
-                }
+            normalize_ws_response_body(response, session_id);
+        } else if let Some(event_type) = value
+            .as_object_mut()
+            .and_then(|object| object.remove("type"))
+        {
+            normalize_ws_response_body(&mut value, session_id);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("type".to_string(), event_type);
             }
         }
     }
@@ -568,9 +666,13 @@ fn normalize_grok_model(model: &str) -> String {
 fn grok_session_id(
     headers: &HeaderMap,
     downstream_session_id: Option<&str>,
+    preserved_session_id: Option<&str>,
     model: &str,
     tenant_scope: Option<&str>,
 ) -> Option<String> {
+    if let Some(session_id) = preserved_session_id {
+        return Some(session_id.to_string());
+    }
     let raw = if model.starts_with("grok-composer-") {
         random_session_id()
     } else {
@@ -842,12 +944,113 @@ mod tests {
             ProxyRoute::CodexResponses,
             None,
             None,
+            None,
             false,
         )
         .unwrap();
 
         assert_eq!(contract.actual_model, DEFAULT_GROK_MODEL);
         assert_eq!(request_model(&body).as_deref(), Some(DEFAULT_GROK_MODEL));
+    }
+
+    #[test]
+    fn compact_contract_keeps_the_session_header_but_omits_prompt_cache_key() {
+        let mut body = json_body(json!({
+            "model": "grok",
+            "input": "ping",
+            "prompt_cache_key": "client-controlled"
+        }));
+        let contract = apply_forward_contract(
+            &mut body,
+            &HeaderMap::new(),
+            ProxyRoute::CodexResponsesCompact,
+            Some("session-1"),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let value = serde_json::from_slice::<Value>(&body).unwrap();
+
+        assert!(value.get("prompt_cache_key").is_none());
+        assert_eq!(contract.session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            contract.headers.iter().find_map(|(name, value)| {
+                (*name == "x-grok-conv-id").then_some(value.as_str())
+            }),
+            Some("session-1")
+        );
+    }
+
+    #[test]
+    fn composer_initial_attempt_isolates_client_session_ids() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-conv-id",
+            HeaderValue::from_static("client-conversation"),
+        );
+        headers.insert("x-session-id", HeaderValue::from_static("client-header"));
+        let mut body = json_body(json!({"model": "grok-composer", "input": "ping"}));
+
+        let contract = apply_forward_contract(
+            &mut body,
+            &headers,
+            ProxyRoute::CodexResponses,
+            Some("client-metadata"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let session_id = contract.session_id.as_deref().unwrap();
+
+        assert_ne!(session_id, "client-conversation");
+        assert_ne!(session_id, "client-header");
+        assert_ne!(session_id, "client-metadata");
+        assert_eq!(
+            contract.headers.iter().find_map(|(name, value)| {
+                (*name == "x-grok-conv-id").then_some(value.as_str())
+            }),
+            Some(session_id)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["prompt_cache_key"],
+            session_id
+        );
+    }
+
+    #[test]
+    fn composer_auth_replay_reuses_preserved_session_without_renamespacing() {
+        let mut first_body = json_body(json!({"model": "grok-composer", "input": "ping"}));
+        let first = apply_forward_contract(
+            &mut first_body,
+            &HeaderMap::new(),
+            ProxyRoute::CodexResponses,
+            Some("client-metadata"),
+            None,
+            Some("share-a"),
+            false,
+        )
+        .unwrap();
+        let preserved = first.session_id.unwrap();
+        let mut replay_body = json_body(json!({"model": "grok-composer", "input": "ping"}));
+
+        let replay = apply_forward_contract(
+            &mut replay_body,
+            &HeaderMap::new(),
+            ProxyRoute::CodexResponses,
+            Some("different-client-metadata"),
+            Some(&preserved),
+            Some("different-share"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(replay.session_id.as_deref(), Some(preserved.as_str()));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&replay_body).unwrap()["prompt_cache_key"],
+            preserved
+        );
     }
 
     #[test]
@@ -875,23 +1078,66 @@ mod tests {
             ProxyRoute::CodexResponses,
             None,
             None,
+            None,
             true,
         )
         .unwrap();
-        let header = |name: &str| {
+        {
+            let header = |name: &str| {
+                contract
+                    .headers
+                    .iter()
+                    .find_map(|(key, value)| (*key == name).then_some(value.as_str()))
+            };
+
+            let expected_user_agent = grok_cli_user_agent();
+            let expected_version = grok_cli_version();
+            assert_eq!(header("user-agent"), Some(expected_user_agent.as_str()));
+            assert_eq!(
+                header("x-grok-client-identifier"),
+                Some(GROK_CLI_CLIENT_IDENTIFIER)
+            );
+            assert_eq!(
+                header("x-grok-client-version"),
+                Some(expected_version.as_str())
+            );
+            assert_eq!(header("x-xai-token-auth"), Some(GROK_CLI_TOKEN_AUTH));
+            assert_eq!(header("x-grok-turn-idx"), None);
+        }
+    }
+
+    #[test]
+    fn cli_profile_forwards_only_a_valid_client_turn_index() {
+        let contract_for = |value: Option<&str>| {
+            let mut body = json_body(json!({"model": "grok-build", "input": "ping"}));
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert("x-grok-turn-idx", HeaderValue::from_str(value).unwrap());
+            }
+            apply_forward_contract(
+                &mut body,
+                &headers,
+                ProxyRoute::CodexResponses,
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap()
+        };
+        let turn = |contract: &GrokForwardContract| {
             contract
                 .headers
                 .iter()
-                .find_map(|(key, value)| (*key == name).then_some(value.as_str()))
+                .find(|(name, _)| *name == "x-grok-turn-idx")
+                .map(|(_, value)| value.clone())
         };
 
-        assert_eq!(header("user-agent"), Some(GROK_CLI_USER_AGENT));
-        assert_eq!(
-            header("x-grok-client-identifier"),
-            Some(GROK_CLI_CLIENT_IDENTIFIER)
-        );
-        assert_eq!(header("x-grok-client-version"), Some(GROK_CLI_VERSION));
-        assert_eq!(header("x-xai-token-auth"), Some(GROK_CLI_TOKEN_AUTH));
+        assert_eq!(turn(&contract_for(Some("7"))), Some("7".to_string()));
+        assert_eq!(turn(&contract_for(None)), None);
+        assert_eq!(turn(&contract_for(Some("-1"))), None);
+        assert_eq!(turn(&contract_for(Some("1.0"))), None);
+        assert_eq!(turn(&contract_for(Some("18446744073709551616"))), None);
     }
 
     #[test]
@@ -912,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn injects_prompt_cache_key_without_overwriting_existing_value() {
+    fn prompt_cache_key_is_always_bound_to_the_server_session() {
         let mut body = json_body(json!({"model": "grok"}));
         inject_prompt_cache_key(&mut body, "session-1").unwrap();
         let value = serde_json::from_slice::<Value>(&body).unwrap();
@@ -921,7 +1167,7 @@ mod tests {
         let mut body = json_body(json!({"model": "grok", "prompt_cache_key": "client"}));
         inject_prompt_cache_key(&mut body, "session-1").unwrap();
         let value = serde_json::from_slice::<Value>(&body).unwrap();
-        assert_eq!(value["prompt_cache_key"], "client");
+        assert_eq!(value["prompt_cache_key"], "session-1");
     }
 
     #[test]
@@ -947,7 +1193,10 @@ mod tests {
         let value = ws_request_body(
             json!({
                 "model": "grok-build",
+                "prompt_cache_key": "client-controlled",
+                "stream": true,
                 "stream_options": {"include_usage": true},
+                "background": true,
                 "tools": [{"type": "unsupported"}, {"type": "function"}]
             }),
             Some("session-1"),
@@ -955,6 +1204,9 @@ mod tests {
         let response = &value["response"];
         assert_eq!(response["model"], "grok-build-0.1");
         assert!(response.get("stream_options").is_none());
+        assert!(response.get("stream").is_none());
+        assert!(response.get("background").is_none());
+        assert_eq!(response["store"], true);
         assert_eq!(response["tools"].as_array().unwrap().len(), 1);
         assert_eq!(response["prompt_cache_key"], "session-1");
     }
@@ -966,6 +1218,13 @@ mod tests {
                 "type": "response.create",
                 "response": {
                     "model": "grok-composer",
+                    "prompt_cache_key": "client-controlled",
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                    "background": true,
+                    "store": false,
+                    "previous_response_id": "resp_previous",
+                    "instructions": "must be removed when continuing",
                     "external_web_access": true,
                     "tools": [{"type": "unsupported"}],
                     "input": [{"encrypted_content": "gAAAAinvalid"}]
@@ -977,8 +1236,62 @@ mod tests {
         assert_eq!(response["model"], "grok-composer-2.5-fast");
         assert!(response.get("external_web_access").is_none());
         assert!(response.get("tools").is_none());
+        assert!(response.get("stream").is_none());
+        assert!(response.get("stream_options").is_none());
+        assert!(response.get("background").is_none());
+        assert!(response.get("instructions").is_none());
+        assert_eq!(response["store"], true);
         assert_eq!(response["input"].as_array().unwrap().len(), 0);
         assert_eq!(response["prompt_cache_key"], "session-1");
+    }
+
+    #[test]
+    fn ws_message_body_sanitizes_flat_response_create() {
+        let value = ws_message_body(
+            json!({
+                "type": "response.create",
+                "model": "grok-build",
+                "stream": true,
+                "background": true,
+                "previous_response_id": "resp_previous",
+                "instructions": "duplicate continuation instructions"
+            }),
+            Some("session-flat"),
+        );
+
+        assert_eq!(value["type"], "response.create");
+        assert_eq!(value["model"], "grok-build-0.1");
+        assert!(value.get("stream").is_none());
+        assert!(value.get("background").is_none());
+        assert!(value.get("instructions").is_none());
+        assert_eq!(value["store"], true);
+        assert_eq!(value["prompt_cache_key"], "session-flat");
+    }
+
+    #[test]
+    fn media_request_validation_rejects_path_and_query_injection() {
+        for request_id in ["video_123", "request-ABC_9"] {
+            validate_media_request(&Method::GET, &format!("/videos/{request_id}")).unwrap();
+        }
+        for path in [
+            "/videos/",
+            "/videos/../models",
+            "/videos/request?include=token",
+            "/videos/request#fragment",
+            "/videos/request%2Fmodels",
+        ] {
+            assert!(
+                validate_media_request(&Method::GET, path).is_err(),
+                "{path}"
+            );
+        }
+        assert!(validate_media_request(
+            &Method::GET,
+            &format!("/videos/{}", "a".repeat(GROK_VIDEO_REQUEST_ID_MAX_LEN + 1)),
+        )
+        .is_err());
+        validate_media_request(&Method::POST, "/images/edits").unwrap();
+        assert!(validate_media_request(&Method::DELETE, "/images/edits").is_err());
     }
 
     #[test]
@@ -990,6 +1303,42 @@ mod tests {
         assert_eq!(
             video_session_key_from_response(br#"{"data":{"id":"vid_2"}}"#).as_deref(),
             Some("grok-video:vid_2")
+        );
+        for body in [
+            br#"{"request_id":"../models"}"#.as_slice(),
+            br#"{"request_id":"request?include=token"}"#.as_slice(),
+            br#"{"request_id":" vid_3 "}"#.as_slice(),
+        ] {
+            assert_eq!(video_session_key_from_response(body), None);
+        }
+        let oversized = serde_json::to_vec(&json!({
+            "request_id": "a".repeat(GROK_VIDEO_REQUEST_ID_MAX_LEN + 1)
+        }))
+        .unwrap();
+        assert_eq!(video_session_key_from_response(&oversized), None);
+    }
+
+    #[test]
+    fn sticky_video_session_key_rejects_untrusted_body_ids() {
+        assert_eq!(
+            sticky_media_session_key("/videos/generations", br#"{"request_id":"request_1"}"#,)
+                .as_deref(),
+            Some("grok-video:request_1")
+        );
+        for body in [
+            br#"{"request_id":"../models"}"#.as_slice(),
+            br#"{"request_id":"request?include=token"}"#.as_slice(),
+            br#"{"request_id":" request_2 "}"#.as_slice(),
+        ] {
+            assert_eq!(sticky_media_session_key("/videos/generations", body), None);
+        }
+        let oversized = serde_json::to_vec(&json!({
+            "request_id": "a".repeat(GROK_VIDEO_REQUEST_ID_MAX_LEN + 1)
+        }))
+        .unwrap();
+        assert_eq!(
+            sticky_media_session_key("/videos/generations", &oversized),
+            None
         );
     }
 

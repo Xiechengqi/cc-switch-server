@@ -771,7 +771,7 @@ async fn auth_routes_cover_password_api_token_and_email_paths() {
 }
 
 #[tokio::test]
-async fn claude_inference_routes_require_dedicated_auth_and_reject_browser_origins() {
+async fn direct_inference_routes_require_dedicated_auth_and_reject_browser_origins() {
     let state = test_state();
     let app = app_router(state);
     for path in [
@@ -795,6 +795,63 @@ async fn claude_inference_routes_require_dedicated_auth_and_reject_browser_origi
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    for (method, path) in [
+        (Method::GET, "/v1/models"),
+        (Method::POST, "/v1/chat/completions"),
+        (Method::POST, "/v1/responses"),
+        (Method::GET, "/v1/responses"),
+        (Method::POST, "/v1/images/generations"),
+        (Method::POST, "/v1/images/edits"),
+        (Method::POST, "/v1/videos/generations"),
+        (Method::GET, "/v1/videos/request-1"),
+        (Method::POST, "/v1beta/models/gemini-pro:generateContent"),
+    ] {
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+        let browser = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("x-api-key", TEST_INFERENCE_TOKEN)
+                    .header("origin", "https://malicious.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser.status(), StatusCode::FORBIDDEN, "{path}");
     }
 
     let response = app
@@ -829,6 +886,7 @@ async fn claude_inference_routes_require_dedicated_auth_and_reject_browser_origi
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -838,6 +896,20 @@ async fn claude_inference_routes_require_dedicated_auth_and_reject_browser_origi
                     axum::http::header::AUTHORIZATION,
                     format!("Bearer {TEST_INFERENCE_TOKEN}"),
                 )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1beta/models/gemini-pro:generateContent")
+                .header("content-type", "application/json")
+                .header("x-goog-api-key", TEST_INFERENCE_TOKEN)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1026,6 +1098,39 @@ async fn account_capabilities_expose_structured_login_flows_and_derived_legacy_f
     assert_eq!(codex_device["supportsCallback"], false);
     assert_eq!(codex_device["supportsPoll"], true);
     assert_eq!(codex_device["supportsCancel"], true);
+}
+
+#[tokio::test]
+async fn grok_browser_login_ignores_a_caller_supplied_redirect_uri() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/login/start",
+            json!({
+                "providerType": "grok_oauth",
+                "redirectUri": "https://attacker.example/callback"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let login = json_body(response).await["login"].clone();
+    assert_eq!(login["redirectUri"], "http://127.0.0.1:56121/callback");
+    assert!(!login.to_string().contains("attacker.example"));
+    let authorize_url = url::Url::parse(login["authorizeUrl"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        authorize_url
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.into_owned())
+            .as_deref(),
+        Some("http://127.0.0.1:56121/callback")
+    );
 }
 
 #[tokio::test]
@@ -2029,6 +2134,7 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/chat/completions")
+                .header("x-api-key", TEST_INFERENCE_TOKEN)
                 .header("x-cc-provider-id", "copilot-managed")
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -9217,19 +9323,50 @@ fn json_request(
         .method(method)
         .uri(uri)
         .header(axum::http::header::CONTENT_TYPE, "application/json");
-    if matches!(
-        uri,
-        "/v1/messages"
-            | "/claude/v1/messages"
-            | "/v1/messages/count_tokens"
-            | "/claude/v1/messages/count_tokens"
-    ) {
+    if is_direct_inference_test_uri(uri) {
         builder = builder.header("x-api-key", TEST_INFERENCE_TOKEN);
     }
     if let Some(token) = bearer {
         builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
     }
     builder.body(body).unwrap()
+}
+
+fn is_direct_inference_test_uri(uri: &str) -> bool {
+    let path = uri.split('?').next().unwrap_or(uri);
+    matches!(
+        path,
+        "/v1/models"
+            | "/models"
+            | "/v1/messages"
+            | "/claude/v1/messages"
+            | "/v1/messages/count_tokens"
+            | "/claude/v1/messages/count_tokens"
+            | "/v1/chat/completions"
+            | "/v1/v1/chat/completions"
+            | "/chat/completions"
+            | "/codex/v1/chat/completions"
+            | "/v1/responses"
+            | "/v1/responses/compact"
+            | "/v1/v1/responses"
+            | "/v1/v1/responses/compact"
+            | "/responses"
+            | "/responses/compact"
+            | "/codex/v1/responses"
+            | "/codex/v1/responses/compact"
+            | "/backend-api/codex/responses"
+            | "/backend-api/codex/responses/compact"
+            | "/v1/images/generations"
+            | "/images/generations"
+            | "/v1/images/edits"
+            | "/images/edits"
+            | "/v1/videos/generations"
+            | "/videos/generations"
+    ) || path.starts_with("/v1/videos/")
+        || path.starts_with("/videos/")
+        || path.starts_with("/v1beta/")
+        || path.starts_with("/gemini/v1/")
+        || path.starts_with("/gemini/v1beta/")
 }
 
 fn control_request(

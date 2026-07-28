@@ -15,6 +15,12 @@ pub(in crate::api) struct ModelsQuery {
 pub(in crate::api) struct OpenAiModelsResponse {
     pub(in crate::api) object: &'static str,
     pub(in crate::api) data: Vec<OpenAiModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) stale: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) fetched_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

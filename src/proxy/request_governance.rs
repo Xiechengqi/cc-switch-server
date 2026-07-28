@@ -74,6 +74,41 @@ pub(super) fn decode_request_body_for_proxy(
     })
 }
 
+pub(super) fn decode_request_body_for_proxy_with_limit(
+    headers: &HeaderMap,
+    body: Bytes,
+    decoded_limit: usize,
+) -> Result<Bytes, ProxyError> {
+    if body.len() > decoded_limit {
+        return Err(decoded_request_body_too_large(decoded_limit));
+    }
+    let Some(codings) = content_encoding_tokens(headers) else {
+        return Ok(body);
+    };
+    if codings.iter().any(|coding| !is_supported_coding(coding)) {
+        return Err(ProxyError::bad_request(format!(
+            "unsupported request content-encoding: {}",
+            codings.join(", ")
+        )));
+    }
+    match decode_content_codings_bounded(body, &codings, decoded_limit) {
+        Ok(body) => Ok(body),
+        Err(BoundedDecodeError::TooLarge) => Err(decoded_request_body_too_large(decoded_limit)),
+        Err(BoundedDecodeError::Io(error)) => Err(ProxyError::bad_request(format!(
+            "failed to decode request content-encoding {}: {error}",
+            codings.join(", ")
+        ))),
+    }
+}
+
+fn decoded_request_body_too_large(limit: usize) -> ProxyError {
+    ProxyError {
+        status: axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        message: format!("decoded request body exceeds the {limit} byte limit"),
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct ResponseDecodeResult {
     pub(super) body: Bytes,
     pub(super) preserve_content_encoding: bool,
@@ -104,6 +139,46 @@ pub(super) fn decode_response_body_for_proxy(
             body,
             preserve_content_encoding: true,
         },
+    }
+}
+
+pub(super) fn decode_response_body_for_proxy_with_limit(
+    headers: &HeaderMap,
+    body: Bytes,
+    decoded_limit: usize,
+) -> Result<ResponseDecodeResult, ProxyError> {
+    if body.len() > decoded_limit {
+        return Err(decoded_response_body_too_large(decoded_limit));
+    }
+    let Some(codings) = content_encoding_tokens(headers) else {
+        return Ok(ResponseDecodeResult {
+            body,
+            preserve_content_encoding: false,
+        });
+    };
+    if codings.iter().any(|coding| !is_supported_coding(coding)) {
+        return Ok(ResponseDecodeResult {
+            body,
+            preserve_content_encoding: true,
+        });
+    }
+    match decode_content_codings_bounded(body.clone(), &codings, decoded_limit) {
+        Ok(decoded) => Ok(ResponseDecodeResult {
+            body: decoded,
+            preserve_content_encoding: false,
+        }),
+        Err(BoundedDecodeError::TooLarge) => Err(decoded_response_body_too_large(decoded_limit)),
+        Err(BoundedDecodeError::Io(_)) => Ok(ResponseDecodeResult {
+            body,
+            preserve_content_encoding: true,
+        }),
+    }
+}
+
+fn decoded_response_body_too_large(limit: usize) -> ProxyError {
+    ProxyError {
+        status: axum::http::StatusCode::BAD_GATEWAY,
+        message: format!("decoded upstream response body exceeds the {limit} byte limit"),
     }
 }
 
@@ -347,6 +422,23 @@ fn decode_content_codings(body: Bytes, codings: &[String]) -> std::io::Result<By
     Ok(Bytes::from(current))
 }
 
+enum BoundedDecodeError {
+    Io(std::io::Error),
+    TooLarge,
+}
+
+fn decode_content_codings_bounded(
+    body: Bytes,
+    codings: &[String],
+    limit: usize,
+) -> Result<Bytes, BoundedDecodeError> {
+    let mut current = body.to_vec();
+    for coding in codings.iter().rev() {
+        current = decode_single_coding_bounded(coding, &current, limit)?;
+    }
+    Ok(Bytes::from(current))
+}
+
 fn decode_single_coding(coding: &str, body: &[u8]) -> std::io::Result<Vec<u8>> {
     match coding {
         "gzip" | "x-gzip" => read_all(GzDecoder::new(body)),
@@ -357,9 +449,37 @@ fn decode_single_coding(coding: &str, body: &[u8]) -> std::io::Result<Vec<u8>> {
     }
 }
 
+fn decode_single_coding_bounded(
+    coding: &str,
+    body: &[u8],
+    limit: usize,
+) -> Result<Vec<u8>, BoundedDecodeError> {
+    match coding {
+        "gzip" | "x-gzip" => read_all_bounded(GzDecoder::new(body), limit),
+        "deflate" => match read_all_bounded(ZlibDecoder::new(body), limit) {
+            Err(BoundedDecodeError::Io(_)) => read_all_bounded(DeflateDecoder::new(body), limit),
+            result => result,
+        },
+        _ => Ok(body.to_vec()),
+    }
+}
+
 fn read_all(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     reader.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn read_all_bounded(reader: impl Read, limit: usize) -> Result<Vec<u8>, BoundedDecodeError> {
+    let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    let mut output = Vec::new();
+    reader
+        .take(read_limit)
+        .read_to_end(&mut output)
+        .map_err(BoundedDecodeError::Io)?;
+    if output.len() > limit {
+        return Err(BoundedDecodeError::TooLarge);
+    }
     Ok(output)
 }
 
@@ -403,6 +523,25 @@ mod tests {
             media_heuristic_enabled: false,
             private_field_whitelist: vec!["_metadata".to_string()],
         }
+    }
+
+    #[test]
+    fn bounded_response_decode_rejects_wire_and_expanded_bodies() {
+        let headers = HeaderMap::new();
+        let wire_error =
+            decode_response_body_for_proxy_with_limit(&headers, Bytes::from_static(b"12345"), 4)
+                .unwrap_err();
+        assert_eq!(wire_error.status, axum::http::StatusCode::BAD_GATEWAY);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&vec![b'x'; 1024]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut gzip_headers = HeaderMap::new();
+        gzip_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let expanded_error =
+            decode_response_body_for_proxy_with_limit(&gzip_headers, Bytes::from(compressed), 128)
+                .unwrap_err();
+        assert_eq!(expanded_error.status, axum::http::StatusCode::BAD_GATEWAY);
     }
 
     #[test]
@@ -657,6 +796,27 @@ mod tests {
             decode_request_body_for_proxy(&headers, Bytes::from(raw)).unwrap(),
             Bytes::from_static(body)
         );
+    }
+
+    #[test]
+    fn bounded_request_decode_rejects_wire_and_inflated_body_overflow() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&vec![b'x'; 4_096]).unwrap();
+        let gzip = gzip.finish().unwrap();
+
+        let inflated = decode_request_body_for_proxy_with_limit(&headers, Bytes::from(gzip), 1_024)
+            .unwrap_err();
+        assert_eq!(inflated.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        let wire = decode_request_body_for_proxy_with_limit(
+            &HeaderMap::new(),
+            Bytes::from(vec![b'x'; 1_025]),
+            1_024,
+        )
+        .unwrap_err();
+        assert_eq!(wire.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

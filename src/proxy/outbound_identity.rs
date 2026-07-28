@@ -54,10 +54,7 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
             crate::codex_identity::finalize_owned_headers(headers);
         }
         ManagedIdentityFamily::GrokCli => {
-            set_user_agent(
-                headers,
-                crate::domain::grok_cli::GROK_CLI_USER_AGENT.to_string(),
-            );
+            set_user_agent(headers, crate::domain::grok_cli::grok_cli_user_agent());
         }
         ManagedIdentityFamily::Kiro => {
             set_user_agent(headers, "aws-sdk-js/1.0.34 KiroIDE-2.3.0".to_string())
@@ -188,7 +185,7 @@ mod tests {
             ),
             (
                 ManagedIdentityFamily::GrokCli,
-                crate::domain::grok_cli::GROK_CLI_USER_AGENT.to_string(),
+                crate::domain::grok_cli::grok_cli_user_agent(),
             ),
             (
                 ManagedIdentityFamily::Kiro,

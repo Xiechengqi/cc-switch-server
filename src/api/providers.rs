@@ -487,6 +487,9 @@ pub(in crate::api) async fn fetch_provider_models(
                 merged: false,
                 merged_count: 0,
                 models: Vec::new(),
+                source: None,
+                stale: None,
+                fetched_at_ms: None,
                 provider: None,
             }));
         }
@@ -507,6 +510,9 @@ pub(in crate::api) async fn fetch_provider_models(
             merged: false,
             merged_count: 0,
             models: Vec::new(),
+            source: None,
+            stale: None,
+            fetched_at_ms: None,
             provider: None,
         }));
     }
@@ -530,6 +536,9 @@ pub(in crate::api) async fn fetch_provider_models(
         merged: false,
         merged_count: 0,
         models: fetched.models,
+        source: fetched.source,
+        stale: fetched.stale,
+        fetched_at_ms: fetched.fetched_at_ms,
         provider: None,
     }))
 }
@@ -669,7 +678,7 @@ pub(in crate::api) async fn test_provider_inner(
     if query.network.unwrap_or(false) {
         if let Some((provider_type, account_id)) = execution.managed_account_target() {
             state
-                .refresh_managed_account_if_needed(provider_type, account_id)
+                .refresh_managed_account_if_needed(provider_type, Some(account_id))
                 .await
                 .map_err(map_managed_account_refresh_error)?;
         }
@@ -953,6 +962,9 @@ fn redact_provider_endpoint(endpoint: &str) -> String {
 pub(in crate::api) struct ProviderModelsFetchResult {
     url: String,
     models: Vec<FetchedProviderModel>,
+    source: Option<String>,
+    stale: Option<bool>,
+    fetched_at_ms: Option<i64>,
 }
 
 pub(in crate::api) async fn fetch_provider_models_inner(
@@ -965,6 +977,89 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     execution
         .ensure_operation_supported(proxy::provider_ops::ProviderOperation::Discovery)
         .map_err(ApiError::proxy)?;
+    if stored.provider_type == ProviderType::GrokOAuth {
+        let managed_binding = match &execution.plan.auth_ref {
+            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::GrokOAuth,
+                auth_identity_generation,
+            } if execution.driver_is("oauth.grok_responses") && !account_id.trim().is_empty() => {
+                Some((account_id.as_str(), *auth_identity_generation))
+            }
+            _ => None,
+        };
+        let catalog = match managed_binding {
+            None => crate::clients::oauth::grok_models::static_grok_model_catalog(
+                "managed_account_binding_unavailable",
+            ),
+            Some(_) if state.credential_persistence_degraded() => {
+                crate::clients::oauth::grok_models::static_grok_model_catalog(
+                    "credential_persistence_degraded",
+                )
+            }
+            Some((account_id, expected_generation)) => {
+                let refresh = state
+                    .refresh_managed_account_if_needed(ProviderType::GrokOAuth, Some(account_id))
+                    .await;
+                if let Err(error) = refresh {
+                    tracing::warn!(error = ?error, "Grok model discovery token refresh failed");
+                    crate::clients::oauth::grok_models::static_grok_model_catalog(
+                        "token_refresh_failed",
+                    )
+                } else if state.credential_persistence_degraded() {
+                    crate::clients::oauth::grok_models::static_grok_model_catalog(
+                        "credential_persistence_degraded",
+                    )
+                } else {
+                    let account = state
+                        .find_account_for_provider(ProviderType::GrokOAuth, Some(account_id))
+                        .await
+                        .filter(|account| account.auth_identity_generation == expected_generation);
+                    if let Some((account, access_token)) = account.as_ref().and_then(|account| {
+                        account
+                            .access_token
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|token| !token.is_empty())
+                            .map(|token| (account, token))
+                    }) {
+                        #[cfg(test)]
+                        if let Some(url) = execution
+                            .plan
+                            .driver_options
+                            .get("testGrokModelsUrl")
+                            .and_then(Value::as_str)
+                        {
+                            return Ok(grok_provider_models_fetch_result(
+                                crate::clients::oauth::grok_models::grok_model_catalog_at_test_url(
+                                    &state.http_client().await,
+                                    &account.id,
+                                    access_token,
+                                    url,
+                                )
+                                .await,
+                                url,
+                            ));
+                        }
+                        crate::clients::oauth::grok_models::grok_model_catalog(
+                            &state.http_client().await,
+                            &account.id,
+                            access_token,
+                        )
+                        .await
+                    } else {
+                        crate::clients::oauth::grok_models::static_grok_model_catalog(
+                            "access_token_unavailable",
+                        )
+                    }
+                }
+            }
+        };
+        return Ok(grok_provider_models_fetch_result(
+            catalog,
+            crate::clients::oauth::grok_models::GROK_MODELS_URL,
+        ));
+    }
     let accounts = state.accounts_snapshot().await;
     let adapter = proxy::adapters::adapter_for(stored.app, stored.provider_type);
     let mut url = execution.discovery_url().map_err(ApiError::proxy)?;
@@ -1013,7 +1108,36 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     Ok(ProviderModelsFetchResult {
         url,
         models: parse_provider_models(&raw),
+        source: Some("upstream".to_string()),
+        stale: Some(false),
+        fetched_at_ms: Some(chrono::Utc::now().timestamp_millis()),
     })
+}
+
+fn grok_provider_models_fetch_result(
+    catalog: crate::clients::oauth::grok_models::GrokModelCatalog,
+    url: &str,
+) -> ProviderModelsFetchResult {
+    let models = catalog
+        .models
+        .iter()
+        .map(|id| FetchedProviderModel {
+            id: id.clone(),
+            upstream_model: id.clone(),
+            display_name: None,
+            raw: serde_json::json!({
+                "id": id,
+                "object": "model",
+            }),
+        })
+        .collect();
+    ProviderModelsFetchResult {
+        url: url.to_string(),
+        models,
+        source: Some(catalog.source.to_string()),
+        stale: Some(catalog.stale),
+        fetched_at_ms: catalog.fetched_at_ms,
+    }
 }
 
 pub(in crate::api) fn parse_provider_models(raw: &Value) -> Vec<FetchedProviderModel> {
@@ -1602,6 +1726,7 @@ fn map_managed_account_refresh_error(error: crate::state::ManagedAccountRefreshE
         ManagedAccountRefreshError::Refresh {
             status_code,
             message: _,
+            retry_after_ms,
         } => ApiError::new(
             StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
             match status_code {
@@ -1609,7 +1734,8 @@ fn map_managed_account_refresh_error(error: crate::state::ManagedAccountRefreshE
                 429 => "managed account refresh was rate limited; retry later",
                 _ => "managed account refresh failed",
             },
-        ),
+        )
+        .with_retry_after_ms(retry_after_ms),
     }
 }
 
@@ -1618,7 +1744,33 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::domain::providers::model::{AppKind, Provider, ProviderType};
+    use crate::domain::providers::model::{
+        AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
+    };
+
+    fn provider_api_test_state(name: &str) -> ServerState {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(
+                    std::env::temp_dir()
+                        .join(format!("cc-switch-server-provider-api-{name}-{nanos}")),
+                ),
+                web_dist_dir: None,
+                log_level: "warn".to_string(),
+                command: None,
+            },
+            std::sync::Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn provider_test_body_prefers_test_config_model() {
@@ -1666,6 +1818,302 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn grok_model_discovery_exposes_source_stale_and_fetch_time() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed_authorization = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let observed_for_route = std::sync::Arc::clone(&observed_authorization);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move |headers: HeaderMap| {
+                let observed = std::sync::Arc::clone(&observed_for_route);
+                async move {
+                    *observed.lock().unwrap() = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    axum::Json(json!({"data": [{"id": "grok-mock-live"}]}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("grok-model-catalog");
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "grok-model-account",
+                        "providerType": "grok_oauth",
+                        "accessToken": "grok-model-access",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "verifiedGrokClaims": {"subject": "grok-model-subject"}
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-model-provider".to_string(),
+                        name: "Grok model provider".to_string(),
+                        settings_config: json!({"testGrokModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("grok_oauth".to_string()),
+                                account_id: Some("grok-model-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution =
+            resolve_provider_execution_by_key(&state, AppKind::Codex, "grok-model-provider")
+                .await
+                .unwrap();
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+
+        assert_eq!(fetched.source.as_deref(), Some("upstream"));
+        assert_eq!(fetched.stale, Some(false));
+        assert!(fetched.fetched_at_ms.is_some_and(|value| value > 0));
+        assert_eq!(fetched.models.len(), 1);
+        assert_eq!(fetched.models[0].id, "grok-mock-live");
+        assert_eq!(
+            observed_authorization.lock().unwrap().as_str(),
+            "Bearer grok-model-access"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_model_discovery_stops_before_models_when_token_refresh_fails() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let model_requests_for_route = std::sync::Arc::clone(&model_requests);
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                axum::routing::post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({"error": "invalid_grant"})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                axum::routing::get(move || {
+                    let requests = std::sync::Arc::clone(&model_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({
+                            "data": [{"id": "must-not-be-requested"}]
+                        }))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("grok-model-refresh-rejected");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "grok-provider-refresh-rejected-account",
+                        "providerType": "grok_oauth",
+                        "accessToken": "stale-provider-model-access",
+                        "refreshToken": "rejected-provider-model-refresh",
+                        "expiresAt": 1,
+                        "profile": {
+                            "verifiedGrokClaims": {
+                                "subject": "grok-provider-refresh-rejected-subject"
+                            }
+                        },
+                        "raw": {"testOAuthTokenUrl": token_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-provider-refresh-rejected".to_string(),
+                        name: "Grok provider refresh rejected".to_string(),
+                        settings_config: json!({"testGrokModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("grok_oauth".to_string()),
+                                account_id: Some(
+                                    "grok-provider-refresh-rejected-account".to_string(),
+                                ),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution = resolve_provider_execution_by_key(
+            &state,
+            AppKind::Codex,
+            "grok-provider-refresh-rejected",
+        )
+        .await
+        .unwrap();
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+
+        assert_eq!(fetched.source.as_deref(), Some("static_fallback"));
+        assert_eq!(fetched.stale, Some(true));
+        assert!(!state.credential_persistence_degraded());
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_model_discovery_never_borrows_an_account_for_legacy_api_key_auth() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let model_requests_for_route = std::sync::Arc::clone(&model_requests);
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                axum::routing::post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({"access_token": "must-not-be-requested"}))
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                axum::routing::get(move || {
+                    let requests = std::sync::Arc::clone(&model_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({"data": [{"id": "must-not-be-requested"}]}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("grok-model-legacy-api-key");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "grok-model-unrelated-account",
+                        "providerType": "grok_oauth",
+                        "accessToken": "unrelated-expired-access",
+                        "refreshToken": "unrelated-refresh",
+                        "expiresAt": 1,
+                        "profile": {
+                            "verifiedGrokClaims": {"subject": "unrelated-subject"}
+                        },
+                        "raw": {"testOAuthTokenUrl": token_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-model-legacy-api-key".to_string(),
+                        name: "Grok legacy API key".to_string(),
+                        settings_config: json!({
+                            "env": {"OPENAI_API_KEY": "legacy-api-key"},
+                            "testGrokModelsUrl": models_url
+                        }),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".to_string()),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution =
+            resolve_provider_execution_by_key(&state, AppKind::Codex, "grok-model-legacy-api-key")
+                .await
+                .unwrap();
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+
+        assert_eq!(fetched.source.as_deref(), Some("static_fallback"));
+        assert_eq!(fetched.stale, Some(true));
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
     }
 
     #[test]

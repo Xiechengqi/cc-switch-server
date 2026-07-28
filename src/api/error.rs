@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{header::RETRY_AFTER, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
@@ -22,6 +22,8 @@ pub(crate) struct ErrorResponse {
     pub(crate) status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) retryable: Option<bool>,
+    #[serde(rename = "retryAfterSeconds", skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_after_seconds: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -31,6 +33,7 @@ pub struct ApiError {
     pub(crate) code: Option<&'static str>,
     pub(crate) error_type: Option<&'static str>,
     pub(crate) retryable: Option<bool>,
+    pub(crate) retry_after_seconds: Option<u64>,
 }
 
 impl ApiError {
@@ -41,6 +44,7 @@ impl ApiError {
             code: None,
             error_type: None,
             retryable: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -55,6 +59,7 @@ impl ApiError {
             code: Some(code),
             error_type: None,
             retryable: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -77,6 +82,7 @@ impl ApiError {
             code: Some(code),
             error_type: None,
             retryable: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -87,6 +93,7 @@ impl ApiError {
             code: Some(code),
             error_type: None,
             retryable: Some(false),
+            retry_after_seconds: None,
         }
     }
 
@@ -97,6 +104,7 @@ impl ApiError {
             code: Some("cc_switch_provider_contract_mismatch"),
             error_type: Some("provider_contract_mismatch"),
             retryable: Some(false),
+            retry_after_seconds: None,
         }
     }
 
@@ -111,6 +119,7 @@ impl ApiError {
             code: Some("cc_switch_feature_disabled"),
             error_type: Some("feature_disabled"),
             retryable: Some(false),
+            retry_after_seconds: None,
         }
     }
 
@@ -124,6 +133,7 @@ impl ApiError {
             code: Some("cc_switch_web_invoke_unknown"),
             error_type: Some("web_invoke_unknown"),
             retryable: Some(false),
+            retry_after_seconds: None,
         }
     }
 
@@ -134,6 +144,7 @@ impl ApiError {
             code: Some("cc_switch_web_invoke_not_wired"),
             error_type: Some("web_invoke_not_wired"),
             retryable: Some(false),
+            retry_after_seconds: None,
         }
     }
 
@@ -155,19 +166,32 @@ impl ApiError {
         let error_type = error.error_type();
         let retryable = error.retryable();
         let message = error.client_message().to_string();
+        let retry_after_seconds = error.retry_after_seconds();
         Self {
             status: error.status,
             message,
             code: Some(code),
             error_type: Some(error_type),
             retryable: Some(retryable),
+            retry_after_seconds,
         }
+    }
+
+    pub(crate) fn with_retry_after_ms(mut self, retry_after_ms: Option<i64>) -> Self {
+        self.retry_after_seconds = retry_after_ms.map(|milliseconds| {
+            u64::try_from(milliseconds.max(0))
+                .unwrap_or(u64::MAX)
+                .saturating_add(999)
+                / 1_000
+        });
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let retry_after_seconds = self.retry_after_seconds;
+        let mut response = (
             self.status,
             Json(ErrorResponse {
                 ok: false,
@@ -176,9 +200,16 @@ impl IntoResponse for ApiError {
                 error_type: self.error_type,
                 status: Some(self.status.as_u16()),
                 retryable: self.retryable,
+                retry_after_seconds,
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(seconds) = retry_after_seconds {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -243,6 +274,29 @@ pub(crate) fn map_account_write_error(error: anyhow::Error) -> ApiError {
         return map_subscription_binding_error(binding.clone());
     }
     ApiError::internal(error)
+}
+
+#[cfg(test)]
+mod retry_response_tests {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn rate_limit_response_exposes_matching_header_and_json_delay() {
+        let response = super::ApiError::proxy(crate::proxy::ProxyError::rate_limited(
+            "account is cooling down",
+            7,
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "7");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["retryAfterSeconds"], 7);
+        assert_eq!(json["error"], "account is cooling down");
+        assert_eq!(json["retryable"], true);
+    }
 }
 
 pub(crate) fn map_codex_workspace_rebind_error(

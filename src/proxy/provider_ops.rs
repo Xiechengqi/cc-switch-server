@@ -109,6 +109,21 @@ impl ProviderExecution {
                 self.plan.warnings.join("; ")
             )));
         }
+        if self.stored.provider_type == ProviderType::GrokOAuth
+            && !matches!(
+                &self.plan.auth_ref,
+                RuntimeAuthRef::ManagedAccount {
+                    account_id,
+                    expected_provider_type: ProviderType::GrokOAuth,
+                    ..
+                } if !account_id.trim().is_empty()
+            )
+        {
+            return Err(ProxyError::bad_request(format!(
+                "Provider {} must explicitly bind a grok_oauth managed account",
+                self.stored.provider.id
+            )));
+        }
         if matches!(
             self.plan.auth_ref,
             RuntimeAuthRef::Legacy {
@@ -173,25 +188,25 @@ impl ProviderExecution {
         }
     }
 
-    pub fn managed_account_target(&self) -> Option<(ProviderType, Option<&str>)> {
+    pub fn managed_account_target(&self) -> Option<(ProviderType, &str)> {
         match &self.plan.auth_ref {
             RuntimeAuthRef::ManagedAccount {
                 account_id,
                 expected_provider_type,
                 ..
-            } => Some((*expected_provider_type, Some(account_id.as_str()))),
+            } => Some((*expected_provider_type, account_id.as_str())),
             RuntimeAuthRef::Legacy {
                 account_id: Some(account_id),
                 ..
             } if matches!(
                 self.stored.provider_type,
-                ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+                ProviderType::ClaudeOAuth | ProviderType::CodexOAuth | ProviderType::GrokOAuth
             ) || (provider_secret(&self.stored).is_none()
                 && oauth_provider_spec(self.stored.provider_type).is_some_and(|spec| {
                     spec.server_native_refresh_enabled() && !spec.token_urls.is_empty()
                 })) =>
             {
-                Some((self.stored.provider_type, Some(account_id.as_str())))
+                Some((self.stored.provider_type, account_id.as_str()))
             }
             _ => None,
         }
@@ -578,6 +593,7 @@ impl ProviderExecution {
                 route,
                 None,
                 None,
+                None,
                 matches!(self.plan.auth_ref, RuntimeAuthRef::ManagedAccount { .. }),
             )?;
             request.model = Some(contract.actual_model.clone());
@@ -590,7 +606,6 @@ impl ProviderExecution {
                 endpoint,
                 matches!(self.plan.auth_ref, RuntimeAuthRef::ManagedAccount { .. }),
             );
-            self.enforce_model_policy(request)?;
         }
         Ok(())
     }
@@ -971,6 +986,21 @@ fn account_header_override_blocked(name: &str, provider_type: ProviderType) -> b
     {
         return true;
     }
+    if provider_type == ProviderType::GrokOAuth
+        && matches!(
+            normalized.as_str(),
+            "x-xai-token-auth"
+                | "x-grok-client-identifier"
+                | "x-grok-client-version"
+                | "x-grok-client-surface"
+                | "x-authenticateresponse"
+                | "x-grok-conv-id"
+                | "x-grok-cache-identity"
+                | "x-grok-turn-idx"
+        )
+    {
+        return true;
+    }
     matches!(
         normalized.as_str(),
         "authorization"
@@ -1170,6 +1200,62 @@ mod tests {
     }
 
     #[test]
+    fn grok_test_contract_keeps_the_normalized_single_model_alias() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "grok-account".to_string(),
+                expected_provider_type: ProviderType::GrokOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({}),
+            1,
+        );
+        execution.stored.provider_type = ProviderType::GrokOAuth;
+        execution.stored.provider_type_id = ProviderType::GrokOAuth.as_str().to_string();
+        let plan = Arc::make_mut(&mut execution.plan);
+        plan.driver_id =
+            crate::domain::providers::registry::DriverId::parse("oauth.grok_responses").unwrap();
+        plan.model_policy = RuntimeModelPolicy::Single {
+            upstream_model: "grok-composer".to_string(),
+        };
+
+        let mut request = AdapterRequest {
+            body: bytes::Bytes::from_static(br#"{"model":"requested-model","input":[]}"#),
+            upstream_endpoint: None,
+            upstream_headers: vec![],
+            model: Some("requested-model".to_string()),
+            requested_model: Some("requested-model".to_string()),
+            actual_model: None,
+            actual_model_source: None,
+            stream_requested: false,
+            custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
+            claude_tool_name_map: Default::default(),
+        };
+        execution.enforce_model_policy(&mut request).unwrap();
+        execution.finalize_request(&mut request).unwrap();
+        let mut endpoint = execution
+            .resolve_endpoint(ProxyRoute::CodexResponses, None, &request)
+            .unwrap();
+        execution
+            .apply_test_forward_contract(
+                ProxyRoute::CodexResponses,
+                &mut request,
+                &mut endpoint,
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "grok-composer-2.5-fast");
+        assert_eq!(
+            request.actual_model.as_deref(),
+            Some("grok-composer-2.5-fast")
+        );
+    }
+
+    #[test]
     fn static_auth_placement_is_defined_by_the_runtime_scheme() {
         let api_key = execution_with_auth(
             RuntimeAuthRef::StaticCredential {
@@ -1267,7 +1353,7 @@ mod tests {
         );
         assert_eq!(
             typed.managed_account_target(),
-            Some((ProviderType::ClaudeOAuth, Some("typed-account")))
+            Some((ProviderType::ClaudeOAuth, "typed-account"))
         );
 
         let mut legacy = execution_with_auth(
@@ -1287,15 +1373,47 @@ mod tests {
         });
         assert_eq!(
             legacy.managed_account_target(),
-            Some((ProviderType::ClaudeOAuth, Some("legacy-account")))
+            Some((ProviderType::ClaudeOAuth, "legacy-account"))
         );
 
         legacy.stored.provider.settings_config =
             json!({"env": {"ANTHROPIC_AUTH_TOKEN": "provider-secret"}});
         assert_eq!(
             legacy.managed_account_target(),
-            Some((ProviderType::ClaudeOAuth, Some("legacy-account")))
+            Some((ProviderType::ClaudeOAuth, "legacy-account"))
         );
+
+        legacy.stored.app = AppKind::Codex;
+        legacy.stored.provider_type = ProviderType::GrokOAuth;
+        legacy.stored.provider.settings_config =
+            json!({"env": {"OPENAI_API_KEY": "stale-provider-secret"}});
+        assert_eq!(
+            legacy.managed_account_target(),
+            Some((ProviderType::GrokOAuth, "legacy-account"))
+        );
+    }
+
+    #[test]
+    fn grok_account_headers_cannot_override_proxy_protocol_identity() {
+        for name in [
+            "x-xai-token-auth",
+            "X-Grok-Client-Identifier",
+            "x-grok-client-version",
+            "x-grok-client-surface",
+            "x-authenticateresponse",
+            "x-grok-conv-id",
+            "x-grok-cache-identity",
+            "x-grok-turn-idx",
+        ] {
+            assert!(account_header_override_blocked(
+                name,
+                ProviderType::GrokOAuth
+            ));
+        }
+        assert!(!account_header_override_blocked(
+            "x-enterprise-sso",
+            ProviderType::GrokOAuth
+        ));
     }
 
     #[test]
@@ -1318,6 +1436,30 @@ mod tests {
         let error = legacy.ensure_ready().unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("must explicitly bind"));
+        assert_eq!(legacy.managed_account_target(), None);
+    }
+
+    #[test]
+    fn unbound_legacy_grok_is_not_ready_even_with_a_static_secret() {
+        let mut legacy = execution_with_auth(
+            RuntimeAuthRef::Legacy {
+                account_id: None,
+                credential_generation: 1,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({"env": {"OPENAI_API_KEY": "legacy-secret"}}),
+            1,
+        );
+        legacy.stored.provider_type = ProviderType::GrokOAuth;
+        legacy.stored.provider_type_id = ProviderType::GrokOAuth.as_str().to_string();
+        legacy.plan = Arc::new(ProviderRuntimePlan {
+            configuration_state: RuntimeConfigurationState::LegacyCompat,
+            ..legacy.plan.as_ref().clone()
+        });
+
+        let error = legacy.ensure_ready().unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("grok_oauth managed account"));
         assert_eq!(legacy.managed_account_target(), None);
     }
 

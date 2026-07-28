@@ -17,9 +17,9 @@ use crate::domain::accounts::store::{
 };
 use crate::domain::claude_cli::claude_cli_user_agent;
 use crate::domain::grok_cli::{
-    GROK_CLI_CLIENT_IDENTIFIER, GROK_CLI_MONTHLY_BILLING_URL, GROK_CLI_TOKEN_AUTH,
-    GROK_CLI_USER_AGENT, GROK_CLI_USER_URL, GROK_CLI_VERSION, GROK_CLI_WEEKLY_BILLING_URL,
-    GROK_SUBSCRIPTIONS_URL, GROK_TASK_USAGE_URL,
+    grok_cli_user_agent, grok_cli_version, GROK_CLI_CLIENT_IDENTIFIER,
+    GROK_CLI_MONTHLY_BILLING_URL, GROK_CLI_TOKEN_AUTH, GROK_CLI_USER_URL,
+    GROK_CLI_WEEKLY_BILLING_URL, GROK_SUBSCRIPTIONS_URL, GROK_TASK_USAGE_URL,
 };
 use crate::domain::providers::model::ProviderType;
 
@@ -901,10 +901,10 @@ async fn grok_probe_json(
             .get(url)
             .header(AUTHORIZATION, format!("Bearer {access_token}"))
             .header(ACCEPT, "application/json")
-            .header(USER_AGENT, GROK_CLI_USER_AGENT)
+            .header(USER_AGENT, grok_cli_user_agent())
             .header("x-xai-token-auth", GROK_CLI_TOKEN_AUTH)
             .header("x-grok-client-identifier", GROK_CLI_CLIENT_IDENTIFIER)
-            .header("x-grok-client-version", GROK_CLI_VERSION)
+            .header("x-grok-client-version", grok_cli_version())
             .header("x-grok-client-surface", "grok-cli")
             .header("x-grok-client-mode", "headless")
             .timeout(request_timeout);

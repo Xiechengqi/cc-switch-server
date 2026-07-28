@@ -42,8 +42,8 @@ use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::AccountRefreshLocks;
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{
-    active_account_usage_block, Account, AccountRefreshUpdate, AccountStore,
-    ManualSubscriptionExpiryError,
+    active_account_usage_block, native_refresh_snapshot_matches, Account, AccountRefreshUpdate,
+    AccountStore, ManualSubscriptionExpiryError,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::credentials::{
@@ -338,9 +338,15 @@ pub type ServerState = Arc<ServerStateInner>;
 
 #[derive(Debug)]
 pub enum ManagedAccountRefreshError {
-    Conflict { provider_type: ProviderType },
+    Conflict {
+        provider_type: ProviderType,
+    },
     NotFound,
-    Refresh { status_code: u16, message: String },
+    Refresh {
+        status_code: u16,
+        message: String,
+        retry_after_ms: Option<i64>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -392,6 +398,8 @@ pub struct GrokMediaSessionBinding {
     pub account_id: Option<String>,
     pub expires_at_ms: i64,
 }
+
+const GROK_MEDIA_SESSION_MAX_BINDINGS: usize = 4_096;
 
 pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
     vec![
@@ -4124,7 +4132,7 @@ impl ServerStateInner {
 
     pub(crate) async fn commit_native_refresh_success(
         self: &Arc<Self>,
-        account_id: &str,
+        expected: &Account,
         update: AccountRefreshUpdate,
     ) -> Result<Account, NativeRefreshCommitError> {
         let _references = self.reference_mutations.lock().await;
@@ -4136,10 +4144,29 @@ impl ServerStateInner {
         let mut accounts = self.accounts.write().await;
         let shares = self.shares.read().await;
         let current = accounts.clone();
+        let live = current
+            .accounts
+            .iter()
+            .find(|account| account.id == expected.id)
+            .cloned()
+            .with_context(|| format!("managed account not found: {}", expected.id))
+            .map_err(NativeRefreshCommitError::State)?;
+        if !native_refresh_snapshot_matches(&live, expected) {
+            tracing::info!(
+                account_id = %expected.id,
+                provider_type = %expected.provider_type.as_str(),
+                expected_auth_generation = expected.auth_identity_generation,
+                current_auth_generation = live.auth_identity_generation,
+                expected_token_generation = expected.token_refresh_generation,
+                current_token_generation = live.token_refresh_generation,
+                "discarded superseded OAuth refresh result"
+            );
+            return Ok(live);
+        }
         let mut candidate = current.clone();
         let updated = candidate
-            .mark_native_refresh_success(account_id, update)
-            .with_context(|| format!("managed account not found: {account_id}"))
+            .mark_native_refresh_success(&expected.id, update)
+            .with_context(|| format!("managed account not found: {}", expected.id))
             .map_err(NativeRefreshCommitError::State)?;
         crate::domain::sharing::subscription_identity::validate_ordinary_account_subscription_change(
             &providers,
@@ -4172,8 +4199,12 @@ impl ServerStateInner {
         #[cfg(not(test))]
         let persist_result = candidate.save(&self.config_dir);
 
-        // A rotating refresh token may already have invalidated the previous token.
-        // Keep the new credentials live even when durable storage is temporarily unavailable.
+        // Publish the degraded gate before credentials that failed to persist become visible.
+        // A rotating refresh token may already have invalidated the previous token, so the new
+        // credentials remain live for the persistence retry but cannot be used for new traffic.
+        if persist_result.is_err() {
+            self.mark_credential_persistence_degraded();
+        }
         *accounts = candidate;
         drop(shares);
         drop(accounts);
@@ -4182,7 +4213,6 @@ impl ServerStateInner {
         drop(_references);
 
         if let Err(error) = persist_result {
-            self.mark_credential_persistence_degraded();
             self.schedule_credential_persistence_retry();
             return Err(NativeRefreshCommitError::Persistence(error));
         }
@@ -4193,19 +4223,32 @@ impl ServerStateInner {
 
     pub(crate) async fn commit_native_refresh_failure(
         self: &Arc<Self>,
-        account_id: &str,
+        expected: &Account,
         message: String,
         kind: crate::domain::accounts::oauth::OAuthErrorKind,
     ) -> anyhow::Result<Option<Account>> {
-        let account_id = account_id.to_string();
+        let expected = expected.clone();
         self.mutate_accounts_immediate(move |accounts| {
+            let current = accounts
+                .accounts
+                .iter()
+                .find(|account| account.id == expected.id)
+                .cloned()?;
+            if !native_refresh_snapshot_matches(&current, &expected) {
+                tracing::info!(
+                    account_id = %expected.id,
+                    provider_type = %expected.provider_type.as_str(),
+                    "discarded superseded OAuth refresh failure"
+                );
+                return Some(current);
+            }
             let message = accounts
                 .accounts
                 .iter()
-                .find(|account| account.id == account_id)
+                .find(|account| account.id == expected.id)
                 .map(|account| redact_account_error_for_log(account, &message))
                 .unwrap_or_else(|| crate::logging::redact_sensitive_text(&message));
-            accounts.mark_native_refresh_failure(&account_id, message, kind)
+            accounts.mark_native_refresh_failure(&expected.id, message, kind)
         })
         .await
     }
@@ -4268,7 +4311,7 @@ impl ServerStateInner {
     }
 
     #[cfg(test)]
-    fn inject_account_refresh_persist_failures(&self, count: u64) {
+    pub(crate) fn inject_account_refresh_persist_failures(&self, count: u64) {
         self.account_refresh_persist_failures
             .store(count, std::sync::atomic::Ordering::Release);
     }
@@ -5316,7 +5359,7 @@ impl ServerStateInner {
                     "managed OAuth account refresh failed"
                 );
                 let updated = match self
-                    .commit_native_refresh_failure(&account.id, error.message.clone(), error.kind)
+                    .commit_native_refresh_failure(&account, error.message.clone(), error.kind)
                     .await
                 {
                     Ok(updated) => updated,
@@ -5344,14 +5387,12 @@ impl ServerStateInner {
                 return Err(ManagedAccountRefreshError::Refresh {
                     status_code: error.status_code,
                     message: managed_account_refresh_public_message(error.kind).to_string(),
+                    retry_after_ms: error.retry_after_ms,
                 });
             }
         };
 
-        let updated = match self
-            .commit_native_refresh_success(&account.id, update)
-            .await
-        {
+        let updated = match self.commit_native_refresh_success(&account, update).await {
             Ok(updated) => updated,
             Err(error) => {
                 if !error.is_persistence_degraded() {
@@ -5363,6 +5404,7 @@ impl ServerStateInner {
                     return Err(ManagedAccountRefreshError::Refresh {
                         status_code: 500,
                         message: "managed OAuth credential state commit failed".to_string(),
+                        retry_after_ms: None,
                     });
                 }
                 let updated = self.find_account_by_id(&account.id).await;
@@ -5387,6 +5429,7 @@ impl ServerStateInner {
                     status_code: 503,
                     message: "rotated credentials are live but durable persistence is degraded"
                         .to_string(),
+                    retry_after_ms: None,
                 });
             }
         };
@@ -5482,6 +5525,36 @@ impl ServerStateInner {
         account
     }
 
+    pub async fn record_grok_capability_evidence(
+        &self,
+        account_id: &str,
+        capability: crate::domain::accounts::store::GrokAccountCapability,
+        source: &'static str,
+    ) -> anyhow::Result<bool> {
+        if self
+            .find_account_by_id(account_id)
+            .await
+            .is_some_and(|account| {
+                crate::domain::accounts::store::grok_account_capability_evidence_present(
+                    &account, capability,
+                )
+            })
+        {
+            return Ok(false);
+        }
+        let account_id = account_id.to_string();
+        let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        self.mutate_accounts_immediate(move |accounts| {
+            accounts.record_grok_capability_evidence(
+                &account_id,
+                capability,
+                source,
+                observed_at_ms,
+            )
+        })
+        .await
+    }
+
     pub fn remember_grok_media_session(
         &self,
         session_key: String,
@@ -5496,6 +5569,20 @@ impl ServerStateInner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         sessions.retain(|_, binding| binding.expires_at_ms > now);
+        if !sessions.contains_key(&session_key) && sessions.len() >= GROK_MEDIA_SESSION_MAX_BINDINGS
+        {
+            let earliest = sessions
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.expires_at_ms
+                        .cmp(&right.expires_at_ms)
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone());
+            if let Some(earliest) = earliest {
+                sessions.remove(&earliest);
+            }
+        }
         sessions.insert(
             session_key,
             GrokMediaSessionBinding {
@@ -5645,21 +5732,26 @@ impl ServerStateInner {
         &self,
         device_code: &str,
         result: GrokDevicePollResult,
+        now_ms: i64,
     ) -> bool {
         self.grok_device_flows
             .write()
             .await
-            .finish_poll(device_code, result)
+            .finish_poll(device_code, result, now_ms)
     }
 
-    pub async fn fail_grok_device_poll(&self, device_code: &str, terminal: bool) {
+    pub async fn fail_grok_device_poll(&self, device_code: &str, terminal: bool, now_ms: i64) {
         self.grok_device_flows
             .write()
             .await
-            .fail_poll(device_code, terminal);
+            .fail_poll(device_code, terminal, now_ms);
     }
 
     pub async fn cancel_grok_device_flow(&self, device_code: &str) -> bool {
+        self.remove_grok_device_flow(device_code).await
+    }
+
+    pub async fn remove_grok_device_flow(&self, device_code: &str) -> bool {
         self.grok_device_flows.write().await.cancel(device_code)
     }
 
@@ -6133,13 +6225,13 @@ fn now_ms_i64() -> i64 {
 }
 
 fn build_http_client() -> anyhow::Result<reqwest::Client> {
-    crate::infra::http::direct_client_builder()
+    crate::infra::http::outbound_client_builder()?
         .connect_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
         .tcp_keepalive(Duration::from_secs(60))
         .no_gzip()
         .build()
-        .context("build direct HTTP client")
+        .context("build shared outbound HTTP client")
 }
 
 pub async fn refresh_router_installation_registration(state: &ServerState) -> bool {
@@ -6786,10 +6878,7 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
     match execute_native_account_refresh(&http_client, &account, now, interval_ms).await {
         Ok(update) => {
-            let updated = match state
-                .commit_native_refresh_success(&account.id, update)
-                .await
-            {
+            let updated = match state.commit_native_refresh_success(&account, update).await {
                 Ok(updated) => {
                     crate::metrics::record_warm_refresh(account.provider_type.as_str(), "success");
                     Some(updated)
@@ -6851,7 +6940,7 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                 "background OAuth token warm-refresh failed"
             );
             let updated = match state
-                .commit_native_refresh_failure(&account.id, error.message, error.kind)
+                .commit_native_refresh_failure(&account, error.message, error.kind)
                 .await
             {
                 Ok(updated) => updated,
@@ -7023,7 +7112,7 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
             }
         };
         active_account = match state
-            .commit_native_refresh_success(&active_account.id, update)
+            .commit_native_refresh_success(&active_account, update)
             .await
         {
             Ok(account) => account,
@@ -13393,6 +13482,80 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn grok_media_sessions_are_bounded_and_evict_the_earliest_expiry() {
+        let state = test_state();
+        state.remember_grok_media_session(
+            "grok-video:earliest".to_string(),
+            "grok-provider".to_string(),
+            Some("grok-account".to_string()),
+            60_000,
+        );
+        for index in 0..GROK_MEDIA_SESSION_MAX_BINDINGS - 1 {
+            state.remember_grok_media_session(
+                format!("grok-video:retained-{index}"),
+                "grok-provider".to_string(),
+                Some("grok-account".to_string()),
+                120_000,
+            );
+        }
+
+        state.remember_grok_media_session(
+            "grok-video:newest".to_string(),
+            "grok-provider".to_string(),
+            Some("grok-account".to_string()),
+            120_000,
+        );
+
+        assert!(state
+            .grok_media_session_binding("grok-video:earliest")
+            .is_none());
+        assert!(state
+            .grok_media_session_binding("grok-video:newest")
+            .is_some());
+        assert_eq!(
+            state
+                .grok_media_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            GROK_MEDIA_SESSION_MAX_BINDINGS
+        );
+    }
+
+    fn refresh_test_account_input(
+        id: &str,
+        provider_type: ProviderType,
+        email: Option<&str>,
+        access_token: &str,
+        refresh_token: &str,
+        expires_at: i64,
+    ) -> crate::domain::accounts::store::UpsertAccountInput {
+        crate::domain::accounts::store::UpsertAccountInput {
+            id: Some(id.to_string()),
+            provider_type,
+            email: email.map(str::to_string),
+            access_token: Some(access_token.to_string()),
+            refresh_token: Some(refresh_token.to_string()),
+            id_token: None,
+            token_type: Some("Bearer".to_string()),
+            api_key: None,
+            extra_headers: None,
+            scopes: Vec::new(),
+            profile: None,
+            raw: None,
+            subscription_level: None,
+            entitlement_status: None,
+            quota_percent: None,
+            quota: None,
+            quota_refreshed_at: None,
+            quota_next_refresh_at: None,
+            expires_at: Some(expires_at),
+            rate_limited_until: None,
+            last_refresh_error: None,
+        }
+    }
+
     #[tokio::test]
     async fn inference_token_update_preserves_concurrent_config_changes() {
         let state = test_state();
@@ -13480,10 +13643,14 @@ mod tests {
             .await
             .unwrap();
         state.inject_account_refresh_persist_failures(1);
+        let refresh_snapshot = state
+            .find_account_by_id("rotating-credential-account")
+            .await
+            .unwrap();
 
         let result = state
             .commit_native_refresh_success(
-                "rotating-credential-account",
+                &refresh_snapshot,
                 AccountRefreshUpdate {
                     access_token: Some("new-access".to_string()),
                     refresh_token: Some("new-refresh".to_string()),
@@ -13537,7 +13704,7 @@ mod tests {
 
         let failed = state
             .commit_native_refresh_failure(
-                "rotating-credential-account",
+                &live,
                 "invalid_grant refresh_token=new-refresh".to_string(),
                 crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
             )
@@ -13555,10 +13722,19 @@ mod tests {
     #[tokio::test]
     async fn refresh_commit_precondition_error_is_not_persistence_degraded() {
         let state = test_state();
+        let mut detached = AccountStore::default();
+        let missing = detached.upsert(refresh_test_account_input(
+            "missing-account",
+            ProviderType::GrokOAuth,
+            None,
+            "old-access",
+            "old-refresh",
+            1,
+        ));
 
         let result = state
             .commit_native_refresh_success(
-                "missing-account",
+                &missing,
                 AccountRefreshUpdate {
                     access_token: Some("new-access".to_string()),
                     ..Default::default()
@@ -13568,6 +13744,76 @@ mod tests {
 
         assert!(matches!(result, Err(NativeRefreshCommitError::State(_))));
         assert!(!state.credential_persistence_degraded());
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_success_and_failure_cannot_overwrite_reauthorization() {
+        let state = test_state();
+        let stale = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "grok-refresh-cas",
+                    ProviderType::GrokOAuth,
+                    Some("old@example.com"),
+                    "old-access",
+                    "old-refresh",
+                    1,
+                ))
+            })
+            .await
+            .unwrap();
+        let reauthorized = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "grok-refresh-cas",
+                    ProviderType::GrokOAuth,
+                    Some("new@example.com"),
+                    "reauthorized-access",
+                    "reauthorized-refresh",
+                    i64::MAX,
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(reauthorized.auth_identity_generation > stale.auth_identity_generation);
+        assert!(reauthorized.token_refresh_generation > stale.token_refresh_generation);
+
+        let after_success = state
+            .commit_native_refresh_success(
+                &stale,
+                AccountRefreshUpdate {
+                    access_token: Some("stale-refresh-access".to_string()),
+                    refresh_token: Some("stale-refresh-token".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after_success.access_token.as_deref(),
+            Some("reauthorized-access")
+        );
+
+        let after_failure = state
+            .commit_native_refresh_failure(
+                &stale,
+                "invalid_grant".to_string(),
+                crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!after_failure.needs_relogin);
+        assert!(after_failure.last_refresh_error.is_none());
+
+        let persisted = AccountStore::load_or_default(&state.config_dir).unwrap();
+        let persisted = persisted
+            .find_for_provider(ProviderType::GrokOAuth, Some("grok-refresh-cas"))
+            .unwrap();
+        assert_eq!(
+            persisted.refresh_token.as_deref(),
+            Some("reauthorized-refresh")
+        );
     }
 
     #[test]

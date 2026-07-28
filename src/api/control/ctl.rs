@@ -346,7 +346,7 @@ pub(crate) async fn refresh_share_usage_item(
         {
             Ok(update) => {
                 match state
-                    .commit_native_refresh_success(&active_account.id, update)
+                    .commit_native_refresh_success(&active_account, update)
                     .await
                 {
                     Ok(updated) => active_account = updated,
@@ -389,7 +389,7 @@ pub(crate) async fn refresh_share_usage_item(
                 let public_error = oauth_error_public_message(error.kind).to_string();
                 let updated = state
                     .commit_native_refresh_failure(
-                        &active_account.id,
+                        &active_account,
                         error.message.clone(),
                         error.kind,
                     )

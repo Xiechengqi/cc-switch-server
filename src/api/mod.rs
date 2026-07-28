@@ -62,6 +62,7 @@ pub(in crate::api) use usage::*;
 use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::Request;
@@ -88,6 +89,7 @@ use crate::clients::oauth::refresh::{
     account_needs_native_refresh, execute_native_account_refresh, execute_oauth_json_request,
     execute_oauth_token_request, provider_native_refresh_available, AccountRefreshFailure,
 };
+
 use crate::domain::accounts::cursor_import::{
     cursor_workos_user_id_from_access_token, import_from_local_cursor,
     upsert_input_from_cursor_local_import,
@@ -98,8 +100,9 @@ use crate::domain::accounts::login::{
 };
 use crate::domain::accounts::managers::{manager_for, AccountManager};
 use crate::domain::accounts::oauth::{
-    build_cursor_profile_request, build_profile_request, build_refresh_request, identity_from_jwt,
+    build_cursor_profile_request, build_profile_request, build_refresh_request,
     oauth_provider_spec, token_expires_soon, upsert_input_from_login_response,
+    upsert_input_from_verified_grok_login_response,
     upsert_input_from_verified_openai_login_response, OAuthAuthorizeFlow, OAuthHttpRequest,
 };
 use crate::domain::accounts::store::{
@@ -110,6 +113,7 @@ use crate::domain::providers::model::{
     classify_provider_response, AppKind, Provider, ProviderType, ProviderTypeRequest,
     ProviderTypeResponse,
 };
+use crate::domain::providers::runtime::{RuntimeAuthRef, RuntimeConfigurationState};
 use crate::domain::providers::store::{ProviderSortUpdate, StoredProvider};
 use crate::domain::settings::config::{
     ServerConfig, UpdateClientTunnelInput, UpdateRouterConfigInput,
@@ -520,15 +524,36 @@ pub fn app_router(state: ServerState) -> Router {
             "/backend-api/codex/responses/compact",
             post(proxy_codex_responses_compact),
         )
-        .route("/v1/images/generations", post(proxy_images_generations))
-        .route("/images/generations", post(proxy_images_generations))
-        .route("/v1/images/edits", post(proxy_grok_images_edits))
-        .route("/images/edits", post(proxy_grok_images_edits))
+        .route(
+            "/v1/images/generations",
+            post(proxy_images_generations)
+                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/images/generations",
+            post(proxy_images_generations)
+                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/images/edits",
+            post(proxy_grok_images_edits)
+                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/images/edits",
+            post(proxy_grok_images_edits)
+                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+        )
         .route(
             "/v1/videos/generations",
-            post(proxy_grok_videos_generations),
+            post(proxy_grok_videos_generations)
+                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
         )
-        .route("/videos/generations", post(proxy_grok_videos_generations))
+        .route(
+            "/videos/generations",
+            post(proxy_grok_videos_generations)
+                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+        )
         .route("/v1/videos/:request_id", get(proxy_grok_video_status))
         .route("/videos/:request_id", get(proxy_grok_video_status))
         .route("/v1beta/*path", any(proxy_gemini))
@@ -629,7 +654,7 @@ async fn verify_router_ingress(
         _ => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    if is_claude_inference_path(request.uri().path()) && !router_verified {
+    if is_direct_inference_path(request.uri().path()) && !router_verified {
         if request.headers().contains_key(header::ORIGIN) {
             return ApiError::forbidden(
                 "browser-originated direct inference requests are not allowed",
@@ -694,24 +719,59 @@ async fn verify_router_ingress(
     next.run(request).await
 }
 
-fn is_claude_inference_path(path: &str) -> bool {
+fn is_direct_inference_path(path: &str) -> bool {
     matches!(
         path,
-        "/v1/messages"
+        "/v1/models"
+            | "/models"
+            | "/v1/messages"
             | "/claude/v1/messages"
             | "/v1/messages/count_tokens"
             | "/claude/v1/messages/count_tokens"
-    )
+            | "/v1/chat/completions"
+            | "/v1/v1/chat/completions"
+            | "/chat/completions"
+            | "/codex/v1/chat/completions"
+            | "/v1/responses"
+            | "/v1/responses/compact"
+            | "/v1/v1/responses"
+            | "/v1/v1/responses/compact"
+            | "/responses"
+            | "/responses/compact"
+            | "/codex/v1/responses"
+            | "/codex/v1/responses/compact"
+            | "/backend-api/codex/responses"
+            | "/backend-api/codex/responses/compact"
+            | "/v1/images/generations"
+            | "/images/generations"
+            | "/v1/images/edits"
+            | "/images/edits"
+            | "/v1/videos/generations"
+            | "/videos/generations"
+    ) || path
+        .strip_prefix("/v1/videos/")
+        .is_some_and(|request_id| !request_id.is_empty())
+        || path
+            .strip_prefix("/videos/")
+            .is_some_and(|request_id| !request_id.is_empty())
+        || path.starts_with("/v1beta/")
+        || path.starts_with("/gemini/v1/")
+        || path.starts_with("/gemini/v1beta/")
 }
 
 fn inference_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
-    bearer_token(headers).into_iter().chain(
-        headers
-            .get("x-api-key")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty()),
-    )
+    bearer_token(headers)
+        .into_iter()
+        .chain(inference_header_token(headers, "x-api-key"))
+        .chain(inference_header_token(headers, "x-goog-api-key"))
+}
+
+fn inference_header_token<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 async fn embedded_web_asset(method: Method, uri: Uri) -> Response {
@@ -751,6 +811,7 @@ fn web_dist_missing_response() -> Response {
             error_type: None,
             status: Some(StatusCode::NOT_FOUND.as_u16()),
             retryable: None,
+            retry_after_seconds: None,
         }),
     )
         .into_response()
@@ -849,11 +910,760 @@ async fn proxy_models(
         })
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let providers = state.providers.read().await;
+    let providers = state.providers.read().await.clone();
+    let mut data = openai_model_list(&providers.providers, query.app, provider_id);
+    let ui_settings = state.ui_settings.read().await.value.clone();
+    let grok_provider =
+        resolve_grok_catalog_provider(&providers, &ui_settings, query.app, provider_id).cloned();
+    #[cfg(test)]
+    let grok_models_test_url = grok_provider.as_ref().and_then(|provider| {
+        providers
+            .runtime_plan(provider.app, &provider.provider.id)
+            .and_then(|plan| {
+                plan.driver_options
+                    .get("testGrokModelsUrl")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+    });
+    let grok_catalog = if let Some(provider) = grok_provider.as_ref() {
+        if let Some((account_id, expected_generation)) =
+            grok_catalog_managed_account_binding(&providers, provider)
+        {
+            if state.credential_persistence_degraded() {
+                Some(
+                    crate::clients::oauth::grok_models::static_grok_model_catalog(
+                        "credential_persistence_degraded",
+                    ),
+                )
+            } else {
+                let refresh = state
+                    .refresh_managed_account_if_needed(
+                        ProviderType::GrokOAuth,
+                        Some(account_id.as_str()),
+                    )
+                    .await;
+                if let Err(error) = refresh {
+                    tracing::warn!(error = ?error, "Grok model discovery token refresh failed");
+                    Some(
+                        crate::clients::oauth::grok_models::static_grok_model_catalog(
+                            "token_refresh_failed",
+                        ),
+                    )
+                } else if state.credential_persistence_degraded() {
+                    Some(
+                        crate::clients::oauth::grok_models::static_grok_model_catalog(
+                            "credential_persistence_degraded",
+                        ),
+                    )
+                } else {
+                    let account = state
+                        .find_account_for_provider(
+                            ProviderType::GrokOAuth,
+                            Some(account_id.as_str()),
+                        )
+                        .await
+                        .filter(|account| account.auth_identity_generation == expected_generation);
+                    if let Some((account, access_token)) = account.as_ref().and_then(|account| {
+                        account
+                            .access_token
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|token| !token.is_empty())
+                            .map(|token| (account, token))
+                    }) {
+                        #[cfg(test)]
+                        if let Some(url) = grok_models_test_url.as_deref() {
+                            Some(
+                                crate::clients::oauth::grok_models::grok_model_catalog_at_test_url(
+                                    &state.http_client().await,
+                                    &account.id,
+                                    access_token,
+                                    url,
+                                )
+                                .await,
+                            )
+                        } else {
+                            Some(
+                                crate::clients::oauth::grok_models::grok_model_catalog(
+                                    &state.http_client().await,
+                                    &account.id,
+                                    access_token,
+                                )
+                                .await,
+                            )
+                        }
+                        #[cfg(not(test))]
+                        Some(
+                            crate::clients::oauth::grok_models::grok_model_catalog(
+                                &state.http_client().await,
+                                &account.id,
+                                access_token,
+                            )
+                            .await,
+                        )
+                    } else {
+                        Some(
+                            crate::clients::oauth::grok_models::static_grok_model_catalog(
+                                "access_token_unavailable",
+                            ),
+                        )
+                    }
+                }
+            }
+        } else {
+            Some(
+                crate::clients::oauth::grok_models::static_grok_model_catalog(
+                    "managed_account_binding_unavailable",
+                ),
+            )
+        }
+    } else {
+        None
+    };
+    if let (Some(provider), Some(catalog)) = (grok_provider.as_ref(), grok_catalog.as_ref()) {
+        let owned_by = model_owner(provider);
+        for id in &catalog.models {
+            if !data.iter().any(|model| model.id == *id) {
+                data.push(OpenAiModel {
+                    id: id.clone(),
+                    object: "model",
+                    owned_by: owned_by.clone(),
+                    reasoning_efforts: None,
+                    input_modalities: None,
+                });
+            }
+        }
+        data.sort_by(|left, right| left.id.cmp(&right.id));
+    }
     Json(OpenAiModelsResponse {
         object: "list",
-        data: openai_model_list(&providers.providers, query.app, provider_id),
+        data,
+        source: grok_catalog
+            .as_ref()
+            .map(|catalog| catalog.source.to_string()),
+        stale: grok_catalog.as_ref().map(|catalog| catalog.stale),
+        fetched_at_ms: grok_catalog.and_then(|catalog| catalog.fetched_at_ms),
     })
+}
+
+fn resolve_grok_catalog_provider<'a>(
+    providers: &'a crate::domain::providers::store::ProviderStore,
+    ui_settings: &Value,
+    app: Option<AppKind>,
+    explicit_provider_id: Option<&str>,
+) -> Option<&'a StoredProvider> {
+    if let Some(provider_id) = explicit_provider_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let mut matches = providers.providers.iter().filter(|provider| {
+            provider.provider_type == ProviderType::GrokOAuth
+                && provider.provider.id == provider_id
+                && app.is_none_or(|app| provider.app == app)
+        });
+        let provider = matches.next()?;
+        return matches.next().is_none().then_some(provider);
+    }
+
+    let app = app?;
+    let provider_id = current_provider::resolve_current_provider_id(providers, ui_settings, app)?;
+    providers.providers.iter().find(|provider| {
+        provider.provider_type == ProviderType::GrokOAuth
+            && provider.provider.id == provider_id
+            && provider.app == app
+    })
+}
+
+fn grok_catalog_managed_account_binding(
+    providers: &crate::domain::providers::store::ProviderStore,
+    provider: &StoredProvider,
+) -> Option<(String, u64)> {
+    let plan = providers.runtime_plan(provider.app, &provider.provider.id)?;
+    if plan.provider_revision != provider.resource.revision
+        || plan.configuration_state == RuntimeConfigurationState::NeedsAttention
+        || plan.driver_id.as_str() != "oauth.grok_responses"
+    {
+        return None;
+    }
+    match &plan.auth_ref {
+        RuntimeAuthRef::ManagedAccount {
+            account_id,
+            expected_provider_type: ProviderType::GrokOAuth,
+            auth_identity_generation,
+        } if !account_id.trim().is_empty() => Some((account_id.clone(), *auth_identity_generation)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod grok_catalog_provider_tests {
+    use super::*;
+    use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta};
+    use crate::domain::providers::store::ProviderStore;
+    use tower::ServiceExt;
+
+    fn catalog_test_state(name: &str) -> ServerState {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(
+                    std::env::temp_dir()
+                        .join(format!("cc-switch-server-model-catalog-{name}-{nanos}")),
+                ),
+                web_dist_dir: None,
+                log_level: "warn".to_string(),
+                command: None,
+            },
+            std::sync::Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap()
+    }
+
+    fn grok_provider(id: &str) -> StoredProvider {
+        StoredProvider {
+            app: AppKind::Codex,
+            provider: Provider {
+                id: id.to_string(),
+                name: id.to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::GrokOAuth,
+            provider_type_id: ProviderType::GrokOAuth.as_str().to_string(),
+            resource: Default::default(),
+        }
+    }
+
+    #[test]
+    fn untargeted_model_catalog_does_not_select_an_arbitrary_grok_account() {
+        let providers = ProviderStore {
+            providers: vec![grok_provider("grok-first"), grok_provider("grok-second")],
+            ..Default::default()
+        };
+
+        assert!(resolve_grok_catalog_provider(&providers, &json!({}), None, None).is_none());
+    }
+
+    #[test]
+    fn model_catalog_uses_explicit_or_app_current_grok_provider() {
+        let providers = ProviderStore {
+            providers: vec![grok_provider("grok-first"), grok_provider("grok-current")],
+            ..Default::default()
+        };
+        let ui_settings = json!({"currentProviderCodex": "grok-current"});
+
+        let explicit =
+            resolve_grok_catalog_provider(&providers, &ui_settings, None, Some("grok-first"))
+                .unwrap();
+        assert_eq!(explicit.provider.id, "grok-first");
+
+        let current =
+            resolve_grok_catalog_provider(&providers, &ui_settings, Some(AppKind::Codex), None)
+                .unwrap();
+        assert_eq!(current.provider.id, "grok-current");
+
+        assert!(resolve_grok_catalog_provider(
+            &providers,
+            &json!({"currentProviderCodex": ""}),
+            Some(AppKind::Codex),
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn provider_id_without_app_must_identify_one_grok_provider() {
+        let mut claude = grok_provider("shared-id");
+        claude.app = AppKind::Claude;
+        let providers = ProviderStore {
+            providers: vec![grok_provider("shared-id"), claude],
+            ..Default::default()
+        };
+
+        assert!(
+            resolve_grok_catalog_provider(&providers, &json!({}), None, Some("shared-id"),)
+                .is_none()
+        );
+        assert_eq!(
+            resolve_grok_catalog_provider(
+                &providers,
+                &json!({}),
+                Some(AppKind::Codex),
+                Some("shared-id"),
+            )
+            .unwrap()
+            .app,
+            AppKind::Codex,
+        );
+    }
+
+    #[tokio::test]
+    async fn media_routes_override_the_default_body_limit_but_remain_bounded() {
+        let state = catalog_test_state("media-body-limit");
+        let inference_token = "media-inference-token-0123456789";
+        state.set_inference_token(inference_token).await.unwrap();
+        let app = app_router(state);
+
+        let above_default = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/edits")
+            .header(header::AUTHORIZATION, format!("Bearer {inference_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(vec![b' '; 2 * 1024 * 1024 + 1]))
+            .unwrap();
+        let accepted_by_extractor = app.clone().oneshot(above_default).await.unwrap();
+        assert_ne!(
+            accepted_by_extractor.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let above_media_limit = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/edits")
+            .header(header::AUTHORIZATION, format!("Bearer {inference_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(vec![
+                b' ';
+                proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES + 1
+            ]))
+            .unwrap();
+        let rejected = app.oneshot(above_media_limit).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_stops_before_upstream_when_refresh_enters_degraded_mode() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let model_requests_for_route = std::sync::Arc::clone(&model_requests);
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(json!({
+                            "access_token": "rotated-model-access",
+                            "refresh_token": "rotated-model-refresh",
+                            "expires_in": 3_600
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                get(move || {
+                    let requests = std::sync::Arc::clone(&model_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(json!({"data": [{"id": "must-not-be-requested"}]}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = catalog_test_state("refresh-degraded");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "grok-degraded-model-account",
+                        "providerType": "grok_oauth",
+                        "accessToken": "expiring-model-access",
+                        "refreshToken": "unique-degraded-model-refresh",
+                        "expiresAt": 1,
+                        "profile": {
+                            "verifiedGrokClaims": {"subject": "grok-degraded-model-subject"}
+                        },
+                        "raw": {"testOAuthTokenUrl": token_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-degraded-model-provider".to_string(),
+                        name: "Grok degraded model provider".to_string(),
+                        settings_config: json!({"testGrokModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("grok_oauth".to_string()),
+                                account_id: Some("grok-degraded-model-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        state.inject_account_refresh_persist_failures(1);
+
+        let response = proxy_models(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ModelsQuery {
+                app: Some(AppKind::Codex),
+                provider_id: Some("grok-degraded-model-provider".to_string()),
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(response.source.as_deref(), Some("static_fallback"));
+        assert_eq!(response.stale, Some(true));
+        assert!(state.credential_persistence_degraded());
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn model_catalog_stops_before_models_when_token_refresh_fails() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let model_requests_for_route = std::sync::Arc::clone(&model_requests);
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({"error": "invalid_grant"})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                get(move || {
+                    let requests = std::sync::Arc::clone(&model_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(json!({"data": [{"id": "must-not-be-requested"}]}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = catalog_test_state("refresh-rejected");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "grok-refresh-rejected-account",
+                        "providerType": "grok_oauth",
+                        "accessToken": "stale-model-access",
+                        "refreshToken": "rejected-model-refresh",
+                        "expiresAt": 1,
+                        "profile": {
+                            "verifiedGrokClaims": {"subject": "grok-refresh-rejected-subject"}
+                        },
+                        "raw": {"testOAuthTokenUrl": token_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-refresh-rejected-provider".to_string(),
+                        name: "Grok refresh rejected provider".to_string(),
+                        settings_config: json!({"testGrokModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("grok_oauth".to_string()),
+                                account_id: Some("grok-refresh-rejected-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+
+        let response = proxy_models(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ModelsQuery {
+                app: Some(AppKind::Codex),
+                provider_id: Some("grok-refresh-rejected-provider".to_string()),
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(response.source.as_deref(), Some("static_fallback"));
+        assert_eq!(response.stale, Some(true));
+        assert!(!state.credential_persistence_degraded());
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn model_catalog_rejects_unbound_or_stale_binding_without_upstream_requests() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let model_requests_for_route = std::sync::Arc::clone(&model_requests);
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(json!({"access_token": "must-not-be-requested"}))
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                get(move || {
+                    let requests = std::sync::Arc::clone(&model_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(json!({"data": [{"id": "must-not-be-requested"}]}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = catalog_test_state("invalid-managed-binding");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "grok-invalid-binding-account",
+                        "providerType": "grok_oauth",
+                        "accessToken": "expiring-invalid-binding-access",
+                        "refreshToken": "invalid-binding-refresh",
+                        "expiresAt": 1,
+                        "profile": {
+                            "verifiedGrokClaims": {"subject": "invalid-binding-subject"}
+                        },
+                        "raw": {"testOAuthTokenUrl": token_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                for (id, auth_binding) in [
+                    ("grok-unbound-model-provider", None),
+                    (
+                        "grok-stale-model-provider",
+                        Some(AuthBinding {
+                            source: Some("account_store".to_string()),
+                            auth_provider: Some("grok_oauth".to_string()),
+                            account_id: Some("grok-invalid-binding-account".to_string()),
+                            auth_identity_generation: Some(2),
+                        }),
+                    ),
+                ] {
+                    providers.upsert(
+                        AppKind::Codex,
+                        Provider {
+                            id: id.to_string(),
+                            name: id.to_string(),
+                            settings_config: json!({"testGrokModelsUrl": models_url}),
+                            category: None,
+                            meta: Some(ProviderMeta {
+                                provider_type: Some("grok_oauth".to_string()),
+                                auth_binding,
+                                ..Default::default()
+                            }),
+                            extra: Default::default(),
+                        },
+                    );
+                }
+            })
+            .await
+            .unwrap();
+
+        for provider_id in ["grok-unbound-model-provider", "grok-stale-model-provider"] {
+            let response = proxy_models(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(ModelsQuery {
+                    app: Some(AppKind::Codex),
+                    provider_id: Some(provider_id.to_string()),
+                }),
+            )
+            .await
+            .0;
+            assert_eq!(response.source.as_deref(), Some("static_fallback"));
+            assert_eq!(response.stale, Some(true));
+            assert_eq!(response.fetched_at_ms, None);
+        }
+
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn model_catalog_uses_only_the_runtime_bound_account() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed_authorization = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let observed_for_route = std::sync::Arc::clone(&observed_authorization);
+        let upstream = Router::new().route(
+            "/models",
+            get(move |headers: HeaderMap| {
+                let observed = std::sync::Arc::clone(&observed_for_route);
+                async move {
+                    *observed.lock().unwrap() = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    Json(json!({"data": [{"id": "grok-runtime-bound"}]}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = catalog_test_state("runtime-bound-account");
+        state
+            .mutate_accounts_immediate(|accounts| {
+                for (id, access_token) in [
+                    ("grok-model-distractor", "distractor-access"),
+                    ("grok-model-bound", "runtime-bound-access"),
+                ] {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": id,
+                            "providerType": "grok_oauth",
+                            "accessToken": access_token,
+                            "expiresAt": i64::MAX / 2,
+                            "profile": {
+                                "verifiedGrokClaims": {"subject": format!("{id}-subject")}
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-runtime-bound-provider".to_string(),
+                        name: "Grok runtime-bound provider".to_string(),
+                        settings_config: json!({"testGrokModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("grok_oauth".to_string()),
+                                account_id: Some("grok-model-bound".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+
+        let response = proxy_models(
+            State(state),
+            HeaderMap::new(),
+            Query(ModelsQuery {
+                app: Some(AppKind::Codex),
+                provider_id: Some("grok-runtime-bound-provider".to_string()),
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(response.source.as_deref(), Some("upstream"));
+        assert!(response
+            .data
+            .iter()
+            .any(|model| model.id == "grok-runtime-bound"));
+        assert_eq!(
+            observed_authorization.lock().unwrap().as_str(),
+            "Bearer runtime-bound-access"
+        );
+        server.abort();
+    }
 }
 
 async fn web_runtime_context(

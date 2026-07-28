@@ -197,9 +197,12 @@ export function sourceBoundaryViolations(relativePath, source) {
         );
       }
     }
-    if (/reqwest::Proxy\b|\.proxy\s*\(/.test(production)) {
+    if (
+      relativePath !== "src/infra/http.rs" &&
+      /reqwest::Proxy\b|\.proxy\s*\(/.test(production)
+    ) {
       violations.push(
-        `${relativePath}: production outbound proxy construction`,
+        `${relativePath}: production outbound proxy bypasses the shared transport`,
       );
     }
   }

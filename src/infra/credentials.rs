@@ -14,6 +14,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const ROOT_KEY_FILE_NAME: &str = "accounts.key";
 pub const ROOT_KEY_ENV: &str = "CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY";
 const PROVIDER_KEY_INFO: &[u8] = b"cc-switch-server/provider-credentials/v1";
+const ACCOUNT_KEY_INFO: &[u8] = b"cc-switch-server/account-credentials/v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +146,14 @@ pub fn derive_provider_key(root_key: &[u8; 32]) -> anyhow::Result<[u8; 32]> {
     Ok(key)
 }
 
+pub fn derive_account_key(root_key: &[u8; 32]) -> anyhow::Result<[u8; 32]> {
+    let hkdf = Hkdf::<Sha256>::new(Some(b"cc-switch-server/account-key-salt/v2"), root_key);
+    let mut key = [0u8; 32];
+    hkdf.expand(ACCOUNT_KEY_INFO, &mut key)
+        .map_err(|_| anyhow::anyhow!("derive account credential key"))?;
+    Ok(key)
+}
+
 pub fn provider_key_id(provider_key: &[u8; 32]) -> String {
     let digest = Sha256::digest(provider_key);
     format!("provider-v1-{}", hex::encode(&digest[..8]))
@@ -159,8 +168,11 @@ mod tests {
         let root = [7u8; 32];
         let first = derive_provider_key(&root).unwrap();
         let second = derive_provider_key(&root).unwrap();
+        let account = derive_account_key(&root).unwrap();
         assert_eq!(first, second);
         assert_ne!(first, root);
+        assert_ne!(account, root);
+        assert_ne!(account, first);
         assert_eq!(provider_key_id(&first), provider_key_id(&second));
     }
 

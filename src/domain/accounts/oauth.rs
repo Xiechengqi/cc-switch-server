@@ -181,7 +181,7 @@ static ANTIGRAVITY_AUTHORIZE_SCOPE: &str = "https://www.googleapis.com/auth/clou
 static XAI_TOKEN_URLS: &[&str] = &["https://auth.x.ai/oauth2/token"];
 static XAI_AUTHORIZE_URL: &str = "https://auth.x.ai/oauth2/authorize";
 static XAI_AUTHORIZE_SCOPE: &str =
-    "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
+    "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write";
 pub const XAI_LOOPBACK_REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
 
 pub fn claude_oauth_token_urls_for_redirect(redirect_uri: &str) -> Vec<&'static str> {
@@ -343,11 +343,7 @@ fn validate_oauth_endpoint_url(
     provider_type: ProviderType,
     url: &str,
 ) -> Result<(), OAuthErrorClassification> {
-    if provider_type != ProviderType::GrokOAuth
-        || std::env::var("XAI_ALLOW_UNSAFE_URL_OVERRIDES")
-            .ok()
-            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
-    {
+    if provider_type != ProviderType::GrokOAuth {
         return Ok(());
     }
     let parsed = reqwest::Url::parse(url).map_err(|error| OAuthErrorClassification {
@@ -356,32 +352,61 @@ fn validate_oauth_endpoint_url(
         refresh_token_may_have_rotated: false,
         message: format!("invalid xAI OAuth endpoint URL: {error}"),
     })?;
-    let host = parsed.host_str().unwrap_or_default();
-    if parsed.scheme() == "https" && (host == "x.ai" || host.ends_with(".x.ai")) {
+    #[cfg(test)]
+    if parsed.scheme() == "http"
+        && parsed
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback())
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.fragment().is_none()
+    {
+        return Ok(());
+    }
+    let allowed = std::iter::once(XAI_AUTHORIZE_URL).chain(XAI_TOKEN_URLS.iter().copied());
+    if allowed
+        .filter_map(|value| reqwest::Url::parse(value).ok())
+        .any(|allowed| parsed == allowed)
+    {
         return Ok(());
     }
     Err(OAuthErrorClassification {
         kind: OAuthErrorKind::Unsupported,
         retryable: false,
         refresh_token_may_have_rotated: false,
-        message: format!("xAI OAuth endpoint host is not allowed: {url}"),
+        message: format!("xAI OAuth endpoint is not allowed: {url}"),
     })
 }
 
 fn grok_authorize_url() -> String {
-    std::env::var("CC_SWITCH_SERVER_XAI_AUTHORIZE_URL")
+    #[cfg(test)]
+    if let Some(value) = std::env::var("CC_SWITCH_SERVER_XAI_AUTHORIZE_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| XAI_AUTHORIZE_URL.to_string())
+    {
+        return value;
+    }
+    XAI_AUTHORIZE_URL.to_string()
 }
 
 fn grok_token_url(default: &'static str) -> String {
-    std::env::var("CC_SWITCH_SERVER_XAI_TOKEN_URL")
+    #[cfg(test)]
+    if let Some(value) = std::env::var("CC_SWITCH_SERVER_XAI_TOKEN_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default.to_string())
+    {
+        return value;
+    }
+    default.to_string()
+}
+
+pub fn grok_oauth_token_url() -> Result<String, OAuthErrorClassification> {
+    let url = grok_token_url(XAI_TOKEN_URLS[0]);
+    validate_oauth_endpoint_url(ProviderType::GrokOAuth, &url)?;
+    Ok(url)
 }
 
 /// OAuth quota UI hooks key accounts by this label (see `managed_auth_provider_label`).
@@ -951,12 +976,19 @@ pub fn refresh_update_from_token_response(
 ) -> AccountRefreshUpdate {
     // OpenAI identity is populated only by callers that completed JWKS
     // verification. Token material still needs to be persisted here.
-    let mut identity = if provider_type == ProviderType::CodexOAuth {
+    let mut identity = if matches!(
+        provider_type,
+        ProviderType::CodexOAuth | ProviderType::GrokOAuth
+    ) {
         OAuthIdentity::default()
     } else {
         unverified_identity_from_token_response(provider_type, response)
     };
-    if provider_type != ProviderType::CodexOAuth && identity == OAuthIdentity::default() {
+    if !matches!(
+        provider_type,
+        ProviderType::CodexOAuth | ProviderType::GrokOAuth
+    ) && identity == OAuthIdentity::default()
+    {
         identity = identity_from_provider_value(&raw).unwrap_or_default();
     }
     let quota = quota_from_provider_snapshot(provider_type, &raw);
@@ -1004,6 +1036,30 @@ pub fn refresh_update_from_verified_openai_token_response(
     update.email = verified_identity.email.clone();
     update.subscription_level = verified_identity.plan_type.clone();
     update.profile = profile_value(ProviderType::CodexOAuth, verified_identity, &raw);
+    update
+}
+
+pub fn refresh_update_from_verified_grok_token_response(
+    response: &OAuthTokenResponse,
+    raw: Value,
+    verified_identity: &OAuthIdentity,
+    now_ms: i64,
+    quota_refresh_interval_ms: i64,
+) -> AccountRefreshUpdate {
+    let mut update = refresh_update_from_token_response(
+        ProviderType::GrokOAuth,
+        response,
+        raw.clone(),
+        now_ms,
+        quota_refresh_interval_ms,
+    );
+    update.email = verified_identity.email.clone();
+    update.subscription_level = verified_identity.plan_type.clone();
+    update.profile = profile_value(ProviderType::GrokOAuth, verified_identity, &raw);
+    crate::domain::accounts::store::set_verified_grok_claims(
+        &mut update.profile,
+        Some(canonical_grok_claims(verified_identity)),
+    );
     update
 }
 
@@ -1113,6 +1169,41 @@ pub fn upsert_input_from_verified_openai_login_response(
     )
 }
 
+pub fn upsert_input_from_verified_grok_token_response(
+    response: &OAuthTokenResponse,
+    token_raw: Value,
+    verified_identity: &OAuthIdentity,
+    now_ms: i64,
+) -> Result<UpsertAccountInput, OAuthErrorClassification> {
+    upsert_input_from_verified_grok_login_response(
+        response,
+        token_raw,
+        None,
+        verified_identity,
+        now_ms,
+        crate::domain::settings::ui_settings::default_oauth_quota_refresh_interval_ms(),
+    )
+}
+
+pub fn upsert_input_from_verified_grok_login_response(
+    response: &OAuthTokenResponse,
+    token_raw: Value,
+    profile_raw: Option<Value>,
+    verified_identity: &OAuthIdentity,
+    now_ms: i64,
+    quota_refresh_interval_ms: i64,
+) -> Result<UpsertAccountInput, OAuthErrorClassification> {
+    upsert_input_from_login_response_inner(
+        ProviderType::GrokOAuth,
+        response,
+        token_raw,
+        profile_raw,
+        now_ms,
+        quota_refresh_interval_ms,
+        Some(verified_identity),
+    )
+}
+
 fn upsert_input_from_login_response_inner(
     provider_type: ProviderType,
     response: &OAuthTokenResponse,
@@ -1120,40 +1211,50 @@ fn upsert_input_from_login_response_inner(
     profile_raw: Option<Value>,
     now_ms: i64,
     quota_refresh_interval_ms: i64,
-    verified_openai_identity: Option<&OAuthIdentity>,
+    verified_identity: Option<&OAuthIdentity>,
 ) -> Result<UpsertAccountInput, OAuthErrorClassification> {
-    let identity = if provider_type == ProviderType::CodexOAuth {
-        verified_openai_identity.cloned().ok_or_else(|| {
+    let identity = match provider_type {
+        ProviderType::CodexOAuth => verified_identity.cloned().ok_or_else(|| {
             missing_credential("codex_oauth account import requires verified OpenAI identity")
-        })?
-    } else {
-        login_identity(provider_type, response, &token_raw, profile_raw.as_ref())
+        })?,
+        ProviderType::GrokOAuth => verified_identity.cloned().ok_or_else(|| {
+            missing_credential("grok_oauth account import requires verified xAI identity")
+        })?,
+        _ => login_identity(provider_type, response, &token_raw, profile_raw.as_ref()),
     };
-    let account_id = if provider_type == ProviderType::CodexOAuth {
-        if identity
-            .account_id
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            return Err(missing_credential(
-                "codex_oauth verified identity does not contain chatgpt_account_id",
-            ));
+    let account_id = match provider_type {
+        ProviderType::CodexOAuth => {
+            if identity
+                .account_id
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                return Err(missing_credential(
+                    "codex_oauth verified identity does not contain chatgpt_account_id",
+                ));
+            }
+            identity
+                .subject
+                .as_deref()
+                .and_then(openai_account_record_id_from_subject)
+                .ok_or_else(|| {
+                    missing_credential("codex_oauth verified identity does not contain subject")
+                })?
         }
-        identity
+        ProviderType::GrokOAuth => identity
             .subject
             .as_deref()
-            .and_then(openai_account_record_id_from_subject)
+            .and_then(grok_account_record_id_from_subject)
             .ok_or_else(|| {
-                missing_credential("codex_oauth verified identity does not contain subject")
-            })?
-    } else {
-        identity.account_id.clone().ok_or_else(|| {
+                missing_credential("grok_oauth verified identity does not contain subject")
+            })?,
+        _ => identity.account_id.clone().ok_or_else(|| {
             missing_credential(format!(
                 "{} token response does not contain an account id",
                 provider_type.as_str()
             ))
-        })?
+        })?,
     };
     if provider_token_exchange_available(provider_type)
         && response
@@ -1174,7 +1275,10 @@ fn upsert_input_from_login_response_inner(
         now_ms,
         quota_refresh_interval_ms,
     );
-    if provider_type != ProviderType::CodexOAuth {
+    if !matches!(
+        provider_type,
+        ProviderType::CodexOAuth | ProviderType::GrokOAuth
+    ) {
         if let Some(profile_raw) = profile_raw.clone() {
             update = merge_refresh_updates(
                 update,
@@ -1196,6 +1300,12 @@ fn upsert_input_from_login_response_inner(
     update.profile =
         login_profile_value(provider_type, &identity, &token_raw, profile_raw.as_ref())
             .or(update.profile);
+    if provider_type == ProviderType::GrokOAuth {
+        crate::domain::accounts::store::set_verified_grok_claims(
+            &mut update.profile,
+            Some(canonical_grok_claims(&identity)),
+        );
+    }
     update.raw = Some(login_raw_value(token_raw, profile_raw));
 
     Ok(UpsertAccountInput {
@@ -1494,6 +1604,46 @@ pub fn openai_account_record_id_from_subject(subject: &str) -> Option<String> {
     }
     let digest = Sha256::digest(subject.as_bytes());
     Some(format!("codex-oauth-{}", hex::encode(&digest[..16])))
+}
+
+pub fn grok_account_record_id_from_subject(subject: &str) -> Option<String> {
+    let subject = subject.trim();
+    if subject.is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(subject.as_bytes());
+    Some(format!("grok-oauth-{}", hex::encode(&digest[..16])))
+}
+
+pub fn grok_identity_from_claims(claims: &Value) -> OAuthIdentity {
+    let subject =
+        string_field(Some(claims), "sub").or_else(|| string_field(Some(claims), "subject"));
+    OAuthIdentity {
+        account_id: subject.clone(),
+        subject,
+        email: string_field(Some(claims), "email")
+            .or_else(|| string_field(Some(claims), "preferred_username")),
+        plan_type: plan_type_field(Some(claims), "tier")
+            .or_else(|| plan_type_field(Some(claims), "subscription_tier"))
+            .or_else(|| plan_type_field(Some(claims), "plan")),
+        subscription_expires_at: string_or_integer_field(claims.get("subscription"), "expires_at")
+            .or_else(|| string_or_integer_field(Some(claims), "subscription_expires_at")),
+        poid: None,
+        organizations: None,
+    }
+}
+
+pub fn canonical_grok_claims(identity: &OAuthIdentity) -> Value {
+    let mut claims = serde_json::Map::new();
+    insert_optional_string(&mut claims, "subject", identity.subject.as_deref());
+    insert_optional_string(&mut claims, "email", identity.email.as_deref());
+    insert_optional_string(&mut claims, "planType", identity.plan_type.as_deref());
+    insert_optional_string(
+        &mut claims,
+        "subscriptionExpiresAt",
+        identity.subscription_expires_at.as_deref(),
+    );
+    Value::Object(claims)
 }
 
 fn openai_identity_from_jwt(token: &str) -> Option<OAuthIdentity> {
@@ -1919,7 +2069,8 @@ fn enrich_grok_profile_value(provider_type: ProviderType, token_raw: &Value, val
             value[target] = Value::String(item);
         }
     }
-    value["claims"] = claims;
+    value["claimsTrust"] = Value::String("unverified_display_only".to_string());
+    value["unverifiedTokenClaims"] = claims;
 }
 
 fn split_scopes(scope: &str) -> Vec<String> {
@@ -2195,6 +2346,35 @@ mod tests {
         let error = parse_grok_authorization_code_input("?code=auth-code&state=other", "state-1")
             .expect_err("state mismatch should fail");
         assert_eq!(error.kind, OAuthErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn grok_oauth_requests_include_workspace_scopes() {
+        let spec = oauth_provider_spec(ProviderType::GrokOAuth).unwrap();
+        let scopes = spec
+            .authorize_scope
+            .unwrap()
+            .split_whitespace()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(scopes.contains("workspaces:read"));
+        assert!(scopes.contains("workspaces:write"));
+        assert_eq!(spec.authorize_scope, spec.refresh_scope);
+
+        let authorize = build_authorize_url(
+            ProviderType::GrokOAuth,
+            Some(XAI_LOOPBACK_REDIRECT_URI),
+            Some("challenge"),
+            "state-workspace",
+        )
+        .unwrap();
+        let authorize = reqwest::Url::parse(&authorize).unwrap();
+        let query = authorize
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(query["scope"].contains("workspaces:read"));
+        assert!(query["scope"].contains("workspaces:write"));
+        assert_eq!(query["nonce"], "state-workspace");
     }
 
     #[test]

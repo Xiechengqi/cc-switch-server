@@ -434,10 +434,16 @@ fn runtime_auth_ref(
     let Some(profile) = profile else {
         if matches!(
             stored.provider_type,
-            ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+            ProviderType::ClaudeOAuth | ProviderType::CodexOAuth | ProviderType::GrokOAuth
         ) && provider_account_id(stored).is_some()
         {
             return managed_account_auth_ref(stored, accounts, stored.provider_type, warnings);
+        }
+        if stored.provider_type == ProviderType::GrokOAuth {
+            warnings.push(
+                "grok_oauth Provider must explicitly bind a managed grok_oauth account".to_string(),
+            );
+            return RuntimeAuthRef::Missing;
         }
         return RuntimeAuthRef::Legacy {
             account_id: provider_account_id(stored).map(str::to_string),
@@ -551,7 +557,7 @@ pub fn has_authoritative_subscription_oauth_binding(stored: &StoredProvider) -> 
     if provider_account_id(stored).is_none()
         || !matches!(
             stored.provider_type,
-            ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+            ProviderType::ClaudeOAuth | ProviderType::CodexOAuth | ProviderType::GrokOAuth
         )
     {
         return false;
@@ -660,6 +666,18 @@ fn runtime_driver_options(
     ] {
         if let Some(value) = value {
             options.insert(name.to_string(), value);
+        }
+    }
+    #[cfg(test)]
+    for name in ["testGrokWebsocketUrl", "testGrokModelsUrl"] {
+        if let Some(value) = provider
+            .settings_config
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            options.insert(name.to_string(), json!(value));
         }
     }
     if outbound_identity_policy == OutboundIdentityPolicy::CustomOverride {
@@ -830,7 +848,7 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
 fn managed_oauth_endpoint_is_fixed(provider_type: ProviderType) -> bool {
     matches!(
         provider_type,
-        ProviderType::ClaudeOAuth | ProviderType::CodexOAuth
+        ProviderType::ClaudeOAuth | ProviderType::CodexOAuth | ProviderType::GrokOAuth
     )
 }
 
@@ -1117,6 +1135,72 @@ mod tests {
     }
 
     #[test]
+    fn bound_legacy_grok_uses_managed_auth_even_with_a_static_secret() {
+        let mut stored = provider("codex.grok_oauth", ProviderType::GrokOAuth);
+        stored.resource.profile_id = None;
+        stored.resource.profile_schema_revision = None;
+        stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("legacy-secret");
+        stored.provider.settings_config["env"]["OPENAI_BASE_URL"] =
+            json!("https://attacker.example/oauth");
+        stored.provider.meta.as_mut().unwrap().auth_binding = Some(AuthBinding {
+            source: Some("account".to_string()),
+            auth_provider: Some("grok_oauth".to_string()),
+            account_id: Some("grok-account".to_string()),
+            auth_identity_generation: Some(3),
+        });
+        let account = serde_json::from_value(json!({
+            "id": "grok-account",
+            "providerType": "grok_oauth",
+            "authIdentityGeneration": 3,
+            "accessToken": "managed-grok-access-token"
+        }))
+        .unwrap();
+
+        let plan = compile_runtime_plan(
+            &stored,
+            &AccountStore {
+                accounts: vec![account],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.endpoint, "https://api.x.ai/v1");
+        assert_eq!(
+            plan.auth_ref,
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "grok-account".to_string(),
+                expected_provider_type: ProviderType::GrokOAuth,
+                auth_identity_generation: 3,
+            }
+        );
+        assert!(has_authoritative_subscription_oauth_binding(&stored));
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ignored a configured endpoint override")));
+    }
+
+    #[test]
+    fn unbound_legacy_grok_rejects_a_static_secret() {
+        let mut stored = provider("codex.grok_oauth", ProviderType::GrokOAuth);
+        stored.resource.profile_id = None;
+        stored.resource.profile_schema_revision = None;
+        stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("legacy-secret");
+
+        let plan = compile_runtime_plan(&stored, &AccountStore::default()).unwrap();
+
+        assert_eq!(
+            plan.configuration_state,
+            RuntimeConfigurationState::NeedsAttention
+        );
+        assert_eq!(plan.auth_ref, RuntimeAuthRef::Missing);
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("must explicitly bind")));
+    }
+
+    #[test]
     fn custom_runtime_fingerprint_changes_for_endpoint_but_ignores_proxy_fields() {
         let accounts = AccountStore::default();
         let mut stored = provider("codex.custom_http", ProviderType::Codex);
@@ -1180,6 +1264,11 @@ mod tests {
                 AppKind::Codex,
                 ProviderType::CodexOAuth,
                 "https://chatgpt.com/backend-api/codex",
+            ),
+            (
+                AppKind::Codex,
+                ProviderType::GrokOAuth,
+                "https://api.x.ai/v1",
             ),
         ] {
             let mut stored = provider("codex.openai_oauth", provider_type);

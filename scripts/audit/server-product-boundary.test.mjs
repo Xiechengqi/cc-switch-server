@@ -28,6 +28,23 @@ mod tests {
   );
 });
 
+test("only the shared HTTP transport may construct an outbound proxy", () => {
+  assert.deepEqual(
+    sourceBoundaryViolations(
+      "src/infra/http.rs",
+      "fn shared() { let _ = reqwest::Proxy::all(\"http://proxy\"); }",
+    ),
+    [],
+  );
+  assert.match(
+    sourceBoundaryViolations(
+      "src/example.rs",
+      "fn bypass() { let _ = reqwest::Proxy::all(\"http://proxy\"); }",
+    ).join("\n"),
+    /bypasses the shared transport/,
+  );
+});
+
 test("removed Provider routing and settings capabilities fail closed", () => {
   assert.match(
     sourceBoundaryViolations(

@@ -58,6 +58,7 @@ RUN_PROBES=1 STREAM_PROBE=1 scripts/smoke/direct-market-diagnostics.sh
 scripts/smoke/router-market-smoke.sh
 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 scripts/smoke/oauth-readiness-check.sh
+node scripts/smoke/grok-oauth-real.mjs
 scripts/smoke/share-market-grant-smoke.sh
 RUN_REAL=1 scripts/release-readiness.sh
 ```
@@ -101,6 +102,8 @@ credential.
 | --- | --- | --- |
 | `SERVER_URL` | 被测 server base URL | 可完整记录 |
 | `CC_SWITCH_SERVER_TOKEN` | server 登录 bearer token | 不记录明文，只记录是否存在 |
+| `CC_SWITCH_BASE_URL` | OAuth 真实账号 smoke 使用的 server base URL | 可完整记录 |
+| `CC_SWITCH_INFERENCE_TOKEN` | 真实推理入口 token | 不记录明文，只记录是否存在 |
 
 ### router/market public probe
 
@@ -128,11 +131,18 @@ credential.
 | `CODEX_OAUTH_TEST_ACCOUNT` | Codex OAuth Plus/Pro 测试账号 | 记录脱敏 email |
 | `CLAUDE_OAUTH_TEST_ACCOUNT` | Claude OAuth 测试账号 | 记录脱敏 email |
 | `GEMINI_OAUTH_TEST_ACCOUNT` | Gemini OAuth/CLI 测试账号 | 记录脱敏 email |
+| `GROK_OAUTH_TEST_ACCOUNT` | Grok/xAI OAuth 测试账号 | 记录脱敏 email |
 | `CURSOR_OAUTH_TEST_ACCOUNT` | Cursor OAuth 测试账号 | 记录脱敏 email |
 | `ANTIGRAVITY_OAUTH_TEST_ACCOUNT` | Antigravity/Agy OAuth 测试账号 | 记录脱敏 email |
 | `CODEX_OAUTH_REFRESH_TOKEN_FIXTURE` | Codex OAuth 手动导入 refresh token fixture | 不记录明文 |
 | `CLAUDE_OAUTH_REFRESH_TOKEN_FIXTURE` | Claude OAuth 手动导入 refresh token fixture | 不记录明文 |
 | `GEMINI_OAUTH_REFRESH_TOKEN_FIXTURE` | Gemini OAuth/CLI 手动导入 refresh token fixture | 不记录明文 |
+| `GROK_OAUTH_REFRESH_TOKEN_FIXTURE` | Grok OAuth 手动导入 refresh token fixture | 不记录明文 |
+| `GROK_OAUTH_AUTH_JSON_FIXTURE` | 显式粘贴的 Grok auth.json fixture | 不记录内容或路径中的账号信息 |
+| `GROK_OAUTH_CALLBACK_URL` | Grok 固定 loopback callback，默认 `http://127.0.0.1:56121/callback` | 可完整记录 |
+| `CC_SWITCH_GROK_PROVIDER_ID` | 只绑定待测账号的 Grok Provider id | 可完整记录 |
+| `CC_SWITCH_GROK_MODEL` | Grok 单模型验收值，默认 `grok-4.5` | 可完整记录 |
+| `CC_SWITCH_GROK_MEDIA_SMOKE` | `1` 时额外运行短图片生成 | 可完整记录 |
 | `CURSOR_OAUTH_REFRESH_TOKEN_FIXTURE` | Cursor OAuth 手动导入 refresh token fixture | 不记录明文 |
 | `ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE` | Antigravity/Agy OAuth 手动导入 refresh token fixture | 不记录明文 |
 | `CURSOR_API_KEY_FIXTURE` | Cursor API Key 真实验收 fixture | 不记录明文 |
@@ -179,6 +189,24 @@ Codex OAuth 专项补充：
 18. 同一 Codex session 连续两个 WS response 应只建立一个上游连接；更换 Provider/runtime/workspace/credential 必须生成新 pool key。用 `CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 缩短参数验证 capacity/idle TTL/max age，并验证 `codexWebsocketEnabled=false` 的禁用行为。
 19. 分别模拟 WS connect refused/timeout、握手 5xx、stale cached socket、首事件前 send/read/close 1009，确认只在首个业务 JSON 事件前通过同账号 HTTP/SSE 回退；握手 400/401/403/429 不得作为传输 fallback。缩短 `STREAM_FIRST_BYTE_TIMEOUT_MS` 验证首事件超时可回退，再缩短 `STREAM_IDLE_TIMEOUT_MS` 验证已收到 `response.created` 后只终止流且不重放。`cc_switch_codex_websocket_fallback_total{source,result}` 与 cache/retry 指标应对应增加。
 
+Grok OAuth 单账号专项补充：
+
+1. 待测 `grok_oauth` Provider 必须显式绑定一个账号。另建一个绑定不同账号的 Grok Provider 作为负向候选；无论 HTTP、SSE、媒体、WebSocket、429、5xx 或 refresh 失败，负向 Provider/账号的请求数都必须保持为零。
+2. 浏览器 PKCE、device start/poll/cancel 和显式 auth.json 导入分别验收。新登录、device 和 auth.json 缺失 ID token、`alg=none`、伪造签名、错误 issuer/audience/nonce、过期/nbf 或未知 `kid` 均必须 fail closed；不得把 email、display name 或未验证 token payload 当作 principal。
+3. Refresh 不返回新 ID token 时，只允许已有 verified subject 的账号继续；返回新 ID token 时必须重新验签并拒绝 subject 变化。轮换后的 token 必须先 durable commit，落盘失败期间 `/ready`、HTTP/SSE、媒体和 WS 都应以 degraded/503 阻止新 Grok 流量。
+4. 授权请求必须包含 `workspaces:read`、`workspaces:write` 和既有 Grok CLI/conversation scopes。Device start/poll 必须携带 `x-grok-client-version` 与 `x-grok-client-surface: ui`；生产 code exchange、device poll、refresh、OIDC discovery 和 JWKS 必须使用固定的官方 `auth.x.ai` HTTPS URL。生产环境变量或 Provider 伪造 OAuth、WS、models 或 inference host 必须无效或被固定覆盖。
+5. 抓包确认 HTTP/SSE、媒体、WS handshake 和 WS→HTTP fallback 使用同一 CLI identity family，默认 version/User-Agent 为 `0.2.111`，并携带一致的 `Authorization`、`x-xai-token-auth`、client identifier/version 和 conversation id。给绑定账号配置同名 `extraHeaders` 必须在零上游请求下 fail closed；legacy Provider 即使残留 `OPENAI_API_KEY` 也必须继续使用 managed token 和 CLI endpoint，配置 inference base URL 必须被固定策略忽略。
+6. 对 Responses JSON 和 SSE 发送固定 `x-session-id` 与合法十进制 `x-grok-turn-idx`，确认上游值完全一致。缺失、负数、带符号、空白、非数字、超过 20 位和 `u64` 溢出都应在上游完全省略；Server 不生成、不缓存、不递增 turn，也不因非法值返回 4xx。
+7. HTTP non-stream 和 SSE 分别模拟首次 401，确认只强刷绑定账号一次，重放使用新 Authorization，同时 conversation id、turn、Provider id 和 model 不变。第二次 401 直接返回并只冷却原账号，不进入通用 Provider failover。
+8. `websocket` 未验证时 GET Responses WS 必须在零上游请求下返回 503。显式 bootstrap 后模拟握手首次 401，再模拟首事件前 close 1009 或 connect/5xx，确认强刷及 HTTP/SSE fallback 始终复用原 Provider、账号、conversation id、turn、single-model policy 和 in-flight lease；握手 400/401/403/429 与首业务事件后的错误不得 fallback。分别发送裸 body、nested 和 flat `response.create`，确认三者统一删除 stream/background、强制 `store=true`，且 continuation 不重复发送 instructions；握手 403/5xx 必须更新绑定账号 cooldown，entitlement headers 必须持久化。
+9. `image_generation`、`image_edit`、`video_generation` 未验证时必须各自 fail closed。仅在 `CC_SWITCH_GROK_OAUTH_CAPABILITIES` 明确 bootstrap 对应能力后执行短请求；成功证据持久化后移除开关重启，能力应继续开放。媒体首次 401 只强刷原账号一次，视频状态查询保持创建时的 Provider/账号 sticky identity。验证大于 2 MiB 且不超过 32 MiB 的图片编辑可进入 handler，wire body、gzip/deflate 任一解码层或最终 decoded body 超过 32 MiB 都返回 413；视频 request id 中的 `/`、`?`、`#`、percent escape、空值、超长值必须在零上游请求下返回 400。
+10. 对 HTTP、SSE、媒体和 WS 分别注入 429 与 reset/retry hints，确认只更新绑定账号的 cooldown/rate-limit outcome，保留下游审计允许的限流头且不跨 Provider。403/5xx/network failure 同样不能授权账号切换。
+11. `/v1/models?app=codex&providerId=<id>` 必须返回选定模型及 `source`、`stale`、`fetchedAtMs`。依次验收 upstream、TTL fresh cache、ETag 304、过期后的 last-known-good 和无缓存 static fallback；所有目录请求只使用已提交 RuntimePlan 中 revision/类型/身份代际一致的 managed binding。未绑定、stale generation、stale plan 或 degraded persistence 时 token 和 models 上游请求数都必须为零。
+12. 将 Grok CLI version 降到已知不受支持值并触发上游 version gate，确认下游错误改写为面向管理员的 `CC_SWITCH_GROK_CLI_VERSION` / `CC_SWITCH_GROK_CLI_USER_AGENT` 指引，raw token/账号不泄漏，`cc_switch_grok_cli_version_gate_total` 增加；恢复默认 `0.2.111` 后重测。
+13. Quota 抓包同时覆盖 user、weekly、monthly、task usage 和 subscriptions。`currentPeriod.end`、`billingPeriodEnd`、token expiry 及 inactive subscription 不能成为订阅到期日；仅 active subscription 的明确 expiry 或账号手工 next-payment 值可进入 UI，且不影响凭据有效性和路由。
+14. 运行 `node scripts/smoke/grok-oauth-real.mjs` 验收 readiness、models metadata、Responses JSON 和完整 SSE terminal。只有显式设置 `CC_SWITCH_GROK_MEDIA_SMOKE=1` 才运行图片；缺少 base/token/provider 或仍为占位符时的 `SKIP` 只能记录为 blocked-inputs，不能记录为真实通过。
+15. 检查 `/metrics` 中 Provider outcome、forward retry、WS fallback、CLI version gate、model catalog、账号 in-flight/max、warm refresh 和 persistence degraded 指标；labels 和 evidence 只含有界分类、Provider id、模型和脱敏账号，不得包含 access/refresh/ID token 或 raw OAuth/upstream body。
+
 Claude OAuth 专项补充：
 
 1. 同一 `claude_oauth` 账号并发触发多次 refresh 时，上游 token endpoint 不应收到重复风暴；失败后短窗口内应进入 per-token backoff。
@@ -205,7 +233,7 @@ Claude OAuth 专项补充：
 22. 连续 `invalid_grant` 达到 `CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 阈值后，账号应显示 `relogin` 并退出其固定 Provider 内的账号调度；网络错误、限流和普通 quota 错误不得累计该计数，手工 refresh 成功后状态应清零。
 23. `GET /metrics` 应能看到账号 inflight/max、Claude retry、Provider outcome、warm-refresh、CLI version-gate、beta decision、count_tokens outcome 与 stream protocol error 指标；labels 必须保持固定枚举。该端点默认无鉴权，公网部署必须由反向代理或网络策略限制抓取来源。
 
-Cursor/Copilot/Kiro/Bedrock 的真实验收变量已经接入 `scripts/smoke/real-acceptance-env-check.sh` 的 AB7 gate 和 `scripts/smoke/oauth-readiness-check.sh` 的脱敏 evidence。变量齐备只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。
+Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。
 
 ### share-market grant
 
@@ -227,6 +255,7 @@ Cursor/Copilot/Kiro/Bedrock 的真实验收变量已经接入 `scripts/smoke/rea
 - `scripts/smoke/direct-market-diagnostics.sh`
 - `scripts/smoke/code-agent-regression.sh`
 - `scripts/smoke/oauth-readiness-check.sh`
+- `scripts/smoke/grok-oauth-real.mjs`
 - `scripts/smoke/share-market-grant-smoke.sh`
 - `scripts/release-readiness.sh`
 

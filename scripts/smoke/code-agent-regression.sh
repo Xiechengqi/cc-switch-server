@@ -3,6 +3,7 @@ set -euo pipefail
 
 SERVER_URL="${SERVER_URL:-http://127.0.0.1:15721}"
 API_TOKEN="${CC_SWITCH_SERVER_TOKEN:-}"
+INFERENCE_TOKEN="${CC_SWITCH_INFERENCE_TOKEN:-}"
 SHARE_ID="${SHARE_ID:-}"
 CLAUDE_SHARE_ID="${CLAUDE_SHARE_ID:-}"
 CODEX_SHARE_ID="${CODEX_SHARE_ID:-${SHARE_ID}}"
@@ -42,6 +43,11 @@ fail() { FAILURES=$((FAILURES + 1)); echo "[FAIL] $*"; }
 auth_header=()
 if [[ -n "$API_TOKEN" ]]; then
   auth_header=(-H "Authorization: Bearer $API_TOKEN")
+fi
+
+inference_auth_header=()
+if [[ -n "$INFERENCE_TOKEN" ]]; then
+  inference_auth_header=(-H "x-api-key: $INFERENCE_TOKEN")
 fi
 
 router_auth_header=()
@@ -195,15 +201,15 @@ else
 fi
 
 echo "== local source probes =="
-if [[ -n "$API_TOKEN" ]]; then
+if [[ -n "$INFERENCE_TOKEN" ]]; then
   if [[ -n "$CLAUDE_SHARE_ID" ]]; then
     probe "claude local messages non-stream" "$SERVER_URL/v1/messages" \
       '{"model":"probe","max_tokens":1,"messages":[{"role":"user","content":"ping"}],"stream":false}' \
-      -H "X-CC-Switch-Share-Id: $CLAUDE_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
+      "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CLAUDE_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
     if [[ "$STREAM_PROBE" == "1" ]]; then
       stream_probe "claude local messages stream" "$SERVER_URL/v1/messages" \
         '{"model":"probe","max_tokens":1,"messages":[{"role":"user","content":"stream ping"}],"stream":true}' \
-        -H "X-CC-Switch-Share-Id: $CLAUDE_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
+        "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CLAUDE_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
     fi
   else
     skip "CLAUDE_SHARE_ID missing; skipped Claude local probes"
@@ -212,14 +218,14 @@ if [[ -n "$API_TOKEN" ]]; then
   if [[ -n "$CODEX_SHARE_ID" ]]; then
   probe "codex local responses non-stream" "$SERVER_URL/v1/responses" \
     '{"model":"probe","input":"ping","stream":false,"max_output_tokens":1}' \
-    -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
+    "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
   probe "codex local chat non-stream" "$SERVER_URL/v1/chat/completions" \
     '{"model":"probe","messages":[{"role":"user","content":"ping"}],"stream":false,"max_tokens":1}' \
-    -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
+    "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
   if [[ "$STREAM_PROBE" == "1" ]]; then
     stream_probe "codex local responses stream" "$SERVER_URL/v1/responses" \
       '{"model":"probe","input":"stream ping","stream":true,"max_output_tokens":1}' \
-      -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
+      "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
   fi
   else
     skip "CODEX_SHARE_ID/SHARE_ID missing; skipped Codex local probes"
@@ -228,17 +234,17 @@ if [[ -n "$API_TOKEN" ]]; then
   if [[ -n "$GEMINI_SHARE_ID" ]]; then
     probe "gemini local generateContent non-stream" "$SERVER_URL/v1beta/models/probe:generateContent" \
       '{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":1}}' \
-      -H "X-CC-Switch-Share-Id: $GEMINI_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
+      "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $GEMINI_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
     if [[ "$STREAM_PROBE" == "1" ]]; then
       stream_probe "gemini local generateContent stream" "$SERVER_URL/v1beta/models/probe:streamGenerateContent" \
         '{"contents":[{"role":"user","parts":[{"text":"stream ping"}]}],"generationConfig":{"maxOutputTokens":1}}' \
-        -H "X-CC-Switch-Share-Id: $GEMINI_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
+        "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $GEMINI_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
     fi
   else
     skip "GEMINI_SHARE_ID missing; skipped Gemini local probes"
   fi
 else
-  skip "CC_SWITCH_SERVER_TOKEN missing; skipped local source probes"
+  skip "CC_SWITCH_INFERENCE_TOKEN missing; skipped local source probes"
 fi
 
 echo "== direct source probes =="
