@@ -20,12 +20,19 @@ export type ShareAccessByApp = Partial<
 
 export type ShareSaleMarketKind = "token" | "share";
 
-export type ShareTokenPeriod = "lifetime" | "day" | "week" | "calendarMonth";
+export type ShareTokenPeriod =
+  | "lifetime"
+  | "day"
+  | "week"
+  | "sevenDays"
+  | "calendarMonth"
+  | "thirtyDays";
 
 export type ShareUserPolicy = {
   parallelLimit?: number;
   tokenLimit?: number;
   tokenPeriod: ShareTokenPeriod;
+  tokenPeriodAnchorAtMs?: number;
   expiresAt?: number;
 };
 
@@ -35,12 +42,25 @@ export type ShareUserUsageBucket = {
   requestsCount: number;
 };
 
+export type ShareAnchoredUsageBucket = ShareUserUsageBucket & {
+  period: Extract<ShareTokenPeriod, "sevenDays" | "thirtyDays">;
+  anchorAtMs: number;
+};
+
+export type ShareUserUsage = {
+  lifetime: ShareUserUsageBucket;
+  day: ShareUserUsageBucket;
+  week: ShareUserUsageBucket;
+  calendarMonth: ShareUserUsageBucket;
+  anchored?: ShareAnchoredUsageBucket;
+};
+
 export type ShareUserGrant = {
   email: string;
   role: "owner" | "shareto";
   active: boolean;
   policy: ShareUserPolicy;
-  usage?: Partial<Record<ShareTokenPeriod, ShareUserUsageBucket>>;
+  usage?: ShareUserUsage;
   createdAtMs?: number;
   updatedAtMs?: number;
   revokedAtMs?: number;

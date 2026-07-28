@@ -54,8 +54,12 @@
     "userLimit": {
       "periodLifetime": "Lifetime",
       "periodDay": "Daily",
-      "periodWeek": "Weekly",
+      "periodWeek": "Calendar week",
+      "periodSevenDays": "Every 7 days",
       "periodMonth": "Calendar month",
+      "periodThirtyDays": "Every 30 days",
+      "anchor": "Period start (UTC)",
+      "anchorHint": "Resets at fixed intervals from this UTC time. It cannot be in the future.",
       "title": "User limits",
       "hint": "The overall Share limits always apply; each user is also constrained by their own limits.",
       "add": "Add user",

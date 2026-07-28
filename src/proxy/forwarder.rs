@@ -7283,14 +7283,12 @@ pub(super) async fn record_share_invocation_result(
         return;
     };
     state
-        .mutate_shares_debounced(|shares| {
-            shares.record_user_invocation_result(
-                share_id,
-                user_email,
-                share_usage_tokens(usage),
-                crate::infra::time::now_ms() as i64,
-            );
-        })
+        .record_share_invocation_result(
+            share_id,
+            user_email,
+            share_usage_tokens(usage),
+            crate::infra::time::now_ms() as i64,
+        )
         .await;
 }
 

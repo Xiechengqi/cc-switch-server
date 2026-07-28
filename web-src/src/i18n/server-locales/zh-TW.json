@@ -54,8 +54,12 @@
     "userLimit": {
       "periodLifetime": "累計",
       "periodDay": "每天",
-      "periodWeek": "每週",
+      "periodWeek": "自然週",
+      "periodSevenDays": "每 7 天",
       "periodMonth": "自然月",
+      "periodThirtyDays": "每 30 天",
+      "anchor": "週期開始時間（UTC）",
+      "anchorHint": "從該 UTC 時間起每隔固定天數重設，不可晚於目前時間。",
       "title": "使用者限制",
       "hint": "Share 總限制永遠生效；每位使用者也會受到各自限制。",
       "add": "新增使用者",

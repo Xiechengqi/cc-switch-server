@@ -52,6 +52,8 @@ Run the checks manually at:
 - The full Shares page scrolls vertically to the bottom at both target viewports; expanding settings or request logs does not leave content clipped below the shell.
 - Request logs show the selected Share's recent seven-day history with correct token, status, latency, range, and pagination values; the table remains horizontally scrollable on narrow screens.
 - After a server restart, requests written since the last usage snapshot still appear, and a completed streaming request keeps its final token and latency values.
+- User Token periods show Lifetime, Daily, UTC calendar week, Every 7 days, Calendar month, and Every 30 days. The two fixed periods require a non-future UTC start time, preserve minute precision, and hide/clear that field for all calendar periods.
+- Two Share users with the same fixed period but different starts show independent current windows and reset countdowns. Changing a user's period or start recomputes the current window from request history instead of resetting usage to zero.
 
 ## Usage
 

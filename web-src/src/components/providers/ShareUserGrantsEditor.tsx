@@ -41,8 +41,11 @@ type PolicyDraft = {
   parallelLimit: string;
   tokenLimit: string;
   tokenPeriod: ShareTokenPeriod;
+  tokenPeriodAnchor: string;
   expiresAt: string;
 };
+
+const ANCHORED_PERIODS: ReadonlySet<ShareTokenPeriod> = new Set(["sevenDays", "thirtyDays"]);
 
 type ShareUserGrantsEditorProps = {
   value: ShareUserGrantMap;
@@ -61,12 +64,24 @@ function toLocalDateTime(value: number | undefined) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function toUtcDateTime(value?: number) {
+  const date = new Date(value ?? Math.floor(Date.now() / 60_000) * 60_000);
+  if (!Number.isFinite(date.getTime())) return "";
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+
+function parseUtcDateTime(value: string) {
+  return value ? new Date(`${value}:00Z`).getTime() : undefined;
+}
+
 function policyDraft(email: string, policy: ShareUserPolicy): PolicyDraft {
   return {
     email,
     parallelLimit: policy.parallelLimit == null ? "" : String(policy.parallelLimit),
     tokenLimit: policy.tokenLimit == null ? "" : String(policy.tokenLimit),
     tokenPeriod: policy.tokenPeriod ?? "lifetime",
+    tokenPeriodAnchor: toUtcDateTime(policy.tokenPeriodAnchorAtMs),
     expiresAt: toLocalDateTime(policy.expiresAt),
   };
 }
@@ -139,6 +154,10 @@ export function ShareUserGrantsEditor({
     const expiresAt = draft.expiresAt
       ? new Date(draft.expiresAt).getTime()
       : undefined;
+    const anchored = ANCHORED_PERIODS.has(draft.tokenPeriod);
+    const tokenPeriodAnchorAtMs = anchored
+      ? parseUtcDateTime(draft.tokenPeriodAnchor)
+      : undefined;
     if (
       !isValidShareEmail(email) ||
       (editingEmail == null && Boolean(value[email]?.active)) ||
@@ -146,7 +165,12 @@ export function ShareUserGrantsEditor({
       tokenLimit === 0 ||
       (parallelLimit != null && (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
       (tokenLimit != null && (!Number.isInteger(tokenLimit) || tokenLimit < 1)) ||
-      (expiresAt != null && !Number.isFinite(expiresAt))
+      (expiresAt != null && !Number.isFinite(expiresAt)) ||
+      (anchored && (
+        tokenPeriodAnchorAtMs == null ||
+        !Number.isFinite(tokenPeriodAnchorAtMs) ||
+        tokenPeriodAnchorAtMs > Math.floor(Date.now() / 60_000) * 60_000
+      ))
     ) {
       return;
     }
@@ -160,6 +184,7 @@ export function ShareUserGrantsEditor({
         parallelLimit,
         tokenLimit,
         tokenPeriod: draft.tokenPeriod,
+        tokenPeriodAnchorAtMs,
         expiresAt,
       },
     };
@@ -175,8 +200,10 @@ export function ShareUserGrantsEditor({
   const periodLabels: Record<ShareTokenPeriod, string> = {
     lifetime: t("share.userLimit.periodLifetime", { defaultValue: "累计" }),
     day: t("share.userLimit.periodDay", { defaultValue: "每天" }),
-    week: t("share.userLimit.periodWeek", { defaultValue: "每周" }),
+    week: t("share.userLimit.periodWeek", { defaultValue: "自然周" }),
+    sevenDays: t("share.userLimit.periodSevenDays", { defaultValue: "每 7 天" }),
     calendarMonth: t("share.userLimit.periodMonth", { defaultValue: "每月" }),
+    thirtyDays: t("share.userLimit.periodThirtyDays", { defaultValue: "每 30 天" }),
   };
 
   return (
@@ -275,13 +302,36 @@ export function ShareUserGrantsEditor({
               </div>
               <div className="space-y-2">
                 <Label>{t("share.userLimit.period", { defaultValue: "Token 周期" })}</Label>
-                <Select value={draft.tokenPeriod} onValueChange={(tokenPeriod: ShareTokenPeriod) => setDraft({ ...draft, tokenPeriod })}>
+                <Select value={draft.tokenPeriod} onValueChange={(tokenPeriod: ShareTokenPeriod) => setDraft({
+                  ...draft,
+                  tokenPeriod,
+                  tokenPeriodAnchor: ANCHORED_PERIODS.has(tokenPeriod)
+                    ? (draft.tokenPeriodAnchor || toUtcDateTime())
+                    : "",
+                })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent className="z-[120]">
                     {(Object.keys(periodLabels) as ShareTokenPeriod[]).map((period) => <SelectItem key={period} value={period}>{periodLabels[period]}</SelectItem>)}
                   </SelectContent>
                 </Select>
               </div>
+              {ANCHORED_PERIODS.has(draft.tokenPeriod) ? (
+                <div className="space-y-2 sm:col-span-2">
+                  <Label htmlFor="share-user-period-anchor">
+                    {t("share.userLimit.anchor", { defaultValue: "周期开始时间（UTC）" })}
+                  </Label>
+                  <Input
+                    id="share-user-period-anchor"
+                    type="datetime-local"
+                    step={60}
+                    value={draft.tokenPeriodAnchor}
+                    onChange={(event) => setDraft({ ...draft, tokenPeriodAnchor: event.target.value })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t("share.userLimit.anchorHint", { defaultValue: "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。" })}
+                  </p>
+                </div>
+              ) : null}
               <div className="space-y-2">
                 <Label htmlFor="share-user-expiry">{t("share.expiration", { defaultValue: "到期时间" })}</Label>
                 <Input id="share-user-expiry" type="datetime-local" value={draft.expiresAt} onChange={(event) => setDraft({ ...draft, expiresAt: event.target.value })} />

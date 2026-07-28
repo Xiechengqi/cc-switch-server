@@ -18,7 +18,7 @@ const MAX_USAGE_LOGS: usize = 2_000;
 const USAGE_ROLLUP_BUCKET_MS: u128 = 60 * 1000;
 const USAGE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 const USAGE_COMPACT_EVERY_EVENTS: u64 = 500;
-const USAGE_SCHEMA_VERSION: u8 = 2;
+const USAGE_SCHEMA_VERSION: u8 = 3;
 const USAGE_JOURNAL_VERSION: u8 = 2;
 const DEFAULT_USAGE_STATS_WINDOW_MS: u128 = 60 * 60 * 1000;
 const DEFAULT_USAGE_STATS_LIMIT: usize = 50;
@@ -152,6 +152,19 @@ pub struct UsageLog {
     pub created_at_ms: u128,
 }
 
+impl UsageLog {
+    pub fn quota_tokens(&self) -> u64 {
+        self.total_tokens
+            .or_else(|| match (self.input_tokens, self.output_tokens) {
+                (Some(input), Some(output)) => Some(input.saturating_add(output)),
+                (Some(input), None) => Some(input),
+                (None, Some(output)) => Some(output),
+                (None, None) => None,
+            })
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UsageLogContext {
     pub request_id: Option<String>,
@@ -189,6 +202,11 @@ impl UsageStore {
         let rollups_need_migration = loaded_rollups
             .as_ref()
             .is_some_and(|rollups| rollups.schema_version < USAGE_SCHEMA_VERSION);
+        if rollups_need_migration {
+            if let Some(rollups) = loaded_rollups.as_mut() {
+                rollups.backfill_quota_tokens();
+            }
+        }
         let normalized_rollups = loaded_rollups
             .as_mut()
             .is_some_and(UsageRollupStore::normalize_keys);
@@ -253,7 +271,7 @@ impl UsageStore {
             store.save_recent_snapshot(config_dir)?;
             truncate_usage_journal(config_dir)?;
             store.writes_since_compact = 0;
-            tracing::info!("migrated usage storage to token-only schema");
+            tracing::info!("migrated usage storage schema");
         }
         Ok(store)
     }
@@ -293,6 +311,40 @@ impl UsageStore {
         self.rollups.add_log(&log);
         self.logs.push(log);
         self.trim_recent_window();
+    }
+
+    pub fn share_user_quota_usage(
+        &self,
+        share_id: &str,
+        user_email: &str,
+        starts_at_ms: i64,
+        ends_at_ms: i64,
+    ) -> (u64, u64) {
+        let (Ok(starts_at_ms), Ok(ends_at_ms)) =
+            (u128::try_from(starts_at_ms), u128::try_from(ends_at_ms))
+        else {
+            return (0, 0);
+        };
+        let normalized_email = user_email.trim();
+        self.rollups
+            .buckets
+            .values()
+            .filter(|bucket| {
+                bucket.bucket_start_ms >= starts_at_ms
+                    && bucket.bucket_start_ms < ends_at_ms
+                    && bucket.share_id.as_deref() == Some(share_id)
+                    && bucket
+                        .user_email
+                        .as_deref()
+                        .is_some_and(|email| email.trim().eq_ignore_ascii_case(normalized_email))
+                    && !bucket.is_health_check
+            })
+            .fold((0u64, 0u64), |(tokens, requests), bucket| {
+                (
+                    tokens.saturating_add(bucket.stats.quota_tokens),
+                    requests.saturating_add(bucket.stats.rollup.requests),
+                )
+            })
     }
 
     pub fn push_and_persist(&mut self, config_dir: &Path, log: UsageLog) -> anyhow::Result<()> {
@@ -752,6 +804,20 @@ impl UsageRollupStore {
             }
         }
         changed
+    }
+
+    fn backfill_quota_tokens(&mut self) {
+        for bucket in self.buckets.values_mut() {
+            bucket.stats.quota_tokens = if bucket.stats.rollup.total_tokens > 0 {
+                bucket.stats.rollup.total_tokens
+            } else {
+                bucket
+                    .stats
+                    .rollup
+                    .input_tokens
+                    .saturating_add(bucket.stats.rollup.output_tokens)
+            };
+        }
     }
 
     fn add_log(&mut self, log: &UsageLog) {
@@ -1395,6 +1461,8 @@ fn subtract_log_from_rollup(rollup: &mut UsageRollup, log: &UsageLog) {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct UsageStatsAccumulator {
     rollup: UsageRollup,
+    #[serde(default)]
+    quota_tokens: u64,
     duration_sum_ms: u128,
     duration_count: u64,
     first_token_sum_ms: u128,
@@ -1405,6 +1473,7 @@ struct UsageStatsAccumulator {
 impl UsageStatsAccumulator {
     fn push(&mut self, log: &UsageLog) {
         add_log_to_rollup(&mut self.rollup, log);
+        self.quota_tokens = self.quota_tokens.saturating_add(log.quota_tokens());
         self.duration_sum_ms = self.duration_sum_ms.saturating_add(log.duration_ms);
         self.duration_count = self.duration_count.saturating_add(1);
         if let Some(first_token_ms) = log.first_token_ms {
@@ -1420,6 +1489,7 @@ impl UsageStatsAccumulator {
 
     fn remove(&mut self, log: &UsageLog) {
         subtract_log_from_rollup(&mut self.rollup, log);
+        self.quota_tokens = self.quota_tokens.saturating_sub(log.quota_tokens());
         self.duration_sum_ms = self.duration_sum_ms.saturating_sub(log.duration_ms);
         self.duration_count = self.duration_count.saturating_sub(1);
         if let Some(first_token_ms) = log.first_token_ms {
@@ -1433,6 +1503,7 @@ impl UsageStatsAccumulator {
 
     fn merge(&mut self, other: &UsageStatsAccumulator) {
         self.rollup.add_assign(&other.rollup);
+        self.quota_tokens = self.quota_tokens.saturating_add(other.quota_tokens);
         self.duration_sum_ms = self.duration_sum_ms.saturating_add(other.duration_sum_ms);
         self.duration_count = self.duration_count.saturating_add(other.duration_count);
         self.first_token_sum_ms = self
@@ -2296,6 +2367,45 @@ mod tests {
     }
 
     #[test]
+    fn share_user_quota_uses_persistent_rollups_beyond_recent_log_limit() {
+        let starts_at_ms = 1_800_000_000_000u128;
+        let mut store = UsageStore::default();
+        for index in 0..=MAX_USAGE_LOGS {
+            let mut log = UsageLog::new(
+                AppKind::Codex,
+                "p1".to_string(),
+                "provider 1".to_string(),
+                ProviderType::Codex,
+                200,
+                10,
+                UsageModelMetadata::default(),
+                TokenUsage {
+                    input_tokens: Some(40),
+                    output_tokens: Some(2),
+                    total_tokens: Some(7),
+                    ..TokenUsage::default()
+                },
+            );
+            log.request_id = format!("req_quota_{index}");
+            log.share_id = Some("share-1".to_string());
+            log.user_email = Some("User@Example.com".to_string());
+            log.created_at_ms = starts_at_ms + index as u128;
+            store.push(log);
+        }
+
+        assert_eq!(store.logs.len(), MAX_USAGE_LOGS);
+        assert_eq!(
+            store.share_user_quota_usage(
+                "share-1",
+                "user@example.com",
+                starts_at_ms as i64,
+                (starts_at_ms + 60_000) as i64,
+            ),
+            (7 * (MAX_USAGE_LOGS as u64 + 1), MAX_USAGE_LOGS as u64 + 1)
+        );
+    }
+
+    #[test]
     fn push_deduplicates_router_direct_and_market_request_id() {
         let mut direct = UsageLog::new(
             AppKind::Codex,
@@ -2928,6 +3038,15 @@ mod tests {
         let rollup = loaded.rollup();
         assert_eq!(rollup.requests, 5);
         assert_eq!(rollup.total_tokens, 50);
+        assert_eq!(
+            loaded
+                .rollups
+                .buckets
+                .values()
+                .map(|bucket| bucket.stats.quota_tokens)
+                .sum::<u64>(),
+            50
+        );
 
         let snapshot = fs::read_to_string(usage_path(&dir)).unwrap();
         let rollups = fs::read_to_string(usage_rollups_path(&dir)).unwrap();

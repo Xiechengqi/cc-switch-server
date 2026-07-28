@@ -286,13 +286,10 @@ pub(in crate::api) async fn web_patch_share_settings(
 ) -> Result<Share, ApiError> {
     let share_id = web_arg_share_id(args)?;
     let share = state
-        .mutate_shares_immediate(|store| {
-            store
-                .apply_settings_patch(&share_id, patch)
-                .map_err(map_share_patch_error)
-        })
+        .apply_share_settings_patch_immediate(&share_id, patch)
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(ApiError::internal)?
+        .map_err(map_share_patch_error)?;
     spawn_share_upsert_sync(state.clone(), share.clone());
     emit_share_event(state, "share.changed", &share, "settings_patched");
     Ok(share)
@@ -907,7 +904,7 @@ pub(in crate::api) async fn web_update_share_acl(
         ..ShareSettingsPatch::default()
     };
     let share = state
-        .try_mutate_shares_immediate(|store| store.apply_settings_patch(&share_id, patch))
+        .apply_share_settings_patch_immediate(&share_id, patch)
         .await
         .map_err(ApiError::internal)?
         .map_err(map_share_patch_error)?;
@@ -949,6 +946,7 @@ pub(in crate::api) async fn web_save_provider_share(
         .ok_or_else(|| ApiError::bad_request("parallelLimit is required"))?;
     let expires_at = web_arg_string_any(value, &["expiresAt", "expires_at"])?;
 
+    let usage_for_quota = state.usage.read().await.clone();
     let mut staged = state.shares.read().await.clone();
     let current = staged
         .get(&share_id)
@@ -970,7 +968,7 @@ pub(in crate::api) async fn web_save_provider_share(
         .update_subdomain(&share_id, subdomain)
         .map_err(map_share_patch_error)?;
     staged
-        .apply_settings_patch(
+        .apply_settings_patch_with_usage(
             &share_id,
             ShareSettingsPatch {
                 description: Some(description),
@@ -989,6 +987,8 @@ pub(in crate::api) async fn web_save_provider_share(
                 user_grants: Some(user_grants),
                 ..ShareSettingsPatch::default()
             },
+            &usage_for_quota,
+            crate::infra::time::now_ms() as i64,
         )
         .map_err(map_share_patch_error)?;
     let candidate = staged
@@ -1035,7 +1035,7 @@ pub(in crate::api) async fn web_save_provider_share(
     }
 
     let saved = match state
-        .try_mutate_shares_immediate(|store| {
+        .try_mutate_share_quota_immediate(|store, usage, applied_at_ms| {
             let current = store
                 .get(&share_id)
                 .ok_or_else(|| ApiError::not_found("share not found"))?;
@@ -1050,7 +1050,14 @@ pub(in crate::api) async fn web_save_provider_share(
             }
             store
                 .replace_configured_share(candidate)
-                .map_err(map_share_patch_error)
+                .map_err(map_share_patch_error)?;
+            store
+                .rebuild_user_anchored_usage(&share_id, usage, applied_at_ms)
+                .map_err(map_share_patch_error)?;
+            store
+                .get(&share_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("share not found"))
         })
         .await
     {

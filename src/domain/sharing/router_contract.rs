@@ -57,7 +57,20 @@ pub enum ShareTokenPeriod {
     Lifetime,
     Day,
     Week,
+    SevenDays,
     CalendarMonth,
+    ThirtyDays,
+}
+
+pub fn supported_share_token_periods() -> Vec<ShareTokenPeriod> {
+    vec![
+        ShareTokenPeriod::Lifetime,
+        ShareTokenPeriod::Day,
+        ShareTokenPeriod::Week,
+        ShareTokenPeriod::SevenDays,
+        ShareTokenPeriod::CalendarMonth,
+        ShareTokenPeriod::ThirtyDays,
+    ]
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +82,8 @@ pub struct ShareUserPolicy {
     pub token_limit: Option<u64>,
     #[serde(default)]
     pub token_period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_period_anchor_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
 }
@@ -95,6 +110,20 @@ pub struct ShareUserUsage {
     pub week: ShareUserUsageBucket,
     #[serde(default)]
     pub calendar_month: ShareUserUsageBucket,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchored: Option<ShareAnchoredUsageBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareAnchoredUsageBucket {
+    pub period: ShareTokenPeriod,
+    pub anchor_at_ms: i64,
+    pub started_at_ms: i64,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub requests_count: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +218,8 @@ pub struct ShareDescriptor {
     pub descriptor_fingerprint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_user_token_periods: Vec<ShareTokenPeriod>,
 }
 
 fn is_zero_revision(value: &u64) -> bool {
@@ -477,6 +508,8 @@ pub struct ShareRequestLogEntry {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_tokens: Option<u32>,
     pub is_streaming: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -685,6 +718,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         descriptor_generation: share.descriptor_generation,
         descriptor_fingerprint: share.descriptor_fingerprint.clone().unwrap_or_default(),
         user_grants: share.user_grants.clone(),
+        supported_user_token_periods: supported_share_token_periods(),
     }
 }
 
@@ -735,6 +769,19 @@ fn static_descriptor_projection(
         for providers in apps.values_mut().filter_map(Value::as_array_mut) {
             for provider in providers {
                 strip_dynamic_provider_projection(provider, true);
+            }
+        }
+    }
+    if let Some(grants) = object.get_mut("userGrants").and_then(Value::as_object_mut) {
+        for grant in grants.values_mut().filter_map(Value::as_object_mut) {
+            for field in [
+                "usage",
+                "createdAtMs",
+                "updatedAtMs",
+                "revokedAtMs",
+                "revision",
+            ] {
+                grant.remove(field);
             }
         }
     }

@@ -12,10 +12,11 @@ use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, share_expires_at_rfc3339, ShareAppAccess,
-    ShareAppSettings, ShareSettingsPatch, ShareTokenPeriod, ShareUserGrant, ShareUserPolicy,
-    ShareUserUsage, ShareUserUsageBucket,
+    descriptor_for_share_with_accounts_and_usage, share_expires_at_rfc3339,
+    ShareAnchoredUsageBucket, ShareAppAccess, ShareAppSettings, ShareSettingsPatch,
+    ShareTokenPeriod, ShareUserGrant, ShareUserPolicy, ShareUserUsage, ShareUserUsageBucket,
 };
+use crate::domain::sharing::token_period::{token_period_window, validate_user_policy};
 use crate::domain::usage::store::UsageStore;
 use crate::infra::time::now_ms;
 
@@ -30,7 +31,32 @@ impl ShareUserUsage {
             ShareTokenPeriod::CalendarMonth => {
                 current_bucket_tokens(&self.calendar_month, utc_calendar_month_start_ms(now_ms))
             }
+            ShareTokenPeriod::SevenDays | ShareTokenPeriod::ThirtyDays => 0,
         }
+    }
+
+    pub fn tokens_for_policy(&self, policy: &ShareUserPolicy, now_ms: i64) -> u64 {
+        if !policy.token_period.requires_anchor() {
+            return self.tokens_for(policy.token_period, now_ms);
+        }
+        let Ok(window) = token_period_window(policy, now_ms) else {
+            return 0;
+        };
+        let Some(anchor_at_ms) = policy.token_period_anchor_at_ms else {
+            return 0;
+        };
+        let Some(started_at_ms) = window.starts_at_ms else {
+            return 0;
+        };
+        self.anchored
+            .as_ref()
+            .filter(|bucket| {
+                bucket.period == policy.token_period
+                    && bucket.anchor_at_ms == anchor_at_ms
+                    && bucket.started_at_ms == started_at_ms
+            })
+            .map(|bucket| bucket.tokens_used)
+            .unwrap_or(0)
     }
 
     fn record(&mut self, tokens: u64, now_ms: i64) {
@@ -42,6 +68,65 @@ impl ShareUserUsage {
             utc_calendar_month_start_ms(now_ms),
             tokens,
         );
+    }
+
+    fn record_for_policy(&mut self, policy: &ShareUserPolicy, tokens: u64, now_ms: i64) {
+        self.record(tokens, now_ms);
+        if !policy.token_period.requires_anchor() {
+            return;
+        }
+        let Ok(window) = token_period_window(policy, now_ms) else {
+            return;
+        };
+        let (Some(anchor_at_ms), Some(started_at_ms)) =
+            (policy.token_period_anchor_at_ms, window.starts_at_ms)
+        else {
+            return;
+        };
+        let replace = self.anchored.as_ref().is_none_or(|bucket| {
+            bucket.period != policy.token_period
+                || bucket.anchor_at_ms != anchor_at_ms
+                || bucket.started_at_ms != started_at_ms
+        });
+        if replace {
+            self.anchored = Some(ShareAnchoredUsageBucket {
+                period: policy.token_period,
+                anchor_at_ms,
+                started_at_ms,
+                tokens_used: 0,
+                requests_count: 0,
+            });
+        }
+        if let Some(bucket) = self.anchored.as_mut() {
+            bucket.tokens_used = bucket.tokens_used.saturating_add(tokens);
+            bucket.requests_count = bucket.requests_count.saturating_add(1);
+        }
+    }
+
+    pub fn rebuild_anchored(
+        &mut self,
+        policy: &ShareUserPolicy,
+        now_ms: i64,
+        tokens_used: u64,
+        requests_count: u64,
+    ) -> Result<(), String> {
+        if !policy.token_period.requires_anchor() {
+            self.anchored = None;
+            return Ok(());
+        }
+        let window = token_period_window(policy, now_ms)?;
+        self.anchored = Some(ShareAnchoredUsageBucket {
+            period: policy.token_period,
+            anchor_at_ms: policy
+                .token_period_anchor_at_ms
+                .ok_or_else(|| "tokenPeriodAnchorAtMs is required".to_string())?,
+            started_at_ms: window
+                .starts_at_ms
+                .ok_or_else(|| "fixed token period has no start".to_string())?,
+            tokens_used,
+            requests_count,
+        });
+        Ok(())
     }
 }
 
@@ -847,9 +932,11 @@ impl ShareStore {
                     status_changed: false,
                 });
             }
-            if grant.policy.token_limit.is_some_and(|limit| {
-                grant.usage.tokens_for(grant.policy.token_period, now_ms) >= limit
-            }) {
+            if grant
+                .policy
+                .token_limit
+                .is_some_and(|limit| grant.usage.tokens_for_policy(&grant.policy, now_ms) >= limit)
+            {
                 return Err(ShareInvocationRejection {
                     reason: ShareRejectReason::UserExhausted,
                     message: "This user's Share token quota has been exhausted.".to_string(),
@@ -897,7 +984,10 @@ impl ShareStore {
             .map(str::to_ascii_lowercase)
         {
             if let Some(grant) = share.user_grants.get_mut(&email) {
-                grant.usage.record(tokens, recorded_at_ms);
+                let policy = grant.policy.clone();
+                grant
+                    .usage
+                    .record_for_policy(&policy, tokens, recorded_at_ms);
                 grant.updated_at_ms = now_ms();
             }
         }
@@ -1246,6 +1336,62 @@ impl ShareStore {
         self.shares[index] = share.clone();
 
         Ok(share)
+    }
+
+    pub fn apply_settings_patch_with_usage(
+        &mut self,
+        share_id: &str,
+        patch: ShareSettingsPatch,
+        usage: &UsageStore,
+        applied_at_ms: i64,
+    ) -> Result<Share, SharePatchError> {
+        let mut candidate = self.clone();
+        candidate.apply_settings_patch(share_id, patch)?;
+        candidate.rebuild_user_anchored_usage(share_id, usage, applied_at_ms)?;
+        let share = candidate
+            .get(share_id)
+            .cloned()
+            .ok_or(SharePatchError::NotFound)?;
+        *self = candidate;
+        Ok(share)
+    }
+
+    pub fn rebuild_user_anchored_usage(
+        &mut self,
+        share_id: &str,
+        usage: &UsageStore,
+        now_ms: i64,
+    ) -> Result<(), SharePatchError> {
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|share| share.id == share_id)
+            .ok_or(SharePatchError::NotFound)?;
+        for grant in share.user_grants.values_mut() {
+            if !grant.active || !grant.policy.token_period.requires_anchor() {
+                grant
+                    .usage
+                    .rebuild_anchored(&grant.policy, now_ms, 0, 0)
+                    .map_err(SharePatchError::Invalid)?;
+                continue;
+            }
+            let window =
+                token_period_window(&grant.policy, now_ms).map_err(SharePatchError::Invalid)?;
+            let start = window
+                .starts_at_ms
+                .ok_or_else(|| SharePatchError::Invalid("fixed period has no start".into()))?;
+            let end = window
+                .ends_at_ms
+                .ok_or_else(|| SharePatchError::Invalid("fixed period has no end".into()))?;
+            let normalized_email = grant.email.trim().to_ascii_lowercase();
+            let (tokens_used, requests_count) =
+                usage.share_user_quota_usage(share_id, &normalized_email, start, end);
+            grant
+                .usage
+                .rebuild_anchored(&grant.policy, now_ms, tokens_used, requests_count)
+                .map_err(SharePatchError::Invalid)?;
+        }
+        Ok(())
     }
 
     pub fn canonicalize_primary_app_settings(
@@ -1951,6 +2097,7 @@ fn default_user_policy(share: &Share) -> ShareUserPolicy {
         parallel_limit: share.parallel_limit,
         token_limit: share.token_limit,
         token_period: ShareTokenPeriod::Lifetime,
+        token_period_anchor_at_ms: None,
         expires_at: share.expires_at,
     }
 }
@@ -2005,6 +2152,8 @@ fn normalize_user_grants(
                 "user limits must be positive or unlimited".to_string(),
             ));
         }
+        validate_user_policy(&incoming_grant.policy, now as i64)
+            .map_err(SharePatchError::Invalid)?;
         let previous = existing.get(&email);
         let mut grant = incoming_grant.clone();
         grant.email = email.clone();
@@ -2474,6 +2623,7 @@ mod tests {
             parallel_limit: Some(7),
             token_limit: Some(50_000),
             token_period: ShareTokenPeriod::Lifetime,
+            token_period_anchor_at_ms: None,
             expires_at: Some(expires_at),
         };
 
@@ -2508,6 +2658,115 @@ mod tests {
             0
         );
         assert_eq!(usage.tokens_for(ShareTokenPeriod::Lifetime, february), 24);
+    }
+
+    #[test]
+    fn anchored_usage_is_scoped_by_period_anchor_and_current_window() {
+        let anchor = test_timestamp_ms(2026, 7, 1, 12, 15);
+        let policy = ShareUserPolicy {
+            token_limit: Some(100),
+            token_period: ShareTokenPeriod::SevenDays,
+            token_period_anchor_at_ms: Some(anchor),
+            ..ShareUserPolicy::default()
+        };
+        let mut usage = ShareUserUsage::default();
+        usage.record_for_policy(&policy, 17, test_timestamp_ms(2026, 7, 14, 8, 0));
+        assert_eq!(
+            usage.tokens_for_policy(&policy, test_timestamp_ms(2026, 7, 15, 12, 14)),
+            17
+        );
+        assert_eq!(
+            usage.tokens_for_policy(&policy, test_timestamp_ms(2026, 7, 15, 12, 15)),
+            0
+        );
+
+        let shifted = ShareUserPolicy {
+            token_period_anchor_at_ms: Some(test_timestamp_ms(2026, 7, 2, 12, 15)),
+            ..policy
+        };
+        assert_eq!(
+            usage.tokens_for_policy(&shifted, test_timestamp_ms(2026, 7, 15, 12, 14)),
+            0
+        );
+    }
+
+    #[test]
+    fn changing_fixed_period_rebuilds_usage_from_persistent_history() {
+        let now = test_timestamp_ms(2026, 7, 28, 12, 0);
+        let mut input = codex_share_input("anchored-history");
+        input.acl = Some(ShareAcl {
+            shared_with_emails: vec!["user@example.com".to_string()],
+            ..ShareAcl::default()
+        });
+        let mut store = ShareStore::default();
+        store.upsert(input).unwrap();
+
+        let mut log = crate::domain::usage::store::UsageLog::new(
+            AppKind::Codex,
+            "provider-codex".to_string(),
+            "Provider".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            crate::domain::usage::store::UsageModelMetadata::default(),
+            crate::domain::usage::store::TokenUsage {
+                total_tokens: Some(17),
+                ..Default::default()
+            },
+        );
+        log.share_id = Some("anchored-history".to_string());
+        log.user_email = Some("USER@example.com".to_string());
+        log.created_at_ms = test_timestamp_ms(2026, 7, 24, 8, 0) as u128;
+        let mut usage = UsageStore::default();
+        usage.push(log);
+
+        let mut grants = store.get("anchored-history").unwrap().user_grants.clone();
+        grants.get_mut("user@example.com").unwrap().policy = ShareUserPolicy {
+            token_limit: Some(100),
+            token_period: ShareTokenPeriod::SevenDays,
+            token_period_anchor_at_ms: Some(test_timestamp_ms(2026, 7, 1, 12, 0)),
+            ..ShareUserPolicy::default()
+        };
+        let updated = store
+            .apply_settings_patch_with_usage(
+                "anchored-history",
+                ShareSettingsPatch {
+                    user_grants: Some(grants.clone()),
+                    ..ShareSettingsPatch::default()
+                },
+                &usage,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            updated.user_grants["user@example.com"]
+                .usage
+                .tokens_for_policy(&updated.user_grants["user@example.com"].policy, now),
+            17
+        );
+
+        grants
+            .get_mut("user@example.com")
+            .unwrap()
+            .policy
+            .token_period_anchor_at_ms = Some(test_timestamp_ms(2026, 7, 25, 12, 0));
+        let shifted = store
+            .apply_settings_patch_with_usage(
+                "anchored-history",
+                ShareSettingsPatch {
+                    user_grants: Some(grants),
+                    ..ShareSettingsPatch::default()
+                },
+                &usage,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            shifted.user_grants["user@example.com"]
+                .usage
+                .tokens_for_policy(&shifted.user_grants["user@example.com"].policy, now),
+            0
+        );
     }
 
     #[test]
@@ -3950,6 +4209,7 @@ mod tests {
             parallel_limit: Some(7),
             token_limit: Some(50_000),
             token_period: ShareTokenPeriod::Lifetime,
+            token_period_anchor_at_ms: None,
             expires_at: Some(expires_at),
         };
         assert_eq!(share.user_grants["owner@example.com"].policy, expected);

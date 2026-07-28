@@ -54,8 +54,12 @@
     "userLimit": {
       "periodLifetime": "累計",
       "periodDay": "日次",
-      "periodWeek": "週次",
+      "periodWeek": "暦週",
+      "periodSevenDays": "7 日ごと",
       "periodMonth": "暦月",
+      "periodThirtyDays": "30 日ごと",
+      "anchor": "周期開始日時（UTC）",
+      "anchorHint": "この UTC 日時を起点に固定間隔でリセットします。未来の日時は指定できません。",
       "title": "ユーザー制限",
       "hint": "Share 全体の制限は常に適用され、各ユーザーには個別の制限も適用されます。",
       "add": "ユーザーを追加",

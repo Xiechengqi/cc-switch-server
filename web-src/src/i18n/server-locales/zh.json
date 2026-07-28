@@ -54,8 +54,12 @@
     "userLimit": {
       "periodLifetime": "累计",
       "periodDay": "每天",
-      "periodWeek": "每周",
+      "periodWeek": "自然周",
+      "periodSevenDays": "每 7 天",
       "periodMonth": "自然月",
+      "periodThirtyDays": "每 30 天",
+      "anchor": "周期开始时间（UTC）",
+      "anchorHint": "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。",
       "title": "用户限制",
       "hint": "总 Share 限制始终生效；每个用户还受自己的限制约束。",
       "add": "添加用户",

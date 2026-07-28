@@ -227,6 +227,7 @@ pub struct ServerStateInner {
     pub(crate) accounts: RwLock<AccountStore>,
     pub(crate) usage: RwLock<UsageStore>,
     pub(crate) shares: RwLock<ShareStore>,
+    share_quota_mutations: AsyncMutex<()>,
     pub(crate) ui_settings: RwLock<UiSettingsStore>,
     pub(crate) sessions: RwLock<Vec<Session>>,
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
@@ -2615,6 +2616,7 @@ impl ServerStateInner {
             accounts: RwLock::new(accounts),
             usage: RwLock::new(usage),
             shares: RwLock::new(shares),
+            share_quota_mutations: AsyncMutex::new(()),
             ui_settings: RwLock::new(ui_settings),
             sessions: RwLock::new(Vec::new()),
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
@@ -5948,6 +5950,47 @@ impl ServerStateInner {
         Ok(Ok(result))
     }
 
+    pub async fn apply_share_settings_patch_immediate(
+        &self,
+        share_id: &str,
+        patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
+    ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
+        self.try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
+            shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
+        })
+        .await
+    }
+
+    pub async fn try_mutate_share_quota_immediate<R, E>(
+        &self,
+        mutate: impl FnOnce(&mut ShareStore, &UsageStore, i64) -> Result<R, E>,
+    ) -> anyhow::Result<Result<R, E>> {
+        let _quota_mutation = self.share_quota_mutations.lock().await;
+        let usage = self.usage.read().await.clone();
+        let applied_at_ms = crate::infra::time::now_ms() as i64;
+        self.try_mutate_shares_immediate(|shares| mutate(shares, &usage, applied_at_ms))
+            .await
+    }
+
+    pub async fn record_share_invocation_result(
+        self: &Arc<Self>,
+        share_id: &str,
+        user_email: Option<&str>,
+        tokens: u64,
+        recorded_at_ms: i64,
+    ) {
+        let _quota_mutation = self.share_quota_mutations.lock().await;
+        let usage = self.usage.read().await.clone();
+        self.mutate_shares_debounced(|shares| {
+            shares.record_user_invocation_result(share_id, user_email, tokens, recorded_at_ms);
+            if let Err(error) = shares.rebuild_user_anchored_usage(share_id, &usage, recorded_at_ms)
+            {
+                tracing::error!(%error, share_id, "rebuild anchored Share quota usage failed");
+            }
+        })
+        .await;
+    }
+
     pub async fn mutate_shares_debounced<R>(
         self: &Arc<Self>,
         mutate: impl FnOnce(&mut ShareStore) -> R,
@@ -7797,24 +7840,26 @@ async fn apply_and_ack_share_edit(
 async fn apply_share_edit_locally(state: &ServerState, edit: &ShareEditView) -> anyhow::Result<()> {
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
+    state
+        .apply_share_settings_patch_immediate(&edit.share_id, edit.patch.clone())
+        .await??;
     let usage = state.usage.read().await.clone();
-    {
-        let mut shares = state.shares.write().await;
-        shares.apply_settings_patch(&edit.share_id, edit.patch.clone())?;
-        shares.update_market_grant(
-            &edit.share_id,
-            Some(ShareMarketGrantStatus {
-                status: "applied".to_string(),
-                grant_id: Some(edit.id.clone()),
-                last_error: None,
-                updated_at_ms: Some(crate::infra::time::now_ms()),
-            }),
-        );
-        shares.refresh_runtime_snapshots(&providers, Some(&accounts), &usage);
-        shares.router_registered = true;
-        shares.last_router_error = None;
-    }
-    state.save_shares().await?;
+    state
+        .mutate_shares_immediate(|shares| {
+            shares.update_market_grant(
+                &edit.share_id,
+                Some(ShareMarketGrantStatus {
+                    status: "applied".to_string(),
+                    grant_id: Some(edit.id.clone()),
+                    last_error: None,
+                    updated_at_ms: Some(crate::infra::time::now_ms()),
+                }),
+            );
+            shares.refresh_runtime_snapshots(&providers, Some(&accounts), &usage);
+            shares.router_registered = true;
+            shares.last_router_error = None;
+        })
+        .await?;
     Ok(())
 }
 
@@ -8627,6 +8672,7 @@ pub(crate) async fn share_request_log_entry(
         output_tokens: clamp_u64_to_u32(log.output_tokens.unwrap_or(0)),
         cache_read_tokens: clamp_u64_to_u32(log.cache_read_tokens.unwrap_or(0)),
         cache_creation_tokens: clamp_u64_to_u32(log.cache_creation_tokens.unwrap_or(0)),
+        quota_tokens: Some(clamp_u64_to_u32(log.quota_tokens())),
         is_streaming: log.is_streaming,
         session_id: log.session_id.clone(),
         user_country: log.user_country.clone(),

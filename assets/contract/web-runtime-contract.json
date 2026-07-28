@@ -2,6 +2,14 @@
   "version": 1,
   "product": "cc-switch-server",
   "uiAutomationAllowed": false,
+  "shareUserTokenPeriods": {
+    "wireValues": ["lifetime", "day", "week", "sevenDays", "calendarMonth", "thirtyDays"],
+    "weekSemantics": "utc_calendar_week_monday",
+    "anchoredPeriods": ["sevenDays", "thirtyDays"],
+    "anchorField": "tokenPeriodAnchorAtMs",
+    "anchorPrecision": "utc_epoch_milliseconds_minute",
+    "windowBounds": "half_open"
+  },
   "clientWebTransport": {
     "privatePrefix": "/web-api/",
     "publicPaths": [

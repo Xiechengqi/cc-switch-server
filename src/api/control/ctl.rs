@@ -29,26 +29,20 @@ pub(crate) async fn control_apply_share_settings(
         }
     }
     let share = state
-        .mutate_shares_immediate(|shares| {
-            shares
-                .apply_settings_patch(&input.share_id, input.patch)
-                .map_err(|error| match error {
-                    crate::domain::sharing::shares::SharePatchError::NotFound => {
-                        ApiError::not_found("share not found")
-                    }
-                    crate::domain::sharing::shares::SharePatchError::BindingImmutable => {
-                        ApiError::conflict_code(
-                            "cc_switch_share_binding_immutable",
-                            error.to_string(),
-                        )
-                    }
-                    crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
-                        ApiError::bad_request(message)
-                    }
-                })
-        })
+        .apply_share_settings_patch_immediate(&input.share_id, input.patch)
         .await
-        .map_err(ApiError::internal)??;
+        .map_err(ApiError::internal)?
+        .map_err(|error| match error {
+            crate::domain::sharing::shares::SharePatchError::NotFound => {
+                ApiError::not_found("share not found")
+            }
+            crate::domain::sharing::shares::SharePatchError::BindingImmutable => {
+                ApiError::conflict_code("cc_switch_share_binding_immutable", error.to_string())
+            }
+            crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
+                ApiError::bad_request(message)
+            }
+        })?;
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
     let usage = state.usage.read().await.clone();
