@@ -85,6 +85,9 @@ const MAX_PROVIDER_IMPORT_ITEMS: usize = 256;
 const CODEX_WORKSPACE_REBIND_TRANSACTION_SCHEMA: u32 = 1;
 const CODEX_WORKSPACE_REBIND_TRANSACTION_FILE: &str = ".codex-workspace-rebind-transaction.json";
 const CODEX_WORKSPACE_REBIND_STAGE_DIRECTORY: &str = ".codex-workspace-rebind-stage";
+const EPHEMERAL_IMAGE_TTL_MS: i64 = 60 * 60 * 1000;
+const EPHEMERAL_IMAGE_MAX_ENTRIES: usize = 128;
+const EPHEMERAL_IMAGE_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 
 #[cfg(test)]
 pub(crate) async fn install_openai_test_jwk(jwk: jsonwebtoken::jwk::Jwk) {
@@ -229,6 +232,104 @@ impl DeviceFlowPrincipalStore {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EphemeralImage {
+    pub(crate) data: bytes::Bytes,
+    pub(crate) mime_type: String,
+    pub(crate) expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EphemeralImageHandle {
+    pub(crate) token: String,
+}
+
+#[derive(Debug, Default)]
+struct EphemeralImageStore {
+    entries: BTreeMap<String, EphemeralImageEntry>,
+    total_bytes: usize,
+}
+
+#[derive(Debug)]
+struct EphemeralImageEntry {
+    image: EphemeralImage,
+    inserted_at_ms: i64,
+}
+
+impl EphemeralImageStore {
+    fn insert(
+        &mut self,
+        data: bytes::Bytes,
+        mime_type: String,
+        now_ms: i64,
+    ) -> anyhow::Result<EphemeralImageHandle> {
+        anyhow::ensure!(
+            data.len() <= EPHEMERAL_IMAGE_MAX_TOTAL_BYTES,
+            "generated image exceeds the ephemeral image store capacity"
+        );
+        self.prune(now_ms);
+        while self.entries.len() >= EPHEMERAL_IMAGE_MAX_ENTRIES
+            || self.total_bytes.saturating_add(data.len()) > EPHEMERAL_IMAGE_MAX_TOTAL_BYTES
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at_ms)
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+
+        let token = loop {
+            let mut random = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut random);
+            let candidate = hex::encode(random);
+            if !self.entries.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let expires_at_ms = now_ms.saturating_add(EPHEMERAL_IMAGE_TTL_MS);
+        self.total_bytes = self.total_bytes.saturating_add(data.len());
+        self.entries.insert(
+            token.clone(),
+            EphemeralImageEntry {
+                image: EphemeralImage {
+                    data,
+                    mime_type,
+                    expires_at_ms,
+                },
+                inserted_at_ms: now_ms,
+            },
+        );
+        Ok(EphemeralImageHandle { token })
+    }
+
+    fn get(&mut self, token: &str, now_ms: i64) -> Option<EphemeralImage> {
+        self.prune(now_ms);
+        self.entries.get(token).map(|entry| entry.image.clone())
+    }
+
+    fn prune(&mut self, now_ms: i64) {
+        let expired = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.image.expires_at_ms <= now_ms)
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        for token in expired {
+            self.remove(&token);
+        }
+    }
+
+    fn remove(&mut self, token: &str) {
+        if let Some(entry) = self.entries.remove(token) {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.image.data.len());
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ServerStateInner {
     pub bind_addr: SocketAddr,
@@ -253,6 +354,7 @@ pub struct ServerStateInner {
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
     grok_media_sessions: Mutex<BTreeMap<String, GrokMediaSessionBinding>>,
+    ephemeral_images: Mutex<EphemeralImageStore>,
     grok_device_flows: RwLock<GrokDeviceFlowStore>,
     kiro_device_flows: RwLock<KiroDeviceFlowStore>,
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
@@ -2776,6 +2878,7 @@ impl ServerStateInner {
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
             copilot_upstream_auth: RwLock::new(BTreeMap::new()),
             grok_media_sessions: Mutex::new(BTreeMap::new()),
+            ephemeral_images: Mutex::new(EphemeralImageStore::default()),
             grok_device_flows: RwLock::new(GrokDeviceFlowStore::default()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
@@ -2824,6 +2927,23 @@ impl ServerStateInner {
             "off"
         };
         crate::logging::reload_log_level(level);
+    }
+
+    pub(crate) fn store_ephemeral_image(
+        &self,
+        data: bytes::Bytes,
+        mime_type: String,
+    ) -> anyhow::Result<EphemeralImageHandle> {
+        let now_ms = now_ms_i64();
+        self.ephemeral_images
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ephemeral image store lock poisoned"))?
+            .insert(data, mime_type, now_ms)
+    }
+
+    pub(crate) fn ephemeral_image(&self, token: &str) -> Option<EphemeralImage> {
+        let now_ms = now_ms_i64();
+        self.ephemeral_images.lock().ok()?.get(token, now_ms)
     }
 
     pub async fn read_admin_log_tail(
@@ -9547,6 +9667,43 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
+
+    #[test]
+    fn ephemeral_image_store_enforces_token_ttl_and_entry_capacity() {
+        let mut expiring = EphemeralImageStore::default();
+        let handle = expiring
+            .insert(
+                bytes::Bytes::from_static(b"image"),
+                "image/png".to_string(),
+                10,
+            )
+            .unwrap();
+        assert_eq!(handle.token.len(), 64);
+        assert!(handle.token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(expiring
+            .get(&handle.token, 10 + EPHEMERAL_IMAGE_TTL_MS - 1)
+            .is_some());
+        assert!(expiring
+            .get(&handle.token, 10 + EPHEMERAL_IMAGE_TTL_MS)
+            .is_none());
+
+        let mut bounded = EphemeralImageStore::default();
+        let mut handles = Vec::new();
+        for now_ms in 0..=EPHEMERAL_IMAGE_MAX_ENTRIES {
+            handles.push(
+                bounded
+                    .insert(
+                        bytes::Bytes::from_static(b"x"),
+                        "image/png".to_string(),
+                        now_ms as i64,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(bounded.entries.len(), EPHEMERAL_IMAGE_MAX_ENTRIES);
+        assert!(bounded.get(&handles[0].token, 1_000).is_none());
+        assert!(bounded.get(&handles.last().unwrap().token, 1_000).is_some());
+    }
 
     fn router_sync_share_input(share_id: &str, provider_id: &str) -> UpsertShareInput {
         UpsertShareInput {

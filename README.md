@@ -63,7 +63,7 @@ market or direct share URL
 | Code Agent | 反代入口 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | **Claude Code** | `POST /v1/messages` | ✅ Native | Anthropic Messages 原生转发；支持 Claude/Codex/Gemini/OpenRouter 等跨协议 adapter |
-| **Codex CLI** | `POST /v1/responses`、`GET /v1/responses` (WebSocket)、`POST /v1/chat/completions`、`POST /v1/images/generations` | ✅ Native | Responses/Chat 互转；Device + CLI OAuth；有界 WS cache 与提交前 HTTP/SSE fallback |
+| **Codex CLI** | `POST /v1/responses`、`GET /v1/responses` (WebSocket)、`POST /v1/chat/completions`、`POST /v1/images/generations`、`POST /v1/images/edits` | ✅ Native | Responses/Chat 互转；Device + CLI OAuth；Images 增量/Cloudflare 心跳；有界 WS cache 与提交前 HTTP/SSE fallback |
 | **Gemini CLI** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 透传；`GET /v1beta/models` 等列表端点已覆盖 |
 | **OpenAI-compatible** | `GET /v1/models`、`GET /models` | ✅ Native | 模型列表与 OpenAI-compatible 探测 |
 | **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | ⚠️ Partial | OAuth/模型列表已接入；无独立 `/antigravity/v1*` 路由组 |

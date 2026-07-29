@@ -4,13 +4,15 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use base64::Engine;
 use bytes::Bytes;
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{stream, StreamExt};
 use reqwest::Url;
 use serde_json::Value;
 
 use super::ProxyError;
 
 pub(crate) const MAX_IMAGE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CODEX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+pub(crate) const MAX_CODEX_IMAGES_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const BATCH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 3;
@@ -180,6 +182,34 @@ pub(crate) fn decode_image_data_uri(
 }
 
 pub(crate) async fn inline_codex_remote_images(body: &Bytes) -> Result<Bytes, ProxyError> {
+    inline_codex_images_with_limits(
+        body,
+        MAX_IMAGE_BYTES,
+        MAX_IMAGE_BYTES.saturating_mul(MAX_IMAGES_PER_REQUEST),
+    )
+    .await
+}
+
+pub(crate) async fn inline_codex_images_endpoint_images(body: &Bytes) -> Result<Bytes, ProxyError> {
+    inline_codex_images_with_limits(body, MAX_CODEX_IMAGE_BYTES, MAX_CODEX_IMAGES_TOTAL_BYTES).await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CodexImageLocation {
+    Content {
+        input_index: usize,
+        content_index: usize,
+    },
+    ToolMask {
+        tool_index: usize,
+    },
+}
+
+async fn inline_codex_images_with_limits(
+    body: &Bytes,
+    max_image_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<Bytes, ProxyError> {
     let mut value = serde_json::from_slice::<Value>(body)
         .map_err(|error| invalid_image(format!("invalid Codex image request JSON: {error}")))?;
     let image_count = codex_image_part_count(&value);
@@ -188,46 +218,69 @@ pub(crate) async fn inline_codex_remote_images(body: &Bytes) -> Result<Bytes, Pr
             "Codex request exceeds {MAX_IMAGES_PER_REQUEST} image limit"
         )));
     }
-    let references = codex_remote_image_references(&value)?;
+    let (references, mut total_bytes) =
+        codex_image_references(&value, max_image_bytes, max_total_bytes)?;
     if references.is_empty() {
         return Ok(body.clone());
     }
 
-    let loaded_images =
-        tokio::time::timeout(
-            BATCH_FETCH_TIMEOUT,
-            stream::iter(references.into_iter().map(
-                |(input_index, content_index, url)| async move {
-                    let loaded = fetch_remote_image(&url, MAX_IMAGE_BYTES).await?;
-                    Ok::<_, ProxyError>((input_index, content_index, loaded))
-                },
-            ))
-            .buffered(MAX_CONCURRENT_FETCHES)
-            .try_collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(|_| remote_image_error("remote image batch timed out"))??;
+    let loaded_images = tokio::time::timeout(BATCH_FETCH_TIMEOUT, async move {
+        let mut pending = stream::iter(references.into_iter().map(|(location, url)| async move {
+            let loaded = fetch_remote_image(&url, max_image_bytes).await?;
+            Ok::<_, ProxyError>((location, loaded))
+        }))
+        .buffer_unordered(MAX_CONCURRENT_FETCHES);
+        let mut loaded_images = Vec::new();
+        while let Some(result) = pending.next().await {
+            let (location, loaded) = result?;
+            total_bytes =
+                checked_total_image_bytes(total_bytes, loaded.data.len(), max_total_bytes)?;
+            loaded_images.push((location, loaded));
+        }
+        Ok::<_, ProxyError>(loaded_images)
+    })
+    .await
+    .map_err(|_| remote_image_error("remote image batch timed out"))??;
 
-    for (input_index, content_index, loaded) in loaded_images {
+    for (location, loaded) in loaded_images {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&loaded.data);
         let data_uri = format!("data:{};base64,{encoded}", loaded.mime_type);
-        let Some(part) = value
-            .get_mut("input")
-            .and_then(Value::as_array_mut)
-            .and_then(|input| input.get_mut(input_index))
-            .and_then(|item| item.get_mut("content"))
-            .and_then(Value::as_array_mut)
-            .and_then(|content| content.get_mut(content_index))
-        else {
-            return Err(invalid_image("Codex image content changed while loading"));
-        };
-        match part.get_mut("image_url") {
-            Some(Value::Object(image_url)) => {
-                image_url.insert("url".to_string(), Value::String(data_uri));
+        match location {
+            CodexImageLocation::Content {
+                input_index,
+                content_index,
+            } => {
+                let Some(part) = value
+                    .get_mut("input")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|input| input.get_mut(input_index))
+                    .and_then(|item| item.get_mut("content"))
+                    .and_then(Value::as_array_mut)
+                    .and_then(|content| content.get_mut(content_index))
+                else {
+                    return Err(invalid_image("Codex image content changed while loading"));
+                };
+                match part.get_mut("image_url") {
+                    Some(Value::Object(image_url)) => {
+                        image_url.insert("url".to_string(), Value::String(data_uri));
+                    }
+                    Some(image_url) => *image_url = Value::String(data_uri),
+                    None => {
+                        part["image_url"] = Value::String(data_uri);
+                    }
+                }
             }
-            Some(image_url) => *image_url = Value::String(data_uri),
-            None => {
-                part["image_url"] = Value::String(data_uri);
+            CodexImageLocation::ToolMask { tool_index } => {
+                let Some(image_url) = value
+                    .get_mut("tools")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|tools| tools.get_mut(tool_index))
+                    .and_then(|tool| tool.get_mut("input_image_mask"))
+                    .and_then(|mask| mask.get_mut("image_url"))
+                else {
+                    return Err(invalid_image("Codex image mask changed while loading"));
+                };
+                *image_url = Value::String(data_uri);
             }
         }
     }
@@ -254,34 +307,90 @@ fn codex_image_part_count(value: &Value) -> usize {
         .count()
 }
 
-fn codex_remote_image_references(value: &Value) -> Result<Vec<(usize, usize, String)>, ProxyError> {
+fn codex_image_references(
+    value: &Value,
+    max_image_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<(Vec<(CodexImageLocation, String)>, usize), ProxyError> {
     let mut references = Vec::new();
-    let Some(input) = value.get("input").and_then(Value::as_array) else {
-        return Ok(references);
-    };
-    for (input_index, item) in input.iter().enumerate() {
-        let Some(content) = item.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        for (content_index, part) in content.iter().enumerate() {
-            if !matches!(
-                part.get("type").and_then(Value::as_str),
-                Some("input_image" | "image_url")
-            ) {
-                continue;
-            }
-            let Some(url) = codex_image_url(part).map(str::trim) else {
+    let mut total_bytes = 0usize;
+    if let Some(input) = value.get("input").and_then(Value::as_array) {
+        for (input_index, item) in input.iter().enumerate() {
+            let Some(content) = item.get("content").and_then(Value::as_array) else {
                 continue;
             };
-            if is_data_image_uri(url) {
-                decode_image_data_uri(url, MAX_IMAGE_BYTES)?;
-                continue;
+            for (content_index, part) in content.iter().enumerate() {
+                if !matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("input_image" | "image_url")
+                ) {
+                    continue;
+                }
+                collect_codex_image_reference(
+                    part,
+                    CodexImageLocation::Content {
+                        input_index,
+                        content_index,
+                    },
+                    max_image_bytes,
+                    max_total_bytes,
+                    &mut total_bytes,
+                    &mut references,
+                )?;
             }
-            require_http_image_url(url)?;
-            references.push((input_index, content_index, url.to_string()));
         }
     }
-    Ok(references)
+    if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+        for (tool_index, tool) in tools.iter().enumerate() {
+            let Some(mask) = tool.get("input_image_mask") else {
+                continue;
+            };
+            collect_codex_image_reference(
+                mask,
+                CodexImageLocation::ToolMask { tool_index },
+                max_image_bytes,
+                max_total_bytes,
+                &mut total_bytes,
+                &mut references,
+            )?;
+        }
+    }
+    Ok((references, total_bytes))
+}
+
+fn collect_codex_image_reference(
+    part: &Value,
+    location: CodexImageLocation,
+    max_image_bytes: usize,
+    max_total_bytes: usize,
+    total_bytes: &mut usize,
+    references: &mut Vec<(CodexImageLocation, String)>,
+) -> Result<(), ProxyError> {
+    let Some(url) = codex_image_url(part).map(str::trim) else {
+        return Ok(());
+    };
+    if is_data_image_uri(url) {
+        let loaded = decode_image_data_uri(url, max_image_bytes)?;
+        *total_bytes = checked_total_image_bytes(*total_bytes, loaded.data.len(), max_total_bytes)?;
+        return Ok(());
+    }
+    require_http_image_url(url)?;
+    references.push((location, url.to_string()));
+    Ok(())
+}
+
+fn checked_total_image_bytes(
+    current: usize,
+    next: usize,
+    max_total_bytes: usize,
+) -> Result<usize, ProxyError> {
+    let total = current.saturating_add(next);
+    if total > max_total_bytes {
+        return Err(invalid_image(format!(
+            "Codex request image payload exceeds {max_total_bytes} byte aggregate limit"
+        )));
+    }
+    Ok(total)
 }
 
 fn codex_image_url(part: &Value) -> Option<&str> {
@@ -546,10 +655,16 @@ mod tests {
                 ]
             }]
         });
-        let references = codex_remote_image_references(&value).unwrap();
+        let (references, total_bytes) = codex_image_references(
+            &value,
+            MAX_IMAGE_BYTES,
+            MAX_IMAGES_PER_REQUEST * MAX_IMAGE_BYTES,
+        )
+        .unwrap();
         assert_eq!(references.len(), 2);
-        assert_eq!(references[0].2, "https://example.com/a.png");
-        assert_eq!(references[1].2, "HTTPS://example.com/b.png");
+        assert_eq!(references[0].1, "https://example.com/a.png");
+        assert_eq!(references[1].1, "HTTPS://example.com/b.png");
+        assert_eq!(total_bytes, 8);
     }
 
     #[test]
@@ -562,7 +677,12 @@ mod tests {
                 ]
             }]
         });
-        let error = codex_remote_image_references(&value).unwrap_err();
+        let error = codex_image_references(
+            &value,
+            MAX_IMAGE_BYTES,
+            MAX_IMAGES_PER_REQUEST * MAX_IMAGE_BYTES,
+        )
+        .unwrap_err();
         assert!(error.message.contains("http/https"));
     }
 

@@ -1,5 +1,7 @@
 use crate::domain::providers::store::StoredProvider;
-use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
+use crate::domain::usage::store::{
+    ImageUsageMetadata, TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata,
+};
 use crate::state::{ServerEvent, ServerState};
 
 pub(super) async fn log_usage(
@@ -73,6 +75,67 @@ pub(super) async fn update_stream_usage(
             .id(request_id.to_string())
             .app(stored.app)
             .message(stream_status.unwrap_or("stream")),
+    );
+    crate::state::sync_latest_direct_share_log(state.clone()).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn update_image_stream_usage(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request_id: &str,
+    status_code: u16,
+    duration_ms: u128,
+    first_token_ms: Option<u128>,
+    usage: TokenUsage,
+    stream_status: &str,
+    error_message: Option<&str>,
+    image: Option<ImageUsageMetadata>,
+) {
+    let persisted = state
+        .update_usage_log(request_id, |log| {
+            let mut router_visible_changed = apply_stream_usage_fields(
+                log,
+                status_code,
+                duration_ms,
+                first_token_ms,
+                usage,
+                Some(stream_status),
+            );
+            let next_error = error_message.map(str::to_string);
+            router_visible_changed |= log.error_message != next_error;
+            log.error_message = next_error;
+            if let Some(image) = image {
+                router_visible_changed |= log.image_count != Some(image.count)
+                    || log.image_bytes != Some(image.bytes)
+                    || log.image_format != image.format
+                    || log.image_width != image.width
+                    || log.image_height != image.height
+                    || log.image_size != image.size;
+                log.image_count = Some(image.count);
+                log.image_bytes = Some(image.bytes);
+                log.image_format = image.format;
+                log.image_width = image.width;
+                log.image_height = image.height;
+                log.image_size = image.size;
+            }
+            if router_visible_changed {
+                log.router_last_synced_at_ms = None;
+                log.router_last_sync_error = None;
+                log.router_sync_attempt_count = 0;
+            }
+        })
+        .await;
+    match persisted {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(error) => tracing::warn!("failed to persist image stream usage update: {error}"),
+    }
+    state.emit_event(
+        ServerEvent::new("usage.updated", "usage")
+            .id(request_id.to_string())
+            .app(stored.app)
+            .message(stream_status),
     );
     crate::state::sync_latest_direct_share_log(state.clone()).await;
 }

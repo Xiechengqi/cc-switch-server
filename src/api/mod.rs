@@ -540,24 +540,32 @@ pub fn app_router(state: ServerState) -> Router {
             post(proxy_codex_alpha_search),
         )
         .route(
+            "/v1/images/files/:token",
+            get(ephemeral_image_file).head(ephemeral_image_file),
+        )
+        .route(
             "/v1/images/generations",
-            post(proxy_images_generations)
-                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+            post(proxy_images_generations).layer(DefaultBodyLimit::max(
+                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+            )),
         )
         .route(
             "/images/generations",
-            post(proxy_images_generations)
-                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+            post(proxy_images_generations).layer(DefaultBodyLimit::max(
+                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+            )),
         )
         .route(
             "/v1/images/edits",
-            post(proxy_images_edits)
-                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+            post(proxy_images_edits).layer(DefaultBodyLimit::max(
+                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+            )),
         )
         .route(
             "/images/edits",
-            post(proxy_images_edits)
-                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+            post(proxy_images_edits).layer(DefaultBodyLimit::max(
+                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+            )),
         )
         .route(
             "/v1/videos/generations",
@@ -1550,7 +1558,7 @@ mod grok_catalog_provider_tests {
             StatusCode::PAYLOAD_TOO_LARGE
         );
 
-        let above_media_limit = axum::http::Request::builder()
+        let codex_envelope = axum::http::Request::builder()
             .method(Method::POST)
             .uri("/v1/images/edits")
             .header(header::AUTHORIZATION, format!("Bearer {inference_token}"))
@@ -1560,8 +1568,95 @@ mod grok_catalog_provider_tests {
                 proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES + 1
             ]))
             .unwrap();
-        let rejected = app.oneshot(above_media_limit).await.unwrap();
+        let accepted_codex_envelope = app.clone().oneshot(codex_envelope).await.unwrap();
+        assert_ne!(
+            accepted_codex_envelope.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let above_images_envelope = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/edits")
+            .header(header::AUTHORIZATION, format!("Bearer {inference_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(vec![
+                b' ';
+                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES
+                    + 1
+            ]))
+            .unwrap();
+        let rejected = app.oneshot(above_images_envelope).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_image_capability_url_supports_get_head_and_rejects_invalid_tokens() {
+        let state = catalog_test_state("ephemeral-image-download");
+        let image = Bytes::from_static(b"\x89PNG\r\n\x1a\nfixture");
+        let handle = state
+            .store_ephemeral_image(image.clone(), "image/png".to_string())
+            .unwrap();
+        let path = format!("/v1/images/files/{}", handle.token);
+        let app = app_router(state);
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri(&path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(get_response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            get_response.headers()[header::CACHE_CONTROL],
+            "private, no-store, max-age=0"
+        );
+        assert_eq!(get_response.headers()["x-content-type-options"], "nosniff");
+        let body = axum::body::to_bytes(get_response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body, image);
+
+        let head_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::HEAD)
+                    .uri(&path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_response.status(), StatusCode::OK);
+        assert_eq!(head_response.headers()[header::CONTENT_LENGTH], "15");
+        assert!(axum::body::to_bytes(head_response.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+
+        for invalid_path in [
+            "/v1/images/files/not-a-token".to_string(),
+            format!("/v1/images/files/{}", "0".repeat(64)),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(Method::GET)
+                        .uri(invalid_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]
@@ -2148,6 +2243,54 @@ async fn proxy_images_generations(
     proxy::forward_images_generations(state, headers, body)
         .await
         .map_err(ApiError::proxy)
+}
+
+async fn ephemeral_image_file(
+    State(state): State<ServerState>,
+    Path(token): Path<String>,
+    method: Method,
+) -> Response {
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(image) = state.ephemeral_image(&token) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from(image.data.clone())
+    };
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        image
+            .mime_type
+            .parse()
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&image.data.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store, max-age=0"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("inline"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("cross-origin"),
+    );
+    response
 }
 
 async fn proxy_images_edits(

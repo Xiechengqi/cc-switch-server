@@ -40,7 +40,7 @@ use cc_switch_server::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
 };
 use cc_switch_server::domain::sharing::router_contract::{
-    ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch,
+    ShareGrantManager, ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch,
 };
 use cc_switch_server::domain::sharing::shares::{ShareBinding, UpsertShareInput};
 use cc_switch_server::domain::usage::store::{
@@ -551,6 +551,100 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
         .as_str()
         .unwrap()
         .contains("replay control request"));
+}
+
+#[tokio::test]
+async fn control_apply_share_settings_accepts_router_share_market_managed_grant() {
+    let state = test_state();
+    let mut config = state.config_snapshot().await;
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-ctl".to_string(),
+        public_key: "public-key".to_string(),
+        private_key: "private-key".to_string(),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+    let share = state
+        .mutate_shares_immediate(|store| {
+            store
+                .upsert(test_share_input(
+                    "share-managed-control",
+                    "provider-managed-control",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    let body = serde_json::to_vec(&json!({
+        "shareId": share.id,
+        "patch": {
+            "managedGrant": {
+                "operationId": "router-share-market-operation-1",
+                "entitlementId": "router-share-market-entitlement-1",
+                "shareSequence": 1,
+                "expectedConfigRevision": share.config_revision,
+                "action": "upsert",
+                "email": "renter@example.com",
+                "policy": {
+                    "parallelLimit": 2,
+                    "tokenLimit": 1000,
+                    "tokenPeriod": "day"
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let timestamp_ms = now_ms() as i64;
+    let signature = BASE64_STANDARD.encode(
+        control_signature(
+            APPLY_SHARE_SETTINGS_PATH,
+            "control-secret",
+            &body,
+            timestamp_ms,
+            "nonce-managed-control",
+        )
+        .unwrap(),
+    );
+
+    let response = app_router(state.clone())
+        .oneshot(control_request(
+            APPLY_SHARE_SETTINGS_PATH,
+            body,
+            timestamp_ms,
+            "nonce-managed-control",
+            &signature,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = json_body(response).await;
+    assert_eq!(response["ok"], true);
+    assert_eq!(
+        response["share"]["userGrants"]["renter@example.com"]["manager"],
+        "routerShareMarket"
+    );
+    assert_eq!(
+        response["share"]["userGrants"]["renter@example.com"]["entitlementId"],
+        "router-share-market-entitlement-1"
+    );
+
+    let grant = state
+        .mutate_shares_immediate(|store| {
+            store
+                .get("share-managed-control")
+                .and_then(|share| share.user_grants.get("renter@example.com"))
+                .cloned()
+        })
+        .await
+        .unwrap()
+        .expect("persisted managed grant");
+    assert!(grant.active);
+    assert_eq!(grant.manager, ShareGrantManager::RouterShareMarket);
+    assert_eq!(
+        grant.entitlement_id.as_deref(),
+        Some("router-share-market-entitlement-1")
+    );
 }
 
 #[tokio::test]

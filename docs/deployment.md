@@ -164,6 +164,8 @@ scripts/smoke/router-market-smoke.sh
 
 建议外层使用 Caddy/Nginx/Cloudflare Tunnel 终止 TLS，再反代到 `127.0.0.1:15721` 或内网地址。`router` tunnel 暴露的 public URL 与本机管理入口可以并存，但生产管理入口必须使用强密码和最小暴露面。
 
+Codex OAuth Images 穿过 Cloudflare 时，反代必须流式透传源站 Body，不能在 Worker 中调用 `.text()`、`.json()` 或 `.arrayBuffer()`。如果 Worker fetch 使用不同的源站 host，设置 `CC_SWITCH_IMAGE_PUBLIC_BASE_URL=https://<公开域名>`，并允许 `/v1/images/files/<token>` 的匿名 GET/HEAD 回到生成图片的同一实例；多副本必须配置粘性回源，因为当前 capability store 不跨实例共享。Cloudflare/WAF 上传规则需允许 48 MiB Codex Images HTTP envelope。Images 响应和 capability 文件都必须保持 `no-store`；详细约束和 524 验收见 [`codex-oauth-single-account.md`](codex-oauth-single-account.md#cloudflare-proxy)。
+
 ## OAuth/代理桥接运维
 
 `/api/accounts/capabilities` 的 `loginFlows` 是 OAuth 登录方式的权威能力列表；旧客户端可继续读取由它派生的 `supportsStartLogin` 和 `supportsCallback`。Claude OAuth 支持 browser/CLI manual callback，OpenAI OAuth 还支持 device code。该接口只描述 Server 已实现的控制面能力，不代表真实账号、上游配额或 Router callback 已完成验收。

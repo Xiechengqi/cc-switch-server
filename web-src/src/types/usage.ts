@@ -24,7 +24,14 @@ export interface RequestLog {
   cacheReadTokens: number;
   cacheCreationTokens: number;
   totalTokens?: number | null;
+  imageCount?: number | null;
+  imageBytes?: number | null;
+  imageFormat?: string | null;
+  imageWidth?: number | null;
+  imageHeight?: number | null;
+  imageSize?: string | null;
   isStreaming: boolean;
+  streamStatus?: string | null;
   latencyMs: number;
   firstTokenMs?: number;
   durationMs?: number;

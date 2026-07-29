@@ -44,6 +44,7 @@ pub(crate) use router::ensure_codex_oauth_active_account;
 pub use router::ProxyRoute;
 
 pub const MEDIA_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+pub const CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES: usize = 48 * 1024 * 1024;
 pub const MEDIA_RESPONSE_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 pub(super) const MAX_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 8 * 24 * 60 * 60 * 1000;

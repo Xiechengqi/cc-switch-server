@@ -128,6 +128,18 @@ pub struct UsageLog {
     #[serde(default)]
     pub total_tokens: Option<u64>,
     #[serde(default)]
+    pub image_count: Option<u32>,
+    #[serde(default)]
+    pub image_bytes: Option<u64>,
+    #[serde(default)]
+    pub image_format: Option<String>,
+    #[serde(default)]
+    pub image_width: Option<u32>,
+    #[serde(default)]
+    pub image_height: Option<u32>,
+    #[serde(default)]
+    pub image_size: Option<String>,
+    #[serde(default)]
     pub share_id: Option<String>,
     #[serde(default)]
     pub user_email: Option<String>,
@@ -183,6 +195,18 @@ pub struct UsageLogContext {
     pub is_streaming: bool,
     pub stream_status: Option<String>,
     pub usage_estimated: bool,
+    pub error_message: Option<String>,
+    pub image: Option<ImageUsageMetadata>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageUsageMetadata {
+    pub count: u32,
+    pub bytes: u64,
+    pub format: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub size: Option<String>,
 }
 
 impl UsageStore {
@@ -706,6 +730,12 @@ impl UsageLog {
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             total_tokens: usage.total_tokens,
+            image_count: None,
+            image_bytes: None,
+            image_format: None,
+            image_width: None,
+            image_height: None,
+            image_size: None,
             share_id: None,
             user_email: None,
             data_source: None,
@@ -738,6 +768,15 @@ impl UsageLog {
         self.is_streaming = context.is_streaming;
         self.stream_status = context.stream_status;
         self.usage_estimated = context.usage_estimated;
+        self.error_message = context.error_message;
+        if let Some(image) = context.image {
+            self.image_count = Some(image.count);
+            self.image_bytes = Some(image.bytes);
+            self.image_format = image.format;
+            self.image_width = image.width;
+            self.image_height = image.height;
+            self.image_size = image.size;
+        }
     }
 }
 
@@ -1158,8 +1197,8 @@ pub fn usage_from_json_with_semantics(
     value: &serde_json::Value,
     semantics: InputTokenSemantics,
 ) -> TokenUsage {
-    let usage = value
-        .get("usage")
+    let usage = preferred_image_tool_token_usage(value)
+        .or_else(|| value.get("usage"))
         .or_else(|| value.pointer("/message/usage"))
         .or_else(|| value.pointer("/response/usage"))
         .or_else(|| value.pointer("/delta/usage"))
@@ -1284,6 +1323,25 @@ pub fn usage_from_json_with_semantics(
         cache_creation_tokens,
         total_tokens,
     }
+}
+
+fn preferred_image_tool_token_usage(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value
+        .pointer("/response/tool_usage/image_gen")
+        .or_else(|| value.pointer("/tool_usage/image_gen"))
+        .filter(|usage| {
+            [
+                "input_tokens",
+                "inputTokens",
+                "output_tokens",
+                "outputTokens",
+                "total_tokens",
+                "totalTokens",
+            ]
+            .iter()
+            .filter_map(|key| usage.get(*key).and_then(serde_json::Value::as_u64))
+            .any(|tokens| tokens > 0)
+        })
 }
 
 fn infer_input_token_semantics(usage: &serde_json::Value) -> InputTokenSemantics {
@@ -2059,6 +2117,52 @@ mod tests {
         assert_eq!(anthropic.raw_input_tokens, Some(7));
         assert_eq!(anthropic.output_tokens, Some(3));
         assert_eq!(anthropic.total_tokens, Some(10));
+    }
+
+    #[test]
+    fn image_tool_usage_only_overrides_response_usage_when_it_has_billed_tokens() {
+        let text = usage_from_json(&json!({
+            "response": {
+                "tool_usage": {
+                    "image_gen": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0
+                    }
+                },
+                "usage": {"input_tokens": 82, "output_tokens": 48, "total_tokens": 130}
+            }
+        }));
+        assert_eq!(text.input_tokens, Some(82));
+        assert_eq!(text.output_tokens, Some(48));
+        assert_eq!(text.total_tokens, Some(130));
+
+        let image = usage_from_json(&json!({
+            "response": {
+                "tool_usage": {
+                    "image_gen": {
+                        "images": 1,
+                        "input_tokens": 34,
+                        "output_tokens": 1756,
+                        "total_tokens": 1790
+                    }
+                },
+                "usage": {"input_tokens": 5, "output_tokens": 9, "total_tokens": 14}
+            }
+        }));
+        assert_eq!(image.input_tokens, Some(34));
+        assert_eq!(image.output_tokens, Some(1756));
+        assert_eq!(image.total_tokens, Some(1790));
+
+        let count_only = usage_from_json(&json!({
+            "response": {
+                "tool_usage": {"image_gen": {"images": 1}},
+                "usage": {"input_tokens": 13, "output_tokens": 21, "total_tokens": 34}
+            }
+        }));
+        assert_eq!(count_only.input_tokens, Some(13));
+        assert_eq!(count_only.output_tokens, Some(21));
+        assert_eq!(count_only.total_tokens, Some(34));
     }
 
     #[test]

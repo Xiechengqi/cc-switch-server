@@ -431,6 +431,12 @@ export interface UsageLog {
   cacheReadTokens?: number | null;
   cacheCreationTokens?: number | null;
   totalTokens?: number | null;
+  imageCount?: number | null;
+  imageBytes?: number | null;
+  imageFormat?: string | null;
+  imageWidth?: number | null;
+  imageHeight?: number | null;
+  imageSize?: string | null;
   shareId?: string | null;
   shareName?: string | null;
   userEmail?: string | null;

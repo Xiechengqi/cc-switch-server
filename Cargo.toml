@@ -31,6 +31,7 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client-l
 hex = "0.4"
 hmac = "0.12"
 hkdf = "0.12"
+imagesize = "0.13"
 jsonwebtoken = "9"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }

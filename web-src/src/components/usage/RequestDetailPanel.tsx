@@ -59,6 +59,15 @@ export function RequestDetailPanel({
     freshInput + request.cacheReadTokens + request.cacheCreationTokens;
   const hasSeparateCachedInput = rawInput !== freshInput;
   const totalTokens = getTotalTokens(request);
+  const hasImageOutput =
+    request.imageCount != null ||
+    request.imageBytes != null ||
+    request.imageFormat != null ||
+    request.imageSize != null;
+  const imageDimensions =
+    request.imageWidth != null && request.imageHeight != null
+      ? `${request.imageWidth} x ${request.imageHeight}`
+      : request.imageSize;
 
   return (
     <Dialog open onOpenChange={onClose}>
@@ -203,6 +212,52 @@ export function RequestDetailPanel({
               </div>
             </dl>
           </div>
+
+          {hasImageOutput && (
+            <div className="rounded-lg border p-4">
+              <h3 className="mb-3 font-semibold">
+                {t("usage.imageOutput", "图片输出")}
+              </h3>
+              <dl className="grid grid-cols-2 gap-3 text-sm">
+                {request.imageCount != null && (
+                  <div>
+                    <dt className="text-muted-foreground">
+                      {t("usage.imageCount", "图片数量")}
+                    </dt>
+                    <dd className="font-mono">
+                      {request.imageCount.toLocaleString()}
+                    </dd>
+                  </div>
+                )}
+                {request.imageBytes != null && (
+                  <div>
+                    <dt className="text-muted-foreground">
+                      {t("usage.imageBytes", "输出字节")}
+                    </dt>
+                    <dd className="font-mono">
+                      {request.imageBytes.toLocaleString()} B
+                    </dd>
+                  </div>
+                )}
+                {request.imageFormat && (
+                  <div>
+                    <dt className="text-muted-foreground">
+                      {t("usage.imageFormat", "图片格式")}
+                    </dt>
+                    <dd className="font-mono">{request.imageFormat}</dd>
+                  </div>
+                )}
+                {imageDimensions && (
+                  <div>
+                    <dt className="text-muted-foreground">
+                      {t("usage.imageDimensions", "图片尺寸")}
+                    </dt>
+                    <dd className="font-mono">{imageDimensions}</dd>
+                  </div>
+                )}
+              </dl>
+            </div>
+          )}
 
           {/* 性能信息 */}
           <div className="rounded-lg border p-4">

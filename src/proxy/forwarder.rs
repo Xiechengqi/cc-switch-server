@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::http::header::{ACCEPT, CONNECTION, CONTENT_ENCODING, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use base64::engine::general_purpose::STANDARD;
@@ -32,7 +32,9 @@ use crate::domain::providers::current_provider;
 use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
-use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
+use crate::domain::usage::store::{
+    ImageUsageMetadata, TokenUsage, UsageLogContext, UsageModelMetadata,
+};
 use crate::infra::time::now_ms as current_time_ms;
 use crate::state::{
     AccountInFlightGuard, AccountInFlightSnapshot, CopilotUpstreamAuthError, DeepSeekUpstreamError,
@@ -65,11 +67,16 @@ use super::router::{
     select_provider_with_account_inflight, ProxyRoute,
 };
 use super::streaming::{ClaudeSseError, ClaudeSseErrorDetector, StreamUsageAccumulator};
-use super::usage::{log_usage, update_stream_usage};
+use super::usage::{log_usage, update_image_stream_usage, update_stream_usage};
 use super::{setting, ProxyError};
 
 const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const CODEX_IMAGES_DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
+const CODEX_IMAGES_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const CODEX_IMAGES_MAX_PARTIAL_IMAGES: i64 = 3;
+const CODEX_IMAGES_MAX_OUTPUT_BYTES: usize = 48 * 1024 * 1024;
+const CODEX_IMAGES_MAX_UPSTREAM_BYTES: usize = 72 * 1024 * 1024;
+const CODEX_IMAGES_MAX_PIXELS: u64 = 8_294_400;
 const MAX_FORWARD_RETRY_ATTEMPTS: u32 = 3;
 const MAX_FORWARD_RETRY_ELAPSED_MS: u128 = 10_000;
 const DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 60_000;
@@ -3179,10 +3186,11 @@ pub async fn forward_images_generations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
+    let wire_body_len = body.len();
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
         body,
-        super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+        super::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
     )?;
     let mut request_context = request_context_from_headers(&headers);
     request_context.session_id =
@@ -3237,6 +3245,7 @@ pub async fn forward_images_generations(
     drop(providers);
 
     if execution.driver_is("oauth.grok_responses") {
+        ensure_grok_media_request_body_limit(wire_body_len, body.len())?;
         forward_grok_media_with_execution(
             state,
             execution,
@@ -3275,10 +3284,11 @@ pub async fn forward_images_edits(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
+    let wire_body_len = body.len();
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
         body,
-        super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+        super::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
     )?;
     let mut request_context = request_context_from_headers(&headers);
     request_context.session_id =
@@ -3333,6 +3343,7 @@ pub async fn forward_images_edits(
     drop(providers);
 
     if execution.driver_is("oauth.grok_responses") {
+        ensure_grok_media_request_body_limit(wire_body_len, body.len())?;
         forward_grok_media_with_execution(
             state,
             execution,
@@ -3364,6 +3375,24 @@ pub async fn forward_images_edits(
             "image editing requires a grok_oauth provider or codex_oauth provider with image generation enabled",
         ))
     }
+}
+
+fn ensure_grok_media_request_body_limit(
+    wire_body_len: usize,
+    decoded_body_len: usize,
+) -> Result<(), ProxyError> {
+    if wire_body_len > super::MEDIA_REQUEST_BODY_LIMIT_BYTES
+        || decoded_body_len > super::MEDIA_REQUEST_BODY_LIMIT_BYTES
+    {
+        return Err(ProxyError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!(
+                "Grok media request body exceeds the {} byte limit",
+                super::MEDIA_REQUEST_BODY_LIMIT_BYTES
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // Media forwarding carries the full request/accounting context.
@@ -3597,8 +3626,8 @@ async fn forward_codex_images_request(
     headers: HeaderMap,
     mut prepared: CodexImagesPreparedRequest,
     request_context: UsageLogContext,
-    _account_in_flight_guard: Option<AccountInFlightGuard>,
-    _share_invocation_guard: Option<ShareInFlightGuard>,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
     let stored = execution.runtime_stored_view();
     ensure_managed_credential_persistence_available(&state, &execution)?;
@@ -3610,92 +3639,246 @@ async fn forward_codex_images_request(
         &headers,
         request_context.share_id.is_some(),
     )?;
-    prepared.body = super::remote_image::inline_codex_remote_images(&prepared.body).await?;
+    let mut adapter_request = adapters::AdapterRequest {
+        body: prepared.body.clone(),
+        upstream_endpoint: None,
+        upstream_headers: Vec::new(),
+        model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
+        requested_model: Some(prepared.requested_model.clone()),
+        actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
+        actual_model_source: Some("codex_image_generation_bridge".to_string()),
+        stream_requested: true,
+        custom_tool_names: Default::default(),
+        responses_tool_context: Default::default(),
+        claude_tool_name_map: Default::default(),
+    };
+    execution.enforce_model_policy(&mut adapter_request)?;
+    prepared.body =
+        super::remote_image::inline_codex_images_endpoint_images(&prepared.body).await?;
+    adapter_request.body = prepared.body.clone();
+    let public_origin = if prepared.response_format == "url" {
+        Some(codex_images_public_origin(&headers)?)
+    } else {
+        None
+    };
     let session_id = codex_oauth_session_id_from_request(&headers, &prepared.body);
     let started = Instant::now();
-    {
-        refresh_execution_managed_account_if_needed(&state, &execution).await?;
-        let mut adapter_request = adapters::AdapterRequest {
-            body: prepared.body.clone(),
-            upstream_endpoint: None,
-            upstream_headers: Vec::new(),
-            model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
-            requested_model: Some(prepared.tool_model.clone()),
-            actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
-            actual_model_source: Some("codex_image_generation_bridge".to_string()),
-            stream_requested: true,
-            custom_tool_names: Default::default(),
-            responses_tool_context: Default::default(),
-            claude_tool_name_map: Default::default(),
-        };
-        execution.enforce_model_policy(&mut adapter_request)?;
-        let mut auth_refresh_attempted = false;
-        let mut upstream = loop {
-            let upstream = match send_codex_images_attempt(
-                &state,
-                &execution,
-                &stored,
-                &adapter_request,
-                session_id.as_deref(),
-            )
-            .await
-            {
-                Ok(upstream) => upstream,
-                Err(error) => {
-                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-                    return Err(error);
-                }
-            };
-            if upstream.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
-                if let Some((provider_type, account_id)) = execution.managed_account_target() {
-                    drop(upstream);
-                    let refresh_result = state
-                        .refresh_managed_account_now(provider_type, Some(account_id))
-                        .await;
-                    if let Err(error) = refresh_result {
-                        mark_managed_account_auth_cooldown(
-                            &state,
-                            &execution,
-                            "images_forced_refresh_failed",
-                        )
-                        .await;
-                        return Err(managed_account_refresh_error_to_proxy_error(error));
-                    }
-                    auth_refresh_attempted = true;
-                    record_forward_retry(ProxyRoute::CodexResponses, "auth", "images_unauthorized");
-                    continue;
-                }
-            }
-            break upstream;
-        };
-        let status = upstream.status();
-        let status_code = status.as_u16();
-        if status == StatusCode::UNAUTHORIZED && auth_refresh_attempted {
-            mark_managed_account_auth_cooldown(
-                &state,
-                &execution,
-                "images_unauthorized_after_refresh",
-            )
-            .await;
-        }
-        let mut response_headers = upstream.headers().clone();
-        strip_hop_by_hop_response_headers(&mut response_headers);
-        let content_type = response_headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let content_encoding = content_encoding_value(&response_headers);
-        let bytes = crate::infra::http::read_response_body_limited(
-            &mut upstream,
-            super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
+    if let Err(error) = refresh_execution_managed_account_if_needed(&state, &execution).await {
+        let timeout = error.status == StatusCode::GATEWAY_TIMEOUT;
+        record_codex_images_prebody_failure(
+            &state,
+            &stored,
+            &prepared,
+            &request_context,
+            started,
+            error.status.as_u16(),
+            if timeout { "timeout" } else { "failed" },
+            &error.message,
+            None,
+            if timeout {
+                "timeout"
+            } else {
+                "auth_refresh_failed"
+            },
+        )
+        .await;
+        return Err(error);
+    }
+    let first_event_timeout = execution.stream_first_byte_timeout();
+    let mut auth_refresh_attempted = false;
+    let mut upstream = loop {
+        let header_timeout = first_event_timeout
+            .map(|timeout| timeout.saturating_sub(started.elapsed()))
+            .unwrap_or_else(|| execution.request_timeout());
+        let upstream = match send_codex_images_attempt(
+            &state,
+            &execution,
+            &stored,
+            &adapter_request,
+            session_id.as_deref(),
+            header_timeout,
         )
         .await
-        .map_err(ProxyError::bad_gateway)?;
-        let decoded = decode_response_body_for_proxy_with_limit(
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                let timeout = error.status == StatusCode::GATEWAY_TIMEOUT;
+                record_codex_images_prebody_failure(
+                    &state,
+                    &stored,
+                    &prepared,
+                    &request_context,
+                    started,
+                    error.status.as_u16(),
+                    if timeout { "timeout" } else { "upstream_error" },
+                    &error.message,
+                    Some(if timeout {
+                        ProviderOutcome::Failure {
+                            status_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                        }
+                    } else {
+                        ProviderOutcome::NetworkFailure
+                    }),
+                    if timeout {
+                        "timeout"
+                    } else {
+                        "network_failure"
+                    },
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        if upstream.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
+            if let Some((provider_type, account_id)) = execution.managed_account_target() {
+                drop(upstream);
+                let refresh_result = state
+                    .refresh_managed_account_now(provider_type, Some(account_id))
+                    .await;
+                if let Err(error) = refresh_result {
+                    mark_managed_account_auth_cooldown(
+                        &state,
+                        &execution,
+                        "images_forced_refresh_failed",
+                    )
+                    .await;
+                    let error = managed_account_refresh_error_to_proxy_error(error);
+                    record_codex_images_prebody_failure(
+                        &state,
+                        &stored,
+                        &prepared,
+                        &request_context,
+                        started,
+                        error.status.as_u16(),
+                        "failed",
+                        &error.message,
+                        Some(ProviderOutcome::Failure {
+                            status_code: StatusCode::UNAUTHORIZED.as_u16(),
+                        }),
+                        "auth_refresh_failed",
+                    )
+                    .await;
+                    return Err(error);
+                }
+                auth_refresh_attempted = true;
+                record_forward_retry(ProxyRoute::CodexResponses, "auth", "images_unauthorized");
+                continue;
+            }
+        }
+        break upstream;
+    };
+    let status = upstream.status();
+    let status_code = status.as_u16();
+    if status == StatusCode::UNAUTHORIZED && auth_refresh_attempted {
+        mark_managed_account_auth_cooldown(&state, &execution, "images_unauthorized_after_refresh")
+            .await;
+    }
+    let mut response_headers = upstream.headers().clone();
+    strip_hop_by_hop_response_headers(&mut response_headers);
+    let content_type = response_headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let content_encoding = content_encoding_value(&response_headers);
+
+    if !status.is_success() {
+        let error_body_timeout = execution.request_timeout();
+        let bytes = match tokio::time::timeout(
+            error_body_timeout,
+            crate::infra::http::read_response_body_limited(
+                &mut upstream,
+                super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
+            ),
+        )
+        .await
+        {
+            Err(_) => {
+                let error = ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "Codex Images upstream error body timeout after {}ms",
+                        error_body_timeout.as_millis()
+                    ),
+                };
+                record_codex_images_prebody_failure(
+                    &state,
+                    &stored,
+                    &prepared,
+                    &request_context,
+                    started,
+                    error.status.as_u16(),
+                    "timeout",
+                    &error.message,
+                    Some(ProviderOutcome::Failure {
+                        status_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                    }),
+                    "timeout",
+                )
+                .await;
+                return Err(error);
+            }
+            Ok(Err(read_error)) => {
+                let network_failure = matches!(
+                    &read_error,
+                    crate::infra::http::BoundedResponseBodyError::Request(_)
+                );
+                let error = ProxyError::bad_gateway(read_error);
+                record_codex_images_prebody_failure(
+                    &state,
+                    &stored,
+                    &prepared,
+                    &request_context,
+                    started,
+                    error.status.as_u16(),
+                    if network_failure {
+                        "upstream_error"
+                    } else {
+                        "failed"
+                    },
+                    &error.message,
+                    Some(if network_failure {
+                        ProviderOutcome::NetworkFailure
+                    } else {
+                        ProviderOutcome::Failure {
+                            status_code: StatusCode::BAD_GATEWAY.as_u16(),
+                        }
+                    }),
+                    if network_failure {
+                        "network_failure"
+                    } else {
+                        "protocol_error"
+                    },
+                )
+                .await;
+                return Err(error);
+            }
+            Ok(Ok(bytes)) => bytes,
+        };
+        let decoded = match decode_response_body_for_proxy_with_limit(
             &response_headers,
             bytes,
             super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
-        )?;
+        ) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                record_codex_images_prebody_failure(
+                    &state,
+                    &stored,
+                    &prepared,
+                    &request_context,
+                    started,
+                    error.status.as_u16(),
+                    "failed",
+                    &error.message,
+                    Some(ProviderOutcome::Failure {
+                        status_code: StatusCode::BAD_GATEWAY.as_u16(),
+                    }),
+                    "protocol_error",
+                )
+                .await;
+                return Err(error);
+            }
+        };
         if status == StatusCode::TOO_MANY_REQUESTS {
             maybe_mark_upstream_rate_limited(
                 &state,
@@ -3706,55 +3889,23 @@ async fn forward_codex_images_request(
             )
             .await;
         }
-        record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
-        if !status.is_success() {
-            record_share_invocation_result(
-                &state,
-                request_context.share_id.as_deref(),
-                request_context.user_email.as_deref(),
-                TokenUsage::default(),
-            )
-            .await;
-            let mut response = Response::new(Body::from(decoded.body));
-            *response.status_mut() = status;
-            if let Some(content_type) = content_type {
-                if let Ok(value) = HeaderValue::from_str(&content_type) {
-                    response.headers_mut().insert(CONTENT_TYPE, value);
-                }
-            }
-            if decoded.preserve_content_encoding {
-                if let Some(value) = content_encoding {
-                    response.headers_mut().insert(CONTENT_ENCODING, value);
-                }
-            }
-            copy_safe_upstream_response_headers(&response_headers, &mut response);
-            return Ok(response);
-        }
-        let image_response = codex_images_response_from_responses_body(
-            &decoded.body,
-            prepared.response_format.as_deref(),
-            prepared.stream,
-        )?;
         let mut usage_accumulator = StreamUsageAccumulator::new(
             adapters::usage_input_semantics_for(&stored, ProxyRoute::CodexResponses),
         );
         usage_accumulator.push(&decoded.body);
         let usage = usage_accumulator.finish();
+        let error_message = bounded_codex_image_error_message(&decoded.body);
         log_usage(
             &state,
             &stored,
             status_code,
             started.elapsed().as_millis(),
-            UsageModelMetadata {
-                model: Some(prepared.tool_model.clone()),
-                requested_model: Some(prepared.tool_model.clone()),
-                actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
-                actual_model_source: Some("codex_image_generation_bridge".to_string()),
-            },
+            codex_images_model_metadata(&prepared),
             usage,
             UsageLogContext {
                 is_streaming: prepared.stream,
-                stream_status: Some("completed".to_string()),
+                stream_status: prepared.stream.then(|| "failed".to_string()),
+                error_message: Some(error_message),
                 ..request_context.clone()
             },
         )
@@ -3766,15 +3917,127 @@ async fn forward_codex_images_request(
             usage,
         )
         .await;
-        let mut response = Response::new(Body::from(image_response.body));
-        *response.status_mut() = StatusCode::OK;
-        response.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static(image_response.content_type),
+        record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
+        crate::metrics::record_codex_images_request(
+            prepared.operation.as_str(),
+            prepared.stream,
+            "http_error",
         );
+        let mut response = Response::new(Body::from(decoded.body));
+        *response.status_mut() = status;
+        if let Some(content_type) = content_type {
+            if let Ok(value) = HeaderValue::from_str(&content_type) {
+                response.headers_mut().insert(CONTENT_TYPE, value);
+            }
+        }
+        if decoded.preserve_content_encoding {
+            if let Some(value) = content_encoding {
+                response.headers_mut().insert(CONTENT_ENCODING, value);
+            }
+        }
         copy_safe_upstream_response_headers(&response_headers, &mut response);
-        Ok(response)
+        return Ok(response);
     }
+
+    if content_encoding.as_ref().is_some_and(|value| {
+        value
+            .to_str()
+            .ok()
+            .is_none_or(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+    }) {
+        let error =
+            ProxyError::bad_gateway("Codex Images upstream ignored Accept-Encoding: identity");
+        record_codex_images_prebody_failure(
+            &state,
+            &stored,
+            &prepared,
+            &request_context,
+            started,
+            error.status.as_u16(),
+            "failed",
+            &error.message,
+            Some(ProviderOutcome::Failure {
+                status_code: StatusCode::BAD_GATEWAY.as_u16(),
+            }),
+            "protocol_error",
+        )
+        .await;
+        return Err(error);
+    }
+    if upstream.content_length().is_some_and(|length| {
+        length > u64::try_from(CODEX_IMAGES_MAX_UPSTREAM_BYTES).unwrap_or(u64::MAX)
+    }) {
+        let error = ProxyError::bad_gateway(format!(
+            "upstream response body exceeds the {} byte limit",
+            CODEX_IMAGES_MAX_UPSTREAM_BYTES
+        ));
+        record_codex_images_prebody_failure(
+            &state,
+            &stored,
+            &prepared,
+            &request_context,
+            started,
+            error.status.as_u16(),
+            "failed",
+            &error.message,
+            Some(ProviderOutcome::Failure {
+                status_code: StatusCode::BAD_GATEWAY.as_u16(),
+            }),
+            "protocol_error",
+        )
+        .await;
+        return Err(error);
+    }
+
+    let request_id = log_usage(
+        &state,
+        &stored,
+        status_code,
+        started.elapsed().as_millis(),
+        codex_images_model_metadata(&prepared),
+        TokenUsage::default(),
+        UsageLogContext {
+            is_streaming: prepared.stream,
+            stream_status: Some("pending".to_string()),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    let upstream_is_sse = content_type
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    let downstream_stream = prepared.stream;
+    let stream = codex_images_response_stream(CodexImagesStreamArgs {
+        state,
+        stored,
+        upstream,
+        upstream_is_sse,
+        prepared,
+        request_context,
+        started,
+        request_id,
+        status_code,
+        first_event_timeout: first_event_timeout
+            .map(|timeout| timeout.saturating_sub(started.elapsed())),
+        idle_timeout: execution.stream_idle_timeout(),
+        keepalive_interval: CODEX_IMAGES_KEEPALIVE_INTERVAL,
+        public_origin,
+        account_in_flight_guard,
+        share_invocation_guard,
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(if downstream_stream {
+            "text/event-stream; charset=utf-8"
+        } else {
+            "application/json"
+        }),
+    );
+    apply_codex_images_streaming_headers(&mut response);
+    copy_safe_upstream_response_headers(&response_headers, &mut response);
+    Ok(response)
 }
 
 async fn send_codex_images_attempt(
@@ -3783,11 +4046,17 @@ async fn send_codex_images_attempt(
     stored: &StoredProvider,
     adapter_request: &adapters::AdapterRequest,
     session_id: Option<&str>,
+    header_timeout: Duration,
 ) -> Result<reqwest::Response, ProxyError> {
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
     let mut target_headers = adapter.build_headers(AppKind::Codex, stored, &accounts)?;
     append_codex_oauth_session_headers(&mut target_headers, session_id);
+    replace_or_push_header(
+        &mut target_headers,
+        "accept-encoding",
+        "identity".to_string(),
+    );
     crate::codex_identity::finalize_headers(&mut target_headers);
     let mut target_headers = owned_headers(target_headers);
     let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, adapter_request)?;
@@ -3800,27 +4069,107 @@ async fn send_codex_images_attempt(
         .post(&url)
         .header(ACCEPT, "application/json, text/event-stream")
         .header(CONTENT_TYPE, "application/json")
-        .body(adapter_request.body.clone())
-        .timeout(execution.request_timeout());
+        .body(adapter_request.body.clone());
     for (name, value) in &target_headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    request.send().await.map_err(ProxyError::bad_gateway)
+    tokio::time::timeout(header_timeout, request.send())
+        .await
+        .map_err(|_| ProxyError {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: format!(
+                "Codex Images upstream response header timeout after {}ms",
+                header_timeout.as_millis()
+            ),
+        })?
+        .map_err(ProxyError::bad_gateway)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn record_codex_images_prebody_failure(
+    state: &ServerState,
+    stored: &StoredProvider,
+    prepared: &CodexImagesPreparedRequest,
+    request_context: &UsageLogContext,
+    started: Instant,
+    status_code: u16,
+    stream_status: &str,
+    error_message: &str,
+    provider_outcome: Option<ProviderOutcome>,
+    metric_outcome: &'static str,
+) {
+    let usage = TokenUsage::default();
+    log_usage(
+        state,
+        stored,
+        status_code,
+        started.elapsed().as_millis(),
+        codex_images_model_metadata(prepared),
+        usage,
+        UsageLogContext {
+            is_streaming: prepared.stream,
+            stream_status: Some(stream_status.to_string()),
+            error_message: Some(bounded_codex_image_message(error_message.to_string())),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    record_share_invocation_result(
+        state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        usage,
+    )
+    .await;
+    if let Some(provider_outcome) = provider_outcome {
+        record_provider_outcome(state, stored, provider_outcome).await;
+    }
+    crate::metrics::record_codex_images_request(
+        prepared.operation.as_str(),
+        prepared.stream,
+        metric_outcome,
+    );
+}
+
+#[derive(Debug)]
 struct CodexImagesPreparedRequest {
     body: Bytes,
-    tool_model: String,
-    response_format: Option<String>,
+    operation: CodexImagesOperation,
+    requested_model: String,
+    response_format: String,
     stream: bool,
 }
 
-struct CodexImagesResponse {
-    body: Bytes,
-    content_type: &'static str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexImagesOperation {
+    Generation,
+    Edit,
 }
 
-#[derive(Clone, Default)]
+impl CodexImagesOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Generation => "generation",
+            Self::Edit => "edit",
+        }
+    }
+
+    fn stream_prefix(self) -> &'static str {
+        match self {
+            Self::Generation => "image_generation",
+            Self::Edit => "image_edit",
+        }
+    }
+
+    fn tool_action(self) -> &'static str {
+        match self {
+            Self::Generation => "generate",
+            Self::Edit => "edit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct CodexImageResult {
     result: String,
     revised_prompt: Option<String>,
@@ -3828,6 +4177,9 @@ struct CodexImageResult {
     size: Option<String>,
     background: Option<String>,
     quality: Option<String>,
+    bytes: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedRequest, ProxyError> {
@@ -3835,60 +4187,23 @@ fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedReq
         status: StatusCode::BAD_REQUEST,
         message: format!("invalid OpenAI image generation request JSON: {error}"),
     })?;
+    if !value.is_object() {
+        return Err(ProxyError::bad_request(
+            "OpenAI image generation request must be a JSON object",
+        ));
+    }
     let prompt = value
         .get("prompt")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
         .ok_or_else(|| ProxyError::bad_request("image generation prompt is required"))?;
-    let tool_model = value
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(CODEX_IMAGES_DEFAULT_TOOL_MODEL)
-        .to_string();
-    let response_format = value
-        .get("response_format")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|format| !format.is_empty())
-        .map(str::to_ascii_lowercase);
-    let stream = value
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut tool = json!({
-        "type": "image_generation",
-        "action": "generate",
-        "model": tool_model,
-    });
-    for field in [
-        "size",
-        "quality",
-        "background",
-        "output_format",
-        "moderation",
-    ] {
-        if let Some(text) = value
-            .get(field)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            tool[field] = Value::String(text.to_string());
-        }
-    }
-    for field in ["output_compression", "partial_images", "n"] {
-        if let Some(number) = value.get(field).and_then(Value::as_i64) {
-            tool[field] = Value::Number(number.into());
-        }
-    }
+    let common = codex_images_common_options(&value, prompt, CodexImagesOperation::Generation)?;
     let request = json!({
         "instructions": "",
         "stream": true,
         "reasoning": {"effort": "medium", "summary": "auto"},
-        "parallel_tool_calls": true,
+        "parallel_tool_calls": false,
         "include": ["reasoning.encrypted_content"],
         "model": CODEX_IMAGES_RESPONSES_MAIN_MODEL,
         "store": false,
@@ -3898,7 +4213,7 @@ fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedReq
             "role": "user",
             "content": [{"type": "input_text", "text": prompt}]
         }],
-        "tools": [tool],
+        "tools": [common.tool],
     });
     let body = serde_json::to_vec(&request)
         .map(Bytes::from)
@@ -3908,12 +4223,10 @@ fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedReq
         })?;
     Ok(CodexImagesPreparedRequest {
         body,
-        tool_model: request["tools"][0]["model"]
-            .as_str()
-            .unwrap_or(CODEX_IMAGES_DEFAULT_TOOL_MODEL)
-            .to_string(),
-        response_format,
-        stream,
+        operation: CodexImagesOperation::Generation,
+        requested_model: common.requested_model,
+        response_format: common.response_format,
+        stream: common.stream,
     })
 }
 
@@ -3942,6 +4255,7 @@ async fn codex_images_edit_request(
     let mut fields = serde_json::Map::new();
     let mut images = Vec::new();
     let mut mask = None;
+    let mut total_image_bytes = 0usize;
     while let Some(field) = multipart.next_field().await.map_err(|error| {
         ProxyError::bad_request(format!("invalid image edit multipart: {error}"))
     })? {
@@ -3962,12 +4276,25 @@ async fn codex_images_edit_request(
             let content_type = super::remote_image::validate_image_bytes(
                 &bytes,
                 Some(&claimed_content_type),
-                super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+                super::remote_image::MAX_CODEX_IMAGE_BYTES,
             )?;
+            total_image_bytes =
+                checked_codex_image_edit_total_bytes(total_image_bytes, bytes.len())?;
             let data_url = format!("data:{content_type};base64,{}", STANDARD.encode(bytes));
             if name == "mask" {
+                if mask.is_some() {
+                    return Err(ProxyError::bad_request(
+                        "image edit accepts at most one mask",
+                    ));
+                }
                 mask = Some(data_url);
             } else {
+                if images.len() >= super::remote_image::MAX_IMAGES_PER_REQUEST {
+                    return Err(ProxyError::bad_request(format!(
+                        "image edit accepts at most {} input images",
+                        super::remote_image::MAX_IMAGES_PER_REQUEST
+                    )));
+                }
                 images.push(data_url);
             }
             continue;
@@ -3992,10 +4319,25 @@ async fn codex_images_edit_request(
     codex_images_edit_request_from_value(Value::Object(fields))
 }
 
+fn checked_codex_image_edit_total_bytes(current: usize, next: usize) -> Result<usize, ProxyError> {
+    let total = current.saturating_add(next);
+    if total > super::remote_image::MAX_CODEX_IMAGES_TOTAL_BYTES {
+        return Err(ProxyError::bad_request(format!(
+            "image edit payload exceeds {} byte aggregate image limit",
+            super::remote_image::MAX_CODEX_IMAGES_TOTAL_BYTES
+        )));
+    }
+    Ok(total)
+}
+
 fn codex_images_edit_request_from_value(
     value: Value,
 ) -> Result<CodexImagesPreparedRequest, ProxyError> {
-    const MAX_EDIT_IMAGES: usize = 16;
+    if !value.is_object() {
+        return Err(ProxyError::bad_request(
+            "OpenAI image edit request must be a JSON object",
+        ));
+    }
     let prompt = value
         .get("prompt")
         .and_then(Value::as_str)
@@ -4003,10 +4345,7 @@ fn codex_images_edit_request_from_value(
         .filter(|prompt| !prompt.is_empty())
         .ok_or_else(|| ProxyError::bad_request("image edit prompt is required"))?;
     let mut image_urls = Vec::new();
-    for field in ["images", "image"] {
-        let Some(images) = value.get(field) else {
-            continue;
-        };
+    if let Some(images) = value.get("images").or_else(|| value.get("image")) {
         let candidates = images
             .as_array()
             .map(Vec::as_slice)
@@ -4030,52 +4369,13 @@ fn codex_images_edit_request_from_value(
             "image edit input image is required",
         ));
     }
-    if image_urls.len() > MAX_EDIT_IMAGES {
+    if image_urls.len() > super::remote_image::MAX_IMAGES_PER_REQUEST {
         return Err(ProxyError::bad_request(format!(
-            "image edit accepts at most {MAX_EDIT_IMAGES} input images"
+            "image edit accepts at most {} input images",
+            super::remote_image::MAX_IMAGES_PER_REQUEST
         )));
     }
-    let tool_model = value
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(CODEX_IMAGES_DEFAULT_TOOL_MODEL)
-        .to_string();
-    let response_format = value
-        .get("response_format")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|format| !format.is_empty())
-        .map(str::to_ascii_lowercase);
-    let stream = json_boolish(value.get("stream")).unwrap_or(false);
-    let mut tool = json!({
-        "type": "image_generation",
-        "action": "edit",
-        "model": tool_model,
-    });
-    for field in [
-        "size",
-        "quality",
-        "background",
-        "output_format",
-        "input_fidelity",
-        "moderation",
-    ] {
-        if let Some(text) = value
-            .get(field)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            tool[field] = Value::String(text.to_string());
-        }
-    }
-    for field in ["output_compression", "partial_images", "n"] {
-        if let Some(number) = value.get(field).and_then(json_i64ish) {
-            tool[field] = Value::Number(number.into());
-        }
-    }
+    let mut common = codex_images_common_options(&value, prompt, CodexImagesOperation::Edit)?;
     if let Some(mask) = value
         .pointer("/mask/image_url")
         .and_then(Value::as_str)
@@ -4083,7 +4383,7 @@ fn codex_images_edit_request_from_value(
         .map(str::trim)
         .filter(|mask| !mask.is_empty())
     {
-        tool["input_image_mask"] = json!({"image_url": mask});
+        common.tool["input_image_mask"] = json!({"image_url": mask});
     }
     let mut content = vec![json!({"type": "input_text", "text": prompt})];
     content.extend(
@@ -4101,7 +4401,7 @@ fn codex_images_edit_request_from_value(
         "store": false,
         "tool_choice": {"type": "image_generation"},
         "input": [{"type": "message", "role": "user", "content": content}],
-        "tools": [tool],
+        "tools": [common.tool],
     });
     let body = serde_json::to_vec(&request)
         .map(Bytes::from)
@@ -4111,71 +4411,1127 @@ fn codex_images_edit_request_from_value(
         })?;
     Ok(CodexImagesPreparedRequest {
         body,
-        tool_model: request["tools"][0]["model"]
-            .as_str()
-            .unwrap_or(CODEX_IMAGES_DEFAULT_TOOL_MODEL)
-            .to_string(),
+        operation: CodexImagesOperation::Edit,
+        requested_model: common.requested_model,
+        response_format: common.response_format,
+        stream: common.stream,
+    })
+}
+
+struct CodexImagesCommonOptions {
+    tool: Value,
+    requested_model: String,
+    response_format: String,
+    stream: bool,
+}
+
+fn codex_images_common_options(
+    value: &Value,
+    prompt: &str,
+    operation: CodexImagesOperation,
+) -> Result<CodexImagesCommonOptions, ProxyError> {
+    let requested_model = optional_codex_image_string(value, "model")?
+        .unwrap_or_else(|| CODEX_IMAGES_DEFAULT_TOOL_MODEL.to_string());
+    let (tool_model, alias_size) = normalize_codex_image_model(&requested_model, prompt);
+    if !tool_model.to_ascii_lowercase().starts_with("gpt-image-") {
+        return Err(ProxyError::bad_request(format!(
+            "images endpoint requires a gpt-image-* model, got {requested_model:?}"
+        )));
+    }
+    let response_format = optional_codex_image_string(value, "response_format")?
+        .unwrap_or_else(|| "b64_json".to_string())
+        .to_ascii_lowercase();
+    if !matches!(response_format.as_str(), "b64_json" | "url") {
+        return Err(ProxyError::bad_request(
+            "image response_format must be b64_json or url",
+        ));
+    }
+    let stream = codex_image_bool_field(value, "stream")?.unwrap_or(false);
+    if let Some(n) = codex_image_integer_field(value, "n")? {
+        if n != 1 {
+            return Err(ProxyError::bad_request(
+                "Codex OAuth image bridge currently supports exactly n=1",
+            ));
+        }
+    }
+
+    let mut tool = json!({
+        "type": "image_generation",
+        "action": operation.tool_action(),
+        "model": tool_model,
+    });
+    for (field, allowed) in [
+        ("quality", &["auto", "low", "medium", "high"][..]),
+        ("background", &["auto", "transparent", "opaque"][..]),
+        ("output_format", &["png", "jpeg", "webp"][..]),
+        ("moderation", &["auto", "low"][..]),
+    ] {
+        if let Some(raw) = optional_codex_image_string(value, field)? {
+            let normalized = raw.to_ascii_lowercase();
+            if !allowed.contains(&normalized.as_str()) {
+                return Err(ProxyError::bad_request(format!(
+                    "image {field} must be one of {}",
+                    allowed.join(", ")
+                )));
+            }
+            tool[field] = Value::String(normalized);
+        }
+    }
+    if let Some(input_fidelity) = optional_codex_image_string(value, "input_fidelity")? {
+        if operation != CodexImagesOperation::Edit {
+            return Err(ProxyError::bad_request(
+                "input_fidelity is only supported for image edits",
+            ));
+        }
+        let input_fidelity = input_fidelity.to_ascii_lowercase();
+        if !matches!(input_fidelity.as_str(), "low" | "high") {
+            return Err(ProxyError::bad_request(
+                "image input_fidelity must be low or high",
+            ));
+        }
+        tool["input_fidelity"] = Value::String(input_fidelity);
+    }
+    if let Some(output_compression) = codex_image_integer_field(value, "output_compression")? {
+        if !(0..=100).contains(&output_compression) {
+            return Err(ProxyError::bad_request(
+                "image output_compression must be between 0 and 100",
+            ));
+        }
+        tool["output_compression"] = Value::Number(output_compression.into());
+    }
+    if let Some(partial_images) = codex_image_integer_field(value, "partial_images")? {
+        if !(0..=CODEX_IMAGES_MAX_PARTIAL_IMAGES).contains(&partial_images) {
+            return Err(ProxyError::bad_request(format!(
+                "image partial_images must be between 0 and {CODEX_IMAGES_MAX_PARTIAL_IMAGES}"
+            )));
+        }
+        if partial_images > 0 && !stream {
+            return Err(ProxyError::bad_request(
+                "image partial_images requires stream=true",
+            ));
+        }
+        tool["partial_images"] = Value::Number(partial_images.into());
+    }
+    let size = optional_codex_image_string(value, "size")?.or(alias_size);
+    if let Some(size) = size {
+        let size = validate_codex_image_size(&tool_model, &size)?;
+        tool["size"] = Value::String(size);
+    }
+
+    Ok(CodexImagesCommonOptions {
+        tool,
+        requested_model,
         response_format,
         stream,
     })
 }
 
-fn json_boolish(value: Option<&Value>) -> Option<bool> {
-    value.and_then(|value| {
-        value.as_bool().or_else(|| {
-            value.as_str().map(str::trim).and_then(|value| {
-                match value.to_ascii_lowercase().as_str() {
-                    "true" | "1" | "yes" => Some(true),
-                    "false" | "0" | "no" => Some(false),
-                    _ => None,
-                }
-            })
-        })
-    })
+fn optional_codex_image_string(value: &Value, field: &str) -> Result<Option<String>, ProxyError> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty()))
+        }
+        Some(_) => Err(ProxyError::bad_request(format!(
+            "image {field} must be a string"
+        ))),
+    }
 }
 
-fn json_i64ish(value: &Value) -> Option<i64> {
+fn codex_image_bool_field(value: &Value, field: &str) -> Result<Option<bool>, ProxyError> {
+    let Some(value) = value.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(value) = value.as_bool() {
+        return Ok(Some(value));
+    }
+    if let Some(value) = value.as_str() {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(Some(true)),
+            "false" | "0" | "no" | "off" => Ok(Some(false)),
+            _ => Err(ProxyError::bad_request(format!(
+                "image {field} must be a boolean"
+            ))),
+        };
+    }
+    Err(ProxyError::bad_request(format!(
+        "image {field} must be a boolean"
+    )))
+}
+
+fn codex_image_integer_field(value: &Value, field: &str) -> Result<Option<i64>, ProxyError> {
+    let Some(value) = value.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
     value
         .as_i64()
-        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+        .map(Some)
+        .ok_or_else(|| ProxyError::bad_request(format!("image {field} must be an integer")))
 }
 
-fn codex_images_response_from_responses_body(
-    body: &[u8],
-    response_format: Option<&str>,
-    stream: bool,
-) -> Result<CodexImagesResponse, ProxyError> {
-    let (results, created_at) = collect_codex_image_results(body);
-    if results.is_empty() {
-        return Err(ProxyError {
-            status: StatusCode::BAD_GATEWAY,
-            message: "codex image generation response did not contain image output".to_string(),
-        });
+fn normalize_codex_image_model(model: &str, prompt: &str) -> (String, Option<String>) {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "gpt-image-2-2k" => (
+            CODEX_IMAGES_DEFAULT_TOOL_MODEL.to_string(),
+            Some(image_alias_size(
+                prompt,
+                "2048x2048",
+                "2560x1440",
+                "1440x2560",
+            )),
+        ),
+        "gpt-image-2-4k" => (
+            CODEX_IMAGES_DEFAULT_TOOL_MODEL.to_string(),
+            Some(image_alias_size(
+                prompt,
+                "2880x2880",
+                "3840x2160",
+                "2160x3840",
+            )),
+        ),
+        _ => (model.trim().to_string(), None),
     }
-    if stream {
-        let mut output = String::new();
-        for result in results {
-            let payload = codex_image_result_payload(&result, response_format);
-            output.push_str(&format!(
-                "event: image_generation.completed\ndata: {payload}\n\n"
+}
+
+fn image_alias_size(prompt: &str, square: &str, landscape: &str, portrait: &str) -> String {
+    let prompt = prompt.to_ascii_lowercase();
+    if ["portrait", "vertical", "phone wallpaper", "9:16"]
+        .iter()
+        .any(|keyword| prompt.contains(keyword))
+    {
+        portrait.to_string()
+    } else if [
+        "landscape",
+        "horizontal",
+        "widescreen",
+        "desktop wallpaper",
+        "16:9",
+    ]
+    .iter()
+    .any(|keyword| prompt.contains(keyword))
+    {
+        landscape.to_string()
+    } else {
+        square.to_string()
+    }
+}
+
+fn validate_codex_image_size(model: &str, size: &str) -> Result<String, ProxyError> {
+    let size = size.trim().to_ascii_lowercase();
+    if size == "auto" {
+        return Ok(size);
+    }
+    let (width, height) = size
+        .split_once('x')
+        .ok_or_else(|| ProxyError::bad_request("image size must use WIDTHxHEIGHT or auto"))?;
+    let width = width
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ProxyError::bad_request("image size has an invalid width"))?;
+    let height = height
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ProxyError::bad_request("image size has an invalid height"))?;
+    if model.eq_ignore_ascii_case(CODEX_IMAGES_DEFAULT_TOOL_MODEL) {
+        if width % 16 != 0 || height % 16 != 0 {
+            return Err(ProxyError::bad_request(
+                "gpt-image-2 width and height must be multiples of 16",
             ));
         }
-        output.push_str("data: [DONE]\n\n");
-        return Ok(CodexImagesResponse {
-            body: Bytes::from(output),
-            content_type: "text/event-stream",
+        if width.saturating_mul(height) > CODEX_IMAGES_MAX_PIXELS {
+            return Err(ProxyError::bad_request(format!(
+                "gpt-image-2 size exceeds {CODEX_IMAGES_MAX_PIXELS} total pixels"
+            )));
+        }
+        let long = width.max(height);
+        let short = width.min(height);
+        if long > short.saturating_mul(3) {
+            return Err(ProxyError::bad_request(
+                "gpt-image-2 aspect ratio must not exceed 3:1",
+            ));
+        }
+    } else if !matches!((width, height), (1024, 1024) | (1536, 1024) | (1024, 1536)) {
+        return Err(ProxyError::bad_request(
+            "gpt-image size must be auto, 1024x1024, 1536x1024, or 1024x1536",
+        ));
+    }
+    Ok(format!("{width}x{height}"))
+}
+
+struct CodexImagesStreamArgs {
+    state: ServerState,
+    stored: StoredProvider,
+    upstream: reqwest::Response,
+    upstream_is_sse: bool,
+    prepared: CodexImagesPreparedRequest,
+    request_context: UsageLogContext,
+    started: Instant,
+    request_id: String,
+    status_code: u16,
+    first_event_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    keepalive_interval: Duration,
+    public_origin: Option<String>,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+}
+
+fn codex_images_response_stream(
+    args: CodexImagesStreamArgs,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>> {
+    let CodexImagesStreamArgs {
+        state,
+        stored,
+        upstream,
+        upstream_is_sse,
+        prepared,
+        request_context,
+        started,
+        request_id,
+        status_code,
+        first_event_timeout,
+        idle_timeout,
+        keepalive_interval,
+        public_origin,
+        account_in_flight_guard,
+        share_invocation_guard,
+    } = args;
+    let mut lifecycle = CodexImagesLifecycleGuard {
+        armed: true,
+        state: state.clone(),
+        stored: stored.clone(),
+        request_id,
+        request_context,
+        started,
+        first_token_ms: None,
+        usage: StreamUsageAccumulator::new(adapters::usage_input_semantics_for(
+            &stored,
+            ProxyRoute::CodexResponses,
+        )),
+        usage_snapshot: TokenUsage::default(),
+        operation: prepared.operation,
+        downstream_stream: prepared.stream,
+        account_in_flight_guard,
+        share_invocation_guard,
+    };
+    async_stream::stream! {
+        let mut inner = upstream.bytes_stream();
+        let mut parser = CodexImagesResponseParser::new(upstream_is_sse);
+        let initial = if prepared.stream {
+            Bytes::from_static(b": connected\n\n")
+        } else {
+            Bytes::from_static(b"\n")
+        };
+        yield Ok(initial);
+
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + keepalive_interval,
+            keepalive_interval,
+        );
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut saw_valid_event = false;
+        let mut read_deadline = first_event_timeout
+            .map(|timeout| tokio::time::Instant::now() + timeout);
+
+        loop {
+            let step = if let Some(deadline) = read_deadline {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => CodexImagesReadStep::Timeout,
+                    result = inner.try_next() => CodexImagesReadStep::Upstream(result),
+                    _ = keepalive.tick() => CodexImagesReadStep::Keepalive,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    result = inner.try_next() => CodexImagesReadStep::Upstream(result),
+                    _ = keepalive.tick() => CodexImagesReadStep::Keepalive,
+                }
+            };
+
+            let parsed = match step {
+                CodexImagesReadStep::Keepalive => {
+                    let keepalive = if prepared.stream {
+                        Bytes::from_static(b": keepalive\n\n")
+                    } else {
+                        Bytes::from_static(b" \n")
+                    };
+                    yield Ok(keepalive);
+                    continue;
+                }
+                CodexImagesReadStep::Timeout => {
+                    let timeout = if saw_valid_event {
+                        idle_timeout
+                    } else {
+                        first_event_timeout
+                    }
+                    .unwrap_or_default();
+                    Err(CodexImagesFailure::timeout(saw_valid_event, timeout))
+                }
+                CodexImagesReadStep::Upstream(Err(error)) => {
+                    Err(CodexImagesFailure::network(error.to_string()))
+                }
+                CodexImagesReadStep::Upstream(Ok(Some(chunk))) => {
+                    lifecycle.usage_snapshot = lifecycle.usage.push(&chunk);
+                    let parsed = parser.push(&chunk);
+                    if parsed.as_ref().is_ok_and(|parsed| parsed.saw_valid_event) {
+                        saw_valid_event = true;
+                        read_deadline = idle_timeout
+                            .map(|timeout| tokio::time::Instant::now() + timeout);
+                    } else if saw_valid_event {
+                        read_deadline = idle_timeout
+                            .map(|timeout| tokio::time::Instant::now() + timeout);
+                    }
+                    parsed
+                }
+                CodexImagesReadStep::Upstream(Ok(None)) => parser.finish(),
+            };
+
+            let mut terminal = None;
+            match parsed {
+                Ok(parsed) => {
+                    for event in parsed.events {
+                        match event {
+                            CodexImagesProtocolEvent::Partial(partial) => {
+                                if lifecycle.first_token_ms.is_none() {
+                                    lifecycle.first_token_ms = Some(started.elapsed().as_millis());
+                                    if prepared.stream {
+                                        update_stream_usage(
+                                            &state,
+                                            &stored,
+                                            &lifecycle.request_id,
+                                            status_code,
+                                            started.elapsed().as_millis(),
+                                            lifecycle.first_token_ms,
+                                            lifecycle.usage_snapshot,
+                                            Some("streaming"),
+                                        )
+                                        .await;
+                                    }
+                                }
+                                if prepared.stream {
+                                    match render_codex_image_partial(
+                                        &state,
+                                        &prepared,
+                                        &partial,
+                                        public_origin.as_deref(),
+                                    ) {
+                                        Ok(frame) => yield Ok(frame),
+                                        Err(error) => {
+                                            terminal = Some(Err(error));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            CodexImagesProtocolEvent::Completed(completion) => {
+                                terminal = Some(Ok(completion));
+                                break;
+                            }
+                            CodexImagesProtocolEvent::Failed(error) => {
+                                terminal = Some(Err(error));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => terminal = Some(Err(error)),
+            }
+
+            let Some(terminal) = terminal else {
+                continue;
+            };
+            match terminal {
+                Ok(completion) => {
+                    let rendered = render_codex_images_completion(
+                        &state,
+                        &prepared,
+                        completion,
+                        public_origin.as_deref(),
+                    );
+                    match rendered {
+                        Ok(rendered) => {
+                            if lifecycle.first_token_ms.is_none() {
+                                lifecycle.first_token_ms = Some(started.elapsed().as_millis());
+                            }
+                            let usage = lifecycle.finish_usage();
+                            lifecycle
+                                .finish(
+                                    status_code,
+                                    "completed",
+                                    None,
+                                    usage,
+                                    Some(rendered.image_usage.clone()),
+                                    Some(provider_outcome_from_status(status_code)),
+                                    "completed",
+                                )
+                                .await;
+                            for frame in rendered.frames {
+                                yield Ok(frame);
+                            }
+                            return;
+                        }
+                        Err(error) => {
+                            let usage = lifecycle.finish_usage();
+                            lifecycle
+                                .finish(
+                                    error.status_code,
+                                    "failed",
+                                    Some(&error.message),
+                                    usage,
+                                    None,
+                                    error.provider_outcome(),
+                                    error.metric_outcome(),
+                                )
+                                .await;
+                            yield Ok(render_codex_images_error(prepared.stream, &error));
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let usage = lifecycle.finish_usage();
+                    lifecycle
+                        .finish(
+                            error.status_code,
+                            error.stream_status(),
+                            Some(&error.message),
+                            usage,
+                            None,
+                            error.provider_outcome(),
+                            error.metric_outcome(),
+                        )
+                        .await;
+                    yield Ok(render_codex_images_error(prepared.stream, &error));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+enum CodexImagesReadStep {
+    Keepalive,
+    Timeout,
+    Upstream(Result<Option<Bytes>, reqwest::Error>),
+}
+
+struct CodexImagesLifecycleGuard {
+    armed: bool,
+    state: ServerState,
+    stored: StoredProvider,
+    request_id: String,
+    request_context: UsageLogContext,
+    started: Instant,
+    first_token_ms: Option<u128>,
+    usage: StreamUsageAccumulator,
+    usage_snapshot: TokenUsage,
+    operation: CodexImagesOperation,
+    downstream_stream: bool,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+}
+
+impl CodexImagesLifecycleGuard {
+    fn finish_usage(&mut self) -> TokenUsage {
+        let usage = std::mem::take(&mut self.usage).finish();
+        self.usage_snapshot = usage;
+        usage
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish(
+        &mut self,
+        status_code: u16,
+        stream_status: &str,
+        error_message: Option<&str>,
+        usage: TokenUsage,
+        image: Option<ImageUsageMetadata>,
+        provider_outcome: Option<ProviderOutcome>,
+        metric_outcome: &'static str,
+    ) {
+        update_image_stream_usage(
+            &self.state,
+            &self.stored,
+            &self.request_id,
+            status_code,
+            self.started.elapsed().as_millis(),
+            self.first_token_ms,
+            usage,
+            stream_status,
+            error_message,
+            image.clone(),
+        )
+        .await;
+        record_share_invocation_result(
+            &self.state,
+            self.request_context.share_id.as_deref(),
+            self.request_context.user_email.as_deref(),
+            usage,
+        )
+        .await;
+        if let Some(provider_outcome) = provider_outcome {
+            record_provider_outcome(&self.state, &self.stored, provider_outcome).await;
+        }
+        crate::metrics::record_codex_images_request(
+            self.operation.as_str(),
+            self.downstream_stream,
+            metric_outcome,
+        );
+        if let Some(image) = image {
+            crate::metrics::record_codex_images_output(
+                self.operation.as_str(),
+                image.format.as_deref().unwrap_or("unknown"),
+                u64::from(image.count),
+                image.bytes,
+            );
+        }
+        self.armed = false;
+        self.account_in_flight_guard.take();
+        self.share_invocation_guard.take();
+    }
+}
+
+impl Drop for CodexImagesLifecycleGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let stored = self.stored.clone();
+        let request_id = self.request_id.clone();
+        let request_context = self.request_context.clone();
+        let duration_ms = self.started.elapsed().as_millis();
+        let first_token_ms = self.first_token_ms;
+        let usage = self.usage_snapshot;
+        let operation = self.operation;
+        let downstream_stream = self.downstream_stream;
+        tokio::spawn(async move {
+            update_image_stream_usage(
+                &state,
+                &stored,
+                &request_id,
+                499,
+                duration_ms,
+                first_token_ms,
+                usage,
+                "client_cancelled",
+                Some("downstream client cancelled the image response"),
+                None,
+            )
+            .await;
+            record_share_invocation_result(
+                &state,
+                request_context.share_id.as_deref(),
+                request_context.user_email.as_deref(),
+                usage,
+            )
+            .await;
+            crate::metrics::record_codex_images_request(
+                operation.as_str(),
+                downstream_stream,
+                "client_cancelled",
+            );
+            crate::metrics::record_stream_client_cancelled(stored.app.as_str());
         });
     }
-    let mut data = Vec::new();
-    let mut first_meta = CodexImageResult::default();
-    for (index, result) in results.iter().enumerate() {
-        if index == 0 {
-            first_meta = result.clone();
+}
+
+struct CodexImagesParsedChunk {
+    events: Vec<CodexImagesProtocolEvent>,
+    saw_valid_event: bool,
+}
+
+enum CodexImagesProtocolEvent {
+    Partial(CodexImagePartial),
+    Completed(CodexImagesCompletion),
+    Failed(CodexImagesFailure),
+}
+
+struct CodexImagePartial {
+    result: String,
+    partial_image_index: i64,
+    created_at: i64,
+    meta: CodexImageResult,
+}
+
+struct CodexImagesCompletion {
+    results: Vec<CodexImageResult>,
+    created_at: i64,
+    usage: Option<Value>,
+}
+
+struct CodexImagesResponseParser {
+    sse: bool,
+    buffer: Vec<u8>,
+    total_bytes: usize,
+    pending_results: Vec<CodexImageResult>,
+    pending_refusal: Option<String>,
+    stream_meta: CodexImageResult,
+    created_at: i64,
+}
+
+impl CodexImagesResponseParser {
+    fn new(sse: bool) -> Self {
+        Self {
+            sse,
+            buffer: Vec::new(),
+            total_bytes: 0,
+            pending_results: Vec::new(),
+            pending_refusal: None,
+            stream_meta: CodexImageResult::default(),
+            created_at: (current_time_ms() / 1000) as i64,
         }
-        data.push(codex_image_result_data(result, response_format));
     }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<CodexImagesParsedChunk, CodexImagesFailure> {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        if self.total_bytes > CODEX_IMAGES_MAX_UPSTREAM_BYTES {
+            return Err(CodexImagesFailure::protocol(format!(
+                "upstream response body exceeds the {} byte limit",
+                CODEX_IMAGES_MAX_UPSTREAM_BYTES
+            )));
+        }
+        self.buffer.extend_from_slice(chunk);
+        if !self.sse {
+            return Ok(CodexImagesParsedChunk {
+                events: Vec::new(),
+                saw_valid_event: false,
+            });
+        }
+        let mut events = Vec::new();
+        let mut saw_valid_event = false;
+        while let Some((event_end, delimiter_len)) = next_sse_event_boundary_bytes(&self.buffer) {
+            let event = self.buffer[..event_end].to_vec();
+            self.buffer.drain(..event_end + delimiter_len);
+            if let Some(parsed) = self.parse_sse_event(&event, &mut saw_valid_event)? {
+                let terminal = matches!(
+                    parsed,
+                    CodexImagesProtocolEvent::Completed(_) | CodexImagesProtocolEvent::Failed(_)
+                );
+                events.push(parsed);
+                if terminal {
+                    break;
+                }
+            }
+        }
+        Ok(CodexImagesParsedChunk {
+            events,
+            saw_valid_event,
+        })
+    }
+
+    fn finish(&mut self) -> Result<CodexImagesParsedChunk, CodexImagesFailure> {
+        if self.sse {
+            let mut events = Vec::new();
+            let mut saw_valid_event = false;
+            if !self.buffer.iter().all(u8::is_ascii_whitespace) {
+                let tail = std::mem::take(&mut self.buffer);
+                if let Some(event) = self.parse_sse_event(&tail, &mut saw_valid_event)? {
+                    events.push(event);
+                }
+            }
+            if !events.iter().any(|event| {
+                matches!(
+                    event,
+                    CodexImagesProtocolEvent::Completed(_) | CodexImagesProtocolEvent::Failed(_)
+                )
+            }) {
+                return Err(CodexImagesFailure::protocol(
+                    "Codex image stream ended before a terminal event",
+                ));
+            }
+            return Ok(CodexImagesParsedChunk {
+                events,
+                saw_valid_event,
+            });
+        }
+
+        let value = serde_json::from_slice::<Value>(&self.buffer).map_err(|error| {
+            CodexImagesFailure::protocol(format!("invalid Codex Images upstream JSON: {error}"))
+        })?;
+        let event = self
+            .protocol_event_from_value(&value, None)?
+            .unwrap_or_else(|| {
+                CodexImagesProtocolEvent::Failed(CodexImagesFailure::protocol(
+                    "Codex Images upstream JSON did not contain a terminal response",
+                ))
+            });
+        Ok(CodexImagesParsedChunk {
+            events: vec![event],
+            saw_valid_event: true,
+        })
+    }
+
+    fn parse_sse_event(
+        &mut self,
+        event: &[u8],
+        saw_valid_event: &mut bool,
+    ) -> Result<Option<CodexImagesProtocolEvent>, CodexImagesFailure> {
+        let event = std::str::from_utf8(event).map_err(|error| {
+            CodexImagesFailure::protocol(format!("Codex Images SSE is not UTF-8: {error}"))
+        })?;
+        let mut event_name = None;
+        let mut data = Vec::new();
+        for line in event.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(value) = line.strip_prefix("event:") {
+                event_name = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data.push(value.trim_start().to_string());
+            }
+        }
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let payload = data.join("\n");
+        *saw_valid_event = true;
+        if payload.trim() == "[DONE]" {
+            return self.completion_from_pending().map(Some);
+        }
+        let value = serde_json::from_str::<Value>(&payload).map_err(|error| {
+            CodexImagesFailure::protocol(format!("invalid Codex Images SSE JSON: {error}"))
+        })?;
+        self.protocol_event_from_value(&value, event_name.as_deref())
+    }
+
+    fn protocol_event_from_value(
+        &mut self,
+        value: &Value,
+        event_name: Option<&str>,
+    ) -> Result<Option<CodexImagesProtocolEvent>, CodexImagesFailure> {
+        self.merge_lifecycle_meta(value);
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if event_name == Some("error")
+            || matches!(
+                event_type,
+                "error"
+                    | "response.failed"
+                    | "response.incomplete"
+                    | "response.cancelled"
+                    | "response.canceled"
+            )
+            || value
+                .pointer("/response/status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| {
+                    matches!(status, "failed" | "incomplete" | "cancelled" | "canceled")
+                })
+        {
+            return Ok(Some(CodexImagesProtocolEvent::Failed(
+                CodexImagesFailure::upstream(codex_image_failure_message(value)),
+            )));
+        }
+        match event_type {
+            "response.image_generation_call.partial_image" => {
+                let Some(result) = value
+                    .get("partial_image_b64")
+                    .or_else(|| value.get("partial_image"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|result| !result.is_empty())
+                else {
+                    return Ok(None);
+                };
+                let mut meta = self.stream_meta.clone();
+                merge_codex_image_meta(&mut meta, &codex_image_meta_from_value(value));
+                Ok(Some(CodexImagesProtocolEvent::Partial(CodexImagePartial {
+                    result: result.to_string(),
+                    partial_image_index: value
+                        .get("partial_image_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default(),
+                    created_at: self.created_at,
+                    meta,
+                })))
+            }
+            "response.output_item.done" => {
+                if let Some(mut result) = codex_image_result_from_item(value.get("item")) {
+                    merge_codex_image_meta(&mut result, &self.stream_meta);
+                    self.pending_results.push(result);
+                } else if let Some(refusal) = value
+                    .get("item")
+                    .and_then(codex_image_refusal_text_from_item)
+                {
+                    self.pending_refusal = Some(refusal);
+                }
+                Ok(None)
+            }
+            "response.output_text.delta" => {
+                if let Some(delta) = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|delta| !delta.is_empty())
+                {
+                    append_codex_image_refusal_text(&mut self.pending_refusal, delta);
+                }
+                Ok(None)
+            }
+            "response.completed" | "response.done" => self.completion_from_value(value).map(Some),
+            "" if !self.sse => self.completion_from_value(value).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    fn completion_from_value(
+        &mut self,
+        value: &Value,
+    ) -> Result<CodexImagesProtocolEvent, CodexImagesFailure> {
+        let response = value.get("response").unwrap_or(value);
+        let mut results = response
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| codex_image_result_from_item(Some(item)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if results.is_empty() {
+            results = std::mem::take(&mut self.pending_results);
+        }
+        if results.is_empty() {
+            let refusal = codex_image_refusal_text_from_response(response)
+                .or_else(|| self.pending_refusal.take());
+            if let Some(refusal) = refusal {
+                return Err(CodexImagesFailure::upstream(format!(
+                    "upstream image generation did not produce an image: {refusal}"
+                )));
+            }
+            return Err(CodexImagesFailure::protocol(
+                "Codex image generation response did not contain image output",
+            ));
+        }
+        if results.len() != 1 {
+            return Err(CodexImagesFailure::protocol(format!(
+                "Codex image generation returned {} outputs for an n=1 request",
+                results.len()
+            )));
+        }
+        for result in &mut results {
+            merge_codex_image_meta(result, &self.stream_meta);
+        }
+        let created_at = response
+            .get("created_at")
+            .and_then(Value::as_i64)
+            .filter(|created_at| *created_at > 0)
+            .unwrap_or(self.created_at);
+        let usage = response
+            .pointer("/tool_usage/image_gen")
+            .or_else(|| response.get("usage"))
+            .filter(|usage| usage.is_object())
+            .cloned();
+        Ok(CodexImagesProtocolEvent::Completed(CodexImagesCompletion {
+            results,
+            created_at,
+            usage,
+        }))
+    }
+
+    fn completion_from_pending(&mut self) -> Result<CodexImagesProtocolEvent, CodexImagesFailure> {
+        let results = std::mem::take(&mut self.pending_results);
+        if results.is_empty() {
+            return Err(CodexImagesFailure::protocol(
+                "Codex image stream ended before image generation completed",
+            ));
+        }
+        Ok(CodexImagesProtocolEvent::Completed(CodexImagesCompletion {
+            results,
+            created_at: self.created_at,
+            usage: None,
+        }))
+    }
+
+    fn merge_lifecycle_meta(&mut self, value: &Value) {
+        if let Some(created_at) = value
+            .pointer("/response/created_at")
+            .or_else(|| value.get("created_at"))
+            .and_then(Value::as_i64)
+            .filter(|created_at| *created_at > 0)
+        {
+            self.created_at = created_at;
+        }
+        merge_codex_image_meta(&mut self.stream_meta, &codex_image_meta_from_value(value));
+        if let Some(item) = value.get("item") {
+            merge_codex_image_meta(&mut self.stream_meta, &codex_image_meta_from_value(item));
+        }
+        if let Some(tool) = value
+            .pointer("/response/tools")
+            .or_else(|| value.get("tools"))
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools.iter().find(|tool| {
+                    tool.get("type").and_then(Value::as_str) == Some("image_generation")
+                })
+            })
+        {
+            merge_codex_image_meta(&mut self.stream_meta, &codex_image_meta_from_value(tool));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CodexImagesFailureKind {
+    Upstream,
+    Protocol,
+    Network,
+    Timeout,
+    Local,
+}
+
+#[derive(Debug)]
+struct CodexImagesFailure {
+    kind: CodexImagesFailureKind,
+    status_code: u16,
+    code: &'static str,
+    message: String,
+}
+
+impl CodexImagesFailure {
+    fn upstream(message: impl Into<String>) -> Self {
+        Self {
+            kind: CodexImagesFailureKind::Upstream,
+            status_code: StatusCode::BAD_GATEWAY.as_u16(),
+            code: "image_generation_failed",
+            message: bounded_codex_image_message(message.into()),
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            kind: CodexImagesFailureKind::Protocol,
+            status_code: StatusCode::BAD_GATEWAY.as_u16(),
+            code: "invalid_upstream_image_response",
+            message: bounded_codex_image_message(message.into()),
+        }
+    }
+
+    fn network(message: impl Into<String>) -> Self {
+        Self {
+            kind: CodexImagesFailureKind::Network,
+            status_code: StatusCode::BAD_GATEWAY.as_u16(),
+            code: "upstream_image_stream_error",
+            message: bounded_codex_image_message(message.into()),
+        }
+    }
+
+    fn timeout(after_first_event: bool, timeout: Duration) -> Self {
+        let phase = if after_first_event {
+            "idle"
+        } else {
+            "first event"
+        };
+        Self {
+            kind: CodexImagesFailureKind::Timeout,
+            status_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+            code: "upstream_image_timeout",
+            message: format!(
+                "Codex Images upstream {phase} timeout after {}ms",
+                timeout.as_millis()
+            ),
+        }
+    }
+
+    fn local(message: impl Into<String>) -> Self {
+        Self {
+            kind: CodexImagesFailureKind::Local,
+            status_code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            code: "image_response_error",
+            message: bounded_codex_image_message(message.into()),
+        }
+    }
+
+    fn provider_outcome(&self) -> Option<ProviderOutcome> {
+        match self.kind {
+            CodexImagesFailureKind::Network => Some(ProviderOutcome::NetworkFailure),
+            CodexImagesFailureKind::Upstream | CodexImagesFailureKind::Protocol => {
+                Some(ProviderOutcome::Failure {
+                    status_code: StatusCode::BAD_GATEWAY.as_u16(),
+                })
+            }
+            CodexImagesFailureKind::Timeout => Some(ProviderOutcome::Failure {
+                status_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+            }),
+            CodexImagesFailureKind::Local => None,
+        }
+    }
+
+    fn stream_status(&self) -> &'static str {
+        match self.kind {
+            CodexImagesFailureKind::Network => "upstream_error",
+            CodexImagesFailureKind::Timeout => "timeout",
+            _ => "failed",
+        }
+    }
+
+    fn metric_outcome(&self) -> &'static str {
+        match self.kind {
+            CodexImagesFailureKind::Upstream => "upstream_failed",
+            CodexImagesFailureKind::Protocol => "protocol_error",
+            CodexImagesFailureKind::Network => "network_failure",
+            CodexImagesFailureKind::Timeout => "timeout",
+            CodexImagesFailureKind::Local => "local_error",
+        }
+    }
+}
+
+struct RenderedCodexImagesCompletion {
+    frames: Vec<Bytes>,
+    image_usage: ImageUsageMetadata,
+}
+
+fn render_codex_images_completion(
+    state: &ServerState,
+    prepared: &CodexImagesPreparedRequest,
+    completion: CodexImagesCompletion,
+    public_origin: Option<&str>,
+) -> Result<RenderedCodexImagesCompletion, CodexImagesFailure> {
+    let first_meta = completion.results.first().cloned().unwrap_or_default();
+    let mut data = Vec::with_capacity(completion.results.len());
+    let mut image_usage = ImageUsageMetadata::default();
+    for result in completion.results {
+        let (item, item_usage) =
+            render_codex_image_data(state, result, &prepared.response_format, public_origin)?;
+        merge_codex_image_usage(&mut image_usage, item_usage);
+        data.push(item);
+    }
+    if prepared.stream {
+        let event_name = format!("{}.completed", prepared.operation.stream_prefix());
+        let mut frames = Vec::with_capacity(data.len());
+        for mut item in data {
+            item["type"] = Value::String(event_name.clone());
+            item["created_at"] = Value::Number(completion.created_at.into());
+            if let Some(usage) = completion.usage.clone() {
+                item["usage"] = usage;
+            }
+            frames.push(Bytes::from(format!(
+                "event: {event_name}\ndata: {item}\n\n"
+            )));
+        }
+        return Ok(RenderedCodexImagesCompletion {
+            frames,
+            image_usage,
+        });
+    }
+
     let mut response = json!({
-        "created": created_at,
+        "created": completion.created_at,
         "data": data,
     });
     if let Some(value) = first_meta.background {
@@ -4190,87 +5546,155 @@ fn codex_images_response_from_responses_body(
     if let Some(value) = first_meta.size {
         response["size"] = Value::String(value);
     }
+    if let Some(usage) = completion.usage {
+        response["usage"] = usage;
+    }
     let body = serde_json::to_vec(&response)
         .map(Bytes::from)
-        .map_err(|error| ProxyError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("encode codex image generation response failed: {error}"),
+        .map_err(|error| {
+            CodexImagesFailure::local(format!("encode Codex image response failed: {error}"))
         })?;
-    Ok(CodexImagesResponse {
-        body,
-        content_type: "application/json",
+    Ok(RenderedCodexImagesCompletion {
+        frames: vec![body],
+        image_usage,
     })
 }
 
-fn collect_codex_image_results(body: &[u8]) -> (Vec<CodexImageResult>, i64) {
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        return images_from_completed_value(&value, Vec::new());
+fn render_codex_image_partial(
+    state: &ServerState,
+    prepared: &CodexImagesPreparedRequest,
+    partial: &CodexImagePartial,
+    public_origin: Option<&str>,
+) -> Result<Bytes, CodexImagesFailure> {
+    let mut result = partial.meta.clone();
+    result.result = partial.result.clone();
+    let (mut payload, _) =
+        render_codex_image_data(state, result, &prepared.response_format, public_origin)?;
+    let event_name = format!("{}.partial_image", prepared.operation.stream_prefix());
+    payload["type"] = Value::String(event_name.clone());
+    payload["created_at"] = Value::Number(partial.created_at.into());
+    payload["partial_image_index"] = Value::Number(partial.partial_image_index.into());
+    Ok(Bytes::from(format!(
+        "event: {event_name}\ndata: {payload}\n\n"
+    )))
+}
+
+fn render_codex_image_data(
+    state: &ServerState,
+    mut result: CodexImageResult,
+    response_format: &str,
+    public_origin: Option<&str>,
+) -> Result<(Value, ImageUsageMetadata), CodexImagesFailure> {
+    let decoded = STANDARD.decode(result.result.trim()).map_err(|error| {
+        CodexImagesFailure::protocol(format!("Codex image output is not valid base64: {error}"))
+    })?;
+    if decoded.len() > CODEX_IMAGES_MAX_OUTPUT_BYTES {
+        return Err(CodexImagesFailure::protocol(format!(
+            "Codex image output exceeds the {CODEX_IMAGES_MAX_OUTPUT_BYTES} byte per-image limit"
+        )));
     }
-    let text = String::from_utf8_lossy(body);
-    let mut buffer = text.to_string();
-    let mut fallback = Vec::new();
-    let mut completed = None;
-    while let Some((event_end, delimiter_len)) = next_sse_event_boundary(&buffer) {
-        let event = buffer[..event_end].to_string();
-        buffer.drain(..event_end + delimiter_len);
-        collect_codex_image_event(&event, &mut fallback, &mut completed);
+    let claimed_mime_type = codex_image_claimed_mime_type(result.output_format.as_deref())?;
+    let mime_type = super::remote_image::validate_image_bytes(
+        &decoded,
+        claimed_mime_type,
+        CODEX_IMAGES_MAX_OUTPUT_BYTES,
+    )
+    .map_err(|error| {
+        CodexImagesFailure::protocol(format!("Codex image output is invalid: {}", error.message))
+    })?;
+    result.bytes = Some(decoded.len() as u64);
+    if let Ok(size) = imagesize::blob_size(&decoded) {
+        result.width = u32::try_from(size.width).ok();
+        result.height = u32::try_from(size.height).ok();
     }
-    if !buffer.trim().is_empty() {
-        collect_codex_image_event(&buffer, &mut fallback, &mut completed);
-    }
-    if let Some(completed) = completed {
-        images_from_completed_value(&completed, fallback)
+    let format = codex_image_format_from_mime(&mime_type)?.to_string();
+    let mut data = json!({});
+    if response_format == "url" {
+        let public_origin = public_origin.ok_or_else(|| {
+            CodexImagesFailure::local("image URL response has no public server origin")
+        })?;
+        let handle = state
+            .store_ephemeral_image(Bytes::from(decoded), mime_type)
+            .map_err(|error| CodexImagesFailure::local(error.to_string()))?;
+        data["url"] = Value::String(format!("{public_origin}/v1/images/files/{}", handle.token));
     } else {
-        (fallback, (current_time_ms() / 1000) as i64)
+        data["b64_json"] = Value::String(result.result.clone());
+    }
+    if let Some(value) = result.revised_prompt.clone() {
+        data["revised_prompt"] = Value::String(value);
+    }
+    if let Some(value) = result.output_format.clone() {
+        data["output_format"] = Value::String(value);
+    }
+    if let Some(value) = result.size.clone() {
+        data["size"] = Value::String(value);
+    }
+    if let Some(value) = result.background.clone() {
+        data["background"] = Value::String(value);
+    }
+    if let Some(value) = result.quality.clone() {
+        data["quality"] = Value::String(value);
+    }
+    data["bytes"] = Value::Number(result.bytes.unwrap_or_default().into());
+    if let Some(width) = result.width {
+        data["width"] = Value::Number(width.into());
+    }
+    if let Some(height) = result.height {
+        data["height"] = Value::Number(height.into());
+    }
+    let actual_size = match (result.width, result.height) {
+        (Some(width), Some(height)) => Some(format!("{width}x{height}")),
+        _ => result.size.clone(),
+    };
+    Ok((
+        data,
+        ImageUsageMetadata {
+            count: 1,
+            bytes: result.bytes.unwrap_or_default(),
+            format: Some(format),
+            width: result.width,
+            height: result.height,
+            size: actual_size,
+        },
+    ))
+}
+
+fn merge_codex_image_usage(target: &mut ImageUsageMetadata, next: ImageUsageMetadata) {
+    target.count = target.count.saturating_add(next.count);
+    target.bytes = target.bytes.saturating_add(next.bytes);
+    target.format = merge_codex_image_usage_text(target.format.take(), next.format);
+    target.size = merge_codex_image_usage_text(target.size.take(), next.size);
+    if target.width.is_none() {
+        target.width = next.width;
+    }
+    if target.height.is_none() {
+        target.height = next.height;
     }
 }
 
-fn collect_codex_image_event(
-    event: &str,
-    fallback: &mut Vec<CodexImageResult>,
-    completed: &mut Option<Value>,
-) {
-    let Some(payload) = first_sse_data_payload(event) else {
-        return;
-    };
-    if payload == "[DONE]" || !payload.starts_with('{') {
-        return;
+fn merge_codex_image_usage_text(current: Option<String>, next: Option<String>) -> Option<String> {
+    match (current, next) {
+        (None, next) => next,
+        (current, None) => current,
+        (Some(current), Some(next)) if current == next => Some(current),
+        (Some(_), Some(_)) => Some("mixed".to_string()),
     }
-    let Ok(value) = serde_json::from_str::<Value>(payload) else {
-        return;
-    };
-    match value.get("type").and_then(Value::as_str) {
-        Some("response.output_item.done") => {
-            if let Some(result) = codex_image_result_from_item(value.get("item")) {
-                fallback.push(result);
-            }
+}
+
+fn render_codex_images_error(stream: bool, error: &CodexImagesFailure) -> Bytes {
+    let payload = json!({
+        "type": "error",
+        "error": {
+            "type": "server_error",
+            "code": error.code,
+            "message": error.message,
         }
-        Some("response.completed") => *completed = Some(value),
-        _ => {}
+    });
+    if stream {
+        Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+    } else {
+        Bytes::from(payload.to_string())
     }
-}
-
-fn images_from_completed_value(
-    value: &Value,
-    fallback: Vec<CodexImageResult>,
-) -> (Vec<CodexImageResult>, i64) {
-    let created_at = value
-        .pointer("/response/created_at")
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| (current_time_ms() / 1000) as i64);
-    let results = value
-        .pointer("/response/output")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| codex_image_result_from_item(Some(item)))
-                .collect::<Vec<_>>()
-        })
-        .filter(|items| !items.is_empty())
-        .unwrap_or(fallback);
-    (results, created_at)
 }
 
 fn codex_image_result_from_item(item: Option<&Value>) -> Option<CodexImageResult> {
@@ -4284,14 +5708,56 @@ fn codex_image_result_from_item(item: Option<&Value>) -> Option<CodexImageResult
         .map(str::trim)
         .filter(|result| !result.is_empty())?
         .to_string();
-    Some(CodexImageResult {
-        result,
-        revised_prompt: image_string_field(item, "revised_prompt"),
-        output_format: image_string_field(item, "output_format"),
-        size: image_string_field(item, "size"),
-        background: image_string_field(item, "background"),
-        quality: image_string_field(item, "quality"),
-    })
+    let mut image = codex_image_meta_from_value(item);
+    image.result = result;
+    Some(image)
+}
+
+fn codex_image_meta_from_value(value: &Value) -> CodexImageResult {
+    CodexImageResult {
+        revised_prompt: image_string_field(value, "revised_prompt"),
+        output_format: image_string_field(value, "output_format"),
+        size: image_string_field(value, "size"),
+        background: image_string_field(value, "background"),
+        quality: image_string_field(value, "quality"),
+        bytes: value.get("bytes").and_then(Value::as_u64),
+        width: value
+            .get("width")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        height: value
+            .get("height")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        ..CodexImageResult::default()
+    }
+}
+
+fn merge_codex_image_meta(target: &mut CodexImageResult, source: &CodexImageResult) {
+    if target.revised_prompt.is_none() {
+        target.revised_prompt = source.revised_prompt.clone();
+    }
+    if target.output_format.is_none() {
+        target.output_format = source.output_format.clone();
+    }
+    if target.size.is_none() {
+        target.size = source.size.clone();
+    }
+    if target.background.is_none() {
+        target.background = source.background.clone();
+    }
+    if target.quality.is_none() {
+        target.quality = source.quality.clone();
+    }
+    if target.bytes.is_none() {
+        target.bytes = source.bytes;
+    }
+    if target.width.is_none() {
+        target.width = source.width;
+    }
+    if target.height.is_none() {
+        target.height = source.height;
+    }
 }
 
 fn image_string_field(item: &Value, field: &str) -> Option<String> {
@@ -4302,42 +5768,221 @@ fn image_string_field(item: &Value, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn codex_image_result_payload(result: &CodexImageResult, response_format: Option<&str>) -> Value {
-    let mut payload = codex_image_result_data(result, response_format);
-    payload["type"] = Value::String("image_generation.completed".to_string());
-    payload
-}
-
-fn codex_image_result_data(result: &CodexImageResult, response_format: Option<&str>) -> Value {
-    let mut data = json!({});
-    if response_format
-        .map(|format| format.eq_ignore_ascii_case("url"))
-        .unwrap_or(false)
+fn codex_image_refusal_text_from_response(response: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    for item in response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
     {
-        data["url"] = Value::String(format!(
-            "data:{};base64,{}",
-            codex_image_mime_type(result.output_format.as_deref()),
-            result.result
-        ));
-    } else {
-        data["b64_json"] = Value::String(result.result.clone());
+        if let Some(text) = codex_image_refusal_text_from_item(item) {
+            parts.push(text);
+        }
     }
-    if let Some(value) = result.revised_prompt.clone() {
-        data["revised_prompt"] = Value::String(value);
-    }
-    data
+    (!parts.is_empty()).then(|| bounded_codex_image_message(parts.join(" ")))
 }
 
-fn codex_image_mime_type(output_format: Option<&str>) -> &'static str {
-    match output_format
+fn codex_image_refusal_text_from_item(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let text = item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
         .map(str::trim)
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then(|| bounded_codex_image_message(text))
+}
+
+fn append_codex_image_refusal_text(target: &mut Option<String>, next: &str) {
+    let combined = match target.take() {
+        Some(current) if !current.is_empty() => format!("{current} {next}"),
+        _ => next.to_string(),
+    };
+    *target = Some(bounded_codex_image_message(combined));
+}
+
+fn next_sse_event_boundary_bytes(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) if crlf <= lf => Some((crlf, 4)),
+        (Some(lf), _) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
+}
+
+fn codex_image_failure_message(value: &Value) -> String {
+    let message = value
+        .pointer("/error/message")
+        .or_else(|| value.pointer("/response/error/message"))
+        .or_else(|| value.pointer("/response/incomplete_details/message"))
+        .or_else(|| value.pointer("/response/incomplete_details/reason"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or("upstream image generation failed");
+    let code = value
+        .pointer("/error/code")
+        .or_else(|| value.pointer("/response/error/code"))
+        .or_else(|| value.pointer("/error/type"))
+        .or_else(|| value.pointer("/response/error/type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
+    match code {
+        Some(code)
+            if !message
+                .to_ascii_lowercase()
+                .contains(&code.to_ascii_lowercase()) =>
+        {
+            format!("upstream image generation failed ({code}): {message}")
+        }
+        _ => format!("upstream image generation failed: {message}"),
+    }
+}
+
+fn bounded_codex_image_error_message(body: &[u8]) -> String {
+    bounded_codex_image_message(upstream_error_message(body))
+}
+
+fn bounded_codex_image_message(message: String) -> String {
+    const MAX_ERROR_CHARS: usize = 512;
+    if message.chars().count() <= MAX_ERROR_CHARS {
+        message
+    } else {
+        message.chars().take(MAX_ERROR_CHARS).collect()
+    }
+}
+
+fn codex_images_model_metadata(prepared: &CodexImagesPreparedRequest) -> UsageModelMetadata {
+    UsageModelMetadata {
+        model: Some(prepared.requested_model.clone()),
+        requested_model: Some(prepared.requested_model.clone()),
+        actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
+        actual_model_source: Some("codex_image_generation_bridge".to_string()),
+    }
+}
+
+fn apply_codex_images_streaming_headers(response: &mut Response) {
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate, no-transform"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+}
+
+fn codex_images_public_origin(headers: &HeaderMap) -> Result<String, ProxyError> {
+    let configured = std::env::var("CC_SWITCH_IMAGE_PUBLIC_BASE_URL").ok();
+    codex_images_public_origin_with_base(headers, configured.as_deref())
+}
+
+fn codex_images_public_origin_with_base(
+    headers: &HeaderMap,
+    configured: Option<&str>,
+) -> Result<String, ProxyError> {
+    if let Some(configured) = configured {
+        if let Some(origin) = normalize_codex_images_public_origin(configured) {
+            return Ok(origin);
+        }
+        return Err(ProxyError::bad_request(
+            "CC_SWITCH_IMAGE_PUBLIC_BASE_URL must be an HTTP(S) origin without path, query, or fragment",
+        ));
+    }
+    let authority = optional_header(headers, "x-cc-switch-client-tunnel-host")
+        .or_else(|| copy_header(headers, HOST).map(str::to_string))
+        .or_else(|| optional_header(headers, "x-forwarded-host"))
+        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
+        .filter(|value| value.parse::<http::uri::Authority>().is_ok())
+        .ok_or_else(|| ProxyError::bad_request(
+            "response_format=url requires a valid public Host header or CC_SWITCH_IMAGE_PUBLIC_BASE_URL",
+        ))?;
+    let cf_scheme = optional_header(headers, "cf-visitor").and_then(|value| {
+        serde_json::from_str::<Value>(&value)
+            .ok()?
+            .get("scheme")?
+            .as_str()
+            .map(str::to_string)
+    });
+    let scheme = cf_scheme
+        .or_else(|| optional_header(headers, "x-forwarded-proto"))
+        .and_then(|value| {
+            value
+                .split(',')
+                .next()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+        })
+        .filter(|value| matches!(value.as_str(), "http" | "https"))
+        .unwrap_or_else(|| {
+            if headers.contains_key("cf-ray") {
+                "https".to_string()
+            } else {
+                "http".to_string()
+            }
+        });
+    normalize_codex_images_public_origin(&format!("{scheme}://{authority}"))
+        .ok_or_else(|| ProxyError::bad_request("could not derive a valid image public origin"))
+}
+
+fn normalize_codex_images_public_origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
-        "jpeg" | "jpg" => "image/jpeg",
-        "webp" => "image/webp",
-        _ => "image/png",
+        return None;
+    }
+    Some(value.trim().trim_end_matches('/').to_string())
+}
+
+fn codex_image_claimed_mime_type(
+    output_format: Option<&str>,
+) -> Result<Option<&'static str>, CodexImagesFailure> {
+    let Some(output_format) = output_format
+        .map(str::trim)
+        .filter(|output_format| !output_format.is_empty())
+    else {
+        return Ok(None);
+    };
+    match output_format.to_ascii_lowercase().as_str() {
+        "png" => Ok(Some("image/png")),
+        "jpeg" | "jpg" => Ok(Some("image/jpeg")),
+        "webp" => Ok(Some("image/webp")),
+        _ => Err(CodexImagesFailure::protocol(format!(
+            "Codex image output declared unsupported format {output_format:?}"
+        ))),
+    }
+}
+
+fn codex_image_format_from_mime(mime_type: &str) -> Result<&'static str, CodexImagesFailure> {
+    match mime_type {
+        "image/png" => Ok("png"),
+        "image/jpeg" => Ok("jpeg"),
+        "image/webp" => Ok("webp"),
+        _ => Err(CodexImagesFailure::protocol(format!(
+            "Codex image output used unsupported MIME type {mime_type:?}"
+        ))),
     }
 }
 
@@ -13748,7 +15393,9 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         }
     }
 
-    async fn spawn_test_oversized_codex_upstream() -> TestUnauthorizedCodexUpstream {
+    async fn spawn_test_oversized_codex_upstream(
+        status: StatusCode,
+    ) -> TestUnauthorizedCodexUpstream {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -13767,11 +15414,11 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                         .to_string();
                     authorizations.lock().unwrap().push(authorization);
                     Response::builder()
-                        .status(StatusCode::OK)
+                        .status(status)
                         .header(CONTENT_TYPE, "text/event-stream")
                         .header(
                             axum::http::header::CONTENT_LENGTH,
-                            (crate::proxy::MEDIA_RESPONSE_BODY_LIMIT_BYTES + 1).to_string(),
+                            (CODEX_IMAGES_MAX_UPSTREAM_BYTES + 1).to_string(),
                         )
                         .body(Body::from_stream(futures_util::stream::pending::<
                             Result<Bytes, std::io::Error>,
@@ -13787,6 +15434,112 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             address,
             authorizations,
             server,
+        }
+    }
+
+    async fn spawn_test_streaming_codex_images_upstream(
+        chunks: Vec<(Duration, Bytes)>,
+        stall_after_chunks: bool,
+    ) -> TestUnauthorizedCodexUpstream {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authorizations_for_route = std::sync::Arc::clone(&authorizations);
+        let chunks = std::sync::Arc::new(chunks);
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |headers: HeaderMap| {
+                let authorizations = std::sync::Arc::clone(&authorizations_for_route);
+                let chunks = std::sync::Arc::clone(&chunks);
+                async move {
+                    authorizations.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    let chunks = futures_util::stream::iter(chunks.as_ref().clone()).then(
+                        |(delay, chunk)| async move {
+                            tokio::time::sleep(delay).await;
+                            Ok::<Bytes, std::convert::Infallible>(chunk)
+                        },
+                    );
+                    let body = if stall_after_chunks {
+                        Body::from_stream(chunks.chain(futures_util::stream::pending()))
+                    } else {
+                        Body::from_stream(chunks)
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestUnauthorizedCodexUpstream {
+            address,
+            authorizations,
+            server,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn codex_images_stream_test_args(
+        state: &ServerState,
+        execution: &ProviderExecution,
+        upstream_address: std::net::SocketAddr,
+        prepared: CodexImagesPreparedRequest,
+        first_event_timeout: Option<Duration>,
+        idle_timeout: Option<Duration>,
+        keepalive_interval: Duration,
+        account_in_flight_guard: Option<AccountInFlightGuard>,
+    ) -> CodexImagesStreamArgs {
+        let stored = execution.runtime_stored_view();
+        let started = Instant::now();
+        let upstream = reqwest::Client::new()
+            .post(format!("http://{upstream_address}/v1/responses"))
+            .send()
+            .await
+            .unwrap();
+        let status_code = upstream.status().as_u16();
+        let request_context = UsageLogContext::default();
+        let request_id = log_usage(
+            state,
+            &stored,
+            status_code,
+            started.elapsed().as_millis(),
+            codex_images_model_metadata(&prepared),
+            TokenUsage::default(),
+            UsageLogContext {
+                is_streaming: prepared.stream,
+                stream_status: Some("pending".to_string()),
+                ..request_context.clone()
+            },
+        )
+        .await;
+        CodexImagesStreamArgs {
+            state: state.clone(),
+            stored,
+            upstream,
+            upstream_is_sse: true,
+            prepared,
+            request_context,
+            started,
+            request_id,
+            status_code,
+            first_event_timeout,
+            idle_timeout,
+            keepalive_interval,
+            public_origin: None,
+            account_in_flight_guard,
+            share_invocation_guard: None,
         }
     }
 
@@ -14857,7 +16610,7 @@ data: {"type":"response.output_item.done","output_index":2,"item":{"type":"funct
     }
 
     #[test]
-    fn codex_images_generation_builds_responses_request_and_extracts_fallback_output() {
+    fn codex_images_generation_builds_responses_request_and_parses_fallback_output() {
         let prepared = codex_images_generation_request(
             br#"{"prompt":"draw a cat","model":"gpt-image-2","response_format":"url","size":"1024x1024","stream":false}"#,
         )
@@ -14876,29 +16629,91 @@ data: {"type":"response.output_item.done","output_index":2,"item":{"type":"funct
             Some("1024x1024")
         );
 
-        let response = codex_images_response_from_responses_body(
-            br#"data: {"type":"response.output_item.done","item":{"id":"ig_1","type":"image_generation_call","result":"aGVsbG8=","output_format":"png","revised_prompt":"cat"}}
+        let mut parser = CodexImagesResponseParser::new(true);
+        let parsed = parser
+            .push(
+                br#"data: {"type":"response.output_item.done","item":{"id":"ig_1","type":"image_generation_call","result":"aGVsbG8=","output_format":"png","revised_prompt":"cat"}}
 
 data: {"type":"response.completed","response":{"created_at":1800000000,"output":[]}}
 
 "#,
-            Some("url"),
-            false,
+            )
+            .unwrap();
+        let completion = parsed
+            .events
+            .into_iter()
+            .find_map(|event| match event {
+                CodexImagesProtocolEvent::Completed(completion) => Some(completion),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(completion.created_at, 1_800_000_000);
+        assert_eq!(completion.results.len(), 1);
+        assert_eq!(completion.results[0].result, "aGVsbG8=");
+        assert_eq!(completion.results[0].revised_prompt.as_deref(), Some("cat"));
+    }
+
+    #[test]
+    fn codex_images_output_requires_a_supported_matching_image_signature() {
+        let state = forwarder_test_state("codex-images-output-signature");
+        let invalid = render_codex_image_data(
+            &state,
+            CodexImageResult {
+                result: STANDARD.encode(b"not an image"),
+                output_format: Some("png".to_string()),
+                ..CodexImageResult::default()
+            },
+            "b64_json",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(invalid.code, "invalid_upstream_image_response");
+        assert!(invalid.message.contains("supported image signature"));
+
+        let mismatch = render_codex_image_data(
+            &state,
+            CodexImageResult {
+                result: "iVBORw0KGgo=".to_string(),
+                output_format: Some("jpeg".to_string()),
+                ..CodexImageResult::default()
+            },
+            "b64_json",
+            None,
+        )
+        .unwrap_err();
+        assert!(mismatch
+            .message
+            .contains("does not match detected image/png"));
+
+        let (data, usage) = render_codex_image_data(
+            &state,
+            CodexImageResult {
+                result: "iVBORw0KGgo=".to_string(),
+                ..CodexImageResult::default()
+            },
+            "b64_json",
+            None,
         )
         .unwrap();
-        assert_eq!(response.content_type, "application/json");
-        let value: Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(value["created"], json!(1_800_000_000));
-        assert_eq!(
-            value.pointer("/data/0/url").and_then(Value::as_str),
-            Some("data:image/png;base64,aGVsbG8=")
-        );
-        assert_eq!(
-            value
-                .pointer("/data/0/revised_prompt")
-                .and_then(Value::as_str),
-            Some("cat")
-        );
+        assert_eq!(data["b64_json"], "iVBORw0KGgo=");
+        assert_eq!(usage.format.as_deref(), Some("png"));
+    }
+
+    #[test]
+    fn codex_images_shared_routes_preserve_grok_media_body_limit() {
+        assert!(ensure_grok_media_request_body_limit(
+            crate::proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+            crate::proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+        )
+        .is_ok());
+        for (wire_body_len, decoded_body_len) in [
+            (crate::proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES + 1, 1),
+            (1, crate::proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES + 1),
+        ] {
+            let error =
+                ensure_grok_media_request_body_limit(wire_body_len, decoded_body_len).unwrap_err();
+            assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        }
     }
 
     #[test]
@@ -14909,14 +16724,14 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             "image": {"image_url": "data:image/png;base64,aW1hZ2U="},
             "mask": {"image_url": "data:image/png;base64,bWFzaw=="},
             "stream": "true",
-            "n": "2",
+            "n": "1",
             "input_fidelity": "high"
         }))
         .unwrap();
         let request: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert!(prepared.stream);
         assert_eq!(request.pointer("/tools/0/action"), Some(&json!("edit")));
-        assert_eq!(request.pointer("/tools/0/n"), Some(&json!(2)));
+        assert_eq!(request.pointer("/tools/0/n"), None);
         assert_eq!(
             request.pointer("/tools/0/input_fidelity"),
             Some(&json!("high"))
@@ -14929,6 +16744,167 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             request.pointer("/input/0/content/1/image_url"),
             Some(&json!("data:image/png;base64,aW1hZ2U="))
         );
+    }
+
+    #[test]
+    fn codex_images_rejects_unproven_multi_output_requests() {
+        let error = codex_images_generation_request(
+            br#"{"prompt":"two images","model":"gpt-image-2","n":2}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("exactly n=1"));
+    }
+
+    #[test]
+    fn codex_images_parser_maps_partial_and_terminal_failure_events() {
+        let mut parser = CodexImagesResponseParser::new(true);
+        let partial = parser
+            .push(
+                br#"data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"iVBORw0KGgo=","partial_image_index":2,"created_at":1800000000}
+
+"#,
+            )
+            .unwrap();
+        match partial.events.as_slice() {
+            [CodexImagesProtocolEvent::Partial(partial)] => {
+                assert_eq!(partial.result, "iVBORw0KGgo=");
+                assert_eq!(partial.partial_image_index, 2);
+                assert_eq!(partial.created_at, 1_800_000_000);
+            }
+            _ => panic!("expected one partial image event"),
+        }
+
+        for payload in [
+            json!({"type": "error", "error": {"code": "server_error", "message": "boom"}}),
+            json!({"type": "response.failed", "response": {"error": {"message": "failed"}}}),
+            json!({"type": "response.incomplete", "response": {"status": "incomplete"}}),
+            json!({"type": "response.cancelled", "response": {"status": "cancelled"}}),
+        ] {
+            let mut parser = CodexImagesResponseParser::new(true);
+            let parsed = parser
+                .push(format!("data: {payload}\n\n").as_bytes())
+                .unwrap();
+            match parsed.events.as_slice() {
+                [CodexImagesProtocolEvent::Failed(failure)] => {
+                    assert_eq!(failure.code, "image_generation_failed");
+                    assert_eq!(failure.status_code, StatusCode::BAD_GATEWAY.as_u16());
+                }
+                _ => panic!("expected terminal failure for {payload}"),
+            }
+        }
+
+        let mut parser = CodexImagesResponseParser::new(true);
+        let parsed = parser
+            .push(b"event: error\ndata: {\"message\":\"event failure\"}\n\n")
+            .unwrap();
+        assert!(matches!(
+            parsed.events.as_slice(),
+            [CodexImagesProtocolEvent::Failed(_)]
+        ));
+    }
+
+    #[test]
+    fn codex_images_parser_rejects_eof_without_terminal_event() {
+        let mut parser = CodexImagesResponseParser::new(true);
+        parser
+            .push(
+                b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\"}}\n\n",
+            )
+            .unwrap();
+
+        let error = match parser.finish() {
+            Ok(_) => panic!("truncated image stream must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "invalid_upstream_image_response");
+        assert!(error.message.contains("terminal event"));
+    }
+
+    #[test]
+    fn codex_images_parser_accepts_response_done_and_surfaces_text_refusal() {
+        let mut parser = CodexImagesResponseParser::new(true);
+        let parsed = parser
+            .push(
+                b"data: {\"type\":\"response.done\",\"response\":{\"created_at\":1800000000,\"output\":[{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}]}}\n\n",
+            )
+            .unwrap();
+        assert!(matches!(
+            parsed.events.as_slice(),
+            [CodexImagesProtocolEvent::Completed(_)]
+        ));
+
+        let mut parser = CodexImagesResponseParser::new(true);
+        let result = parser.push(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"This image request was refused.\"}]}]}}\n\n"
+                .as_bytes(),
+        );
+        let failure = match result {
+            Ok(_) => panic!("text-only image completion must fail"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code, "image_generation_failed");
+        assert!(failure.message.contains("This image request was refused."));
+
+        let mut parser = CodexImagesResponseParser::new(true);
+        let result = parser.push(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\"},{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\"}]}}\n\n",
+        );
+        let failure = match result {
+            Ok(_) => panic!("n=1 bridge must reject multiple upstream outputs"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code, "invalid_upstream_image_response");
+        assert!(failure.message.contains("2 outputs"));
+    }
+
+    #[test]
+    fn codex_images_edit_aggregate_limit_is_checked_without_overflow() {
+        assert_eq!(
+            checked_codex_image_edit_total_bytes(
+                crate::proxy::remote_image::MAX_CODEX_IMAGES_TOTAL_BYTES - 1,
+                1,
+            )
+            .unwrap(),
+            crate::proxy::remote_image::MAX_CODEX_IMAGES_TOTAL_BYTES
+        );
+        let error = checked_codex_image_edit_total_bytes(
+            crate::proxy::remote_image::MAX_CODEX_IMAGES_TOTAL_BYTES - 1,
+            2,
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("aggregate image limit"));
+    }
+
+    #[test]
+    fn codex_images_public_origin_prefers_verified_tunnel_and_cloudflare_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("origin.internal:15721"));
+        headers.insert(
+            "x-cc-switch-client-tunnel-host",
+            HeaderValue::from_static("images.example.com"),
+        );
+        headers.insert(
+            "cf-visitor",
+            HeaderValue::from_static(r#"{"scheme":"https"}"#),
+        );
+
+        assert_eq!(
+            codex_images_public_origin_with_base(&headers, None).unwrap(),
+            "https://images.example.com"
+        );
+        assert_eq!(
+            codex_images_public_origin_with_base(&headers, Some("https://cdn.example.com/"),)
+                .unwrap(),
+            "https://cdn.example.com"
+        );
+        assert!(codex_images_public_origin_with_base(
+            &headers,
+            Some("https://cdn.example.com/images"),
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -14947,7 +16923,9 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             )
             .as_bytes(),
         );
-        body.extend_from_slice(b"\x89PNG\r\n\x1a\nfixture");
+        let mut image = vec![0_u8; 1024 * 1024 + 1];
+        image[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        body.extend_from_slice(&image);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -16082,7 +18060,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             refreshed_access_token.clone(),
             "text/event-stream",
             concat!(
-                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ig_1\",\"type\":\"image_generation_call\",\"result\":\"aGVsbG8=\",\"output_format\":\"png\"}}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ig_1\",\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1800000000,\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
                 "data: [DONE]\n\n"
             )
@@ -16116,7 +18094,10 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             .await
             .unwrap();
         let body = serde_json::from_slice::<Value>(&body).unwrap();
-        assert_eq!(body.pointer("/data/0/b64_json"), Some(&json!("aGVsbG8=")));
+        assert_eq!(
+            body.pointer("/data/0/b64_json"),
+            Some(&json!("iVBORw0KGgo="))
+        );
         assert_eq!(
             refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
             1
@@ -16141,7 +18122,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     #[tokio::test]
     async fn codex_images_rejects_oversized_upstream_response_body() {
         let name = "codex-images-oversized-response";
-        let upstream = spawn_test_oversized_codex_upstream().await;
+        let upstream = spawn_test_oversized_codex_upstream(StatusCode::OK).await;
         let (state, execution) =
             codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
         let mut headers = HeaderMap::new();
@@ -16168,11 +18149,391 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             error.message,
             format!(
                 "proxy upstream request failed: upstream response body exceeds the {} byte limit",
-                crate::proxy::MEDIA_RESPONSE_BODY_LIMIT_BYTES
+                CODEX_IMAGES_MAX_UPSTREAM_BYTES
             )
         );
         assert_eq!(upstream.authorizations.lock().unwrap().len(), 1);
         upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_records_non_success_error_body_read_failures() {
+        let name = "codex-images-oversized-error-body";
+        let upstream = spawn_test_oversized_codex_upstream(StatusCode::BAD_GATEWAY).await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"bounded upstream error"}"#,
+        )
+        .unwrap();
+
+        let error = forward_codex_images_request(
+            state.clone(),
+            execution,
+            headers,
+            prepared,
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("response body exceeds"));
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().expect("Codex image failure usage log");
+        assert_eq!(log.status_code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(log.stream_status.as_deref(), Some("failed"));
+        assert!(log
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("response body exceeds")));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_stream_commits_before_upstream_completion_and_records_image_usage() {
+        let name = "codex-images-incremental-success";
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![(
+                Duration::from_millis(120),
+                Bytes::from_static(
+                    b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"created_at\":1800000000,\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5},\"tool_usage\":{\"image_gen\":{\"images\":1,\"input_tokens\":34,\"output_tokens\":1756,\"total_tokens\":1790}}}}\n\n",
+                ),
+            )],
+            false,
+        )
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"incremental","stream":true}"#,
+        )
+        .unwrap();
+
+        let response = forward_codex_images_request(
+            state.clone(),
+            execution,
+            headers,
+            prepared,
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let initial = tokio::time::timeout(Duration::from_millis(40), body.next())
+            .await
+            .expect("the downstream prelude must not wait for image generation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial, Bytes::from_static(b": connected\n\n"));
+        assert!(tokio::time::timeout(Duration::from_millis(40), body.next())
+            .await
+            .is_err());
+        let completed = tokio::time::timeout(Duration::from_secs(1), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let completed = String::from_utf8(completed.to_vec()).unwrap();
+        assert!(completed.contains("event: image_generation.completed"));
+        assert!(completed.contains("iVBORw0KGgo="));
+        assert!(body.next().await.is_none());
+
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().unwrap();
+        assert_eq!(log.status_code, StatusCode::OK.as_u16());
+        assert_eq!(log.stream_status.as_deref(), Some("completed"));
+        assert_eq!(log.input_tokens, Some(34));
+        assert_eq!(log.output_tokens, Some(1756));
+        assert_eq!(log.total_tokens, Some(1790));
+        assert_eq!(log.image_count, Some(1));
+        assert_eq!(log.image_bytes, Some(8));
+        assert_eq!(log.image_format.as_deref(), Some("png"));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_non_stream_heartbeat_preserves_one_valid_json_document() {
+        let name = "codex-images-json-heartbeat";
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![(
+                Duration::from_millis(80),
+                Bytes::from_static(
+                    b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"created_at\":1800000000,\"output\":[]}}\n\n",
+                ),
+            )],
+            false,
+        )
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"json heartbeat","stream":false}"#,
+        )
+        .unwrap();
+        let args = codex_images_stream_test_args(
+            &state,
+            &execution,
+            upstream.address,
+            prepared,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+            Duration::from_millis(20),
+            None,
+        )
+        .await;
+        let mut body = Body::from_stream(codex_images_response_stream(args)).into_data_stream();
+        let bytes = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                bytes.extend_from_slice(&chunk.unwrap());
+            }
+            bytes
+        })
+        .await
+        .unwrap();
+
+        assert!(bytes.starts_with(b"\n"));
+        assert!(bytes.windows(2).any(|window| window == b" \n"));
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value.pointer("/data/0/b64_json"),
+            Some(&json!("iVBORw0KGgo="))
+        );
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_stream_keepalive_and_unpolled_cancel_release_body_leases() {
+        let name = "codex-images-cancel";
+        let upstream = spawn_test_streaming_codex_images_upstream(Vec::new(), true).await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"keepalive","stream":true}"#,
+        )
+        .unwrap();
+        let args = codex_images_stream_test_args(
+            &state,
+            &execution,
+            upstream.address,
+            prepared,
+            None,
+            None,
+            Duration::from_millis(20),
+            None,
+        )
+        .await;
+        let mut body = Body::from_stream(codex_images_response_stream(args)).into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), b": connected\n\n"[..]);
+        let keepalive = tokio::time::timeout(Duration::from_millis(100), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(keepalive, Bytes::from_static(b": keepalive\n\n"));
+        drop(body);
+
+        let guard = state
+            .account_in_flight
+            .try_acquire(ProviderType::CodexOAuth, &account_id, 1)
+            .unwrap();
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"cancel before poll","stream":true}"#,
+        )
+        .unwrap();
+        let args = codex_images_stream_test_args(
+            &state,
+            &execution,
+            upstream.address,
+            prepared,
+            None,
+            None,
+            Duration::from_secs(1),
+            Some(guard),
+        )
+        .await;
+        let request_id = args.request_id.clone();
+        let body = Body::from_stream(codex_images_response_stream(args));
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::CodexOAuth, &account_id),
+            1
+        );
+        drop(body);
+
+        for _ in 0..100 {
+            let released = state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::CodexOAuth, &account_id)
+                == 0;
+            let cancelled = state
+                .usage_snapshot()
+                .await
+                .logs
+                .iter()
+                .find(|log| log.request_id == request_id)
+                .is_some_and(|log| {
+                    log.status_code == 499
+                        && log.stream_status.as_deref() == Some("client_cancelled")
+                });
+            if released && cancelled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::CodexOAuth, &account_id),
+            0
+        );
+        let usage = state.usage_snapshot().await;
+        let log = usage
+            .logs
+            .iter()
+            .find(|log| log.request_id == request_id)
+            .unwrap();
+        assert_eq!(log.status_code, 499);
+        assert_eq!(log.stream_status.as_deref(), Some("client_cancelled"));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_stream_distinguishes_first_event_and_idle_timeouts() {
+        for (name, chunks, expected_phase) in [
+            ("codex-images-first-timeout", Vec::new(), "first event"),
+            (
+                "codex-images-idle-timeout",
+                vec![(
+                    Duration::ZERO,
+                    Bytes::from_static(
+                        b"data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+                    ),
+                )],
+                "idle",
+            ),
+        ] {
+            let upstream = spawn_test_streaming_codex_images_upstream(chunks, true).await;
+            let (state, execution) =
+                codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+            let prepared = codex_images_generation_request(
+                br#"{"model":"gpt-image-2","prompt":"timeout","stream":true}"#,
+            )
+            .unwrap();
+            let args = codex_images_stream_test_args(
+                &state,
+                &execution,
+                upstream.address,
+                prepared,
+                Some(Duration::from_millis(35)),
+                Some(Duration::from_millis(35)),
+                Duration::from_secs(1),
+                None,
+            )
+            .await;
+            let request_id = args.request_id.clone();
+            let mut body =
+                Body::from_stream(codex_images_response_stream(args)).into_data_stream();
+            assert_eq!(body.next().await.unwrap().unwrap(), b": connected\n\n"[..]);
+            let failure = tokio::time::timeout(Duration::from_millis(250), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let failure = String::from_utf8(failure.to_vec()).unwrap();
+            assert!(failure.contains("event: error"));
+            assert!(failure.contains(expected_phase));
+
+            let usage = state.usage_snapshot().await;
+            let log = usage
+                .logs
+                .iter()
+                .find(|log| log.request_id == request_id)
+                .unwrap();
+            assert_eq!(log.status_code, StatusCode::GATEWAY_TIMEOUT.as_u16());
+            assert_eq!(log.stream_status.as_deref(), Some("timeout"));
+            upstream.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_images_first_event_timeout_is_one_budget_across_headers_and_stream() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(|| async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let body = futures_util::stream::once(async move {
+                    tokio::time::sleep(Duration::from_millis(160)).await;
+                    Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\"}]}}\n\n",
+                    ))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(body))
+                    .unwrap()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (state, mut execution) = codex_bridge_test_context(
+            "codex-images-cumulative-first-event-timeout",
+            format!("http://{address}"),
+        )
+        .await;
+        let plan = std::sync::Arc::make_mut(&mut execution.plan);
+        plan.transport_policy.stream_first_byte_timeout_ms = Some(180);
+        plan.transport_policy.stream_idle_timeout_ms = Some(500);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"one timeout budget","stream":true}"#,
+        )
+        .unwrap();
+
+        let response = forward_codex_images_request(
+            state,
+            execution,
+            headers,
+            prepared,
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), b": connected\n\n"[..]);
+        let failure = tokio::time::timeout(Duration::from_millis(300), body.next())
+            .await
+            .expect("remaining first-event budget must expire before the delayed event")
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8(failure.to_vec())
+            .unwrap()
+            .contains("first event timeout"));
+        server.abort();
     }
 
     #[tokio::test]

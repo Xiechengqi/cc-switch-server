@@ -83,6 +83,35 @@ pub fn record_codex_websocket_fallback(source: &'static str, result: &'static st
     .increment(1);
 }
 
+pub fn record_codex_images_request(
+    operation: &'static str,
+    streaming: bool,
+    outcome: &'static str,
+) {
+    metrics::counter!(
+        "cc_switch_codex_images_requests_total",
+        "operation" => operation,
+        "mode" => if streaming { "stream" } else { "json" },
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+pub fn record_codex_images_output(operation: &'static str, format: &str, count: u64, bytes: u64) {
+    metrics::counter!(
+        "cc_switch_codex_images_output_total",
+        "operation" => operation,
+        "format" => format.to_string()
+    )
+    .increment(count);
+    metrics::counter!(
+        "cc_switch_codex_images_output_bytes_total",
+        "operation" => operation,
+        "format" => format.to_string()
+    )
+    .increment(bytes);
+}
+
 pub fn record_provider_outcome(app: &str, provider_id: &str, outcome: ProviderRequestOutcome) {
     let outcome = match outcome {
         ProviderRequestOutcome::Success { .. } => "success",
@@ -214,6 +243,18 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_codex_websocket_fallback_total",
         "Codex WebSocket to HTTP fallback attempts and outcomes"
+    );
+    metrics::describe_counter!(
+        "cc_switch_codex_images_requests_total",
+        "Codex OAuth Images requests by operation, response mode, and terminal outcome"
+    );
+    metrics::describe_counter!(
+        "cc_switch_codex_images_output_total",
+        "Codex OAuth Images outputs by operation and format"
+    );
+    metrics::describe_counter!(
+        "cc_switch_codex_images_output_bytes_total",
+        "Codex OAuth Images decoded output bytes by operation and format"
     );
     metrics::describe_counter!(
         "cc_switch_provider_outcome_total",

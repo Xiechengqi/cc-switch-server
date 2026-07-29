@@ -11,6 +11,16 @@
 
 Server 只记录上述 Token 桶，不按模型价格计算或保存成本金额。
 
+Codex OAuth Images 在同一 usage log 额外记录独立的输出元数据，不把图片字节换算成 Token 或费用：
+
+- `imageCount`：语义完成并成功渲染的图片数。
+- `imageBytes`：base64 解码后的图片总字节数。
+- `imageFormat`：`png`、`jpeg`、`webp`；多种格式时为 `mixed`。
+- `imageWidth` / `imageHeight`：可识别时的实际像素尺寸。
+- `imageSize`：实际 `WIDTHxHEIGHT`，无法识别时回落到上游 size；多种尺寸时为 `mixed`。
+
+图片元数据只在语义 completed 后写入。partial image、失败、超时或客户端取消不会被统计为成功输出；Prometheus 对应暴露 `cc_switch_codex_images_requests_total`、`cc_switch_codex_images_output_total` 和 `cc_switch_codex_images_output_bytes_total`。
+
 解析来源：
 
 - Claude/Anthropic：支持 `message.usage`、`usage`、流式 `message_delta` 的 `usage` / `delta.usage`，并识别 `cache_read_input_tokens`、`cache_creation_input_tokens` 及 camelCase/cache alias。
@@ -30,3 +40,8 @@ Stream 状态：
 - `completed`：上游正常结束。
 - `upstream_error`：上游 stream 过程中报错。
 - `interrupted`：客户端在 stream 结束前断开。
+- `failed`：Images 上游显式失败、协议错误或本地渲染失败。
+- `timeout`：Images 首事件或事件后空闲超时；usage `statusCode` 为 504。
+- `client_cancelled`：Images 下游 Body 被取消；usage `statusCode` 为 499。
+
+Images 为穿过 Cloudflare 保持连接，可能在最终结果前提交 SSE comment 或 JSON 空白。因此 wire HTTP status 可能保持 200，终态应以完整 payload 和 usage log 的 `statusCode`/`streamStatus` 为准。

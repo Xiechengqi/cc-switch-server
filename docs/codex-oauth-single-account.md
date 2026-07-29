@@ -85,6 +85,48 @@ models manifest、alpha search、Provider 网络测试、模型发现、quota re
 - Images generation/edit 使用固定 Codex bridge、身份头和 body 上限；401 重放后仍返回原始上游错误 body，不用另一个账号掩盖错误。
 - models manifest 与 alpha search 只访问固定 ChatGPT Codex endpoint，并采用同账号一次 401 refresh 边界。
 
+### Images 兼容与资源边界
+
+Codex OAuth 图片桥覆盖 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。它把 OpenAI Images 请求转换成同一活动账号上的 Responses `image_generation` tool 调用；上游始终使用增量 SSE，generation 与 edit 分别回放为 `image_generation.*` 和 `image_edit.*` 事件。`n` 当前只接受 `1`，不会用未验证的多图语义制造重复生成或重复计费。
+
+- 输入模型只接受 `gpt-image-*`；`gpt-image-2-2k` 和 `gpt-image-2-4k` 会规范化为 `gpt-image-2` 及对应方向尺寸。
+- `response_format` 支持 `b64_json` 和 `url`；同时校验 `size`、`quality`、`background`、`output_format`、`moderation`、`input_fidelity`、`output_compression`、`partial_images` 和 `stream` 的类型、范围及组合关系。
+- edit 支持 JSON image URL/data URI 和 multipart `image`/`image[]`/`mask`。每张输入图最多 20 MiB、所有输入图和 mask 合计最多 32 MiB、input image 最多 16 张、mask 最多 1 张；MIME 必须与 PNG/JPEG/GIF/WebP/BMP/AVIF 签名一致。为容纳 32 MiB 图片经 base64 后的膨胀和 multipart 元数据，Codex Images HTTP decoded envelope 上限为 48 MiB；图片解码后的聚合上限仍为 32 MiB。共享 Images 路由上的 Grok media wire/decoded body 继续限制为 32 MiB。
+- 远程图片只允许 HTTP(S)，逐次校验 redirect、DNS 全部解析结果和最终 MIME/signature，阻止私网、loopback、保留地址、协议降级与 DNS rebinding，并使用 10 秒单图、30 秒批次和 4 路并发上限。
+- 单张解码后输出最多 48 MiB，Codex Images 成功流累计最多 72 MiB，以容纳 48 MiB 图片的 base64 膨胀和 SSE/JSON 元数据。输出必须是合法 base64，且实际 PNG/JPEG/WebP 签名必须与上游声明格式一致；能识别的图片会记录实际宽高，无法识别尺寸时仍保留上游 size 元数据。
+
+下游 `stream=true` 会立即发送 `: connected`，空闲期间每 15 秒发送 `: keepalive`；partial、completed 和 error 按 Images SSE 事件输出。`stream=false` 仍保持一个合法 JSON 文档：先发送 JSON 合法空白，并每 15 秒发送空白心跳，最终再写入 JSON 对象。这样 Cloudflare 可以持续看到源站字节，而 Server 不需要把整个生成结果缓冲到内存后才响应。
+
+首个有效上游事件使用 `STREAM_FIRST_BYTE_TIMEOUT_MS`，之后使用 `STREAM_IDLE_TIMEOUT_MS`。`response.failed`、`response.incomplete`、cancel/error 事件、缺失终止事件的 EOF、超限、网络错误和超时都不会记为 Provider 成功。客户端中断会记为 HTTP `499`/`client_cancelled`，并在 Body 释放时归还账号与 Share in-flight lease。
+
+由于首个空白或 SSE comment 已提交 HTTP headers，后续流内失败不能再把 wire status 从 `200` 改成 `502/504`：stream 模式返回 `event: error`，JSON 模式返回标准 error JSON；本地 usage log 的 `statusCode`、`streamStatus` 和 `errorMessage` 记录真实终态。调用方不能只看初始 HTTP 200 判断图片成功，必须消费完整 Body 并验证 completed/data 或 error。
+
+### `response_format=url`
+
+URL 模式不会返回伪造或上游私有 URL。Server 将解码后的图片放入进程内 capability store，并返回同源 `/v1/images/files/<256-bit-token>`：
+
+- token 具有 256-bit 随机熵，GET/HEAD 不再要求 inference token；token 本身就是短期访问能力。
+- TTL 为 1 小时，最多 128 项、合计 256 MiB；达到上限会淘汰最旧项，进程重启会使 URL 不可用。多副本部署必须让生成请求及其后续文件 GET/HEAD 粘性回到同一实例；当前实现没有共享对象存储，无法保证跨实例 URL 可用。
+- 下载响应带 `private, no-store`、`nosniff`、准确 Content-Type/Length，不应被 Cloudflare Cache、浏览器或下游代理持久化。
+- public origin 优先使用 `CC_SWITCH_IMAGE_PUBLIC_BASE_URL`，其次使用 Router 已验证的 Client tunnel host，再按 Host/forwarded headers 推导。环境变量必须是无 path/query/fragment 的 HTTP(S) origin。
+
+### Cloudflare Proxy
+
+Cloudflare DNS 橙云或 Tunnel 直接保留公开 Host 时可自动推导 URL。Cloudflare Worker 把请求转发到不同源站 host 时，应显式配置：
+
+```bash
+CC_SWITCH_IMAGE_PUBLIC_BASE_URL=https://api.example.com
+```
+
+Worker 必须把上游 Body 当作 `ReadableStream` 原样返回，例如 `new Response(upstream.body, { status, headers })`；不能调用 `.text()`、`.json()`、`.arrayBuffer()`，也不能先聚合完整响应。还必须：
+
+- 透传或正确生成公开 Host、`CF-Visitor`/`X-Forwarded-Proto`，不要覆盖 Server 的 `Cache-Control: no-store` 和 `X-Accel-Buffering: no`。
+- 对 Images SSE/JSON 关闭 Worker 自定义缓冲、响应重写和 cache；允许至少每 15 秒一个很小的 chunk 立即流向客户端。
+- 允许 `/v1/images/files/<token>` 的匿名 GET/HEAD 到达同一 Server 实例，不把 inference bearer 追加到生成 URL，也不缓存 capability 响应。
+- 确认 WAF、请求体和上传规则允许 Codex Images 的 48 MiB HTTP envelope（解码图片聚合仍为 32 MiB）；真实验证首块、15 秒以上生成、URL 下载和客户端取消。
+
+Cloudflare 524 是否消失、Worker 是否实际 flush 小 chunk、订阅账号是否拥有 image entitlement，仍是外部部署/真实 OAuth gate，离线测试不能替代。
+
 ## WebSocket 与 HTTP Fallback
 
 Codex Responses WebSocket 使用有界连接池，pool key 包含进程、Provider/runtime、session、upstream URL、credential generation 和 workspace headers。

@@ -103,6 +103,7 @@ credential.
 | `CC_SWITCH_SERVER_TOKEN` | server 登录 bearer token | 不记录明文，只记录是否存在 |
 | `CC_SWITCH_BASE_URL` | OAuth 真实账号 smoke 使用的 server base URL | 可完整记录 |
 | `CC_SWITCH_INFERENCE_TOKEN` | 真实推理入口 token | 不记录明文，只记录是否存在 |
+| `CC_SWITCH_IMAGE_PUBLIC_BASE_URL` | Cloudflare 改写源站 Host 时的 Images URL 公开 origin | 可完整记录 |
 
 ### router/market public probe
 
@@ -178,7 +179,7 @@ Codex OAuth 专项补充：
 8. provider 的 `codexWebsocketEnabled=false` 应使 GET WS 返回 503，并保持 POST Responses SSE 可用；恢复开关后再跑 text/binary WS 与 Windows reset 场景。
 9. GPT-5.6 Sol/Terra 接受 `ultra`，Luna 将 `ultra` 降为 `max`，旧 GPT 将 `max/ultra` 降为 `xhigh`；`/v1/models` 应返回 Sol/Terra/Luna。
 10. usage fixture 同时覆盖 nested `cache_write_tokens`、cache read、cache creation 显式零值和 Anthropic exclusive input，核对 fresh/read/write/output 四桶与总 Token。
-11. `/v1/images/generations` 使用短图片 prompt 验证既有 Codex bridge、身份头和账号冷却；不要把已有 Images 路由误报为未实现。
+11. Codex Images 必须同时验收 `/v1/images/generations` 与 `/v1/images/edits`：短 prompt 的 non-stream `b64_json` 能完整解码，`stream=true` 在上游生成完成前收到 `: connected`，超过 15 秒的生成持续收到 keepalive，partial/completed/error 的事件名前缀分别符合 generation/edit。edit 上传一张大于 1 MiB 的真实图片应到达上游；用两张 base64 图片验证超过 32 MiB HTTP body、但图片聚合不超过 32 MiB 时仍可进入 handler。单图大于 20 MiB、图片聚合大于 32 MiB、HTTP decoded envelope 大于 48 MiB、超过 16 张、伪造输入或输出 MIME/signature、非法参数和 `n>1` 必须在零上游或受控边界失败。模拟 `response.failed`、incomplete/cancel、无终止 EOF、首事件/idle timeout、错误 body 超限与客户端断连，核对 usage 的 502/504/499、stream status、inflight 归零，且其他账号/Provider 请求数为零。`response_format=url` 应返回当前公开 origin 下的随机 capability URL；匿名 GET/HEAD 的 bytes、Content-Type/Length、`no-store`/`nosniff` 正确，无效 token 和重启后的旧 token 为 404。通过 Cloudflare Worker/Tunnel 再执行一次：Worker 必须直接透传 `Response.body`，不能调用 `.text()`/`.json()`/`.arrayBuffer()`；源站 Host 被改写时设置 `CC_SWITCH_IMAGE_PUBLIC_BASE_URL`，多副本配置生成与下载的实例粘性，确认无 524、小心跳实际 flush、文件路由不被认证层或 Cache 拦截。只记录 requestId、状态、首块/心跳时间、字节数和脱敏账号，不记录图片内容或 capability token。
 12. server 不应自动读取或写入运行主机用户的 `~/.codex/auth.json`；只测试显式登录/导入。TLS/JA3 只有在 rustls 请求出现可重复的上游拒绝证据时才开启专项评估。
 13. 从配置中的非 loopback HTTPS Client URL 发起 CLI OAuth，确认授权请求仍使用 `http://localhost:1455/auth/callback`。浏览器本地回调失败后提交完整地址栏 URL 应完成同一管理员主体的会话；裸 code、`127.0.0.1`、错误端口/path、重复 state、过期/取消会话、另一管理员会话、非同源页面、未配置的 host 和远程 HTTP Client URL 都必须拒绝。另以 `0.0.0.0` 或 `::` 启动 Server，确认携带伪造 `Host: 127.0.0.1` 的远程请求仍被拒绝；只有 Server 实际绑定 loopback 时才允许本机例外。Device OAuth 同时保持可用。
 14. Provider 中伪造 OAuth authorize/token、quota 或 inference endpoint 后保存/转发必须被固定 endpoint policy 拒绝或覆盖，OAuth token 不得发往自定义 host；managed OAuth Provider 缺少显式账号绑定时必须拒绝保存，不能隐式选同类型第一个账号。
